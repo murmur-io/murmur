@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      Hardened-runtime entitlements for the notarized Murmur build.
+      Applied ONLY by scripts/macos-sign-notarize.sh during the Developer ID sign —
+      the normal ad-hoc dev build does not use this file.
+    -->
+
+    <!-- WKWebView / JS engine under hardened runtime -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Murmur loads the ScreenCaptureKit system-audio sidecar + whisper.cpp / Metal
+         dylibs that aren't signed by our Team ID; library validation must be relaxed. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Microphone capture (non-sandboxed Developer ID app; works with the
+         NSMicrophoneUsageDescription TCC prompt). Harmless if redundant. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+  </dict>
+</plist>
