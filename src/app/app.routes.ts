@@ -43,6 +43,13 @@ export const routes: Routes = [
         (m) => m.FloatingBarComponent,
       ),
   },
+  {
+    path: "onboarding",
+    loadComponent: () =>
+      import("./features/onboarding/onboarding.component").then(
+        (m) => m.OnboardingComponent,
+      ),
+  },
   { path: "", pathMatch: "full", redirectTo: "record" },
   { path: "**", redirectTo: "record" },
 ];
