@@ -760,9 +760,13 @@ export class SettingsComponent implements OnInit {
   /** Approx download size for the selected quality (shown on the Download button). */
   readonly downloadHint = signal("~470 MB");
 
+  /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
+  private loadedOnboarded = true;
+
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
+      this.loadedOnboarded = cfg.onboarded ?? true;
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -812,6 +816,7 @@ export class SettingsComponent implements OnInit {
       captureSystemAudio: v.captureSystemAudio,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
+      onboarded: this.loadedOnboarded,
     };
     try {
       await this.ipc.saveConfig(cfg);
