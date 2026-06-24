@@ -419,6 +419,11 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Floating-bar window — transparent document so only the frosted pill shows. */
+body.bar-shell { background: transparent !important; }
+body.bar-shell::before,
+body.bar-shell::after { display: none !important; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     transition-duration: 0.01ms !important;

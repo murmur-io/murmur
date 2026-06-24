@@ -29,6 +29,13 @@ export const routes: Routes = [
         (m) => m.DetailComponent,
       ),
   },
+  {
+    path: "bar",
+    loadComponent: () =>
+      import("./features/bar/bar.component").then(
+        (m) => m.FloatingBarComponent,
+      ),
+  },
   { path: "", pathMatch: "full", redirectTo: "record" },
   { path: "**", redirectTo: "record" },
 ];
