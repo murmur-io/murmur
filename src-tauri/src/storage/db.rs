@@ -199,6 +199,26 @@ impl Db {
         .transpose()
     }
 
+    /// Recent meetings, newest first (Library list).
+    pub fn list_meetings(&self, limit: i64) -> Result<Vec<Meeting>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, started_at, ended_at, title, duration_s, audio_path, status
+                   FROM meetings ORDER BY started_at DESC, id DESC LIMIT ?1",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], row_to_meeting)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            // row_to_meeting yields rusqlite::Result<Result<Meeting>>: unwrap both layers.
+            out.push(r.map_err(map_err)??);
+        }
+        Ok(out)
+    }
+
     // ── segments ────────────────────────────────────────────────────────────
 
     pub fn insert_segments(&self, meeting_id: &str, segments: &[Segment]) -> Result<()> {
@@ -295,6 +315,19 @@ impl Db {
             "SELECT meeting_id, provider_id, markdown, created_at, exported_path
                FROM notes ORDER BY created_at DESC LIMIT 1",
             [],
+            row_to_note,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// The most recent note for a meeting across providers (Detail view).
+    pub fn get_latest_note_for_meeting(&self, meeting_id: &str) -> Result<Option<NoteRecord>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+               FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![meeting_id],
             row_to_note,
         )
         .optional()

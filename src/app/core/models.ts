@@ -53,3 +53,34 @@ export interface StopResult {
   markdown: string;
   exportedPath: string;
 }
+
+export type MeetingStatus =
+  | "DRAFT"
+  | "RECORDING"
+  | "TRANSCRIBED"
+  | "SUMMARIZED"
+  | "EXPORTED"
+  | "ERROR";
+
+export interface Meeting {
+  id: string;
+  startedAt: string;
+  endedAt: string | null;
+  title: string | null;
+  durationS: number;
+  audioPath: string | null;
+  status: MeetingStatus;
+}
+
+export interface Segment {
+  idx: number;
+  startS: number;
+  endS: number;
+  text: string;
+}
+
+export interface MeetingDetail {
+  meeting: Meeting;
+  note: NoteDto | null;
+  segments: Segment[];
+}
