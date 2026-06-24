@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use meetnotes_lib::audio;
 use meetnotes_lib::export;
 use meetnotes_lib::summarize::claude_code::ClaudeCodeProvider;
 use meetnotes_lib::summarize::provider::{
@@ -24,12 +25,26 @@ async fn main() {
     let wav = Path::new(&args[1]);
     let model = Path::new(&args[2]);
     let vault = Path::new(&args[3]);
+    let system_wav = args.get(4).map(String::as_str);
 
     eprintln!("[e2e] loading whisper model: {}", model.display());
     let tx = Transcriber::load(model).expect("load whisper model");
 
-    eprintln!("[e2e] transcribing: {}", wav.display());
-    let transcript = tx.transcribe_wav(wav, Some("en")).expect("transcribe wav");
+    let transcript = if let Some(sys) = system_wav {
+        // Phase 2 mixing path: read mic + system tracks, resample both to 16 kHz, mix,
+        // and transcribe the blend. Exercises audio::read_wav_mono / resample_to_16k / mix
+        // — i.e. everything in system-audio capture EXCEPT the ScreenCaptureKit syscall.
+        eprintln!("[e2e] mixing mic {} + system {}", wav.display(), sys);
+        let (mic, mic_rate) = audio::read_wav_mono(wav).expect("read mic wav");
+        let (sysm, sys_rate) = audio::read_wav_mono(Path::new(sys)).expect("read system wav");
+        let mic16 = audio::resample_to_16k(&mic, mic_rate).expect("resample mic");
+        let sys16 = audio::resample_to_16k(&sysm, sys_rate).expect("resample system");
+        let mixed = audio::mix(&mic16, &sys16);
+        tx.transcribe(&mixed, Some("en")).expect("transcribe mixed")
+    } else {
+        eprintln!("[e2e] transcribing: {}", wav.display());
+        tx.transcribe_wav(wav, Some("en")).expect("transcribe wav")
+    };
     println!("=== TRANSCRIPT ===");
     println!("{}", transcript.full_text);
     println!("==================");

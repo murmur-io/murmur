@@ -34,5 +34,8 @@ npx ng build
 echo "── headless core E2E (say → ffmpeg → Whisper → provider → Obsidian) ──"
 bash scripts/e2e-core.sh
 
+echo "── headless mixing E2E (mic + system → mixed transcript, both sides) ──"
+bash scripts/e2e-mix.sh
+
 echo
 echo "✅ CI: all gates green"
