@@ -57,6 +57,7 @@ pub fn run() {
             commands::provider_statuses,
             commands::resummarize,
             commands::list_meetings,
+            commands::search_meetings,
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,

@@ -9,6 +9,7 @@ import type {
   MeetingTimeline,
   NoteDto,
   ProviderStatus,
+  SearchHit,
   StartResult,
   StatusPayload,
   StopResult,
@@ -70,6 +71,11 @@ export class IpcService {
 
   listMeetings(): Promise<Meeting[]> {
     return invoke<Meeting[]>("list_meetings");
+  }
+
+  /** Search meetings (title + transcript + note) for the Library search box. */
+  searchMeetings(query: string): Promise<SearchHit[]> {
+    return invoke<SearchHit[]>("search_meetings", { query });
   }
 
   /** Aggregate analytics for the dashboard + Analytics tab. */

@@ -131,3 +131,9 @@ export interface MeetingTimeline {
   speakers: SpeakerTurn[];
   topics: TopicSpan[];
 }
+
+export interface SearchHit {
+  meeting: Meeting;
+  snippet: string;
+  matchedIn: string;
+}

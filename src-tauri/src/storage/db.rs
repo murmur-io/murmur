@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, Result};
 use crate::storage::models::{
-    Analytics, DayCount, Meeting, MeetingStatus, NoteRecord, StatusCount,
+    Analytics, DayCount, Meeting, MeetingStatus, NoteRecord, SearchHit, StatusCount,
 };
 use crate::transcribe::types::Segment;
 
@@ -224,6 +224,49 @@ impl Db {
             out.push(r.map_err(map_err)??);
         }
         Ok(out)
+    }
+
+    /// Search meeting titles, transcript segments, and note markdown for `query`. Returns
+    /// newest-first hits, each with a short snippet around the match. Case-insensitive.
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let like = format!("%{}%", escape_like(q));
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
+                        m.audio_path, m.status
+                   FROM meetings m
+                   LEFT JOIN segments s ON s.meeting_id = m.id
+                   LEFT JOIN notes n ON n.meeting_id = m.id
+                  WHERE m.title LIKE ?1 ESCAPE '\\'
+                     OR s.text LIKE ?1 ESCAPE '\\'
+                     OR n.markdown LIKE ?1 ESCAPE '\\'
+                  ORDER BY m.started_at DESC, m.id DESC
+                  LIMIT ?2",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![like, limit], row_to_meeting)
+            .map_err(map_err)?;
+        let mut meetings = Vec::new();
+        for r in rows {
+            meetings.push(r.map_err(map_err)??);
+        }
+
+        let mut hits = Vec::with_capacity(meetings.len());
+        for m in meetings {
+            let (snippet, matched_in) = search_snippet(&conn, &m, q, &like)?;
+            hits.push(SearchHit {
+                meeting: m,
+                snippet,
+                matched_in,
+            });
+        }
+        Ok(hits)
     }
 
     // ── segments ────────────────────────────────────────────────────────────
@@ -552,6 +595,108 @@ fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>> {
         audio_path,
         status,
     }))
+}
+
+/// Escape LIKE wildcards so user input is matched literally (paired with `ESCAPE '\'`).
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Build a `(snippet, matched_in)` pair for a search hit, reusing the open connection.
+fn search_snippet(
+    conn: &Connection,
+    m: &Meeting,
+    q: &str,
+    like: &str,
+) -> Result<(String, String)> {
+    let ql = q.to_lowercase();
+    if let Some(t) = &m.title {
+        if t.to_lowercase().contains(&ql) {
+            return Ok((t.clone(), "title".to_string()));
+        }
+    }
+    let seg: Option<String> = conn
+        .query_row(
+            "SELECT text FROM segments WHERE meeting_id = ?1 AND text LIKE ?2 ESCAPE '\\' \
+             ORDER BY idx LIMIT 1",
+            rusqlite::params![m.id, like],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_err)?;
+    if let Some(text) = seg {
+        return Ok((excerpt(&text, q), "transcript".to_string()));
+    }
+    let note: Option<String> = conn
+        .query_row(
+            "SELECT markdown FROM notes WHERE meeting_id = ?1 AND markdown LIKE ?2 ESCAPE '\\' \
+             LIMIT 1",
+            rusqlite::params![m.id, like],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_err)?;
+    if let Some(md) = note {
+        return Ok((excerpt(&md, q), "note".to_string()));
+    }
+    Ok((m.title.clone().unwrap_or_default(), "title".to_string()))
+}
+
+/// A ~130-char snippet around the first case-insensitive match of `q` in `text`,
+/// whitespace-collapsed, with ellipses. Char-boundary safe for Unicode.
+fn excerpt(text: &str, q: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let pos = flat
+        .to_lowercase()
+        .find(&q.to_lowercase())
+        .unwrap_or(0)
+        .min(flat.len());
+    let mut start = pos.saturating_sub(40);
+    while start > 0 && !flat.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (pos + q.len() + 90).min(flat.len());
+    while end < flat.len() && !flat.is_char_boundary(end) {
+        end += 1;
+    }
+    let body = flat.get(start..end).unwrap_or(&flat).trim();
+    let mut s = String::new();
+    if start > 0 {
+        s.push('…');
+    }
+    s.push_str(body);
+    if end < flat.len() {
+        s.push('…');
+    }
+    s
+}
+
+#[cfg(test)]
+mod search_helper_tests {
+    use super::{escape_like, excerpt};
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        // '%' → '\%', '_' → '\_', '\' → '\\'
+        assert_eq!(escape_like("a%b_c\\d"), "a\\%b\\_c\\\\d");
+    }
+
+    #[test]
+    fn excerpt_centers_on_match_with_ellipses() {
+        // Match sits deep in a long string → window is clipped on both sides.
+        let text = format!("{}needle{}", "alpha ".repeat(20), " omega".repeat(20));
+        let e = excerpt(&text, "needle");
+        assert!(e.contains("needle"));
+        assert!(e.starts_with('…'), "leading ellipsis, got: {e}");
+        assert!(e.ends_with('…'), "trailing ellipsis, got: {e}");
+    }
+
+    #[test]
+    fn excerpt_handles_unicode_safely() {
+        let text = "zażółć gęślą jaźń ąśćńółżź omówiliśmy budżet i planowanie na przyszły kwartał szczegółowo";
+        let e = excerpt(text, "budżet");
+        assert!(e.contains("budżet"));
+    }
 }
 
 fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {

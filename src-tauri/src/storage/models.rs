@@ -98,3 +98,13 @@ pub struct MeetingTimeline {
     #[serde(default)]
     pub topics: Vec<TopicSpan>,
 }
+
+/// One search result: the matched meeting + a snippet and which field matched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub meeting: Meeting,
+    pub snippet: String,
+    /// "title" | "transcript" | "note"
+    pub matched_in: String,
+}
