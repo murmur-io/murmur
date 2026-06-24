@@ -4,8 +4,11 @@ import {
   OnInit,
   computed,
   inject,
+  signal,
 } from "@angular/core";
 import { RecorderStore } from "../../core/recorder.store";
+import { IpcService } from "../../core/ipc.service";
+import type { AppConfigDto } from "../../core/models";
 
 @Component({
   selector: "app-record",
@@ -13,12 +16,25 @@ import { RecorderStore } from "../../core/recorder.store";
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <section class="record">
+      @if (vaultMissing()) {
+        <p class="warn" role="alert">
+          ⚠️ Set your Obsidian <strong>vault folder</strong> in Settings before
+          recording — notes can't be saved without it.
+        </p>
+      } @else if (modelMissing()) {
+        <p class="warn" role="alert">
+          ⚠️ No <strong>Whisper model</strong> configured. You can record, but
+          transcription needs a model — set its path in Settings (or place a
+          default model in the app's models folder).
+        </p>
+      }
+
       <div class="controls">
         @if (!store.isRecording()) {
           <button
             type="button"
             (click)="store.start()"
-            [disabled]="store.isBusy()"
+            [disabled]="store.isBusy() || vaultMissing()"
           >
             Record
           </button>
@@ -67,6 +83,13 @@ import { RecorderStore } from "../../core/recorder.store";
       .record {
         max-width: 760px;
       }
+      .warn {
+        background: rgba(241, 196, 15, 0.15);
+        border: 1px solid rgba(241, 196, 15, 0.5);
+        border-radius: 6px;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.9rem;
+      }
       .controls button {
         font-size: 1rem;
         padding: 0.5rem 1.25rem;
@@ -108,6 +131,22 @@ import { RecorderStore } from "../../core/recorder.store";
 })
 export class RecordComponent implements OnInit {
   readonly store = inject(RecorderStore);
+  private readonly ipc = inject(IpcService);
+
+  /** Latest settings snapshot, refreshed on entry, used for the readiness guard (SF-4). */
+  private readonly config = signal<AppConfigDto | null>(null);
+
+  /** A vault folder is mandatory — export fails without it, so block recording. */
+  readonly vaultMissing = computed(() => {
+    const c = this.config();
+    return !c || !c.vaultPath || c.vaultPath.trim() === "";
+  });
+
+  /** A model is needed for transcription; soft warning (a default may exist on disk). */
+  readonly modelMissing = computed(() => {
+    const c = this.config();
+    return !c || !c.whisperModelPath || c.whisperModelPath.trim() === "";
+  });
 
   /** 0..100 width for the mic level bar. */
   readonly levelPct = computed(() =>
@@ -116,5 +155,6 @@ export class RecordComponent implements OnInit {
 
   async ngOnInit(): Promise<void> {
     await this.store.init();
+    this.config.set(await this.ipc.getConfig());
   }
 }
