@@ -25,7 +25,7 @@ import { filter, map } from "rxjs";
         <div class="app-bar">
           <span class="brand">
             <span class="brand-dot"></span>
-            MeetNotes
+            murmur
           </span>
           <nav class="app-nav">
             <a routerLink="/record" routerLinkActive="active">Record</a>

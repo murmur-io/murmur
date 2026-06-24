@@ -79,7 +79,7 @@ fn create_bar_window(app: &tauri::AppHandle) -> tauri::Result<()> {
         return Ok(());
     }
     let win = WebviewWindowBuilder::new(app, "bar", WebviewUrl::App("bar".into()))
-        .title("MeetNotes")
+        .title("Murmur")
         .inner_size(540.0, 58.0)
         .decorations(false)
         .transparent(true)
