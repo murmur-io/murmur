@@ -6,7 +6,9 @@ use crate::error::AppError;
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
-use crate::storage::models::{Analytics, Meeting, MeetingStatus, MeetingTimeline, NoteRecord};
+use crate::storage::models::{
+    Analytics, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, SearchHit,
+};
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
@@ -310,6 +312,15 @@ pub fn update_note(
         markdown,
         exported_path: existing.exported_path,
     })
+}
+
+/// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
+#[tauri::command]
+pub fn search_meetings(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<Vec<SearchHit>, AppError> {
+    state.db.search(&query, 100)
 }
 
 /// Read current config (settings table), without secrets.
