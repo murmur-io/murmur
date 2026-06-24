@@ -99,9 +99,16 @@ export class RecorderStore {
   }
 
   private applyStatus(p: StatusPayload): void {
+    const wasRecording = this._stage() === "recording";
     this._stage.set(p.stage);
     this._message.set(p.message);
     this._meetingId.set(p.meetingId);
+    // Anchor the elapsed timer when THIS window first observes recording — covers windows
+    // that didn't call start() themselves (the floating bar, or a voice-triggered start),
+    // where _recStartMs would otherwise stay 0 and show an epoch-sized timer.
+    if (p.stage === "recording" && !wasRecording) {
+      this._recStartMs = Date.now();
+    }
     if (p.stage === "error") {
       this._error.set(p.message);
     } else {
