@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::audio::Recorder;
 use crate::error::AppError;
@@ -62,6 +62,7 @@ pub struct AppConfigDto {
     pub claude_binary: String,
     pub capture_system_audio: bool,
     pub model_size: String,
+    pub voice_trigger: bool,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -108,6 +109,12 @@ pub async fn start_recording(
         audio_path: None,
         status: MeetingStatus::Recording,
     })?;
+
+    // Free the mic from the voice listener (if any) before opening it for the recording.
+    {
+        let app2 = app.clone();
+        let _ = tokio::task::spawn_blocking(move || stop_voice_listener(&app2)).await;
+    }
 
     // Start mic capture.
     let recorder = Recorder::start()?;
@@ -213,6 +220,9 @@ pub async fn stop_recording(
     )
     .await?;
 
+    // Resume voice listening if it's still enabled (the mic is free again).
+    restart_voice_listener(app);
+
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -277,14 +287,22 @@ pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> 
 
 /// Persist config to settings table + refresh in-memory cache. Does NOT touch Keychain.
 #[tauri::command]
-pub fn save_config(state: State<'_, AppState>, config: AppConfigDto) -> Result<(), AppError> {
+pub fn save_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: AppConfigDto,
+) -> Result<(), AppError> {
     let new_config = dto_to_config(config);
     new_config.save(&state.db)?;
-    let mut cache = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    *cache = new_config;
+    {
+        let mut cache = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        *cache = new_config;
+    }
+    // Reconcile the voice-trigger listener with the new config.
+    restart_voice_listener(app);
     Ok(())
 }
 
@@ -301,6 +319,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         claude_binary: c.claude_binary.clone(),
         capture_system_audio: c.capture_system_audio,
         model_size: c.model_size.clone(),
+        voice_trigger: c.voice_trigger,
     }
 }
 
@@ -323,6 +342,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         } else {
             d.model_size
         },
+        voice_trigger: d.voice_trigger,
     }
 }
 
@@ -467,4 +487,49 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
 #[tauri::command]
 pub fn toggle_bar(app: AppHandle) {
     crate::toggle_bar(&app);
+}
+
+/// (Re)start the voice-trigger listener if enabled — model present and not recording —
+/// replacing any existing one. Safe to call repeatedly to reconcile after a config change
+/// or once a recording finishes.
+pub fn restart_voice_listener(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
+        l.stop();
+    }
+    let (enabled, configured, size, language) = match state.config.lock() {
+        Ok(c) => (
+            c.voice_trigger,
+            c.whisper_model_path.clone(),
+            c.model_size.clone(),
+            c.language.clone(),
+        ),
+        Err(_) => return,
+    };
+    if !enabled {
+        return;
+    }
+    // Don't grab the mic while a real recording is in progress.
+    if state.recorder.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return;
+    }
+    let p = configured.as_deref().map(std::path::Path::new);
+    match crate::transcribe::resolve_model_path(p, &size, language.as_deref().unwrap_or("")) {
+        Ok(Some(model_path)) => {
+            let listener =
+                crate::audio::listener::VoiceListener::start(app.clone(), model_path, language);
+            if let Ok(mut g) = state.voice_listener.lock() {
+                *g = Some(listener);
+            }
+        }
+        _ => tracing::warn!(target: "voice", "voice trigger enabled but no Whisper model present"),
+    }
+}
+
+/// Stop + drop the voice-trigger listener, releasing the mic. No-op if not running.
+pub fn stop_voice_listener(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
+        l.stop();
+    }
 }

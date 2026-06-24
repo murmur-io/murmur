@@ -184,6 +184,20 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         </label>
       </div>
 
+      <!-- Voice trigger — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Voice trigger</span>
+            <span class="text-secondary toggle-sub">
+              Start recording hands-free when you say “start recording”. Listens
+              with your Whisper model while idle.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="voiceTrigger" />
+        </label>
+      </div>
+
       <!-- Anthropic API key -->
       <div class="card">
         <fieldset>
@@ -467,6 +481,7 @@ export class SettingsComponent implements OnInit {
     claudeBinary: "claude",
     captureSystemAudio: false,
     modelSize: "small",
+    voiceTrigger: false,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -505,6 +520,7 @@ export class SettingsComponent implements OnInit {
         claudeBinary: cfg.claudeBinary,
         captureSystemAudio: cfg.captureSystemAudio ?? false,
         modelSize: cfg.modelSize ?? "small",
+        voiceTrigger: cfg.voiceTrigger ?? false,
       });
       this.updateDownloadHint();
       this.hasKey.set(await this.ipc.hasAnthropicKey());
@@ -540,6 +556,7 @@ export class SettingsComponent implements OnInit {
       claudeBinary: v.claudeBinary,
       captureSystemAudio: v.captureSystemAudio,
       modelSize: v.modelSize,
+      voiceTrigger: v.voiceTrigger,
     };
     try {
       await this.ipc.saveConfig(cfg);

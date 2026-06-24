@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::audio::listener::VoiceListener;
 use crate::audio::system::SystemAudioRecorder;
 use crate::audio::Recorder;
 use crate::error::{AppError, Result};
@@ -17,6 +18,8 @@ pub struct AppState {
     pub recorder: Mutex<Option<Recorder>>,
     /// Some while recording AND system-audio capture is enabled + available.
     pub system_recorder: Mutex<Option<SystemAudioRecorder>>,
+    /// Some while the voice-trigger listener is running.
+    pub voice_listener: Mutex<Option<VoiceListener>>,
     /// Db is internally Send+Sync (Mutex<Connection>).
     pub db: Db,
     /// In-memory cache of the settings table.
@@ -36,6 +39,7 @@ impl AppState {
         Ok(Self {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
+            voice_listener: Mutex::new(None),
             db,
             config: Mutex::new(config),
             current_meeting: Mutex::new(None),

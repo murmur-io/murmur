@@ -86,10 +86,15 @@ export class RecorderStore {
   );
 
   private unlisten: UnlistenFn | null = null;
+  private unlistenVoice: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
     this.unlisten = await this.ipc.onStatus((p) => this.applyStatus(p));
+    // Voice trigger: when the backend hears the wake phrase, start a recording.
+    this.unlistenVoice = await this.ipc.onVoiceStart(() => {
+      if (!this.isRecording()) void this.start();
+    });
     await this.refreshLastNote();
   }
 

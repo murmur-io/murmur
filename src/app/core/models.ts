@@ -37,6 +37,7 @@ export interface AppConfigDto {
   claudeBinary: string;
   captureSystemAudio: boolean;
   modelSize: string;
+  voiceTrigger: boolean;
 }
 
 export interface NoteDto {
