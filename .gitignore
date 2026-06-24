@@ -1,6 +1,9 @@
 /target
 /node_modules
+/dist
 .DS_Store
 *.gguf
 *.wav
 *.mp4
+.angular
+/src-tauri/target

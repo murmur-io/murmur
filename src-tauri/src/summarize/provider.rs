@@ -1,0 +1,43 @@
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::error::Result;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingMeta {
+    /// e.g. "2026-06-24"
+    pub date_iso: String,
+    pub title_hint: Option<String>,
+    pub duration_s: i64,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SummarizeRequest {
+    pub transcript: String,
+    pub meta: MeetingMeta,
+    /// note-format prompt (summarize/template.rs)
+    pub template: String,
+    /// existing note titles → [[link]] targets
+    pub vault_titles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Availability {
+    Available,
+    Unavailable { reason: String },
+}
+
+#[async_trait]
+pub trait SummarizerProvider: Send + Sync {
+    /// Stable id: "claude_code" | "anthropic" | "ollama".
+    fn id(&self) -> &str;
+
+    /// Cheap, non-failing readiness probe (key set? ollama up? claude in PATH?).
+    async fn availability(&self) -> Availability;
+
+    /// Produce finished Obsidian-ready Markdown from the request.
+    async fn summarize(&self, req: &SummarizeRequest) -> Result<String>;
+}
