@@ -133,6 +133,21 @@ impl Recorder {
     pub fn level(&self) -> f32 {
         self.shared.load_peak()
     }
+
+    /// The device's native capture sample rate (Hz).
+    pub fn source_sample_rate(&self) -> u32 {
+        self.source_sample_rate
+    }
+
+    /// Clone up to the last `max_samples` captured mono samples WITHOUT draining — used by
+    /// live transcription. Read-only; never disturbs capture or the final stop() buffer.
+    pub fn snapshot_tail(&self, max_samples: usize) -> Vec<f32> {
+        let Ok(guard) = self.shared.samples.lock() else {
+            return Vec::new();
+        };
+        let start = guard.len().saturating_sub(max_samples);
+        guard[start..].to_vec()
+    }
 }
 
 impl Drop for Recorder {

@@ -19,6 +19,7 @@ import type {
 export const EVENT_STATUS = "meetnotes://status";
 export const EVENT_VOICE_START = "murmur://voice-start";
 export const EVENT_TOGGLE_RECORD = "murmur://toggle-record";
+export const EVENT_LIVE_CAPTION = "murmur://live-caption";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -140,5 +141,12 @@ export class IpcService {
   /** Fires when the menu-bar (tray) "Start / Stop recording" item is chosen. */
   onToggleRecord(cb: () => void): Promise<UnlistenFn> {
     return listen(EVENT_TOGGLE_RECORD, () => cb());
+  }
+
+  /** Fires with the latest live-transcription caption during recording. */
+  onLiveCaption(cb: (text: string) => void): Promise<UnlistenFn> {
+    return listen<{ text: string }>(EVENT_LIVE_CAPTION, (e) =>
+      cb(e.payload.text),
+    );
   }
 }

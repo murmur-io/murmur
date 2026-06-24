@@ -26,12 +26,15 @@ export class RecorderStore {
   private readonly _lastNote = signal<NoteDto | null>(null);
   private readonly _error = signal<string | null>(null);
   private readonly _meetingId = signal<string | null>(null);
+  private readonly _liveCaption = signal<string>("");
 
   readonly stage = this._stage.asReadonly();
   readonly message = this._message.asReadonly();
   readonly lastNote = this._lastNote.asReadonly();
   readonly error = this._error.asReadonly();
   readonly meetingId = this._meetingId.asReadonly();
+  /** Latest live-transcription caption (best-effort, only during recording). */
+  readonly liveCaption = this._liveCaption.asReadonly();
 
   readonly isRecording = computed(() => this._stage() === "recording");
   readonly isBusy = computed(() =>
@@ -88,6 +91,7 @@ export class RecorderStore {
   private unlisten: UnlistenFn | null = null;
   private unlistenVoice: UnlistenFn | null = null;
   private unlistenToggle: UnlistenFn | null = null;
+  private unlistenLive: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -100,6 +104,10 @@ export class RecorderStore {
     this.unlistenToggle = await this.ipc.onToggleRecord(() =>
       this.toggleRecord(),
     );
+    // Live captions during recording (best-effort; backend emits partial transcripts).
+    this.unlistenLive = await this.ipc.onLiveCaption((t) =>
+      this._liveCaption.set(t),
+    );
     await this.refreshLastNote();
   }
 
@@ -108,6 +116,9 @@ export class RecorderStore {
     this._stage.set(p.stage);
     this._message.set(p.message);
     this._meetingId.set(p.meetingId);
+    if (p.stage !== "recording") {
+      this._liveCaption.set("");
+    }
     // Anchor the elapsed timer when THIS window first observes recording — covers windows
     // that didn't call start() themselves (the floating bar, or a voice-triggered start),
     // where _recStartMs would otherwise stay 0 and show an epoch-sized timer.
@@ -123,6 +134,7 @@ export class RecorderStore {
 
   async start(): Promise<void> {
     this._error.set(null);
+    this._liveCaption.set("");
     try {
       const res = await this.ipc.startRecording();
       this._meetingId.set(res.meetingId);
