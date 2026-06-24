@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   OnInit,
   computed,
@@ -162,88 +163,148 @@ interface ParsedNote {
         <section class="block">
           <div class="block-head">
             <h3>Analysis</h3>
-            @if (note()?.tags?.length) {
+            @if (!editing() && note()?.tags?.length) {
               <div class="tags">
                 @for (t of note()!.tags; track t) {
                   <span class="pill tag">{{ t }}</span>
                 }
               </div>
             }
+            @if (note() && !editing()) {
+              <button
+                type="button"
+                class="btn btn-ghost edit-btn"
+                (click)="startEdit()"
+              >
+                Edit
+              </button>
+            }
           </div>
 
           @if (note(); as n) {
-            @if (n.participants.length) {
-              <div class="card meta-card" [style.animation-delay.ms]="80">
-                <span class="meta-card-label">Participants</span>
-                <div class="people">
-                  @for (p of n.participants; track p) {
-                    <span class="person">{{ p }}</span>
-                  }
+            @if (editing()) {
+              <!-- In-app note editor (raw markdown → re-written to the vault) -->
+              <article class="card editor">
+                <textarea
+                  class="editor-area"
+                  spellcheck="false"
+                  autocapitalize="off"
+                  autocomplete="off"
+                  aria-label="Note markdown"
+                  [value]="draft()"
+                  [disabled]="saving()"
+                  (input)="onDraftInput($event)"
+                ></textarea>
+
+                @if (saveError(); as err) {
+                  <p class="editor-error" role="alert">{{ err }}</p>
+                }
+
+                <div class="editor-foot">
+                  <span class="editor-hint"
+                    >Markdown · saved to your vault</span
+                  >
+                  <div class="editor-actions">
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      (click)="cancelEdit()"
+                      [disabled]="saving()"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="saveNote()"
+                      [disabled]="saving()"
+                    >
+                      {{ saving() ? "Saving…" : "Save" }}
+                    </button>
+                  </div>
                 </div>
-              </div>
-            }
+              </article>
+            } @else {
+              @if (n.participants.length) {
+                <div class="card meta-card" [style.animation-delay.ms]="80">
+                  <span class="meta-card-label">Participants</span>
+                  <div class="people">
+                    @for (p of n.participants; track p) {
+                      <span class="person">{{ p }}</span>
+                    }
+                  </div>
+                </div>
+              }
 
-            @if (n.sections.length) {
-              @for (sec of n.sections; track sec.heading; let i = $index) {
-                <article
-                  class="card section"
-                  [style.animation-delay.ms]="120 + i * 60"
-                >
-                  <h4 class="section-head">{{ sec.heading }}</h4>
+              @if (n.sections.length) {
+                @for (sec of n.sections; track sec.heading; let i = $index) {
+                  <article
+                    class="card section"
+                    [style.animation-delay.ms]="120 + i * 60"
+                  >
+                    <h4 class="section-head">{{ sec.heading }}</h4>
 
-                  @switch (sec.kind) {
-                    @case ("actions") {
-                      <ul class="checklist">
-                        @for (a of sec.actions; track $index) {
-                          <li class="check" [class.is-done]="a.done">
-                            <span
-                              class="check-box"
-                              [class.is-done]="a.done"
-                              aria-hidden="true"
-                            ></span>
-                            <span class="check-text">{{ a.text }}</span>
-                          </li>
-                        }
-                      </ul>
+                    @switch (sec.kind) {
+                      @case ("actions") {
+                        <ul class="checklist">
+                          @for (a of sec.actions; track $index) {
+                            <li class="check" [class.is-done]="a.done">
+                              <span
+                                class="check-box"
+                                [class.is-done]="a.done"
+                                aria-hidden="true"
+                              ></span>
+                              <span class="check-text">{{ a.text }}</span>
+                            </li>
+                          }
+                        </ul>
+                      }
+                      @case ("bullets") {
+                        <ul class="bullets">
+                          @for (b of sec.bullets; track $index) {
+                            <li class="bullet">{{ b }}</li>
+                          }
+                        </ul>
+                      }
+                      @default {
+                        <div class="prose">
+                          @for (para of sec.paragraphs; track $index) {
+                            <p>{{ para }}</p>
+                          }
+                        </div>
+                      }
                     }
-                    @case ("bullets") {
-                      <ul class="bullets">
-                        @for (b of sec.bullets; track $index) {
-                          <li class="bullet">{{ b }}</li>
-                        }
-                      </ul>
-                    }
-                    @default {
-                      <div class="prose">
-                        @for (para of sec.paragraphs; track $index) {
-                          <p>{{ para }}</p>
-                        }
-                      </div>
-                    }
-                  }
+                  </article>
+                }
+              } @else if (n.raw) {
+                <article class="card section" [style.animation-delay.ms]="120">
+                  <pre class="note-body">{{ n.raw }}</pre>
                 </article>
               }
-            } @else if (n.raw) {
-              <article class="card section" [style.animation-delay.ms]="120">
-                <pre class="note-body">{{ n.raw }}</pre>
-              </article>
-            }
 
-            @if (d.note?.exportedPath; as path) {
-              <div class="card saved" [style.animation-delay.ms]="160">
-                <span class="saved-icon" aria-hidden="true"></span>
-                <div class="saved-body">
-                  <span class="saved-label">Saved to vault</span>
-                  <span class="saved-path">{{ path }}</span>
+              @if (justSaved()) {
+                <div class="saved-toast" role="status">
+                  <span class="saved-toast-check" aria-hidden="true"></span>
+                  Saved
                 </div>
-                <button
-                  type="button"
-                  class="btn btn-ghost copy-btn"
-                  (click)="copy(path)"
-                >
-                  {{ copied() ? "Copied" : "Copy path" }}
-                </button>
-              </div>
+              }
+
+              @if (d.note?.exportedPath; as path) {
+                <div class="card saved" [style.animation-delay.ms]="160">
+                  <span class="saved-icon" aria-hidden="true"></span>
+                  <div class="saved-body">
+                    <span class="saved-label">Saved to vault</span>
+                    <span class="saved-path">{{ path }}</span>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn btn-ghost copy-btn"
+                    (click)="copy(path)"
+                  >
+                    {{ copied() ? "Copied" : "Copy path" }}
+                  </button>
+                </div>
+              }
             }
           } @else {
             <div class="card empty-card empty-state">
@@ -765,6 +826,99 @@ interface ParsedNote {
         font-size: 0.8125rem;
       }
 
+      /* Edit affordance in the Analysis header */
+      .edit-btn {
+        margin-left: auto;
+        height: 32px;
+        padding: 0 var(--space-3);
+        font-size: 0.8125rem;
+      }
+
+      /* In-app note editor (glassmorphism, full-height monospace textarea) */
+      .editor {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+        padding: var(--space-4);
+        animation: rise 420ms var(--transition) both;
+      }
+      .editor-area {
+        width: 100%;
+        min-height: 360px;
+        flex: 1 1 auto;
+        padding: var(--space-4);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 0.875rem;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.7;
+        resize: vertical;
+        tab-size: 2;
+      }
+      .editor-error {
+        margin: 0;
+        padding: var(--space-2) var(--space-3);
+        border: 1px solid rgba(255, 107, 107, 0.3);
+        border-radius: var(--radius-sm);
+        background: var(--danger-soft);
+        color: var(--text-primary);
+        font-size: 0.85rem;
+      }
+      .editor-foot {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+      }
+      .editor-hint {
+        color: var(--text-muted);
+        font-size: 0.8125rem;
+      }
+      .editor-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        margin-left: auto;
+      }
+
+      /* Transient "Saved" confirmation */
+      .saved-toast {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        align-self: flex-start;
+        padding: var(--space-1) var(--space-3);
+        height: 28px;
+        border-radius: var(--radius-pill);
+        background: var(--success-soft);
+        border: 1px solid transparent;
+        color: var(--success);
+        font-size: 0.8125rem;
+        font-weight: 600;
+        animation: rise 280ms var(--transition) both;
+      }
+      .saved-toast-check {
+        position: relative;
+        width: 14px;
+        height: 14px;
+        flex: none;
+      }
+      .saved-toast-check::after {
+        content: "";
+        position: absolute;
+        left: 4px;
+        top: 0;
+        width: 4px;
+        height: 9px;
+        border: solid currentColor;
+        border-width: 0 2px 2px 0;
+        transform: rotate(45deg);
+      }
+
       /* ========================================================== */
       /* 3) Transcript                                              */
       /* ========================================================== */
@@ -878,6 +1032,7 @@ interface ParsedNote {
 export class DetailComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly route = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
 
   /** Exposed so the template can format aria values. */
   protected readonly Math = Math;
@@ -886,6 +1041,21 @@ export class DetailComponent implements OnInit {
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly msg = signal("");
+
+  // --- In-app note editor state -------------------------------------------
+  /** True while the raw-markdown editor replaces the rendered analysis cards. */
+  readonly editing = signal(false);
+  /** Two-way working copy of the note's markdown (textarea (input) → signal). */
+  readonly draft = signal("");
+  /** Disables Save/Cancel while an updateNote IPC call is in flight. */
+  readonly saving = signal(false);
+  /** Inline error surfaced when a save fails. */
+  readonly saveError = signal("");
+  /** Drives the brief "Saved" confirmation badge after a successful write. */
+  readonly justSaved = signal(false);
+
+  /** Tracked so we can cancel the pending "Saved" reset on destroy (no leaks). */
+  private savedResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- Audio player state (driven by the <audio> event bindings) ----------
   private readonly audio = viewChild<ElementRef<HTMLAudioElement>>("player");
@@ -991,6 +1161,69 @@ export class DetailComponent implements OnInit {
     } finally {
       this.busy.set(false);
     }
+  }
+
+  // --- In-app note editor --------------------------------------------------
+
+  /** Enter edit mode, seeding the draft with the note's current raw markdown. */
+  startEdit(): void {
+    this.draft.set(this.detail()?.note?.markdown ?? "");
+    this.saveError.set("");
+    this.editing.set(true);
+  }
+
+  /** Two-way bind: mirror the textarea value into the `draft` signal. */
+  onDraftInput(event: Event): void {
+    this.draft.set((event.target as HTMLTextAreaElement).value);
+  }
+
+  /** Discard the working copy and leave edit mode unchanged. */
+  cancelEdit(): void {
+    this.editing.set(false);
+    this.saveError.set("");
+  }
+
+  /**
+   * Persist the draft: re-write the vault file via `updateNote`, fold the
+   * returned markdown back into the in-memory detail signal (so the `note()`
+   * computed re-parses and the analysis cards re-render), exit edit mode, then
+   * flash a brief "Saved" confirmation. Errors surface inline; the page state
+   * (audio / timeline / transcript) is never touched.
+   */
+  async saveNote(): Promise<void> {
+    const meetingId = this.detail()?.meeting.id;
+    if (!meetingId) {
+      return;
+    }
+    this.saving.set(true);
+    this.saveError.set("");
+    try {
+      const updated = await this.ipc.updateNote(meetingId, this.draft());
+      const current = this.detail();
+      if (current) {
+        this.detail.set({ ...current, note: updated });
+      }
+      this.editing.set(false);
+      this.flashSaved();
+    } catch (e) {
+      this.saveError.set("Couldn’t save: " + String(e));
+    } finally {
+      this.saving.set(false);
+    }
+  }
+
+  /** Show the "Saved" badge for a moment (tracked timeout — cancelled on destroy). */
+  private flashSaved(): void {
+    this.justSaved.set(true);
+    if (this.savedResetTimer) {
+      clearTimeout(this.savedResetTimer);
+    }
+    this.savedResetTimer = setTimeout(() => this.justSaved.set(false), 2200);
+    this.destroyRef.onDestroy(() => {
+      if (this.savedResetTimer) {
+        clearTimeout(this.savedResetTimer);
+      }
+    });
   }
 
   // --- Audio player controls ----------------------------------------------
