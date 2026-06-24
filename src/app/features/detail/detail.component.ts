@@ -11,7 +11,8 @@ import {
 import { ActivatedRoute, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { IpcService } from "../../core/ipc.service";
-import type { MeetingDetail } from "../../core/models";
+import type { MeetingDetail, MeetingTimeline } from "../../core/models";
+import { MeetingTimelineComponent } from "./meeting-timeline.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
@@ -45,7 +46,7 @@ interface ParsedNote {
   selector: "app-detail",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, MeetingTimelineComponent],
   template: `
     <section class="detail">
       <a routerLink="/library" class="back">
@@ -144,6 +145,18 @@ interface ParsedNote {
             <span class="audio-off-text">Audio not available</span>
           </div>
         }
+
+        <!-- 1b) INTERACTIVE TIMELINE (speakers + topics, shared playhead) -- -->
+        <app-meeting-timeline
+          [timeline]="timeline()"
+          [total]="timelineTotal()"
+          [currentTime]="currentTime()"
+          [loading]="timelineLoading()"
+          [error]="timelineError()"
+          [hasAudio]="!!audioSrc()"
+          (seek)="seekTo($event)"
+          (retry)="loadTimeline()"
+        />
 
         <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
         <section class="block">
@@ -902,6 +915,34 @@ export class DetailComponent implements OnInit {
     return md ? this.parseNote(md) : null;
   });
 
+  // --- Interactive timeline (speaker + topic viz) -------------------------
+  readonly timeline = signal<MeetingTimeline | null>(null);
+  readonly timelineLoading = signal(false);
+  readonly timelineError = signal(false);
+
+  /**
+   * Total length for the shared timeline scale: the meeting duration, falling
+   * back to the furthest end across speakers / topics / transcript segments.
+   */
+  readonly timelineTotal = computed(() => {
+    const dur = this.detail()?.meeting.durationS ?? 0;
+    if (dur > 0) {
+      return dur;
+    }
+    let max = 0;
+    const tl = this.timeline();
+    for (const s of tl?.speakers ?? []) {
+      max = Math.max(max, s.endS);
+    }
+    for (const t of tl?.topics ?? []) {
+      max = Math.max(max, t.endS);
+    }
+    for (const seg of this.detail()?.segments ?? []) {
+      max = Math.max(max, seg.endS);
+    }
+    return max;
+  });
+
   async ngOnInit(): Promise<void> {
     const id = this.route.snapshot.paramMap.get("id");
     if (!id) {
@@ -912,6 +953,29 @@ export class DetailComponent implements OnInit {
       this.detail.set(await this.ipc.getMeetingDetail(id));
     } finally {
       this.loading.set(false);
+    }
+    // Kick the timeline off after the detail load; never blocks the page and
+    // tolerates the first-call LLM latency (backend caches the result).
+    if (this.detail()) {
+      void this.loadTimeline();
+    }
+  }
+
+  /** Fetch (or re-fetch, via Retry) the AI-derived speaker + topic timeline. */
+  async loadTimeline(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id) {
+      return;
+    }
+    this.timelineError.set(false);
+    this.timelineLoading.set(true);
+    try {
+      this.timeline.set(await this.ipc.getTimeline(id));
+    } catch {
+      this.timeline.set(null);
+      this.timelineError.set(true);
+    } finally {
+      this.timelineLoading.set(false);
     }
   }
 
@@ -1017,10 +1081,17 @@ export class DetailComponent implements OnInit {
     this.currentTime.set(next);
   }
 
-  /** Click-to-seek from a transcript row: jump to the segment + play. */
+  /**
+   * Click-to-seek from a transcript row or a timeline block: jump to `startS`
+   * + play. With no audio element (audioPath null) we still advance the
+   * `currentTime` signal so the timeline highlight + playhead respond.
+   */
   seekTo(startS: number): void {
     const el = this.el;
     if (!el) {
+      const total = this.timelineTotal();
+      const clamped = total > 0 ? Math.min(total, Math.max(0, startS)) : startS;
+      this.currentTime.set(clamped);
       return;
     }
     el.currentTime = startS;
