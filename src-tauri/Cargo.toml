@@ -16,6 +16,7 @@ tauri-build = { version = "2.2", features = [] }
 # ── Tauri shell ──
 tauri = { version = "2.11", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2.2"
+tauri-plugin-global-shortcut = "2"
 
 # ── Audio capture + WAV ──
 cpal = "0.16"

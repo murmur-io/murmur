@@ -1,5 +1,18 @@
-import { ChangeDetectionStrategy, Component } from "@angular/core";
-import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
+import {
+  ChangeDetectionStrategy,
+  Component,
+  effect,
+  inject,
+} from "@angular/core";
+import { toSignal } from "@angular/core/rxjs-interop";
+import {
+  NavigationEnd,
+  Router,
+  RouterLink,
+  RouterLinkActive,
+  RouterOutlet,
+} from "@angular/router";
+import { filter, map } from "rxjs";
 
 @Component({
   selector: "app-root",
@@ -7,20 +20,22 @@ import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterOutlet, RouterLink, RouterLinkActive],
   template: `
-    <header class="app-header">
-      <div class="app-bar">
-        <span class="brand">
-          <span class="brand-dot"></span>
-          MeetNotes
-        </span>
-        <nav class="app-nav">
-          <a routerLink="/record" routerLinkActive="active">Record</a>
-          <a routerLink="/library" routerLinkActive="active">Meetings</a>
-          <a routerLink="/settings" routerLinkActive="active">Settings</a>
-        </nav>
-      </div>
-    </header>
-    <main class="app-main">
+    @if (!isBar()) {
+      <header class="app-header">
+        <div class="app-bar">
+          <span class="brand">
+            <span class="brand-dot"></span>
+            MeetNotes
+          </span>
+          <nav class="app-nav">
+            <a routerLink="/record" routerLinkActive="active">Record</a>
+            <a routerLink="/library" routerLinkActive="active">Meetings</a>
+            <a routerLink="/settings" routerLinkActive="active">Settings</a>
+          </nav>
+        </div>
+      </header>
+    }
+    <main class="app-main" [class.bare]="isBar()">
       <router-outlet></router-outlet>
     </main>
   `,
@@ -75,7 +90,6 @@ import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
         margin-left: auto;
       }
 
-      /* Each tab is a quiet pill; the active one fills with the accent tint. */
       .app-nav a {
         display: inline-flex;
         align-items: center;
@@ -108,7 +122,30 @@ import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
         margin: 0 auto;
         padding: var(--space-6) var(--space-5) var(--space-8);
       }
+      /* Floating-bar window: no chrome, fill the transparent window edge-to-edge. */
+      .app-main.bare {
+        max-width: none;
+        margin: 0;
+        padding: 0;
+        min-height: 100vh;
+      }
     `,
   ],
 })
-export class AppComponent {}
+export class AppComponent {
+  private readonly router = inject(Router);
+
+  /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
+  readonly isBar = toSignal(
+    this.router.events.pipe(
+      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
+      map(() => this.router.url.startsWith("/bar")),
+    ),
+    { initialValue: location.pathname.startsWith("/bar") },
+  );
+
+  /** Make the bar window's document transparent (no aurora/grain behind the pill). */
+  private readonly _bodyClass = effect(() => {
+    document.body.classList.toggle("bar-shell", this.isBar());
+  });
+}
