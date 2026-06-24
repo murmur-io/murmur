@@ -1,0 +1,37 @@
+<svg width="1080" height="300" viewBox="0 0 1080 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#6e76ff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#6e76ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orb" cx="40%" cy="32%" r="80%">
+      <stop offset="0%" stop-color="#cdc2ff"/>
+      <stop offset="44%" stop-color="#8079ff"/>
+      <stop offset="100%" stop-color="#5a4fe6"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a6abff"/>
+      <stop offset="100%" stop-color="#6e76ff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- mark: glowing voice orb + murmur ripples -->
+  <g transform="translate(150,150)">
+    <g fill="none" stroke="url(#ring)" stroke-linecap="round">
+      <circle r="118" stroke-opacity="0.14" stroke-width="6"/>
+      <circle r="84" stroke-opacity="0.30" stroke-width="7"/>
+      <circle r="52" stroke-opacity="0.55" stroke-width="8"/>
+    </g>
+    <circle r="80" fill="url(#glow)"/>
+    <circle r="34" fill="url(#orb)"/>
+    <ellipse cx="-9" cy="-11" rx="11" ry="8" fill="#ffffff" opacity="0.40"/>
+  </g>
+
+  <!-- wordmark + tagline -->
+  <text x="312" y="170"
+        font-family="'Hanken Grotesk', -apple-system, system-ui, sans-serif"
+        font-size="132" font-weight="600" letter-spacing="-5" fill="#f6f6fa">murmur</text>
+  <text x="316" y="226"
+        font-family="'Hanken Grotesk', -apple-system, system-ui, sans-serif"
+        font-size="31" font-weight="500" letter-spacing="0.5" fill="#9a9aa7">on-device meeting notes</text>
+</svg>
