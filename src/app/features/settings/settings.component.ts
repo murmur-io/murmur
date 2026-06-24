@@ -7,6 +7,7 @@ import {
   signal,
 } from "@angular/core";
 import { FormBuilder, FormControl, ReactiveFormsModule } from "@angular/forms";
+import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type { AppConfigDto, ProviderStatus } from "../../core/models";
@@ -374,6 +375,13 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
             Saved
           </span>
         }
+        <button
+          type="button"
+          class="btn btn-ghost rerun-setup"
+          (click)="rerunOnboarding()"
+        >
+          Run setup again
+        </button>
       </div>
 
       <!-- Provider availability -->
@@ -667,6 +675,12 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
       .saved-pill {
         margin-left: var(--space-1);
       }
+      /* Quiet escape hatch to re-run the first-run wizard — pushed to the edge. */
+      .rerun-setup {
+        margin-left: auto;
+        font-size: 0.875rem;
+        color: var(--text-muted);
+      }
 
       /* --- Provider availability list --- */
       .provider-list {
@@ -709,6 +723,7 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
 export class SettingsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly fb = inject(FormBuilder);
+  private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
 
   /** Tracked so we can cancel the pending "Copied" reset on destroy (no leaks). */
@@ -832,6 +847,11 @@ export class SettingsComponent implements OnInit {
     await this.ipc.setAnthropicKey(key);
     this.keyControl.setValue("");
     this.hasKey.set(await this.ipc.hasAnthropicKey());
+  }
+
+  /** Re-open the first-run wizard. Existing settings are preserved and prefilled. */
+  rerunOnboarding(): void {
+    void this.router.navigate(["/onboarding"]);
   }
 
   async refreshProviders(): Promise<void> {

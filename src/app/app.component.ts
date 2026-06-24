@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  OnInit,
   effect,
   inject,
 } from "@angular/core";
@@ -13,6 +14,7 @@ import {
   RouterOutlet,
 } from "@angular/router";
 import { filter, map } from "rxjs";
+import { IpcService } from "./core/ipc.service";
 
 @Component({
   selector: "app-root",
@@ -133,8 +135,9 @@ import { filter, map } from "rxjs";
     `,
   ],
 })
-export class AppComponent {
+export class AppComponent implements OnInit {
   private readonly router = inject(Router);
+  private readonly ipc = inject(IpcService);
 
   /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
   readonly isBar = toSignal(
@@ -149,4 +152,21 @@ export class AppComponent {
   private readonly _bodyClass = effect(() => {
     document.body.classList.toggle("bar-shell", this.isBar());
   });
+
+  /**
+   * First-run gate (MAIN window only). On startup, if the user hasn't completed
+   * onboarding, send them to the wizard. The floating-bar window is never gated —
+   * it just mirrors recording state and must stay chromeless.
+   */
+  async ngOnInit(): Promise<void> {
+    if (this.isBar()) return;
+    try {
+      const cfg = await this.ipc.getConfig();
+      if (!cfg.onboarded) {
+        await this.router.navigateByUrl("/onboarding");
+      }
+    } catch {
+      // Config unavailable — don't trap the user; the app loads normally.
+    }
+  }
 }
