@@ -1,0 +1,58 @@
+[package]
+name = "meetnotes"
+version = "0.0.0"
+description = "MeetNotes — local meeting capture, transcription, and AI notes for Obsidian"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "meetnotes_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.2", features = [] }
+
+[dependencies]
+# ── Tauri shell ──
+tauri = { version = "2.11", features = ["macos-private-api"] }
+tauri-plugin-dialog = "2.2"
+
+# ── Audio capture + WAV ──
+cpal = "0.16"
+hound = "3.5"
+rubato = "0.16"
+
+# ── Transcription ──
+whisper-rs = { version = "0.16", features = ["metal"] }
+
+# ── HTTP (Anthropic + Ollama providers) ──
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# ── Async runtime ──
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync"] }
+async-trait = "0.1"
+
+# ── Storage ──
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# ── Serde ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── Errors ──
+anyhow = "1"
+thiserror = "1"
+
+# ── Secrets ──
+keyring = { version = "3", features = ["apple-native"] }
+
+# ── Misc ──
+chrono = { version = "0.4", features = ["clock", "serde"] }
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# default keeps Metal on for whisper; nothing else conditional in P0
+default = []
