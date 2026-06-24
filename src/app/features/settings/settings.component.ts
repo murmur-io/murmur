@@ -145,6 +145,56 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         </fieldset>
       </div>
 
+      <!-- Notes: how Claude writes & files each meeting note -->
+      <div class="card notes-card">
+        <div class="notes-copy">
+          <h3>Notes</h3>
+          <p class="text-secondary notes-sub">
+            Shape how Claude writes each summary and where it lands in your
+            vault.
+          </p>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Summary style</span>
+          <select formControlName="noteStyle">
+            <option value="standard">Standard (balanced)</option>
+            <option value="brief">Brief (TL;DR + actions)</option>
+            <option value="detailed">Detailed (full depth)</option>
+            <option value="action">Action-focused</option>
+          </select>
+          <span class="field-help text-muted">
+            @switch (form.controls.noteStyle.value) {
+              @case ("brief") {
+                A tight TL;DR up top, then just the decisions and action items.
+              }
+              @case ("detailed") {
+                The full picture — discussion, context, decisions and every
+                follow-up.
+              }
+              @case ("action") {
+                Front-loads who-does-what — owners, tasks and due dates first.
+              }
+              @default {
+                A balanced summary, key points and action items — good for most
+                meetings.
+              }
+            }
+          </span>
+        </label>
+
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Organize into thematic subfolders</span>
+            <span class="text-secondary toggle-sub">
+              Claude files each note into a topic subfolder of your vault (e.g.
+              Standups, 1-1s, Acme Project).
+            </span>
+          </span>
+          <input type="checkbox" formControlName="autoOrganize" />
+        </label>
+      </div>
+
       <!-- Works with Obsidian — optional vault companion -->
       <div class="card obsidian-card">
         <div class="obsidian-head">
@@ -483,6 +533,30 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         align-items: center;
       }
 
+      /* --- Notes card (summary style + auto-organize) --- */
+      .notes-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .notes-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .notes-copy h3 {
+        margin: 0;
+      }
+      .notes-sub {
+        margin: 0;
+        font-size: 0.875rem;
+      }
+      /* One-line helper that tracks the selected summary style. */
+      .field-help {
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
+
       /* --- Works-with-Obsidian card --- */
       .obsidian-card {
         display: flex;
@@ -746,6 +820,8 @@ export class SettingsComponent implements OnInit {
     captureSystemAudio: false,
     modelSize: "small",
     voiceTrigger: false,
+    noteStyle: "standard",
+    autoOrganize: false,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -777,16 +853,11 @@ export class SettingsComponent implements OnInit {
 
   /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
   private loadedOnboarded = true;
-  /** Preserved from loaded config until the settings UI exposes them as controls. */
-  private loadedNoteStyle = "standard";
-  private loadedAutoOrganize = false;
 
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
       this.loadedOnboarded = cfg.onboarded ?? true;
-      this.loadedNoteStyle = cfg.noteStyle ?? "standard";
-      this.loadedAutoOrganize = cfg.autoOrganize ?? false;
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -800,6 +871,8 @@ export class SettingsComponent implements OnInit {
         captureSystemAudio: cfg.captureSystemAudio ?? false,
         modelSize: cfg.modelSize ?? "small",
         voiceTrigger: cfg.voiceTrigger ?? false,
+        noteStyle: cfg.noteStyle ?? "standard",
+        autoOrganize: cfg.autoOrganize ?? false,
       });
       this.updateDownloadHint();
       this.hasKey.set(await this.ipc.hasAnthropicKey());
@@ -837,8 +910,8 @@ export class SettingsComponent implements OnInit {
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
-      noteStyle: this.loadedNoteStyle,
-      autoOrganize: this.loadedAutoOrganize,
+      noteStyle: v.noteStyle,
+      autoOrganize: v.autoOrganize,
     };
     try {
       await this.ipc.saveConfig(cfg);
