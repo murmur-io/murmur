@@ -100,6 +100,21 @@ export class IpcService {
     return invoke<string>("chat_meeting", { meetingId, question, history });
   }
 
+  /** Copy a meeting's recording (WAV) to a chosen path. */
+  exportAudio(meetingId: string, destPath: string): Promise<void> {
+    return invoke<void>("export_audio", { meetingId, destPath });
+  }
+
+  /** Write a meeting's note markdown to a chosen path. */
+  exportNote(meetingId: string, destPath: string): Promise<void> {
+    return invoke<void>("export_note", { meetingId, destPath });
+  }
+
+  /** Best-effort detection of a running meeting app (Zoom/Teams/Webex), else null. */
+  detectMeetingApp(): Promise<string | null> {
+    return invoke<string | null>("detect_meeting_app");
+  }
+
   /** Aggregate analytics for the dashboard + Analytics tab. */
   getAnalytics(): Promise<Analytics> {
     return invoke<Analytics>("get_analytics");
