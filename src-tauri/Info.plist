@@ -3,6 +3,6 @@
 <plist version="1.0">
   <dict>
     <key>NSMicrophoneUsageDescription</key>
-    <string>MeetNotes records meeting audio from your microphone to transcribe it locally.</string>
+    <string>Murmur records meeting audio from your microphone to transcribe it locally on your Mac.</string>
   </dict>
 </plist>
