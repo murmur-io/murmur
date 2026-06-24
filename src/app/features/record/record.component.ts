@@ -6,14 +6,16 @@ import {
   inject,
   signal,
 } from "@angular/core";
+import { RouterLink } from "@angular/router";
 import { RecorderStore } from "../../core/recorder.store";
 import { IpcService } from "../../core/ipc.service";
-import type { AppConfigDto } from "../../core/models";
+import type { Analytics, AppConfigDto } from "../../core/models";
 
 @Component({
   selector: "app-record",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [RouterLink],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
     <section class="record">
@@ -113,26 +115,55 @@ import type { AppConfigDto } from "../../core/models";
         </div>
       }
 
-      <!-- ── Last note ───────────────────────────────────────────────────── -->
-      <div class="last-note">
-        <h3>Last note</h3>
-        @if (store.lastNote(); as note) {
-          <div class="card note-card">
-            @if (note.exportedPath) {
-              <p class="path">{{ note.exportedPath }}</p>
+      <!-- ── Minimal stats strip (home hero — links to full analytics) ────── -->
+      @if (analytics(); as a) {
+        @if (a.totalMeetings > 0) {
+          <div class="card stats" role="group" aria-label="Your stats">
+            <dl class="figures">
+              <div class="figure" style="--d: 0">
+                <dt>Meetings</dt>
+                <dd>{{ a.totalMeetings }}</dd>
+              </div>
+              <span class="sep" aria-hidden="true"></span>
+              <div class="figure" style="--d: 1">
+                <dt>Total time</dt>
+                <dd>{{ formatDuration(a.totalDurationS) }}</dd>
+              </div>
+              <span class="sep" aria-hidden="true"></span>
+              <div class="figure" style="--d: 2">
+                <dt>This week</dt>
+                <dd>{{ a.meetings7d }}</dd>
+              </div>
+            </dl>
+
+            @if (spark().length > 0) {
+              <div
+                class="spark"
+                aria-hidden="true"
+                title="Meetings over the last 30 days"
+              >
+                @for (s of spark(); track s.date) {
+                  <span class="spark-bar" [style.--h.%]="s.h"></span>
+                }
+              </div>
             }
-            <pre class="preview">{{ note.markdown }}</pre>
+
+            <a class="stats-link" routerLink="/analytics">
+              View analytics
+              <span class="arrow" aria-hidden="true">→</span>
+            </a>
           </div>
         } @else {
-          <div class="card empty-card">
-            <span class="empty-mark" aria-hidden="true"></span>
-            <p class="empty">
-              No note yet — press <span class="kbd-inline">⌘R</span> or hit the
-              bar to capture your first meeting.
-            </p>
+          <div class="card stats stats-empty">
+            <span class="stats-mark" aria-hidden="true"></span>
+            <p class="stats-empty-text">Your stats will appear here</p>
+            <a class="stats-link" routerLink="/analytics">
+              View analytics
+              <span class="arrow" aria-hidden="true">→</span>
+            </a>
           </div>
         }
-      </div>
+      }
     </section>
   `,
   styles: [
@@ -523,61 +554,131 @@ import type { AppConfigDto } from "../../core/models";
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
 
-      /* ── Last note ─────────────────────────────────────────────────────── */
-      .last-note h3 {
-        margin-bottom: var(--space-3);
-      }
-      .note-card {
-        padding: var(--space-4);
-      }
-      .path {
-        margin: 0 0 var(--space-3);
-        color: var(--text-muted);
-        font-size: 0.8125rem;
-        font-family: var(--font-mono);
-        word-break: break-all;
-      }
-      .preview {
-        margin: 0;
-        white-space: pre-wrap;
-        background: rgba(0, 0, 0, 0.22);
-        border: 1px solid var(--border-subtle);
-        color: var(--text-secondary);
-        padding: var(--space-4);
-        border-radius: var(--radius-md);
-        max-height: 380px;
-        overflow: auto;
-        font-size: 0.85rem;
-        line-height: 1.65;
-      }
-      .empty-card {
+      /* ── Minimal stats strip ───────────────────────────────────────────── */
+      .stats {
         display: flex;
         align-items: center;
-        gap: var(--space-3);
-        padding: var(--space-5);
+        gap: var(--space-5);
+        padding: var(--space-4) var(--space-5);
       }
-      .empty-mark {
-        width: 36px;
-        height: 36px;
-        min-width: 36px;
-        border-radius: 50%;
-        background: var(--accent-soft);
-        position: relative;
-      }
-      .empty-mark::after {
-        content: "";
-        position: absolute;
-        inset: 0;
-        margin: auto;
-        width: 11px;
-        height: 11px;
-        border-radius: 50%;
-        background: var(--accent);
-      }
-      .empty {
+
+      .figures {
+        display: flex;
+        align-items: center;
+        gap: var(--space-4);
         margin: 0;
-        color: var(--text-secondary);
+        flex: none;
       }
+      .figure {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        animation: rise 420ms var(--transition) both;
+        animation-delay: calc(120ms + var(--d) * 70ms);
+      }
+      .figure dt {
+        color: var(--text-muted);
+        font-size: 0.6875rem;
+        font-weight: 550;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .figure dd {
+        margin: 0;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 1.15rem;
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.01em;
+        line-height: 1.1;
+      }
+      .sep {
+        width: 1px;
+        height: 26px;
+        background: var(--border-subtle);
+        flex: none;
+      }
+
+      /* Tiny inline CSS sparkline of perDay activity. */
+      .spark {
+        display: flex;
+        align-items: flex-end;
+        gap: 2px;
+        flex: 1;
+        min-width: 0;
+        height: 30px;
+        padding: 0 var(--space-1);
+        overflow: hidden;
+      }
+      .spark-bar {
+        flex: 1;
+        min-width: 2px;
+        height: max(2px, var(--h, 0%));
+        border-radius: var(--radius-pill);
+        background: var(--accent-gradient);
+        opacity: 0.85;
+        transform-origin: bottom;
+        animation: spark-grow 520ms var(--ease-spring) both;
+      }
+      @keyframes spark-grow {
+        from {
+          transform: scaleY(0);
+          opacity: 0;
+        }
+        to {
+          transform: scaleY(1);
+          opacity: 0.85;
+        }
+      }
+
+      .stats-link {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        flex: none;
+        margin-left: auto;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        font-weight: 550;
+        white-space: nowrap;
+        transition: color var(--transition);
+      }
+      .stats-link .arrow {
+        transition: transform var(--transition);
+      }
+      .stats-link:hover {
+        color: var(--text-primary);
+      }
+      .stats-link:hover .arrow {
+        transform: translateX(3px);
+      }
+      .stats-link:focus-visible {
+        outline: none;
+        border-radius: var(--radius-sm);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+
+      /* Empty state — soft, quiet, still offers the way in. */
+      .stats-empty {
+        justify-content: flex-start;
+        gap: var(--space-3);
+      }
+      .stats-mark {
+        width: 30px;
+        height: 30px;
+        min-width: 30px;
+        border-radius: 50%;
+        background: var(--surface-input);
+        border: 1px solid var(--border);
+        flex: none;
+      }
+      .stats-empty-text {
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 0.9rem;
+      }
+
       .kbd-inline {
         font-family: var(--font-mono);
         font-size: 0.8em;
@@ -645,10 +746,44 @@ export class RecordComponent implements OnInit {
     return "On-device transcription · your audio never leaves this Mac.";
   });
 
+  /** Aggregate stats for the minimal home strip (null = not yet loaded). */
+  readonly analytics = signal<Analytics | null>(null);
+
+  /**
+   * Sparkline bars: per-day meeting counts scaled to a 0–100% height, padded to
+   * a steady width so a single busy day doesn't render as one lonely bar.
+   */
+  readonly spark = computed<{ date: string; h: number }[]>(() => {
+    const a = this.analytics();
+    if (!a || a.perDay.length === 0) return [];
+    const days = [...a.perDay].sort((x, y) => x.date.localeCompare(y.date));
+    const max = Math.max(...days.map((d) => d.count), 1);
+    const bars = days.map((d) => ({
+      date: d.date,
+      h: Math.round((d.count / max) * 100),
+    }));
+    // Left-pad with flat placeholders so the strip keeps a consistent rhythm.
+    const minBars = 14;
+    if (bars.length < minBars) {
+      const pad = Array.from({ length: minBars - bars.length }, (_, i) => ({
+        date: `pad-${i}`,
+        h: 0,
+      }));
+      return [...pad, ...bars];
+    }
+    return bars;
+  });
+
   async ngOnInit(): Promise<void> {
     await this.store.init();
     this.config.set(await this.ipc.getConfig());
     this.modelPresent.set(await this.ipc.modelPresent());
+    // Stats are secondary — never let a failure here block the record screen.
+    try {
+      this.analytics.set(await this.ipc.getAnalytics());
+    } catch {
+      this.analytics.set(null);
+    }
   }
 
   /** ⌘R / Ctrl+R toggles recording. */
@@ -680,5 +815,20 @@ export class RecordComponent implements OnInit {
     } finally {
       this.downloadingModel.set(false);
     }
+  }
+
+  /** Presentational only: seconds → compact "1h 5m" / "12m" / "45s". */
+  formatDuration(durationS: number): string {
+    const total = Math.max(0, Math.round(durationS));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) {
+      return `${h}h ${m}m`;
+    }
+    if (m > 0) {
+      return `${m}m`;
+    }
+    return `${s}s`;
   }
 }

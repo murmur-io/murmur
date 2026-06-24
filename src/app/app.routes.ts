@@ -30,6 +30,13 @@ export const routes: Routes = [
       ),
   },
   {
+    path: "analytics",
+    loadComponent: () =>
+      import("./features/analytics/analytics.component").then(
+        (m) => m.AnalyticsComponent,
+      ),
+  },
+  {
     path: "bar",
     loadComponent: () =>
       import("./features/bar/bar.component").then(

@@ -30,6 +30,7 @@ import { filter, map } from "rxjs";
           <nav class="app-nav">
             <a routerLink="/record" routerLinkActive="active">Record</a>
             <a routerLink="/library" routerLinkActive="active">Meetings</a>
+            <a routerLink="/analytics" routerLinkActive="active">Analytics</a>
             <a routerLink="/settings" routerLinkActive="active">Settings</a>
           </nav>
         </div>
