@@ -25,7 +25,7 @@
 | Secrets | Anthropic key in macOS Keychain | unit-level |
 | Export | Atomic `.md` write into the vault + vault auto-detect | unit tests + **E2E** |
 | Library/Detail | list meetings, view note + transcript, re-summarize | `ng build` + `ng lint` |
-| Release bundle | `tauri build --bundles app` → MeetNotes.app (17 MB, unsigned) | **verified builds** (`scripts/release.sh`); DMG layout + signing = real-Mac |
+| Release bundle | `scripts/release.sh`: builds .app + ad-hoc codesign+verify + functional .dmg (hdiutil) | **verified headless**; Developer-ID identity + notarization + *styled* DMG = account/GUI-gated |
 | Quality | clippy `-D warnings`, `ng lint`, 34 tests | `scripts/ci.sh` |
 
 The headless E2E (`scripts/e2e-core.sh`) drives `say → ffmpeg → Whisper(base.en) →
@@ -41,8 +41,11 @@ pipeline is proven end-to-end, minus the parts that need a desktop (below).
    verified. **Unverified (needs a real Mac):** capturing *live* system audio — that
    requires a desktop session + the Screen Recording (TCC) permission + real audio.
    Enable the toggle and confirm a mixed recording. Design notes: `docs/PHASE2-SYSTEM-AUDIO.md`.
-2. **Apple code-sign + notarize.** Template in `scripts/macos-sign-notarize.sh`; needs a
-   paid Apple Developer ID + a notarytool credential.
+2. **Apple code-sign + notarize / styled DMG.** The release `.app` builds, **ad-hoc-signs,
+   and passes `codesign --verify --deep --strict`**, and a functional `.dmg` builds via
+   `hdiutil` — all headless (`scripts/release.sh`). What remains is account/GUI-gated: a
+   **Developer-ID identity** + **notarization** (paid Apple account; template in
+   `scripts/macos-sign-notarize.sh`) and Tauri's *styled* DMG layout (Finder/AppleScript).
 3. **Real GUI + mic run** (closes the last Phase-0 DoD item). See §Run below.
 
 ## Toolchain (installed in this environment)
