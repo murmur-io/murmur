@@ -415,3 +415,35 @@ pub fn get_meeting_detail(
         segments,
     }))
 }
+
+/// Whether a usable Whisper model is present (the configured path, or the default model
+/// in the app models dir). Lets the UI auto-detect + offer a download when missing.
+#[tauri::command]
+pub fn model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let configured = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.whisper_model_path.clone()
+    };
+    let p = configured.as_deref().map(std::path::Path::new);
+    Ok(crate::transcribe::resolve_model_path(p)?.is_some())
+}
+
+/// Download the default Whisper model (ggml-base.en, ~150 MB) from the whisper.cpp
+/// HuggingFace mirror into the app models dir if missing; returns its path. No-op (returns
+/// the existing path) when a model is already present.
+#[tauri::command]
+pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppError> {
+    let configured = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.whisper_model_path.clone()
+    };
+    let p = configured.as_deref().map(std::path::Path::new);
+    let path = crate::transcribe::ensure_model(p).await?;
+    Ok(path.to_string_lossy().to_string())
+}

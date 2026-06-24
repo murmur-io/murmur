@@ -1,13 +1,483 @@
+/* ============================================================================
+   MeetNotes — Global Design System
+   Dark, minimalist, premium. Revolut-spirit fintech-clean.
+
+   All design tokens are CSS custom properties on :root. Components reference
+   them via var(--token). Never hardcode colours/radii/spacing in components —
+   pull from the scale below so every screen matches exactly.
+   ============================================================================ */
+
 :root {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  color-scheme: light dark;
+  /* --- Font ---------------------------------------------------------------- */
+  /* System stack: crisp, native, legible. Mirrored in index.html (inlined). */
+  --font-sans: -apple-system, "SF Pro Text", BlinkMacSystemFont, system-ui,
+    "Segoe UI", Roboto, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", "Menlo", monospace;
+
+  /* --- Surfaces (layered near-black; build depth, never flat / pure black) - */
+  --surface-base: #0a0a0f;       /* app/body background — the deepest layer    */
+  --surface-raised: #15151c;     /* cards, panels — sits above the base        */
+  --surface-overlay: #1f1f29;    /* popovers/menus/hover-raised — above cards   */
+  --surface-input: #1c1c25;      /* form fields, inert wells                    */
+  --surface-hover: rgba(255, 255, 255, 0.04); /* subtle hover wash on rows/btns */
+
+  /* --- Text ---------------------------------------------------------------- */
+  --text-primary: #f4f4f7;       /* headings & primary copy                     */
+  --text-secondary: #9a9aa7;     /* supporting/secondary copy                   */
+  --text-muted: #6b6b78;         /* meta, timestamps, placeholders, disabled    */
+  --text-on-accent: #ffffff;     /* text/icons on the accent fill               */
+
+  /* --- Accent (ONE vivid colour — electric indigo/violet, used sparingly) -- */
+  --accent: #6e5bff;             /* primary action, active tab, focus ring      */
+  --accent-hover: #7d6cff;       /* accent on hover                             */
+  --accent-active: #5d4bef;      /* accent pressed                              */
+  --accent-soft: rgba(110, 91, 255, 0.14); /* tinted bg (active pill, banners)  */
+  --accent-ring: rgba(110, 91, 255, 0.45); /* focus ring colour                 */
+  --accent-gradient: linear-gradient(135deg, #6e5bff 0%, #9a7cff 100%); /* hero */
+
+  /* --- Borders (soft, low-alpha white hairlines) --------------------------- */
+  --border: rgba(255, 255, 255, 0.08);        /* default hairline             */
+  --border-strong: rgba(255, 255, 255, 0.14); /* emphasised / hover border    */
+  --border-subtle: rgba(255, 255, 255, 0.06); /* faintest divider             */
+
+  /* --- Status colours ------------------------------------------------------ */
+  --success: #2ecc71;
+  --success-soft: rgba(46, 204, 113, 0.14);
+  --danger: #ff5d5d;
+  --danger-soft: rgba(255, 93, 93, 0.13);
+  --warning: #f5b14c;
+  --warning-soft: rgba(245, 177, 76, 0.13);
+
+  /* --- Radius scale (large, soft) ------------------------------------------ */
+  --radius-sm: 8px;    /* chips, small controls                                */
+  --radius-md: 12px;   /* buttons, inputs, selects                             */
+  --radius-lg: 16px;   /* cards, panels                                        */
+  --radius-xl: 20px;   /* large hero surfaces                                  */
+  --radius-pill: 999px;/* pills, toggles, status badges                        */
+
+  /* --- Spacing scale (4px base) -------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* --- Shadows (soft, diffuse — depth not drama) --------------------------- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.36);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.5);
+  --shadow-accent: 0 8px 28px rgba(110, 91, 255, 0.4); /* glow under accent btn */
+
+  /* --- Motion -------------------------------------------------------------- */
+  --transition: 160ms cubic-bezier(0.4, 0, 0.2, 1);      /* standard           */
+  --transition-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1); /* micro-interactions */
+
+  /* --- Layout -------------------------------------------------------------- */
+  --content-max: 820px; /* readable column width for feature screens           */
+
+  font-family: var(--font-sans);
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 * {
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
   padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  background: var(--surface-base);
+  /* Faint radial wash from the top so the base reads layered, not a void. */
+  background-image: radial-gradient(
+    1200px 600px at 50% -10%,
+    rgba(110, 91, 255, 0.08),
+    transparent 70%
+  );
+  background-attachment: fixed;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  letter-spacing: -0.011em;
+}
+
+/* --- Base typography ------------------------------------------------------- */
+h1,
+h2,
+h3,
+h4 {
+  margin: 0 0 var(--space-3);
+  color: var(--text-primary);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+h1 { font-size: 1.75rem; }
+h2 { font-size: 1.4rem; }
+h3 {
+  font-size: 1.0625rem;
+  font-weight: 600;
+}
+h4 { font-size: 0.9375rem; }
+
+p { margin: 0 0 var(--space-3); }
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color var(--transition);
+}
+a:hover { color: var(--accent-hover); }
+
+strong { font-weight: 600; }
+
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+/* ============================================================================
+   Reusable component primitives
+   Use these classes anywhere; they carry the full visual language.
+   ============================================================================ */
+
+/* --- Buttons --------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-4);
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 550;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: background var(--transition), border-color var(--transition),
+    color var(--transition), transform var(--transition-fast),
+    box-shadow var(--transition);
+}
+.btn:hover {
+  background: var(--surface-overlay);
+  border-color: var(--border-strong);
+}
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* Primary — the single vivid accent. Use once per view for the main action. */
+.btn-primary {
+  background: var(--accent-gradient);
+  border-color: transparent;
+  color: var(--text-on-accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-accent);
+}
+.btn-primary:hover {
+  background: var(--accent-gradient);
+  filter: brightness(1.07);
+  border-color: transparent;
+}
+.btn-primary:disabled { box-shadow: none; filter: none; }
+
+/* Ghost — quiet, borderless secondary action. */
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+.btn-ghost:hover {
+  background: var(--surface-hover);
+  border-color: transparent;
+  color: var(--text-primary);
+}
+
+/* Danger — destructive action. */
+.btn-danger {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
+}
+.btn-danger:hover {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  filter: brightness(1.1);
+}
+
+/* --- Card ------------------------------------------------------------------ */
+.card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-md);
+}
+
+/* --- Form fields ----------------------------------------------------------- */
+input[type="text"],
+input[type="password"],
+input[type="search"],
+input[type="number"],
+input[type="email"],
+input[type="url"],
+input:not([type]),
+select,
+textarea {
+  width: 100%;
+  padding: 0 var(--space-3);
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  line-height: 1.4;
+  transition: border-color var(--transition), background var(--transition),
+    box-shadow var(--transition);
+  appearance: none;
+}
+textarea {
+  height: auto;
+  min-height: 96px;
+  padding: var(--space-3);
+  resize: vertical;
+  line-height: 1.55;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+}
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: var(--border-strong);
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  background: var(--surface-raised);
+}
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Native select chevron — drawn with a background SVG so it picks up our colour */
+select {
+  padding-right: var(--space-6);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' stroke='%239A9AA7' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--space-3) center;
+  cursor: pointer;
+}
+select option {
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+}
+
+/* Checkbox — custom accent-filled box with a drawn tick. */
+input[type="checkbox"] {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  cursor: pointer;
+  position: relative;
+  transition: background var(--transition), border-color var(--transition),
+    box-shadow var(--transition);
+}
+input[type="checkbox"]:hover {
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked {
+  background: var(--accent-gradient);
+  border-color: transparent;
+}
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid var(--text-on-accent);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+input[type="checkbox"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* Fieldset — group of related controls. */
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  margin: 0;
+}
+legend {
+  padding: 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* --- Status pill ----------------------------------------------------------- */
+/* Neutral by default; add a state modifier to tint. */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.pill .pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.pill.is-accent {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+}
+.pill.is-success {
+  background: var(--success-soft);
+  border-color: transparent;
+  color: var(--success);
+}
+.pill.is-danger {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
+}
+.pill.is-warning {
+  background: var(--warning-soft);
+  border-color: transparent;
+  color: var(--warning);
+}
+
+/* --- Banner (inline notice: warning / info / error) ------------------------ */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.banner.is-warning {
+  background: var(--warning-soft);
+  border-color: rgba(245, 177, 76, 0.3);
+  color: var(--text-primary);
+}
+.banner.is-danger {
+  background: var(--danger-soft);
+  border-color: rgba(255, 93, 93, 0.3);
+  color: var(--text-primary);
+}
+.banner.is-accent {
+  background: var(--accent-soft);
+  border-color: rgba(110, 91, 255, 0.3);
+  color: var(--text-primary);
+}
+
+/* --- Helper text colours --------------------------------------------------- */
+.text-secondary { color: var(--text-secondary); }
+.text-muted { color: var(--text-muted); }
+.text-success { color: var(--success); }
+.text-danger { color: var(--danger); }
+
+/* ============================================================================
+   Slim custom scrollbar — unobtrusive, themed.
+   ============================================================================ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.24);
+  background-clip: padding-box;
+}
+
+/* Respect reduced-motion preferences. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

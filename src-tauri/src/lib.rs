@@ -40,6 +40,8 @@ pub fn run() {
             commands::resummarize,
             commands::list_meetings,
             commands::get_meeting_detail,
+            commands::model_present,
+            commands::download_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
