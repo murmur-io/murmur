@@ -162,6 +162,18 @@ pub async fn start_recording(
         }
     }
 
+    // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
+    // during recording (see transcribe::live). Never affects the recording or final note.
+    if let Some(cfg) = state.config.lock().ok().map(|c| c.clone()) {
+        if let Ok(Some(model_path)) = crate::transcribe::model::resolve_model_path(
+            cfg.whisper_model_path.as_deref().map(std::path::Path::new),
+            &cfg.model_size,
+            cfg.language.as_deref().unwrap_or(""),
+        ) {
+            crate::transcribe::live::spawn(app.clone(), model_path, cfg.language.clone());
+        }
+    }
+
     let _ = app.emit(
         EVENT_STATUS,
         StatusPayload {
