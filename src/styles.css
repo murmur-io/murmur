@@ -1,61 +1,94 @@
 /* ============================================================================
    MeetNotes — Global Design System
-   Dark, minimalist, premium. Revolut-spirit fintech-clean.
+   "Calm frosted control-room": dark, minimalist, premium glassmorphism.
+   Inspiration: Loom's zero-friction recorder · Notion's content-calm ·
+   Apple's frosted Dynamic-Island HUD.
 
-   All design tokens are CSS custom properties on :root. Components reference
-   them via var(--token). Never hardcode colours/radii/spacing in components —
-   pull from the scale below so every screen matches exactly.
+   Every design token is a CSS custom property on :root. Components reference
+   them via var(--token) — never hardcode colours/radii/spacing. Frosted-glass
+   surfaces (.card, .glass, nav, pills) float over an atmospheric aurora field;
+   ONE cool accent for calm states, ONE warm "live" accent for recording.
    ============================================================================ */
 
+/* --- Distinctive self-hosted type (variable woff2; no runtime fetch) -------- */
+@font-face {
+  font-family: "Hanken Grotesk";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/assets/fonts/hanken-grotesk.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("/assets/fonts/jetbrains-mono.woff2") format("woff2");
+}
+
 :root {
-  /* --- Font ---------------------------------------------------------------- */
-  /* System stack: crisp, native, legible. Mirrored in index.html (inlined). */
-  --font-sans: -apple-system, "SF Pro Text", BlinkMacSystemFont, system-ui,
-    "Segoe UI", Roboto, sans-serif;
-  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", "Menlo", monospace;
+  /* --- Font --------------------------------------------------------------- */
+  --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, system-ui,
+    sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
 
-  /* --- Surfaces (layered near-black; build depth, never flat / pure black) - */
-  --surface-base: #0a0a0f;       /* app/body background — the deepest layer    */
-  --surface-raised: #15151c;     /* cards, panels — sits above the base        */
-  --surface-overlay: #1f1f29;    /* popovers/menus/hover-raised — above cards   */
-  --surface-input: #1c1c25;      /* form fields, inert wells                    */
-  --surface-hover: rgba(255, 255, 255, 0.04); /* subtle hover wash on rows/btns */
+  /* --- Surfaces (deep layered field; glass sits on top) ------------------- */
+  --surface-base: #07070b;       /* app/body background — deepest layer        */
+  --surface-raised: rgba(255, 255, 255, 0.045); /* glass cards/panels          */
+  --surface-overlay: #1b1b24;    /* opaque popovers/menus/<option>             */
+  --surface-input: rgba(255, 255, 255, 0.035);  /* form wells (glassy)         */
+  --surface-solid: #111118;      /* when a true opaque surface is needed       */
+  --surface-hover: rgba(255, 255, 255, 0.06);   /* hover wash on rows/ghosts   */
 
-  /* --- Text ---------------------------------------------------------------- */
-  --text-primary: #f4f4f7;       /* headings & primary copy                     */
-  --text-secondary: #9a9aa7;     /* supporting/secondary copy                   */
-  --text-muted: #6b6b78;         /* meta, timestamps, placeholders, disabled    */
-  --text-on-accent: #ffffff;     /* text/icons on the accent fill               */
+  /* --- Glass (frosted treatment) ------------------------------------------ */
+  --glass-blur: 30px;
+  --glass-saturate: 135%;
+  --glass-border: rgba(255, 255, 255, 0.10);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.10); /* top edge gleam */
 
-  /* --- Accent (ONE vivid colour — electric indigo/violet, used sparingly) -- */
-  --accent: #6e5bff;             /* primary action, active tab, focus ring      */
-  --accent-hover: #7d6cff;       /* accent on hover                             */
-  --accent-active: #5d4bef;      /* accent pressed                              */
-  --accent-soft: rgba(110, 91, 255, 0.14); /* tinted bg (active pill, banners)  */
-  --accent-ring: rgba(110, 91, 255, 0.45); /* focus ring colour                 */
-  --accent-gradient: linear-gradient(135deg, #6e5bff 0%, #9a7cff 100%); /* hero */
+  /* --- Text --------------------------------------------------------------- */
+  --text-primary: #f6f6fa;
+  --text-secondary: #a6a6b6;
+  --text-muted: #6c6c7d;
+  --text-on-accent: #ffffff;
 
-  /* --- Borders (soft, low-alpha white hairlines) --------------------------- */
-  --border: rgba(255, 255, 255, 0.08);        /* default hairline             */
-  --border-strong: rgba(255, 255, 255, 0.14); /* emphasised / hover border    */
-  --border-subtle: rgba(255, 255, 255, 0.06); /* faintest divider             */
+  /* --- Cool accent (calm states: idle, nav, focus, links) ----------------- */
+  --accent: #6e76ff;
+  --accent-hover: #8a90ff;
+  --accent-active: #5b63f0;
+  --accent-soft: rgba(110, 118, 255, 0.16);
+  --accent-ring: rgba(110, 118, 255, 0.5);
+  --accent-gradient: linear-gradient(135deg, #6e76ff 0%, #9d7bff 100%);
 
-  /* --- Status colours ------------------------------------------------------ */
-  --success: #2ecc71;
-  --success-soft: rgba(46, 204, 113, 0.14);
-  --danger: #ff5d5d;
-  --danger-soft: rgba(255, 93, 93, 0.13);
+  /* --- Warm "live" accent (recording only — alive, not alarming) ---------- */
+  --live: #ff7a5c;
+  --live-hover: #ff8e74;
+  --live-soft: rgba(255, 122, 92, 0.16);
+  --live-gradient: linear-gradient(135deg, #ff7a5c 0%, #ff5e9c 100%);
+  --live-glow: 0 0 0 1px rgba(255, 122, 92, 0.35),
+    0 12px 40px rgba(255, 94, 120, 0.35);
+
+  /* --- Borders ------------------------------------------------------------ */
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-subtle: rgba(255, 255, 255, 0.055);
+
+  /* --- Status ------------------------------------------------------------- */
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.15);
+  --danger: #ff6b6b;
+  --danger-soft: rgba(255, 107, 107, 0.14);
   --warning: #f5b14c;
-  --warning-soft: rgba(245, 177, 76, 0.13);
+  --warning-soft: rgba(245, 177, 76, 0.14);
 
-  /* --- Radius scale (large, soft) ------------------------------------------ */
-  --radius-sm: 8px;    /* chips, small controls                                */
-  --radius-md: 12px;   /* buttons, inputs, selects                             */
-  --radius-lg: 16px;   /* cards, panels                                        */
-  --radius-xl: 20px;   /* large hero surfaces                                  */
-  --radius-pill: 999px;/* pills, toggles, status badges                        */
+  /* --- Radius (large, soft, Apple-round) ---------------------------------- */
+  --radius-sm: 9px;
+  --radius-md: 13px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --radius-pill: 999px;
 
-  /* --- Spacing scale (4px base) -------------------------------------------- */
+  /* --- Spacing (4px base) ------------------------------------------------- */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -65,18 +98,19 @@
   --space-7: 48px;
   --space-8: 64px;
 
-  /* --- Shadows (soft, diffuse — depth not drama) --------------------------- */
+  /* --- Shadows (soft, diffuse depth) -------------------------------------- */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.36);
-  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.5);
-  --shadow-accent: 0 8px 28px rgba(110, 91, 255, 0.4); /* glow under accent btn */
+  --shadow-md: 0 16px 40px rgba(0, 0, 0, 0.42);
+  --shadow-lg: 0 28px 70px rgba(0, 0, 0, 0.55);
+  --shadow-accent: 0 10px 34px rgba(110, 118, 255, 0.42);
 
-  /* --- Motion -------------------------------------------------------------- */
-  --transition: 160ms cubic-bezier(0.4, 0, 0.2, 1);      /* standard           */
-  --transition-fast: 120ms cubic-bezier(0.4, 0, 0.2, 1); /* micro-interactions */
+  /* --- Motion (spring-ish, Apple-fluid) ----------------------------------- */
+  --transition: 200ms cubic-bezier(0.32, 0.72, 0, 1);
+  --transition-fast: 130ms cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 
-  /* --- Layout -------------------------------------------------------------- */
-  --content-max: 820px; /* readable column width for feature screens           */
+  /* --- Layout ------------------------------------------------------------- */
+  --content-max: 840px;
 
   font-family: var(--font-sans);
   color-scheme: dark;
@@ -84,76 +118,75 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-* {
-  box-sizing: border-box;
-}
-
-html,
-body {
-  margin: 0;
-  padding: 0;
-}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
 
 body {
   min-height: 100vh;
   background: var(--surface-base);
-  /* Faint radial wash from the top so the base reads layered, not a void. */
-  background-image: radial-gradient(
-    1200px 600px at 50% -10%,
-    rgba(110, 91, 255, 0.08),
-    transparent 70%
-  );
-  background-attachment: fixed;
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-size: 15px;
   line-height: 1.55;
-  letter-spacing: -0.011em;
+  letter-spacing: -0.012em;
+}
+
+/* --- Atmospheric aurora field (sits behind everything; glass blurs it) ----- */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -10%;
+  z-index: -2;
+  background:
+    radial-gradient(46% 38% at 16% 8%, rgba(110, 118, 255, 0.18), transparent 60%),
+    radial-gradient(42% 34% at 88% 14%, rgba(74, 196, 240, 0.10), transparent 62%),
+    radial-gradient(48% 46% at 78% 92%, rgba(157, 123, 255, 0.14), transparent 64%),
+    radial-gradient(40% 40% at 10% 96%, rgba(255, 122, 92, 0.07), transparent 60%);
+  filter: saturate(120%);
+  animation: aurora-drift 26s ease-in-out infinite alternate;
+  will-change: transform;
+}
+/* Fine grain overlay — kills gradient banding, adds a premium tactile finish. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+@keyframes aurora-drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(2%, -3%, 0) scale(1.08); }
 }
 
 /* --- Base typography ------------------------------------------------------- */
-h1,
-h2,
-h3,
-h4 {
+h1, h2, h3, h4 {
   margin: 0 0 var(--space-3);
   color: var(--text-primary);
-  font-weight: 650;
-  letter-spacing: -0.02em;
-  line-height: 1.2;
-}
-h1 { font-size: 1.75rem; }
-h2 { font-size: 1.4rem; }
-h3 {
-  font-size: 1.0625rem;
   font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
 }
+h1 { font-size: 1.85rem; font-weight: 650; }
+h2 { font-size: 1.4rem; }
+h3 { font-size: 1.0625rem; }
 h4 { font-size: 0.9375rem; }
-
 p { margin: 0 0 var(--space-3); }
 
 a {
-  color: var(--accent);
+  color: var(--accent-hover);
   text-decoration: none;
   transition: color var(--transition);
 }
-a:hover { color: var(--accent-hover); }
-
+a:hover { color: var(--text-primary); }
 strong { font-weight: 600; }
-
-code,
-pre {
-  font-family: var(--font-mono);
-}
-
-::selection {
-  background: var(--accent-soft);
-  color: var(--text-primary);
-}
+code, pre { font-family: var(--font-mono); }
+::selection { background: var(--accent-soft); color: var(--text-primary); }
 
 /* ============================================================================
-   Reusable component primitives
-   Use these classes anywhere; they carry the full visual language.
+   Reusable primitives — carry the full visual language.
    ============================================================================ */
 
 /* --- Buttons --------------------------------------------------------------- */
@@ -164,9 +197,11 @@ pre {
   gap: var(--space-2);
   padding: 0 var(--space-4);
   height: 40px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-md);
-  background: var(--surface-input);
+  background: rgba(255, 255, 255, 0.05);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
   color: var(--text-primary);
   font-family: inherit;
   font-size: 0.9375rem;
@@ -176,12 +211,13 @@ pre {
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
+  box-shadow: var(--glass-highlight);
   transition: background var(--transition), border-color var(--transition),
     color var(--transition), transform var(--transition-fast),
     box-shadow var(--transition);
 }
 .btn:hover {
-  background: var(--surface-overlay);
+  background: var(--surface-hover);
   border-color: var(--border-strong);
 }
 .btn:active { transform: translateY(1px); }
@@ -190,31 +226,31 @@ pre {
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .btn:disabled {
-  opacity: 0.45;
+  opacity: 0.4;
   cursor: not-allowed;
   transform: none;
-  box-shadow: none;
 }
 
-/* Primary — the single vivid accent. Use once per view for the main action. */
 .btn-primary {
   background: var(--accent-gradient);
   border-color: transparent;
   color: var(--text-on-accent);
   font-weight: 600;
-  box-shadow: var(--shadow-accent);
+  box-shadow: var(--shadow-accent), var(--glass-highlight);
 }
 .btn-primary:hover {
   background: var(--accent-gradient);
-  filter: brightness(1.07);
+  filter: brightness(1.08);
   border-color: transparent;
 }
 .btn-primary:disabled { box-shadow: none; filter: none; }
 
-/* Ghost — quiet, borderless secondary action. */
 .btn-ghost {
   background: transparent;
   border-color: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
   color: var(--text-secondary);
 }
 .btn-ghost:hover {
@@ -223,41 +259,32 @@ pre {
   color: var(--text-primary);
 }
 
-/* Danger — destructive action. */
 .btn-danger {
   background: var(--danger-soft);
   border-color: transparent;
   color: var(--danger);
 }
-.btn-danger:hover {
-  background: var(--danger-soft);
-  border-color: var(--danger);
-  filter: brightness(1.1);
-}
+.btn-danger:hover { border-color: var(--danger); filter: brightness(1.1); }
 
-/* --- Card ------------------------------------------------------------------ */
+/* --- Card (the core frosted-glass surface) --------------------------------- */
 .card {
   background: var(--surface-raised);
-  border: 1px solid var(--border);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   padding: var(--space-5);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--shadow-md), var(--glass-highlight);
 }
 
 /* --- Form fields ----------------------------------------------------------- */
-input[type="text"],
-input[type="password"],
-input[type="search"],
-input[type="number"],
-input[type="email"],
-input[type="url"],
-input:not([type]),
-select,
-textarea {
+input[type="text"], input[type="password"], input[type="search"],
+input[type="number"], input[type="email"], input[type="url"],
+input:not([type]), select, textarea {
   width: 100%;
   padding: 0 var(--space-3);
   height: 40px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-md);
   background: var(--surface-input);
   color: var(--text-primary);
@@ -275,44 +302,25 @@ textarea {
   resize: vertical;
   line-height: 1.55;
 }
-input::placeholder,
-textarea::placeholder {
-  color: var(--text-muted);
-}
-input:hover,
-select:hover,
-textarea:hover {
-  border-color: var(--border-strong);
-}
-input:focus,
-select:focus,
-textarea:focus {
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+input:hover, select:hover, textarea:hover { border-color: var(--border-strong); }
+input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-ring);
-  background: var(--surface-raised);
+  background: rgba(255, 255, 255, 0.06);
 }
-input:disabled,
-select:disabled,
-textarea:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
+input:disabled, select:disabled, textarea:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* Native select chevron — drawn with a background SVG so it picks up our colour */
 select {
   padding-right: var(--space-6);
-  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' stroke='%239A9AA7' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' stroke='%23a6a6b6' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right var(--space-3) center;
   cursor: pointer;
 }
-select option {
-  background: var(--surface-overlay);
-  color: var(--text-primary);
-}
+select option { background: var(--surface-overlay); color: var(--text-primary); }
 
-/* Checkbox — custom accent-filled box with a drawn tick. */
 input[type="checkbox"] {
   appearance: none;
   width: 20px;
@@ -327,55 +335,32 @@ input[type="checkbox"] {
   transition: background var(--transition), border-color var(--transition),
     box-shadow var(--transition);
 }
-input[type="checkbox"]:hover {
-  border-color: var(--accent);
-}
-input[type="checkbox"]:checked {
-  background: var(--accent-gradient);
-  border-color: transparent;
-}
+input[type="checkbox"]:hover { border-color: var(--accent); }
+input[type="checkbox"]:checked { background: var(--accent-gradient); border-color: transparent; }
 input[type="checkbox"]:checked::after {
   content: "";
   position: absolute;
-  left: 6px;
-  top: 2px;
-  width: 5px;
-  height: 10px;
+  left: 6px; top: 2px;
+  width: 5px; height: 10px;
   border: solid var(--text-on-accent);
   border-width: 0 2px 2px 0;
   transform: rotate(45deg);
 }
-input[type="checkbox"]:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
+input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
 
-/* Fieldset — group of related controls. */
-fieldset {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-4);
-  margin: 0;
-}
-legend {
-  padding: 0 var(--space-2);
-  color: var(--text-secondary);
-  font-size: 0.8125rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-}
+fieldset { border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin: 0; }
+legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.01em; }
 
 /* --- Status pill ----------------------------------------------------------- */
-/* Neutral by default; add a state modifier to tint. */
 .pill {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-1) var(--space-3);
   height: 28px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-pill);
-  background: var(--surface-input);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--text-secondary);
   font-size: 0.8125rem;
   font-weight: 550;
@@ -383,99 +368,59 @@ legend {
   line-height: 1;
   white-space: nowrap;
 }
-.pill .pill-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: currentColor;
-  flex: none;
-}
-.pill.is-accent {
-  background: var(--accent-soft);
-  border-color: transparent;
-  color: var(--accent-hover);
-}
-.pill.is-success {
-  background: var(--success-soft);
-  border-color: transparent;
-  color: var(--success);
-}
-.pill.is-danger {
-  background: var(--danger-soft);
-  border-color: transparent;
-  color: var(--danger);
-}
-.pill.is-warning {
-  background: var(--warning-soft);
-  border-color: transparent;
-  color: var(--warning);
-}
+.pill .pill-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.pill.is-accent { background: var(--accent-soft); border-color: transparent; color: var(--accent-hover); }
+.pill.is-success { background: var(--success-soft); border-color: transparent; color: var(--success); }
+.pill.is-danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.pill.is-warning { background: var(--warning-soft); border-color: transparent; color: var(--warning); }
+.pill.is-live { background: var(--live-soft); border-color: transparent; color: var(--live-hover); }
 
-/* --- Banner (inline notice: warning / info / error) ------------------------ */
+/* --- Banner ---------------------------------------------------------------- */
 .banner {
   display: flex;
   align-items: flex-start;
   gap: var(--space-3);
   padding: var(--space-4);
-  border: 1px solid var(--border);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   background: var(--surface-raised);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   color: var(--text-secondary);
   font-size: 0.9rem;
   line-height: 1.5;
+  box-shadow: var(--glass-highlight);
 }
-.banner.is-warning {
-  background: var(--warning-soft);
-  border-color: rgba(245, 177, 76, 0.3);
-  color: var(--text-primary);
-}
-.banner.is-danger {
-  background: var(--danger-soft);
-  border-color: rgba(255, 93, 93, 0.3);
-  color: var(--text-primary);
-}
-.banner.is-accent {
-  background: var(--accent-soft);
-  border-color: rgba(110, 91, 255, 0.3);
-  color: var(--text-primary);
-}
+.banner.is-warning { background: var(--warning-soft); border-color: rgba(245, 177, 76, 0.3); color: var(--text-primary); }
+.banner.is-danger { background: var(--danger-soft); border-color: rgba(255, 107, 107, 0.3); color: var(--text-primary); }
+.banner.is-accent { background: var(--accent-soft); border-color: rgba(110, 118, 255, 0.3); color: var(--text-primary); }
 
-/* --- Helper text colours --------------------------------------------------- */
+/* --- Helper text ----------------------------------------------------------- */
 .text-secondary { color: var(--text-secondary); }
 .text-muted { color: var(--text-muted); }
 .text-success { color: var(--success); }
 .text-danger { color: var(--danger); }
 
-/* ============================================================================
-   Slim custom scrollbar — unobtrusive, themed.
-   ============================================================================ */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
-}
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
+/* --- Slim themed scrollbar ------------------------------------------------- */
+* { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.14);
   border-radius: var(--radius-pill);
   border: 2px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.24);
-  background-clip: padding-box;
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); background-clip: padding-box; }
+
+/* --- Shared entrance: gentle staggered rise ------------------------------- */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
-/* Respect reduced-motion preferences. */
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  *, *::before, *::after {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;

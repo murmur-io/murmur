@@ -35,10 +35,11 @@ import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
         position: sticky;
         top: 0;
         z-index: 10;
-        background: rgba(10, 10, 15, 0.72);
-        backdrop-filter: saturate(180%) blur(16px);
-        -webkit-backdrop-filter: saturate(180%) blur(16px);
+        background: rgba(7, 7, 11, 0.55);
+        backdrop-filter: saturate(150%) blur(22px);
+        -webkit-backdrop-filter: saturate(150%) blur(22px);
         border-bottom: 1px solid var(--border-subtle);
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04);
       }
 
       .app-bar {

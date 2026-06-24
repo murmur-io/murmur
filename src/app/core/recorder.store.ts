@@ -1,6 +1,14 @@
 import { Injectable, computed, inject, signal } from "@angular/core";
 import { toObservable, toSignal } from "@angular/core/rxjs-interop";
-import { catchError, from, interval, of, startWith, switchMap } from "rxjs";
+import {
+  catchError,
+  from,
+  interval,
+  map,
+  of,
+  startWith,
+  switchMap,
+} from "rxjs";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import type { NoteDto, Stage, StatusPayload } from "./models";
@@ -54,6 +62,29 @@ export class RecorderStore {
     { initialValue: 0 },
   );
 
+  /** Epoch ms when the current recording started — drives the elapsed timer. */
+  private _recStartMs = 0;
+
+  /**
+   * Seconds elapsed since recording started; 0 when idle. Bridged from an rxjs
+   * interval via toSignal — same sanctioned pattern as `level` (no setInterval).
+   */
+  readonly elapsed = toSignal(
+    toObservable(this.isRecording).pipe(
+      switchMap((rec) =>
+        rec
+          ? interval(250).pipe(
+              startWith(0),
+              map(() =>
+                Math.max(0, Math.floor((Date.now() - this._recStartMs) / 1000)),
+              ),
+            )
+          : of(0),
+      ),
+    ),
+    { initialValue: 0 },
+  );
+
   private unlisten: UnlistenFn | null = null;
 
   async init(): Promise<void> {
@@ -78,6 +109,7 @@ export class RecorderStore {
     try {
       const res = await this.ipc.startRecording();
       this._meetingId.set(res.meetingId);
+      this._recStartMs = Date.now();
       this._stage.set("recording");
     } catch (e) {
       this._error.set(String(e));
