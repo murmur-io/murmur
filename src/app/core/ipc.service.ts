@@ -2,6 +2,7 @@ import { Injectable } from "@angular/core";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  Analytics,
   AppConfigDto,
   Meeting,
   MeetingDetail,
@@ -63,6 +64,11 @@ export class IpcService {
 
   listMeetings(): Promise<Meeting[]> {
     return invoke<Meeting[]>("list_meetings");
+  }
+
+  /** Aggregate analytics for the dashboard + Analytics tab. */
+  getAnalytics(): Promise<Analytics> {
+    return invoke<Analytics>("get_analytics");
   }
 
   getMeetingDetail(meetingId: string): Promise<MeetingDetail | null> {

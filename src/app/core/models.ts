@@ -87,3 +87,27 @@ export interface MeetingDetail {
   note: NoteDto | null;
   segments: Segment[];
 }
+
+export interface StatusCount {
+  status: string;
+  count: number;
+}
+
+export interface DayCount {
+  date: string;
+  count: number;
+  durationS: number;
+}
+
+export interface Analytics {
+  totalMeetings: number;
+  totalDurationS: number;
+  avgDurationS: number;
+  longestDurationS: number;
+  meetings7d: number;
+  duration7dS: number;
+  notesCount: number;
+  firstMeetingAt: string | null;
+  byStatus: StatusCount[];
+  perDay: DayCount[];
+}

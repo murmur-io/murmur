@@ -5,7 +5,9 @@ use std::sync::Mutex;
 use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, Result};
-use crate::storage::models::{Meeting, MeetingStatus, NoteRecord};
+use crate::storage::models::{
+    Analytics, DayCount, Meeting, MeetingStatus, NoteRecord, StatusCount,
+};
 use crate::transcribe::types::Segment;
 
 impl MeetingStatus {
@@ -389,6 +391,111 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok(out)
+    }
+
+    // ── analytics ──────────────────────────────────────────────────────────────
+
+    /// Aggregate stats for the dashboard + Analytics tab.
+    pub fn analytics(&self) -> Result<Analytics> {
+        let conn = self.lock();
+        let total_meetings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meetings", [], |r| r.get(0))
+            .map_err(map_err)?;
+        let total_duration_s: i64 = conn
+            .query_row("SELECT COALESCE(SUM(duration_s), 0) FROM meetings", [], |r| {
+                r.get(0)
+            })
+            .map_err(map_err)?;
+        let longest_duration_s: i64 = conn
+            .query_row("SELECT COALESCE(MAX(duration_s), 0) FROM meetings", [], |r| {
+                r.get(0)
+            })
+            .map_err(map_err)?;
+        let notes_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .map_err(map_err)?;
+        let first_meeting_at: Option<String> = conn
+            .query_row("SELECT MIN(started_at) FROM meetings", [], |r| r.get(0))
+            .map_err(map_err)?;
+        let avg_duration_s = if total_meetings > 0 {
+            total_duration_s / total_meetings
+        } else {
+            0
+        };
+
+        // RFC3339 UTC timestamps sort lexicographically = chronologically, so comparing
+        // against a computed cutoff string is safe (avoids SQLite ISO-parsing quirks).
+        let cutoff_7d = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let meetings_7d: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meetings WHERE started_at >= ?1",
+                rusqlite::params![cutoff_7d],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let duration_7d_s: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(duration_s), 0) FROM meetings WHERE started_at >= ?1",
+                rusqlite::params![cutoff_7d],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+
+        let by_status = {
+            let mut stmt = conn
+                .prepare("SELECT status, COUNT(*) FROM meetings GROUP BY status")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(StatusCount {
+                        status: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                })
+                .map_err(map_err)?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(map_err)?);
+            }
+            v
+        };
+
+        let cutoff_30d = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let per_day = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT substr(started_at, 1, 10) AS d, COUNT(*), COALESCE(SUM(duration_s), 0)
+                       FROM meetings WHERE started_at >= ?1 GROUP BY d ORDER BY d",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![cutoff_30d], |row| {
+                    Ok(DayCount {
+                        date: row.get(0)?,
+                        count: row.get(1)?,
+                        duration_s: row.get(2)?,
+                    })
+                })
+                .map_err(map_err)?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r.map_err(map_err)?);
+            }
+            v
+        };
+
+        Ok(Analytics {
+            total_meetings,
+            total_duration_s,
+            avg_duration_s,
+            longest_duration_s,
+            meetings_7d,
+            duration_7d_s,
+            notes_count,
+            first_meeting_at,
+            by_status,
+            per_day,
+        })
     }
 }
 
