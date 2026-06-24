@@ -38,6 +38,7 @@ export interface AppConfigDto {
   captureSystemAudio: boolean;
   modelSize: string;
   voiceTrigger: boolean;
+  onboarded: boolean;
 }
 
 export interface NoteDto {
