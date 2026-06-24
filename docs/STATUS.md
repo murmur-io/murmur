@@ -25,7 +25,8 @@
 | Secrets | Anthropic key in macOS Keychain | unit-level |
 | Export | Atomic `.md` write into the vault + vault auto-detect | unit tests + **E2E** |
 | Library/Detail | list meetings, view note + transcript, re-summarize | `ng build` + `ng lint` |
-| Quality | clippy `-D warnings`, `ng lint`, 31 tests | `scripts/ci.sh` |
+| Release bundle | `tauri build --bundles app` → MeetNotes.app (17 MB, unsigned) | **verified builds** (`scripts/release.sh`); DMG layout + signing = real-Mac |
+| Quality | clippy `-D warnings`, `ng lint`, 34 tests | `scripts/ci.sh` |
 
 The headless E2E (`scripts/e2e-core.sh`) drives `say → ffmpeg → Whisper(base.en) →
 ClaudeCodeProvider → Obsidian .md` and asserts a real note with front-matter — the core
