@@ -8,6 +8,14 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+echo "── swiftc: system-audio sidecar typecheck ──"
+if command -v swiftc >/dev/null 2>&1; then
+  swiftc -typecheck src-tauri/sysaudio/sysaudio.swift \
+    -framework ScreenCaptureKit -framework AVFoundation
+else
+  echo "  (swiftc not found — skipping; system-audio sidecar will not build)"
+fi
+
 echo "── cargo clippy (deny warnings) ──"
 ( cd src-tauri && cargo clippy --all-targets -- -D warnings )
 

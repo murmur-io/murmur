@@ -93,6 +93,43 @@ pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Read a WAV file (any sample rate) into mono f32 samples plus its sample rate.
+/// Supports 16-bit int PCM and 32-bit float WAVs; multi-channel input is down-mixed to
+/// mono by averaging. Used to read the system-audio sidecar's WAV before mixing.
+pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| AppError::Audio(format!("open wav {}: {e}", path.display())))?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|s| s.map_err(|e| AppError::Audio(format!("decode wav sample: {e}"))))
+            .collect::<Result<Vec<f32>>>()?,
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| {
+                    s.map(|v| v as f32 / max)
+                        .map_err(|e| AppError::Audio(format!("decode wav sample: {e}")))
+                })
+                .collect::<Result<Vec<f32>>>()?
+        }
+    };
+
+    let mono = if channels <= 1 {
+        interleaved
+    } else {
+        interleaved
+            .chunks(channels)
+            .map(|f| f.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+    Ok((mono, spec.sample_rate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

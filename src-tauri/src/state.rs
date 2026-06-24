@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::audio::system::SystemAudioRecorder;
 use crate::audio::Recorder;
 use crate::error::{AppError, Result};
 use crate::settings::AppConfig;
@@ -14,6 +15,8 @@ const DB_FILE: &str = "meetnotes.sqlite";
 pub struct AppState {
     /// Some while recording.
     pub recorder: Mutex<Option<Recorder>>,
+    /// Some while recording AND system-audio capture is enabled + available.
+    pub system_recorder: Mutex<Option<SystemAudioRecorder>>,
     /// Db is internally Send+Sync (Mutex<Connection>).
     pub db: Db,
     /// In-memory cache of the settings table.
@@ -32,6 +35,7 @@ impl AppState {
 
         Ok(Self {
             recorder: Mutex::new(None),
+            system_recorder: Mutex::new(None),
             db,
             config: Mutex::new(config),
             current_meeting: Mutex::new(None),

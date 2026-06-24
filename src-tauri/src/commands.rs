@@ -60,6 +60,7 @@ pub struct AppConfigDto {
     pub ollama_base_url: String,
     pub ollama_model: String,
     pub claude_binary: String,
+    pub capture_system_audio: bool,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -124,6 +125,30 @@ pub async fn start_recording(
         *current = Some(meeting_uuid);
     }
 
+    // Optionally capture system audio (the other side of the call) alongside the mic.
+    // Best-effort: if it can't start, we log and record mic-only — never fail recording.
+    {
+        let enabled = state
+            .config
+            .lock()
+            .map(|c| c.capture_system_audio)
+            .unwrap_or(false);
+        if enabled && crate::audio::system::is_available() {
+            let sys_wav = std::env::temp_dir().join(format!("meetnotes-sys-{meeting_id}.wav"));
+            match crate::audio::system::SystemAudioRecorder::start(sys_wav) {
+                Ok(rec) => {
+                    if let Ok(mut slot) = state.system_recorder.lock() {
+                        *slot = Some(rec);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "audio", error = %e,
+                    "system-audio capture unavailable; recording mic only"
+                ),
+            }
+        }
+    }
+
     let _ = app.emit(
         EVENT_STATUS,
         StatusPayload {
@@ -166,11 +191,26 @@ pub async fn stop_recording(
 
     let (samples, src_rate) = recorder.stop()?;
 
+    // Stop the system-audio sidecar (if any) and collect its WAV for mixing.
+    let system_wav = {
+        let rec = state
+            .system_recorder
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        match rec {
+            Some(r) => r.stop().unwrap_or(None),
+            None => None,
+        }
+    };
+
     // Duration from the persisted started_at, falling back to a sample-count estimate.
     let duration_s = compute_duration_s(&state, &meeting_id, samples.len(), src_rate);
 
-    let result =
-        pipeline::run_after_stop(&app, &state, &meeting_id, samples, src_rate, duration_s).await?;
+    let result = pipeline::run_after_stop(
+        &app, &state, &meeting_id, samples, src_rate, duration_s, system_wav,
+    )
+    .await?;
 
     Ok(StopResult {
         meeting_id: result.meeting_id,
@@ -258,6 +298,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         ollama_base_url: c.ollama_base_url.clone(),
         ollama_model: c.ollama_model.clone(),
         claude_binary: c.claude_binary.clone(),
+        capture_system_audio: c.capture_system_audio,
     }
 }
 
@@ -274,6 +315,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         ollama_base_url: d.ollama_base_url,
         ollama_model: d.ollama_model,
         claude_binary: d.claude_binary,
+        capture_system_audio: d.capture_system_audio,
     }
 }
 

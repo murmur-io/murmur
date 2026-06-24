@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub ollama_model: String,
     /// default "claude"
     pub claude_binary: String,
+    /// Capture system audio (the other side of the call) via ScreenCaptureKit. Default off.
+    pub capture_system_audio: bool,
 }
 
 impl Default for AppConfig {
@@ -35,6 +37,7 @@ impl Default for AppConfig {
             ollama_base_url: "http://localhost:11434".to_string(),
             ollama_model: "llama3.1".to_string(),
             claude_binary: "claude".to_string(),
+            capture_system_audio: false,
         }
     }
 }
@@ -49,6 +52,7 @@ const K_ANTHROPIC_MODEL: &str = "anthropic_model";
 const K_OLLAMA_BASE_URL: &str = "ollama_base_url";
 const K_OLLAMA_MODEL: &str = "ollama_model";
 const K_CLAUDE_BINARY: &str = "claude_binary";
+const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -86,6 +90,9 @@ impl AppConfig {
                 cfg.claude_binary = v;
             }
         }
+        if let Some(v) = db.get_setting(K_CAPTURE_SYSTEM_AUDIO)? {
+            cfg.capture_system_audio = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -108,6 +115,10 @@ impl AppConfig {
         db.set_setting(K_OLLAMA_BASE_URL, &self.ollama_base_url)?;
         db.set_setting(K_OLLAMA_MODEL, &self.ollama_model)?;
         db.set_setting(K_CLAUDE_BINARY, &self.claude_binary)?;
+        db.set_setting(
+            K_CAPTURE_SYSTEM_AUDIO,
+            if self.capture_system_audio { "true" } else { "false" },
+        )?;
         Ok(())
     }
 }
