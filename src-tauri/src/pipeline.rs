@@ -133,7 +133,9 @@ async fn run_inner(
 
     if transcript.full_text.trim().is_empty() {
         return Err(AppError::Transcribe(
-            "transcript was empty — nothing to summarize".into(),
+            "No speech detected in the recording — nothing to transcribe. \
+             Check your microphone input and try recording again."
+                .into(),
         ));
     }
 

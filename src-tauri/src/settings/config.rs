@@ -147,10 +147,12 @@ mod tests {
     #[test]
     fn save_then_load_round_trips() {
         let db = temp_db();
-        let mut cfg = AppConfig::default();
-        cfg.provider_id = "ollama".to_string();
-        cfg.vault_path = Some("/vault".to_string());
-        cfg.language = Some("en".to_string());
+        let cfg = AppConfig {
+            provider_id: "ollama".to_string(),
+            vault_path: Some("/vault".to_string()),
+            language: Some("en".to_string()),
+            ..Default::default()
+        };
         cfg.save(&db).unwrap();
 
         let loaded = AppConfig::load(&db).unwrap();
