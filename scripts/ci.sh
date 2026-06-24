@@ -17,6 +17,9 @@ echo "── cargo test ──"
 echo "── cargo build ──"
 ( cd src-tauri && cargo build )
 
+echo "── ng lint ──"
+npx ng lint
+
 echo "── ng build ──"
 npx ng build
 
