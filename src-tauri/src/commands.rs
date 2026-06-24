@@ -6,7 +6,7 @@ use crate::error::AppError;
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
-use crate::storage::models::{Analytics, Meeting, MeetingStatus, MeetingTimeline};
+use crate::storage::models::{Analytics, Meeting, MeetingStatus, MeetingTimeline, NoteRecord};
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
@@ -64,6 +64,8 @@ pub struct AppConfigDto {
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
+    pub note_style: String,
+    pub auto_organize: bool,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -276,6 +278,40 @@ pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppE
     }))
 }
 
+/// Replace a meeting note's markdown (in-app edit) and re-write the SAME vault file in
+/// place (no duplicate). Returns the updated note.
+#[tauri::command]
+pub fn update_note(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    markdown: String,
+) -> Result<NoteDto, AppError> {
+    let existing = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: existing.provider_id.clone(),
+        markdown: markdown.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+    })?;
+
+    if let Some(path) = existing.exported_path.as_deref() {
+        crate::export::overwrite_note(std::path::Path::new(path), &markdown)?;
+    }
+
+    Ok(NoteDto {
+        meeting_id,
+        provider_id: existing.provider_id,
+        markdown,
+        exported_path: existing.exported_path,
+    })
+}
+
 /// Read current config (settings table), without secrets.
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> {
@@ -322,6 +358,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
+        note_style: c.note_style.clone(),
+        auto_organize: c.auto_organize,
     }
 }
 
@@ -346,6 +384,12 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         },
         voice_trigger: d.voice_trigger,
         onboarded: d.onboarded,
+        note_style: if d.note_style.trim().is_empty() {
+            "standard".to_string()
+        } else {
+            d.note_style
+        },
+        auto_organize: d.auto_organize,
     }
 }
 

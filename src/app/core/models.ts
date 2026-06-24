@@ -39,6 +39,8 @@ export interface AppConfigDto {
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;
+  noteStyle: string;
+  autoOrganize: boolean;
 }
 
 export interface NoteDto {
