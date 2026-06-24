@@ -346,11 +346,11 @@ pub async fn resummarize_existing(
 /// auto-download inside the pipeline in Phase 0 — that would surprise the user mid-run).
 fn resolve_model_path(config: &AppConfig) -> Result<PathBuf> {
     let configured = config.whisper_model_path.as_deref().map(Path::new);
-    match transcribe::resolve_model_path(configured)? {
+    let language = config.language.as_deref().unwrap_or("");
+    match transcribe::resolve_model_path(configured, &config.model_size, language)? {
         Some(p) => Ok(p),
         None => Err(AppError::Transcribe(
-            "no Whisper model found — set 'Whisper model path' in Settings (download a \
-             ggml/gguf model first)"
+            "no Whisper model found — pick a language + model in Settings and download it"
                 .into(),
         )),
     }

@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub claude_binary: String,
     /// Capture system audio (the other side of the call) via ScreenCaptureKit. Default off.
     pub capture_system_audio: bool,
+    /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3". Default "small".
+    pub model_size: String,
 }
 
 impl Default for AppConfig {
@@ -38,6 +40,7 @@ impl Default for AppConfig {
             ollama_model: "llama3.1".to_string(),
             claude_binary: "claude".to_string(),
             capture_system_audio: false,
+            model_size: "small".to_string(),
         }
     }
 }
@@ -53,6 +56,7 @@ const K_OLLAMA_BASE_URL: &str = "ollama_base_url";
 const K_OLLAMA_MODEL: &str = "ollama_model";
 const K_CLAUDE_BINARY: &str = "claude_binary";
 const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
+const K_MODEL_SIZE: &str = "model_size";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -93,6 +97,11 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_CAPTURE_SYSTEM_AUDIO)? {
             cfg.capture_system_audio = v == "true";
         }
+        if let Some(v) = db.get_setting(K_MODEL_SIZE)? {
+            if !v.is_empty() {
+                cfg.model_size = v;
+            }
+        }
 
         Ok(cfg)
     }
@@ -119,6 +128,7 @@ impl AppConfig {
             K_CAPTURE_SYSTEM_AUDIO,
             if self.capture_system_audio { "true" } else { "false" },
         )?;
+        db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         Ok(())
     }
 }
