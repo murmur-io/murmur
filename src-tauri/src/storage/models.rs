@@ -108,3 +108,11 @@ pub struct SearchHit {
     /// "title" | "transcript" | "note"
     pub matched_in: String,
 }
+
+/// One turn in a meeting chat conversation. `role` is "user" | "assistant".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}

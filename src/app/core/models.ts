@@ -137,3 +137,8 @@ export interface SearchHit {
   snippet: string;
   matchedIn: string;
 }
+
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}

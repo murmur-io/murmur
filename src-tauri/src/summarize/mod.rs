@@ -7,6 +7,7 @@ use crate::summarize::ollama::OllamaProvider;
 use crate::summarize::provider::SummarizerProvider;
 
 pub mod anthropic;
+pub mod chat;
 pub mod claude_code;
 pub mod ollama;
 pub mod organize;

@@ -7,7 +7,7 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
-    Analytics, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, SearchHit,
+    Analytics, ChatTurn, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, SearchHit,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -353,6 +353,41 @@ pub fn rename_meeting(
         return Err(AppError::InvalidArg("title cannot be empty".into()));
     }
     state.db.set_meeting_title(&meeting_id, title)
+}
+
+/// Grounded Q&A over a meeting's transcript ("chat with the meeting"). The configured
+/// provider answers strictly from the transcript + the running conversation history.
+#[tauri::command]
+pub async fn chat_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    question: String,
+    history: Vec<ChatTurn>,
+) -> Result<String, AppError> {
+    if question.trim().is_empty() {
+        return Err(AppError::InvalidArg("question is empty".into()));
+    }
+    let segments = state.db.get_segments(&meeting_id)?;
+    if segments.is_empty() {
+        return Err(AppError::InvalidArg(
+            "this meeting has no transcript to chat about yet".into(),
+        ));
+    }
+    let transcript = segments
+        .iter()
+        .map(|s| format!("[{:.0}s] {}", s.start_s, s.text.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let (system, user) = crate::summarize::chat::build(&transcript, &history, &question);
+    provider.complete(&system, &user).await
 }
 
 /// Read current config (settings table), without secrets.

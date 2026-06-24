@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Analytics,
   AppConfigDto,
+  ChatTurn,
   Meeting,
   MeetingDetail,
   MeetingTimeline,
@@ -86,6 +87,15 @@ export class IpcService {
   /** Rename a meeting's title. */
   renameMeeting(meetingId: string, title: string): Promise<void> {
     return invoke<void>("rename_meeting", { meetingId, title });
+  }
+
+  /** Ask a grounded question about a meeting's transcript (chat with the meeting). */
+  chatMeeting(
+    meetingId: string,
+    question: string,
+    history: ChatTurn[],
+  ): Promise<string> {
+    return invoke<string>("chat_meeting", { meetingId, question, history });
   }
 
   /** Aggregate analytics for the dashboard + Analytics tab. */
