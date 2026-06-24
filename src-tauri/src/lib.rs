@@ -58,6 +58,7 @@ pub fn run() {
             commands::list_meetings,
             commands::get_meeting_detail,
             commands::get_analytics,
+            commands::get_timeline,
             commands::model_present,
             commands::download_model,
             commands::toggle_bar,

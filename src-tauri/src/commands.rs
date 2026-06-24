@@ -6,7 +6,7 @@ use crate::error::AppError;
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
-use crate::storage::models::{Analytics, Meeting, MeetingStatus};
+use crate::storage::models::{Analytics, Meeting, MeetingStatus, MeetingTimeline};
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
@@ -423,6 +423,42 @@ pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppErro
 #[tauri::command]
 pub fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, AppError> {
     state.db.analytics()
+}
+
+/// Speaker + topic timeline for a meeting (AI-derived, cached after first generation).
+#[tauri::command]
+pub async fn get_timeline(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<MeetingTimeline, AppError> {
+    if let Some(json) = state.db.get_timeline_data(&meeting_id)? {
+        if let Ok(t) = serde_json::from_str::<MeetingTimeline>(&json) {
+            return Ok(t);
+        }
+    }
+    let segments = state.db.get_segments(&meeting_id)?;
+    if segments.is_empty() {
+        return Ok(MeetingTimeline::default());
+    }
+    let duration_s = state
+        .db
+        .get_meeting(&meeting_id)?
+        .map(|m| m.duration_s)
+        .unwrap_or(0);
+    let config = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.clone()
+    };
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let timeline =
+        crate::summarize::timeline::generate(provider.as_ref(), &segments, duration_s).await?;
+    if let Ok(json) = serde_json::to_string(&timeline) {
+        let _ = state.db.set_timeline_data(&meeting_id, &json);
+    }
+    Ok(timeline)
 }
 
 /// A meeting + its latest note + transcript segments for the Detail view.

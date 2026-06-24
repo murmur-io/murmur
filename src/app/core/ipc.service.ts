@@ -6,6 +6,7 @@ import type {
   AppConfigDto,
   Meeting,
   MeetingDetail,
+  MeetingTimeline,
   NoteDto,
   ProviderStatus,
   StartResult,
@@ -73,6 +74,11 @@ export class IpcService {
 
   getMeetingDetail(meetingId: string): Promise<MeetingDetail | null> {
     return invoke<MeetingDetail | null>("get_meeting_detail", { meetingId });
+  }
+
+  /** AI-derived speaker + topic timeline for a meeting (generated + cached on first call). */
+  getTimeline(meetingId: string): Promise<MeetingTimeline> {
+    return invoke<MeetingTimeline>("get_timeline", { meetingId });
   }
 
   /** Whether a usable Whisper model is present (configured path or default models dir). */

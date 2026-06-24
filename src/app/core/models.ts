@@ -112,3 +112,20 @@ export interface Analytics {
   byStatus: StatusCount[];
   perDay: DayCount[];
 }
+
+export interface SpeakerTurn {
+  speaker: string;
+  startS: number;
+  endS: number;
+}
+
+export interface TopicSpan {
+  label: string;
+  startS: number;
+  endS: number;
+}
+
+export interface MeetingTimeline {
+  speakers: SpeakerTurn[];
+  topics: TopicSpan[];
+}

@@ -146,6 +146,55 @@ impl SummarizerProvider for AnthropicProvider {
 
         Ok(note.to_string())
     }
+
+    async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
+        let api_key = self
+            .api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| AppError::Unavailable("Anthropic API key is not set".to_string()))?;
+
+        let body = json!({
+            "model": self.model,
+            "max_tokens": MAX_TOKENS,
+            "system": system,
+            "messages": [ { "role": "user", "content": user } ],
+        });
+
+        let resp = self
+            .client
+            .post(API_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Summarize(format!("Anthropic request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            let detail = extract_api_error(&err_body).unwrap_or_else(|| err_body.clone());
+            return Err(AppError::Summarize(format!(
+                "Anthropic API returned {status}: {}",
+                detail.trim()
+            )));
+        }
+
+        let parsed: MessagesResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Summarize(format!("failed to parse Anthropic response: {e}")))?;
+        let text: String = parsed
+            .content
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        Ok(text.trim().to_string())
+    }
 }
 
 /// Best-effort extraction of the `error.message` field from an Anthropic error body.

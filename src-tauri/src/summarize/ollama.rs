@@ -121,4 +121,34 @@ impl SummarizerProvider for OllamaProvider {
 
         Ok(note.to_string())
     }
+
+    async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
+        let url = format!("{}/api/generate", self.base_url);
+        let body = json!({
+            "model": self.model,
+            "system": system,
+            "prompt": user,
+            "stream": false,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Summarize(format!("Ollama request failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Summarize(format!(
+                "Ollama API returned {status}: {}",
+                err_body.trim()
+            )));
+        }
+        let parsed: GenerateResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Summarize(format!("failed to parse Ollama response: {e}")))?;
+        Ok(parsed.response.trim().to_string())
+    }
 }

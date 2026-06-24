@@ -103,6 +103,11 @@ impl Db {
              CREATE TABLE IF NOT EXISTS settings (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS timelines (
+               meeting_id TEXT PRIMARY KEY,
+               data TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );",
         )
         .map_err(map_err)?;
@@ -347,6 +352,30 @@ impl Db {
             "UPDATE notes SET exported_path = ?3
              WHERE meeting_id = ?1 AND provider_id = ?2",
             rusqlite::params![meeting_id, provider_id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    // ── timelines (AI-derived speaker + topic spans; JSON blob per meeting) ──────
+
+    pub fn get_timeline_data(&self, meeting_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT data FROM timelines WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    pub fn set_timeline_data(&self, meeting_id: &str, data: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO timelines (meeting_id, data) VALUES (?1, ?2)
+             ON CONFLICT(meeting_id) DO UPDATE SET data = excluded.data",
+            rusqlite::params![meeting_id, data],
         )
         .map_err(map_err)?;
         Ok(())
