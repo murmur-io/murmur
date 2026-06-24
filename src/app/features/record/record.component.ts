@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   OnInit,
   computed,
   inject,
@@ -52,6 +53,32 @@ import type { Analytics, AppConfigDto } from "../../core/models";
 
       <!-- ── The morphing recording bar (the hero) ───────────────────────── -->
       <div class="stage" [class.live]="store.isRecording()">
+        <!-- Meeting-app nudge: a subtle, dismissible suggestion to hit record. -->
+        @if (showNudge()) {
+          <div class="nudge" role="status">
+            <span class="nudge-dot" aria-hidden="true"></span>
+            <span class="nudge-text">
+              <strong>{{ detectedApp() }}</strong> is running — start recording?
+            </span>
+            <span class="nudge-actions">
+              <button
+                type="button"
+                class="btn btn-primary btn-sm"
+                (click)="startFromNudge()"
+              >
+                Start recording
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost btn-sm"
+                (click)="dismissNudge()"
+              >
+                Dismiss
+              </button>
+            </span>
+          </div>
+        }
+
         @if (store.isRecording()) {
           <div class="rec-bar is-recording" role="status">
             <span class="orb live" aria-hidden="true"></span>
@@ -272,6 +299,46 @@ import type { Analytics, AppConfigDto } from "../../core/models";
           transparent 72%
         );
         opacity: 0.95;
+      }
+
+      /* ── Meeting-app nudge: subtle accent strip, never blocking ────────── */
+      .nudge {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        width: 100%;
+        max-width: 560px;
+        padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+        border: 1px solid rgba(110, 118, 255, 0.3);
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        color: var(--text-primary);
+        animation: rise 320ms var(--transition) both;
+      }
+      .nudge-dot {
+        width: 8px;
+        height: 8px;
+        min-width: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 10px rgba(110, 118, 255, 0.8);
+      }
+      .nudge-text {
+        flex: 1;
+        min-width: 0;
+        font-size: 0.875rem;
+        line-height: 1.4;
+      }
+      .nudge-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        flex: none;
+      }
+      .nudge .btn-sm {
+        height: 32px;
+        padding: 0 var(--space-3);
+        font-size: 0.85rem;
       }
 
       /* ── The capsule, shared across states (each state swaps content) ──── */
@@ -782,6 +849,14 @@ import type { Analytics, AppConfigDto } from "../../core/models";
 export class RecordComponent implements OnInit {
   readonly store = inject(RecorderStore);
   private readonly ipc = inject(IpcService);
+  private readonly destroyRef = inject(DestroyRef);
+
+  /** Name of a running meeting app (Zoom/Teams/Webex), or null if none detected. */
+  readonly detectedApp = signal<string | null>(null);
+  /** Once dismissed, the nudge stays hidden for the rest of this session. */
+  private readonly nudgeDismissed = signal(false);
+  /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
+  private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
 
   /** Bars in the live waveform (driven by the real mic level signal). */
   readonly bars = Array.from({ length: 28 }, (_, i) => i);
@@ -815,6 +890,19 @@ export class RecordComponent implements OnInit {
       this.modelPresent() !== false &&
       !this.downloadingModel() &&
       !this.store.isBusy(),
+  );
+
+  /**
+   * Show the start-recording nudge only when a meeting app is running, we're
+   * not already recording, the user hasn't dismissed it this session, and
+   * recording is actually possible. A nudge — never blocks the screen.
+   */
+  readonly showNudge = computed(
+    () =>
+      this.detectedApp() !== null &&
+      !this.store.isRecording() &&
+      !this.nudgeDismissed() &&
+      this.canRecord(),
   );
 
   /** Elapsed recording time as m:ss. */
@@ -875,6 +963,38 @@ export class RecordComponent implements OnInit {
     } catch {
       this.analytics.set(null);
     }
+
+    // Meeting-app detection: check once now, then poll on a tracked interval.
+    void this.checkMeetingApp();
+    this.meetingAppPoll = setInterval(
+      () => void this.checkMeetingApp(),
+      12_000,
+    );
+    this.destroyRef.onDestroy(() => {
+      if (this.meetingAppPoll !== null) {
+        clearInterval(this.meetingAppPoll);
+        this.meetingAppPoll = null;
+      }
+    });
+  }
+
+  /** Best-effort poll for a running meeting app; failures leave the nudge hidden. */
+  private async checkMeetingApp(): Promise<void> {
+    try {
+      this.detectedApp.set(await this.ipc.detectMeetingApp());
+    } catch {
+      this.detectedApp.set(null);
+    }
+  }
+
+  /** Nudge primary action — kick off a recording, then let it fade out. */
+  startFromNudge(): void {
+    void this.store.start();
+  }
+
+  /** Nudge ghost action — hide it for the rest of this session. */
+  dismissNudge(): void {
+    this.nudgeDismissed.set(true);
   }
 
   /** ⌘R / Ctrl+R toggles recording. */
