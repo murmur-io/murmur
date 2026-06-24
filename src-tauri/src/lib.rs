@@ -79,7 +79,7 @@ fn create_bar_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     }
     let win = WebviewWindowBuilder::new(app, "bar", WebviewUrl::App("bar".into()))
         .title("MeetNotes")
-        .inner_size(560.0, 108.0)
+        .inner_size(600.0, 152.0)
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
@@ -112,7 +112,7 @@ fn position_bar_top_center(win: &tauri::WebviewWindow) {
         let screen = monitor.size();
         let scale = monitor.scale_factor();
         let x = ((screen.width as f64 - size.width as f64) / 2.0).max(0.0);
-        let y = (96.0 * scale).min(screen.height as f64 * 0.3);
+        let y = (48.0 * scale).min(screen.height as f64 * 0.3);
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
     }
 }
