@@ -183,22 +183,6 @@ const STATUS_ORDER = [
       .head h2 {
         margin: 0;
       }
-      .count {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 24px;
-        height: 24px;
-        padding: 0 var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-        color: var(--text-secondary);
-        font-size: 0.8125rem;
-        font-weight: 600;
-        font-variant-numeric: tabular-nums;
-        line-height: 1;
-      }
 
       /* --- Hero stat cards --- */
       .hero {
@@ -475,35 +459,7 @@ const STATUS_ORDER = [
         letter-spacing: -0.01em;
       }
 
-      /* --- Empty / loading states --- */
-      .state-card {
-        padding: var(--space-6);
-      }
-      .empty-state {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: var(--space-2);
-        padding: var(--space-7) var(--space-5);
-        text-align: center;
-      }
-      .empty-mark {
-        width: 44px;
-        height: 44px;
-        margin-bottom: var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-      }
-      .empty-title {
-        margin: 0;
-        color: var(--text-primary);
-        font-weight: 600;
-      }
-      .empty {
-        margin: 0;
-        color: var(--text-muted);
-      }
+      /* --- Empty / loading states (.count/.state-card/.empty* are global) --- */
 
       /* --- Responsive --- */
       @media (max-width: 720px) {

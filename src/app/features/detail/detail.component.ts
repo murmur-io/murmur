@@ -3,13 +3,15 @@ import {
   Component,
   DestroyRef,
   ElementRef,
+  Injector,
   OnInit,
+  afterNextRender,
   computed,
   inject,
   signal,
   viewChild,
 } from "@angular/core";
-import { ActivatedRoute, RouterLink } from "@angular/router";
+import { ActivatedRoute, Router, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { IpcService } from "../../core/ipc.service";
 import type { MeetingDetail, MeetingTimeline } from "../../core/models";
@@ -58,7 +60,43 @@ interface ParsedNote {
       @if (detail(); as d) {
         <header class="head">
           <div class="head-text">
-            <h2>{{ d.meeting.title || "(untitled)" }}</h2>
+            @if (renaming()) {
+              <div class="rename">
+                <input
+                  #renameInput
+                  type="text"
+                  class="rename-input"
+                  aria-label="Meeting title"
+                  autocapitalize="sentences"
+                  autocomplete="off"
+                  [value]="titleDraft()"
+                  [disabled]="savingRename()"
+                  (input)="onTitleInput($event)"
+                  (keydown.enter)="saveRename()"
+                  (keydown.escape)="cancelRename()"
+                />
+                <div class="rename-actions">
+                  <button
+                    type="button"
+                    class="btn btn-ghost rename-btn"
+                    (click)="cancelRename()"
+                    [disabled]="savingRename()"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-primary rename-btn"
+                    (click)="saveRename()"
+                    [disabled]="savingRename() || !titleDraft().trim()"
+                  >
+                    {{ savingRename() ? "Saving…" : "Save" }}
+                  </button>
+                </div>
+              </div>
+            } @else {
+              <h2>{{ d.meeting.title || "(untitled)" }}</h2>
+            }
             <div class="meta">
               <span class="pill" [class]="statusPillClass(d.meeting.status)">
                 <span class="pill-dot"></span>
@@ -80,15 +118,71 @@ interface ParsedNote {
               type="button"
               class="btn btn-primary"
               (click)="resummarize(d.meeting.id)"
-              [disabled]="busy()"
+              [disabled]="busy() || renaming()"
             >
               Re-summarize
             </button>
+            @if (!renaming()) {
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="startRename()"
+                [disabled]="busy()"
+              >
+                Rename
+              </button>
+              <button
+                type="button"
+                class="btn btn-danger"
+                (click)="askDelete()"
+                [disabled]="busy()"
+              >
+                Delete
+              </button>
+            }
             @if (msg()) {
               <span class="msg">{{ msg() }}</span>
             }
           </div>
         </header>
+
+        <!-- In-app delete confirmation (signal-driven; no window.confirm) ----- -->
+        @if (confirmingDelete()) {
+          <div
+            class="card confirm"
+            role="alertdialog"
+            aria-label="Delete meeting"
+          >
+            <div class="confirm-text">
+              <p class="confirm-title">Delete this meeting?</p>
+              <p class="confirm-copy">
+                This permanently removes the recording, transcript, summary and
+                the note in your vault. This can’t be undone.
+              </p>
+              @if (deleteError(); as err) {
+                <p class="confirm-error" role="alert">{{ err }}</p>
+              }
+            </div>
+            <div class="confirm-actions">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="cancelDelete()"
+                [disabled]="deleting()"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-danger"
+                (click)="confirmDelete(d.meeting.id)"
+                [disabled]="deleting()"
+              >
+                {{ deleting() ? "Deleting…" : "Delete" }}
+              </button>
+            </div>
+          </div>
+        }
 
         <!-- 1) AUDIO PLAYER ------------------------------------------------ -->
         @if (audioSrc(); as src) {
@@ -438,6 +532,70 @@ interface ParsedNote {
         font-size: 0.85rem;
       }
 
+      /* --- Inline title rename --- */
+      .rename {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-2);
+      }
+      .rename-input {
+        flex: 1 1 16rem;
+        min-width: 0;
+        height: 44px;
+        font-size: 1.25rem;
+        font-weight: 600;
+        letter-spacing: -0.025em;
+      }
+      .rename-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+      }
+      .rename-btn {
+        height: 36px;
+        padding: 0 var(--space-3);
+        font-size: 0.875rem;
+      }
+
+      /* --- In-app delete confirmation --- */
+      .confirm {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-4);
+        border-color: rgba(255, 107, 107, 0.3);
+        animation: rise 240ms var(--transition) both;
+      }
+      .confirm-text {
+        min-width: 0;
+        flex: 1 1 20rem;
+      }
+      .confirm-title {
+        margin: 0 0 var(--space-1);
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+      .confirm-copy {
+        margin: 0;
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+        line-height: 1.55;
+      }
+      .confirm-error {
+        margin: var(--space-2) 0 0;
+        color: var(--danger);
+        font-size: 0.85rem;
+      }
+      .confirm-actions,
+      .editor-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        margin-left: auto;
+      }
+
       /* --- Section blocks --- */
       .block {
         display: flex;
@@ -451,22 +609,6 @@ interface ParsedNote {
       }
       .block-head h3 {
         margin: 0;
-      }
-      .count {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 24px;
-        height: 24px;
-        padding: 0 var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-        color: var(--text-secondary);
-        font-size: 0.8125rem;
-        font-weight: 600;
-        font-variant-numeric: tabular-nums;
-        line-height: 1;
       }
 
       /* ========================================================== */
@@ -624,7 +766,8 @@ interface ParsedNote {
       /* ========================================================== */
       /* 2) Rich analysis                                           */
       /* ========================================================== */
-      .tags {
+      .tags,
+      .people {
         display: flex;
         flex-wrap: wrap;
         gap: var(--space-2);
@@ -652,11 +795,6 @@ interface ParsedNote {
         font-weight: 600;
         letter-spacing: 0.04em;
         text-transform: uppercase;
-      }
-      .people {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-2);
       }
       .person {
         display: inline-flex;
@@ -760,7 +898,8 @@ interface ParsedNote {
         border-width: 0 2px 2px 0;
         transform: rotate(45deg);
       }
-      .check-text {
+      .check-text,
+      .seg-text {
         color: var(--text-secondary);
         min-width: 0;
       }
@@ -878,12 +1017,6 @@ interface ParsedNote {
         color: var(--text-muted);
         font-size: 0.8125rem;
       }
-      .editor-actions {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        margin-left: auto;
-      }
 
       /* Transient "Saved" confirmation */
       .saved-toast {
@@ -983,42 +1116,10 @@ interface ParsedNote {
         font-variant-numeric: tabular-nums;
         padding-top: 0.1em;
       }
-      .seg-text {
-        color: var(--text-secondary);
-        min-width: 0;
-      }
 
-      /* --- Empty / loading wells --- */
-      .state-card {
-        padding: var(--space-6);
-      }
+      /* --- Empty / loading wells (.count/.state-card/.empty* are global) --- */
       .empty-card {
         padding: var(--space-5);
-      }
-      .empty-state {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: var(--space-2);
-        padding: var(--space-7) var(--space-5);
-        text-align: center;
-      }
-      .empty-mark {
-        width: 44px;
-        height: 44px;
-        margin-bottom: var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-      }
-      .empty-title {
-        margin: 0;
-        color: var(--text-primary);
-        font-weight: 600;
-      }
-      .empty {
-        margin: 0;
-        color: var(--text-muted);
       }
 
       @media (max-width: 720px) {
@@ -1032,6 +1133,8 @@ interface ParsedNote {
 export class DetailComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
+  private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
 
   /** Exposed so the template can format aria values. */
@@ -1041,6 +1144,25 @@ export class DetailComponent implements OnInit {
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly msg = signal("");
+
+  // --- Inline title rename state ------------------------------------------
+  /** True while the header title is swapped for an inline text input. */
+  readonly renaming = signal(false);
+  /** Working copy of the title (input (input) → signal); empty values ignored. */
+  readonly titleDraft = signal("");
+  /** Disables Save/Cancel while a renameMeeting IPC call is in flight. */
+  readonly savingRename = signal(false);
+  /** Focusable rename input — focused after it renders (afterNextRender). */
+  private readonly renameInput =
+    viewChild<ElementRef<HTMLInputElement>>("renameInput");
+
+  // --- In-app delete confirmation state -----------------------------------
+  /** True while the signal-driven delete-confirm panel is shown. */
+  readonly confirmingDelete = signal(false);
+  /** True while a deleteMeeting IPC call is in flight (irreversible). */
+  readonly deleting = signal(false);
+  /** Inline error surfaced when the delete fails. */
+  readonly deleteError = signal("");
 
   // --- In-app note editor state -------------------------------------------
   /** True while the raw-markdown editor replaces the rendered analysis cards. */
@@ -1160,6 +1282,85 @@ export class DetailComponent implements OnInit {
       this.msg.set("Error: " + String(e));
     } finally {
       this.busy.set(false);
+    }
+  }
+
+  // --- Inline title rename -------------------------------------------------
+
+  /** Enter rename mode, seeding the draft with the meeting's current title. */
+  startRename(): void {
+    this.titleDraft.set(this.detail()?.meeting.title ?? "");
+    this.renaming.set(true);
+    // Focus the field once it has rendered (zoneless-safe; no setTimeout).
+    afterNextRender(() => this.renameInput()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
+  }
+
+  /** Mirror the rename input value into the `titleDraft` signal. */
+  onTitleInput(event: Event): void {
+    this.titleDraft.set((event.target as HTMLInputElement).value);
+  }
+
+  /** Leave rename mode without persisting. */
+  cancelRename(): void {
+    this.renaming.set(false);
+  }
+
+  /**
+   * Persist the new title: ignore empty/whitespace values, await the rename
+   * IPC, then fold the trimmed title into the in-memory meeting so the header
+   * reflects it immediately. The rest of the page state is untouched.
+   */
+  async saveRename(): Promise<void> {
+    const current = this.detail();
+    const id = current?.meeting.id;
+    const title = this.titleDraft().trim();
+    if (!current || !id || !title) {
+      return;
+    }
+    this.savingRename.set(true);
+    try {
+      await this.ipc.renameMeeting(id, title);
+      this.detail.set({
+        ...current,
+        meeting: { ...current.meeting, title },
+      });
+      this.renaming.set(false);
+    } catch (e) {
+      this.msg.set("Couldn’t rename: " + String(e));
+    } finally {
+      this.savingRename.set(false);
+    }
+  }
+
+  // --- In-app delete -------------------------------------------------------
+
+  /** Open the signal-driven confirm panel (no window.confirm). */
+  askDelete(): void {
+    this.deleteError.set("");
+    this.confirmingDelete.set(true);
+  }
+
+  /** Dismiss the confirm panel without deleting. */
+  cancelDelete(): void {
+    this.confirmingDelete.set(false);
+  }
+
+  /**
+   * Irreversibly delete the meeting (recording, transcript, summary + the
+   * exported vault note), then navigate back to the library. Errors surface
+   * inline in the confirm panel and keep the user on the page.
+   */
+  async confirmDelete(id: string): Promise<void> {
+    this.deleting.set(true);
+    this.deleteError.set("");
+    try {
+      await this.ipc.deleteMeeting(id);
+      await this.router.navigateByUrl("/library");
+    } catch (e) {
+      this.deleteError.set("Couldn’t delete: " + String(e));
+      this.deleting.set(false);
     }
   }
 
