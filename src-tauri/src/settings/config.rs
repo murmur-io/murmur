@@ -29,6 +29,10 @@ pub struct AppConfig {
     pub voice_trigger: bool,
     /// Whether the first-run onboarding has been completed.
     pub onboarded: bool,
+    /// Summary style preset: "standard" | "brief" | "detailed" | "action".
+    pub note_style: String,
+    /// When true, Claude files each note into a thematic subfolder of the vault.
+    pub auto_organize: bool,
 }
 
 impl Default for AppConfig {
@@ -47,6 +51,8 @@ impl Default for AppConfig {
             model_size: "small".to_string(),
             voice_trigger: false,
             onboarded: false,
+            note_style: "standard".to_string(),
+            auto_organize: false,
         }
     }
 }
@@ -65,6 +71,8 @@ const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
+const K_NOTE_STYLE: &str = "note_style";
+const K_AUTO_ORGANIZE: &str = "auto_organize";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -116,6 +124,14 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_ONBOARDED)? {
             cfg.onboarded = v == "true";
         }
+        if let Some(v) = db.get_setting(K_NOTE_STYLE)? {
+            if !v.is_empty() {
+                cfg.note_style = v;
+            }
+        }
+        if let Some(v) = db.get_setting(K_AUTO_ORGANIZE)? {
+            cfg.auto_organize = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -148,6 +164,11 @@ impl AppConfig {
             if self.voice_trigger { "true" } else { "false" },
         )?;
         db.set_setting(K_ONBOARDED, if self.onboarded { "true" } else { "false" })?;
+        db.set_setting(K_NOTE_STYLE, &self.note_style)?;
+        db.set_setting(
+            K_AUTO_ORGANIZE,
+            if self.auto_organize { "true" } else { "false" },
+        )?;
         Ok(())
     }
 }

@@ -49,6 +49,7 @@ pub fn run() {
             commands::stop_recording,
             commands::recording_level,
             commands::get_last_note,
+            commands::update_note,
             commands::get_config,
             commands::save_config,
             commands::set_anthropic_key,

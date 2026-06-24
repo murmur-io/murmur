@@ -296,6 +296,48 @@ fn collect_md_stems(dir: &Path, out: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Immediate subdirectory names of the vault (skips hidden / `.obsidian`), used as
+/// existing-folder hints for AI thematic filing.
+pub fn list_subfolders(vault_dir: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(vault_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(AppError::Export(format!("read_dir failed: {e}"))),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::Export(format!("dir entry failed: {e}")))?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(name) = entry.file_name().to_str() {
+                if !name.starts_with('.') {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Overwrite the note at `path` with `markdown` in place (atomic temp-write + rename).
+/// Used when editing a note in-app so the SAME vault file is updated, not duplicated.
+pub fn overwrite_note(path: &Path, markdown: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Export("note path has no parent".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| AppError::Export(format!("create note dir failed: {e}")))?;
+    let tmp_path = parent.join(format!(".edit.{}.tmp", std::process::id()));
+    write_and_sync(&tmp_path, markdown).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        AppError::Export(format!("atomic rename failed: {e}"))
+    })?;
+    Ok(())
+}
+
 // ── Vault detection (from ~/Library/Application Support/obsidian/obsidian.json) ──
 
 /// A detected Obsidian vault.

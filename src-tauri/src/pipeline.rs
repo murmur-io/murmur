@@ -210,7 +210,7 @@ async fn summarize_and_export(
             duration_s,
             language,
         },
-        template: template::default_template(),
+        template: template::template_for_style(&config.note_style),
         vault_titles,
     };
 
@@ -241,9 +241,11 @@ async fn summarize_and_export(
         })?;
 
     let title = derive_title(&markdown, date_iso);
+    let subfolder =
+        resolve_subfolder(config, provider.as_ref(), vault_path, &title, &markdown).await;
     let exported_path = export::write_note(
         Path::new(vault_path),
-        config.vault_subfolder.as_deref(),
+        subfolder.as_deref(),
         &title,
         when_iso,
         &markdown,
@@ -266,6 +268,30 @@ async fn summarize_and_export(
         exported_path,
         meeting_id: meeting_id.to_string(),
     })
+}
+
+/// Pick the vault subfolder for a note: AI thematic filing (nested under the configured
+/// subfolder, if any) when `auto_organize` is on; otherwise just the configured subfolder.
+/// Classification failures degrade gracefully to the configured subfolder.
+async fn resolve_subfolder(
+    config: &AppConfig,
+    provider: &dyn crate::summarize::provider::SummarizerProvider,
+    vault_path: &str,
+    title: &str,
+    markdown: &str,
+) -> Option<String> {
+    if !config.auto_organize {
+        return config.vault_subfolder.clone();
+    }
+    let existing = export::list_subfolders(Path::new(vault_path)).unwrap_or_default();
+    match crate::summarize::organize::classify_subfolder(provider, title, markdown, &existing).await
+    {
+        Some(folder) => match config.vault_subfolder.as_deref().filter(|s| !s.is_empty()) {
+            Some(base) => Some(format!("{base}/{folder}")),
+            None => Some(folder),
+        },
+        None => config.vault_subfolder.clone(),
+    }
 }
 
 /// Re-run summarize + export for an existing meeting using its already-stored transcript

@@ -58,6 +58,64 @@ Formatting rules:
     .to_string()
 }
 
+/// Pick the note-format template for a style preset. Unknown styles fall back to standard.
+/// Every variant preserves the load-bearing invariant: the note's first line is `---`.
+pub fn template_for_style(style: &str) -> String {
+    match style {
+        "brief" => style_variant(
+            "Keep it SHORT — a busy reader skims this in 15 seconds.",
+            "# <title>\n\n## TL;DR\nMax 2 sentences capturing the outcome.\n\n## Decisions\n- Only the decisions actually made (or omit).\n\n## Action items\n- [ ] Owner — action (due date if mentioned)\n",
+        ),
+        "detailed" => style_variant(
+            "Be THOROUGH — capture nuance, context, and reasoning for a reader who missed the meeting.",
+            "# <title>\n\n## Summary\nA full 4–8 sentence overview of context, discussion, and outcome.\n\n## Discussion\nThe main threads of conversation, with the reasoning and trade-offs raised.\n\n## Key points\n- Specific, factual points.\n\n## Decisions\n- Decisions made, with the rationale.\n\n## Action items\n- [ ] Owner — action (due date if mentioned)\n\n## Risks & open questions\n- Anything unresolved or risky.\n\n## Notes\nAdditional context and follow-ups.\n",
+        ),
+        "action" => style_variant(
+            "Be ACTION-FOCUSED — the reader cares most about what happens next and who owns it.",
+            "# <title>\n\n## Summary\n1–2 sentences of context.\n\n## Action items\n- [ ] Owner — action (due date if mentioned)\n\n## Decisions\n- Decisions made (or \"None recorded\").\n\n## Follow-ups\n- Open questions / things to revisit.\n",
+        ),
+        _ => default_template(),
+    }
+}
+
+/// Build a style variant: the shared front-matter contract + a style-specific tone line and
+/// body section layout. Mirrors `default_template`'s invariants (first line `---`, no fences).
+fn style_variant(tone: &str, body_sections: &str) -> String {
+    format!(
+        r#"You are a meticulous meeting-notes writer for an Obsidian vault.
+
+Produce a SINGLE, complete Markdown note summarizing the meeting transcript that
+follows. Output ONLY the note — no preamble, no explanation, no code fences around
+the whole note. {tone}
+
+The note MUST begin, on the very first line, with a YAML front-matter block delimited
+by a line containing exactly three dashes (`---`), then the front-matter keys, then a
+closing `---` line. Do not emit anything before the opening `---`.
+
+Front-matter (YAML) keys to include:
+- title: a concise human-readable meeting title (string)
+- date: the meeting date in ISO format (YYYY-MM-DD)
+- duration_minutes: integer minutes (rounded)
+- tags: a YAML list including at least [meeting]
+- participants: a YAML list (may be empty if unknown)
+
+After the closing `---`, write the note body using these sections (omit a section only
+if there is genuinely nothing to say):
+
+{body_sections}
+Linking rules:
+- When the meeting clearly references one of the EXISTING NOTE TITLES provided below,
+  link to it using Obsidian wikilink syntax: [[Exact Title]]. Only link titles that
+  appear in that list; never invent links.
+
+Formatting rules:
+- Use plain Markdown. Use real newlines.
+- Be faithful to the transcript; do not fabricate participants, decisions, or action
+  items that are not supported by the transcript.
+"#
+    )
+}
+
 /// Render the full prompt text a provider sends (template + meta + vault titles + transcript).
 ///
 /// Providers that take a single combined prompt (Ollama, and the Claude Code stdin path)

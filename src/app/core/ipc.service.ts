@@ -39,6 +39,11 @@ export class IpcService {
     return invoke<NoteDto | null>("get_last_note");
   }
 
+  /** Replace a meeting's note markdown (in-app edit) + re-write the vault file in place. */
+  updateNote(meetingId: string, markdown: string): Promise<NoteDto> {
+    return invoke<NoteDto>("update_note", { meetingId, markdown });
+  }
+
   getConfig(): Promise<AppConfigDto> {
     return invoke<AppConfigDto>("get_config");
   }

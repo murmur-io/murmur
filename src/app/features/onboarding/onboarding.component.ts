@@ -1258,6 +1258,8 @@ export class OnboardingComponent implements OnInit {
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
+      noteStyle: base?.noteStyle ?? "standard",
+      autoOrganize: base?.autoOrganize ?? false,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

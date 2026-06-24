@@ -9,6 +9,7 @@ use crate::summarize::provider::SummarizerProvider;
 pub mod anthropic;
 pub mod claude_code;
 pub mod ollama;
+pub mod organize;
 pub mod provider;
 pub mod template;
 pub mod timeline;

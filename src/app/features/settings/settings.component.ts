@@ -777,11 +777,16 @@ export class SettingsComponent implements OnInit {
 
   /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
   private loadedOnboarded = true;
+  /** Preserved from loaded config until the settings UI exposes them as controls. */
+  private loadedNoteStyle = "standard";
+  private loadedAutoOrganize = false;
 
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
       this.loadedOnboarded = cfg.onboarded ?? true;
+      this.loadedNoteStyle = cfg.noteStyle ?? "standard";
+      this.loadedAutoOrganize = cfg.autoOrganize ?? false;
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -832,6 +837,8 @@ export class SettingsComponent implements OnInit {
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
+      noteStyle: this.loadedNoteStyle,
+      autoOrganize: this.loadedAutoOrganize,
     };
     try {
       await this.ipc.saveConfig(cfg);
