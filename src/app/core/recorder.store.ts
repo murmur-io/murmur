@@ -87,6 +87,7 @@ export class RecorderStore {
 
   private unlisten: UnlistenFn | null = null;
   private unlistenVoice: UnlistenFn | null = null;
+  private unlistenToggle: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -95,6 +96,10 @@ export class RecorderStore {
     this.unlistenVoice = await this.ipc.onVoiceStart(() => {
       if (!this.isRecording()) void this.start();
     });
+    // Tray "Start / Stop recording": toggle from the menu bar without opening a window.
+    this.unlistenToggle = await this.ipc.onToggleRecord(() =>
+      this.toggleRecord(),
+    );
     await this.refreshLastNote();
   }
 
@@ -145,6 +150,16 @@ export class RecorderStore {
     } catch (e) {
       this._error.set(String(e));
       this._stage.set("error");
+    }
+  }
+
+  /** Tray toggle: stop if recording, else start (ignored while a recording is processing). */
+  toggleRecord(): void {
+    const s = this._stage();
+    if (s === "recording") {
+      void this.stop();
+    } else if (s === "idle" || s === "done" || s === "error") {
+      void this.start();
     }
   }
 

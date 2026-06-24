@@ -12,7 +12,7 @@ pub mod summarize;
 pub mod transcribe;
 
 use tauri::window::{Effect, EffectsBuilder};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use crate::state::AppState;
@@ -141,11 +141,19 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     let open = MenuItem::with_id(app, "open", "Open Murmur", true, None::<&str>)?;
+    let record =
+        MenuItem::with_id(app, "record", "Start / Stop recording", true, None::<&str>)?;
     let bar = MenuItem::with_id(app, "bar", "Recorder bar  (⌘⇧R)", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Murmur", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open, &bar, &PredefinedMenuItem::separator(app)?, &quit],
+        &[
+            &open,
+            &record,
+            &bar,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
     )?;
 
     let mut builder = TrayIconBuilder::new()
@@ -154,6 +162,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .tooltip("Murmur")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_main(app),
+            "record" => toggle_record(app),
             "bar" => toggle_bar(app),
             "quit" => app.exit(0),
             _ => {}
@@ -173,6 +182,14 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+/// Tray "Start / Stop recording": ask the (possibly hidden) main window to toggle a
+/// recording. The webview stays alive while hidden, so this records without opening a window.
+fn toggle_record(app: &tauri::AppHandle) {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.emit(crate::events::EVENT_TOGGLE_RECORD, ());
+    }
 }
 
 /// Show + focus the main window (after a hide/minimize), recreating it if it was closed.
