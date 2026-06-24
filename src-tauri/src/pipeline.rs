@@ -52,6 +52,7 @@ fn audio_dir() -> Result<PathBuf> {
 ///
 /// On any error the meeting is marked `Error` and an `error`-stage status is emitted
 /// before the error is propagated to the caller (the Tauri command).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_after_stop(
     app: &AppHandle,
     state: &AppState,
@@ -59,8 +60,9 @@ pub async fn run_after_stop(
     samples: Vec<f32>,
     src_rate: u32,
     duration_s: i64,
+    system_wav: Option<PathBuf>,
 ) -> Result<PipelineResult> {
-    match run_inner(app, state, meeting_id, samples, src_rate, duration_s).await {
+    match run_inner(app, state, meeting_id, samples, src_rate, duration_s, system_wav).await {
         Ok(result) => Ok(result),
         Err(e) => {
             // Persist the failure and surface it to the UI without leaking PII.
@@ -73,6 +75,7 @@ pub async fn run_after_stop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     app: &AppHandle,
     state: &AppState,
@@ -80,6 +83,7 @@ async fn run_inner(
     samples: Vec<f32>,
     src_rate: u32,
     duration_s: i64,
+    system_wav: Option<PathBuf>,
 ) -> Result<PipelineResult> {
     // Snapshot config under the lock, then release it for the rest of the async work.
     let config: AppConfig = {
@@ -94,10 +98,28 @@ async fn run_inner(
     let date_iso = now.format("%Y-%m-%d").to_string();
     let ended_at = now.to_rfc3339();
 
-    // ── 1. Write WAV (16 kHz mono) ──────────────────────────────────────────
+    // ── 1. Build 16 kHz mono samples (mic, optionally mixed with system audio) ──
+    let mic_16k = audio::resample_to_16k(&samples, src_rate)?;
+    let samples_16k = match system_wav {
+        Some(path) => match audio::read_wav_mono(&path) {
+            Ok((sys, sys_rate)) => {
+                let sys_16k = audio::resample_to_16k(&sys, sys_rate)?;
+                let _ = std::fs::remove_file(&path); // transient sidecar output
+                tracing::info!(target: "audio", "mixed mic + system-audio tracks");
+                audio::mix(&mic_16k, &sys_16k)
+            }
+            Err(e) => {
+                tracing::warn!(target: "audio", error = %e, "could not read system-audio track; using mic only");
+                mic_16k
+            }
+        },
+        None => mic_16k,
+    };
+
+    // Persist the (possibly mixed) 16 kHz mono WAV for archive.
     let wav_dir = audio_dir()?;
     let wav_path = wav_dir.join(format!("{meeting_id}.wav"));
-    audio::write_wav_16k_mono(&wav_path, &samples, src_rate)?;
+    audio::write_wav_16k_mono(&wav_path, &samples_16k, audio::TARGET_RATE_HZ)?;
     state.db.finalize_meeting(
         meeting_id,
         &ended_at,
@@ -110,7 +132,6 @@ async fn run_inner(
 
     let model_path = resolve_model_path(&config)?;
     let lang = config.language.as_deref();
-    let samples_16k = audio::resample_to_16k(&samples, src_rate)?;
 
     // Whisper load + inference are CPU/GPU-bound and blocking; run off the async
     // runtime's worker so we don't stall other tasks. The model path / lang are

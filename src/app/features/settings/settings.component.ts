@@ -81,6 +81,12 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           <input formControlName="claudeBinary" />
         </label>
 
+        <label class="check">
+          <input type="checkbox" formControlName="captureSystemAudio" />
+          Capture system audio (the other side of the call) — needs the Screen
+          Recording permission on first use
+        </label>
+
         <fieldset>
           <legend>Anthropic API key</legend>
           <p>Status: {{ hasKey() ? "set" : "not set" }}</p>
@@ -144,6 +150,11 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
       .row input {
         flex: 1;
       }
+      .check {
+        flex-direction: row;
+        align-items: center;
+        gap: 0.5rem;
+      }
       .ok {
         color: #27ae60;
       }
@@ -174,6 +185,7 @@ export class SettingsComponent implements OnInit {
       ollamaBaseUrl: cfg.ollamaBaseUrl,
       ollamaModel: cfg.ollamaModel,
       claudeBinary: cfg.claudeBinary,
+      captureSystemAudio: cfg.captureSystemAudio,
     });
     this.hasKey.set(await this.ipc.hasAnthropicKey());
     await this.refreshProviders();
@@ -204,6 +216,7 @@ export class SettingsComponent implements OnInit {
       ollamaBaseUrl: v.ollamaBaseUrl,
       ollamaModel: v.ollamaModel,
       claudeBinary: v.claudeBinary,
+      captureSystemAudio: v.captureSystemAudio,
     };
     await this.ipc.saveConfig(cfg);
     this.saved.set(true);

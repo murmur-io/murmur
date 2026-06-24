@@ -35,6 +35,7 @@ export interface AppConfigDto {
   ollamaBaseUrl: string;
   ollamaModel: string;
   claudeBinary: string;
+  captureSystemAudio: boolean;
 }
 
 export interface NoteDto {
