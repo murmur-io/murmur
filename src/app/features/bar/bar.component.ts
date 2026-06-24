@@ -10,8 +10,10 @@ import { RecorderStore } from "../../core/recorder.store";
 
 /**
  * The floating, always-on-top "OS bar" (a second Tauri window summoned with ⌘⇧R).
- * Frameless + transparent; reuses RecorderStore, so recording state stays in sync with
- * the main window through the backend's EVENT_STATUS broadcast.
+ * The window itself carries native macOS vibrancy (HudWindow) + a native rounded shadow,
+ * so the pill is REAL frosted glass that blurs the desktop behind it. The document is
+ * transparent; the CSS only adds a faint tint, border, and the content. Recording state
+ * stays in sync with the main window via the backend's EVENT_STATUS broadcast.
  */
 @Component({
   selector: "app-floating-bar",
@@ -42,7 +44,7 @@ import { RecorderStore } from "../../core/recorder.store";
         </button>
       } @else if (isProcessing()) {
         <span class="orb proc" data-tauri-drag-region aria-hidden="true"></span>
-        <span class="label" data-tauri-drag-region>{{
+        <span class="label proc-label" data-tauri-drag-region>{{
           store.message() || store.stage()
         }}</span>
         <div class="track" aria-hidden="true"><div class="shim"></div></div>
@@ -81,34 +83,30 @@ import { RecorderStore } from "../../core/recorder.store";
         height: 100vh;
         overflow: hidden;
         background: transparent;
-        padding: 0;
       }
 
+      /* The pill fills the window; native vibrancy provides the frost + shadow. */
       .bar {
         display: flex;
         align-items: center;
         gap: var(--space-3);
         width: 100%;
-        max-width: 540px;
-        height: 84px;
-        padding: 0 var(--space-2) 0 var(--space-4);
+        height: 100%;
+        padding: 0 6px 0 var(--space-4);
         border-radius: var(--radius-pill);
-        border: 1px solid var(--glass-border);
-        background: rgba(20, 20, 28, 0.6);
-        -webkit-backdrop-filter: blur(34px) saturate(150%);
-        backdrop-filter: blur(34px) saturate(150%);
-        box-shadow:
-          0 8px 24px rgba(0, 0, 0, 0.45),
-          var(--glass-highlight);
-        animation: bar-pop 320ms var(--ease-spring) both;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        /* Faint tint over the vibrancy for text contrast — NOT an opaque fill. */
+        background: rgba(14, 14, 20, 0.2);
+        box-shadow: var(--glass-highlight);
+        animation: bar-pop 280ms var(--ease-spring) both;
         transition:
           border-color var(--transition),
-          box-shadow var(--transition);
+          background var(--transition);
       }
       @keyframes bar-pop {
         from {
           opacity: 0;
-          transform: translateY(-12px) scale(0.96);
+          transform: translateY(-10px) scale(0.97);
         }
         to {
           opacity: 1;
@@ -117,65 +115,68 @@ import { RecorderStore } from "../../core/recorder.store";
       }
       .bar.is-recording {
         border-color: rgba(255, 122, 92, 0.45);
+        background: rgba(28, 14, 14, 0.22);
         box-shadow:
-          0 0 0 1px rgba(255, 122, 92, 0.35),
-          0 8px 26px rgba(255, 94, 120, 0.32),
-          var(--glass-highlight);
+          var(--glass-highlight),
+          inset 0 0 24px rgba(255, 122, 92, 0.1);
       }
 
-      /* Drag handle (two dots) */
+      /* Drag handle */
       .grip {
         display: inline-flex;
         flex-direction: column;
-        gap: 4px;
-        padding: var(--space-2) 2px;
+        gap: 3px;
+        padding: var(--space-2) 1px;
         cursor: grab;
       }
       .grip i {
-        width: 4px;
-        height: 4px;
+        width: 3px;
+        height: 3px;
         border-radius: 50%;
         background: var(--text-muted);
       }
 
       .label {
         flex: 1;
-        font-size: 1rem;
+        min-width: 0;
+        font-size: 0.95rem;
         font-weight: 550;
         letter-spacing: -0.01em;
         color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
         cursor: default;
       }
-      .label.ready-label {
+      .ready-label {
         cursor: grab;
       }
-      .is-processing .label {
-        flex: none;
+      .proc-label {
         text-transform: capitalize;
       }
 
       .kbd {
         display: inline-flex;
         align-items: center;
-        height: 26px;
+        height: 24px;
         padding: 0 var(--space-2);
         border-radius: var(--radius-sm);
-        background: rgba(255, 255, 255, 0.07);
+        background: rgba(255, 255, 255, 0.08);
         border: 1px solid var(--border);
         color: var(--text-secondary);
         font-family: var(--font-mono);
-        font-size: 0.78rem;
+        font-size: 0.74rem;
         cursor: grab;
       }
 
       .timer {
         font-family: var(--font-mono);
-        font-size: 1rem;
+        font-size: 0.95rem;
         font-weight: 500;
         font-variant-numeric: tabular-nums;
         letter-spacing: 0.02em;
         color: var(--text-primary);
-        min-width: 52px;
+        min-width: 48px;
         cursor: grab;
       }
 
@@ -185,12 +186,12 @@ import { RecorderStore } from "../../core/recorder.store";
         display: flex;
         align-items: center;
         gap: 3px;
-        height: 34px;
+        height: 24px;
       }
       .wbar {
         flex: 1;
         min-width: 2px;
-        max-width: 5px;
+        max-width: 4px;
         height: 100%;
         border-radius: var(--radius-pill);
         background: var(--live-gradient);
@@ -211,10 +212,11 @@ import { RecorderStore } from "../../core/recorder.store";
 
       /* Processing shimmer */
       .track {
-        flex: 1;
+        flex: none;
+        width: 72px;
         height: 4px;
         border-radius: var(--radius-pill);
-        background: rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.1);
         overflow: hidden;
       }
       .shim {
@@ -233,14 +235,14 @@ import { RecorderStore } from "../../core/recorder.store";
         }
       }
 
-      /* Circular action buttons */
+      /* Circular action buttons (sized to the slimmer pill) */
       .circle {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 60px;
-        height: 60px;
-        min-width: 60px;
+        width: 44px;
+        height: 44px;
+        min-width: 44px;
         border: none;
         border-radius: 50%;
         cursor: pointer;
@@ -261,7 +263,7 @@ import { RecorderStore } from "../../core/recorder.store";
         box-shadow: var(--shadow-accent);
       }
       .circle.rec:hover:not(:disabled) {
-        transform: scale(1.05);
+        transform: scale(1.06);
         filter: brightness(1.08);
       }
       .circle.rec:disabled {
@@ -269,34 +271,34 @@ import { RecorderStore } from "../../core/recorder.store";
         cursor: not-allowed;
       }
       .circle.rec .dot {
-        width: 18px;
-        height: 18px;
+        width: 15px;
+        height: 15px;
         border-radius: 50%;
         background: #fff;
       }
       .circle.stop {
         background: var(--live-gradient);
-        box-shadow: 0 8px 24px rgba(255, 94, 120, 0.45);
+        box-shadow: 0 6px 18px rgba(255, 94, 120, 0.45);
       }
       .circle.stop:hover {
-        transform: scale(1.05);
+        transform: scale(1.06);
         filter: brightness(1.08);
       }
       .circle.stop:focus-visible {
         box-shadow: 0 0 0 3px rgba(255, 122, 92, 0.6);
       }
       .circle.stop .sq {
-        width: 17px;
-        height: 17px;
-        border-radius: 5px;
+        width: 14px;
+        height: 14px;
+        border-radius: 4px;
         background: #fff;
       }
 
       /* Status orbs */
       .orb {
-        width: 13px;
-        height: 13px;
-        min-width: 13px;
+        width: 12px;
+        height: 12px;
+        min-width: 12px;
         border-radius: 50%;
         position: relative;
       }
@@ -356,7 +358,7 @@ import { RecorderStore } from "../../core/recorder.store";
 export class FloatingBarComponent implements OnInit {
   readonly store = inject(RecorderStore);
 
-  readonly bars = Array.from({ length: 32 }, (_, i) => i);
+  readonly bars = Array.from({ length: 30 }, (_, i) => i);
 
   readonly isProcessing = computed(
     () => this.store.isBusy() && !this.store.isRecording(),
@@ -371,7 +373,7 @@ export class FloatingBarComponent implements OnInit {
   constructor() {
     // This window must be see-through so only the frosted pill shows. Force the document
     // transparent immediately (don't wait on the app-shell effect); `color-scheme: dark`
-    // otherwise paints an opaque black canvas behind the pill.
+    // otherwise paints an opaque black canvas over the native vibrancy.
     document.documentElement.style.background = "transparent";
     document.documentElement.style.colorScheme = "normal";
     document.body.style.background = "transparent";

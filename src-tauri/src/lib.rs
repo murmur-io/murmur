@@ -11,6 +11,7 @@ pub mod storage;
 pub mod summarize;
 pub mod transcribe;
 
+use tauri::window::{Effect, EffectsBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -79,13 +80,19 @@ fn create_bar_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     }
     let win = WebviewWindowBuilder::new(app, "bar", WebviewUrl::App("bar".into()))
         .title("MeetNotes")
-        .inner_size(600.0, 152.0)
+        .inner_size(540.0, 58.0)
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
-        .shadow(false)
+        .shadow(true)
+        .effects(
+            EffectsBuilder::new()
+                .effect(Effect::HudWindow)
+                .radius(29.0)
+                .build(),
+        )
         .visible(false)
         .build()?;
     position_bar_top_center(&win);
