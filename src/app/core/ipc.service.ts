@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppConfigDto,
+  Meeting,
+  MeetingDetail,
   NoteDto,
   ProviderStatus,
   StartResult,
@@ -56,6 +58,14 @@ export class IpcService {
 
   resummarize(meetingId: string): Promise<StopResult> {
     return invoke<StopResult>("resummarize", { meetingId });
+  }
+
+  listMeetings(): Promise<Meeting[]> {
+    return invoke<Meeting[]>("list_meetings");
+  }
+
+  getMeetingDetail(meetingId: string): Promise<MeetingDetail | null> {
+    return invoke<MeetingDetail | null>("get_meeting_detail", { meetingId });
   }
 
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {

@@ -15,6 +15,20 @@ export const routes: Routes = [
         (m) => m.SettingsComponent,
       ),
   },
+  {
+    path: "library",
+    loadComponent: () =>
+      import("./features/library/library.component").then(
+        (m) => m.LibraryComponent,
+      ),
+  },
+  {
+    path: "meeting/:id",
+    loadComponent: () =>
+      import("./features/detail/detail.component").then(
+        (m) => m.DetailComponent,
+      ),
+  },
   { path: "", pathMatch: "full", redirectTo: "record" },
   { path: "**", redirectTo: "record" },
 ];

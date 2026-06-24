@@ -8,6 +8,7 @@ use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{Meeting, MeetingStatus};
 use crate::summarize::all_providers;
+use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
 use tauri::Emitter;
 
@@ -59,6 +60,15 @@ pub struct AppConfigDto {
     pub ollama_base_url: String,
     pub ollama_model: String,
     pub claude_binary: String,
+}
+
+/// A meeting + its latest note + transcript segments (Library Detail view).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDetailDto {
+    pub meeting: Meeting,
+    pub note: Option<NoteDto>,
+    pub segments: Vec<Segment>,
 }
 
 // ── Commands (PHASE0-PLAN §7) ──
@@ -329,4 +339,37 @@ pub async fn resummarize(
         markdown: result.note_markdown,
         exported_path: result.exported_path.to_string_lossy().to_string(),
     })
+}
+
+/// Recent meetings for the Library list (newest first, capped).
+#[tauri::command]
+pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppError> {
+    state.db.list_meetings(200)
+}
+
+/// A meeting + its latest note + transcript segments for the Detail view.
+/// Returns `None` if the meeting id is unknown.
+#[tauri::command]
+pub fn get_meeting_detail(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Option<MeetingDetailDto>, AppError> {
+    let Some(meeting) = state.db.get_meeting(&meeting_id)? else {
+        return Ok(None);
+    };
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .map(|n| NoteDto {
+            meeting_id: n.meeting_id,
+            provider_id: n.provider_id,
+            markdown: n.markdown,
+            exported_path: n.exported_path,
+        });
+    let segments = state.db.get_segments(&meeting_id)?;
+    Ok(Some(MeetingDetailDto {
+        meeting,
+        note,
+        segments,
+    }))
 }

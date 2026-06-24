@@ -38,6 +38,8 @@ pub fn run() {
             commands::has_anthropic_key,
             commands::provider_statuses,
             commands::resummarize,
+            commands::list_meetings,
+            commands::get_meeting_detail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
