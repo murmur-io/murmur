@@ -165,7 +165,10 @@ interface SnippetPart {
         } @else {
           <ul class="list card">
             @for (m of meetings(); track m.id; let i = $index) {
-              <li>
+              <li
+                class="row-item"
+                [class.is-confirming]="pendingDeleteId() === m.id"
+              >
                 <a
                   class="row"
                   [routerLink]="['/meeting', m.id]"
@@ -191,6 +194,83 @@ interface SnippetPart {
                     <span class="chevron" aria-hidden="true">›</span>
                   </span>
                 </a>
+
+                <!-- Subtle delete affordance — a separate button (never the
+                     row's link). stop/prevent so a click can't navigate. -->
+                <button
+                  type="button"
+                  class="row-delete"
+                  [attr.aria-label]="
+                    'Delete meeting: ' + (m.title || '(untitled)')
+                  "
+                  (click)="
+                    $event.preventDefault();
+                    $event.stopPropagation();
+                    askDelete(m.id)
+                  "
+                >
+                  <svg
+                    viewBox="0 0 16 16"
+                    width="15"
+                    height="15"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M3 4.5h10M6.5 4.5V3.5a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M5.5 4.5l.4 8a1 1 0 0 0 1 .95h2.2a1 1 0 0 0 1-.95l.4-8"
+                      stroke="currentColor"
+                      stroke-width="1.3"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      fill="none"
+                    />
+                  </svg>
+                </button>
+
+                @if (pendingDeleteId() === m.id) {
+                  <!-- In-app confirm (signal-driven; NOT window.confirm) -->
+                  <div
+                    class="confirm"
+                    role="alertdialog"
+                    aria-modal="true"
+                    [attr.aria-label]="
+                      'Delete meeting: ' + (m.title || '(untitled)')
+                    "
+                  >
+                    <p class="confirm-title">Delete this meeting?</p>
+                    <p class="confirm-body">
+                      This permanently removes the recording, transcript,
+                      summary and vault note. It can’t be undone.
+                    </p>
+                    @if (deleteError()) {
+                      <p class="confirm-error" role="alert">
+                        {{ deleteError() }}
+                      </p>
+                    }
+                    <div class="confirm-actions">
+                      <button
+                        type="button"
+                        class="btn btn-ghost"
+                        [disabled]="deleting()"
+                        (click)="cancelDelete()"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-danger"
+                        [disabled]="deleting()"
+                        (click)="confirmDelete(m.id)"
+                      >
+                        @if (deleting()) {
+                          <span class="spinner" aria-hidden="true"></span>
+                          Deleting…
+                        } @else {
+                          Delete
+                        }
+                      </button>
+                    </div>
+                  </div>
+                }
               </li>
             }
           </ul>
@@ -309,22 +389,6 @@ interface SnippetPart {
       .library-head h2 {
         margin: 0;
       }
-      .count {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 24px;
-        height: 24px;
-        padding: 0 var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-        color: var(--text-secondary);
-        font-size: 0.8125rem;
-        font-weight: 600;
-        font-variant-numeric: tabular-nums;
-        line-height: 1;
-      }
 
       /* --- Meeting / results list --- */
       .list {
@@ -358,6 +422,99 @@ interface SnippetPart {
       }
       .row:active {
         transform: translateY(1px);
+      }
+
+      /* --- Per-row delete affordance (hidden until hover / focus) --------- */
+      .row-item {
+        position: relative;
+      }
+      /* Keep the link clear of the delete button's hover footprint. */
+      .row-item .row {
+        padding-right: var(--space-7);
+      }
+      .row-delete {
+        position: absolute;
+        top: 50%;
+        right: var(--space-3);
+        transform: translateY(-50%) scale(0.9);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        background: var(--surface-input);
+        color: var(--text-muted);
+        cursor: pointer;
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity var(--transition),
+          transform var(--transition-fast),
+          background var(--transition),
+          border-color var(--transition),
+          color var(--transition);
+      }
+      .row-item:hover .row-delete,
+      .row-item:focus-within .row-delete,
+      .row-item.is-confirming .row-delete {
+        opacity: 1;
+        pointer-events: auto;
+        transform: translateY(-50%) scale(1);
+      }
+      .row-delete:hover {
+        background: var(--danger-soft);
+        border-color: var(--danger);
+        color: var(--danger);
+      }
+      .row-delete:active {
+        transform: translateY(-50%) scale(0.92);
+      }
+      .row-delete:focus-visible {
+        outline: none;
+        opacity: 1;
+        pointer-events: auto;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      /* Fade the decorative chevron out so the ✕ owns the right edge. */
+      .row-item:hover .chevron,
+      .row-item:focus-within .chevron,
+      .row-item.is-confirming .chevron {
+        opacity: 0;
+      }
+
+      /* --- In-app delete confirm (signal-driven; not window.confirm) ------ */
+      .confirm {
+        margin: 0 var(--space-2) var(--space-2);
+        padding: var(--space-4);
+        border: 1px solid var(--danger);
+        border-radius: var(--radius-md);
+        background: var(--danger-soft);
+        animation: rise 200ms var(--transition) both;
+      }
+      .confirm-title {
+        margin: 0 0 var(--space-1);
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+      .confirm-body {
+        margin: 0;
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+        line-height: 1.5;
+      }
+      .confirm-error {
+        margin: var(--space-3) 0 0;
+        color: var(--danger);
+        font-size: 0.8125rem;
+      }
+      .confirm-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: var(--space-2);
+        margin-top: var(--space-4);
       }
 
       .row-main {
@@ -406,6 +563,7 @@ interface SnippetPart {
         line-height: 1;
         transition:
           color var(--transition),
+          opacity var(--transition),
           transform var(--transition);
       }
       .row:hover .chevron {
@@ -456,10 +614,7 @@ interface SnippetPart {
         padding: 0 2px;
       }
 
-      /* --- Empty / loading states --- */
-      .state-card {
-        padding: var(--space-6);
-      }
+      /* --- Loading states (.count/.state-card/.empty* are global) --- */
       .searching {
         display: inline-flex;
         align-items: center;
@@ -479,31 +634,6 @@ interface SnippetPart {
           transform: rotate(360deg);
         }
       }
-      .empty-state {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: var(--space-2);
-        padding: var(--space-7) var(--space-5);
-        text-align: center;
-      }
-      .empty-mark {
-        width: 44px;
-        height: 44px;
-        margin-bottom: var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-      }
-      .empty-title {
-        margin: 0;
-        color: var(--text-primary);
-        font-weight: 600;
-      }
-      .empty {
-        margin: 0;
-        color: var(--text-muted);
-      }
     `,
   ],
 })
@@ -518,6 +648,14 @@ export class LibraryComponent implements OnInit {
   // --- No-query meetings list (unchanged behaviour) -----------------------
   readonly meetings = signal<Meeting[]>([]);
   readonly loading = signal(true);
+
+  // --- Delete affordance (in-app, signal-driven confirm) ------------------
+  /** Id of the meeting whose inline confirm panel is open (null = none). */
+  readonly pendingDeleteId = signal<string | null>(null);
+  /** True while a delete IPC call is in flight — guards the confirm button. */
+  readonly deleting = signal(false);
+  /** Non-empty when the last delete failed (cleared on the next attempt). */
+  readonly deleteError = signal<string | null>(null);
 
   // --- Search state -------------------------------------------------------
   /** Raw, untrimmed query bound to the input. */
@@ -614,6 +752,48 @@ export class LibraryComponent implements OnInit {
     this.results.set([]);
     this.searching.set(false);
     this.searchInput()?.nativeElement.focus();
+  }
+
+  // --- Delete a meeting (open confirm → await IPC → prune signal) ----------
+
+  /**
+   * Open the inline confirm panel for `id`. The triggering ✕ button calls
+   * `preventDefault`/`stopPropagation` itself so the row never navigates.
+   */
+  askDelete(id: string): void {
+    this.deleteError.set(null);
+    this.pendingDeleteId.set(id);
+  }
+
+  /** Dismiss the confirm panel without deleting (ignored mid-flight). */
+  cancelDelete(): void {
+    if (this.deleting()) {
+      return;
+    }
+    this.pendingDeleteId.set(null);
+    this.deleteError.set(null);
+  }
+
+  /**
+   * Confirm the pending delete: await the irreversible IPC call, then prune the
+   * row from the local `meetings` signal (no full reload needed). On failure we
+   * surface an inline error and keep the panel open so the user can retry.
+   */
+  async confirmDelete(id: string): Promise<void> {
+    if (this.deleting()) {
+      return;
+    }
+    this.deleting.set(true);
+    this.deleteError.set(null);
+    try {
+      await this.ipc.deleteMeeting(id);
+      this.meetings.update((list) => list.filter((m) => m.id !== id));
+      this.pendingDeleteId.set(null);
+    } catch {
+      this.deleteError.set("Couldn’t delete this meeting. Please try again.");
+    } finally {
+      this.deleting.set(false);
+    }
   }
 
   // --- Snippet highlighting (no innerHTML / DomSanitizer) ------------------
