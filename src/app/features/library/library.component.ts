@@ -80,6 +80,32 @@ interface SnippetPart {
         }
       </div>
 
+      <!-- Tag filter chips (hidden during an active search; absent if no tags) -->
+      @if (!hasQuery() && tags().length > 0) {
+        <div class="tagbar" role="group" aria-label="Filter meetings by tag">
+          <button
+            type="button"
+            class="chip"
+            [class.is-active]="activeTag() === null"
+            [attr.aria-pressed]="activeTag() === null"
+            (click)="selectTag(null)"
+          >
+            All
+          </button>
+          @for (tag of tags(); track tag) {
+            <button
+              type="button"
+              class="chip"
+              [class.is-active]="activeTag() === tag"
+              [attr.aria-pressed]="activeTag() === tag"
+              (click)="selectTag(tag)"
+            >
+              {{ tag }}
+            </button>
+          }
+        </div>
+      }
+
       @if (hasQuery()) {
         <!-- ===================== SEARCH RESULTS ===================== -->
         <header class="library-head">
@@ -146,25 +172,32 @@ interface SnippetPart {
       } @else {
         <!-- ===================== MEETINGS LIST (no query) ===================== -->
         <header class="library-head">
-          <h2>Meetings</h2>
-          @if (!loading() && meetings().length > 0) {
-            <span class="count">{{ meetings().length }}</span>
+          <h2>{{ activeTag() === null ? "Meetings" : activeTag() }}</h2>
+          @if (!listLoading() && displayedMeetings().length > 0) {
+            <span class="count">{{ displayedMeetings().length }}</span>
           }
         </header>
 
-        @if (loading()) {
+        @if (listLoading()) {
           <div class="card state-card">
             <p class="empty">Loading…</p>
           </div>
-        } @else if (meetings().length === 0) {
+        } @else if (displayedMeetings().length === 0) {
           <div class="card empty-state">
             <span class="empty-mark" aria-hidden="true"></span>
-            <p class="empty-title">No meetings yet</p>
-            <p class="empty">Record one from the Record tab to see it here.</p>
+            @if (activeTag() === null) {
+              <p class="empty-title">No meetings yet</p>
+              <p class="empty">
+                Record one from the Record tab to see it here.
+              </p>
+            } @else {
+              <p class="empty-title">No meetings tagged “{{ activeTag() }}”</p>
+              <p class="empty">Pick another tag, or choose All.</p>
+            }
           </div>
         } @else {
           <ul class="list card">
-            @for (m of meetings(); track m.id; let i = $index) {
+            @for (m of displayedMeetings(); track m.id; let i = $index) {
               <li
                 class="row-item"
                 [class.is-confirming]="pendingDeleteId() === m.id"
@@ -379,6 +412,54 @@ interface SnippetPart {
       .search-clear:focus-visible {
         outline: none;
         box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+
+      /* --- Tag filter chips (pill language; accent for the active tag) ----- */
+      .tagbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-2);
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        height: 30px;
+        padding: 0 var(--space-3);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-pill);
+        background: var(--surface-input);
+        color: var(--text-secondary);
+        font-family: inherit;
+        font-size: 0.8125rem;
+        font-weight: 550;
+        letter-spacing: -0.01em;
+        line-height: 1;
+        white-space: nowrap;
+        cursor: pointer;
+        transition:
+          background var(--transition),
+          border-color var(--transition),
+          color var(--transition),
+          transform var(--transition-fast);
+      }
+      .chip:hover {
+        background: var(--surface-hover);
+        border-color: var(--border-strong);
+        color: var(--text-primary);
+      }
+      .chip:active {
+        transform: scale(0.96);
+      }
+      .chip:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .chip.is-active {
+        background: var(--accent-soft);
+        border-color: transparent;
+        color: var(--accent-hover);
+        font-weight: 600;
       }
 
       .library-head {
@@ -649,6 +730,25 @@ export class LibraryComponent implements OnInit {
   readonly meetings = signal<Meeting[]>([]);
   readonly loading = signal(true);
 
+  // --- Tag filter ----------------------------------------------------------
+  /** All distinct tags across meetings; empty → no filter bar is rendered. */
+  readonly tags = signal<string[]>([]);
+  /** Selected tag (null = "All", i.e. the full meetings list). */
+  readonly activeTag = signal<string | null>(null);
+  /** Meetings carrying the active tag (only used when a tag is selected). */
+  readonly tagMeetings = signal<Meeting[]>([]);
+  /** True while a tag's meetings are being fetched. */
+  readonly tagLoading = signal(false);
+
+  /** The list to render when not searching: full list, or the tag-filtered one. */
+  readonly displayedMeetings = computed(() =>
+    this.activeTag() === null ? this.meetings() : this.tagMeetings(),
+  );
+  /** Loading state for the visible no-query list (initial load or a tag fetch). */
+  readonly listLoading = computed(() =>
+    this.activeTag() === null ? this.loading() : this.tagLoading(),
+  );
+
   // --- Delete affordance (in-app, signal-driven confirm) ------------------
   /** Id of the meeting whose inline confirm panel is open (null = none). */
   readonly pendingDeleteId = signal<string | null>(null);
@@ -672,17 +772,72 @@ export class LibraryComponent implements OnInit {
   private searchTimer: ReturnType<typeof setTimeout> | null = null;
 
   async ngOnInit(): Promise<void> {
-    try {
-      this.meetings.set(await this.ipc.listMeetings());
-    } finally {
-      this.loading.set(false);
-    }
     // Clean up any in-flight debounce timer when the view is torn down.
     this.destroyRef.onDestroy(() => {
       if (this.searchTimer) {
         clearTimeout(this.searchTimer);
       }
     });
+
+    // Load the meetings list and the tag set in parallel; a tag-load failure
+    // must not break the list, so settle each independently.
+    const [meetings] = await Promise.allSettled([
+      this.ipc.listMeetings(),
+      this.loadTags(),
+    ]);
+    if (meetings.status === "fulfilled") {
+      this.meetings.set(meetings.value);
+    }
+    this.loading.set(false);
+  }
+
+  /** Fetch the distinct tag set; on failure leave `tags` empty (no filter bar). */
+  private async loadTags(): Promise<void> {
+    try {
+      this.tags.set(await this.ipc.listAllTags());
+    } catch {
+      this.tags.set([]);
+    }
+  }
+
+  // --- Tag filtering -------------------------------------------------------
+
+  /**
+   * Select a tag (or `null` for "All"). "All" clears back to the full meetings
+   * list; a tag loads its meetings into `tagMeetings`. Latest-tag-wins so a
+   * slower earlier fetch can't clobber a newer selection.
+   */
+  async selectTag(tag: string | null): Promise<void> {
+    if (this.activeTag() === tag) {
+      return;
+    }
+    // Switching the view dismisses any open delete confirm to avoid a dangling
+    // panel pointing at a row that may not be in the new list.
+    this.cancelDelete();
+    this.activeTag.set(tag);
+
+    if (tag === null) {
+      this.tagMeetings.set([]);
+      this.tagLoading.set(false);
+      return;
+    }
+
+    this.tagLoading.set(true);
+    try {
+      const list = await this.ipc.listMeetingsByTag(tag);
+      if (this.activeTag() !== tag) {
+        return; // stale — a newer tag selection superseded this request.
+      }
+      this.tagMeetings.set(list);
+    } catch {
+      if (this.activeTag() === tag) {
+        this.tagMeetings.set([]);
+      }
+    } finally {
+      if (this.activeTag() === tag) {
+        this.tagLoading.set(false);
+      }
+    }
   }
 
   // --- Search-as-you-type --------------------------------------------------
@@ -710,6 +865,13 @@ export class LibraryComponent implements OnInit {
       this.searching.set(false);
       this.results.set([]);
       return;
+    }
+
+    // Search takes precedence over the tag filter: reset to the full list so
+    // that clearing the search returns to "All" (the chip bar is hidden while
+    // searching). Per-row delete still works against `meetings` underneath.
+    if (this.activeTag() !== null) {
+      void this.selectTag(null);
     }
 
     this.searching.set(true);
@@ -787,7 +949,9 @@ export class LibraryComponent implements OnInit {
     this.deleteError.set(null);
     try {
       await this.ipc.deleteMeeting(id);
+      // Prune from both lists so whichever view is showing updates at once.
       this.meetings.update((list) => list.filter((m) => m.id !== id));
+      this.tagMeetings.update((list) => list.filter((m) => m.id !== id));
       this.pendingDeleteId.set(null);
     } catch {
       this.deleteError.set("Couldn’t delete this meeting. Please try again.");

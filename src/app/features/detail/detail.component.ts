@@ -113,6 +113,39 @@ interface ParsedNote {
                 formatDuration(d.meeting.durationS)
               }}</span>
             </div>
+
+            <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags) -->
+            <div class="tag-editor">
+              @for (t of tags(); track t) {
+                <span class="pill tag-chip">
+                  {{ t }}
+                  <button
+                    type="button"
+                    class="tag-x"
+                    [attr.aria-label]="'Remove tag ' + t"
+                    [disabled]="tagsBusy()"
+                    (click)="removeTag(t)"
+                  >
+                    ×
+                  </button>
+                </span>
+              }
+              <input
+                type="text"
+                class="tag-input"
+                placeholder="+ Add tag"
+                aria-label="Add tag"
+                autocapitalize="off"
+                autocomplete="off"
+                [value]="tagDraft()"
+                [disabled]="tagsBusy()"
+                (input)="onTagInput($event)"
+                (keydown.enter)="addTag()"
+              />
+            </div>
+            @if (tagsError(); as err) {
+              <span class="tag-error" role="alert">{{ err }}</span>
+            }
           </div>
 
           <div class="actions">
@@ -573,6 +606,66 @@ interface ParsedNote {
       .meta-item,
       .meta-sep {
         color: var(--text-muted);
+      }
+
+      /* --- Tag editor (chips + inline add) --- */
+      .tag-editor {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-2);
+      }
+      .tag-chip {
+        height: 26px;
+        padding: 0 var(--space-1) 0 var(--space-3);
+        background: var(--accent-soft);
+        border-color: transparent;
+        color: var(--accent-hover);
+        font-size: 0.75rem;
+        font-weight: 600;
+      }
+      .tag-x {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        border: none;
+        border-radius: var(--radius-pill);
+        background: transparent;
+        color: inherit;
+        font-size: 0.95rem;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0.7;
+        transition:
+          background var(--transition),
+          opacity var(--transition);
+      }
+      .tag-x:hover:not(:disabled) {
+        background: var(--surface-hover);
+        opacity: 1;
+      }
+      .tag-x:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 2px var(--accent-ring);
+      }
+      .tag-x:disabled {
+        cursor: default;
+        opacity: 0.4;
+      }
+      .tag-input {
+        width: auto;
+        flex: 0 1 9rem;
+        height: 26px;
+        padding: 0 var(--space-3);
+        border-radius: var(--radius-pill);
+        font-size: 0.75rem;
+      }
+      .tag-error {
+        color: var(--danger);
+        font-size: 0.8125rem;
       }
 
       .actions {
@@ -1305,6 +1398,16 @@ export class DetailComponent implements OnInit {
   /** Tracked so we can cancel the pending export-label reset on destroy. */
   private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // --- Meeting tags (editable; persisted via set/getMeetingTags) -----------
+  /** The meeting's current tags (loaded in ngOnInit; updated optimistically). */
+  readonly tags = signal<string[]>([]);
+  /** Working copy of the add-tag input (input (input) → signal). */
+  readonly tagDraft = signal("");
+  /** Disables chips + input while a setMeetingTags IPC call is in flight. */
+  readonly tagsBusy = signal(false);
+  /** Inline error surfaced when a tag add/remove fails. */
+  readonly tagsError = signal("");
+
   // --- Audio player state (driven by the <audio> event bindings) ----------
   private readonly audio = viewChild<ElementRef<HTMLAudioElement>>("player");
   readonly currentTime = signal(0);
@@ -1376,6 +1479,12 @@ export class DetailComponent implements OnInit {
     // tolerates the first-call LLM latency (backend caches the result).
     if (this.detail()) {
       void this.loadTimeline();
+      // Load the meeting's tags (best-effort; failure leaves the chips empty).
+      try {
+        this.tags.set(await this.ipc.getMeetingTags(id));
+      } catch {
+        this.tags.set([]);
+      }
     }
   }
 
@@ -1551,6 +1660,61 @@ export class DetailComponent implements OnInit {
         clearTimeout(this.savedResetTimer);
       }
     });
+  }
+
+  // --- Meeting tags --------------------------------------------------------
+
+  /** Mirror the add-tag input value into the `tagDraft` signal. */
+  onTagInput(event: Event): void {
+    this.tagDraft.set((event.target as HTMLInputElement).value);
+  }
+
+  /**
+   * Add the typed tag: trim, ignore empty/duplicate (case-insensitive), then
+   * persist the new array. Clears the input on a non-empty attempt.
+   */
+  async addTag(): Promise<void> {
+    const tag = this.tagDraft().trim();
+    if (!tag) {
+      return;
+    }
+    const exists = this.tags().some(
+      (t) => t.toLowerCase() === tag.toLowerCase(),
+    );
+    this.tagDraft.set("");
+    if (exists) {
+      return;
+    }
+    await this.persistTags([...this.tags(), tag]);
+  }
+
+  /** Remove a tag and persist the reduced array. */
+  async removeTag(tag: string): Promise<void> {
+    await this.persistTags(this.tags().filter((t) => t !== tag));
+  }
+
+  /**
+   * Optimistically apply `next` to the `tags` signal, persist via
+   * setMeetingTags, and roll back to the previous tags if the write fails.
+   * Errors surface inline next to the editor.
+   */
+  private async persistTags(next: string[]): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id) {
+      return;
+    }
+    const previous = this.tags();
+    this.tagsError.set("");
+    this.tags.set(next);
+    this.tagsBusy.set(true);
+    try {
+      await this.ipc.setMeetingTags(id, next);
+    } catch (e) {
+      this.tags.set(previous);
+      this.tagsError.set("Couldn’t save tags: " + String(e));
+    } finally {
+      this.tagsBusy.set(false);
+    }
   }
 
   // --- Audio player controls ----------------------------------------------
