@@ -180,6 +180,15 @@ impl Db {
         Ok(())
     }
 
+    /// Delete a meeting and (via ON DELETE CASCADE) its segments, notes, and timeline.
+    /// Audio + vault files are removed by the caller before this.
+    pub fn delete_meeting(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
+            .map_err(map_err)?;
+        Ok(())
+    }
+
     pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>> {
         let conn = self.lock();
         conn.query_row(

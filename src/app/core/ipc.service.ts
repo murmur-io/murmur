@@ -78,6 +78,16 @@ export class IpcService {
     return invoke<SearchHit[]>("search_meetings", { query });
   }
 
+  /** Permanently delete a meeting (audio + vault note + all DB rows). Irreversible. */
+  deleteMeeting(meetingId: string): Promise<void> {
+    return invoke<void>("delete_meeting", { meetingId });
+  }
+
+  /** Rename a meeting's title. */
+  renameMeeting(meetingId: string, title: string): Promise<void> {
+    return invoke<void>("rename_meeting", { meetingId, title });
+  }
+
   /** Aggregate analytics for the dashboard + Analytics tab. */
   getAnalytics(): Promise<Analytics> {
     return invoke<Analytics>("get_analytics");

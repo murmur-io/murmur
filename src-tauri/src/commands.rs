@@ -323,6 +323,38 @@ pub fn search_meetings(
     state.db.search(&query, 100)
 }
 
+/// Permanently delete a meeting: its audio file, its exported vault note, and all DB rows
+/// (segments, notes, timeline cascade via FK). Irreversible.
+#[tauri::command]
+pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<(), AppError> {
+    // Capture + remove on-disk files before the rows disappear (best-effort).
+    if let Some(m) = state.db.get_meeting(&meeting_id)? {
+        if let Some(audio) = m.audio_path.as_deref() {
+            let _ = std::fs::remove_file(audio);
+        }
+    }
+    if let Some(note) = state.db.get_latest_note_for_meeting(&meeting_id)? {
+        if let Some(path) = note.exported_path.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    state.db.delete_meeting(&meeting_id)
+}
+
+/// Rename a meeting's title (in-app + Library list). Does not rename the vault file.
+#[tauri::command]
+pub fn rename_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    title: String,
+) -> Result<(), AppError> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(AppError::InvalidArg("title cannot be empty".into()));
+    }
+    state.db.set_meeting_title(&meeting_id, title)
+}
+
 /// Read current config (settings table), without secrets.
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> {
