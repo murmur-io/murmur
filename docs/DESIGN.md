@@ -79,8 +79,24 @@ Zaprojektowane tak, by **HostedProvider** (proxy+subskrypcja) oraz OpenAI/Groq/G
 - `notes(meeting_id, provider_id, markdown, created_at, exported_path)`
 - `settings(key, value)`
 
-### 5.5 Eksport do Obsidian
-- Zapis `.md` do skonfigurowanego folderu vaulta; nazwa `YYYY-MM-DD HHmm - <tytuł>.md`; nasz szablon + frontmatter. Idempotentnie (bez dublowania). Obsidian = folder `.md`, plik pojawia się sam.
+### 5.5 Obsidian — zapis i synchronizacja
+**Nie ma „integracji z API Obsidiana" — vault to folder plików `.md`.** Apka wrzuca plik, a file-watcher Obsidiana sam go pokazuje. To cała synchronizacja „notatka → Obsidian", jednokierunkowa.
+
+Rozdziel dwa znaczenia „synchro":
+- **(a) Notatka → vault — NASZ zakres:** zapis `.md` do folderu. Tyle.
+- **(b) Między urządzeniami — NIE nasz zakres:** Obsidian Sync / iCloud / Dropbox / git — cokolwiek user trzyma na vaulcie. Gdy plik już jest w folderze, ich mechanizm sam roznosi go na telefon/inne maszyny. Nie dotykamy tego.
+
+**Jak apka pozna vault:** Settings → dropdown wykrytych vaultów (czytamy `~/Library/Application Support/obsidian/obsidian.json`; ścieżka per-OS — Win/Linux później) + ręczny wybór folderu. Opcjonalnie podfolder docelowy (np. `Spotkania/`).
+
+**Bezpieczny zapis** (folder bywa obserwowany też przez sync):
+- Atomowo: zapis do `.tmp` (dotfile — Obsidian go ignoruje) → `rename` na finalną nazwę; Obsidian nigdy nie widzi półpliku.
+- Unikalne nazwy + licznik przy kolizji; idempotencja per spotkanie (bez nadpisywania ręcznych edycji usera).
+
+**Kierunek w v1:** jednokierunkowo (app → vault). SQLite = źródło prawdy apki; `.md` = artefakt. Brak read-backu — jeśli user skasuje/edytuje notatkę w Obsidianie, apka ma swój rekord i może wyeksportować ponownie na żądanie.
+
+**Sposób zapisu:** domyślnie **surowy zapis pliku** (działa nawet gdy Obsidian zamknięty — najpewniejszy). Opcjonalnie schemat `obsidian://` / plugin Advanced URI, żeby np. otworzyć notatkę po utworzeniu albo dopisać link do daily note — bajer UX, nie fundament (URI ma limity długości i wymaga uruchomionego Obsidiana).
+
+**Opcje (później):** link do daily note (`[[2026-06-24]]`), tagi per projekt, wybór szablonu/folderu per user.
 
 ### 5.6 UI (web/TS)
 - **Record** — start/stop, wskaźniki poziomu, status.
