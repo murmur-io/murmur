@@ -18,6 +18,7 @@ import type {
 
 export const EVENT_STATUS = "meetnotes://status";
 export const EVENT_VOICE_START = "murmur://voice-start";
+export const EVENT_TOGGLE_RECORD = "murmur://toggle-record";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -134,5 +135,10 @@ export class IpcService {
   /** Fires when the backend voice listener hears the wake phrase. */
   onVoiceStart(cb: () => void): Promise<UnlistenFn> {
     return listen(EVENT_VOICE_START, () => cb());
+  }
+
+  /** Fires when the menu-bar (tray) "Start / Stop recording" item is chosen. */
+  onToggleRecord(cb: () => void): Promise<UnlistenFn> {
+    return listen(EVENT_TOGGLE_RECORD, () => cb());
   }
 }
