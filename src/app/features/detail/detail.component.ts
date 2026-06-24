@@ -15,6 +15,7 @@ import { ActivatedRoute, Router, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { IpcService } from "../../core/ipc.service";
 import type { MeetingDetail, MeetingTimeline } from "../../core/models";
+import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingTimelineComponent } from "./meeting-timeline.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
@@ -49,7 +50,7 @@ interface ParsedNote {
   selector: "app-detail",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, MeetingTimelineComponent],
+  imports: [RouterLink, MeetingTimelineComponent, MeetingChatComponent],
   template: `
     <section class="detail">
       <a routerLink="/library" class="back">
@@ -409,6 +410,11 @@ interface ParsedNote {
               </p>
             </div>
           }
+        </section>
+
+        <!-- 2b) CHAT WITH THIS MEETING (grounded Q&A over the transcript) -- -->
+        <section class="block">
+          <app-meeting-chat [meetingId]="d.meeting.id" />
         </section>
 
         <!-- 3) CLICK-TO-SEEK TRANSCRIPT ----------------------------------- -->
