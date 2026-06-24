@@ -14,6 +14,7 @@ import type { AppConfigDto } from "../../core/models";
   selector: "app-record",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  host: { "(document:keydown)": "onKey($event)" },
   template: `
     <section class="record">
       @if (vaultMissing()) {
@@ -28,10 +29,9 @@ import type { AppConfigDto } from "../../core/models";
         <div class="banner is-accent model-banner" role="alert">
           <span class="banner-icon" aria-hidden="true">↓</span>
           <div class="model-banner-body">
-            <p class="model-banner-title">Whisper model needed</p>
+            <p class="model-banner-title">Transcription model needed</p>
             <p class="model-banner-text">
-              Transcription runs on-device. Download the model once to enable
-              recording.
+              Whisper runs on-device. Download it once to enable recording.
             </p>
             @if (modelDownloadError(); as derr) {
               <p class="model-banner-error">{{ derr }}</p>
@@ -42,67 +42,64 @@ import type { AppConfigDto } from "../../core/models";
               (click)="downloadModel()"
               [disabled]="downloadingModel()"
             >
-              @if (downloadingModel()) {
-                Downloading…
-              } @else {
-                Download model (~150 MB)
-              }
+              {{ downloadingModel() ? "Downloading…" : "Download model" }}
             </button>
           </div>
         </div>
       }
 
-      <div class="hero card">
-        <div class="hero-status">
-          <span class="pill" [class]="statusPillClass()">
-            <span class="pill-dot"></span>
-            {{ store.stage() }}
-          </span>
-          @if (store.message()) {
-            <span class="hero-message">{{ store.message() }}</span>
-          }
-        </div>
-
-        <div class="controls">
-          @if (!store.isRecording()) {
-            <button
-              type="button"
-              class="record-btn"
-              (click)="store.start()"
-              [disabled]="
-                store.isBusy() ||
-                vaultMissing() ||
-                modelPresent() === false ||
-                downloadingModel()
-              "
-            >
-              <span class="record-icon" aria-hidden="true"></span>
-              <span>Record</span>
-            </button>
-          } @else {
-            <button
-              type="button"
-              class="record-btn is-recording"
-              (click)="store.stop()"
-            >
-              <span class="record-icon stop" aria-hidden="true"></span>
-              <span>Stop</span>
-            </button>
-          }
-        </div>
-
+      <!-- ── The morphing recording bar (the hero) ───────────────────────── -->
+      <div class="stage" [class.live]="store.isRecording()">
         @if (store.isRecording()) {
-          <div
-            class="meter"
-            role="progressbar"
-            aria-label="Microphone level"
-            [attr.aria-valuenow]="levelPct()"
-            aria-valuemin="0"
-            aria-valuemax="100"
-          >
-            <div class="meter-fill" [style.width.%]="levelPct()"></div>
+          <div class="rec-bar is-recording" role="status">
+            <span class="orb live" aria-hidden="true"></span>
+            <span class="timer">{{ elapsedLabel() }}</span>
+            <div
+              class="wave"
+              [style.--level]="store.level()"
+              aria-hidden="true"
+            >
+              @for (b of bars; track b) {
+                <span class="wbar" [style.--i]="b"></span>
+              }
+            </div>
+            <button
+              type="button"
+              class="stop-btn"
+              (click)="store.stop()"
+              aria-label="Stop recording"
+            >
+              <span class="stop-ico" aria-hidden="true"></span>
+            </button>
           </div>
+        } @else if (isProcessing()) {
+          <div class="rec-bar is-processing" role="status">
+            <span class="orb proc" aria-hidden="true"></span>
+            <span class="proc-label">{{
+              store.message() || store.stage()
+            }}</span>
+            <div class="proc-track" aria-hidden="true">
+              <div class="proc-shimmer"></div>
+            </div>
+          </div>
+        } @else {
+          <button
+            type="button"
+            class="rec-bar is-ready"
+            (click)="store.start()"
+            [disabled]="!canRecord()"
+          >
+            <span class="orb ready" aria-hidden="true"></span>
+            <span class="ready-text">
+              {{
+                store.stage() === "done" ? "Record again" : "Ready to record"
+              }}
+            </span>
+            <span class="kbd" aria-hidden="true">⌘R</span>
+          </button>
         }
+
+        <p class="stage-hint">{{ hint() }}</p>
       </div>
 
       @if (store.error(); as err) {
@@ -112,6 +109,7 @@ import type { AppConfigDto } from "../../core/models";
         </div>
       }
 
+      <!-- ── Last note ───────────────────────────────────────────────────── -->
       <div class="last-note">
         <h3>Last note</h3>
         @if (store.lastNote(); as note) {
@@ -123,8 +121,10 @@ import type { AppConfigDto } from "../../core/models";
           </div>
         } @else {
           <div class="card empty-card">
+            <span class="empty-mark" aria-hidden="true"></span>
             <p class="empty">
-              No note yet — hit Record to capture your first meeting.
+              No note yet — press <span class="kbd-inline">⌘R</span> or hit the
+              bar to capture your first meeting.
             </p>
           </div>
         }
@@ -137,6 +137,7 @@ import type { AppConfigDto } from "../../core/models";
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
+        animation: rise 420ms var(--transition) both;
       }
 
       /* --- Model-download banner --- */
@@ -178,123 +179,315 @@ import type { AppConfigDto } from "../../core/models";
         margin-top: var(--space-1);
       }
 
-      /* --- Hero recording surface --- */
-      .hero {
+      /* ── Stage: the hero area with an atmospheric glow ─────────────────── */
+      .stage {
+        position: relative;
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: var(--space-5);
-        padding: var(--space-7) var(--space-5);
-        border-radius: var(--radius-xl);
-        text-align: center;
+        gap: var(--space-4);
+        padding: var(--space-8) var(--space-4) var(--space-7);
       }
-      .hero-status {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: var(--space-2);
-        min-height: 28px;
-      }
-      .hero-message {
-        color: var(--text-secondary);
-        font-size: 0.875rem;
-      }
-
-      .controls {
-        display: flex;
-        justify-content: center;
-      }
-
-      /* The primary Record control — large, inviting, accent-filled. */
-      .record-btn {
-        display: inline-flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: var(--space-2);
-        width: 168px;
-        height: 168px;
-        border: none;
+      .stage::before {
+        content: "";
+        position: absolute;
+        top: 8%;
+        left: 50%;
+        width: 460px;
+        height: 260px;
+        transform: translateX(-50%);
         border-radius: 50%;
-        background: var(--accent-gradient);
-        color: var(--text-on-accent);
-        font-family: inherit;
-        font-size: 1.0625rem;
-        font-weight: 600;
-        letter-spacing: -0.01em;
-        cursor: pointer;
-        box-shadow: var(--shadow-accent);
+        background: radial-gradient(
+          closest-side,
+          rgba(110, 118, 255, 0.28),
+          transparent 72%
+        );
+        filter: blur(28px);
+        opacity: 0.7;
         transition:
-          transform var(--transition),
+          background var(--transition),
+          opacity var(--transition);
+        pointer-events: none;
+      }
+      /* When recording, the glow warms + intensifies. */
+      .stage.live::before {
+        background: radial-gradient(
+          closest-side,
+          rgba(255, 110, 100, 0.32),
+          transparent 72%
+        );
+        opacity: 0.95;
+      }
+
+      /* ── The capsule, shared across states (each state swaps content) ──── */
+      .rec-bar {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        height: 72px;
+        padding: 0 var(--space-3) 0 var(--space-5);
+        border-radius: var(--radius-pill);
+        border: 1px solid var(--glass-border);
+        background: rgba(255, 255, 255, 0.05);
+        -webkit-backdrop-filter: blur(var(--glass-blur))
+          saturate(var(--glass-saturate));
+        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+        box-shadow: var(--shadow-lg), var(--glass-highlight);
+        animation: bar-in 360ms var(--ease-spring) both;
+        transition:
+          width var(--transition),
+          border-color var(--transition),
           box-shadow var(--transition),
-          filter var(--transition);
+          transform var(--transition-fast);
       }
-      .record-btn:hover:not(:disabled) {
+      @keyframes bar-in {
+        from {
+          opacity: 0;
+          transform: scale(0.94);
+        }
+        to {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      /* Ready — the whole capsule is the button. */
+      .rec-bar.is-ready {
+        width: 340px;
+        max-width: 100%;
+        cursor: pointer;
+        color: var(--text-primary);
+        font-family: inherit;
+      }
+      .rec-bar.is-ready:hover:not(:disabled) {
         transform: translateY(-2px);
-        filter: brightness(1.06);
-        box-shadow: 0 14px 40px rgba(110, 91, 255, 0.5);
+        border-color: var(--border-strong);
+        box-shadow:
+          0 32px 80px rgba(0, 0, 0, 0.6),
+          0 0 0 1px var(--accent-soft),
+          var(--glass-highlight);
       }
-      .record-btn:active:not(:disabled) {
+      .rec-bar.is-ready:active:not(:disabled) {
         transform: translateY(0);
       }
-      .record-btn:focus-visible {
+      .rec-bar.is-ready:focus-visible {
         outline: none;
         box-shadow:
-          0 0 0 4px var(--accent-ring),
-          var(--shadow-accent);
+          0 0 0 3px var(--accent-ring),
+          var(--shadow-lg);
       }
-      .record-btn:disabled {
-        opacity: 0.4;
+      .rec-bar.is-ready:disabled {
+        opacity: 0.45;
         cursor: not-allowed;
-        box-shadow: none;
-        filter: grayscale(0.4);
       }
-
-      .record-icon {
-        width: 22px;
-        height: 22px;
-        border-radius: 50%;
-        background: var(--text-on-accent);
+      .ready-text {
+        flex: 1;
+        text-align: left;
+        font-size: 1.0625rem;
+        font-weight: 550;
+        letter-spacing: -0.01em;
       }
-      .record-icon.stop {
+      .kbd {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 28px;
+        padding: 0 var(--space-3);
         border-radius: var(--radius-sm);
+        background: rgba(255, 255, 255, 0.07);
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+        font-weight: 500;
       }
 
-      /* While recording: soft glowing pulse to signal "live". */
-      .record-btn.is-recording {
-        animation: record-pulse 2s ease-in-out infinite;
+      /* Recording — warm, alive. */
+      .rec-bar.is-recording {
+        width: 520px;
+        max-width: 100%;
+        border-color: rgba(255, 122, 92, 0.4);
+        box-shadow: var(--live-glow), var(--shadow-lg), var(--glass-highlight);
       }
-      @keyframes record-pulse {
+      .timer {
+        font-family: var(--font-mono);
+        font-size: 1.0625rem;
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+        color: var(--text-primary);
+        min-width: 56px;
+      }
+      .wave {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        height: 36px;
+        padding: 0 var(--space-2);
+      }
+      .wbar {
+        flex: 1;
+        min-width: 2px;
+        max-width: 5px;
+        height: 100%;
+        border-radius: var(--radius-pill);
+        background: var(--live-gradient);
+        transform: scaleY(0.16);
+        transform-origin: center;
+        animation: wave 1100ms ease-in-out infinite;
+        animation-delay: calc(var(--i) * -78ms);
+      }
+      @keyframes wave {
         0%,
         100% {
-          box-shadow:
-            0 0 0 0 rgba(110, 91, 255, 0.45),
-            var(--shadow-accent);
+          transform: scaleY(calc(0.14 + var(--level, 0) * 0.55));
         }
         50% {
-          box-shadow:
-            0 0 0 18px rgba(110, 91, 255, 0),
-            var(--shadow-accent);
+          transform: scaleY(calc(0.32 + var(--level, 0) * 1.15));
         }
       }
 
-      /* --- Mic level meter --- */
-      .meter {
-        height: 8px;
-        width: 100%;
-        max-width: 320px;
-        background: rgba(255, 255, 255, 0.08);
-        border-radius: var(--radius-pill);
-        overflow: hidden;
+      /* Stop — warm circular button with a rounded square glyph. */
+      .stop-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 52px;
+        height: 52px;
+        min-width: 52px;
+        border: none;
+        border-radius: 50%;
+        background: var(--live-gradient);
+        cursor: pointer;
+        box-shadow: 0 8px 24px rgba(255, 94, 120, 0.45);
+        transition:
+          transform var(--transition-fast),
+          filter var(--transition);
       }
-      .meter-fill {
-        height: 100%;
-        background: var(--accent-gradient);
-        border-radius: var(--radius-pill);
-        transition: width 80ms linear;
+      .stop-btn:hover {
+        filter: brightness(1.08);
+        transform: scale(1.04);
+      }
+      .stop-btn:active {
+        transform: scale(0.97);
+      }
+      .stop-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(255, 122, 92, 0.6);
+      }
+      .stop-ico {
+        width: 17px;
+        height: 17px;
+        border-radius: 5px;
+        background: #fff;
       }
 
-      /* --- Last note --- */
+      /* Processing — cool, calm, working. */
+      .rec-bar.is-processing {
+        width: 420px;
+        max-width: 100%;
+      }
+      .proc-label {
+        flex: none;
+        color: var(--text-primary);
+        font-size: 0.95rem;
+        font-weight: 550;
+        text-transform: capitalize;
+      }
+      .proc-track {
+        flex: 1;
+        height: 4px;
+        border-radius: var(--radius-pill);
+        background: rgba(255, 255, 255, 0.08);
+        overflow: hidden;
+      }
+      .proc-shimmer {
+        height: 100%;
+        width: 40%;
+        border-radius: var(--radius-pill);
+        background: var(--accent-gradient);
+        animation: shimmer 1.3s ease-in-out infinite;
+      }
+      @keyframes shimmer {
+        0% {
+          transform: translateX(-120%);
+        }
+        100% {
+          transform: translateX(320%);
+        }
+      }
+
+      /* ── Status orb (left node) ────────────────────────────────────────── */
+      .orb {
+        position: relative;
+        width: 14px;
+        height: 14px;
+        min-width: 14px;
+        border-radius: 50%;
+      }
+      .orb.ready {
+        background: var(--accent);
+        box-shadow: 0 0 12px rgba(110, 118, 255, 0.8);
+      }
+      .orb.ready::after {
+        content: "";
+        position: absolute;
+        inset: -5px;
+        border-radius: 50%;
+        border: 1.5px solid var(--accent);
+        opacity: 0.5;
+        animation: breathe 2.4s ease-in-out infinite;
+      }
+      @keyframes breathe {
+        0%,
+        100% {
+          transform: scale(1);
+          opacity: 0.5;
+        }
+        50% {
+          transform: scale(1.5);
+          opacity: 0;
+        }
+      }
+      .orb.live {
+        background: var(--live);
+        box-shadow: 0 0 14px rgba(255, 122, 92, 0.9);
+        animation: live-pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes live-pulse {
+        0%,
+        100% {
+          opacity: 1;
+          transform: scale(1);
+        }
+        50% {
+          opacity: 0.55;
+          transform: scale(0.82);
+        }
+      }
+      .orb.proc {
+        background: transparent;
+        border: 2px solid rgba(255, 255, 255, 0.18);
+        border-top-color: var(--accent);
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .stage-hint {
+        margin: 0;
+        min-height: 1.2em;
+        color: var(--text-muted);
+        font-size: 0.875rem;
+        letter-spacing: -0.005em;
+      }
+
+      /* ── Last note ─────────────────────────────────────────────────────── */
       .last-note h3 {
         margin-bottom: var(--space-3);
       }
@@ -311,22 +504,52 @@ import type { AppConfigDto } from "../../core/models";
       .preview {
         margin: 0;
         white-space: pre-wrap;
-        background: var(--surface-input);
+        background: rgba(0, 0, 0, 0.22);
         border: 1px solid var(--border-subtle);
         color: var(--text-secondary);
         padding: var(--space-4);
         border-radius: var(--radius-md);
-        max-height: 360px;
+        max-height: 380px;
         overflow: auto;
         font-size: 0.85rem;
-        line-height: 1.6;
+        line-height: 1.65;
       }
       .empty-card {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
         padding: var(--space-5);
+      }
+      .empty-mark {
+        width: 36px;
+        height: 36px;
+        min-width: 36px;
+        border-radius: 50%;
+        background: var(--accent-soft);
+        position: relative;
+      }
+      .empty-mark::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        margin: auto;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: var(--accent);
       }
       .empty {
         margin: 0;
-        color: var(--text-muted);
+        color: var(--text-secondary);
+      }
+      .kbd-inline {
+        font-family: var(--font-mono);
+        font-size: 0.8em;
+        padding: 1px 6px;
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.07);
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
       }
     `,
   ],
@@ -335,7 +558,10 @@ export class RecordComponent implements OnInit {
   readonly store = inject(RecorderStore);
   private readonly ipc = inject(IpcService);
 
-  /** Latest settings snapshot, refreshed on entry, used for the readiness guard (SF-4). */
+  /** Bars in the live waveform (driven by the real mic level signal). */
+  readonly bars = Array.from({ length: 28 }, (_, i) => i);
+
+  /** Latest settings snapshot, refreshed on entry — used for the readiness guard. */
   private readonly config = signal<AppConfigDto | null>(null);
 
   /** A vault folder is mandatory — export fails without it, so block recording. */
@@ -344,45 +570,43 @@ export class RecordComponent implements OnInit {
     return !c || !c.vaultPath || c.vaultPath.trim() === "";
   });
 
-  /** A model is needed for transcription; soft warning (a default may exist on disk). */
-  readonly modelMissing = computed(() => {
-    const c = this.config();
-    return !c || !c.whisperModelPath || c.whisperModelPath.trim() === "";
-  });
-
-  /**
-   * Real Whisper-model presence (replaces the config-path heuristic for gating).
-   * `null` = not yet checked, `true`/`false` = detected via ipc.modelPresent().
-   */
+  /** Real Whisper-model presence (null = checking). */
   readonly modelPresent = signal<boolean | null>(null);
-
-  /** True while a download is in-flight — disables Record + the download button. */
   readonly downloadingModel = signal(false);
-
-  /** Surfaced if ipc.downloadModel() rejects. */
   readonly modelDownloadError = signal<string | null>(null);
 
-  /** 0..100 width for the mic level bar. */
-  readonly levelPct = computed(() =>
-    Math.round(Math.max(0, Math.min(1, this.store.level())) * 100),
+  /** Busy but not capturing audio → transcribing / summarizing / exporting. */
+  readonly isProcessing = computed(
+    () => this.store.isBusy() && !this.store.isRecording(),
   );
 
-  /** Maps the current stage to a status-pill state modifier. */
-  readonly statusPillClass = computed(() => {
-    switch (this.store.stage()) {
-      case "recording":
-        return "is-danger";
-      case "transcribing":
-      case "summarizing":
-      case "exporting":
-        return "is-accent";
-      case "done":
-        return "is-success";
-      case "error":
-        return "is-danger";
-      default:
-        return "";
-    }
+  /** Whether the Record action is allowed right now. */
+  readonly canRecord = computed(
+    () =>
+      !this.vaultMissing() &&
+      this.modelPresent() !== false &&
+      !this.downloadingModel() &&
+      !this.store.isBusy(),
+  );
+
+  /** Elapsed recording time as m:ss. */
+  readonly elapsedLabel = computed(() => {
+    const s = this.store.elapsed();
+    const m = Math.floor(s / 60);
+    const sec = (s % 60).toString().padStart(2, "0");
+    return `${m}:${sec}`;
+  });
+
+  /** Context line beneath the bar. */
+  readonly hint = computed(() => {
+    if (this.store.isRecording())
+      return "Recording — press ⌘R or Stop when done.";
+    if (this.isProcessing()) return "Transcribing on-device, then summarizing…";
+    if (this.vaultMissing()) return "Set a vault folder in Settings to start.";
+    if (this.modelPresent() === false) return "Download the model to start.";
+    if (this.store.stage() === "done")
+      return "Saved ✓ — your note is in the vault.";
+    return "On-device transcription · your audio never leaves this Mac.";
   });
 
   async ngOnInit(): Promise<void> {
@@ -391,7 +615,19 @@ export class RecordComponent implements OnInit {
     this.modelPresent.set(await this.ipc.modelPresent());
   }
 
-  /** Download the default Whisper model, then re-check presence and clear on success. */
+  /** ⌘R / Ctrl+R toggles recording. */
+  onKey(e: KeyboardEvent): void {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "r") {
+      e.preventDefault();
+      if (this.store.isRecording()) {
+        void this.store.stop();
+      } else if (this.canRecord()) {
+        void this.store.start();
+      }
+    }
+  }
+
+  /** Download the Whisper model, then re-check presence. */
   async downloadModel(): Promise<void> {
     this.modelDownloadError.set(null);
     this.downloadingModel.set(true);
