@@ -29,11 +29,24 @@ import { RecorderStore } from "../../core/recorder.store";
       @if (store.isRecording()) {
         <span class="orb live" data-tauri-drag-region aria-hidden="true"></span>
         <span class="timer" data-tauri-drag-region>{{ elapsedLabel() }}</span>
-        <div class="wave" [style.--level]="store.level()" aria-hidden="true">
-          @for (b of bars; track b) {
-            <span class="wbar" [style.--i]="b"></span>
-          }
-        </div>
+        @if (caption(); as cc) {
+          <span
+            class="wave is-compact"
+            [style.--level]="store.level()"
+            aria-hidden="true"
+          >
+            @for (b of compactBars; track b) {
+              <span class="wbar" [style.--i]="b"></span>
+            }
+          </span>
+          <span class="cc" aria-live="polite" [title]="cc">{{ cc }}</span>
+        } @else {
+          <div class="wave" [style.--level]="store.level()" aria-hidden="true">
+            @for (b of bars; track b) {
+              <span class="wbar" [style.--i]="b"></span>
+            }
+          </div>
+        }
         <button
           type="button"
           class="circle stop"
@@ -210,6 +223,25 @@ import { RecorderStore } from "../../core/recorder.store";
           transform: scaleY(calc(0.32 + var(--level, 0) * 1.15));
         }
       }
+      /* When a caption shares the row, the wave shrinks to a slim cue. */
+      .wave.is-compact {
+        flex: none;
+        width: 34px;
+      }
+
+      /* Live caption — the tail of the latest partial; tiny, muted, one line. */
+      .cc {
+        flex: 1;
+        min-width: 0;
+        font-size: 0.78rem;
+        font-weight: 500;
+        line-height: 1.3;
+        color: var(--text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: default;
+      }
 
       /* Processing shimmer */
       .track {
@@ -360,10 +392,24 @@ export class FloatingBarComponent implements OnInit {
   readonly store = inject(RecorderStore);
 
   readonly bars = Array.from({ length: 30 }, (_, i) => i);
+  /** Slimmed waveform shown beside the caption so both fit on one row. */
+  readonly compactBars = Array.from({ length: 8 }, (_, i) => i);
 
   readonly isProcessing = computed(
     () => this.store.isBusy() && !this.store.isRecording(),
   );
+
+  /**
+   * The tail of the latest partial transcript — the most recent words, capped so
+   * the buffer stays small. A leading ellipsis marks earlier text; CSS clips any
+   * residual overflow on one line. Empty while idle/silent (caption then hidden).
+   */
+  readonly caption = computed(() => {
+    const text = this.store.liveCaption().trim().replace(/\s+/g, " ");
+    if (!text) return "";
+    const tail = 72;
+    return text.length > tail ? "…" + text.slice(text.length - tail) : text;
+  });
 
   readonly elapsedLabel = computed(() => {
     const s = this.store.elapsed();
