@@ -81,7 +81,7 @@ import { RecorderStore } from "../../core/recorder.store";
         height: 100vh;
         overflow: hidden;
         background: transparent;
-        padding: var(--space-2) var(--space-3);
+        padding: 0;
       }
 
       .bar {
@@ -89,15 +89,16 @@ import { RecorderStore } from "../../core/recorder.store";
         align-items: center;
         gap: var(--space-3);
         width: 100%;
+        max-width: 540px;
         height: 84px;
         padding: 0 var(--space-2) 0 var(--space-4);
         border-radius: var(--radius-pill);
         border: 1px solid var(--glass-border);
-        background: rgba(20, 20, 28, 0.55);
+        background: rgba(20, 20, 28, 0.6);
         -webkit-backdrop-filter: blur(34px) saturate(150%);
         backdrop-filter: blur(34px) saturate(150%);
         box-shadow:
-          0 24px 70px rgba(0, 0, 0, 0.6),
+          0 8px 24px rgba(0, 0, 0, 0.45),
           var(--glass-highlight);
         animation: bar-pop 320ms var(--ease-spring) both;
         transition:
@@ -115,10 +116,10 @@ import { RecorderStore } from "../../core/recorder.store";
         }
       }
       .bar.is-recording {
-        border-color: rgba(255, 122, 92, 0.42);
+        border-color: rgba(255, 122, 92, 0.45);
         box-shadow:
-          var(--live-glow),
-          0 24px 70px rgba(0, 0, 0, 0.6),
+          0 0 0 1px rgba(255, 122, 92, 0.35),
+          0 8px 26px rgba(255, 94, 120, 0.32),
           var(--glass-highlight);
       }
 
