@@ -108,6 +108,26 @@ import type { Analytics, AppConfigDto } from "../../core/models";
         </button>
       </div>
 
+      <!-- ── Live captions — ephemeral partial transcript while recording ──── -->
+      @if (store.isRecording()) {
+        <div class="captions" role="group" aria-label="Live captions">
+          <span class="cc-pill" aria-hidden="true">
+            <span class="cc-dot"></span>
+            LIVE
+          </span>
+          <p class="cc-line" aria-live="polite">
+            @if (liveCaption(); as cc) {
+              <!-- Keyed so each new partial replays the gentle fade/slide. -->
+              @for (rev of [cc]; track rev) {
+                <span class="cc-text">{{ cc }}</span>
+              }
+            } @else {
+              <span class="cc-idle">Listening…</span>
+            }
+          </p>
+        </div>
+      }
+
       @if (store.error(); as err) {
         <div class="banner is-danger" role="alert">
           <span class="banner-icon" aria-hidden="true">!</span>
@@ -554,6 +574,74 @@ import type { Analytics, AppConfigDto } from "../../core/models";
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
 
+      /* ── Live captions — frosted, secondary, ephemeral ─────────────────── */
+      .captions {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--space-3);
+        width: 100%;
+        max-width: 560px;
+        margin: 0 auto;
+        padding: var(--space-3) var(--space-4);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-lg);
+        background: rgba(255, 255, 255, 0.035);
+        -webkit-backdrop-filter: blur(var(--glass-blur))
+          saturate(var(--glass-saturate));
+        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+        box-shadow: var(--glass-highlight);
+        animation: rise 360ms var(--transition) both;
+      }
+      .cc-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        flex: none;
+        margin-top: 1px;
+        padding: 2px var(--space-2);
+        border-radius: var(--radius-pill);
+        background: var(--live-soft);
+        color: var(--live-hover);
+        font-size: 0.625rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        line-height: 1.4;
+      }
+      .cc-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--live);
+        box-shadow: 0 0 8px rgba(255, 122, 92, 0.9);
+        animation: live-pulse 1.4s ease-in-out infinite;
+      }
+      .cc-line {
+        flex: 1;
+        min-width: 0;
+        margin: 0;
+        color: var(--text-secondary);
+        font-size: 0.9rem;
+        line-height: 1.5;
+      }
+      .cc-text {
+        display: block;
+        animation: cc-in 260ms var(--transition) both;
+      }
+      .cc-idle {
+        color: var(--text-muted);
+        font-style: italic;
+      }
+      @keyframes cc-in {
+        from {
+          opacity: 0;
+          transform: translateY(4px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
       /* ── Minimal stats strip ───────────────────────────────────────────── */
       .stats {
         display: flex;
@@ -697,6 +785,9 @@ export class RecordComponent implements OnInit {
 
   /** Bars in the live waveform (driven by the real mic level signal). */
   readonly bars = Array.from({ length: 28 }, (_, i) => i);
+
+  /** Latest partial transcript, trimmed — drives the ephemeral caption line. */
+  readonly liveCaption = computed(() => this.store.liveCaption().trim());
 
   /** Latest settings snapshot, refreshed on entry — used for the readiness guard. */
   private readonly config = signal<AppConfigDto | null>(null);
