@@ -67,6 +67,18 @@ pub fn run() {
                 tracing::warn!(target: "shortcut", error = %e, "could not register global shortcut");
             }
             commands::restart_voice_listener(app.handle().clone());
+            setup_tray(app.handle())?;
+            // Closing the main window HIDES it (recoverable from the tray) instead of
+            // quitting — so the floating bar is never the only way back into the app.
+            if let Some(main) = app.get_webview_window("main") {
+                let w = main.clone();
+                main.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -111,6 +123,57 @@ pub fn toggle_bar(app: &tauri::AppHandle) {
             let _ = win.show();
             let _ = win.set_focus();
         }
+    }
+}
+
+/// Menu-bar (tray) icon so Murmur is always reachable — even with no window open or only
+/// the floating bar showing. Left-click opens the main window; the menu offers Open, the
+/// recorder bar, and Quit.
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open = MenuItem::with_id(app, "open", "Open Murmur", true, None::<&str>)?;
+    let bar = MenuItem::with_id(app, "bar", "Recorder bar  (⌘⇧R)", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Murmur", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[&open, &bar, &PredefinedMenuItem::separator(app)?, &quit],
+    )?;
+
+    let mut builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("Murmur")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main(app),
+            "bar" => toggle_bar(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+/// Show + focus the main window (after a hide/minimize), recreating it if it was closed.
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
     }
 }
 
