@@ -402,6 +402,61 @@ pub async fn chat_meeting(
     provider.complete(&system, &user).await
 }
 
+/// Copy a meeting's recording (WAV) to a user-chosen path (FE picks it via a save dialog).
+#[tauri::command]
+pub fn export_audio(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    dest_path: String,
+) -> Result<(), AppError> {
+    let meeting = state
+        .db
+        .get_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
+    let src = meeting
+        .audio_path
+        .ok_or_else(|| AppError::InvalidArg("this meeting has no audio file".into()))?;
+    std::fs::copy(&src, &dest_path)
+        .map_err(|e| AppError::Storage(format!("copy audio failed: {e}")))?;
+    Ok(())
+}
+
+/// Write a meeting's note markdown to a user-chosen path (FE picks it via a save dialog).
+#[tauri::command]
+pub fn export_note(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    dest_path: String,
+) -> Result<(), AppError> {
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    std::fs::write(&dest_path, note.markdown.as_bytes())
+        .map_err(|e| AppError::Storage(format!("write note failed: {e}")))?;
+    Ok(())
+}
+
+/// Best-effort detection of a running meeting app (Zoom / Teams / Webex) to offer a
+/// "start recording?" nudge. Browser-based Google Meet is NOT detectable this way.
+#[tauri::command]
+pub fn detect_meeting_app() -> Result<Option<String>, AppError> {
+    let listing = match std::process::Command::new("ps").arg("-axo").arg("comm=").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return Ok(None),
+    };
+    for (needle, name) in [
+        ("zoom.us", "Zoom"),
+        ("Microsoft Teams", "Microsoft Teams"),
+        ("Webex", "Webex"),
+    ] {
+        if listing.contains(needle) {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Read current config (settings table), without secrets.
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> {
