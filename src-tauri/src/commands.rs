@@ -462,3 +462,9 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
     let path = crate::transcribe::ensure_model(p, &size, &language).await?;
     Ok(path.to_string_lossy().to_string())
 }
+
+/// Show/hide the floating recorder bar window (also bound to the global ⌘⇧R shortcut).
+#[tauri::command]
+pub fn toggle_bar(app: AppHandle) {
+    crate::toggle_bar(&app);
+}

@@ -367,6 +367,16 @@ export class FloatingBarComponent implements OnInit {
     return `${m}:${(s % 60).toString().padStart(2, "0")}`;
   });
 
+  constructor() {
+    // This window must be see-through so only the frosted pill shows. Force the document
+    // transparent immediately (don't wait on the app-shell effect); `color-scheme: dark`
+    // otherwise paints an opaque black canvas behind the pill.
+    document.documentElement.style.background = "transparent";
+    document.documentElement.style.colorScheme = "normal";
+    document.body.style.background = "transparent";
+    document.body.classList.add("bar-shell");
+  }
+
   async ngOnInit(): Promise<void> {
     await this.store.init();
   }

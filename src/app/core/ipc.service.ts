@@ -78,6 +78,11 @@ export class IpcService {
     return invoke<string>("download_model");
   }
 
+  /** Show/hide the floating always-on-top recorder bar window. */
+  toggleBar(): Promise<void> {
+    return invoke<void>("toggle_bar");
+  }
+
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {
     return listen<StatusPayload>(EVENT_STATUS, (event) => cb(event.payload));
   }

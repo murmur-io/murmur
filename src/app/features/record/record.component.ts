@@ -100,6 +100,10 @@ import type { AppConfigDto } from "../../core/models";
         }
 
         <p class="stage-hint">{{ hint() }}</p>
+        <button type="button" class="popout" (click)="popOut()">
+          Pop out floating bar
+          <span class="kbd-inline">⌘⇧R</span>
+        </button>
       </div>
 
       @if (store.error(); as err) {
@@ -486,6 +490,38 @@ import type { AppConfigDto } from "../../core/models";
         font-size: 0.875rem;
         letter-spacing: -0.005em;
       }
+      .popout {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        margin-top: var(--space-1);
+        padding: var(--space-2) var(--space-4);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-pill);
+        background: rgba(255, 255, 255, 0.03);
+        color: var(--text-secondary);
+        font-family: inherit;
+        font-size: 0.85rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition:
+          background var(--transition),
+          border-color var(--transition),
+          color var(--transition),
+          transform var(--transition-fast);
+      }
+      .popout:hover {
+        background: var(--surface-hover);
+        border-color: var(--border-strong);
+        color: var(--text-primary);
+      }
+      .popout:active {
+        transform: translateY(1px);
+      }
+      .popout:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
 
       /* ── Last note ─────────────────────────────────────────────────────── */
       .last-note h3 {
@@ -625,6 +661,11 @@ export class RecordComponent implements OnInit {
         void this.store.start();
       }
     }
+  }
+
+  /** Summon the floating always-on-top bar (also bound to ⌘⇧R globally). */
+  popOut(): void {
+    void this.ipc.toggleBar();
   }
 
   /** Download the Whisper model, then re-check presence. */

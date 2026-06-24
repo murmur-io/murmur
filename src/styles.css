@@ -419,7 +419,12 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* Floating-bar window — transparent document so only the frosted pill shows. */
+/* Floating-bar window — transparent document so only the frosted pill shows.
+   color-scheme:dark otherwise paints an opaque black canvas behind the pill. */
+html:has(body.bar-shell) {
+  background: transparent !important;
+  color-scheme: normal;
+}
 body.bar-shell { background: transparent !important; }
 body.bar-shell::before,
 body.bar-shell::after { display: none !important; }
