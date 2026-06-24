@@ -1,11 +1,17 @@
 # Phase 2 — System-audio capture (design + handoff)
 
-> **Status: NOT yet implemented.** This is the design for capturing the *other side*
-> of a call (system audio) in addition to the mic. It is the single biggest remaining
-> functional gap before MeetNotes is a real meeting recorder. It is documented here
-> rather than coded blind because **system-audio capture cannot be verified in a
-> headless build environment** — it needs an interactive macOS desktop, the Screen
-> Recording permission, and live audio. Implement + verify it on a real Mac.
+> **Status: IMPLEMENTED (compile-verified) — live capture runtime-UNVERIFIED.**
+> Captures the *other side* of a call (system audio) alongside the mic. Shipped:
+> `src-tauri/sysaudio/sysaudio.swift` (ScreenCaptureKit, compiled by `build.rs`,
+> typechecked in CI), `audio::system::SystemAudioRecorder` (spawn/SIGTERM/read),
+> the unit-tested `audio::mixer`, and an opt-in Settings toggle (default off). Verified:
+> compile, typecheck, mixer tests, and the graceful no-permission exit (code 3). NOT
+> verified: capturing *live* system audio — needs an interactive macOS desktop + the
+> Screen Recording (TCC) permission + real audio; confirm on a real Mac.
+>
+> Implementation note: we chose the **Swift sidecar** (the documented fallback below)
+> over `cidre` — a separately-compilable unit is cleaner and more verifiable (swiftc
+> typechecks it in CI) than in-process Rust bindings.
 
 ## Evidence (how Meetily does it — proven reference)
 Inspecting `/Applications/meetily.app/Contents/MacOS/meetily`:
