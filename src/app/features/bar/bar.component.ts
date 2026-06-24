@@ -92,9 +92,10 @@ import { RecorderStore } from "../../core/recorder.store";
         gap: var(--space-3);
         width: 100%;
         height: 100%;
-        padding: 0 6px 0 var(--space-4);
-        border-radius: var(--radius-pill);
+        padding: 0 7px 0 var(--space-4);
+        border-radius: 29px;
         border: 1px solid rgba(255, 255, 255, 0.12);
+        overflow: hidden;
         /* Faint tint over the vibrancy for text contrast — NOT an opaque fill. */
         background: rgba(14, 14, 20, 0.2);
         box-shadow: var(--glass-highlight);
@@ -260,7 +261,7 @@ import { RecorderStore } from "../../core/recorder.store";
       }
       .circle.rec {
         background: var(--accent-gradient);
-        box-shadow: var(--shadow-accent);
+        box-shadow: 0 4px 16px rgba(110, 118, 255, 0.5);
       }
       .circle.rec:hover:not(:disabled) {
         transform: scale(1.06);
@@ -278,7 +279,7 @@ import { RecorderStore } from "../../core/recorder.store";
       }
       .circle.stop {
         background: var(--live-gradient);
-        box-shadow: 0 6px 18px rgba(255, 94, 120, 0.45);
+        box-shadow: 0 4px 14px rgba(255, 94, 120, 0.45);
       }
       .circle.stop:hover {
         transform: scale(1.06);
