@@ -67,3 +67,34 @@ pub struct Analytics {
     /// Per-day activity for the last ~30 days (only days with meetings).
     pub per_day: Vec<DayCount>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerTurn {
+    pub speaker: String,
+    #[serde(alias = "start", alias = "start_s")]
+    pub start_s: f64,
+    #[serde(alias = "end", alias = "end_s")]
+    pub end_s: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicSpan {
+    pub label: String,
+    #[serde(alias = "start", alias = "start_s")]
+    pub start_s: f64,
+    #[serde(alias = "end", alias = "end_s")]
+    pub end_s: f64,
+}
+
+/// Speaker turns + topic spans for the interactive meeting timeline (AI-derived, since
+/// Whisper doesn't diarize). Cached per meeting once generated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingTimeline {
+    #[serde(default)]
+    pub speakers: Vec<SpeakerTurn>,
+    #[serde(default)]
+    pub topics: Vec<TopicSpan>,
+}

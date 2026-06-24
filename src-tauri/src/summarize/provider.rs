@@ -40,4 +40,8 @@ pub trait SummarizerProvider: Send + Sync {
 
     /// Produce finished Obsidian-ready Markdown from the request.
     async fn summarize(&self, req: &SummarizeRequest) -> Result<String>;
+
+    /// Raw completion: run a system + user prompt and return the model's text verbatim
+    /// (no formatting/validation). Used for structured side-tasks like the timeline.
+    async fn complete(&self, system: &str, user: &str) -> Result<String>;
 }

@@ -11,6 +11,7 @@ pub mod claude_code;
 pub mod ollama;
 pub mod provider;
 pub mod template;
+pub mod timeline;
 
 pub use provider::{Availability, MeetingMeta, SummarizeRequest, SummarizerProvider as _};
 

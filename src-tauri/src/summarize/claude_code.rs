@@ -225,6 +225,50 @@ impl SummarizerProvider for ClaudeCodeProvider {
 
         Ok(note.to_string())
     }
+
+    async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
+        let bin = resolve_binary(&self.binary);
+        let mut child = Command::new(&bin)
+            .arg("-p")
+            .arg("--system-prompt")
+            .arg(system)
+            .arg("--disallowedTools")
+            .arg(DISALLOWED_TOOLS.join(" "))
+            .env("PATH", shell_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| AppError::Summarize("failed to open claude stdin".into()))?;
+            stdin
+                .write_all(user.as_bytes())
+                .await
+                .map_err(|e| AppError::Summarize(format!("failed writing to claude stdin: {e}")))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|e| AppError::Summarize(format!("failed closing claude stdin: {e}")))?;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| AppError::Summarize(format!("failed waiting on claude: {e}")))?;
+        if !output.status.success() {
+            return Err(AppError::Summarize(format!(
+                "claude exited with status {}: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        String::from_utf8(output.stdout)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| AppError::Summarize(format!("claude produced non-UTF8 output: {e}")))
+    }
 }
 
 /// True iff `text`'s first non-empty line is exactly a three-dash YAML fence (allowing
