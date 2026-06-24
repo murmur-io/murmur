@@ -10,7 +10,9 @@ use crate::summarize::template;
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 const DEFAULT_MODEL: &str = "llama3.1";
 /// Short timeout for the readiness probe so the Settings UI fan-out stays snappy.
-const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ollama runs locally, so 500 ms is plenty when it's up and keeps the UI from
+/// stalling when it's down (review SF-2).
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Talks to a local Ollama server's HTTP API (default `http://localhost:11434`).
 pub struct OllamaProvider {
