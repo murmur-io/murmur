@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub model_size: String,
     /// Voice trigger: start recording when a wake phrase is heard. Default off.
     pub voice_trigger: bool,
+    /// Whether the first-run onboarding has been completed.
+    pub onboarded: bool,
 }
 
 impl Default for AppConfig {
@@ -44,6 +46,7 @@ impl Default for AppConfig {
             capture_system_audio: false,
             model_size: "small".to_string(),
             voice_trigger: false,
+            onboarded: false,
         }
     }
 }
@@ -61,6 +64,7 @@ const K_CLAUDE_BINARY: &str = "claude_binary";
 const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
+const K_ONBOARDED: &str = "onboarded";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -109,6 +113,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_VOICE_TRIGGER)? {
             cfg.voice_trigger = v == "true";
         }
+        if let Some(v) = db.get_setting(K_ONBOARDED)? {
+            cfg.onboarded = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -140,6 +147,7 @@ impl AppConfig {
             K_VOICE_TRIGGER,
             if self.voice_trigger { "true" } else { "false" },
         )?;
+        db.set_setting(K_ONBOARDED, if self.onboarded { "true" } else { "false" })?;
         Ok(())
     }
 }

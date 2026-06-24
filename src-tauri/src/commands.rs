@@ -63,6 +63,7 @@ pub struct AppConfigDto {
     pub capture_system_audio: bool,
     pub model_size: String,
     pub voice_trigger: bool,
+    pub onboarded: bool,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -320,6 +321,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         capture_system_audio: c.capture_system_audio,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
+        onboarded: c.onboarded,
     }
 }
 
@@ -343,6 +345,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
             d.model_size
         },
         voice_trigger: d.voice_trigger,
+        onboarded: d.onboarded,
     }
 }
 
