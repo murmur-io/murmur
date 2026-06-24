@@ -1,4 +1,6 @@
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -25,6 +27,62 @@ const DISALLOWED_TOOLS: &[&str] = &[
     "Task",
     "NotebookEdit",
 ];
+
+/// The user's real shell PATH + common install dirs. A macOS GUI app (launched from
+/// Finder / `open`) inherits only a minimal PATH (`/usr/bin:/bin:…`), so `claude` (and the
+/// `node` it spawns) won't be found. Recover the real PATH from the login shell and
+/// augment it with common locations. Cached — the shell probe runs at most once.
+fn shell_path() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut parts: Vec<String> = Vec::new();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        if let Ok(out) = std::process::Command::new(&shell)
+            .args(["-lic", "printf '%s' \"$PATH\""])
+            .output()
+        {
+            if let Some(p) = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .rev()
+                .find(|l| l.contains('/'))
+            {
+                parts.push(p.trim().to_string());
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            for d in [
+                ".local/bin",
+                ".bun/bin",
+                ".deno/bin",
+                ".volta/bin",
+                ".npm-global/bin",
+            ] {
+                parts.push(home.join(d).to_string_lossy().into_owned());
+            }
+        }
+        parts.push("/opt/homebrew/bin".to_string());
+        parts.push("/usr/local/bin".to_string());
+        if let Ok(p) = std::env::var("PATH") {
+            parts.push(p);
+        }
+        parts.join(":")
+    })
+}
+
+/// Resolve a bare binary name to an absolute path found in [`shell_path`]; pass through any
+/// value containing `/` unchanged. Falls back to the bare name if not located.
+fn resolve_binary(binary: &str) -> String {
+    if binary.contains('/') {
+        return binary.to_string();
+    }
+    for dir in shell_path().split(':').filter(|d| !d.is_empty()) {
+        let candidate = Path::new(dir).join(binary);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    binary.to_string()
+}
 
 /// Spawns the local `claude -p` CLI in headless print mode to generate the note.
 ///
@@ -73,8 +131,10 @@ impl SummarizerProvider for ClaudeCodeProvider {
     /// Probe whether the `claude` binary is reachable by running `claude --version`.
     /// Non-failing: any spawn/exec error is reported as `Unavailable`.
     async fn availability(&self) -> Availability {
-        match Command::new(&self.binary)
+        let bin = resolve_binary(&self.binary);
+        match Command::new(&bin)
             .arg("--version")
+            .env("PATH", shell_path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -84,13 +144,12 @@ impl SummarizerProvider for ClaudeCodeProvider {
             Ok(status) if status.success() => Availability::Available,
             Ok(status) => Availability::Unavailable {
                 reason: format!(
-                    "`{} --version` exited with status {}",
-                    self.binary,
+                    "`{bin} --version` exited with status {}",
                     status.code().unwrap_or(-1)
                 ),
             },
             Err(e) => Availability::Unavailable {
-                reason: format!("`{}` not found in PATH ({e})", self.binary),
+                reason: format!("`{bin}` not found ({e})"),
             },
         }
     }
@@ -109,19 +168,19 @@ impl SummarizerProvider for ClaudeCodeProvider {
         // stdin = metadata + vault link targets + transcript (the "user" content).
         let stdin_content = template::render_user_content(req);
 
-        let mut child = Command::new(&self.binary)
+        let bin = resolve_binary(&self.binary);
+        let mut child = Command::new(&bin)
             .arg("-p")
             .arg("--system-prompt")
             .arg(&system_prompt)
             .arg("--disallowedTools")
             .arg(DISALLOWED_TOOLS.join(" "))
+            .env("PATH", shell_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                AppError::Summarize(format!("failed to spawn `{}`: {e}", self.binary))
-            })?;
+            .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
 
         // Write the transcript to stdin, then drop the handle to signal EOF.
         {
