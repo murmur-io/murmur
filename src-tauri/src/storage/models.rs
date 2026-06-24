@@ -34,3 +34,36 @@ pub struct NoteRecord {
     pub created_at: String,
     pub exported_path: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusCount {
+    pub status: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayCount {
+    /// "YYYY-MM-DD"
+    pub date: String,
+    pub count: i64,
+    pub duration_s: i64,
+}
+
+/// Aggregate stats for the dashboard + Analytics tab.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Analytics {
+    pub total_meetings: i64,
+    pub total_duration_s: i64,
+    pub avg_duration_s: i64,
+    pub longest_duration_s: i64,
+    pub meetings_7d: i64,
+    pub duration_7d_s: i64,
+    pub notes_count: i64,
+    pub first_meeting_at: Option<String>,
+    pub by_status: Vec<StatusCount>,
+    /// Per-day activity for the last ~30 days (only days with meetings).
+    pub per_day: Vec<DayCount>,
+}

@@ -6,7 +6,7 @@ use crate::error::AppError;
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
-use crate::storage::models::{Meeting, MeetingStatus};
+use crate::storage::models::{Analytics, Meeting, MeetingStatus};
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
@@ -414,6 +414,12 @@ pub async fn resummarize(
 #[tauri::command]
 pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppError> {
     state.db.list_meetings(200)
+}
+
+/// Aggregate analytics for the dashboard + Analytics tab.
+#[tauri::command]
+pub fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, AppError> {
+    state.db.analytics()
 }
 
 /// A meeting + its latest note + transcript segments for the Detail view.
