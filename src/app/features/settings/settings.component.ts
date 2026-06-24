@@ -5,12 +5,7 @@ import {
   inject,
   signal,
 } from "@angular/core";
-import {
-  FormBuilder,
-  FormControl,
-  FormGroup,
-  ReactiveFormsModule,
-} from "@angular/forms";
+import { FormBuilder, FormControl, ReactiveFormsModule } from "@angular/forms";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type { AppConfigDto, ProviderStatus } from "../../core/models";
@@ -21,142 +16,383 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   template: `
-    @if (form; as f) {
-      <section class="settings" [formGroup]="f">
-        <label>
-          Provider
-          <select formControlName="providerId">
-            <option value="claude_code">Claude Code (default)</option>
-            <option value="anthropic">Anthropic API</option>
-            <option value="ollama">Ollama</option>
-          </select>
-        </label>
+    <section class="settings" [formGroup]="form">
+      @if (loadError(); as err) {
+        <div class="banner is-danger" role="alert">
+          <span class="banner-icon" aria-hidden="true">!</span>
+          <span>Couldn't load settings: {{ err }}</span>
+        </div>
+      }
 
-        <label>
-          Vault folder
-          <span class="row">
-            <input formControlName="vaultPath" placeholder="/path/to/vault" />
-            <button type="button" (click)="pickVault()">Browse…</button>
+      <!-- Whisper model status -->
+      <div class="card model-card">
+        <div class="model-head">
+          <div class="model-copy">
+            <h3>Transcription model</h3>
+            <p class="text-secondary model-sub">
+              Transcription runs on-device with a local Whisper model.
+            </p>
+          </div>
+          @if (modelPresent() === true) {
+            <span class="pill is-success">
+              <span class="pill-dot"></span>
+              Model ready
+            </span>
+          } @else if (modelPresent() === false) {
+            <button
+              type="button"
+              class="btn btn-primary"
+              (click)="downloadModel()"
+              [disabled]="downloadingModel()"
+            >
+              @if (downloadingModel()) {
+                Downloading…
+              } @else {
+                Download model (~150 MB)
+              }
+            </button>
+          } @else {
+            <span class="pill">
+              <span class="pill-dot"></span>
+              Checking…
+            </span>
+          }
+        </div>
+        @if (modelDownloadError(); as derr) {
+          <p class="model-error text-danger">{{ derr }}</p>
+        }
+      </div>
+
+      <!-- General -->
+      <div class="card">
+        <fieldset>
+          <legend>General</legend>
+
+          <label class="field">
+            <span class="field-label">Provider</span>
+            <select formControlName="providerId">
+              <option value="claude_code">Claude Code (default)</option>
+              <option value="anthropic">Anthropic API</option>
+              <option value="ollama">Ollama</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Vault folder</span>
+            <span class="row">
+              <input formControlName="vaultPath" placeholder="/path/to/vault" />
+              <button type="button" class="btn" (click)="pickVault()">
+                Browse…
+              </button>
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Vault subfolder</span>
+            <input formControlName="vaultSubfolder" placeholder="Meetings" />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Whisper model path</span>
+            <span class="row">
+              <input
+                formControlName="whisperModelPath"
+                placeholder="/path/to/ggml-model.bin"
+              />
+              <button type="button" class="btn" (click)="pickModel()">
+                Browse…
+              </button>
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Language (blank = auto)</span>
+            <input formControlName="language" placeholder="en" />
+          </label>
+        </fieldset>
+      </div>
+
+      <!-- Provider configuration -->
+      <div class="card">
+        <fieldset>
+          <legend>Provider configuration</legend>
+
+          <label class="field">
+            <span class="field-label">Anthropic model</span>
+            <input formControlName="anthropicModel" />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Ollama base URL</span>
+            <input formControlName="ollamaBaseUrl" />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Ollama model</span>
+            <input formControlName="ollamaModel" />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Claude binary</span>
+            <input formControlName="claudeBinary" />
+          </label>
+        </fieldset>
+      </div>
+
+      <!-- Capture system audio — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Capture system audio</span>
+            <span class="text-secondary toggle-sub">
+              Records the other side of the call — needs the Screen Recording
+              permission on first use.
+            </span>
           </span>
-        </label>
-
-        <label>
-          Vault subfolder
-          <input formControlName="vaultSubfolder" placeholder="Meetings" />
-        </label>
-
-        <label>
-          Whisper model path
-          <span class="row">
-            <input
-              formControlName="whisperModelPath"
-              placeholder="/path/to/ggml-model.bin"
-            />
-            <button type="button" (click)="pickModel()">Browse…</button>
-          </span>
-        </label>
-
-        <label>
-          Language (blank = auto)
-          <input formControlName="language" placeholder="en" />
-        </label>
-
-        <label>
-          Anthropic model
-          <input formControlName="anthropicModel" />
-        </label>
-
-        <label>
-          Ollama base URL
-          <input formControlName="ollamaBaseUrl" />
-        </label>
-
-        <label>
-          Ollama model
-          <input formControlName="ollamaModel" />
-        </label>
-
-        <label>
-          Claude binary
-          <input formControlName="claudeBinary" />
-        </label>
-
-        <label class="check">
           <input type="checkbox" formControlName="captureSystemAudio" />
-          Capture system audio (the other side of the call) — needs the Screen
-          Recording permission on first use
         </label>
+      </div>
 
+      <!-- Anthropic API key -->
+      <div class="card">
         <fieldset>
           <legend>Anthropic API key</legend>
-          <p>Status: {{ hasKey() ? "set" : "not set" }}</p>
+          <div class="key-status">
+            <span class="text-secondary">Status</span>
+            @if (hasKey()) {
+              <span class="pill is-success">
+                <span class="pill-dot"></span>
+                Set
+              </span>
+            } @else {
+              <span class="pill">
+                <span class="pill-dot"></span>
+                Not set
+              </span>
+            }
+          </div>
           <span class="row">
             <input
               type="password"
               [formControl]="keyControl"
               placeholder="sk-ant-…"
             />
-            <button type="button" (click)="saveKey()">Save key</button>
+            <button type="button" class="btn" (click)="saveKey()">
+              Save key
+            </button>
           </span>
         </fieldset>
+      </div>
 
-        <div class="actions">
-          <button type="button" (click)="save()">Save settings</button>
-          <button type="button" (click)="refreshProviders()">
-            Check providers
-          </button>
-        </div>
-
+      <!-- Actions -->
+      <div class="actions">
+        <button type="button" class="btn btn-primary" (click)="save()">
+          Save settings
+        </button>
+        <button type="button" class="btn" (click)="refreshProviders()">
+          Check providers
+        </button>
         @if (saved()) {
-          <p class="ok">Saved.</p>
+          <span class="pill is-success saved-pill">
+            <span class="pill-dot"></span>
+            Saved
+          </span>
         }
+      </div>
 
+      <!-- Provider availability -->
+      <div class="card">
         <h3>Provider availability</h3>
-        <ul>
+        <ul class="provider-list">
           @for (p of providers(); track p.id) {
-            <li>
-              <strong>{{ p.id }}</strong
-              >:
-              {{ p.available ? "available" : "unavailable" }}
-              @if (p.reason) {
-                <span> ({{ p.reason }})</span>
+            <li class="provider-row">
+              <span class="provider-name">{{ p.id }}</span>
+              @if (p.available) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Available
+                </span>
+              } @else {
+                <span class="provider-unavailable">
+                  <span class="pill is-danger">
+                    <span class="pill-dot"></span>
+                    Unavailable
+                  </span>
+                  @if (p.reason) {
+                    <span class="text-muted provider-reason">{{
+                      p.reason
+                    }}</span>
+                  }
+                </span>
               }
             </li>
           }
         </ul>
-      </section>
-    } @else {
-      <p>Loading settings…</p>
-    }
+      </div>
+    </section>
   `,
   styles: [
     `
       .settings {
-        max-width: 560px;
         display: flex;
         flex-direction: column;
-        gap: 0.75rem;
+        gap: var(--space-5);
       }
-      label {
+
+      /* --- Banner icon (matches the record screen) --- */
+      .banner-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        min-width: 24px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.08);
+        font-weight: 700;
+        font-size: 0.85rem;
+        line-height: 1;
+      }
+
+      /* --- Whisper model status card --- */
+      .model-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-4);
+        flex-wrap: wrap;
+      }
+      .model-copy {
         display: flex;
         flex-direction: column;
-        gap: 0.25rem;
+        gap: var(--space-1);
+      }
+      .model-copy h3 {
+        margin: 0;
+      }
+      .model-sub {
+        margin: 0;
+        font-size: 0.875rem;
+      }
+      .model-error {
+        margin: var(--space-3) 0 0;
+        font-size: 0.85rem;
+      }
+
+      /* --- Cards stack their fieldset flush (card already provides padding) --- */
+      .card fieldset {
+        border: none;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .card fieldset legend {
+        padding: 0;
+        margin-bottom: var(--space-4);
+        float: left;
+        width: 100%;
+        font-size: 0.8125rem;
+      }
+
+      /* --- Stacked label + control --- */
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .field-label {
+        color: var(--text-secondary);
         font-size: 0.9rem;
+        font-weight: 550;
       }
+
       .row {
         display: flex;
-        gap: 0.5rem;
+        gap: var(--space-2);
       }
       .row input {
         flex: 1;
       }
-      .check {
-        flex-direction: row;
-        align-items: center;
-        gap: 0.5rem;
+      .row .btn {
+        flex: none;
       }
-      .ok {
-        color: #27ae60;
+
+      /* --- Capture-system-audio toggle row --- */
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-4);
+        cursor: pointer;
+      }
+      .toggle-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .toggle-title {
+        color: var(--text-primary);
+        font-size: 0.95rem;
+        font-weight: 550;
+      }
+      .toggle-sub {
+        font-size: 0.85rem;
+      }
+
+      /* --- API-key status --- */
+      .key-status {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        margin-bottom: var(--space-2);
+      }
+
+      /* --- Actions --- */
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+      }
+      .saved-pill {
+        margin-left: var(--space-1);
+      }
+
+      /* --- Provider availability list --- */
+      .provider-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      .provider-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+        padding: var(--space-3) 0;
+        border-bottom: 1px solid var(--border-subtle);
+      }
+      .provider-row:last-child {
+        border-bottom: none;
+      }
+      .provider-name {
+        color: var(--text-primary);
+        font-weight: 550;
+        font-family: var(--font-mono);
+        font-size: 0.875rem;
+      }
+      .provider-unavailable {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .provider-reason {
+        font-size: 0.8125rem;
       }
     `,
   ],
@@ -165,47 +401,77 @@ export class SettingsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly fb = inject(FormBuilder);
 
-  /** Reactive form, built once config is loaded (SF-6 — replaces [(ngModel)]). */
-  form: FormGroup | null = null;
+  /**
+   * Built eagerly with defaults so the panel always renders (no "stuck on loading"),
+   * then `patchValue`d from the loaded config in ngOnInit. SF-6: reactive forms.
+   */
+  readonly form = this.fb.nonNullable.group({
+    providerId: "claude_code",
+    vaultPath: "",
+    vaultSubfolder: "",
+    whisperModelPath: "",
+    language: "",
+    anthropicModel: "claude-opus-4-8",
+    ollamaBaseUrl: "http://localhost:11434",
+    ollamaModel: "llama3.1",
+    claudeBinary: "claude",
+    captureSystemAudio: false,
+  });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
   readonly providers = signal<ProviderStatus[]>([]);
   readonly hasKey = signal(false);
   readonly saved = signal(false);
+  readonly loadError = signal<string | null>(null);
+
+  /**
+   * Real Whisper-model presence (same UX as the record screen).
+   * `null` = not yet checked, `true`/`false` = detected via ipc.modelPresent().
+   */
+  readonly modelPresent = signal<boolean | null>(null);
+
+  /** True while a download is in-flight — disables the download button. */
+  readonly downloadingModel = signal(false);
+
+  /** Surfaced if ipc.downloadModel() rejects. */
+  readonly modelDownloadError = signal<string | null>(null);
 
   async ngOnInit(): Promise<void> {
-    const cfg = await this.ipc.getConfig();
-    this.form = this.fb.nonNullable.group({
-      providerId: cfg.providerId,
-      vaultPath: cfg.vaultPath ?? "",
-      vaultSubfolder: cfg.vaultSubfolder ?? "",
-      whisperModelPath: cfg.whisperModelPath ?? "",
-      language: cfg.language ?? "",
-      anthropicModel: cfg.anthropicModel,
-      ollamaBaseUrl: cfg.ollamaBaseUrl,
-      ollamaModel: cfg.ollamaModel,
-      claudeBinary: cfg.claudeBinary,
-      captureSystemAudio: cfg.captureSystemAudio,
-    });
-    this.hasKey.set(await this.ipc.hasAnthropicKey());
-    await this.refreshProviders();
+    try {
+      const cfg = await this.ipc.getConfig();
+      this.form.patchValue({
+        providerId: cfg.providerId,
+        vaultPath: cfg.vaultPath ?? "",
+        vaultSubfolder: cfg.vaultSubfolder ?? "",
+        whisperModelPath: cfg.whisperModelPath ?? "",
+        language: cfg.language ?? "",
+        anthropicModel: cfg.anthropicModel,
+        ollamaBaseUrl: cfg.ollamaBaseUrl,
+        ollamaModel: cfg.ollamaModel,
+        claudeBinary: cfg.claudeBinary,
+        captureSystemAudio: cfg.captureSystemAudio ?? false,
+      });
+      this.hasKey.set(await this.ipc.hasAnthropicKey());
+      this.modelPresent.set(await this.ipc.modelPresent());
+      await this.refreshProviders();
+    } catch (e) {
+      this.loadError.set(String(e));
+    }
   }
 
   async pickVault(): Promise<void> {
     const dir = await open({ directory: true, multiple: false });
-    if (typeof dir === "string") this.form?.patchValue({ vaultPath: dir });
+    if (typeof dir === "string") this.form.patchValue({ vaultPath: dir });
   }
 
   async pickModel(): Promise<void> {
     const file = await open({ directory: false, multiple: false });
     if (typeof file === "string")
-      this.form?.patchValue({ whisperModelPath: file });
+      this.form.patchValue({ whisperModelPath: file });
   }
 
   async save(): Promise<void> {
-    if (!this.form) return;
     const v = this.form.getRawValue();
-    // Empty optional fields → null (the Rust side also normalizes, but keep the DTO clean).
     const cfg: AppConfigDto = {
       providerId: v.providerId,
       vaultPath: v.vaultPath || null,
@@ -218,8 +484,12 @@ export class SettingsComponent implements OnInit {
       claudeBinary: v.claudeBinary,
       captureSystemAudio: v.captureSystemAudio,
     };
-    await this.ipc.saveConfig(cfg);
-    this.saved.set(true);
+    try {
+      await this.ipc.saveConfig(cfg);
+      this.saved.set(true);
+    } catch (e) {
+      this.loadError.set("Save failed: " + String(e));
+    }
   }
 
   async saveKey(): Promise<void> {
@@ -232,5 +502,19 @@ export class SettingsComponent implements OnInit {
 
   async refreshProviders(): Promise<void> {
     this.providers.set(await this.ipc.providerStatuses());
+  }
+
+  /** Download the default Whisper model, then re-check presence and clear on success. */
+  async downloadModel(): Promise<void> {
+    this.modelDownloadError.set(null);
+    this.downloadingModel.set(true);
+    try {
+      await this.ipc.downloadModel();
+      this.modelPresent.set(await this.ipc.modelPresent());
+    } catch (e) {
+      this.modelDownloadError.set(String(e));
+    } finally {
+      this.downloadingModel.set(false);
+    }
   }
 }

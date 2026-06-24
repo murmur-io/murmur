@@ -68,6 +68,16 @@ export class IpcService {
     return invoke<MeetingDetail | null>("get_meeting_detail", { meetingId });
   }
 
+  /** Whether a usable Whisper model is present (configured path or default models dir). */
+  modelPresent(): Promise<boolean> {
+    return invoke<boolean>("model_present");
+  }
+
+  /** Download the default Whisper model (~150 MB) if missing; resolves with its path. */
+  downloadModel(): Promise<string> {
+    return invoke<string>("download_model");
+  }
+
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {
     return listen<StatusPayload>(EVENT_STATUS, (event) => cb(event.payload));
   }

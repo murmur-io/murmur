@@ -16,108 +16,238 @@ import type { MeetingDetail } from "../../core/models";
   imports: [RouterLink],
   template: `
     <section class="detail">
-      <a routerLink="/library" class="back">← Meetings</a>
+      <a routerLink="/library" class="back">
+        <span class="back-arrow" aria-hidden="true">←</span>
+        <span>Meetings</span>
+      </a>
 
       @if (detail(); as d) {
-        <h2>{{ d.meeting.title || "(untitled)" }}</h2>
-        <p class="meta">
-          {{ d.meeting.startedAt }} · {{ d.meeting.durationS }}s ·
-          {{ d.meeting.status }}
-        </p>
+        <header class="head">
+          <div class="head-text">
+            <h2>{{ d.meeting.title || "(untitled)" }}</h2>
+            <div class="meta">
+              <span class="pill" [class]="statusPillClass(d.meeting.status)">
+                <span class="pill-dot"></span>
+                {{ d.meeting.status }}
+              </span>
+              <span class="meta-sep" aria-hidden="true">·</span>
+              <span class="meta-item">{{ d.meeting.startedAt }}</span>
+              <span class="meta-sep" aria-hidden="true">·</span>
+              <span class="meta-item">{{ d.meeting.durationS }}s</span>
+            </div>
+          </div>
 
-        <div class="actions">
-          <button
-            type="button"
-            (click)="resummarize(d.meeting.id)"
-            [disabled]="busy()"
-          >
-            Re-summarize
-          </button>
-          @if (msg()) {
-            <span class="msg">{{ msg() }}</span>
-          }
-        </div>
-
-        <h3>Note</h3>
-        @if (d.note; as note) {
-          @if (note.exportedPath) {
-            <p class="path">{{ note.exportedPath }}</p>
-          }
-          <pre class="preview">{{ note.markdown }}</pre>
-        } @else {
-          <p class="empty">No note yet.</p>
-        }
-
-        <h3>Transcript</h3>
-        @if (d.segments.length) {
-          <ul class="segs">
-            @for (s of d.segments; track s.idx) {
-              <li>
-                <span class="t">[{{ fmt(s.startS) }}]</span> {{ s.text }}
-              </li>
+          <div class="actions">
+            <button
+              type="button"
+              class="btn btn-primary"
+              (click)="resummarize(d.meeting.id)"
+              [disabled]="busy()"
+            >
+              Re-summarize
+            </button>
+            @if (msg()) {
+              <span class="msg">{{ msg() }}</span>
             }
-          </ul>
-        } @else {
-          <p class="empty">No transcript.</p>
-        }
+          </div>
+        </header>
+
+        <section class="block">
+          <h3>Note</h3>
+          @if (d.note; as note) {
+            <article class="card note-card">
+              @if (note.exportedPath) {
+                <p class="path">{{ note.exportedPath }}</p>
+              }
+              <pre class="note-body">{{ note.markdown }}</pre>
+            </article>
+          } @else {
+            <div class="card empty-card">
+              <p class="empty">No note yet.</p>
+            </div>
+          }
+        </section>
+
+        <section class="block">
+          <h3>Transcript</h3>
+          @if (d.segments.length) {
+            <div class="card transcript-card">
+              <ul class="segs">
+                @for (s of d.segments; track s.idx) {
+                  <li class="seg">
+                    <span class="seg-time">{{ fmt(s.startS) }}</span>
+                    <span class="seg-text">{{ s.text }}</span>
+                  </li>
+                }
+              </ul>
+            </div>
+          } @else {
+            <div class="card empty-card">
+              <p class="empty">No transcript.</p>
+            </div>
+          }
+        </section>
       } @else if (loading()) {
-        <p>Loading…</p>
+        <p class="text-secondary">Loading…</p>
       } @else {
-        <p class="empty">Meeting not found.</p>
+        <div class="card empty-card">
+          <p class="empty">Meeting not found.</p>
+        </div>
       }
     </section>
   `,
   styles: [
     `
       .detail {
-        max-width: 820px;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-5);
       }
+
+      /* --- Back link --- */
       .back {
-        display: inline-block;
-        margin-bottom: 0.5rem;
-        opacity: 0.7;
-        text-decoration: none;
-        color: inherit;
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        align-self: flex-start;
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+        font-weight: 550;
+      }
+      .back:hover {
+        color: var(--text-primary);
+      }
+      .back:focus-visible {
+        outline: none;
+        color: var(--text-primary);
+        border-radius: var(--radius-sm);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .back-arrow {
+        font-size: 1rem;
+        line-height: 1;
+      }
+
+      /* --- Header: title, status + meta, primary action --- */
+      .head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--space-4);
+      }
+      .head-text {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        min-width: 0;
+      }
+      .head h2 {
+        margin: 0;
       }
       .meta {
-        font-size: 0.85rem;
-        opacity: 0.65;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-2);
+        color: var(--text-muted);
+        font-size: 0.8125rem;
       }
+      .meta-item {
+        color: var(--text-muted);
+      }
+      .meta-sep {
+        color: var(--text-muted);
+      }
+
       .actions {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        gap: 0.75rem;
-        margin: 0.5rem 0 1rem;
+        gap: var(--space-3);
       }
       .msg {
+        color: var(--text-secondary);
         font-size: 0.85rem;
-        opacity: 0.8;
       }
-      .preview {
-        white-space: pre-wrap;
-        background: rgba(128, 128, 128, 0.12);
-        padding: 0.75rem;
-        border-radius: 6px;
-        max-height: 360px;
-        overflow: auto;
+
+      /* --- Section blocks --- */
+      .block {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+      }
+      .block h3 {
+        margin: 0;
+      }
+
+      /* --- Note card (readable measure + line-height) --- */
+      .note-card {
+        padding: var(--space-5);
       }
       .path {
-        opacity: 0.7;
-        font-size: 0.85rem;
+        margin: 0 0 var(--space-4);
+        color: var(--text-muted);
+        font-size: 0.8125rem;
+        font-family: var(--font-mono);
+        word-break: break-all;
+      }
+      .note-body {
+        margin: 0;
+        white-space: pre-wrap;
+        background: var(--surface-input);
+        border: 1px solid var(--border-subtle);
+        color: var(--text-secondary);
+        padding: var(--space-4);
+        border-radius: var(--radius-md);
+        max-height: 360px;
+        overflow: auto;
+        font-size: 0.9rem;
+        line-height: 1.7;
+      }
+
+      /* --- Transcript list --- */
+      .transcript-card {
+        padding: var(--space-2) var(--space-5);
+        max-height: 480px;
+        overflow: auto;
       }
       .segs {
         list-style: none;
         padding: 0;
         margin: 0;
+      }
+      .seg {
+        display: flex;
+        gap: var(--space-3);
+        padding: var(--space-3) 0;
+        border-bottom: 1px solid var(--border-subtle);
         font-size: 0.9rem;
+        line-height: 1.6;
       }
-      .segs li {
-        padding: 0.15rem 0;
+      .seg:last-child {
+        border-bottom: none;
       }
-      .segs .t {
-        opacity: 0.5;
+      .seg-time {
+        flex: none;
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+        font-size: 0.8125rem;
         font-variant-numeric: tabular-nums;
-        margin-right: 0.4rem;
+        padding-top: 0.1em;
+      }
+      .seg-text {
+        color: var(--text-secondary);
+        min-width: 0;
+      }
+
+      /* --- Empty wells --- */
+      .empty-card {
+        padding: var(--space-5);
+      }
+      .empty {
+        margin: 0;
+        color: var(--text-muted);
       }
     `,
   ],
@@ -163,5 +293,21 @@ export class DetailComponent implements OnInit {
     const m = Math.floor(s / 60);
     const sec = Math.floor(s % 60);
     return `${m}:${sec.toString().padStart(2, "0")}`;
+  }
+
+  /** Maps a meeting status to a status-pill state modifier (presentation only). */
+  statusPillClass(status: string): string {
+    switch (status) {
+      case "RECORDING":
+      case "ERROR":
+        return "is-danger";
+      case "TRANSCRIBED":
+      case "SUMMARIZED":
+        return "is-accent";
+      case "EXPORTED":
+        return "is-success";
+      default:
+        return "";
+    }
   }
 }
