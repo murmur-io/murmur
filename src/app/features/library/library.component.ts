@@ -35,9 +35,13 @@ import type { Meeting, MeetingStatus } from "../../core/models";
         </div>
       } @else {
         <ul class="list card">
-          @for (m of meetings(); track m.id) {
+          @for (m of meetings(); track m.id; let i = $index) {
             <li>
-              <a class="row" [routerLink]="['/meeting', m.id]">
+              <a
+                class="row"
+                [routerLink]="['/meeting', m.id]"
+                [style.animation-delay.ms]="i * 45"
+              >
                 <span class="row-main">
                   <span class="title">{{ m.title || "(untitled)" }}</span>
                   <span class="meta">
@@ -111,6 +115,7 @@ import type { Meeting, MeetingStatus } from "../../core/models";
         border-radius: var(--radius-md);
         text-decoration: none;
         color: inherit;
+        animation: rise 360ms var(--transition) both;
         transition:
           background var(--transition),
           transform var(--transition-fast);

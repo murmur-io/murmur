@@ -282,6 +282,7 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
+        animation: rise 380ms var(--transition) both;
       }
 
       /* --- Banner icon (matches the record screen) --- */

@@ -31,9 +31,13 @@ import type { MeetingDetail } from "../../core/models";
                 {{ d.meeting.status }}
               </span>
               <span class="meta-sep" aria-hidden="true">·</span>
-              <span class="meta-item">{{ d.meeting.startedAt }}</span>
+              <span class="meta-item">{{
+                formatDate(d.meeting.startedAt)
+              }}</span>
               <span class="meta-sep" aria-hidden="true">·</span>
-              <span class="meta-item">{{ d.meeting.durationS }}s</span>
+              <span class="meta-item">{{
+                formatDuration(d.meeting.durationS)
+              }}</span>
             </div>
           </div>
 
@@ -102,6 +106,7 @@ import type { MeetingDetail } from "../../core/models";
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
+        animation: rise 380ms var(--transition) both;
       }
 
       /* --- Back link --- */
@@ -309,5 +314,29 @@ export class DetailComponent implements OnInit {
       default:
         return "";
     }
+  }
+
+  /** Presentational: stored timestamp → friendly local date. */
+  formatDate(startedAt: string): string {
+    const d = new Date(startedAt);
+    if (Number.isNaN(d.getTime())) return startedAt;
+    return d.toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  /** Presentational: seconds → compact "Hh Mm" / "Mm Ss" / "Ss". */
+  formatDuration(durationS: number): string {
+    const total = Math.max(0, Math.round(durationS));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
   }
 }
