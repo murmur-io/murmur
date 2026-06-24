@@ -13,6 +13,7 @@ import {
 } from "@angular/core";
 import { ActivatedRoute, Router, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type { MeetingDetail, MeetingTimeline } from "../../core/models";
 import { MeetingChatComponent } from "./meeting-chat.component";
@@ -59,7 +60,7 @@ interface ParsedNote {
       </a>
 
       @if (detail(); as d) {
-        <header class="head">
+        <header class="head print-keep">
           <div class="head-text">
             @if (renaming()) {
               <div class="rename">
@@ -140,6 +141,53 @@ interface ParsedNote {
               >
                 Delete
               </button>
+            }
+
+            <!-- EXPORT menu: copy / save note / save audio / print-to-PDF.
+                 Gated on a parsed note existing; disabled while editing it. -->
+            @if (note() && !renaming()) {
+              <div class="export" role="group" aria-label="Export">
+                <button
+                  type="button"
+                  class="btn btn-ghost export-btn"
+                  (click)="copyMarkdown()"
+                  [disabled]="editing() || busy()"
+                >
+                  {{ exportMsg() === "md-copied" ? "Copied" : "Copy Markdown" }}
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost export-btn"
+                  (click)="saveMarkdown(d.meeting.id, d.meeting.title)"
+                  [disabled]="editing() || exporting()"
+                >
+                  {{ exportMsg() === "md-saved" ? "Saved" : "Save Markdown…" }}
+                </button>
+                @if (audioSrc()) {
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    (click)="saveAudio(d.meeting.id, d.meeting.title)"
+                    [disabled]="editing() || exporting()"
+                  >
+                    {{
+                      exportMsg() === "audio-saved" ? "Saved" : "Save audio…"
+                    }}
+                  </button>
+                }
+                <button
+                  type="button"
+                  class="btn btn-ghost export-btn"
+                  (click)="saveAsPdf()"
+                  [disabled]="editing()"
+                >
+                  Save as PDF
+                </button>
+              </div>
+            }
+
+            @if (exportError(); as err) {
+              <span class="msg msg-error" role="alert">{{ err }}</span>
             }
             @if (msg()) {
               <span class="msg">{{ msg() }}</span>
@@ -255,7 +303,7 @@ interface ParsedNote {
         />
 
         <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
-        <section class="block">
+        <section class="block print-keep">
           <div class="block-head">
             <h3>Analysis</h3>
             @if (!editing() && note()?.tags?.length) {
@@ -536,6 +584,24 @@ interface ParsedNote {
       .msg {
         color: var(--text-secondary);
         font-size: 0.85rem;
+      }
+      .msg-error {
+        color: var(--danger);
+      }
+
+      /* --- Export menu (compact ghost buttons + a soft leading divider) --- */
+      .export {
+        display: inline-flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--space-1);
+        padding-left: var(--space-3);
+        border-left: 1px solid var(--border-subtle);
+      }
+      .export-btn {
+        height: 36px;
+        padding: 0 var(--space-3);
+        font-size: 0.875rem;
       }
 
       /* --- Inline title rename --- */
@@ -1133,6 +1199,47 @@ interface ParsedNote {
           flex-wrap: wrap;
         }
       }
+
+      /* Print / Save-as-PDF — isolate the note + analysis. Driven by
+         window.print(); the app chrome (header/nav, aurora) that lives outside
+         this component is hidden globally via body.murmur-printing. */
+      @media print {
+        /* Hide the whole detail view, then re-reveal only title + analysis. */
+        .detail > * {
+          display: none !important;
+        }
+        .detail > .print-keep {
+          display: flex !important;
+        }
+        /* Within the kept regions, drop the interactive affordances. */
+        .head .actions,
+        .head .export,
+        .head .msg,
+        .block .edit-btn,
+        .block .saved,
+        .block .saved-toast {
+          display: none !important;
+        }
+        .head.print-keep {
+          justify-content: flex-start;
+        }
+        /* Flatten frosted cards + force ink-friendly dark text. */
+        .card,
+        .section,
+        .meta-card {
+          background: #fff !important;
+          border-color: #ccc !important;
+          box-shadow: none !important;
+          -webkit-backdrop-filter: none !important;
+          backdrop-filter: none !important;
+          break-inside: avoid;
+        }
+        .print-keep,
+        .print-keep * {
+          color: #000 !important;
+          animation: none !important;
+        }
+      }
     `,
   ],
 })
@@ -1184,6 +1291,19 @@ export class DetailComponent implements OnInit {
 
   /** Tracked so we can cancel the pending "Saved" reset on destroy (no leaks). */
   private savedResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // --- Export menu state ---------------------------------------------------
+  /**
+   * Transient success token for the export buttons. One of "", "md-copied",
+   * "md-saved" or "audio-saved" — the matching button swaps its label briefly.
+   */
+  readonly exportMsg = signal("");
+  /** True while a save dialog + export IPC call is in flight (disables saves). */
+  readonly exporting = signal(false);
+  /** Inline error surfaced when an export fails. */
+  readonly exportError = signal("");
+  /** Tracked so we can cancel the pending export-label reset on destroy. */
+  private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- Audio player state (driven by the <audio> event bindings) ----------
   private readonly audio = viewChild<ElementRef<HTMLAudioElement>>("player");
@@ -1553,6 +1673,127 @@ export class DetailComponent implements OnInit {
     } catch {
       this.copied.set(false);
     }
+  }
+
+  // --- Export menu ---------------------------------------------------------
+
+  /**
+   * Copy the note's raw markdown to the clipboard (the full source, not the
+   * parsed analysis). Flashes a brief "Copied" confirmation on the button.
+   */
+  async copyMarkdown(): Promise<void> {
+    if (this.editing()) {
+      return;
+    }
+    const markdown = this.detail()?.note?.markdown;
+    if (!markdown) {
+      return;
+    }
+    this.exportError.set("");
+    try {
+      await navigator.clipboard.writeText(markdown);
+      this.flashExport("md-copied");
+    } catch (e) {
+      this.exportError.set("Couldn’t copy: " + String(e));
+    }
+  }
+
+  /**
+   * Prompt for a destination via the native save dialog, then write the note
+   * markdown there through `exportNote`. A dismissed dialog (null path) is a
+   * no-op; failures surface inline.
+   */
+  async saveMarkdown(id: string, title: string | null): Promise<void> {
+    if (this.editing() || this.exporting()) {
+      return;
+    }
+    this.exportError.set("");
+    this.exporting.set(true);
+    try {
+      const path = await save({
+        defaultPath: `${this.sanitizeTitle(title)}.md`,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (path) {
+        await this.ipc.exportNote(id, path);
+        this.flashExport("md-saved");
+      }
+    } catch (e) {
+      this.exportError.set("Couldn’t save markdown: " + String(e));
+    } finally {
+      this.exporting.set(false);
+    }
+  }
+
+  /**
+   * Prompt for a destination via the native save dialog, then copy the meeting
+   * recording (WAV) there through `exportAudio`. Only reachable when the
+   * meeting actually has audio (the button is gated on `audioSrc()`).
+   */
+  async saveAudio(id: string, title: string | null): Promise<void> {
+    if (this.editing() || this.exporting()) {
+      return;
+    }
+    this.exportError.set("");
+    this.exporting.set(true);
+    try {
+      const path = await save({
+        defaultPath: `${this.sanitizeTitle(title)}.wav`,
+        filters: [{ name: "Audio", extensions: ["wav"] }],
+      });
+      if (path) {
+        await this.ipc.exportAudio(id, path);
+        this.flashExport("audio-saved");
+      }
+    } catch (e) {
+      this.exportError.set("Couldn’t save audio: " + String(e));
+    } finally {
+      this.exporting.set(false);
+    }
+  }
+
+  /**
+   * Save-as-PDF via the OS print dialog. A body-level class flips on the print
+   * stylesheet (isolating the note/analysis) for the duration of the synchronous
+   * `window.print()` call, then is cleared so the live UI is untouched.
+   */
+  saveAsPdf(): void {
+    if (this.editing()) {
+      return;
+    }
+    document.body.classList.add("murmur-printing");
+    try {
+      window.print();
+    } finally {
+      document.body.classList.remove("murmur-printing");
+    }
+  }
+
+  /**
+   * Flash a transient success token on an export button (tracked timeout —
+   * cancelled on destroy so we never poke a dead component).
+   */
+  private flashExport(token: string): void {
+    this.exportMsg.set(token);
+    if (this.exportResetTimer) {
+      clearTimeout(this.exportResetTimer);
+    }
+    this.exportResetTimer = setTimeout(() => this.exportMsg.set(""), 2200);
+    this.destroyRef.onDestroy(() => {
+      if (this.exportResetTimer) {
+        clearTimeout(this.exportResetTimer);
+      }
+    });
+  }
+
+  /** Build a filesystem-safe filename stem from a meeting title. */
+  private sanitizeTitle(title: string | null): string {
+    const cleaned = (title || "")
+      .trim()
+      .replace(/[\\/:*?"<>|]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return cleaned || "meeting-note";
   }
 
   // --- Markdown parsing ----------------------------------------------------

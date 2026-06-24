@@ -482,3 +482,14 @@ body.bar-shell::after { display: none !important; }
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Save-as-PDF isolation (detail view): hide app chrome that lives OUTSIDE the
+   component (so its encapsulated print rules can't reach it). Scoped to the
+   body class the Detail view sets only for the duration of window.print(). */
+@media print {
+  body.murmur-printing::before,
+  body.murmur-printing::after { display: none !important; }
+  body.murmur-printing .app-header { display: none !important; }
+  body.murmur-printing .app-main { max-width: none; margin: 0; padding: 0; }
+  body.murmur-printing { background: #fff !important; color: #000 !important; }
+}
