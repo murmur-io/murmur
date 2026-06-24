@@ -58,6 +58,7 @@ pub fn run() {
             commands::get_meeting_detail,
             commands::model_present,
             commands::download_model,
+            commands::toggle_bar,
         ])
         .setup(|app| {
             create_bar_window(app.handle())?;
@@ -92,7 +93,8 @@ fn create_bar_window(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Toggle the floating bar: hide if visible, otherwise reposition top-centre, show + focus.
-fn toggle_bar(app: &tauri::AppHandle) {
+/// Bound to the global ⌘⇧R shortcut and exposed to the UI via `commands::toggle_bar`.
+pub fn toggle_bar(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("bar") {
         if matches!(win.is_visible(), Ok(true)) {
             let _ = win.hide();
