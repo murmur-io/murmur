@@ -5,7 +5,12 @@ import {
   inject,
   signal,
 } from "@angular/core";
-import { FormsModule } from "@angular/forms";
+import {
+  FormBuilder,
+  FormControl,
+  FormGroup,
+  ReactiveFormsModule,
+} from "@angular/forms";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type { AppConfigDto, ProviderStatus } from "../../core/models";
@@ -14,13 +19,13 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
   selector: "app-settings",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule],
+  imports: [ReactiveFormsModule],
   template: `
-    @if (config(); as cfg) {
-      <section class="settings">
+    @if (form; as f) {
+      <section class="settings" [formGroup]="f">
         <label>
           Provider
-          <select [(ngModel)]="cfg.providerId">
+          <select formControlName="providerId">
             <option value="claude_code">Claude Code (default)</option>
             <option value="anthropic">Anthropic API</option>
             <option value="ollama">Ollama</option>
@@ -30,50 +35,50 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         <label>
           Vault folder
           <span class="row">
-            <input [(ngModel)]="cfg.vaultPath" placeholder="/path/to/vault" />
-            <button type="button" (click)="pickVault(cfg)">Browse…</button>
+            <input formControlName="vaultPath" placeholder="/path/to/vault" />
+            <button type="button" (click)="pickVault()">Browse…</button>
           </span>
         </label>
 
         <label>
           Vault subfolder
-          <input [(ngModel)]="cfg.vaultSubfolder" placeholder="Meetings" />
+          <input formControlName="vaultSubfolder" placeholder="Meetings" />
         </label>
 
         <label>
           Whisper model path
           <span class="row">
             <input
-              [(ngModel)]="cfg.whisperModelPath"
+              formControlName="whisperModelPath"
               placeholder="/path/to/ggml-model.bin"
             />
-            <button type="button" (click)="pickModel(cfg)">Browse…</button>
+            <button type="button" (click)="pickModel()">Browse…</button>
           </span>
         </label>
 
         <label>
           Language (blank = auto)
-          <input [(ngModel)]="cfg.language" placeholder="en" />
+          <input formControlName="language" placeholder="en" />
         </label>
 
         <label>
           Anthropic model
-          <input [(ngModel)]="cfg.anthropicModel" />
+          <input formControlName="anthropicModel" />
         </label>
 
         <label>
           Ollama base URL
-          <input [(ngModel)]="cfg.ollamaBaseUrl" />
+          <input formControlName="ollamaBaseUrl" />
         </label>
 
         <label>
           Ollama model
-          <input [(ngModel)]="cfg.ollamaModel" />
+          <input formControlName="ollamaModel" />
         </label>
 
         <label>
           Claude binary
-          <input [(ngModel)]="cfg.claudeBinary" />
+          <input formControlName="claudeBinary" />
         </label>
 
         <fieldset>
@@ -82,7 +87,7 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           <span class="row">
             <input
               type="password"
-              [(ngModel)]="keyInput"
+              [formControl]="keyControl"
               placeholder="sk-ant-…"
             />
             <button type="button" (click)="saveKey()">Save key</button>
@@ -90,7 +95,7 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         </fieldset>
 
         <div class="actions">
-          <button type="button" (click)="save(cfg)">Save settings</button>
+          <button type="button" (click)="save()">Save settings</button>
           <button type="button" (click)="refreshProviders()">
             Check providers
           </button>
@@ -147,38 +152,68 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
 })
 export class SettingsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
+  private readonly fb = inject(FormBuilder);
 
-  readonly config = signal<AppConfigDto | null>(null);
+  /** Reactive form, built once config is loaded (SF-6 — replaces [(ngModel)]). */
+  form: FormGroup | null = null;
+  readonly keyControl = new FormControl("", { nonNullable: true });
+
   readonly providers = signal<ProviderStatus[]>([]);
   readonly hasKey = signal(false);
   readonly saved = signal(false);
-  keyInput = "";
 
   async ngOnInit(): Promise<void> {
-    this.config.set(await this.ipc.getConfig());
+    const cfg = await this.ipc.getConfig();
+    this.form = this.fb.nonNullable.group({
+      providerId: cfg.providerId,
+      vaultPath: cfg.vaultPath ?? "",
+      vaultSubfolder: cfg.vaultSubfolder ?? "",
+      whisperModelPath: cfg.whisperModelPath ?? "",
+      language: cfg.language ?? "",
+      anthropicModel: cfg.anthropicModel,
+      ollamaBaseUrl: cfg.ollamaBaseUrl,
+      ollamaModel: cfg.ollamaModel,
+      claudeBinary: cfg.claudeBinary,
+    });
     this.hasKey.set(await this.ipc.hasAnthropicKey());
     await this.refreshProviders();
   }
 
-  async pickVault(cfg: AppConfigDto): Promise<void> {
+  async pickVault(): Promise<void> {
     const dir = await open({ directory: true, multiple: false });
-    if (typeof dir === "string") cfg.vaultPath = dir;
+    if (typeof dir === "string") this.form?.patchValue({ vaultPath: dir });
   }
 
-  async pickModel(cfg: AppConfigDto): Promise<void> {
+  async pickModel(): Promise<void> {
     const file = await open({ directory: false, multiple: false });
-    if (typeof file === "string") cfg.whisperModelPath = file;
+    if (typeof file === "string")
+      this.form?.patchValue({ whisperModelPath: file });
   }
 
-  async save(cfg: AppConfigDto): Promise<void> {
+  async save(): Promise<void> {
+    if (!this.form) return;
+    const v = this.form.getRawValue();
+    // Empty optional fields → null (the Rust side also normalizes, but keep the DTO clean).
+    const cfg: AppConfigDto = {
+      providerId: v.providerId,
+      vaultPath: v.vaultPath || null,
+      vaultSubfolder: v.vaultSubfolder || null,
+      whisperModelPath: v.whisperModelPath || null,
+      language: v.language || null,
+      anthropicModel: v.anthropicModel,
+      ollamaBaseUrl: v.ollamaBaseUrl,
+      ollamaModel: v.ollamaModel,
+      claudeBinary: v.claudeBinary,
+    };
     await this.ipc.saveConfig(cfg);
     this.saved.set(true);
   }
 
   async saveKey(): Promise<void> {
-    if (!this.keyInput) return;
-    await this.ipc.setAnthropicKey(this.keyInput);
-    this.keyInput = "";
+    const key = this.keyControl.value;
+    if (!key) return;
+    await this.ipc.setAnthropicKey(key);
+    this.keyControl.setValue("");
     this.hasKey.set(await this.ipc.hasAnthropicKey());
   }
 
