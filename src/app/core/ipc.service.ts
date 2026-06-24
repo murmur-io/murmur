@@ -115,6 +115,26 @@ export class IpcService {
     return invoke<string | null>("detect_meeting_app");
   }
 
+  /** Replace a meeting's tags. */
+  setMeetingTags(meetingId: string, tags: string[]): Promise<void> {
+    return invoke<void>("set_meeting_tags", { meetingId, tags });
+  }
+
+  /** A meeting's tags (sorted). */
+  getMeetingTags(meetingId: string): Promise<string[]> {
+    return invoke<string[]>("get_meeting_tags", { meetingId });
+  }
+
+  /** All distinct tags across meetings (Library filter). */
+  listAllTags(): Promise<string[]> {
+    return invoke<string[]>("list_all_tags");
+  }
+
+  /** Meetings carrying a given tag, newest first. */
+  listMeetingsByTag(tag: string): Promise<Meeting[]> {
+    return invoke<Meeting[]>("list_meetings_by_tag", { tag });
+  }
+
   /** Aggregate analytics for the dashboard + Analytics tab. */
   getAnalytics(): Promise<Analytics> {
     return invoke<Analytics>("get_analytics");

@@ -108,6 +108,12 @@ impl Db {
                meeting_id TEXT PRIMARY KEY,
                data TEXT NOT NULL,
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS meeting_tags (
+               meeting_id TEXT NOT NULL,
+               tag TEXT NOT NULL,
+               PRIMARY KEY (meeting_id, tag),
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );",
         )
         .map_err(map_err)?;
@@ -431,6 +437,88 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    // ── meeting tags ─────────────────────────────────────────────────────────
+
+    /// Replace all tags for a meeting with `tags` (trimmed, blanks dropped).
+    pub fn set_meeting_tags(&self, meeting_id: &str, tags: &[String]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM meeting_tags WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO meeting_tags (meeting_id, tag) VALUES (?1, ?2)")
+                .map_err(map_err)?;
+            for tag in tags {
+                let t = tag.trim();
+                if !t.is_empty() {
+                    stmt.execute(rusqlite::params![meeting_id, t])
+                        .map_err(map_err)?;
+                }
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// All tags for a meeting, sorted.
+    pub fn get_meeting_tags(&self, meeting_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT tag FROM meeting_tags WHERE meeting_id = ?1 ORDER BY tag")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// All distinct tags across meetings, sorted (for the filter UI).
+    pub fn list_all_tags(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT tag FROM meeting_tags ORDER BY tag")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Meetings carrying `tag`, newest first.
+    pub fn list_meetings_by_tag(&self, tag: &str) -> Result<Vec<Meeting>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, \
+                        m.status
+                   FROM meetings m
+                   JOIN meeting_tags t ON t.meeting_id = m.id
+                  WHERE t.tag = ?1
+                  ORDER BY m.started_at DESC, m.id DESC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![tag], row_to_meeting)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)??);
+        }
+        Ok(out)
     }
 
     // ── settings k/v table ───────────────────────────────────────────────────

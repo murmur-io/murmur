@@ -457,6 +457,40 @@ pub fn detect_meeting_app() -> Result<Option<String>, AppError> {
     Ok(None)
 }
 
+/// Replace a meeting's tags (trimmed, de-duplicated by the DB).
+#[tauri::command]
+pub fn set_meeting_tags(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    tags: Vec<String>,
+) -> Result<(), AppError> {
+    state.db.set_meeting_tags(&meeting_id, &tags)
+}
+
+/// A meeting's tags (sorted).
+#[tauri::command]
+pub fn get_meeting_tags(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<String>, AppError> {
+    state.db.get_meeting_tags(&meeting_id)
+}
+
+/// All distinct tags across meetings (for the Library filter).
+#[tauri::command]
+pub fn list_all_tags(state: State<'_, AppState>) -> Result<Vec<String>, AppError> {
+    state.db.list_all_tags()
+}
+
+/// Meetings carrying a given tag, newest first.
+#[tauri::command]
+pub fn list_meetings_by_tag(
+    state: State<'_, AppState>,
+    tag: String,
+) -> Result<Vec<Meeting>, AppError> {
+    state.db.list_meetings_by_tag(&tag)
+}
+
 /// Read current config (settings table), without secrets.
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> {
