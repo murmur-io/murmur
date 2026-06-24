@@ -60,6 +60,7 @@ pub fn run() {
             commands::search_meetings,
             commands::delete_meeting,
             commands::rename_meeting,
+            commands::chat_meeting,
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,
