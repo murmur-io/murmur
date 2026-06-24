@@ -97,6 +97,7 @@ import type { Meeting, MeetingStatus } from "../../core/models";
         color: var(--text-secondary);
         font-size: 0.8125rem;
         font-weight: 600;
+        font-variant-numeric: tabular-nums;
         line-height: 1;
       }
 
