@@ -24,15 +24,49 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         </div>
       }
 
-      <!-- Whisper model status -->
+      <!-- Transcription model: language + quality + auto-download -->
       <div class="card model-card">
-        <div class="model-head">
-          <div class="model-copy">
-            <h3>Transcription model</h3>
-            <p class="text-secondary model-sub">
-              Transcription runs on-device with a local Whisper model.
-            </p>
-          </div>
+        <div class="model-copy">
+          <h3>Transcription model</h3>
+          <p class="text-secondary model-sub">
+            Runs on-device. Pick your language and quality — the matching
+            Whisper model downloads automatically.
+          </p>
+        </div>
+
+        <div class="model-grid">
+          <label class="field">
+            <span class="field-label">Language</span>
+            <select formControlName="language" (change)="onModelChoiceChange()">
+              <option value="">Auto-detect</option>
+              <option value="en">English</option>
+              <option value="pl">Polski</option>
+              <option value="de">Deutsch</option>
+              <option value="es">Español</option>
+              <option value="fr">Français</option>
+              <option value="it">Italiano</option>
+              <option value="pt">Português</option>
+              <option value="uk">Українська</option>
+              <option value="nl">Nederlands</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Quality</span>
+            <select
+              formControlName="modelSize"
+              (change)="onModelChoiceChange()"
+            >
+              <option value="tiny">Tiny — fastest (~75 MB)</option>
+              <option value="base">Base (~150 MB)</option>
+              <option value="small">Small — recommended (~470 MB)</option>
+              <option value="medium">Medium — accurate (~1.5 GB)</option>
+              <option value="large-v3">Large — best (~3 GB)</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="model-status-row">
           @if (modelPresent() === true) {
             <span class="pill is-success">
               <span class="pill-dot"></span>
@@ -48,7 +82,7 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
               @if (downloadingModel()) {
                 Downloading…
               } @else {
-                Download model (~150 MB)
+                Download model ({{ downloadHint() }})
               }
             </button>
           } @else {
@@ -93,21 +127,18 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           </label>
 
           <label class="field">
-            <span class="field-label">Whisper model path</span>
+            <span class="field-label"
+              >Whisper model path (optional override)</span
+            >
             <span class="row">
               <input
                 formControlName="whisperModelPath"
-                placeholder="/path/to/ggml-model.bin"
+                placeholder="leave blank — auto-managed in Transcription model above"
               />
               <button type="button" class="btn" (click)="pickModel()">
                 Browse…
               </button>
             </span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Language (blank = auto)</span>
-            <input formControlName="language" placeholder="en" />
           </label>
         </fieldset>
       </div>
@@ -278,6 +309,25 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         margin: var(--space-3) 0 0;
         font-size: 0.85rem;
       }
+      .model-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .model-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: var(--space-4);
+      }
+      @media (max-width: 520px) {
+        .model-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      .model-status-row {
+        display: flex;
+        align-items: center;
+      }
 
       /* --- Cards stack their fieldset flush (card already provides padding) --- */
       .card fieldset {
@@ -416,6 +466,7 @@ export class SettingsComponent implements OnInit {
     ollamaModel: "llama3.1",
     claudeBinary: "claude",
     captureSystemAudio: false,
+    modelSize: "small",
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -436,6 +487,9 @@ export class SettingsComponent implements OnInit {
   /** Surfaced if ipc.downloadModel() rejects. */
   readonly modelDownloadError = signal<string | null>(null);
 
+  /** Approx download size for the selected quality (shown on the Download button). */
+  readonly downloadHint = signal("~470 MB");
+
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
@@ -450,7 +504,9 @@ export class SettingsComponent implements OnInit {
         ollamaModel: cfg.ollamaModel,
         claudeBinary: cfg.claudeBinary,
         captureSystemAudio: cfg.captureSystemAudio ?? false,
+        modelSize: cfg.modelSize ?? "small",
       });
+      this.updateDownloadHint();
       this.hasKey.set(await this.ipc.hasAnthropicKey());
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
@@ -483,6 +539,7 @@ export class SettingsComponent implements OnInit {
       ollamaModel: v.ollamaModel,
       claudeBinary: v.claudeBinary,
       captureSystemAudio: v.captureSystemAudio,
+      modelSize: v.modelSize,
     };
     try {
       await this.ipc.saveConfig(cfg);
@@ -504,11 +561,30 @@ export class SettingsComponent implements OnInit {
     this.providers.set(await this.ipc.providerStatuses());
   }
 
-  /** Download the default Whisper model, then re-check presence and clear on success. */
+  /** Persist the chosen language + quality, then re-check which model is present. */
+  async onModelChoiceChange(): Promise<void> {
+    this.updateDownloadHint();
+    await this.save();
+    this.modelPresent.set(await this.ipc.modelPresent());
+  }
+
+  private updateDownloadHint(): void {
+    const hints: Record<string, string> = {
+      tiny: "~75 MB",
+      base: "~150 MB",
+      small: "~470 MB",
+      medium: "~1.5 GB",
+      "large-v3": "~3 GB",
+    };
+    this.downloadHint.set(hints[this.form.getRawValue().modelSize] ?? "");
+  }
+
+  /** Download the model for the chosen language + quality, then re-check presence. */
   async downloadModel(): Promise<void> {
     this.modelDownloadError.set(null);
     this.downloadingModel.set(true);
     try {
+      await this.save(); // ensure the chosen language + size are persisted first
       await this.ipc.downloadModel();
       this.modelPresent.set(await this.ipc.modelPresent());
     } catch (e) {

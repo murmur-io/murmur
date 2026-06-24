@@ -16,16 +16,29 @@ use crate::error::{AppError, Result};
 /// App-data subdirectory that holds downloaded GGUF models.
 pub const MODELS_SUBDIR: &str = "models";
 
-/// Default model filename downloaded when nothing is configured.
+/// Map a chosen size + language to a whisper.cpp GGML model filename.
 ///
-/// `base.en` is a good Phase-0 default: ~142 MB, English-only, fast on Apple Silicon
-/// with the Metal backend, and accurate enough for a walking-skeleton proof.
-pub const DEFAULT_MODEL_FILE: &str = "ggml-base.en.bin";
+/// English-only (`.en`) builds exist for tiny/base/small/medium — smaller + faster — and
+/// are used ONLY when the user explicitly selects English. Any other language (incl.
+/// Polish) or auto-detect needs the multilingual build. `large-v3` is multilingual-only.
+pub fn model_filename(size: &str, language: &str) -> String {
+    let size = match size.trim() {
+        "" => "small",
+        s => s,
+    };
+    let en_only = language == "en" && matches!(size, "tiny" | "base" | "small" | "medium");
+    if en_only {
+        format!("ggml-{size}.en.bin")
+    } else {
+        format!("ggml-{size}.bin")
+    }
+}
 
 /// Hugging Face mirror of the official whisper.cpp GGML models (ggerganov/whisper.cpp).
-/// `resolve/main` serves the raw file. whisper-rs loads the GGML/GGUF binary directly.
-const DEFAULT_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+/// `resolve/main` serves the raw file; whisper-rs loads the GGML/GGUF binary directly.
+pub fn model_url(filename: &str) -> String {
+    format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{filename}")
+}
 
 /// The directory where MeetNotes keeps downloaded models:
 /// `<app-data>/MeetNotes/models`. Created if absent.
@@ -47,19 +60,24 @@ pub fn models_dir() -> Result<PathBuf> {
 /// Resolution order:
 /// 1. `configured` — an explicit path from settings (`whisper_model_path`). If it points
 ///    at an existing file it is used verbatim.
-/// 2. The default model file inside [`models_dir`], if it already exists on disk.
+/// 2. The model derived from the chosen `size` + `language` inside [`models_dir`], if it
+///    already exists on disk.
 ///
 /// Returns `Ok(None)` when no usable model is present (caller may then call
 /// [`ensure_model`] to download one, or surface a "set model path" hint to the user).
-pub fn resolve_model_path(configured: Option<&Path>) -> Result<Option<PathBuf>> {
+pub fn resolve_model_path(
+    configured: Option<&Path>,
+    size: &str,
+    language: &str,
+) -> Result<Option<PathBuf>> {
     if let Some(p) = configured {
         if p.is_file() {
             return Ok(Some(p.to_path_buf()));
         }
     }
-    let default = models_dir()?.join(DEFAULT_MODEL_FILE);
-    if default.is_file() {
-        return Ok(Some(default));
+    let derived = models_dir()?.join(model_filename(size, language));
+    if derived.is_file() {
+        return Ok(Some(derived));
     }
     Ok(None)
 }
@@ -73,14 +91,19 @@ pub fn resolve_model_path(configured: Option<&Path>) -> Result<Option<PathBuf>> 
 ///
 /// This is `async` because the download uses `reqwest`; it must be called from within a
 /// Tokio runtime (the pipeline already runs on one).
-pub async fn ensure_model(configured: Option<&Path>) -> Result<PathBuf> {
-    if let Some(found) = resolve_model_path(configured)? {
+pub async fn ensure_model(
+    configured: Option<&Path>,
+    size: &str,
+    language: &str,
+) -> Result<PathBuf> {
+    if let Some(found) = resolve_model_path(configured, size, language)? {
         return Ok(found);
     }
 
     let dir = models_dir()?;
-    let dest = dir.join(DEFAULT_MODEL_FILE);
-    download_model(DEFAULT_MODEL_URL, &dest).await?;
+    let file = model_filename(size, language);
+    let dest = dir.join(&file);
+    download_model(&model_url(&file), &dest).await?;
     Ok(dest)
 }
 

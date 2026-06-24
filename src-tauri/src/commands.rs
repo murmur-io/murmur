@@ -61,6 +61,7 @@ pub struct AppConfigDto {
     pub ollama_model: String,
     pub claude_binary: String,
     pub capture_system_audio: bool,
+    pub model_size: String,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -299,6 +300,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         ollama_model: c.ollama_model.clone(),
         claude_binary: c.claude_binary.clone(),
         capture_system_audio: c.capture_system_audio,
+        model_size: c.model_size.clone(),
     }
 }
 
@@ -316,6 +318,11 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         ollama_model: d.ollama_model,
         claude_binary: d.claude_binary,
         capture_system_audio: d.capture_system_audio,
+        model_size: if d.model_size.trim().is_empty() {
+            "small".to_string()
+        } else {
+            d.model_size
+        },
     }
 }
 
@@ -416,34 +423,42 @@ pub fn get_meeting_detail(
     }))
 }
 
-/// Whether a usable Whisper model is present (the configured path, or the default model
-/// in the app models dir). Lets the UI auto-detect + offer a download when missing.
+/// Whether a usable Whisper model is present for the chosen size + language (or the
+/// explicit configured path). Lets the UI auto-detect + offer a download when missing.
 #[tauri::command]
 pub fn model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
-    let configured = {
+    let (configured, size, language) = {
         let c = state
             .config
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.whisper_model_path.clone()
+        (
+            c.whisper_model_path.clone(),
+            c.model_size.clone(),
+            c.language.clone().unwrap_or_default(),
+        )
     };
     let p = configured.as_deref().map(std::path::Path::new);
-    Ok(crate::transcribe::resolve_model_path(p)?.is_some())
+    Ok(crate::transcribe::resolve_model_path(p, &size, &language)?.is_some())
 }
 
-/// Download the default Whisper model (ggml-base.en, ~150 MB) from the whisper.cpp
-/// HuggingFace mirror into the app models dir if missing; returns its path. No-op (returns
-/// the existing path) when a model is already present.
+/// Download the Whisper model matching the chosen size + language (multilingual unless
+/// English is selected) from the whisper.cpp HuggingFace mirror into the app models dir if
+/// missing; returns its path. No-op (returns the existing path) when already present.
 #[tauri::command]
 pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppError> {
-    let configured = {
+    let (configured, size, language) = {
         let c = state
             .config
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.whisper_model_path.clone()
+        (
+            c.whisper_model_path.clone(),
+            c.model_size.clone(),
+            c.language.clone().unwrap_or_default(),
+        )
     };
     let p = configured.as_deref().map(std::path::Path::new);
-    let path = crate::transcribe::ensure_model(p).await?;
+    let path = crate::transcribe::ensure_model(p, &size, &language).await?;
     Ok(path.to_string_lossy().to_string())
 }
