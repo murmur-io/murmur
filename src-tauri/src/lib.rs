@@ -66,6 +66,7 @@ pub fn run() {
             if let Err(e) = app.global_shortcut().register(SUMMON_SHORTCUT) {
                 tracing::warn!(target: "shortcut", error = %e, "could not register global shortcut");
             }
+            commands::restart_voice_listener(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

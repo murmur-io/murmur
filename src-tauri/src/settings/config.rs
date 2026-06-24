@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub capture_system_audio: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3". Default "small".
     pub model_size: String,
+    /// Voice trigger: start recording when a wake phrase is heard. Default off.
+    pub voice_trigger: bool,
 }
 
 impl Default for AppConfig {
@@ -41,6 +43,7 @@ impl Default for AppConfig {
             claude_binary: "claude".to_string(),
             capture_system_audio: false,
             model_size: "small".to_string(),
+            voice_trigger: false,
         }
     }
 }
@@ -57,6 +60,7 @@ const K_OLLAMA_MODEL: &str = "ollama_model";
 const K_CLAUDE_BINARY: &str = "claude_binary";
 const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 const K_MODEL_SIZE: &str = "model_size";
+const K_VOICE_TRIGGER: &str = "voice_trigger";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -102,6 +106,9 @@ impl AppConfig {
                 cfg.model_size = v;
             }
         }
+        if let Some(v) = db.get_setting(K_VOICE_TRIGGER)? {
+            cfg.voice_trigger = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -129,6 +136,10 @@ impl AppConfig {
             if self.capture_system_audio { "true" } else { "false" },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
+        db.set_setting(
+            K_VOICE_TRIGGER,
+            if self.voice_trigger { "true" } else { "false" },
+        )?;
         Ok(())
     }
 }

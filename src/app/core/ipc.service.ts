@@ -13,6 +13,7 @@ import type {
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
+export const EVENT_VOICE_START = "murmur://voice-start";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -85,5 +86,10 @@ export class IpcService {
 
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {
     return listen<StatusPayload>(EVENT_STATUS, (event) => cb(event.payload));
+  }
+
+  /** Fires when the backend voice listener hears the wake phrase. */
+  onVoiceStart(cb: () => void): Promise<UnlistenFn> {
+    return listen(EVENT_VOICE_START, () => cb());
   }
 }
