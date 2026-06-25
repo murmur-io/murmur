@@ -822,6 +822,7 @@ export class SettingsComponent implements OnInit {
     voiceTrigger: false,
     noteStyle: "standard",
     autoOrganize: false,
+    noteLanguage: "auto",
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -873,6 +874,7 @@ export class SettingsComponent implements OnInit {
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
         autoOrganize: cfg.autoOrganize ?? false,
+        noteLanguage: cfg.noteLanguage ?? "auto",
       });
       this.updateDownloadHint();
       this.hasKey.set(await this.ipc.hasAnthropicKey());
@@ -912,6 +914,7 @@ export class SettingsComponent implements OnInit {
       onboarded: this.loadedOnboarded,
       noteStyle: v.noteStyle,
       autoOrganize: v.autoOrganize,
+      noteLanguage: v.noteLanguage,
     };
     try {
       await this.ipc.saveConfig(cfg);
