@@ -143,3 +143,16 @@ export interface ChatTurn {
   role: "user" | "assistant";
   content: string;
 }
+
+export interface BuiltinRecipe {
+  id: string;
+  label: string;
+  prompt: string;
+}
+
+export interface SavedRecipe {
+  id: string;
+  title: string;
+  prompt: string;
+  createdAt: string;
+}

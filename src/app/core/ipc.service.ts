@@ -4,12 +4,14 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Analytics,
   AppConfigDto,
+  BuiltinRecipe,
   ChatTurn,
   Meeting,
   MeetingDetail,
   MeetingTimeline,
   NoteDto,
   ProviderStatus,
+  SavedRecipe,
   SearchHit,
   StartResult,
   StatusPayload,
@@ -98,6 +100,31 @@ export class IpcService {
     history: ChatTurn[],
   ): Promise<string> {
     return invoke<string>("chat_meeting", { meetingId, question, history });
+  }
+
+  /** Built-in recipe templates (quick chips). */
+  listBuiltinRecipes(): Promise<BuiltinRecipe[]> {
+    return invoke<BuiltinRecipe[]>("list_builtin_recipes");
+  }
+
+  /** User-saved recipe templates. */
+  listSavedRecipes(): Promise<SavedRecipe[]> {
+    return invoke<SavedRecipe[]>("list_saved_recipes");
+  }
+
+  /** Save a recipe template. */
+  saveRecipe(title: string, prompt: string): Promise<SavedRecipe> {
+    return invoke<SavedRecipe>("save_recipe", { title, prompt });
+  }
+
+  /** Delete a saved recipe. */
+  deleteRecipe(id: string): Promise<void> {
+    return invoke<void>("delete_recipe", { id });
+  }
+
+  /** Run a recipe prompt over a meeting's transcript (grounded). */
+  runRecipe(meetingId: string, prompt: string): Promise<string> {
+    return invoke<string>("run_recipe", { meetingId, prompt });
   }
 
   /** Copy a meeting's recording (WAV) to a chosen path. */
