@@ -76,6 +76,8 @@ pub fn run() {
             commands::get_action_items,
             commands::patch_note_tasks,
             commands::add_reminder,
+            commands::pin_moment,
+            commands::link_meeting_entities,
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,

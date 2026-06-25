@@ -8,7 +8,7 @@ use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, BuiltinRecipe, ChatTurn, Meeting, MeetingStatus, MeetingTimeline,
-    NoteRecord, RecipeRecord, SearchHit,
+    NoteRecord, PinResult, RecipeRecord, SearchHit,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -654,6 +654,100 @@ pub async fn add_reminder(text: String, due_date: Option<String>) -> Result<(), 
             String::from_utf8_lossy(&out.stderr).trim()
         )))
     }
+}
+
+/// Pin a meeting moment: append a timestamped ^block-ref to the note (DB + vault file) and
+/// return an obsidian:// deep link to the note.
+#[tauri::command]
+pub fn pin_moment(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    seconds: f64,
+    label: String,
+) -> Result<PinResult, AppError> {
+    let existing = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let secs = seconds.max(0.0) as i64;
+    let block_id = format!("m{secs}");
+    let mmss = format!("{}:{:02}", secs / 60, secs % 60);
+    let new_md = crate::export::append_pin(&existing.markdown, &mmss, &label, &block_id);
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: existing.provider_id.clone(),
+        markdown: new_md.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+    })?;
+    let url = match existing.exported_path.as_deref() {
+        Some(path) => {
+            crate::export::overwrite_note(std::path::Path::new(path), &new_md)?;
+            let vault = {
+                state
+                    .config
+                    .lock()
+                    .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+                    .vault_path
+                    .clone()
+            };
+            match vault.as_deref().filter(|p| !p.is_empty()) {
+                Some(v) => crate::export::build_open_url(
+                    std::path::Path::new(v),
+                    std::path::Path::new(path),
+                ),
+                None => String::new(),
+            }
+        }
+        None => String::new(),
+    };
+    Ok(PinResult {
+        url,
+        block_id,
+        mmss,
+    })
+}
+
+/// Resolve the people + projects in a meeting note and write/append [[Person]] / [[Project]]
+/// stub notes in the vault with a backlink to this meeting — the graph self-assembles.
+#[tauri::command]
+pub async fn link_meeting_entities(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<crate::summarize::graph::GraphPayload, AppError> {
+    let meeting = state
+        .db
+        .get_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg("this meeting has no note yet".into()))?;
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let vault = config
+        .vault_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| AppError::InvalidArg("set a vault folder in Settings first".into()))?;
+    let title = meeting.title.clone().unwrap_or_else(|| "Meeting".to_string());
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let payload =
+        crate::summarize::graph::extract_entities(provider.as_ref(), &title, &note.markdown).await?;
+    let vault_path = std::path::Path::new(&vault);
+    for p in &payload.people {
+        crate::export::entity_stub::ensure_entity_backlink(vault_path, "People", p, &title)?;
+    }
+    for pr in &payload.projects {
+        crate::export::entity_stub::ensure_entity_backlink(vault_path, "Projects", pr, &title)?;
+    }
+    Ok(payload)
 }
 
 /// Read current config (settings table), without secrets.

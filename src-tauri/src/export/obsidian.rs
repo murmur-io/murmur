@@ -338,6 +338,58 @@ pub fn overwrite_note(path: &Path, markdown: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Deep links + pinned moments ─────────────────────────────────────────────
+
+/// Percent-encode a value for an `obsidian://` URL query parameter.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Build an `obsidian://open?vault=…&file=…` deep link to `note_path` inside `vault_dir`.
+pub fn build_open_url(vault_dir: &Path, note_path: &Path) -> String {
+    let vault_name = vault_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("vault");
+    let rel = note_path.strip_prefix(vault_dir).unwrap_or(note_path);
+    let file = rel.with_extension("");
+    format!(
+        "obsidian://open?vault={}&file={}",
+        percent_encode(vault_name),
+        percent_encode(&file.to_string_lossy())
+    )
+}
+
+/// Append a pinned-moment anchor line to a note's markdown (under a "## Pinned moments"
+/// section, always at the end so the section stays contiguous). Pure — returns new markdown.
+pub fn append_pin(markdown: &str, mmss: &str, label: &str, block_id: &str) -> String {
+    let label = label.trim();
+    let line = if label.is_empty() {
+        format!("- **{mmss}** ^{block_id}")
+    } else {
+        format!("- **{mmss}** {label} ^{block_id}")
+    };
+    let mut md = markdown.to_string();
+    if !md.ends_with('\n') {
+        md.push('\n');
+    }
+    if !md.contains("## Pinned moments") {
+        md.push_str("\n## Pinned moments\n");
+    }
+    md.push_str(&line);
+    md.push('\n');
+    md
+}
+
 // ── Vault detection (from ~/Library/Application Support/obsidian/obsidian.json) ──
 
 /// A detected Obsidian vault.

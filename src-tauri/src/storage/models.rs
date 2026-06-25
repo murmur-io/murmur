@@ -146,3 +146,12 @@ pub struct ActionItem {
     pub owner: Option<String>,
     pub due_date: Option<String>,
 }
+
+/// Result of pinning a meeting moment: the ^block-ref id + an obsidian:// deep link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinResult {
+    pub url: String,
+    pub block_id: String,
+    pub mmss: String,
+}

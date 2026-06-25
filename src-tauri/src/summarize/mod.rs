@@ -10,6 +10,7 @@ pub mod action_items;
 pub mod anthropic;
 pub mod chat;
 pub mod claude_code;
+pub mod graph;
 pub mod ollama;
 pub mod organize;
 pub mod provider;

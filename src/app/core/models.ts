@@ -164,3 +164,14 @@ export interface ActionItem {
   owner: string | null;
   dueDate: string | null;
 }
+
+export interface PinResult {
+  url: string;
+  blockId: string;
+  mmss: string;
+}
+
+export interface GraphPayload {
+  people: string[];
+  projects: string[];
+}
