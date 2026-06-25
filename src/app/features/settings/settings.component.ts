@@ -183,6 +183,30 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           </span>
         </label>
 
+        <label class="field">
+          <span class="field-label">Notes language</span>
+          <select formControlName="noteLanguage">
+            <option value="auto">Auto — match the meeting</option>
+            <option value="en">English</option>
+            <option value="pl">Polski</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+            <option value="fr">Français</option>
+            <option value="it">Italiano</option>
+            <option value="pt">Português</option>
+            <option value="uk">Українська</option>
+            <option value="nl">Nederlands</option>
+          </select>
+          <span class="field-help text-muted">
+            @if (form.controls.noteLanguage.value === "auto") {
+              The whole note (headings + content) is written in the meeting's
+              language.
+            } @else {
+              The whole note is written in this language, whatever was spoken.
+            }
+          </span>
+        </label>
+
         <label class="toggle-row">
           <span class="toggle-copy">
             <span class="toggle-title">Organize into thematic subfolders</span>
