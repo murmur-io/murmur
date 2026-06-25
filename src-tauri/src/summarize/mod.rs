@@ -12,6 +12,7 @@ pub mod claude_code;
 pub mod ollama;
 pub mod organize;
 pub mod provider;
+pub mod recipes;
 pub mod template;
 pub mod timeline;
 

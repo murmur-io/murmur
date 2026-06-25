@@ -7,7 +7,8 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
-    Analytics, ChatTurn, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, SearchHit,
+    Analytics, BuiltinRecipe, ChatTurn, Meeting, MeetingStatus, MeetingTimeline, NoteRecord,
+    RecipeRecord, SearchHit,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -490,6 +491,91 @@ pub fn list_meetings_by_tag(
     tag: String,
 ) -> Result<Vec<Meeting>, AppError> {
     state.db.list_meetings_by_tag(&tag)
+}
+
+/// Built-in recipe templates (quick chips).
+#[tauri::command]
+pub fn list_builtin_recipes() -> Result<Vec<BuiltinRecipe>, AppError> {
+    Ok(crate::summarize::recipes::BUILTIN_RECIPES
+        .iter()
+        .map(|(id, label, prompt)| BuiltinRecipe {
+            id: id.to_string(),
+            label: label.to_string(),
+            prompt: prompt.to_string(),
+        })
+        .collect())
+}
+
+/// User-saved recipe templates.
+#[tauri::command]
+pub fn list_saved_recipes(state: State<'_, AppState>) -> Result<Vec<RecipeRecord>, AppError> {
+    state.db.list_saved_recipes()
+}
+
+/// Save a recipe template (prompt + title).
+#[tauri::command]
+pub fn save_recipe(
+    state: State<'_, AppState>,
+    title: String,
+    prompt: String,
+) -> Result<RecipeRecord, AppError> {
+    let title = title.trim();
+    let prompt = prompt.trim();
+    if title.is_empty() || prompt.is_empty() {
+        return Err(AppError::InvalidArg(
+            "recipe title and prompt are required".into(),
+        ));
+    }
+    let rec = RecipeRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: title.to_string(),
+        prompt: prompt.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.db.insert_recipe(&rec)?;
+    Ok(rec)
+}
+
+/// Delete a saved recipe.
+#[tauri::command]
+pub fn delete_recipe(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    state.db.delete_recipe(&id)
+}
+
+/// Run a recipe prompt over a meeting's transcript (grounded), returning the artifact text.
+#[tauri::command]
+pub async fn run_recipe(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    prompt: String,
+) -> Result<String, AppError> {
+    if prompt.trim().is_empty() {
+        return Err(AppError::InvalidArg("recipe prompt is empty".into()));
+    }
+    let segments = state.db.get_segments(&meeting_id)?;
+    if segments.is_empty() {
+        return Err(AppError::InvalidArg("this meeting has no transcript yet".into()));
+    }
+    let transcript = segments
+        .iter()
+        .map(|s| s.text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let (system, user) = crate::summarize::recipes::build_recipe_prompt(
+        &transcript,
+        &prompt,
+        &config.note_language,
+    );
+    provider.complete(&system, &user).await
 }
 
 /// Read current config (settings table), without secrets.

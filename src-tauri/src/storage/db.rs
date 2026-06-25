@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, Result};
 use crate::storage::models::{
-    Analytics, DayCount, Meeting, MeetingStatus, NoteRecord, SearchHit, StatusCount,
+    Analytics, DayCount, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit, StatusCount,
 };
 use crate::transcribe::types::Segment;
 
@@ -114,6 +114,12 @@ impl Db {
                tag TEXT NOT NULL,
                PRIMARY KEY (meeting_id, tag),
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS saved_recipes (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               prompt TEXT NOT NULL,
+               created_at TEXT NOT NULL
              );",
         )
         .map_err(map_err)?;
@@ -519,6 +525,53 @@ impl Db {
             out.push(r.map_err(map_err)??);
         }
         Ok(out)
+    }
+
+    // ── saved recipes ────────────────────────────────────────────────────────
+
+    pub fn list_saved_recipes(&self) -> Result<Vec<RecipeRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, prompt, created_at FROM saved_recipes ORDER BY created_at DESC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RecipeRecord {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    prompt: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    pub fn insert_recipe(&self, r: &RecipeRecord) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO saved_recipes (id, title, prompt, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![r.id, r.title, r.prompt, r.created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    pub fn delete_recipe(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM saved_recipes WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     // ── settings k/v table ───────────────────────────────────────────────────

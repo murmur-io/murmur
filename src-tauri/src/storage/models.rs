@@ -116,3 +116,22 @@ pub struct ChatTurn {
     pub role: String,
     pub content: String,
 }
+
+/// A built-in recipe (prompt template) shown as a quick chip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinRecipe {
+    pub id: String,
+    pub label: String,
+    pub prompt: String,
+}
+
+/// A user-saved recipe (prompt template) persisted in the DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeRecord {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+    pub created_at: String,
+}
