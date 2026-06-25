@@ -210,7 +210,7 @@ async fn summarize_and_export(
             duration_s,
             language,
         },
-        template: template::template_for_style(&config.note_style),
+        template: template::build_template(&config.note_style, &config.note_language),
         vault_titles,
     };
 

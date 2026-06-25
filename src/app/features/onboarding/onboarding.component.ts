@@ -1260,6 +1260,7 @@ export class OnboardingComponent implements OnInit {
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
       noteStyle: base?.noteStyle ?? "standard",
       autoOrganize: base?.autoOrganize ?? false,
+      noteLanguage: base?.noteLanguage ?? "auto",
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

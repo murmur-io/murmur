@@ -41,6 +41,7 @@ export interface AppConfigDto {
   onboarded: boolean;
   noteStyle: string;
   autoOrganize: boolean;
+  noteLanguage: string;
 }
 
 export interface NoteDto {

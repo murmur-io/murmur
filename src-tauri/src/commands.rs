@@ -68,6 +68,7 @@ pub struct AppConfigDto {
     pub onboarded: bool,
     pub note_style: String,
     pub auto_organize: bool,
+    pub note_language: String,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -539,6 +540,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         onboarded: c.onboarded,
         note_style: c.note_style.clone(),
         auto_organize: c.auto_organize,
+        note_language: c.note_language.clone(),
     }
 }
 
@@ -569,6 +571,11 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
             d.note_style
         },
         auto_organize: d.auto_organize,
+        note_language: if d.note_language.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            d.note_language
+        },
     }
 }
 

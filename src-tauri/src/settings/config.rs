@@ -33,6 +33,8 @@ pub struct AppConfig {
     pub note_style: String,
     /// When true, Claude files each note into a thematic subfolder of the vault.
     pub auto_organize: bool,
+    /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
+    pub note_language: String,
 }
 
 impl Default for AppConfig {
@@ -53,6 +55,7 @@ impl Default for AppConfig {
             onboarded: false,
             note_style: "standard".to_string(),
             auto_organize: false,
+            note_language: "auto".to_string(),
         }
     }
 }
@@ -73,6 +76,7 @@ const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
 const K_NOTE_STYLE: &str = "note_style";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
+const K_NOTE_LANGUAGE: &str = "note_language";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -132,6 +136,11 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_AUTO_ORGANIZE)? {
             cfg.auto_organize = v == "true";
         }
+        if let Some(v) = db.get_setting(K_NOTE_LANGUAGE)? {
+            if !v.is_empty() {
+                cfg.note_language = v;
+            }
+        }
 
         Ok(cfg)
     }
@@ -169,6 +178,7 @@ impl AppConfig {
             K_AUTO_ORGANIZE,
             if self.auto_organize { "true" } else { "false" },
         )?;
+        db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
         Ok(())
     }
 }

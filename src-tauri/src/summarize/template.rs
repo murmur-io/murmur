@@ -116,6 +116,45 @@ Formatting rules:
     )
 }
 
+/// An explicit output-language directive appended to the summary system prompt so the WHOLE
+/// note (section headings AND content) comes out in one consistent language. The YAML
+/// front-matter KEYS stay English so Obsidian keeps parsing them.
+pub fn language_directive(note_language: &str) -> String {
+    let lang = note_language.trim();
+    let target = if lang.is_empty() || lang.eq_ignore_ascii_case("auto") {
+        "the SAME language as the meeting transcript below (match the speakers)".to_string()
+    } else {
+        let name = match lang {
+            "en" => "English",
+            "pl" => "Polish",
+            "de" => "German",
+            "es" => "Spanish",
+            "fr" => "French",
+            "it" => "Italian",
+            "pt" => "Portuguese",
+            "uk" => "Ukrainian",
+            "nl" => "Dutch",
+            other => other,
+        };
+        name.to_string()
+    };
+    format!(
+        "OUTPUT LANGUAGE: Write the section headings AND the body content in {target}. \
+KEEP the YAML front-matter KEYS in English exactly as specified (title, date, \
+duration_minutes, tags, participants) — translate only their values and the note body, \
+never the keys."
+    )
+}
+
+/// The full summary system prompt: the style template + the output-language directive.
+pub fn build_template(style: &str, note_language: &str) -> String {
+    format!(
+        "{}\n\n{}",
+        template_for_style(style),
+        language_directive(note_language)
+    )
+}
+
 /// Render the full prompt text a provider sends (template + meta + vault titles + transcript).
 ///
 /// Providers that take a single combined prompt (Ollama, and the Claude Code stdin path)
