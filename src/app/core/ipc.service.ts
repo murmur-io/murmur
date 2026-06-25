@@ -2,6 +2,7 @@ import { Injectable } from "@angular/core";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ActionItem,
   Analytics,
   AppConfigDto,
   BuiltinRecipe,
@@ -125,6 +126,21 @@ export class IpcService {
   /** Run a recipe prompt over a meeting's transcript (grounded). */
   runRecipe(meetingId: string, prompt: string): Promise<string> {
     return invoke<string>("run_recipe", { meetingId, prompt });
+  }
+
+  /** Parse a meeting note's action-item checklist into structured items. */
+  getActionItems(meetingId: string): Promise<ActionItem[]> {
+    return invoke<ActionItem[]>("get_action_items", { meetingId });
+  }
+
+  /** Rewrite the note's action items into Obsidian Tasks format + re-write the vault file. */
+  patchNoteTasks(meetingId: string): Promise<NoteDto> {
+    return invoke<NoteDto>("patch_note_tasks", { meetingId });
+  }
+
+  /** Add a macOS Reminder for an action item (best-effort, TCC-gated). */
+  addReminder(text: string, dueDate: string | null): Promise<void> {
+    return invoke<void>("add_reminder", { text, dueDate });
   }
 
   /** Copy a meeting's recording (WAV) to a chosen path. */

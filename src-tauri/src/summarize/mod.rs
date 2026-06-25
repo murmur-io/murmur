@@ -6,6 +6,7 @@ use crate::summarize::claude_code::ClaudeCodeProvider;
 use crate::summarize::ollama::OllamaProvider;
 use crate::summarize::provider::SummarizerProvider;
 
+pub mod action_items;
 pub mod anthropic;
 pub mod chat;
 pub mod claude_code;

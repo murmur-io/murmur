@@ -4,5 +4,7 @@
   <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Murmur records meeting audio from your microphone to transcribe it locally on your Mac.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Murmur can add your meeting action items to Apple Reminders.</string>
   </dict>
 </plist>
