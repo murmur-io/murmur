@@ -16,6 +16,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type { MeetingDetail, MeetingTimeline } from "../../core/models";
+import { MeetingActionsComponent } from "./meeting-actions.component";
 import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingRecipesComponent } from "./meeting-recipes.component";
 import { MeetingTimelineComponent } from "./meeting-timeline.component";
@@ -55,6 +56,7 @@ interface ParsedNote {
   imports: [
     RouterLink,
     MeetingTimelineComponent,
+    MeetingActionsComponent,
     MeetingChatComponent,
     MeetingRecipesComponent,
   ],
@@ -498,6 +500,9 @@ interface ParsedNote {
             </div>
           }
         </section>
+
+        <!-- 2·5) ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none) - -->
+        <app-meeting-actions [meetingId]="d.meeting.id" />
 
         <!-- 2a) RECIPES / GENERATE (grounded one-tap generations over text) - -->
         <section class="block">
