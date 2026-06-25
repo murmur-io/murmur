@@ -7,10 +7,12 @@ import type {
   AppConfigDto,
   BuiltinRecipe,
   ChatTurn,
+  GraphPayload,
   Meeting,
   MeetingDetail,
   MeetingTimeline,
   NoteDto,
+  PinResult,
   ProviderStatus,
   SavedRecipe,
   SearchHit,
@@ -141,6 +143,20 @@ export class IpcService {
   /** Add a macOS Reminder for an action item (best-effort, TCC-gated). */
   addReminder(text: string, dueDate: string | null): Promise<void> {
     return invoke<void>("add_reminder", { text, dueDate });
+  }
+
+  /** Pin a meeting moment → ^block-ref in the note + an obsidian:// deep link. */
+  pinMoment(
+    meetingId: string,
+    seconds: number,
+    label: string,
+  ): Promise<PinResult> {
+    return invoke<PinResult>("pin_moment", { meetingId, seconds, label });
+  }
+
+  /** Build the self-assembling graph: write [[Person]]/[[Project]] stub notes + backlinks. */
+  linkMeetingEntities(meetingId: string): Promise<GraphPayload> {
+    return invoke<GraphPayload>("link_meeting_entities", { meetingId });
   }
 
   /** Copy a meeting's recording (WAV) to a chosen path. */
