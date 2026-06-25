@@ -156,3 +156,11 @@ export interface SavedRecipe {
   prompt: string;
   createdAt: string;
 }
+
+export interface ActionItem {
+  idx: number;
+  done: boolean;
+  text: string;
+  owner: string | null;
+  dueDate: string | null;
+}

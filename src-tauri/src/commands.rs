@@ -7,8 +7,8 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
-    Analytics, BuiltinRecipe, ChatTurn, Meeting, MeetingStatus, MeetingTimeline, NoteRecord,
-    RecipeRecord, SearchHit,
+    ActionItem, Analytics, BuiltinRecipe, ChatTurn, Meeting, MeetingStatus, MeetingTimeline,
+    NoteRecord, RecipeRecord, SearchHit,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -576,6 +576,84 @@ pub async fn run_recipe(
         &config.note_language,
     );
     provider.complete(&system, &user).await
+}
+
+/// Parse a meeting note's "## Action items" checklist into structured items.
+#[tauri::command]
+pub fn get_action_items(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<ActionItem>, AppError> {
+    let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
+    Ok(match note {
+        Some(n) => crate::summarize::action_items::parse_action_items(&n.markdown),
+        None => Vec::new(),
+    })
+}
+
+/// Rewrite the note's action items into Obsidian Tasks format (📅 due dates) + re-write the
+/// vault file in place. Returns the updated note.
+#[tauri::command]
+pub fn patch_note_tasks(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<NoteDto, AppError> {
+    let existing = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let patched = crate::summarize::action_items::patch_tasks_markdown(&existing.markdown);
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: existing.provider_id.clone(),
+        markdown: patched.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+    })?;
+    if let Some(path) = existing.exported_path.as_deref() {
+        crate::export::overwrite_note(std::path::Path::new(path), &patched)?;
+    }
+    Ok(NoteDto {
+        meeting_id,
+        provider_id: existing.provider_id,
+        markdown: patched,
+        exported_path: existing.exported_path,
+    })
+}
+
+/// Add a macOS Reminder (via osascript) for an action item. A denied Reminders permission
+/// surfaces a clear, actionable error rather than crashing the UI.
+#[tauri::command]
+pub async fn add_reminder(text: String, due_date: Option<String>) -> Result<(), AppError> {
+    let name = match due_date.as_deref().filter(|d| !d.is_empty()) {
+        Some(d) => format!("{} 📅 {}", text.trim(), d),
+        None => text.trim().to_string(),
+    };
+    if name.is_empty() {
+        return Err(AppError::InvalidArg("empty reminder".into()));
+    }
+    let esc = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "tell application \"Reminders\" to make new reminder with properties {{name:\"{esc}\"}}"
+    );
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+    })
+    .await
+    .map_err(|e| AppError::Unavailable(format!("reminder task failed: {e}")))?
+    .map_err(|e| AppError::Unavailable(format!("osascript failed: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::Unavailable(format!(
+            "Could not add to Reminders — grant access in System Settings ▸ Privacy & Security ▸ Reminders. ({})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
 /// Read current config (settings table), without secrets.

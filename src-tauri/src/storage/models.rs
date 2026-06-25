@@ -135,3 +135,14 @@ pub struct RecipeRecord {
     pub prompt: String,
     pub created_at: String,
 }
+
+/// One parsed action-item checklist line from a note's "## Action items" section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionItem {
+    pub idx: usize,
+    pub done: bool,
+    pub text: String,
+    pub owner: Option<String>,
+    pub due_date: Option<String>,
+}
