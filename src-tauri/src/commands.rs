@@ -891,6 +891,61 @@ pub fn topic_threads(state: State<'_, AppState>) -> Result<Vec<TopicThread>, App
     Ok(crate::summarize::threads::build_threads(&input))
 }
 
+/// Export a meeting as an Obsidian Canvas (.canvas) — a spatial board of its topic spans.
+/// Requires the timeline (open the meeting once). Returns the written path.
+#[tauri::command]
+pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<String, AppError> {
+    let meeting = state
+        .db
+        .get_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
+    let json = state.db.get_timeline_data(&meeting_id)?.ok_or_else(|| {
+        AppError::InvalidArg("open the meeting once to generate its timeline first".into())
+    })?;
+    let tl: MeetingTimeline = serde_json::from_str(&json)
+        .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
+    let title = meeting.title.unwrap_or_else(|| "Meeting".to_string());
+    let topics: Vec<(String, f64, f64)> = tl
+        .topics
+        .iter()
+        .map(|t| (t.label.clone(), t.start_s, t.end_s))
+        .collect();
+    let canvas = crate::export::canvas::build_canvas(&title, &topics);
+    let vault = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .vault_path
+            .clone()
+    }
+    .filter(|p| !p.is_empty())
+    .ok_or_else(|| AppError::InvalidArg("set a vault folder in Settings first".into()))?;
+    let dir = std::path::Path::new(&vault).join("Canvas");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Export(format!("create Canvas dir failed: {e}")))?;
+    let fname: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '#' | '^' | '[' | ']' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fname = if fname.is_empty() {
+        "Meeting".to_string()
+    } else {
+        fname
+    };
+    let path = dir.join(format!("{fname}.canvas"));
+    std::fs::write(&path, canvas)
+        .map_err(|e| AppError::Export(format!("write canvas failed: {e}")))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// Read current config (settings table), without secrets.
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> {
