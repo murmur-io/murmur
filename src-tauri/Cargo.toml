@@ -53,6 +53,7 @@ thiserror = "1"
 # ── Secrets ──
 keyring = { version = "3", features = ["apple-native"] }
 getrandom = "0.2"
+aes-gcm = "0.10"
 
 # ── Misc ──
 chrono = { version = "0.4", features = ["clock", "serde"] }

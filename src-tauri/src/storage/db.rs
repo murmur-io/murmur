@@ -131,9 +131,47 @@ impl Db {
                title TEXT NOT NULL,
                prompt TEXT NOT NULL,
                created_at TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS folders (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               path TEXT NOT NULL UNIQUE,
+               parent_id TEXT,
+               locked INTEGER NOT NULL DEFAULT 0,
+               wrapped_key BLOB,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);",
         )
         .map_err(map_err)?;
+        // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
+        // markdown when the folder is locked; NULL when open). migrate() re-runs each launch and
+        // `ALTER ADD COLUMN` errors if the column already exists, so check pragma_table_info first.
+        Self::add_column_if_missing(&conn, "notes", "folder_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "notes", "content_blob", "BLOB")?;
+        Ok(())
+    }
+
+    /// Add `column` to `table` if it is not already present (idempotent migration guard).
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        decl: &str,
+    ) -> Result<()> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(map_err)?;
+        let exists = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(map_err)?
+            .filter_map(|r| r.ok())
+            .any(|c| c == column);
+        drop(stmt);
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
+                .map_err(map_err)?;
+        }
         Ok(())
     }
 
