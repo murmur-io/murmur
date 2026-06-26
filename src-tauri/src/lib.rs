@@ -81,6 +81,7 @@ pub fn run() {
             commands::ask_vault,
             commands::generate_digest,
             commands::topic_threads,
+            commands::export_canvas,
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,
