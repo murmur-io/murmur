@@ -1175,6 +1175,36 @@ pub fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, AppError> 
     state.db.analytics()
 }
 
+/// Rename a speaker across a meeting's cached timeline (e.g. "User 1" → "Sarah"). Persists to
+/// the timelines cache and returns the updated timeline.
+#[tauri::command]
+pub fn rename_speaker(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    old_label: String,
+    new_label: String,
+) -> Result<MeetingTimeline, AppError> {
+    let new_label = new_label.trim();
+    if new_label.is_empty() {
+        return Err(AppError::InvalidArg("new speaker name is empty".into()));
+    }
+    let json = state
+        .db
+        .get_timeline_data(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg("no timeline for this meeting yet".into()))?;
+    let mut tl: crate::storage::models::MeetingTimeline = serde_json::from_str(&json)
+        .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
+    for turn in &mut tl.speakers {
+        if turn.speaker == old_label {
+            turn.speaker = new_label.to_string();
+        }
+    }
+    let updated = serde_json::to_string(&tl)
+        .map_err(|e| AppError::Storage(format!("serialize timeline: {e}")))?;
+    state.db.set_timeline_data(&meeting_id, &updated)?;
+    Ok(tl)
+}
+
 /// Speaker + topic timeline for a meeting (AI-derived, cached after first generation).
 #[tauri::command]
 pub async fn get_timeline(

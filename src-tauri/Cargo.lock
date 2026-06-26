@@ -2059,6 +2059,7 @@ dependencies = [
  "dirs 5.0.1",
  "hound",
  "keyring",
+ "regex",
  "reqwest 0.12.28",
  "rubato",
  "rusqlite",

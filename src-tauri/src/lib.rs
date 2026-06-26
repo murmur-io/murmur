@@ -87,6 +87,7 @@ pub fn run() {
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,
+            commands::rename_speaker,
             commands::model_present,
             commands::download_model,
             commands::toggle_bar,
