@@ -52,9 +52,20 @@ pub struct Db {
 }
 
 impl Db {
-    /// Opens + runs migrations.
+    /// Opens the encrypted DB (fetching the SQLCipher key from the Keychain) + runs migrations.
+    /// This is the path used by the MCP server thread too — it transparently keys the handle.
     pub fn open(path: &Path) -> Result<Self> {
+        let dek = crate::secrets::get_or_create_db_dek()?;
+        Self::open_with_key(path, &dek)
+    }
+
+    /// Opens an (SQLCipher-encrypted) DB with an explicit raw-hex key. The `PRAGMA key` MUST be
+    /// the first statement on the connection, before any other PRAGMA or query.
+    pub fn open_with_key(path: &Path, dek_hex: &str) -> Result<Self> {
         let conn = Connection::open(path).map_err(map_err)?;
+        // SQLCipher: key the connection FIRST (raw 32-byte key as a hex blob ⇒ no KDF).
+        conn.pragma_update(None, "key", format!("x'{dek_hex}'"))
+            .map_err(map_err)?;
         // Enforce FK cascades (segments/notes → meetings) and use WAL for
         // concurrent reads while a write is in progress.
         conn.execute_batch(

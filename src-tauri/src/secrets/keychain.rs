@@ -4,6 +4,26 @@ use crate::error::{AppError, Result};
 
 pub const SERVICE: &str = "com.meetnotes.app";
 
+/// Keychain account holding the SQLCipher database encryption key (DEK).
+pub const ACCOUNT_DB_DEK: &str = "murmur_db_dek";
+
+/// Return the SQLCipher DEK as a 64-char hex string (32 random bytes), creating + persisting it
+/// in the Keychain on first use. Released at launch with no biometric prompt — this layer
+/// protects against database FILE theft, not against an attacker on the unlocked machine
+/// (per-folder biometric locking, added later, covers that). Hex form ⇒ SQLCipher treats it as a
+/// raw key blob (`PRAGMA key = x'…'`) with no KDF.
+pub fn get_or_create_db_dek() -> Result<String> {
+    if let Some(dek) = get_secret(ACCOUNT_DB_DEK)? {
+        return Ok(dek);
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| AppError::Secrets(format!("RNG failed generating DEK: {e}")))?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    set_secret(ACCOUNT_DB_DEK, &hex)?;
+    Ok(hex)
+}
+
 /// Build a keyring entry for `(SERVICE, account)`. `account` is the provider key name,
 /// e.g. "anthropic_api_key".
 fn entry(account: &str) -> Result<Entry> {

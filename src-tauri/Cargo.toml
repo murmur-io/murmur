@@ -38,7 +38,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs
 async-trait = "0.1"
 
 # ── Storage ──
-rusqlite = { version = "0.32", features = ["bundled"] }
+# bundled-sqlcipher-vendored-openssl: whole-DB at-rest encryption, no system OpenSSL dependency
+# (universal-capable). Fallback if the universal build breaks: "bundled-sqlcipher".
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # ── Serde ──
 serde = { version = "1", features = ["derive"] }
@@ -50,6 +52,7 @@ thiserror = "1"
 
 # ── Secrets ──
 keyring = { version = "3", features = ["apple-native"] }
+getrandom = "0.2"
 
 # ── Misc ──
 chrono = { version = "0.4", features = ["clock", "serde"] }
