@@ -112,6 +112,13 @@ export interface Segment {
   startS: number;
   endS: number;
   text: string;
+  /**
+   * Who produced this segment: `"me"` (the local mic / recorder), `"others"`
+   * (captured system audio), or `null` for legacy / mic-only recordings made
+   * before speaker attribution existed. A bare `string` is tolerated so a future
+   * backend can carry richer labels without a model break.
+   */
+  speaker?: "me" | "others" | string | null;
 }
 
 export interface MeetingDetail {

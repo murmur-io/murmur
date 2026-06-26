@@ -53,6 +53,20 @@ export class IpcService {
     return invoke<number>("recording_level");
   }
 
+  /**
+   * Mute / unmute the local microphone on the LIVE recorder. Muting silences
+   * only the mic — captured system audio ("others") keeps recording. No-op when
+   * not recording.
+   */
+  setMicMuted(muted: boolean): Promise<void> {
+    return invoke<void>("set_mic_muted", { muted });
+  }
+
+  /** Whether the live recorder's mic is currently muted (false when not recording). */
+  isMicMuted(): Promise<boolean> {
+    return invoke<boolean>("is_mic_muted");
+  }
+
   getLastNote(): Promise<NoteDto | null> {
     return invoke<NoteDto | null>("get_last_note");
   }
