@@ -66,14 +66,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ── macOS biometric (Touch ID) + screen-share detection (Stage E) ──
 # These objc2 crates are already in the dependency graph transitively (via tauri/tao);
-# we pin the same 0.6/0.3 family. LocalAuthentication = Touch ID KEK gate; AppKit = NSScreen
-# isCaptured screen-share watcher. macOS-only — gated under cfg(target_os = "macos").
+# we pin the same 0.6/0.3 family. LocalAuthentication = Touch ID KEK gate.
+# Screen-share auto-relock uses the PURE CoreGraphics C window-list API (no ObjC msg_send / no
+# NSException risk): objc2-core-graphics CGWindow + objc2-core-foundation CFArray/CFDictionary/
+# CFString for reading window owner + title. macOS-only — gated under cfg(target_os = "macos").
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
 objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString"] }
 
 [features]
 # default keeps Metal on for whisper; nothing else conditional in P0
