@@ -16,10 +16,19 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type {
+  FolderNode,
   GraphPayload,
   MeetingDetail,
   MeetingTimeline,
+  Segment,
 } from "../../core/models";
+import {
+  FoldersService,
+  type FolderExposure,
+} from "../../services/folders.service";
+import { ToastService } from "../../services/toast.service";
+import { LockBadgeComponent } from "../folders/lock-badge.component";
+import { MoveToMenuComponent } from "../folders/move-to-menu.component";
 import { MeetingActionsComponent } from "./meeting-actions.component";
 import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingRecipesComponent } from "./meeting-recipes.component";
@@ -63,6 +72,8 @@ interface ParsedNote {
     MeetingActionsComponent,
     MeetingChatComponent,
     MeetingRecipesComponent,
+    LockBadgeComponent,
+    MoveToMenuComponent,
   ],
   template: `
     <section class="detail">
@@ -124,526 +135,649 @@ interface ParsedNote {
               <span class="meta-item">{{
                 formatDuration(d.meeting.durationS)
               }}</span>
-            </div>
-
-            <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags) -->
-            <div class="tag-editor">
-              @for (t of tags(); track t) {
-                <span class="pill tag-chip">
-                  {{ t }}
-                  <button
-                    type="button"
-                    class="tag-x"
-                    [attr.aria-label]="'Remove tag ' + t"
-                    [disabled]="tagsBusy()"
-                    (click)="removeTag(t)"
-                  >
-                    ×
-                  </button>
+              <!-- Read-only folder + lock badge (where this note lives). -->
+              @if (folderBadge(); as fb) {
+                <span class="meta-sep" aria-hidden="true">·</span>
+                <span
+                  class="meta-item"
+                  style="display: inline-flex; align-items: center; gap: 4px"
+                  [attr.title]="fb.name"
+                >
+                  <app-lock-badge [exposure]="fb.exposure" />
+                  {{ fb.name }}
                 </span>
               }
-              <input
-                type="text"
-                class="tag-input"
-                placeholder="+ Add tag"
-                aria-label="Add tag"
-                autocapitalize="off"
-                autocomplete="off"
-                [value]="tagDraft()"
-                [disabled]="tagsBusy()"
-                (input)="onTagInput($event)"
-                (keydown.enter)="addTag()"
-              />
             </div>
-            @if (tagsError(); as err) {
-              <span class="tag-error" role="alert">{{ err }}</span>
+
+            <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags).
+                 Hidden while locked — there is nothing to tag on a masked note. -->
+            @if (!locked()) {
+              <div class="tag-editor">
+                @for (t of tags(); track t) {
+                  <span class="pill tag-chip">
+                    {{ t }}
+                    <button
+                      type="button"
+                      class="tag-x"
+                      [attr.aria-label]="'Remove tag ' + t"
+                      [disabled]="tagsBusy()"
+                      (click)="removeTag(t)"
+                    >
+                      ×
+                    </button>
+                  </span>
+                }
+                <input
+                  type="text"
+                  class="tag-input"
+                  placeholder="+ Add tag"
+                  aria-label="Add tag"
+                  autocapitalize="off"
+                  autocomplete="off"
+                  [value]="tagDraft()"
+                  [disabled]="tagsBusy()"
+                  (input)="onTagInput($event)"
+                  (keydown.enter)="addTag()"
+                />
+              </div>
+              @if (tagsError(); as err) {
+                <span class="tag-error" role="alert">{{ err }}</span>
+              }
             }
           </div>
 
-          <div class="actions">
-            <button
-              type="button"
-              class="btn btn-primary"
-              (click)="resummarize(d.meeting.id)"
-              [disabled]="busy() || renaming()"
-            >
-              Re-summarize
-            </button>
-            @if (!renaming()) {
+          @if (!locked()) {
+            <div class="actions">
               <button
                 type="button"
-                class="btn btn-ghost"
-                (click)="startRename()"
-                [disabled]="busy()"
+                class="btn btn-primary"
+                (click)="resummarize(d.meeting.id)"
+                [disabled]="busy() || renaming()"
               >
-                Rename
+                Re-summarize
               </button>
-              <button
-                type="button"
-                class="btn btn-danger"
-                (click)="askDelete()"
-                [disabled]="busy()"
-              >
-                Delete
-              </button>
-            }
+              @if (!renaming()) {
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  (click)="startRename()"
+                  [disabled]="busy()"
+                >
+                  Rename
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-danger"
+                  (click)="askDelete()"
+                  [disabled]="busy()"
+                >
+                  Delete
+                </button>
 
-            <!-- EXPORT menu: copy / save note / save audio / print-to-PDF.
+                <!-- MOVE TO FOLDER: opens the folder picker popover. The picker
+                   itself owns the load-bearing encrypt/decrypt confirm. Layout
+                   is inline (no component-stylesheet rule) so it stays anchored
+                   to its trigger without growing the per-component style budget. -->
+                <div style="position: relative; display: inline-flex">
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    [attr.aria-expanded]="moveOpen()"
+                    aria-haspopup="menu"
+                    (click)="toggleMove()"
+                    [disabled]="busy()"
+                  >
+                    Move to folder
+                  </button>
+                  @if (moveOpen()) {
+                    <div
+                      style="position: absolute; top: calc(100% + 8px); left: 0; z-index: 30"
+                    >
+                      <app-move-to-menu
+                        [meetingId]="d.meeting.id"
+                        [currentFolderId]="d.meeting.folderId ?? null"
+                        (moved)="onMoved($event)"
+                        (close)="closeMove()"
+                      />
+                    </div>
+                  }
+                </div>
+              }
+
+              <!-- EXPORT menu: copy / save note / save audio / print-to-PDF.
                  Gated on a parsed note existing; disabled while editing it. -->
-            @if (note() && !renaming()) {
-              <div class="export" role="group" aria-label="Export">
-                <button
-                  type="button"
-                  class="btn btn-ghost export-btn"
-                  (click)="copyMarkdown()"
-                  [disabled]="editing() || busy()"
-                >
-                  {{ exportMsg() === "md-copied" ? "Copied" : "Copy Markdown" }}
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-ghost export-btn"
-                  (click)="saveMarkdown(d.meeting.id, d.meeting.title)"
-                  [disabled]="editing() || exporting()"
-                >
-                  {{ exportMsg() === "md-saved" ? "Saved" : "Save Markdown…" }}
-                </button>
-                @if (audioSrc()) {
+              @if (note() && !renaming()) {
+                <div class="export" role="group" aria-label="Export">
                   <button
                     type="button"
                     class="btn btn-ghost export-btn"
-                    (click)="saveAudio(d.meeting.id, d.meeting.title)"
+                    (click)="copyMarkdown()"
+                    [disabled]="editing() || busy()"
+                  >
+                    {{
+                      exportMsg() === "md-copied" ? "Copied" : "Copy Markdown"
+                    }}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    (click)="saveMarkdown(d.meeting.id, d.meeting.title)"
                     [disabled]="editing() || exporting()"
                   >
                     {{
-                      exportMsg() === "audio-saved" ? "Saved" : "Save audio…"
+                      exportMsg() === "md-saved" ? "Saved" : "Save Markdown…"
                     }}
                   </button>
-                }
-                <button
-                  type="button"
-                  class="btn btn-ghost export-btn"
-                  (click)="saveAsPdf()"
-                  [disabled]="editing()"
-                >
-                  Save as PDF
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-ghost export-btn"
-                  (click)="exportCanvas(d.meeting.id)"
-                  [disabled]="editing() || exportingCanvas()"
-                >
-                  {{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}
-                </button>
-              </div>
-            }
-            @if (canvasMsg(); as path) {
-              <div class="saved-toast canvas-toast" role="status">
-                <span class="saved-toast-check" aria-hidden="true"></span>
-                Canvas saved · {{ path }}
-              </div>
-            }
-            @if (canvasError(); as err) {
-              <span class="msg msg-error" role="alert">{{ err }}</span>
-            }
-
-            <!-- CONNECT TO GRAPH: resolve people + projects into vault stubs.
-                 Gated on a parsed note existing; disabled while editing it. -->
-            @if (note() && !renaming()) {
-              <div class="graph-connect" role="group" aria-label="Graph">
-                <button
-                  type="button"
-                  class="btn btn-ghost export-btn"
-                  (click)="linkGraph()"
-                  [disabled]="editing() || linking()"
-                >
-                  {{ linking() ? "Linking…" : "Link people &amp; projects" }}
-                </button>
-              </div>
-            }
-
-            @if (exportError(); as err) {
-              <span class="msg msg-error" role="alert">{{ err }}</span>
-            }
-            @if (msg()) {
-              <span class="msg">{{ msg() }}</span>
-            }
-          </div>
-        </header>
-
-        <!-- Graph link result: resolved people + projects as chips + caption. -->
-        @if (graphError(); as err) {
-          <div class="card graph-card graph-card--error" role="alert">
-            {{ err }}
-          </div>
-        }
-        @if (graph(); as g) {
-          <div class="card graph-card" role="status">
-            @if (g.people.length || g.projects.length) {
-              <div class="graph-groups">
-                @if (g.people.length) {
-                  <div class="graph-group">
-                    <span class="graph-group-label">People</span>
-                    <div class="graph-pills">
-                      @for (p of g.people; track p) {
-                        <span class="pill tag">{{ p }}</span>
-                      }
-                    </div>
-                  </div>
-                }
-                @if (g.projects.length) {
-                  <div class="graph-group">
-                    <span class="graph-group-label">Projects</span>
-                    <div class="graph-pills">
-                      @for (pr of g.projects; track pr) {
-                        <span class="pill tag graph-pill--project">{{
-                          pr
-                        }}</span>
-                      }
-                    </div>
-                  </div>
-                }
-              </div>
-              <p class="graph-caption">
-                Added to your Obsidian vault graph (People/ &amp; Projects/)
-              </p>
-            } @else {
-              <p class="graph-caption">No people or projects to link yet.</p>
-            }
-          </div>
-        }
-
-        <!-- In-app delete confirmation (signal-driven; no window.confirm) ----- -->
-        @if (confirmingDelete()) {
-          <div
-            class="card confirm"
-            role="alertdialog"
-            aria-label="Delete meeting"
-          >
-            <div class="confirm-text">
-              <p class="confirm-title">Delete this meeting?</p>
-              <p class="confirm-copy">
-                This permanently removes the recording, transcript, summary and
-                the note in your vault. This can’t be undone.
-              </p>
-              @if (deleteError(); as err) {
-                <p class="confirm-error" role="alert">{{ err }}</p>
-              }
-            </div>
-            <div class="confirm-actions">
-              <button
-                type="button"
-                class="btn btn-ghost"
-                (click)="cancelDelete()"
-                [disabled]="deleting()"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                class="btn btn-danger"
-                (click)="confirmDelete(d.meeting.id)"
-                [disabled]="deleting()"
-              >
-                {{ deleting() ? "Deleting…" : "Delete" }}
-              </button>
-            </div>
-          </div>
-        }
-
-        <!-- 1) AUDIO PLAYER ------------------------------------------------ -->
-        @if (audioSrc(); as src) {
-          <div class="card player" [style.animation-delay.ms]="40">
-            <audio
-              #player
-              [src]="src"
-              preload="metadata"
-              (loadedmetadata)="onLoaded()"
-              (timeupdate)="onTimeUpdate()"
-              (play)="playing.set(true)"
-              (pause)="playing.set(false)"
-              (ended)="onEnded()"
-            ></audio>
-
-            <button
-              type="button"
-              class="play"
-              (click)="togglePlay()"
-              [attr.aria-label]="playing() ? 'Pause' : 'Play'"
-              [class.is-playing]="playing()"
-            >
-              @if (playing()) {
-                <span class="icon-pause" aria-hidden="true"></span>
-              } @else {
-                <span class="icon-play" aria-hidden="true"></span>
-              }
-            </button>
-
-            <div class="player-body">
-              <div
-                class="track"
-                role="slider"
-                tabindex="0"
-                aria-label="Seek"
-                [attr.aria-valuemin]="0"
-                [attr.aria-valuemax]="Math.round(duration())"
-                [attr.aria-valuenow]="Math.round(currentTime())"
-                (click)="seekFromEvent($event)"
-                (keydown)="onTrackKey($event)"
-              >
-                <div class="track-fill" [style.width.%]="progressPct()">
-                  <span class="track-knob"></span>
-                </div>
-              </div>
-              <div class="times">
-                <span class="time">{{ fmt(currentTime()) }}</span>
-                <span class="time time-total">{{ fmt(duration()) }}</span>
-              </div>
-            </div>
-          </div>
-        } @else {
-          <div class="card player player--empty">
-            <span class="audio-off" aria-hidden="true"></span>
-            <span class="audio-off-text">Audio not available</span>
-          </div>
-        }
-
-        <!-- 1b) INTERACTIVE TIMELINE (speakers + topics, shared playhead) -- -->
-        <app-meeting-timeline
-          [timeline]="timeline()"
-          [total]="timelineTotal()"
-          [currentTime]="currentTime()"
-          [loading]="timelineLoading()"
-          [error]="timelineError()"
-          [hasAudio]="!!audioSrc()"
-          (seek)="seekTo($event)"
-          (retry)="loadTimeline()"
-          (pin)="onPin($event)"
-          (renameSpeaker)="onRenameSpeaker($event)"
-        />
-
-        <!-- Pin confirmation / error (driven by the timeline's (pin) output). -->
-        @if (pinMsg(); as m) {
-          <div class="saved-toast pin-toast" role="status">
-            <span class="pin-toast-dot" aria-hidden="true"></span>
-            {{ m }}
-          </div>
-        }
-        @if (pinError(); as err) {
-          <div class="saved-toast pin-toast pin-toast--error" role="alert">
-            {{ err }}
-          </div>
-        }
-
-        <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
-        <section class="block print-keep">
-          <div class="block-head">
-            <h3>Analysis</h3>
-            @if (!editing() && note()?.tags?.length) {
-              <div class="tags">
-                @for (t of note()!.tags; track t) {
-                  <span class="pill tag">{{ t }}</span>
-                }
-              </div>
-            }
-            @if (note() && !editing()) {
-              <button
-                type="button"
-                class="btn btn-ghost edit-btn"
-                (click)="startEdit()"
-              >
-                Edit
-              </button>
-            }
-          </div>
-
-          @if (note(); as n) {
-            @if (editing()) {
-              <!-- In-app note editor (raw markdown → re-written to the vault) -->
-              <article class="card editor">
-                <textarea
-                  class="editor-area"
-                  spellcheck="false"
-                  autocapitalize="off"
-                  autocomplete="off"
-                  aria-label="Note markdown"
-                  [value]="draft()"
-                  [disabled]="saving()"
-                  (input)="onDraftInput($event)"
-                ></textarea>
-
-                @if (saveError(); as err) {
-                  <p class="editor-error" role="alert">{{ err }}</p>
-                }
-
-                <div class="editor-foot">
-                  <span class="editor-hint"
-                    >Markdown · saved to your vault</span
-                  >
-                  <div class="editor-actions">
+                  @if (audioSrc()) {
                     <button
                       type="button"
-                      class="btn btn-ghost"
-                      (click)="cancelEdit()"
-                      [disabled]="saving()"
+                      class="btn btn-ghost export-btn"
+                      (click)="saveAudio(d.meeting.id, d.meeting.title)"
+                      [disabled]="editing() || exporting()"
                     >
-                      Cancel
+                      {{
+                        exportMsg() === "audio-saved" ? "Saved" : "Save audio…"
+                      }}
                     </button>
-                    <button
-                      type="button"
-                      class="btn btn-primary"
-                      (click)="saveNote()"
-                      [disabled]="saving()"
-                    >
-                      {{ saving() ? "Saving…" : "Save" }}
-                    </button>
-                  </div>
-                </div>
-              </article>
-            } @else {
-              @if (n.participants.length) {
-                <div class="card meta-card" [style.animation-delay.ms]="80">
-                  <span class="meta-card-label">Participants</span>
-                  <div class="people">
-                    @for (p of n.participants; track p) {
-                      <span class="person">{{ p }}</span>
-                    }
-                  </div>
-                </div>
-              }
-
-              @if (n.sections.length) {
-                @for (sec of n.sections; track sec.heading; let i = $index) {
-                  <article
-                    class="card section"
-                    [style.animation-delay.ms]="120 + i * 60"
-                  >
-                    <h4 class="section-head">{{ sec.heading }}</h4>
-
-                    @switch (sec.kind) {
-                      @case ("actions") {
-                        <ul class="checklist">
-                          @for (a of sec.actions; track $index) {
-                            <li class="check" [class.is-done]="a.done">
-                              <span
-                                class="check-box"
-                                [class.is-done]="a.done"
-                                aria-hidden="true"
-                              ></span>
-                              <span class="check-text">{{ a.text }}</span>
-                            </li>
-                          }
-                        </ul>
-                      }
-                      @case ("bullets") {
-                        <ul class="bullets">
-                          @for (b of sec.bullets; track $index) {
-                            <li class="bullet">{{ b }}</li>
-                          }
-                        </ul>
-                      }
-                      @default {
-                        <div class="prose">
-                          @for (para of sec.paragraphs; track $index) {
-                            <p>{{ para }}</p>
-                          }
-                        </div>
-                      }
-                    }
-                  </article>
-                }
-              } @else if (n.raw) {
-                <article class="card section" [style.animation-delay.ms]="120">
-                  <pre class="note-body">{{ n.raw }}</pre>
-                </article>
-              }
-
-              @if (justSaved()) {
-                <div class="saved-toast" role="status">
-                  <span class="saved-toast-check" aria-hidden="true"></span>
-                  Saved
-                </div>
-              }
-
-              @if (d.note?.exportedPath; as path) {
-                <div class="card saved" [style.animation-delay.ms]="160">
-                  <span class="saved-icon" aria-hidden="true"></span>
-                  <div class="saved-body">
-                    <span class="saved-label">Saved to vault</span>
-                    <span class="saved-path">{{ path }}</span>
-                  </div>
+                  }
                   <button
                     type="button"
-                    class="btn btn-ghost copy-btn"
-                    (click)="copy(path)"
+                    class="btn btn-ghost export-btn"
+                    (click)="saveAsPdf()"
+                    [disabled]="editing()"
                   >
-                    {{ copied() ? "Copied" : "Copy path" }}
+                    Save as PDF
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    (click)="exportCanvas(d.meeting.id)"
+                    [disabled]="editing() || exportingCanvas()"
+                  >
+                    {{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}
                   </button>
                 </div>
               }
-            }
-          } @else {
-            <div class="card empty-card empty-state">
-              <span class="empty-mark" aria-hidden="true"></span>
-              <p class="empty-title">No analysis yet</p>
-              <p class="empty">
-                Re-summarize this meeting to generate a structured note.
-              </p>
+              @if (canvasMsg(); as path) {
+                <div class="saved-toast canvas-toast" role="status">
+                  <span class="saved-toast-check" aria-hidden="true"></span>
+                  Canvas saved · {{ path }}
+                </div>
+              }
+              @if (canvasError(); as err) {
+                <span class="msg msg-error" role="alert">{{ err }}</span>
+              }
+
+              <!-- CONNECT TO GRAPH: resolve people + projects into vault stubs.
+                 Gated on a parsed note existing; disabled while editing it. -->
+              @if (note() && !renaming()) {
+                <div class="graph-connect" role="group" aria-label="Graph">
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    (click)="linkGraph()"
+                    [disabled]="editing() || linking()"
+                  >
+                    {{ linking() ? "Linking…" : "Link people &amp; projects" }}
+                  </button>
+                </div>
+              }
+
+              @if (exportError(); as err) {
+                <span class="msg msg-error" role="alert">{{ err }}</span>
+              }
+              @if (msg()) {
+                <span class="msg">{{ msg() }}</span>
+              }
             </div>
           }
-        </section>
+        </header>
 
-        <!-- 2·5) ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none) - -->
-        <app-meeting-actions [meetingId]="d.meeting.id" />
-
-        <!-- 2a) RECIPES / GENERATE (grounded one-tap generations over text) - -->
-        <section class="block">
-          <div class="block-head">
-            <h3>Recipes</h3>
+        <!-- ============================================================= -->
+        <!-- PHASE 0.5 LOCK GATE — shown when the backend masked this       -->
+        <!-- meeting (sealed, not-session-unlocked folder). Replaces the    -->
+        <!-- note/transcript/audio/timeline/actions with a single frosted   -->
+        <!-- card + a biometric Unlock action. The masked "🔒 Locked" title -->
+        <!-- bar above still shows; the back-to-Meetings nav stays.         -->
+        <!-- ============================================================= -->
+        @if (locked()) {
+          <div
+            class="card empty-state"
+            role="group"
+            aria-labelledby="lock-gate-title"
+            style="animation: rise 420ms var(--transition) both"
+          >
+            <span
+              aria-hidden="true"
+              style="display: inline-flex; align-items: center; justify-content: center; width: 64px; height: 64px; margin-bottom: var(--space-2); border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent-hover)"
+            >
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none">
+                <rect
+                  x="4.5"
+                  y="10.5"
+                  width="15"
+                  height="10.5"
+                  rx="2.4"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                />
+                <path
+                  d="M7.75 10.5V7.75a4.25 4.25 0 0 1 8.5 0V10.5"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                />
+                <circle cx="12" cy="15.4" r="1.6" fill="currentColor" />
+              </svg>
+            </span>
+            <p id="lock-gate-title" class="empty-title">
+              This meeting is locked
+            </p>
+            <p class="empty" style="max-width: 42ch">
+              It lives in a locked folder. Unlock to view the note, transcript
+              and audio.
+            </p>
+            <button
+              #unlockButton
+              type="button"
+              class="btn btn-primary"
+              style="margin-top: var(--space-2)"
+              (click)="unlock()"
+              [disabled]="unlocking()"
+            >
+              {{ unlocking() ? "Unlocking…" : "🔒 Unlock (Touch ID)" }}
+            </button>
           </div>
-          <app-meeting-recipes [meetingId]="d.meeting.id" />
-        </section>
+        }
 
-        <!-- 2b) CHAT WITH THIS MEETING (grounded Q&A over the transcript) -- -->
-        <section class="block">
-          <app-meeting-chat [meetingId]="d.meeting.id" />
-        </section>
+        @if (!locked()) {
+          <!-- Graph link result: resolved people + projects as chips + caption. -->
+          @if (graphError(); as err) {
+            <div class="card graph-card graph-card--error" role="alert">
+              {{ err }}
+            </div>
+          }
+          @if (graph(); as g) {
+            <div class="card graph-card" role="status">
+              @if (g.people.length || g.projects.length) {
+                <div class="graph-groups">
+                  @if (g.people.length) {
+                    <div class="graph-group">
+                      <span class="graph-group-label">People</span>
+                      <div class="graph-pills">
+                        @for (p of g.people; track p) {
+                          <span class="pill tag">{{ p }}</span>
+                        }
+                      </div>
+                    </div>
+                  }
+                  @if (g.projects.length) {
+                    <div class="graph-group">
+                      <span class="graph-group-label">Projects</span>
+                      <div class="graph-pills">
+                        @for (pr of g.projects; track pr) {
+                          <span class="pill tag graph-pill--project">{{
+                            pr
+                          }}</span>
+                        }
+                      </div>
+                    </div>
+                  }
+                </div>
+                <p class="graph-caption">
+                  Added to your Obsidian vault graph (People/ &amp; Projects/)
+                </p>
+              } @else {
+                <p class="graph-caption">No people or projects to link yet.</p>
+              }
+            </div>
+          }
 
-        <!-- 3) CLICK-TO-SEEK TRANSCRIPT ----------------------------------- -->
-        <section class="block">
-          <div class="block-head">
-            <h3>Transcript</h3>
-            @if (d.segments.length) {
-              <span class="count">{{ d.segments.length }}</span>
-            }
-          </div>
+          <!-- In-app delete confirmation (signal-driven; no window.confirm) ----- -->
+          @if (confirmingDelete()) {
+            <div
+              class="card confirm"
+              role="alertdialog"
+              aria-label="Delete meeting"
+            >
+              <div class="confirm-text">
+                <p class="confirm-title">Delete this meeting?</p>
+                <p class="confirm-copy">
+                  This permanently removes the recording, transcript, summary
+                  and the note in your vault. This can’t be undone.
+                </p>
+                @if (deleteError(); as err) {
+                  <p class="confirm-error" role="alert">{{ err }}</p>
+                }
+              </div>
+              <div class="confirm-actions">
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  (click)="cancelDelete()"
+                  [disabled]="deleting()"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-danger"
+                  (click)="confirmDelete(d.meeting.id)"
+                  [disabled]="deleting()"
+                >
+                  {{ deleting() ? "Deleting…" : "Delete" }}
+                </button>
+              </div>
+            </div>
+          }
 
-          @if (d.segments.length) {
-            <div class="card transcript-card" [style.animation-delay.ms]="200">
-              <ul class="segs">
-                @for (s of d.segments; track s.idx) {
-                  <li>
+          <!-- 1) AUDIO PLAYER ------------------------------------------------ -->
+          @if (audioSrc(); as src) {
+            <div class="card player" [style.animation-delay.ms]="40">
+              <audio
+                #player
+                [src]="src"
+                preload="metadata"
+                (loadedmetadata)="onLoaded()"
+                (timeupdate)="onTimeUpdate()"
+                (play)="playing.set(true)"
+                (pause)="playing.set(false)"
+                (ended)="onEnded()"
+              ></audio>
+
+              <button
+                type="button"
+                class="play"
+                (click)="togglePlay()"
+                [attr.aria-label]="playing() ? 'Pause' : 'Play'"
+                [class.is-playing]="playing()"
+              >
+                @if (playing()) {
+                  <span class="icon-pause" aria-hidden="true"></span>
+                } @else {
+                  <span class="icon-play" aria-hidden="true"></span>
+                }
+              </button>
+
+              <div class="player-body">
+                <div
+                  class="track"
+                  role="slider"
+                  tabindex="0"
+                  aria-label="Seek"
+                  [attr.aria-valuemin]="0"
+                  [attr.aria-valuemax]="Math.round(duration())"
+                  [attr.aria-valuenow]="Math.round(currentTime())"
+                  (click)="seekFromEvent($event)"
+                  (keydown)="onTrackKey($event)"
+                >
+                  <div class="track-fill" [style.width.%]="progressPct()">
+                    <span class="track-knob"></span>
+                  </div>
+                </div>
+                <div class="times">
+                  <span class="time">{{ fmt(currentTime()) }}</span>
+                  <span class="time time-total">{{ fmt(duration()) }}</span>
+                </div>
+              </div>
+            </div>
+          } @else {
+            <div class="card player player--empty">
+              <span class="audio-off" aria-hidden="true"></span>
+              <span class="audio-off-text">Audio not available</span>
+            </div>
+          }
+
+          <!-- 1b) INTERACTIVE TIMELINE (speakers + topics, shared playhead) -- -->
+          <app-meeting-timeline
+            [timeline]="timeline()"
+            [total]="timelineTotal()"
+            [currentTime]="currentTime()"
+            [loading]="timelineLoading()"
+            [error]="timelineError()"
+            [hasAudio]="!!audioSrc()"
+            (seek)="seekTo($event)"
+            (retry)="loadTimeline()"
+            (pin)="onPin($event)"
+            (renameSpeaker)="onRenameSpeaker($event)"
+          />
+
+          <!-- Pin confirmation / error (driven by the timeline's (pin) output). -->
+          @if (pinMsg(); as m) {
+            <div class="saved-toast pin-toast" role="status">
+              <span class="pin-toast-dot" aria-hidden="true"></span>
+              {{ m }}
+            </div>
+          }
+          @if (pinError(); as err) {
+            <div class="saved-toast pin-toast pin-toast--error" role="alert">
+              {{ err }}
+            </div>
+          }
+
+          <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
+          <section class="block print-keep">
+            <div class="block-head">
+              <h3>Analysis</h3>
+              @if (!editing() && note()?.tags?.length) {
+                <div class="tags">
+                  @for (t of note()!.tags; track t) {
+                    <span class="pill tag">{{ t }}</span>
+                  }
+                </div>
+              }
+              @if (note() && !editing()) {
+                <button
+                  type="button"
+                  class="btn btn-ghost edit-btn"
+                  (click)="startEdit()"
+                >
+                  Edit
+                </button>
+              }
+            </div>
+
+            @if (note(); as n) {
+              @if (editing()) {
+                <!-- In-app note editor (raw markdown → re-written to the vault) -->
+                <article class="card editor">
+                  <textarea
+                    class="editor-area"
+                    spellcheck="false"
+                    autocapitalize="off"
+                    autocomplete="off"
+                    aria-label="Note markdown"
+                    [value]="draft()"
+                    [disabled]="saving()"
+                    (input)="onDraftInput($event)"
+                  ></textarea>
+
+                  @if (saveError(); as err) {
+                    <p class="editor-error" role="alert">{{ err }}</p>
+                  }
+
+                  <div class="editor-foot">
+                    <span class="editor-hint"
+                      >Markdown · saved to your vault</span
+                    >
+                    <div class="editor-actions">
+                      <button
+                        type="button"
+                        class="btn btn-ghost"
+                        (click)="cancelEdit()"
+                        [disabled]="saving()"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-primary"
+                        (click)="saveNote()"
+                        [disabled]="saving()"
+                      >
+                        {{ saving() ? "Saving…" : "Save" }}
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              } @else {
+                @if (n.participants.length) {
+                  <div class="card meta-card" [style.animation-delay.ms]="80">
+                    <span class="meta-card-label">Participants</span>
+                    <div class="people">
+                      @for (p of n.participants; track p) {
+                        <span class="person">{{ p }}</span>
+                      }
+                    </div>
+                  </div>
+                }
+
+                @if (n.sections.length) {
+                  @for (sec of n.sections; track sec.heading; let i = $index) {
+                    <article
+                      class="card section"
+                      [style.animation-delay.ms]="120 + i * 60"
+                    >
+                      <h4 class="section-head">{{ sec.heading }}</h4>
+
+                      @switch (sec.kind) {
+                        @case ("actions") {
+                          <ul class="checklist">
+                            @for (a of sec.actions; track $index) {
+                              <li class="check" [class.is-done]="a.done">
+                                <span
+                                  class="check-box"
+                                  [class.is-done]="a.done"
+                                  aria-hidden="true"
+                                ></span>
+                                <span class="check-text">{{ a.text }}</span>
+                              </li>
+                            }
+                          </ul>
+                        }
+                        @case ("bullets") {
+                          <ul class="bullets">
+                            @for (b of sec.bullets; track $index) {
+                              <li class="bullet">{{ b }}</li>
+                            }
+                          </ul>
+                        }
+                        @default {
+                          <div class="prose">
+                            @for (para of sec.paragraphs; track $index) {
+                              <p>{{ para }}</p>
+                            }
+                          </div>
+                        }
+                      }
+                    </article>
+                  }
+                } @else if (n.raw) {
+                  <article
+                    class="card section"
+                    [style.animation-delay.ms]="120"
+                  >
+                    <pre class="note-body">{{ n.raw }}</pre>
+                  </article>
+                }
+
+                @if (justSaved()) {
+                  <div class="saved-toast" role="status">
+                    <span class="saved-toast-check" aria-hidden="true"></span>
+                    Saved
+                  </div>
+                }
+
+                @if (d.note?.exportedPath; as path) {
+                  <div class="card saved" [style.animation-delay.ms]="160">
+                    <span class="saved-icon" aria-hidden="true"></span>
+                    <div class="saved-body">
+                      <span class="saved-label">Saved to vault</span>
+                      <span class="saved-path">{{ path }}</span>
+                    </div>
                     <button
                       type="button"
-                      class="seg"
-                      [class.is-active]="isActiveSegment(s.startS, s.endS)"
-                      [disabled]="!audioSrc()"
-                      (click)="seekTo(s.startS)"
+                      class="btn btn-ghost copy-btn"
+                      (click)="copy(path)"
                     >
-                      <span class="seg-time">{{ fmt(s.startS) }}</span>
-                      <span class="seg-text">{{ s.text }}</span>
+                      {{ copied() ? "Copied" : "Copy path" }}
                     </button>
-                  </li>
+                  </div>
                 }
-              </ul>
+              }
+            } @else {
+              <div class="card empty-card empty-state">
+                <span class="empty-mark" aria-hidden="true"></span>
+                <p class="empty-title">No analysis yet</p>
+                <p class="empty">
+                  Re-summarize this meeting to generate a structured note.
+                </p>
+              </div>
+            }
+          </section>
+
+          <!-- 2·5) ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none) - -->
+          <app-meeting-actions [meetingId]="d.meeting.id" />
+
+          <!-- 2a) RECIPES / GENERATE (grounded one-tap generations over text) - -->
+          <section class="block">
+            <div class="block-head">
+              <h3>Recipes</h3>
             </div>
-          } @else {
-            <div class="card empty-card">
-              <p class="empty">No transcript.</p>
+            <app-meeting-recipes [meetingId]="d.meeting.id" />
+          </section>
+
+          <!-- 2b) CHAT WITH THIS MEETING (grounded Q&A over the transcript) -- -->
+          <section class="block">
+            <app-meeting-chat [meetingId]="d.meeting.id" />
+          </section>
+
+          <!-- 3) CLICK-TO-SEEK TRANSCRIPT ----------------------------------- -->
+          <section class="block">
+            <div class="block-head">
+              <h3>Transcript</h3>
+              @if (d.segments.length) {
+                <span class="count">{{ d.segments.length }}</span>
+              }
             </div>
-          }
-        </section>
+
+            @if (d.segments.length) {
+              <div
+                class="card transcript-card"
+                [style.animation-delay.ms]="200"
+              >
+                <ul class="segs">
+                  @for (s of d.segments; track s.idx) {
+                    <li>
+                      <button
+                        type="button"
+                        class="seg"
+                        [class.is-active]="isActiveSegment(s.startS, s.endS)"
+                        [disabled]="!audioSrc()"
+                        (click)="seekTo(s.startS)"
+                      >
+                        <span class="seg-time">{{ fmt(s.startS) }}</span>
+                        @if (speakerChip(s.speaker); as chip) {
+                          <span
+                            class="seg-speaker"
+                            [style.background]="chip.bg"
+                            [style.color]="chip.fg"
+                            >{{ chip.label }}</span
+                          >
+                        }
+                        <span class="seg-text">{{ s.text }}</span>
+                      </button>
+                    </li>
+                  }
+                </ul>
+              </div>
+            } @else {
+              <div class="card empty-card">
+                <p class="empty">No transcript.</p>
+              </div>
+            }
+          </section>
+        }
       } @else if (loading()) {
         <div class="card state-card">
           <p class="empty">Loading…</p>
@@ -716,10 +850,6 @@ interface ParsedNote {
         color: var(--text-muted);
         font-size: 0.8125rem;
       }
-      .meta-item,
-      .meta-sep {
-        color: var(--text-muted);
-      }
 
       /* --- Tag editor (chips + inline add) --- */
       .tag-editor {
@@ -781,6 +911,7 @@ interface ParsedNote {
         font-size: 0.8125rem;
       }
 
+      /* Read-only folder + lock badge in the meta row. */
       .actions {
         display: flex;
         flex-wrap: wrap;
@@ -933,7 +1064,6 @@ interface ParsedNote {
         flex: none;
       }
       .audio-off-text {
-        color: var(--text-muted);
         font-size: 0.875rem;
       }
 
@@ -1118,10 +1248,6 @@ interface ParsedNote {
       }
       .section:hover {
         border-color: var(--border-strong);
-      }
-      .section-head {
-        margin: 0 0 var(--space-3);
-        color: var(--text-primary);
       }
 
       .prose p {
@@ -1321,11 +1447,9 @@ interface ParsedNote {
       }
       .editor-hint,
       .graph-caption {
+        margin: 0;
         color: var(--text-muted);
         font-size: 0.8125rem;
-      }
-      .graph-caption {
-        margin: 0;
       }
 
       /* Transient "Saved" confirmation */
@@ -1429,6 +1553,17 @@ interface ParsedNote {
         padding-top: 0.1em;
       }
 
+      /* Speaker chip: an optional Me/Others tag between the time + text
+         (colours bound inline). Legacy/null segments render unlabeled. */
+      .seg-speaker {
+        flex: none;
+        padding: 2px var(--space-2);
+        border-radius: var(--radius-pill);
+        font-size: 0.6875rem;
+        font-weight: 700;
+        line-height: 1.5;
+      }
+
       /* --- Empty / loading wells (.count/.state-card/.empty* are global) --- */
       .empty-card {
         padding: var(--space-5);
@@ -1489,6 +1624,8 @@ export class DetailComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly folders = inject(FoldersService);
+  private readonly toast = inject(ToastService);
 
   /** Exposed so the template can format aria values. */
   protected readonly Math = Math;
@@ -1497,6 +1634,43 @@ export class DetailComponent implements OnInit {
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly msg = signal("");
+
+  // --- Phase 0.5 lock gate -------------------------------------------------
+  /**
+   * True while the backend has MASKED this meeting (it lives in a sealed,
+   * not-session-unlocked folder). The template renders the lock gate instead
+   * of the note/transcript/audio/timeline/actions. Mirrors `detail()?.locked`.
+   */
+  readonly locked = computed(() => this.detail()?.locked === true);
+  /** True while an `unlockMeeting` biometric call is in flight (pending state). */
+  readonly unlocking = signal(false);
+  /** Focusable unlock button — focused after the gate renders (afterNextRender). */
+  private readonly unlockButton =
+    viewChild<ElementRef<HTMLButtonElement>>("unlockButton");
+
+  // --- Move-to-folder popover ---------------------------------------------
+  /** True while the folder-picker popover is open. */
+  readonly moveOpen = signal(false);
+
+  /**
+   * Read-only folder badge for the header: the owning folder's name + exposure
+   * (open / locked / session), or null when the note is at the vault root or the
+   * folder isn't (yet) in the loaded tree. Reactive to both the meeting's
+   * `folderId` and the folders store, so a move/lock updates it live.
+   */
+  readonly folderBadge = computed<{
+    name: string;
+    exposure: FolderExposure;
+  } | null>(() => {
+    const fid = this.detail()?.meeting.folderId ?? null;
+    if (fid === null) {
+      return null;
+    }
+    const node = this.findFolder(this.folders.tree(), fid);
+    return node
+      ? { name: node.name, exposure: this.folders.exposureOf(node) }
+      : null;
+  });
 
   // --- Inline title rename state ------------------------------------------
   /** True while the header title is swapped for an inline text input. */
@@ -1650,16 +1824,114 @@ export class DetailComponent implements OnInit {
     } finally {
       this.loading.set(false);
     }
+    // Locked (masked) meetings render the lock gate only — skip priming the
+    // timeline/tags (they're empty/masked) and focus the Unlock button instead.
+    if (this.locked()) {
+      afterNextRender(() => this.unlockButton()?.nativeElement.focus(), {
+        injector: this.injector,
+      });
+      return;
+    }
     // Kick the timeline off after the detail load; never blocks the page and
     // tolerates the first-call LLM latency (backend caches the result).
     if (this.detail()) {
       void this.loadTimeline();
+      // Prime the folder tree so the read-only folder/lock badge + the move
+      // picker have state on a direct navigation (idempotent; the root component
+      // also loads it). Non-blocking — a failure just hides the badge.
+      void this.folders.load();
       // Load the meeting's tags (best-effort; failure leaves the chips empty).
       try {
         this.tags.set(await this.ipc.getMeetingTags(id));
       } catch {
         this.tags.set([]);
       }
+    }
+  }
+
+  // --- Move to folder ------------------------------------------------------
+
+  /** Open/close the folder-picker popover (closed while the detail is busy). */
+  toggleMove(): void {
+    if (this.busy()) {
+      return;
+    }
+    this.moveOpen.update((v) => !v);
+  }
+
+  /** Dismiss the folder-picker popover. */
+  closeMove(): void {
+    this.moveOpen.set(false);
+  }
+
+  /**
+   * Apply a completed move locally: patch the in-memory meeting's `folderId` so
+   * the header badge updates immediately (the picker already moved it via the
+   * service + reloaded the tree). Then close the popover.
+   */
+  onMoved(folderId: string | null): void {
+    this.detail.update((d) =>
+      d ? { ...d, meeting: { ...d.meeting, folderId } } : d,
+    );
+    this.closeMove();
+  }
+
+  /** Depth-first search for a folder node by id across the forest. */
+  private findFolder(nodes: FolderNode[], id: string): FolderNode | null {
+    for (const n of nodes) {
+      if (n.id === id) {
+        return n;
+      }
+      const hit = this.findFolder(n.children, id);
+      if (hit) {
+        return hit;
+      }
+    }
+    return null;
+  }
+
+  // --- Phase 0.5 lock gate -------------------------------------------------
+
+  /**
+   * Unlock this meeting's owning folder via the biometric (Touch ID) path, then
+   * RE-FETCH the now-unmasked detail and replace the `detail` signal in place so
+   * the note/transcript/audio/timeline render. The IPC returning null (root /
+   * already-open folder) is still treated as success — we re-fetch regardless.
+   * On failure (biometric denied / cancelled / error) we surface a toast and
+   * stay gated. Uses await (no subscribe-for-state); the button shows a pending
+   * state while in flight. Once unmasked, the timeline + tags are primed too.
+   */
+  async unlock(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id || this.unlocking()) {
+      return;
+    }
+    this.unlocking.set(true);
+    try {
+      // Run the biometric unlock_folder path for the meeting's folder.
+      await this.ipc.unlockMeeting(id);
+      // Re-fetch the now-unmasked detail and swap it in place. A null detail
+      // (deleted out from under us) keeps the not-found state honest.
+      const fresh = await this.ipc.getMeetingDetail(id);
+      this.detail.set(fresh);
+      if (fresh && !fresh.locked) {
+        // Refresh the folder tree so the header lock badge reflects the unlock,
+        // then prime the timeline + tags the masked load skipped. Non-blocking.
+        void this.folders.load();
+        void this.loadTimeline();
+        try {
+          this.tags.set(await this.ipc.getMeetingTags(id));
+        } catch {
+          this.tags.set([]);
+        }
+      }
+    } catch {
+      // Biometric denied / cancelled, or the unlock errored — stay gated.
+      this.toast.danger(
+        "Couldn’t unlock — authentication failed or cancelled.",
+      );
+    } finally {
+      this.unlocking.set(false);
     }
   }
 
@@ -2430,6 +2702,37 @@ export class DetailComponent implements OnInit {
   /** Strip surrounding quotes/whitespace from a YAML scalar. */
   private cleanScalar(s: string): string {
     return s.trim().replace(/^["']/, "").replace(/["']$/, "").trim();
+  }
+
+  /**
+   * Map a transcript segment's `speaker` to a small presentational chip:
+   * "Me" (the local mic, accent) vs "Others" (captured system audio, neutral/
+   * violet). Returns null for legacy / mic-only segments (`null` / unknown) so
+   * they render unlabeled exactly as before. This is independent of the AI
+   * timeline's manual speaker-rename — that feature relabels timeline lanes, not
+   * these per-segment Me/Others tags.
+   */
+  speakerChip(
+    speaker: Segment["speaker"],
+  ): { label: string; bg: string; fg: string } | null {
+    switch (speaker) {
+      case "me":
+        // Local mic — the calm accent.
+        return {
+          label: "Me",
+          bg: "var(--accent-soft)",
+          fg: "var(--accent-hover)",
+        };
+      case "others":
+        // Captured system audio — a neutral violet, distinct from "Me".
+        return {
+          label: "Others",
+          bg: "rgba(157, 123, 255, 0.16)",
+          fg: "#b9a4ff",
+        };
+      default:
+        return null;
+    }
   }
 
   /** Seconds → m:ss for timestamps + player times. */

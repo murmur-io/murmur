@@ -61,8 +61,22 @@ pub async fn run_after_stop(
     src_rate: u32,
     duration_s: i64,
     system_wav: Option<PathBuf>,
+    mic_started_at: std::time::Instant,
+    system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
-    match run_inner(app, state, meeting_id, samples, src_rate, duration_s, system_wav).await {
+    match run_inner(
+        app,
+        state,
+        meeting_id,
+        samples,
+        src_rate,
+        duration_s,
+        system_wav,
+        mic_started_at,
+        system_started_at,
+    )
+    .await
+    {
         Ok(result) => Ok(result),
         Err(e) => {
             // Persist the failure and surface it to the UI without leaking PII.
@@ -84,6 +98,8 @@ async fn run_inner(
     src_rate: u32,
     duration_s: i64,
     system_wav: Option<PathBuf>,
+    mic_started_at: std::time::Instant,
+    system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
     // Snapshot config under the lock, then release it for the rest of the async work.
     let config: AppConfig = {
@@ -98,28 +114,40 @@ async fn run_inner(
     let date_iso = now.format("%Y-%m-%d").to_string();
     let ended_at = now.to_rfc3339();
 
-    // ── 1. Build 16 kHz mono samples (mic, optionally mixed with system audio) ──
+    // ── 1. Build 16 kHz mono streams + archive the COMBINED mix ──────────────
+    //
+    // DUAL-STREAM: mic and system audio are resampled to 16 kHz SEPARATELY and transcribed
+    // separately (§2). `mixer::mix` is used ONLY to produce the combined archive WAV for
+    // playback — its output is NEVER fed to Whisper. If there's no system stream (capture off
+    // or ScreenCaptureKit permission denied → sidecar produced no WAV), we fall back to the
+    // mic-only single pass (today's behaviour, everything attributed "me").
     let mic_16k = audio::resample_to_16k(&samples, src_rate)?;
-    let samples_16k = match system_wav {
-        Some(path) => match audio::read_wav_mono(&path) {
+    let sys_16k: Option<Vec<f32>> = match &system_wav {
+        Some(path) => match audio::read_wav_mono(path) {
             Ok((sys, sys_rate)) => {
-                let sys_16k = audio::resample_to_16k(&sys, sys_rate)?;
-                let _ = std::fs::remove_file(&path); // transient sidecar output
-                tracing::info!(target: "audio", "mixed mic + system-audio tracks");
-                audio::mix(&mic_16k, &sys_16k)
+                let resampled = audio::resample_to_16k(&sys, sys_rate)?;
+                let _ = std::fs::remove_file(path); // transient sidecar output
+                Some(resampled)
             }
             Err(e) => {
                 tracing::warn!(target: "audio", error = %e, "could not read system-audio track; using mic only");
-                mic_16k
+                None
             }
         },
-        None => mic_16k,
+        None => None,
     };
 
-    // Persist the (possibly mixed) 16 kHz mono WAV for archive.
+    // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
+    let archive_16k = match &sys_16k {
+        Some(sys) => {
+            tracing::info!(target: "audio", "archiving mixed mic + system-audio track");
+            audio::mix(&mic_16k, sys)
+        }
+        None => mic_16k.clone(),
+    };
     let wav_dir = audio_dir()?;
     let wav_path = wav_dir.join(format!("{meeting_id}.wav"));
-    audio::write_wav_16k_mono(&wav_path, &samples_16k, audio::TARGET_RATE_HZ)?;
+    audio::write_wav_16k_mono(&wav_path, &archive_16k, audio::TARGET_RATE_HZ)?;
     state.db.finalize_meeting(
         meeting_id,
         &ended_at,
@@ -127,32 +155,75 @@ async fn run_inner(
         &wav_path.to_string_lossy(),
     )?;
 
-    // ── 2. Transcribe ───────────────────────────────────────────────────────
+    // ── 2 + 3. Transcribe EACH stream separately, then MERGE by wall-clock ────
     emit_status(app, "transcribing", "Transcribing audio…", meeting_id);
 
     let model_path = resolve_model_path(&config)?;
     let lang = config.language.as_deref();
 
-    // Whisper load + inference are CPU/GPU-bound and blocking; run off the async
-    // runtime's worker so we don't stall other tasks. The model path / lang are
-    // owned copies so the closure is 'static.
+    // Whisper load + inference are CPU/GPU-bound and blocking; run the WHOLE transcription off
+    // the async runtime's worker so we don't stall other tasks. We load the model ONCE and reuse
+    // it for both streams. Owned copies keep the closure 'static.
     let model_path_owned = model_path.clone();
     let lang_owned = lang.map(str::to_string);
-    let transcript = tokio::task::spawn_blocking(move || -> Result<_> {
+    let has_system = sys_16k.is_some();
+    let merged_segments = tokio::task::spawn_blocking(move || -> Result<Vec<crate::transcribe::types::Segment>> {
+        use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
+        use crate::transcribe::TranscribeQuality;
+
         let transcriber = Transcriber::load(&model_path_owned)?;
-        transcriber.transcribe(&samples_16k, lang_owned.as_deref())
+        // BATCH path → Accurate profile (beam search + temperature fallback + anti-hallucination
+        // thresholds + previous-text conditioning) for BOTH streams. Live captions + voice
+        // trigger keep the Fast greedy profile for latency — see transcribe::whisper.
+        let mic_tx =
+            transcriber.transcribe_with(&mic_16k, lang_owned.as_deref(), TranscribeQuality::Accurate)?;
+
+        let mut streams = vec![StreamInput {
+            segments: mic_tx.segments,
+            started_at: mic_started_at,
+            speaker: SPEAKER_ME,
+        }];
+
+        if let (Some(sys), Some(sys_started)) = (sys_16k, system_started_at) {
+            let sys_tx =
+                transcriber.transcribe_with(&sys, lang_owned.as_deref(), TranscribeQuality::Accurate)?;
+            streams.push(StreamInput {
+                segments: sys_tx.segments,
+                started_at: sys_started,
+                speaker: SPEAKER_OTHERS,
+            });
+        }
+
+        // Anchor each stream's segments to its capture-start host instant → absolute timeline,
+        // merge sorted by absolute start, drop empty (e.g. muted-mic) segments, label "me"/"others".
+        Ok(merge_streams(streams))
     })
     .await
     .map_err(|e| AppError::Transcribe(format!("transcription task panicked: {e}")))??;
 
-    state
-        .db
-        .insert_segments(meeting_id, &transcript.segments)?;
+    if has_system {
+        tracing::info!(target: "transcribe", segments = merged_segments.len(), "merged mic + system streams (me/others)");
+    }
+
+    state.db.insert_segments(meeting_id, &merged_segments)?;
     state
         .db
         .update_meeting_status(meeting_id, MeetingStatus::Transcribed)?;
 
-    if transcript.full_text.trim().is_empty() {
+    // Rebuild the full transcript text from the merged, time-ordered segments.
+    let mut full_text = String::new();
+    for seg in &merged_segments {
+        let t = seg.text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !full_text.is_empty() {
+            full_text.push(' ');
+        }
+        full_text.push_str(t);
+    }
+
+    if full_text.trim().is_empty() {
         return Err(AppError::Transcribe(
             "No speech detected in the recording — nothing to transcribe. \
              Check your microphone input and try recording again."
@@ -160,14 +231,14 @@ async fn run_inner(
         ));
     }
 
-    // ── 3 + 4. Summarize with the configured provider, then export ───────────
+    // ── 4 + 5. Summarize with the configured provider, then export ───────────
     summarize_and_export(
         app,
         state,
         &config,
         meeting_id,
-        &transcript.full_text,
-        transcript.language.clone().or_else(|| lang.map(str::to_string)),
+        &full_text,
+        lang.map(str::to_string),
         duration_s,
         &date_iso,
         &ended_at,
@@ -262,6 +333,16 @@ async fn summarize_and_export(
         .update_meeting_status(meeting_id, MeetingStatus::Exported)?;
 
     emit_status(app, "done", "Note exported.", meeting_id);
+
+    // Best-effort self-assembling graph: persist entities/mentions to the encrypted DB (Sink A)
+    // + mirror vault stubs for unsealed folders (Sink B). NEVER fail the note on a graph error —
+    // a graph-extraction LLM hiccup must not block note export. `add_mention` idempotency makes
+    // the `resummarize_existing` path safe (re-extraction refreshes without double-counting).
+    if let Err(e) =
+        crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+    {
+        tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note export unaffected)");
+    }
 
     Ok(PipelineResult {
         note_markdown: markdown,

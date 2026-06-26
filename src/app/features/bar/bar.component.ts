@@ -7,6 +7,7 @@ import {
 } from "@angular/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { RecorderStore } from "../../core/recorder.store";
+import { MicMuteToggleComponent } from "../record/mic-mute-toggle.component";
 
 /**
  * The floating, always-on-top "OS bar" (a second Tauri window summoned with ⌘⇧R).
@@ -19,6 +20,7 @@ import { RecorderStore } from "../../core/recorder.store";
   selector: "app-floating-bar",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [MicMuteToggleComponent],
   host: { "(document:keydown.escape)": "hide()" },
   template: `
     <div
@@ -47,6 +49,9 @@ import { RecorderStore } from "../../core/recorder.store";
             }
           </div>
         }
+        <!-- Mic-mute: icon-only in the slim pill. Silences only the mic;
+             system audio keeps recording. Never starts/stops anything. -->
+        <app-mic-mute-toggle [compact]="true" />
         <button
           type="button"
           class="circle stop"
