@@ -14,7 +14,10 @@ Rules:\n\
 invent facts, decisions, or attributions.\n\
 - Cite the meetings you rely on inline using their [[Title]] exactly as given.\n\
 - When something evolved across meetings, trace it chronologically.\n\
-- Be concise and concrete.\n\n\
+- Be concise and concrete.\n\
+- Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight bullets \
+or short `##` sections. A tasteful emoji in a section header is welcome (e.g. ## ✅ Decisions). \
+Never output YAML or front-matter.\n\n\
 MEETING NOTES:\n{corpus}"
     );
 
