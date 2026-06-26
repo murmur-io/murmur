@@ -175,3 +175,43 @@ export interface GraphPayload {
   people: string[];
   projects: string[];
 }
+
+export interface VaultSource {
+  meetingId: string;
+  title: string;
+  startedAt: string;
+}
+
+export interface AskVaultResult {
+  answer: string;
+  sources: VaultSource[];
+}
+
+export interface DigestResult {
+  markdown: string;
+  exportedPath: string | null;
+}
+
+export interface TopicMention {
+  meetingId: string;
+  title: string;
+  startedAt: string;
+  startS: number;
+  endS: number;
+}
+
+export interface TopicThread {
+  label: string;
+  count: number;
+  mentions: TopicMention[];
+}
+
+export interface CalendarEvent {
+  title: string;
+  start: string | null;
+}
+
+export interface BriefResult {
+  markdown: string;
+  sources: VaultSource[];
+}
