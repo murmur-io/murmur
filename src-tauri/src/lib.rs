@@ -3,6 +3,7 @@ pub mod commands;
 pub mod error;
 pub mod events;
 pub mod export;
+pub mod mcp;
 pub mod pipeline;
 pub mod secrets;
 pub mod settings;
@@ -99,6 +100,12 @@ pub fn run() {
             }
             commands::restart_voice_listener(app.handle().clone());
             setup_tray(app.handle())?;
+            // Localhost MCP server (read-only meeting tools for Claude Desktop/Code; no egress).
+            if let Some(db_path) =
+                dirs::data_dir().map(|b| b.join("MeetNotes").join("meetnotes.sqlite"))
+            {
+                crate::mcp::spawn(db_path);
+            }
             // Closing the main window HIDES it (recoverable from the tray) instead of
             // quitting — so the floating bar is never the only way back into the app.
             if let Some(main) = app.get_webview_window("main") {
