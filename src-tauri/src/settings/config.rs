@@ -35,6 +35,10 @@ pub struct AppConfig {
     pub auto_organize: bool,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
+    /// Require an `Authorization: Bearer <token>` on MCP `tools/call`. Default OFF so the
+    /// existing local Claude connection keeps working; discovery (initialize/tools/list/ping)
+    /// stays open regardless. Bind is always 127.0.0.1.
+    pub mcp_require_token: bool,
 }
 
 impl Default for AppConfig {
@@ -56,6 +60,7 @@ impl Default for AppConfig {
             note_style: "standard".to_string(),
             auto_organize: false,
             note_language: "auto".to_string(),
+            mcp_require_token: false,
         }
     }
 }
@@ -77,6 +82,7 @@ const K_ONBOARDED: &str = "onboarded";
 const K_NOTE_STYLE: &str = "note_style";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
+const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -141,6 +147,9 @@ impl AppConfig {
                 cfg.note_language = v;
             }
         }
+        if let Some(v) = db.get_setting(K_MCP_REQUIRE_TOKEN)? {
+            cfg.mcp_require_token = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -179,6 +188,10 @@ impl AppConfig {
             if self.auto_organize { "true" } else { "false" },
         )?;
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
+        db.set_setting(
+            K_MCP_REQUIRE_TOKEN,
+            if self.mcp_require_token { "true" } else { "false" },
+        )?;
         Ok(())
     }
 }

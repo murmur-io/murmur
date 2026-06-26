@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::audio::listener::VoiceListener;
 use crate::audio::system::SystemAudioRecorder;
@@ -26,8 +26,9 @@ pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
-    /// MCP until relock (cleared on screen-share start or app exit).
-    pub unlocked_folders: Mutex<std::collections::HashSet<String>>,
+    /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
+    /// thread shares the SAME set as the command surface.
+    pub unlocked_folders: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Master KEK released by biometric; None until first unlock, zeroized on relock.
     pub master_kek: Mutex<Option<[u8; 32]>>,
 }
@@ -55,7 +56,7 @@ impl AppState {
             db,
             config: Mutex::new(config),
             current_meeting: Mutex::new(None),
-            unlocked_folders: Mutex::new(std::collections::HashSet::new()),
+            unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
         })
     }

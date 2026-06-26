@@ -7,6 +7,12 @@ pub const SERVICE: &str = "com.meetnotes.app";
 /// Keychain account holding the SQLCipher database encryption key (DEK).
 pub const ACCOUNT_DB_DEK: &str = "murmur_db_dek";
 
+/// Keychain account holding the master KEK that wraps per-folder content keys (Layer 2 lock).
+pub const ACCOUNT_MASTER_KEK: &str = "murmur_master_kek";
+
+/// Keychain account holding the optional MCP bearer token.
+pub const ACCOUNT_MCP_TOKEN: &str = "murmur_mcp_token";
+
 /// Return the SQLCipher DEK as a 64-char hex string (32 random bytes), creating + persisting it
 /// in the Keychain on first use. Released at launch with no biometric prompt — this layer
 /// protects against database FILE theft, not against an attacker on the unlocked machine
@@ -31,6 +37,63 @@ pub fn get_or_create_db_dek() -> Result<String> {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     set_secret(ACCOUNT_DB_DEK, &hex)?;
     Ok(hex)
+}
+
+/// Return the master KEK (32 raw bytes) that wraps per-folder content keys, creating +
+/// persisting it (as a 64-char hex string) in the Keychain on first use. Mirrors
+/// [`get_or_create_db_dek`]: released at launch in this stage (Stage E will move it behind a
+/// biometric ACL — do NOT add biometric here). This KEK never touches SQLCipher; it only
+/// wraps/unwraps content keys via [`crate::crypto`].
+pub fn get_or_create_master_kek() -> Result<[u8; 32]> {
+    // Dev-only escape hatch mirroring MURMUR_DEV_DEK, but a SEPARATE env var so the at-rest DEK
+    // and the lock KEK can be fixed independently in tests/dev. NEVER compiled into release.
+    #[cfg(debug_assertions)]
+    if let Ok(dev) = std::env::var("MURMUR_DEV_KEK") {
+        if let Some(k) = hex_to_key32(&dev) {
+            return Ok(k);
+        }
+    }
+    if let Some(hex) = get_secret(ACCOUNT_MASTER_KEK)? {
+        if let Some(k) = hex_to_key32(&hex) {
+            return Ok(k);
+        }
+        return Err(AppError::Secrets("stored master KEK is malformed".into()));
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| AppError::Secrets(format!("RNG failed generating KEK: {e}")))?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    set_secret(ACCOUNT_MASTER_KEK, &hex)?;
+    Ok(bytes)
+}
+
+/// Return the MCP bearer token (a random 64-char hex string), minting + persisting it in the
+/// Keychain on first use. Used to gate MCP `tools/call` when `K_MCP_REQUIRE_TOKEN` is on.
+pub fn get_or_create_mcp_token() -> Result<String> {
+    if let Some(tok) = get_secret(ACCOUNT_MCP_TOKEN)? {
+        if !tok.is_empty() {
+            return Ok(tok);
+        }
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| AppError::Secrets(format!("RNG failed generating MCP token: {e}")))?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    set_secret(ACCOUNT_MCP_TOKEN, &hex)?;
+    Ok(hex)
+}
+
+/// Parse a 64-char hex string into a 32-byte key, or `None` if malformed.
+fn hex_to_key32(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Build a keyring entry for `(SERVICE, account)`. `account` is the provider key name,
@@ -62,5 +125,26 @@ pub fn delete_secret(account: &str) -> Result<()> {
         Ok(()) => Ok(()),
         Err(KeyringError::NoEntry) => Ok(()),
         Err(e) => Err(AppError::Secrets(format!("failed to delete secret: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_to_key32;
+
+    #[test]
+    fn hex_to_key32_round_trips() {
+        let bytes: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_to_key32(&hex), Some(bytes));
+        // Trims surrounding whitespace (env-var convenience).
+        assert_eq!(hex_to_key32(&format!("  {hex}\n")), Some(bytes));
+    }
+
+    #[test]
+    fn hex_to_key32_rejects_malformed() {
+        assert_eq!(hex_to_key32("tooshort"), None);
+        assert_eq!(hex_to_key32(&"z".repeat(64)), None);
+        assert_eq!(hex_to_key32(&"a".repeat(63)), None);
     }
 }
