@@ -11,12 +11,13 @@ import { RouterLink } from "@angular/router";
 import { RecorderStore } from "../../core/recorder.store";
 import { IpcService } from "../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../core/models";
+import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 
 @Component({
   selector: "app-record",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, PreMeetingBriefComponent],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
     <section class="record">
@@ -77,6 +78,14 @@ import type { Analytics, AppConfigDto } from "../../core/models";
               </button>
             </span>
           </div>
+        }
+
+        <!-- Pre-meeting brief: a subtle prep affordance — only when not recording. -->
+        @if (showBrief()) {
+          <app-pre-meeting-brief
+            [initialSubject]="briefPrefill()"
+            (dismissed)="dismissBrief()"
+          />
         }
 
         @if (store.isRecording()) {
@@ -855,6 +864,11 @@ export class RecordComponent implements OnInit {
   readonly detectedApp = signal<string | null>(null);
   /** Once dismissed, the nudge stays hidden for the rest of this session. */
   private readonly nudgeDismissed = signal(false);
+
+  /** Title of the next calendar event (best-effort prefill), or null. */
+  private readonly nextEventTitle = signal<string | null>(null);
+  /** Once dismissed, the prep card stays hidden for the rest of this session. */
+  private readonly briefDismissed = signal(false);
   /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
   private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
 
@@ -903,6 +917,27 @@ export class RecordComponent implements OnInit {
       !this.store.isRecording() &&
       !this.nudgeDismissed() &&
       this.canRecord(),
+  );
+
+  /**
+   * Subject to prefill the prep card: the next calendar event's title first,
+   * else the detected meeting-app name (if the nudge already surfaces one),
+   * else empty so the user types their own.
+   */
+  readonly briefPrefill = computed(
+    () => this.nextEventTitle() ?? this.detectedApp() ?? "",
+  );
+
+  /**
+   * Show the prep affordance only when NOT recording / processing and the user
+   * hasn't dismissed it this session. Kept subtle — it never competes with the
+   * record hero, and is hidden the moment a recording (or its processing) runs.
+   */
+  readonly showBrief = computed(
+    () =>
+      !this.store.isRecording() &&
+      !this.isProcessing() &&
+      !this.briefDismissed(),
   );
 
   /** Elapsed recording time as m:ss. */
@@ -964,6 +999,15 @@ export class RecordComponent implements OnInit {
       this.analytics.set(null);
     }
 
+    // Next-event prefill for the prep card — purely best-effort; on any failure
+    // (or no upcoming event) we simply leave the subject blank for the user.
+    try {
+      const next = await this.ipc.nextCalendarEvent();
+      this.nextEventTitle.set(next?.title ?? null);
+    } catch {
+      this.nextEventTitle.set(null);
+    }
+
     // Meeting-app detection: check once now, then poll on a tracked interval.
     void this.checkMeetingApp();
     this.meetingAppPoll = setInterval(
@@ -995,6 +1039,11 @@ export class RecordComponent implements OnInit {
   /** Nudge ghost action — hide it for the rest of this session. */
   dismissNudge(): void {
     this.nudgeDismissed.set(true);
+  }
+
+  /** Prep-card dismiss — hide it for the rest of this session. */
+  dismissBrief(): void {
+    this.briefDismissed.set(true);
   }
 
   /** ⌘R / Ctrl+R toggles recording. */
