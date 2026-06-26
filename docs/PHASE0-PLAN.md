@@ -1,907 +1,203 @@
-# MeetNotes — Phase 0 Implementation Blueprint (Walking Skeleton)
+<!-- Phase 0 implementation plan, code-grounded, generated 2026-06-26. -->
 
-> Status: **Plan — implementation-ready.** Date: 2026-06-24.
-> Authoritative source: [`DESIGN.md`](./DESIGN.md) §10 "Faza 0". This document pins the
-> exact file tree, dependency versions, module API surface, Tauri command signatures,
-> and build order so that independent agents can implement modules in parallel **without
-> interface drift**. No code is written here — only the contract.
+# Murmur Phase 0 — Unified Implementation Plan
+### SQLCipher at-rest + per-folder biometric lock + rich folder UI
 
-## 0. Phase 0 scope (locked)
+Crate `murmur` / lib `meetnotes_lib` at `/Users/jakubgawronski/Projects/meetnotes`. **In scope:** F2 Layer 1 (SQLCipher), F2 Layer 2 (per-folder content key behind biometric), F1 (folder UI + lock lifecycle), MCP exposure filter + token, screen-share auto-relock. **Explicitly OUT:** in-app graph, cloud/sync/sharing, enrichment, hosted MCP, CRDTs.
 
-End-to-end proof: **mic-only capture → local Whisper transcription → pluggable
-`SummarizerProvider` → Obsidian `.md` export**, with a minimal Tauri UI and minimal
-SQLite persistence.
-
-In scope:
-- Mic-only capture via `cpal` → 16 kHz mono WAV (written with `hound`; **no ffmpeg
-  dependency in Phase 0** — see §1 note).
-- Local Whisper transcription via `whisper-rs` (Metal), batch mode (after Stop).
-- `SummarizerProvider` trait + **all three v1 providers**: `ClaudeCodeProvider`
-  (**default**), `AnthropicProvider`, `OllamaProvider`.
-- Obsidian export: atomic `.tmp`→`rename` write into a user-chosen vault folder.
-- Minimal Tauri UI: Record/Stop button, live status, last-note Markdown preview,
-  Settings (vault path + provider selection + Anthropic key entry).
-- Minimal SQLite persistence: `meetings`, `segments`, `notes`, `settings` (the full
-  DESIGN §5.4 schema — implemented now, only partly surfaced in UI).
-- API key in macOS Keychain via `keyring`.
-
-Explicitly **deferred** (NOT Phase 0): ScreenCaptureKit / system audio, speaker
-diarization, live transcription, Library list UI, template editor, Whisper model picker
-UI (model path is a setting, downloaded manually for now), `obsidian://` URI, signing/
-notarization, vault auto-detection from `obsidian.json` (manual folder pick only in P0).
+**The single hardest truth (from all three analyses, and the spec §5.2):** the migration is the only destructive operation and biometric must release a real key from a `.biometryCurrentSet`-ACL'd Keychain entry, not flip a boolean. Everything below is ordered so the destructive step is proven on a throwaway copy before it touches real data, and so the boolean-theater trap is closed by design.
 
 ---
 
-## 1. Toolchain probe (recorded 2026-06-24 on this machine)
+## 1. BUILD ORDER
 
-| Tool | Status | Version found | Implication for later agents |
-|---|---|---|---|
-| `node` | ✅ present | v24.16.0 | Frontend build OK. |
-| `npm` | ✅ present | 11.13.0 | Frontend deps install OK. |
-| `cargo` | ❌ **MISSING** | — | **Cannot compile-check Rust** until installed. |
-| `rustc` | ❌ **MISSING** | — | Same. |
-| Tauri CLI | ❌ MISSING | — | Install via `cargo install tauri-cli` or `npm i -D @tauri-apps/cli`. |
-| `cmake` | ❌ **MISSING** | — | **Required by `whisper-rs-sys`** (builds whisper.cpp). Blocker for transcribe module compile. |
-| `ffmpeg` | ✅ present | 8.1.1 | Not needed in P0 (we use `hound`); available for P2 mixing. |
-| `clang` | ✅ present | Apple clang 21.0.0 | Satisfies C/C++ compiler for whisper.cpp build. |
-| `pkg-config` | ❌ MISSING | — | May be needed by some `-sys` crates; install via Homebrew if a build fails. |
-| Xcode CLT | ✅ present | `/Library/Developer/CommandLineTools` | Provides Metal toolchain + SDK headers. |
-| OS | macOS 26.5 (Darwin 25.5.0), arm64 (Apple Silicon) | — | Metal acceleration available; target `aarch64-apple-darwin`. |
+Legend: **S/M/L** effort · **[INLINE]** = orchestrator edits a shared Rust file serially (conflict-prone, see §2) · **[WORKFLOW]** = delegable to a parallel workflow (new file or isolated FE surface).
 
-### Prerequisite-install commands (run BEFORE any Rust compile-check)
-```bash
-# Rust toolchain (rustup) — installs cargo + rustc
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-rustup target add aarch64-apple-darwin
+### Stage A — SQLCipher foundation (must land first; nothing else is safe until the DB is encrypted-and-migrated)
 
-# Build deps for whisper.cpp (cmake) + pkg-config, via Homebrew
-brew install cmake pkg-config
+**A1. Flip the rusqlite feature + verify the universal build. — M — [INLINE]**
+- `Cargo.toml:41`: `features = ["bundled"]` → primary `["bundled-sqlcipher-vendored-openssl"]`, documented fallback `["bundled-sqlcipher"]` (SecurityFramework/CommonCrypto, no OpenSSL in the graph → sidesteps the cross-compile trigger).
+- **HARD GATE before this is accepted (DB+CRYPTO analysis §1):** green `tauri build --target universal-apple-darwin` on the actual release runner AND a launch test on both arm64 and x86_64 (or `arch -x86_64`). Compile success is NOT enough — the `libssl.3.dylib` code-sign/load failure only shows at runtime ([Tauri #9684]). If it fails, fall back to `bundled-sqlcipher` and confirm SecurityFramework is selected. `tauri.conf.json:31` is `"targets":"all"` — the release path is the universal lipo, so this gate is mandatory, not optional.
+- Mitigation preference order: (1) build each arch natively + manual `lipo`; (2) fall back to `bundled-sqlcipher`; (3) cross-compile with `PKG_CONFIG_SYSROOT_DIR` (least recommended).
 
-# Tauri CLI (project-local)
-npm install -D @tauri-apps/cli@^2
-```
-**Gate for compile-checking agents:** until `cargo`, `rustc`, and `cmake` are present,
-Rust modules can be authored against the signatures in §5 but **cannot be `cargo
-check`-ed**. Frontend (§4) can be built/typechecked immediately (node+npm present).
+**A2. DEK lifecycle in the Keychain. — S — [INLINE]** (`secrets/keychain.rs`)
+- Add `pub const ACCOUNT_DB_DEK: &str = "murmur_db_dek";` and `get_or_create_db_dek() -> Result<String>` returning a **64-char hex string** (32 random bytes via `getrandom`), reusing the existing `get_secret`/`set_secret` plumbing verbatim. Hex form → SQLCipher consumes it as a raw key blob with **no KDF**.
+- DEK uses plain `keyring` (released at launch, file-theft protection) — **no biometric prompt at launch**. This is deliberately distinct from the KEK (Stage E).
+- New dep: `getrandom` (needs approval — tiny, standard, cryptographic RNG).
 
-> **Why no `ffmpeg` crate dependency in Phase 0:** DESIGN §5.1 specifies ffmpeg mixing
-> for *mic + system* audio. Phase 0 is **mic-only mono**, so we capture directly at the
-> device sample rate via `cpal`, resample to 16 kHz mono in-process, and write WAV with
-> `hound`. This removes a heavy native/bundling dependency from the skeleton. ffmpeg
-> returns in Phase 2 when two tracks must be mixed. `ffmpeg` binary is present on this
-> machine regardless.
+**A3. Key the connection at open. — S — [INLINE]** (`db.rs:56`)
+- Split `Db::open(path)` → fetches DEK, calls new `Db::open_with_key(path, dek_hex)`. The `PRAGMA key = x'<hex>'` must be the **FIRST** statement on the connection, before the existing `PRAGMA foreign_keys/journal_mode` batch at `db.rs:60`. Use `conn.pragma_update(None, "key", format!("x'{dek_hex}'"))` — never string-interpolated `execute_batch`, never log the key or formatted PRAGMA.
+- The first read in `migrate()` (`db.rs:73`) validates the key (wrong key → `SQLITE_NOTADB`). WAL stays (encrypted page-by-page).
+- `open_with_key` is the seam the MCP server reuses (§MCP gotcha) and the migration verify-step reuses.
 
----
+**A4. Safe migration module. — M — [WORKFLOW]** (new `src-tauri/src/storage/migration.rs`)
+- `is_plaintext_sqlite(path)`: read first 16 bytes; plaintext starts with magic `"SQLite format 3\0"`, SQLCipher's first 16 bytes are random salt → magic absent. Non-existent/<16 bytes ⇒ new install ⇒ no migration. This makes detection **idempotent**.
+- `encrypt_in_place(db_path, dek_hex)`: the full sequence — checkpoint+collapse WAL → `VACUUM INTO` plaintext backup (`.pre-encrypt.bak`) → `ATTACH ... KEY x'<hex>'` + `SELECT sqlcipher_export('encrypted')` + `DETACH` → set `user_version` on target (export does NOT copy it) → **fresh-reopen the encrypted target with the DEK** and verify (`cipher_integrity_check`, exact per-table row counts vs source, sample-decrypt of newest meeting `(id,title)`) → atomic `rename` into place → retain backup.
+- **Never `PRAGMA rekey`** (cannot encrypt a plaintext DB; export is mandatory). The original is never mutated until the atomic `rename`; every `?` before it leaves the plaintext DB bit-for-bit intact.
+- This is a new file → delegable, but its **call-site wiring in `state.rs` is [INLINE]** (A5).
 
-## 2. Repository file tree (exact, under `/Users/jakubgawronski/Projects/meetnotes`)
+**A5. Wire migration into AppState::init. — S — [INLINE]** (`state.rs:32`)
+- Before `Db::open`: fetch DEK once; `if migration::needs_encryption(&db_path)? { migration::encrypt_in_place(&db_path, &dek)?; }`; then `Db::open_with_key(&db_path, &dek)`. The rest of the app only ever sees an encrypted DB.
+- Add `error.rs` variant `Migration` (and `Auth`/`Locked` now, used later).
 
-```
-meetnotes/
-├─ docs/
-│  ├─ DESIGN.md
-│  └─ PHASE0-PLAN.md                      # this file
-├─ .gitignore
-├─ package.json                           # frontend + tauri CLI scripts
-├─ package-lock.json
-├─ tsconfig.json
-├─ tsconfig.app.json
-├─ tsconfig.spec.json
-├─ angular.json                           # Angular workspace (single app "meetnotes")
-├─ index.html                             # Tauri/Angular entry (devServer + dist root)
-├─ src/                                   # ── FRONTEND (Angular 18, standalone) ──
-│  ├─ main.ts
-│  ├─ styles.css
-│  ├─ app/
-│  │  ├─ app.config.ts                    # provideZonelessChangeDetection, router, http
-│  │  ├─ app.routes.ts                    # /record (default), /settings
-│  │  ├─ app.component.ts                 # shell: nav + <router-outlet>
-│  │  ├─ core/
-│  │  │  ├─ ipc.service.ts                # thin wrapper over @tauri-apps/api invoke/listen
-│  │  │  ├─ models.ts                     # TS mirrors of Rust DTOs (§6)
-│  │  │  └─ recorder.store.ts             # signal-based state: status, lastNote, error
-│  │  └─ features/
-│  │     ├─ record/
-│  │     │  └─ record.component.ts        # Record/Stop, status line, last-note preview
-│  │     └─ settings/
-│  │        └─ settings.component.ts      # vault path, provider, anthropic key, model path
-│  └─ assets/
-└─ src-tauri/                             # ── RUST CORE ──
-   ├─ Cargo.toml                          # §3
-   ├─ Cargo.lock
-   ├─ build.rs                            # tauri_build::build()
-   ├─ tauri.conf.json                     # window, bundle id, devUrl, frontendDist
-   ├─ capabilities/
-   │  └─ default.json                     # core permissions (no fs/shell exposed to webview)
-   ├─ icons/                              # placeholder app icons
-   └─ src/
-      ├─ main.rs                          # tauri::Builder, manage(AppState), command registry
-      ├─ lib.rs                           # `pub mod` re-exports; `run()` entrypoint
-      ├─ error.rs                         # AppError (thiserror) + Result alias; serde for IPC
-      ├─ state.rs                         # AppState (Mutex-guarded handles), AppConfig
-      ├─ commands.rs                      # ALL #[tauri::command] fns (§7)
-      ├─ events.rs                        # event name constants + payload structs
-      ├─ audio/
-      │  ├─ mod.rs                        # pub use recorder::*, wav::*
-      │  ├─ recorder.rs                   # Recorder (cpal capture → samples buffer)
-      │  └─ wav.rs                        # write 16kHz mono WAV via hound + resample
-      ├─ transcribe/
-      │  ├─ mod.rs                        # pub use whisper::*, types::*
-      │  ├─ types.rs                      # Segment, Transcript
-      │  └─ whisper.rs                    # Transcriber (whisper-rs, Metal)
-      ├─ summarize/
-      │  ├─ mod.rs                        # trait + factory + re-exports
-      │  ├─ provider.rs                   # SummarizerProvider trait, request/availability types
-      │  ├─ claude_code.rs               # ClaudeCodeProvider (spawn `claude -p`)
-      │  ├─ anthropic.rs                  # AnthropicProvider (reqwest → api.anthropic.com)
-      │  ├─ ollama.rs                      # OllamaProvider (reqwest → localhost:11434)
-      │  └─ template.rs                   # default note prompt template
-      ├─ export/
-      │  ├─ mod.rs                        # pub use obsidian::*
-      │  └─ obsidian.rs                   # atomic .md write into vault
-      ├─ storage/
-      │  ├─ mod.rs                        # pub use db::*, models::*
-      │  ├─ db.rs                         # Db (rusqlite Connection wrapper) + migrations
-      │  └─ models.rs                     # Meeting, NoteRecord row structs + status enum
-      ├─ secrets/
-      │  ├─ mod.rs                        # pub use keychain::*
-      │  └─ keychain.rs                   # get/set/delete api key via keyring
-      ├─ settings/
-      │  ├─ mod.rs                        # pub use config::*
-      │  └─ config.rs                     # AppConfig load/save (settings table)
-      └─ pipeline.rs                      # orchestrates capture→transcribe→summarize→export
-```
+**A6. MCP keying fix (the gotcha — must ride with A3/A5). — S — [INLINE]** (`lib.rs:104-108`, `mcp.rs:120`)
+- `mcp.rs` re-derives the path and calls `Db::open(db_path)` on its own thread with **no key** → silently breaks the existing local Claude connection the moment encryption lands. Because `Db::open` now fetches the DEK internally, `mcp.rs:120 Db::open` keeps working **once `Db::open` is the keyed path** — verify the MCP thread can fetch from Keychain off the main thread. This is one of the three "must not break."
+
+> **Stage A gate (MIGRATION SAFETY GATE §3 must fully pass here).** No later stage starts until the migration round-trips on a throwaway copy of real data.
+
+### Stage B — Lock data model + crypto primitives (additive; unblocks C/D/E)
+
+**B1. AES-256-GCM wrap/unwrap primitives. — S — [WORKFLOW]** (new `src-tauri/src/crypto.rs`)
+- `aes_gcm_encrypt/decrypt`, KEK-wrap/unwrap of per-folder content keys. Cell format `nonce(12) || ciphertext || tag(16)` as BLOB. New dep `aes-gcm` (RustCrypto, needs approval) + optional `zeroize`. Deliberately NOT OpenSSL-via-rusqlite — keep app-layer crypto in an auditable Rust crate.
+
+**B2. Folder + lock schema (guarded migration). — M — [INLINE]** (`db.rs::migrate`, `db.rs:73`)
+- Append to the `CREATE TABLE IF NOT EXISTS` batch: `folders` table (`id, path UNIQUE, parent_id, locked INTEGER DEFAULT 0, wrapped_key BLOB, key_nonce BLOB, created_at`) + `idx_folders_parent`.
+- Guarded `ALTER`s (check `pragma_table_info` first, since `migrate()` is idempotent and `ALTER ADD COLUMN` errors if the column exists): `notes.folder_id`, `notes.content_blob` (AES-GCM markdown when sealed; NULL when open). The two analyses differ on whether to also tag `meetings` — reconciled: **govern exposure at the note level** (`notes.folder_id`), because the note is the only artifact exported to the vault and exposed via MCP. Segments/audio are already local-only and never exported.
+- This is the single most conflict-prone edit — one orchestrator pass.
+
+**B3. Folder models + session state. — S — split.**
+- `storage/models.rs`: add `Folder`, `FolderNode { folder, note_count, unlocked, children }`. **[WORKFLOW]**
+- `state.rs:16`: add `unlocked_folders: Arc<Mutex<HashSet<String>>>` (Arc so MCP thread shares it) and `master_kek: Mutex<Option<[u8;32]>>`; init at `state.rs:39`. **[INLINE]**
+
+### Stage C — Lock lifecycle commands (the exposure state machine)
+
+**C1. Db helpers. — M — [INLINE]** (`db.rs`)
+- `insert_folder`, `list_folders`, `count_notes_per_folder`, `set_note_folder`, `folder_for_path`, `set_folder_locked`, content-blob encrypt/decrypt, plus the exposure-aware reads `search_visible`, `list_meetings_visible`, `get_note_if_visible` (for §D). Reuses `crypto.rs`.
+
+**C2. 8 commands + `relock_all_inner`. — M — [INLINE]** (`commands.rs` + register in `lib.rs:48-95`)
+- `list_folders`, `create_folder`, `move_note`, `lock_folder` (no biometric — locking is always safe: generate CK, wrap under KEK, encrypt governed notes' markdown→`content_blob`, blank plaintext, delete `.md` from vault, clear `exported_path`), `unlock_folder` (async — biometric → KEK → unwrap CK → add to `unlocked_folders` for the session; **does NOT re-export**), `relock_folder`, `relock_all` (+ `pub(crate) relock_all_inner` for the screen-share watcher to call without a command boundary), `remove_lock` (permanent: decrypt back to plaintext, re-export `.md`, drop `locked_folders`/clear flags → back to default OPEN).
+- **Lock model the commands enforce** (the AGREED LOCK MODEL): default OPEN; lock is explicit per-folder; session-unlock decrypts for in-app + MCP this session without re-export; permanent remove-lock re-exports; auto-relock on screen-share start clears the session set + zeroizes KEK.
+- **Atomicity rule (F1 risk + DB+CRYPTO §4.4):** lock = DB transaction for column writes, delete the vault `.md` only AFTER commit; treat a leftover `.md` as reconcile-on-next-launch. `move_note` must not commit `exported_path`/`folder_id` before bytes are durable (cross-FS copy-fallback).
+- **Pipeline (`pipeline.rs::resolve_subfolder`, ~`:276`):** Phase 0 simplest — new meetings always land OPEN; sealing is an explicit user action afterward (matches "lock is explicit"). Do not auto-seal at export time in P0.
+
+### Stage D — MCP exposure filter + bearer token
+
+**D1. Thread the unlock set into MCP + 3-state filter. — M — [INLINE]** (`mcp.rs:17/23/61/111`, `lib.rs:104`)
+- `spawn/run/handle_rpc/handle_tool_call` gain `unlocked: Arc<Mutex<HashSet<String>>>` (clone of `AppState.unlocked_folders`); update call site at `lib.rs:104-108`.
+- Swap `mcp.rs:127/147/167` to `_visible` query variants with a `LEFT JOIN folders f ON f.id = n.folder_id WHERE (f.locked IS NULL OR f.locked=0 OR f.id IN (<unlocked>))`.
+- **Decryption-free MCP design (LOCK+MCP analysis §3a):** on `unlock_folder`, decrypt the governed notes' `content_blob` into the plaintext `markdown` column **for the session duration**; re-blank on relock. Then MCP reads plaintext `markdown` exactly as today and only consults the `f.locked / IN (unlocked)` predicate — the KEK never reaches the MCP thread (smaller attack surface).
+
+**D2. Optional bearer token (backward-compatible). — S — [INLINE]** (`mcp.rs:41`)
+- Mint a random token on first launch → Keychain (`murmur_mcp_token`) → write into the managed MCP config so it "just works." Enforce `Authorization: Bearer <token>` only on `tools/call` (`mcp.rs:77`); leave `initialize`/`tools/list`/`ping` open for discovery. Bind stays `127.0.0.1` (`mcp.rs:24`, unchanged). Gate behind `K_MCP_REQUIRE_TOKEN`. This closes the "a local process reads sealed notes during a session" hole without breaking the existing un-authenticated client mid-upgrade.
+
+### Stage E — Biometric KEK release + screen-share auto-relock (the cryptographically-real lock)
+
+**E1. Biometric KEK release. — M — [WORKFLOW]** (new `src-tauri/src/biometric.rs`)
+- Use **`tauri-plugin-biometry` (Choochmeque fork)**, NOT the official `tauri-plugin-biometric` (Android/iOS only — no macOS Touch ID). The fork's `macos.rs` is real `objc2-local-authentication` + `objc2-security`, sets `kSecUseDataProtectionKeychain = true` (the flag that makes `kSecAttrAccessControl` honored), carries the prompt via `kSecUseAuthenticationContext`.
+- Store the **master KEK** (32 random bytes) via the plugin's `set_data` behind the biometric ACL once at first lock setup. `unlock_folder` → `get_data(reason)` triggers Touch ID → returns KEK → unwrap the folder's `wrapped_key`.
+- **Correction to the spec wording (decision needed):** the fork uses `SecAccessControlCreateFlags::UserPresence`; for locked notes prefer **`BiometryCurrentSet`** (auto-invalidates the entry when the enrolled fingerprint set changes) — a one-line change in the vendored plugin. Recommend `BiometryCurrentSet`; optionally `| DevicePasscode` for a passcode escape hatch. **This is the boolean-theater closer** (spec §5.2, §F2 risk #1): the KEK bytes are physically inaccessible without a passing Touch ID. Requires real code-signing (`entitlements.plist` present); ad-hoc signing may work in dev, production needs Developer ID.
+- Register `.plugin(tauri_plugin_biometry::init())` at `lib.rs:35` — **[INLINE]**. New dep `tauri-plugin-biometry` (needs approval).
+
+**E2. Screen-share watcher → auto-relock. — M — [WORKFLOW]** (new `src-tauri/src/screenshare.rs`, spawned from `lib.rs::setup` ~`:96` — **[INLINE]** spawn line)
+- **Verdict: feasible and event-driven on macOS 12+.** Primary: observe `NSScreen.isCaptured` via an `NSNotificationCenter` observer (the public, App-Store-safe signal that posts on capture-state change; objc2 stack the biometry plugin already pulls in). On `false→true`, call `relock_all_inner` (clear `unlocked_folders` + zeroize `master_kek`) and emit `EVENT_STATUS`/a new `murmur://screen-share-started` so the UI toasts.
+- Fallback: 1–2s `tokio::interval` polling `NSScreen.isCaptured` on the rising edge (the model says "on start, not a timer" — a 1s poll achieves the same user-visible behavior and is the pragmatic P0 fallback). **Do NOT use `CGDisplayIsCaptured()`** (deprecated + semantically wrong — exclusive-render, not screen-share).
+- **Honest dent (state in UI):** full-screen/display share is caught; single-window WebRTC share (Meet-in-a-Chrome-tab) may not flip whole-screen `isCaptured` — same blind spot as the existing `detect_meeting_app`. Relock is best-effort hiding; it does not recall what's already on screen.
+
+**E3. Config flags. — S — [INLINE]** (`settings/config.rs:63+`)
+- `K_DB_ENCRYPTED`, `K_LOCK_ENABLED`, `K_MCP_REQUIRE_TOKEN`, `K_RELOCK_ON_SCREENSHARE` — add to the key-constant block + `load`/`save`.
+
+### Stage F — Rich folder UI (Angular; depends only on the IPC contract, can start in parallel against stubs)
+
+All Standalone + OnPush + `inject()` + signals/`computed`/`output()`/`input()`; no `@Input/@Output/EventEmitter`, no `*ngIf/*ngFor`, no `markForCheck`, no `subscribe()` for streams, no `setTimeout` in components (`afterNextRender` for focus), timeouts only in services with `DestroyRef.onDestroy`. Zero new npm packages. Inline SVG icons (no `lucide-angular`).
+
+**F1. IPC + models contract. — S — [WORKFLOW]** (`core/models.ts`, `core/ipc.service.ts`)
+- Types: `FolderNode { id, name, parentId, noteCount, noteCountRecursive, locked, children }`, `UnlockResult`, extend `Meeting` with `folderId`. Methods mirror the command surface (snake_case invoke, camelCase args): `listFolders`, `createFolder`, `moveNote`, `listMeetingsByFolder`, `setFolderLocked`, `unlockFolderSession`, `relockSessionFolders`, `onScreenShareStarted`; const `EVENT_SCREEN_SHARE_STARTED = "murmur://screen-share-started"`. **Compiles against backend stubs → unblocks all FE work.**
+
+**F2. ToastService + slot in AppComponent. — S — [WORKFLOW]** (new `services/toast.service.ts`) — tracked-timeout queue with `DestroyRef.onDestroy`.
+
+**F3. FoldersService signal store. — S — [WORKFLOW]** — `tree`, `loading`, `sessionUnlocked: signal<ReadonlySet<string>>`, `unlockedCount = computed`, `exposureOf(f) → 'open'|'locked'|'session'`; ops `load/create/moveNote/setLocked/sessionUnlock/relockAllSession`. Plain signal service (this app uses signal services, not NgRx).
+
+**F4. LockBadgeComponent. — S — [WORKFLOW]** — pure input-driven 3-state (`open`/`locked`/`session`) badge, tokens only, `aria-label` per state, `rise`/`--ease-spring` motion respecting `prefers-reduced-motion`.
+
+**F5. FolderRow + FolderTree. — M — [WORKFLOW]** — recursive tree via child-component recursion (not `*ngFor`); inline create (`afterNextRender` focus); `output<string|null>()` selection; per-folder `.count` chip.
+
+**F6. MoveToMenuComponent. — S — [WORKFLOW]** — popover folder picker (DnD-lite; **decision: ship Move menu for v1, not drag-and-drop** — same IPC, keyboard-accessible, upgradeable later). **Lock-state guard confirm is load-bearing:** moving INTO a locked folder warns "encrypts + removes Markdown from vault"; moving OUT warns "re-exports plaintext."
+
+**F7. LibraryComponent two-pane refactor. — M — [WORKFLOW]** — folder tree left + existing list right; `activeFolderId` signal; `folderMeetings`/`folderLoading` mirroring the existing `tagMeetings` machinery (latest-wins stale guard); `displayedMeetings` 3-way computed (search > folder > tag > all) — **no existing branch removed**. Locked rows render `app-lock-badge` + masked title until session-unlock.
+
+**F8. DetailComponent Move action + read-only badge. — S — [WORKFLOW]**
+
+**F9. ScreenShareService + wire into AppComponent. — S — [WORKFLOW]** — listens `onScreenShareStarted` → `relockAllSession()` → toast; init in `AppComponent` main-window only (guard `if (isBar()) return;`).
+
+**F10. "N unlocked this session" pill + Settings honest-boundary copy. — S — [WORKFLOW]** — pill is `computed` over the service (zero polling); Settings privacy-card gets the copy-only "locked notes are pulled from the vault; open notes remain plaintext `.md`" paragraph (the spec's honest vault boundary).
 
 ---
 
-## 3. `src-tauri/Cargo.toml` — pinned dependency list
+## 2. CONFLICT MAP
 
-```toml
-[package]
-name = "meetnotes"
-version = "0.0.0"
-description = "MeetNotes — local meeting capture, transcription, and AI notes for Obsidian"
-edition = "2021"
-rust-version = "1.77"
+**Shared Rust files → serial [INLINE] by orchestrator (never two workflows editing the same file):**
 
-[lib]
-name = "meetnotes_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+| File | Edited in stages | Why serial |
+|---|---|---|
+| `Cargo.toml` | A1, B1, E1 | feature flip + 3 new deps; one consolidated dep-approval pass |
+| `storage/db.rs` | A3 (`open`/`open_with_key`), B2 (schema+guarded ALTER), C1 (helpers) | one file, three stages — **most conflict-prone**, fully serial |
+| `state.rs` | A5 (migration wire), B3 (session fields) | `AppState` struct + `init` |
+| `lib.rs` | A6 (MCP keying), C2 (+8 handlers at `:48`), D1 (pass unlocked set at `:104`), E1 (`.plugin` at `:35`), E2 (spawn watcher at `:96`) | five distinct line-regions; do as one pass per stage |
+| `mcp.rs` | A6/D1 (thread unlocked set, `_visible` swaps), D2 (token at `:41`) | server file |
+| `settings/config.rs` | E3 (flags) | key block + load/save |
+| `error.rs` | A5 (`Migration`, `Auth`, `Locked`) | one small pass |
+| `commands.rs` | C2 (8 commands) | large file (47KB) — one stage owns it |
 
-[build-dependencies]
-tauri-build = { version = "2.2", features = [] }
+**New modules / isolated surfaces → parallel [WORKFLOW] (no shared-file contention):**
+- `storage/migration.rs` (A4), `crypto.rs` (B1), `biometric.rs` (E1), `screenshare.rs` (E2) — new files; only their **call-site wiring** in `state.rs`/`lib.rs` is INLINE.
+- All of Stage F (Angular) — entirely separate from Rust; can start as soon as the F1 IPC contract is fixed, against backend stubs. New FE files (`folder-tree`, `folder-row`, `lock-badge`, `move-to-menu`, `folders.service`, `toast.service`, `screen-share.service`) are independent; only `library.component.ts`, `detail.component.ts`, `app.component.ts`, `ipc.service.ts`, `models.ts` are shared-FE and should be serialized among FE tasks.
 
-[dependencies]
-# ── Tauri shell ──
-tauri = { version = "2.11", features = ["macos-private-api"] }
-tauri-plugin-dialog = "2.2"          # native folder/file picker for vault path + model file
-
-# ── Audio capture + WAV ──
-cpal = "0.16"                        # cross-platform mic capture (CoreAudio on macOS)
-hound = "3.5"                        # WAV reader/writer (16-bit PCM)
-rubato = "0.16"                      # sample-rate conversion → 16 kHz mono for Whisper
-
-# ── Transcription ──
-whisper-rs = { version = "0.16", features = ["metal"] }   # whisper.cpp bindings, Metal accel
-                                                          # (pulls whisper-rs-sys; needs cmake+clang)
-
-# ── HTTP (Anthropic + Ollama providers) ──
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-
-# ── Async runtime ──
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync"] }
-async-trait = "0.1"                  # for the SummarizerProvider trait
-
-# ── Storage ──
-rusqlite = { version = "0.32", features = ["bundled"] }   # bundled SQLite — no system dep
-
-# ── Serde ──
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# ── Errors ──
-anyhow = "1"                         # internal error plumbing in modules
-thiserror = "1"                      # typed AppError surfaced over IPC
-
-# ── Secrets ──
-keyring = { version = "3", features = ["apple-native"] }  # macOS Keychain (stay on v3, NOT v4)
-
-# ── Misc ──
-chrono = { version = "0.4", features = ["clock", "serde"] }   # timestamps / filename dates
-dirs = "5"                           # locate default vault / app-data dirs
-uuid = { version = "1", features = ["v4"] }                   # meeting ids
-tracing = "0.1"                      # structured logging (NO PII — ids only)
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[features]
-# default keeps Metal on for whisper; nothing else conditional in P0
-default = []
-```
-
-**Crate-choice rationale (load-bearing):**
-- `rusqlite` over `sqlx`: Phase 0 is synchronous, single-process, embedded; `bundled`
-  feature compiles SQLite in (no system lib, no `cmake` for SQLite, no async runtime
-  coupling). DESIGN allows "rusqlite or sqlx" — we pin **rusqlite**.
-- `hound` + `rubato` instead of ffmpeg: pure-Rust WAV + resample; avoids bundling ffmpeg
-  for a mic-only mono skeleton (see §1 note).
-- `keyring` **v3** (not v4): v4 split into `keyring-core` + separate store crates with a
-  different API; v3 with `apple-native` is the stable, documented macOS path.
-- `reqwest` with `rustls-tls` (not native-tls): avoids OpenSSL system dependency.
-- `tokio` `process` feature: required to spawn `claude -p` for `ClaudeCodeProvider`.
+**Parallelization summary:** Stage A is a hard serial prefix (foundation). Once A lands, B1/crypto + F1-F10 frontend can run in parallel. C/D/E share `db.rs`/`lib.rs`/`mcp.rs` and must serialize among themselves but can overlap the frontend.
 
 ---
 
-## 4. Frontend stack decision
+## 3. MIGRATION SAFETY GATE (ordered checklist — run before the flag ships to any real DB)
 
-**Chosen: Angular 18 (standalone components, zoneless change detection) + Vite-style
-Angular CLI dev server, talking to the core via `@tauri-apps/api`.**
+Run top-to-bottom; do not advance on a failure. This gate IS the Stage-A exit criterion.
 
-Justification (brief):
-- The team knows **TypeScript/Angular** (explicit constraint) — zero ramp-up, and the
-  house Angular conventions (signals-first, standalone, `inject()`, `@if`/`@for`) carry
-  over directly. Phase 0 has 2 screens; Angular's overhead is negligible at this size and
-  pays off as the UI grows (Library/Detail/Onboarding in later phases).
-- Tauri is frontend-agnostic; it serves a static `dist/` and exposes `invoke`/`listen`.
-  Angular CLI's dev server (HMR) is used as Tauri `devUrl` in dev, and `ng build` output
-  (`dist/meetnotes/browser`) is the `frontendDist` for the bundle. No SSR.
-- **Zoneless** (`provideZonelessChangeDetection`) keeps it light and signal-driven, which
-  matches the event/`listen`-based status updates from the Rust core cleanly via signals.
+1. **Rust round-trip unit tests green** (file-backed `tempfile`, not in-memory, since `sqlcipher_export`+`rename` are file ops; extend `db.rs` tests ~`:862`):
+   - `encrypt_migration_round_trips` — plaintext DB with known fixtures (3 meetings, segments, 2 notes, tags, timeline) → `encrypt_in_place` → assert no longer plaintext, `.pre-encrypt.bak` exists and IS plaintext, reopen with DEK and every row count + known `(id,title)` + known segment text read back **byte-identical**.
+   - `wrong_key_fails_closed` — different key errors (no silent empty DB).
+   - `migration_is_idempotent` — second run is a no-op, data intact.
+   - `migration_rollback_on_verify_failure` — forced verify failure leaves the original plaintext DB **untouched**, no partial replacement.
+   - `fresh_install_no_migration` — non-existent path ⇒ `Db::open` creates a fresh encrypted DB.
+   - `brand_data_survives_lock_unlock` (Layer 2) — lock folder → column opaque to raw read → session-key decrypt → plaintext returns; wrong CK fails.
+2. **Throwaway real-shaped harness** (cargo example / ignored test): COPY the developer's actual `~/Library/Application Support/MeetNotes/meetnotes.sqlite` to a throwaway temp path (NEVER the original) → run the full `AppState::init` migration path against the copy with a throwaway DEK → diff row counts + a sample of every table copy-vs-encrypted. **Must pass on real-world data shape/volume before the flag ships.**
+3. **Manual E2E on a disposable profile:** point the built app at a throwaway app-data dir seeded with a plaintext DB → confirm first-launch migrates → app reads all meetings → `.pre-encrypt.bak` present → **MCP server still works** (the keying gotcha: `mcp.rs:120 Db::open` succeeds because `Db::open` now fetches the DEK) → second cold launch skips migration (idempotent).
+4. **Universal-build runtime gate (A1):** green `tauri build --target universal-apple-darwin` + launch on both arm64 and x86_64.
+5. **Backup retention:** `.pre-encrypt.bak` retained for one launch cycle; documented disaster-recovery path (a user reporting lost data has the plaintext snapshot on disk).
 
-### `package.json` (frontend + Tauri CLI) — pinned npm deps
-```jsonc
-{
-  "name": "meetnotes",
-  "version": "0.0.0",
-  "scripts": {
-    "start": "ng serve --port 1420",          // Tauri devUrl
-    "build": "ng build",                       // → dist/meetnotes/browser
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "bundle": "tauri build"
-  },
-  "dependencies": {
-    "@angular/animations": "^18.2.0",
-    "@angular/common": "^18.2.0",
-    "@angular/compiler": "^18.2.0",
-    "@angular/core": "^18.2.0",
-    "@angular/forms": "^18.2.0",
-    "@angular/platform-browser": "^18.2.0",
-    "@angular/platform-browser-dynamic": "^18.2.0",
-    "@angular/router": "^18.2.0",
-    "rxjs": "^7.8.0",
-    "tslib": "^2.6.0",
-    "zone.js": "^0.15.0",                      // present but zoneless CD used; kept for CLI compat
-    "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.0.0"
-  },
-  "devDependencies": {
-    "@angular/cli": "^18.2.0",
-    "@angular/compiler-cli": "^18.2.0",
-    "@angular-devkit/build-angular": "^18.2.0",
-    "@tauri-apps/cli": "^2.0.0",
-    "typescript": "~5.5.0"
-  }
-}
-```
-> Angular 18 (not 21) is pinned for Phase 0 because it is the proven-stable combination
-> with Tauri 2's static-serve model and the team's existing tooling; upgrading is a
-> mechanical later step. Conventions (signals, standalone, `@if`/`@for`) are identical.
-
-`tauri.conf.json` key fields:
-- `build.devUrl = "http://localhost:1420"`, `build.beforeDevCommand = "npm run start"`
-- `build.frontendDist = "../dist/meetnotes/browser"`, `build.beforeBuildCommand = "npm run build"`
-- `app.windows[0] = { title: "MeetNotes", width: 900, height: 680 }`
-- `identifier = "com.meetnotes.app"`
+Invariant proven by this gate: **the original `db_path` is never mutated until a fully-verified encrypted copy exists; the only mutating moment is the atomic APFS `rename`.**
 
 ---
 
-## 5. Rust module public API (EXACT signatures — the interface contract)
-
-> These signatures are **binding**. Each module is implementable in isolation against
-> them. Cross-module calls use only what is listed here. Internal helpers are free.
-> `Result<T>` below means `crate::error::Result<T>` unless qualified.
-
-### 5.1 `error.rs`
-```rust
-use serde::Serialize;
-
-#[derive(Debug, thiserror::Error)]
-pub enum AppError {
-    #[error("audio capture error: {0}")]
-    Audio(String),
-    #[error("transcription error: {0}")]
-    Transcribe(String),
-    #[error("summarizer error: {0}")]
-    Summarize(String),
-    #[error("export error: {0}")]
-    Export(String),
-    #[error("storage error: {0}")]
-    Storage(String),
-    #[error("secrets error: {0}")]
-    Secrets(String),
-    #[error("config error: {0}")]
-    Config(String),
-    #[error("provider unavailable: {0}")]
-    Unavailable(String),
-    #[error("invalid argument: {0}")]
-    InvalidArg(String),
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
-pub type Result<T> = std::result::Result<T, AppError>;
-
-// IPC: AppError serializes to a string message so Tauri commands can return it.
-impl Serialize for AppError {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error>;
-}
-```
-
-### 5.2 `state.rs`
-```rust
-use std::sync::Mutex;
-use crate::audio::Recorder;
-use crate::storage::Db;
-use crate::settings::AppConfig;
-
-pub struct AppState {
-    pub recorder: Mutex<Option<Recorder>>,   // Some while recording
-    pub db: Db,                               // Db is internally Send+Sync (Mutex<Connection>)
-    pub config: Mutex<AppConfig>,             // in-memory cache of settings table
-    pub current_meeting: Mutex<Option<uuid::Uuid>>,
-}
-
-impl AppState {
-    /// Open DB at app-data dir, run migrations, load config. Called once in main.rs.
-    pub fn init() -> crate::error::Result<Self>;
-}
-```
-
-### 5.3 `events.rs`
-```rust
-use serde::Serialize;
-
-pub const EVENT_STATUS: &str = "meetnotes://status";
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusPayload {
-    pub stage: String,        // "idle" | "recording" | "transcribing" | "summarizing" | "exporting" | "done" | "error"
-    pub message: String,      // human-readable, NO PII
-    pub meeting_id: Option<String>,
-}
-```
-
-### 5.4 `audio/recorder.rs`
-```rust
-use crate::error::Result;
-
-/// Owns the cpal input stream and accumulates mono f32 samples at the device rate.
-pub struct Recorder {
-    // private: stream handle, shared sample buffer, source_sample_rate
-}
-
-impl Recorder {
-    /// Open default input device, start capturing. Non-blocking; capture runs on cpal thread.
-    pub fn start() -> Result<Self>;
-
-    /// Stop the stream, return (mono_samples_at_source_rate, source_sample_rate_hz).
-    pub fn stop(self) -> Result<(Vec<f32>, u32)>;
-
-    /// Current peak level 0.0..=1.0 for the UI meter (best-effort, lock-free read).
-    pub fn level(&self) -> f32;
-}
-```
-
-### 5.5 `audio/wav.rs`
-```rust
-use std::path::Path;
-use crate::error::Result;
-
-pub const TARGET_RATE_HZ: u32 = 16_000;
-
-/// Resample mono f32 @ src_rate to 16 kHz mono and write 16-bit PCM WAV to `path`.
-pub fn write_wav_16k_mono(path: &Path, samples: &[f32], src_rate: u32) -> Result<()>;
-
-/// Resample mono f32 @ src_rate to 16 kHz mono f32 (in-memory, for Whisper input).
-pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Result<Vec<f32>>;
-```
-
-### 5.6 `transcribe/types.rs`
-```rust
-use serde::{Serialize, Deserialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Segment {
-    pub idx: i64,
-    pub start_s: f64,
-    pub end_s: f64,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transcript {
-    pub full_text: String,
-    pub segments: Vec<Segment>,
-    pub language: Option<String>,
-}
-```
-
-### 5.7 `transcribe/whisper.rs`
-```rust
-use std::path::Path;
-use crate::error::Result;
-use crate::transcribe::types::Transcript;
-
-/// Wraps a loaded whisper.cpp model (Metal). Construct once; reuse per transcription.
-pub struct Transcriber {
-    // private: WhisperContext
-}
-
-impl Transcriber {
-    /// Load a GGUF model from `model_path`. Errors if file missing or load fails.
-    pub fn load(model_path: &Path) -> Result<Self>;
-
-    /// Transcribe 16 kHz mono f32 samples. `lang` = Some("en") or None for auto.
-    pub fn transcribe(&self, samples_16k_mono: &[f32], lang: Option<&str>) -> Result<Transcript>;
-}
-```
-
-### 5.8 `summarize/provider.rs`
-```rust
-use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
-use crate::error::Result;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MeetingMeta {
-    pub date_iso: String,          // "2026-06-24"
-    pub title_hint: Option<String>,
-    pub duration_s: i64,
-    pub language: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SummarizeRequest {
-    pub transcript: String,
-    pub meta: MeetingMeta,
-    pub template: String,          // note-format prompt (summarize/template.rs)
-    pub vault_titles: Vec<String>, // existing note titles → [[link]] targets
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum Availability {
-    Available,
-    Unavailable { reason: String },
-}
-
-#[async_trait]
-pub trait SummarizerProvider: Send + Sync {
-    /// Stable id: "claude_code" | "anthropic" | "ollama".
-    fn id(&self) -> &str;
-
-    /// Cheap, non-failing readiness probe (key set? ollama up? claude in PATH?).
-    async fn availability(&self) -> Availability;
-
-    /// Produce finished Obsidian-ready Markdown from the request.
-    async fn summarize(&self, req: &SummarizeRequest) -> Result<String>;
-}
-```
-
-### 5.9 `summarize/mod.rs` (factory)
-```rust
-use std::sync::Arc;
-use crate::summarize::provider::SummarizerProvider;
-use crate::settings::AppConfig;
-
-pub mod provider;
-pub mod claude_code;
-pub mod anthropic;
-pub mod ollama;
-pub mod template;
-
-pub use provider::{SummarizerProvider as _, MeetingMeta, SummarizeRequest, Availability};
-
-/// Default provider id when settings unset.
-pub const DEFAULT_PROVIDER_ID: &str = "claude_code";
-
-/// Build a provider by id, wiring config + secrets. Unknown id → AppError::InvalidArg.
-pub fn make_provider(id: &str, config: &AppConfig) -> crate::error::Result<Arc<dyn SummarizerProvider>>;
-
-/// All three provider instances (for availability fan-out in Settings UI).
-pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>>;
-```
-
-### 5.10 `summarize/claude_code.rs`
-```rust
-use crate::summarize::provider::*;
-
-pub struct ClaudeCodeProvider {
-    // private: binary path (default "claude"), system prompt
-}
-
-impl ClaudeCodeProvider {
-    pub fn new() -> Self;
-    pub fn with_binary(path: String) -> Self;
-}
-
-#[async_trait::async_trait]
-impl SummarizerProvider for ClaudeCodeProvider {
-    fn id(&self) -> &str;                                   // "claude_code"
-    async fn availability(&self) -> Availability;          // `which claude` reachable?
-    async fn summarize(&self, req: &SummarizeRequest) -> crate::error::Result<String>;
-    // spawns: claude -p --system-prompt <tpl> --disallowedTools <all> ; stdin = transcript;
-    // validates stdout starts with "---" (front-matter) else AppError::Summarize.
-}
-```
-
-### 5.11 `summarize/anthropic.rs`
-```rust
-use crate::summarize::provider::*;
-
-pub struct AnthropicProvider {
-    // private: reqwest::Client, model id, api_key (loaded from Keychain at construction)
-}
-
-impl AnthropicProvider {
-    /// `api_key` already resolved from Keychain by the factory. model defaults to
-    /// "claude-opus-4-8" if config value empty.
-    pub fn new(api_key: Option<String>, model: String) -> Self;
-}
-
-#[async_trait::async_trait]
-impl SummarizerProvider for AnthropicProvider {
-    fn id(&self) -> &str;                                   // "anthropic"
-    async fn availability(&self) -> Availability;          // key present? (no network call)
-    async fn summarize(&self, req: &SummarizeRequest) -> crate::error::Result<String>;
-    // POST https://api.anthropic.com/v1/messages, headers x-api-key + anthropic-version
-    // "2023-06-01"; system=template, user=transcript+meta; returns content[0].text.
-}
-```
-
-### 5.12 `summarize/ollama.rs`
-```rust
-use crate::summarize::provider::*;
-
-pub struct OllamaProvider {
-    // private: reqwest::Client, base_url (default http://localhost:11434), model
-}
-
-impl OllamaProvider {
-    pub fn new(base_url: String, model: String) -> Self;   // model e.g. "llama3.1"
-}
-
-#[async_trait::async_trait]
-impl SummarizerProvider for OllamaProvider {
-    fn id(&self) -> &str;                                   // "ollama"
-    async fn availability(&self) -> Availability;          // GET {base}/api/tags reachable?
-    async fn summarize(&self, req: &SummarizeRequest) -> crate::error::Result<String>;
-    // POST {base}/api/generate { model, prompt:(template+transcript), stream:false }
-}
-```
-
-### 5.13 `summarize/template.rs`
-```rust
-use crate::summarize::provider::SummarizeRequest;
-
-/// The canonical Obsidian note-format prompt (front-matter + sections), shared by all providers.
-pub fn default_template() -> String;
-
-/// Render the full prompt text a provider sends (template + meta + vault titles + transcript).
-pub fn render_prompt(req: &SummarizeRequest) -> String;
-```
-
-### 5.14 `export/obsidian.rs`
-```rust
-use std::path::{Path, PathBuf};
-use crate::error::Result;
-
-/// Atomically write `markdown` into `vault_dir` (optionally `subfolder`) as a uniquely
-/// named .md file derived from `title` + `date_iso`. Writes to a dotfile `.tmp` then
-/// renames. On name collision appends " (N)". Returns the final path written.
-pub fn write_note(
-    vault_dir: &Path,
-    subfolder: Option<&str>,
-    title: &str,
-    date_iso: &str,
-    markdown: &str,
-) -> Result<PathBuf>;
-
-/// List existing note titles (file stems of *.md) in the vault for [[link]] suggestions.
-pub fn list_vault_titles(vault_dir: &Path) -> Result<Vec<String>>;
-```
-
-### 5.15 `storage/models.rs`
-```rust
-use serde::{Serialize, Deserialize};
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MeetingStatus { Draft, Recording, Transcribed, Summarized, Exported, Error }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Meeting {
-    pub id: String,                 // uuid
-    pub started_at: String,         // ISO 8601
-    pub ended_at: Option<String>,
-    pub title: Option<String>,
-    pub duration_s: i64,
-    pub audio_path: Option<String>,
-    pub status: MeetingStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NoteRecord {
-    pub meeting_id: String,
-    pub provider_id: String,
-    pub markdown: String,
-    pub created_at: String,
-    pub exported_path: Option<String>,
-}
-```
-
-### 5.16 `storage/db.rs`
-```rust
-use std::path::Path;
-use crate::error::Result;
-use crate::storage::models::{Meeting, MeetingStatus, NoteRecord};
-use crate::transcribe::types::Segment;
-
-/// Thread-safe SQLite wrapper (internal Mutex<rusqlite::Connection>).
-pub struct Db { /* private */ }
-
-impl Db {
-    pub fn open(path: &Path) -> Result<Self>;     // opens + runs migrations
-    pub fn migrate(&self) -> Result<()>;          // idempotent CREATE TABLE IF NOT EXISTS
-
-    pub fn insert_meeting(&self, m: &Meeting) -> Result<()>;
-    pub fn update_meeting_status(&self, id: &str, status: MeetingStatus) -> Result<()>;
-    pub fn finalize_meeting(&self, id: &str, ended_at: &str, duration_s: i64, audio_path: &str) -> Result<()>;
-    pub fn set_meeting_title(&self, id: &str, title: &str) -> Result<()>;
-    pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>>;
-    pub fn latest_meeting(&self) -> Result<Option<Meeting>>;
-
-    pub fn insert_segments(&self, meeting_id: &str, segments: &[Segment]) -> Result<()>;
-
-    pub fn upsert_note(&self, note: &NoteRecord) -> Result<()>;
-    pub fn get_note(&self, meeting_id: &str, provider_id: &str) -> Result<Option<NoteRecord>>;
-    pub fn latest_note(&self) -> Result<Option<NoteRecord>>;
-    pub fn set_note_exported_path(&self, meeting_id: &str, provider_id: &str, path: &str) -> Result<()>;
-
-    // settings k/v table
-    pub fn get_setting(&self, key: &str) -> Result<Option<String>>;
-    pub fn set_setting(&self, key: &str, value: &str) -> Result<()>;
-    pub fn all_settings(&self) -> Result<Vec<(String, String)>>;
-}
-```
-SQL migrations (created by `migrate()`):
-```sql
-CREATE TABLE IF NOT EXISTS meetings (
-  id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
-  title TEXT, duration_s INTEGER NOT NULL DEFAULT 0,
-  audio_path TEXT, status TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS segments (
-  meeting_id TEXT NOT NULL, idx INTEGER NOT NULL,
-  start_s REAL NOT NULL, end_s REAL NOT NULL, text TEXT NOT NULL,
-  PRIMARY KEY (meeting_id, idx),
-  FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS notes (
-  meeting_id TEXT NOT NULL, provider_id TEXT NOT NULL,
-  markdown TEXT NOT NULL, created_at TEXT NOT NULL, exported_path TEXT,
-  PRIMARY KEY (meeting_id, provider_id),
-  FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-```
-
-### 5.17 `secrets/keychain.rs`
-```rust
-use crate::error::Result;
-
-pub const SERVICE: &str = "com.meetnotes.app";
-
-/// account is the provider key name, e.g. "anthropic_api_key".
-pub fn set_secret(account: &str, secret: &str) -> Result<()>;
-pub fn get_secret(account: &str) -> Result<Option<String>>;   // None if not found
-pub fn delete_secret(account: &str) -> Result<()>;             // Ok if already absent
-```
-
-### 5.18 `settings/config.rs`
-```rust
-use serde::{Serialize, Deserialize};
-use crate::error::Result;
-use crate::storage::Db;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppConfig {
-    pub provider_id: String,           // default "claude_code"
-    pub vault_path: Option<String>,
-    pub vault_subfolder: Option<String>,
-    pub whisper_model_path: Option<String>,
-    pub language: Option<String>,      // "en" | None=auto
-    pub anthropic_model: String,       // default "claude-opus-4-8"
-    pub ollama_base_url: String,       // default "http://localhost:11434"
-    pub ollama_model: String,          // default "llama3.1"
-    pub claude_binary: String,         // default "claude"
-}
-
-impl Default for AppConfig {
-    fn default() -> Self; // fills the defaults above
-}
-
-impl AppConfig {
-    /// Read all known keys from the settings table, falling back to Default.
-    pub fn load(db: &Db) -> Result<Self>;
-    /// Persist every field into the settings table (NOT the api key — that's Keychain).
-    pub fn save(&self, db: &Db) -> Result<()>;
-}
-```
-
-### 5.19 `pipeline.rs` (orchestration)
-```rust
-use std::path::PathBuf;
-use tauri::AppHandle;
-use crate::error::Result;
-use crate::state::AppState;
-
-/// Full post-Stop pipeline: write WAV → transcribe → persist segments → summarize with
-/// configured provider → persist note → export .md → update meeting status. Emits
-/// StatusPayload on EVENT_STATUS at each stage. Returns the exported note path + markdown.
-pub struct PipelineResult { pub note_markdown: String, pub exported_path: PathBuf, pub meeting_id: String }
-
-pub async fn run_after_stop(
-    app: &AppHandle,
-    state: &AppState,
-    meeting_id: &str,
-    samples: Vec<f32>,
-    src_rate: u32,
-    duration_s: i64,
-) -> Result<PipelineResult>;
-```
-
-### 5.20 `lib.rs` / `main.rs`
-```rust
-// lib.rs
-pub mod error; pub mod state; pub mod events; pub mod commands; pub mod pipeline;
-pub mod audio; pub mod transcribe; pub mod summarize; pub mod export;
-pub mod storage; pub mod secrets; pub mod settings;
-pub fn run();   // builds tauri::Builder, manages AppState, registers commands, runs app
-
-// main.rs
-fn main() { meetnotes_lib::run(); }
-```
+## 4. COMMIT SEQUENCE (with gates)
+
+Branch off `main` (never target main). One logical commit per item; CI gate = `NX_DAEMON=false cargo build` + `cargo test` for Rust, lint/test/build for FE; runtime gate where noted.
+
+1. `feat(crypto): SQLCipher feature flip + keyed Db::open + DEK in Keychain` (A1–A3) — **gate: universal-build runtime test (§3.4) + `db.rs` tests.**
+2. `feat(crypto): safe plaintext→encrypted migration + verify + atomic swap` (A4–A5, error variants) — **gate: full MIGRATION SAFETY GATE §3.1–§3.3. This is the destructive-step commit — most scrutiny.**
+3. `fix(mcp): key the MCP DB handle so local Claude survives encryption` (A6) — **gate: manual MCP E2E §3.3.**
+4. `feat(crypto): AES-GCM content primitives + folder/lock schema` (B1–B3) — **gate: `crypto.rs` + schema-idempotency tests.**
+5. `feat(folders): lock lifecycle commands + Db helpers` (C1–C2) — **gate: `brand_data_survives_lock_unlock` + lock/unlock atomicity tests.**
+6. `feat(mcp): exposure-aware visibility filter + optional bearer token` (D1–D2) — **gate: 3-state filter test (sealed hidden / open visible / session-unlocked visible) + token-backward-compat check.**
+7. `feat(security): biometric KEK release (.biometryCurrentSet)` (E1, config flags) — **gate: code-signed build + real Touch ID prompt releases key (NOT a boolean); biometric-change invalidation.**
+8. `feat(security): screen-share auto-relock watcher` (E2) — **gate: live screen-share start → session keys zeroized → MCP + in-app revert to opaque.**
+9. `feat(ui): folder IPC contract + ToastService + FoldersService` (F1–F3).
+10. `feat(ui): LockBadge + FolderTree/FolderRow + MoveToMenu` (F4–F6).
+11. `feat(ui): Library two-pane + Detail move + ScreenShare auto-relock + Settings copy` (F7–F10) — **gate: lint/test/build green; manual walkthrough lock→Touch-ID-unlock→screen-share-relock.**
 
 ---
 
-## 6. Frontend DTO mirrors (`src/app/core/models.ts`)
+## 5. OPEN RISKS + THE 3 THINGS THAT MUST NOT BREAK
 
-TypeScript interfaces mirroring the `camelCase`-serialized Rust types so the UI compiles
-against the same contract:
-```ts
-export type Stage = 'idle'|'recording'|'transcribing'|'summarizing'|'exporting'|'done'|'error';
-export interface StatusPayload { stage: Stage; message: string; meetingId: string|null; }
-export type Availability = { Available: true } | { Unavailable: { reason: string } };
-export interface ProviderStatus { id: string; available: boolean; reason?: string; }
-export interface AppConfigDto {
-  providerId: string; vaultPath: string|null; vaultSubfolder: string|null;
-  whisperModelPath: string|null; language: string|null; anthropicModel: string;
-  ollamaBaseUrl: string; ollamaModel: string; claudeBinary: string;
-}
-export interface NoteDto { meetingId: string; providerId: string; markdown: string; exportedPath: string|null; }
-export interface StartResult { meetingId: string; }
-export interface StopResult { meetingId: string; markdown: string; exportedPath: string; }
-```
+**MUST NOT BREAK (spec §5.2 + all three analyses):**
+1. **Do not corrupt the real DB.** The migration is the only destructive op. Safety rests entirely on: never mutate the original, `VACUUM INTO` backup, fresh-reopen verify (counts + sample decrypt), atomic `rename`. **Prove on a throwaway copy of real data (§3.2) before the flag ships.** A botched mid-swap loses all meeting history.
+2. **Biometric must gate real key release, not a boolean.** The KEK must come from a Keychain entry created with `.biometryCurrentSet` (Security.framework ACL via the biometry plugin's data-protection store). A boolean `if authenticated {}` is theater — a locked folder gives zero extra protection once the SQLCipher DB is open. Requires real code-signing.
+3. **MCP token must not break the existing local Claude connection.** Two sub-risks: (a) the keying gotcha — `mcp.rs Db::open` must fetch the DEK or the existing client breaks silently the instant encryption lands (fixed by routing through keyed `Db::open`, A6); (b) the new bearer token is enforced only on `tools/call`, auto-provisioned into the managed config, leaving discovery open — so the upgrade "just works" without manual reconfiguration.
 
----
+**Other open risks (ranked):**
+- **Universal-build OpenSSL cross-compile** (A1) — the single most common Tauri universal-build breaker; runtime `libssl` load failure is invisible at compile time. Mitigation: native-per-arch + manual lipo, or fall back to `bundled-sqlcipher`.
+- **Locked content drops out of full-text search** (`db.rs:252` `LIKE` over now-opaque blobs). **Decision: accept it for P0** (locked = not searchable until unlocked) — simplest and most honest; state it in the lock UI. Do NOT build a plaintext search index (re-leaks).
+- **Session key cache is plaintext in process memory** while unlocked — unavoidable for an in-app-viewable lock; mitigate with `zeroize` + screen-share relock; document.
+- **Lock/vault atomicity** — a crash between encrypt-column and delete-`.md` leaves a plaintext `.md` the DB thinks is gone; DB transaction + delete-after-commit + reconcile-on-launch.
+- **Single-window screen-share blind spot** — Meet-in-a-Chrome-tab may not flip whole-screen `isCaptured`; document the honest dent.
 
-## 7. Tauri command functions (`commands.rs`) — exact signatures
+**Decisions needing user sign-off:** (1) primary `bundled-sqlcipher-vendored-openssl` vs fallback `bundled-sqlcipher`; (2) `BiometryCurrentSet` (hard-fail on re-enrollment) vs `UserPresence`+passcode; (3) Move menu vs native DnD in P0 (plan ships Move menu); (4) 4 new Rust deps need approval per the no-new-deps stance — `getrandom`, `aes-gcm`, `zeroize`(optional), `tauri-plugin-biometry`.
 
-All are `#[tauri::command]`, registered in `main.rs` `invoke_handler`. State injected via
-`tauri::State<'_, AppState>` and `AppHandle`. Errors return `AppError` (serialized to a
-string message; frontend `invoke` rejects).
-
-```rust
-/// Begin mic capture. Inserts a Meeting(Draft→Recording), stores Recorder in state,
-/// sets current_meeting. Returns the new meeting id. Errors if already recording.
-#[tauri::command]
-async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<StartResult, AppError>;
-
-/// Stop capture, then run the full pipeline (pipeline::run_after_stop). Returns the
-/// exported note path + markdown. Emits status events throughout. Errors if not recording.
-#[tauri::command]
-async fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<StopResult, AppError>;
-
-/// Current mic peak level 0.0..=1.0 for the meter (0.0 when idle). Cheap, polled by UI.
-#[tauri::command]
-fn recording_level(state: State<'_, AppState>) -> Result<f32, AppError>;
-
-/// The most recent note (markdown + export path) for the last-note preview pane.
-#[tauri::command]
-fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppError>;
-
-/// Read current config (settings table), without secrets.
-#[tauri::command]
-fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError>;
-
-/// Persist config to settings table + refresh in-memory cache. Does NOT touch Keychain.
-#[tauri::command]
-fn save_config(state: State<'_, AppState>, config: AppConfigDto) -> Result<(), AppError>;
-
-/// Store/replace the Anthropic API key in Keychain (account "anthropic_api_key").
-#[tauri::command]
-fn set_anthropic_key(key: String) -> Result<(), AppError>;
-
-/// Whether an Anthropic key is currently stored (UI shows "set"/"not set"; never the value).
-#[tauri::command]
-fn has_anthropic_key() -> Result<bool, AppError>;
-
-/// availability() fan-out across all three providers for the Settings UI.
-#[tauri::command]
-async fn provider_statuses(state: State<'_, AppState>) -> Result<Vec<ProviderStatus>, AppError>;
-
-/// Re-run summarize+export for an existing meeting with the configured provider (Detail
-/// "re-summarize"/"re-export" seed — minimal use in P0, wired but UI optional).
-#[tauri::command]
-async fn resummarize(app: AppHandle, state: State<'_, AppState>, meeting_id: String) -> Result<StopResult, AppError>;
-```
-
-Frontend `IpcService` exposes one method per command plus `onStatus(cb)` wrapping
-`listen<StatusPayload>(EVENT_STATUS, cb)`.
-
----
-
-## 8. Build sequence (dependency-ordered; each step independently checkable)
-
-> Steps 0–1 are prerequisites. Rust steps (3+) require `cargo`+`cmake` present (§1).
-> Modules within a step have no inter-dependencies and can be authored in parallel.
-
-0. **Toolchain**: install rustup/cargo, `cmake`, `pkg-config`, Tauri CLI (§1 commands).
-   Verify `cargo --version`, `cmake --version`.
-1. **Scaffold**: `npm create tauri-app` equivalent — create Angular workspace (`src/`) +
-   `src-tauri/` skeleton; commit `Cargo.toml` (§3) and `package.json` (§4).
-   Checkpoint: `npm run build` (frontend) succeeds; `cargo check` on an empty `lib.rs`.
-2. **Foundations (parallel, no deps)**: `error.rs`, `events.rs`, `storage/models.rs`,
-   `transcribe/types.rs`, `summarize/provider.rs` (trait + DTOs), `summarize/template.rs`.
-   Checkpoint: `cargo check` — types compile in isolation.
-3. **Storage + secrets + settings (parallel; depend on step 2)**: `storage/db.rs`
-   (migrations + CRUD), `secrets/keychain.rs`, `settings/config.rs`.
-   Checkpoint: a `cargo test` for `Db::open`+`migrate`+round-trip a setting.
-4. **Audio (depends on error.rs)**: `audio/recorder.rs` (cpal), `audio/wav.rs`
-   (hound+rubato). Checkpoint: unit test resamples a sine to 16 kHz; manual mic capture
-   writes a playable WAV.
-5. **Transcribe (depends on types + a GGUF model on disk)**: `transcribe/whisper.rs`.
-   Checkpoint: transcribe a known 16 kHz WAV → non-empty `Transcript`. **Needs cmake.**
-6. **Providers (parallel; depend on provider.rs + secrets + settings)**:
-   `claude_code.rs`, `anthropic.rs`, `ollama.rs`, then `summarize/mod.rs` factory.
-   Checkpoint: `availability()` returns the right verdict for each in dev env;
-   `ClaudeCodeProvider::summarize` produces front-matter markdown from a sample transcript.
-7. **Export (depends on error.rs)**: `export/obsidian.rs` atomic write + title listing.
-   Checkpoint: writes `.md` atomically into a temp vault; collision → ` (1)` suffix.
-8. **Orchestration**: `state.rs` (AppState::init), `pipeline.rs` (wires 3–7),
-   `commands.rs` (§7), `lib.rs`/`main.rs` registration + `tauri.conf.json`.
-   Checkpoint: `cargo check` whole crate; `tauri dev` launches the window.
-9. **Frontend wiring**: `models.ts`, `ipc.service.ts`, `recorder.store.ts`,
-   `record.component.ts`, `settings.component.ts`, routes/config.
-   Checkpoint: `npm run build` + `tauri dev` — UI invokes commands, status updates render.
-10. **E2E walking-skeleton verification (manual)**: launch app → set vault path + Whisper
-    model path → pick `claude_code` → Record → speak → Stop → observe status stages →
-    `.md` appears in vault → preview pane shows markdown → row in `meetings`/`notes`.
-    Repeat once each with `ollama` and `anthropic` selected.
-
-**Definition of Done (Phase 0):** step 10 passes for the default `ClaudeCode` provider
-end-to-end on this machine, with all three providers compiling and selectable, lint/build
-green, and a note file present in the vault.
-
----
-
-## 9. Open risks carried into Phase 0
-- `whisper-rs-sys` build **requires `cmake`** (currently missing) — install before step 5.
-- GGUF model is **manually placed** in P0 (path is a setting); auto-download is Phase 3.
-- `ClaudeCodeProvider` depends on `claude` being in PATH; `availability()` must degrade
-  gracefully and the UI must surface "not available" without crashing the pipeline.
-- Mic permission prompt (macOS `NSMicrophoneUsageDescription`) must be in `Info.plist`
-  via `tauri.conf.json` bundle config — without it `cpal` capture fails silently.
+Files grounding this plan: `/Users/jakubgawronski/Projects/meetnotes/docs/ARCHITECTURE-LOCAL-CLOUD.md`, `src-tauri/Cargo.toml:41`, `src-tauri/tauri.conf.json:31`, `src-tauri/src/storage/db.rs:56,73`, `src-tauri/src/state.rs:32`, `src-tauri/src/lib.rs:35,48,96,104`, `src-tauri/src/mcp.rs:17,24,41,77,120`, `src-tauri/src/secrets/keychain.rs:5`.
