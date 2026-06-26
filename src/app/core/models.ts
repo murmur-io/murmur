@@ -125,6 +125,14 @@ export interface MeetingDetail {
   meeting: Meeting;
   note: NoteDto | null;
   segments: Segment[];
+  /**
+   * True when this meeting lives in a sealed-and-NOT-session-unlocked folder.
+   * The backend MASKS the payload in that case (title "🔒 Locked", note null,
+   * segments [], audioPath null) — the FE renders a lock gate instead of the
+   * note/transcript/audio/timeline. Re-fetch after `unlockMeeting` to get the
+   * full unmasked content (`locked` then absent/false).
+   */
+  locked?: boolean;
 }
 
 export interface StatusCount {
