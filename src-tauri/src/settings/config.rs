@@ -203,7 +203,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        Db::open(&p).unwrap()
+        // Tests use an explicit key (NOT the Keychain) — Db::open would hit macOS Keychain and
+        // prompt/block depending on the test-binary signature.
+        Db::open_with_key(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap()
     }
 
     #[test]
