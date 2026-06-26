@@ -132,6 +132,7 @@ import { ToastService } from "./services/toast.service";
             <a routerLink="/record" routerLinkActive="active">Record</a>
             <a routerLink="/library" routerLinkActive="active">Meetings</a>
             <a routerLink="/analytics" routerLinkActive="active">Analytics</a>
+            <a routerLink="/graph" routerLinkActive="active">Graph</a>
             <a routerLink="/ask" routerLinkActive="active">Ask</a>
             <a routerLink="/settings" routerLinkActive="active">Settings</a>
           </nav>
