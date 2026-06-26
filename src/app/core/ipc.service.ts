@@ -12,6 +12,7 @@ import type {
   ChatTurn,
   DigestResult,
   GraphPayload,
+  McpInfo,
   Meeting,
   MeetingDetail,
   MeetingTimeline,
@@ -64,6 +65,10 @@ export class IpcService {
 
   saveConfig(config: AppConfigDto): Promise<void> {
     return invoke<void>("save_config", { config });
+  }
+
+  mcpInfo(): Promise<McpInfo> {
+    return invoke<McpInfo>("mcp_info");
   }
 
   setAnthropicKey(key: string): Promise<void> {

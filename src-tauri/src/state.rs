@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use crate::audio::listener::VoiceListener;
@@ -25,6 +26,11 @@ pub struct AppState {
     /// In-memory cache of the settings table.
     pub config: Mutex<AppConfig>,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
+    /// Path to the SQLite DB — handed to the (lazily started) localhost MCP server.
+    pub db_path: PathBuf,
+    /// Set once the MCP server thread has been spawned this session (it binds the port for
+    /// the process lifetime; the per-request `mcp_enabled` check governs whether it serves).
+    pub mcp_started: AtomicBool,
 }
 
 impl AppState {
@@ -43,6 +49,8 @@ impl AppState {
             db,
             config: Mutex::new(config),
             current_meeting: Mutex::new(None),
+            db_path,
+            mcp_started: AtomicBool::new(false),
         })
     }
 

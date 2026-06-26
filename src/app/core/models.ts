@@ -42,6 +42,17 @@ export interface AppConfigDto {
   noteStyle: string;
   autoOrganize: boolean;
   noteLanguage: string;
+  mcpEnabled: boolean;
+}
+
+/** Local MCP server state for the Settings card (mirrors `commands::McpInfoDto`). */
+export interface McpInfo {
+  enabled: boolean;
+  url: string;
+  /** Bearer token — non-empty only when the server is enabled. */
+  token: string;
+  /** Ready-to-paste Claude Desktop config (includes the Authorization header). */
+  configJson: string;
 }
 
 export interface NoteDto {

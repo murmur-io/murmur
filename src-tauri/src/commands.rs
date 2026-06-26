@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
@@ -71,6 +73,7 @@ pub struct AppConfigDto {
     pub note_style: String,
     pub auto_organize: bool,
     pub note_language: String,
+    pub mcp_enabled: bool,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -1039,7 +1042,10 @@ pub fn save_config(
         *cache = new_config;
     }
     // Reconcile the voice-trigger listener with the new config.
-    restart_voice_listener(app);
+    restart_voice_listener(app.clone());
+    // Start the MCP server if it was just toggled on (turning it off is honored live by the
+    // server's per-request check, so nothing to stop here).
+    maybe_start_mcp(&app);
     Ok(())
 }
 
@@ -1061,6 +1067,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_style: c.note_style.clone(),
         auto_organize: c.auto_organize,
         note_language: c.note_language.clone(),
+        mcp_enabled: c.mcp_enabled,
     }
 }
 
@@ -1096,6 +1103,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         } else {
             d.note_language
         },
+        mcp_enabled: d.mcp_enabled,
     }
 }
 
@@ -1312,6 +1320,70 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
 #[tauri::command]
 pub fn toggle_bar(app: AppHandle) {
     crate::toggle_bar(&app);
+}
+
+/// Local MCP server state for the Settings card: whether it's on, its URL, the per-install
+/// bearer token (only exposed when enabled), and a ready-to-paste Claude Desktop config.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpInfoDto {
+    pub enabled: bool,
+    pub url: String,
+    /// The bearer token — non-empty only when the server is enabled.
+    pub token: String,
+    /// JSON to paste into the Claude Desktop config (includes the Authorization header).
+    pub config_json: String,
+}
+
+/// MCP server info for the Settings UI. Provisions the per-install token on first enable so the
+/// pasteable config carries a working `Authorization` header.
+#[tauri::command]
+pub fn mcp_info(state: State<'_, AppState>) -> Result<McpInfoDto, AppError> {
+    let enabled = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .mcp_enabled;
+    let url = format!("http://127.0.0.1:{}", crate::mcp::MCP_PORT);
+    // Only surface the token when the server is actually enabled.
+    let token = if enabled {
+        crate::mcp::ensure_token(&state.db)?
+    } else {
+        String::new()
+    };
+    let config_json = crate::mcp::client_config_json(&url, &token);
+    Ok(McpInfoDto {
+        enabled,
+        url,
+        token,
+        config_json,
+    })
+}
+
+/// Start the localhost MCP server iff it's enabled in config and not already started this
+/// session. Idempotent: the `mcp_started` flag guards against binding the port twice. Turning
+/// the feature off is handled live by the server's per-request `mcp_enabled` check, so there is
+/// no stop path here.
+pub fn maybe_start_mcp(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let enabled = state
+        .config
+        .lock()
+        .map(|c| c.mcp_enabled)
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    // Provision the token before the first serve so the gate has something to match.
+    if let Err(e) = crate::mcp::ensure_token(&state.db) {
+        tracing::warn!(target: "mcp", error = %e, "failed to provision MCP token; not starting");
+        return;
+    }
+    // swap returns the prior value; if it was already true the server is bound — do nothing.
+    if state.mcp_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    crate::mcp::spawn(state.db_path.clone());
 }
 
 /// (Re)start the voice-trigger listener if enabled — model present and not recording —

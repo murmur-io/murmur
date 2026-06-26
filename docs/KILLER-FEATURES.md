@@ -70,8 +70,9 @@ The MCP server's JSON-RPC protocol layer is unit-tested (initialize / tools/list
 notifications / errors); end-to-end interop with a running Claude Desktop should be confirmed by
 adding the config snippet (Settings → Local MCP server) and restarting Claude Desktop.
 
-> ⚠️ **Security caveat (see `docs/SECURITY-AUDIT.md`, finding H1):** the MCP server currently
-> starts unconditionally and has **no authentication** and **no `Host`/`Origin` validation**, so
-> any local process — or a web page via DNS-rebinding — can read your meetings over
-> `127.0.0.1:8765`. Treat "Settings → Local MCP server" as documentation-only until the audit's
-> remediation (opt-in toggle + per-install token + `Host` check) lands.
+> 🔒 **Security (see `docs/SECURITY-AUDIT.md`, finding H1 — fixed 2026-06-26):** the MCP server is
+> **opt-in** (Settings → Local MCP server, **default off** — nothing binds the port until you
+> enable it). When on, every request must present `Authorization: Bearer <per-install token>`,
+> carry no browser `Origin`, and target a loopback `Host` (anti-DNS-rebinding). Settings shows the
+> toggle and a ready-to-paste config that already includes the token. Disabling it takes effect
+> immediately.

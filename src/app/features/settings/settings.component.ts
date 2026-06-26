@@ -542,12 +542,29 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         <div class="privacy-section">
           <span class="privacy-section-label text-muted">Local MCP server</span>
           <p class="text-secondary privacy-note">
-            Murmur runs a localhost MCP server that exposes your meetings
+            Murmur can run a localhost MCP server that exposes your meetings
             (read-only) to Claude Desktop and Claude Code at
             <span class="privacy-inline-url">{{ mcpUrl }}</span
-            >.
+            >. Off by default — when on it requires a per-install token and
+            only accepts loopback requests.
           </p>
 
+          <label class="toggle-row">
+            <span class="toggle-copy">
+              <span class="toggle-title">Enable local MCP server</span>
+              <span class="text-secondary toggle-sub">
+                Lets Claude Desktop/Code read your meetings via the token
+                below. Turning it off takes effect immediately.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              formControlName="mcpEnabled"
+              (change)="mcpOn.set(form.controls.mcpEnabled.value)"
+            />
+          </label>
+
+          @if (mcpOn()) { @if (mcpToken()) {
           <div class="mcp-config">
             <div class="mcp-config-head">
               <span class="mcp-config-label text-muted">Config</span>
@@ -609,12 +626,25 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
                 }
               </button>
             </div>
-            <pre class="mcp-config-block" role="text">{{ mcpConfig }}</pre>
+            <pre class="mcp-config-block" role="text">{{ mcpConfig() }}</pre>
           </div>
 
           <span class="mcp-hint text-muted">
             Add this to your Claude Desktop config, then restart Claude Desktop.
+            The token grants read access to your meetings — keep it private.
           </span>
+          } @else {
+          <span class="mcp-hint text-muted">
+            Save settings to provision the per-install token and reveal the
+            config to paste into Claude Desktop.
+          </span>
+          } } @else {
+          <span class="mcp-hint text-muted">
+            Disabled — your meetings are not exposed on
+            <span class="privacy-inline-url">{{ mcpUrl }}</span>. Enable the
+            toggle and save to generate a token.
+          </span>
+          }
         </div>
       </div>
     </section>
@@ -1103,6 +1133,7 @@ export class SettingsComponent implements OnInit {
     noteStyle: "standard",
     autoOrganize: false,
     noteLanguage: "auto",
+    mcpEnabled: false,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -1120,14 +1151,17 @@ export class SettingsComponent implements OnInit {
   /** The localhost MCP server address — shown inline and embedded in the config. */
   readonly mcpUrl = "http://127.0.0.1:8765";
 
-  /** Exact JSON to drop into the Claude Desktop config — copied verbatim. */
-  readonly mcpConfig = `{
-  "mcpServers": {
-    "murmur": {
-      "url": "${this.mcpUrl}"
-    }
-  }
-}`;
+  /**
+   * Ready-to-paste Claude Desktop config, provisioned by the backend (`mcp_info`) so it carries
+   * the per-install bearer token. Empty until loaded / while the server is disabled.
+   */
+  readonly mcpConfig = signal<string>("");
+
+  /** The per-install bearer token (shown only when the server is enabled). */
+  readonly mcpToken = signal<string>("");
+
+  /** Mirrors the enable toggle as a signal so the (zoneless) template re-renders on change. */
+  readonly mcpOn = signal(false);
 
   /** Flips true for ~1.6s after copying the MCP config — drives the button's confirmed state. */
   readonly configCopied = signal(false);
@@ -1170,11 +1204,13 @@ export class SettingsComponent implements OnInit {
         noteStyle: cfg.noteStyle ?? "standard",
         autoOrganize: cfg.autoOrganize ?? false,
         noteLanguage: cfg.noteLanguage ?? "auto",
+        mcpEnabled: cfg.mcpEnabled ?? false,
       });
       this.updateDownloadHint();
       this.hasKey.set(await this.ipc.hasAnthropicKey());
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
+      await this.refreshMcpInfo();
     } catch (e) {
       this.loadError.set(String(e));
     }
@@ -1210,12 +1246,27 @@ export class SettingsComponent implements OnInit {
       noteStyle: v.noteStyle,
       autoOrganize: v.autoOrganize,
       noteLanguage: v.noteLanguage,
+      mcpEnabled: v.mcpEnabled,
     };
     try {
       await this.ipc.saveConfig(cfg);
       this.saved.set(true);
+      // The backend provisions/serves the MCP token on save; refresh the displayed config.
+      await this.refreshMcpInfo();
     } catch (e) {
       this.loadError.set("Save failed: " + String(e));
+    }
+  }
+
+  /** Pull the MCP server state (enabled + token + pasteable config) from the backend. */
+  private async refreshMcpInfo(): Promise<void> {
+    try {
+      const info = await this.ipc.mcpInfo();
+      this.mcpConfig.set(info.configJson);
+      this.mcpToken.set(info.token);
+      this.mcpOn.set(info.enabled);
+    } catch {
+      // Non-fatal: leave the previously shown values in place.
     }
   }
 
@@ -1278,7 +1329,7 @@ export class SettingsComponent implements OnInit {
    */
   async copyMcpConfig(): Promise<void> {
     try {
-      await navigator.clipboard.writeText(this.mcpConfig);
+      await navigator.clipboard.writeText(this.mcpConfig());
       this.configCopied.set(true);
       if (this.mcpCopyResetTimer) clearTimeout(this.mcpCopyResetTimer);
       this.mcpCopyResetTimer = setTimeout(

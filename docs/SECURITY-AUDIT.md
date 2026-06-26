@@ -13,13 +13,13 @@
 
 | ID | Severity | Finding | Location |
 |----|----------|---------|----------|
-| **H1** | **High** | Localhost MCP server: no auth, no `Host`/`Origin` validation, always-on → local + drive-by (DNS-rebinding) read of all meetings | `src-tauri/src/mcp.rs`, `src-tauri/src/lib.rs:103` |
+| **H1** | **High** · ✅ **fixed** | Localhost MCP server: no auth, no `Host`/`Origin` validation, always-on → local + drive-by (DNS-rebinding) read of all meetings | `src-tauri/src/mcp.rs`, `src-tauri/src/lib.rs:103` |
 | **M1** | Medium | Whisper model download has no integrity check (TLS-only trust) → malicious GGUF → whisper.cpp (C/C++) parse | `src-tauri/src/transcribe/model.rs:112` |
 | **M2** | Medium | `csp: null` — no Content-Security-Policy on the webview (defense-in-depth gap; actual markdown path is sanitized by Angular) | `src-tauri/tauri.conf.json:22` |
 | **M3** | Medium | `export_note` / `export_audio` write to an arbitrary caller-supplied `dest_path` (arbitrary file write reachable from the webview) | `src-tauri/src/commands.rs:409,428` |
 | **L1** | Low | `vault_subfolder` (user setting) joined into the path with no `..` containment check | `src-tauri/src/export/obsidian.rs:121` |
 | **L2** | Low | `add_reminder` builds an AppleScript string; quote/backslash escaped, but control chars not stripped | `src-tauri/src/commands.rs:637` |
-| **L3** | Low | MCP `Db::open` runs `migrate()` (a write txn) on every unauthenticated request | `src-tauri/src/mcp.rs:120` |
+| **L3** | Low · ✅ **fixed** | MCP `Db::open` ran `migrate()` (a write txn) on every request → now one read connection for the server's lifetime | `src-tauri/src/mcp.rs` |
 | **L4** | Info | Transient system-audio WAV in `temp_dir()` (per-user on macOS, fine; note for any future port) | `src-tauri/src/commands.rs:153` |
 | **L5** | Info | Post-rebrand identifier/service still `com.meetnotes.app`; app-data dir `MeetNotes` | `tauri.conf.json:5`, `secrets/keychain.rs:5` |
 
@@ -28,6 +28,13 @@ The codebase is, overall, **carefully written** — see [§ Verified-good](#veri
 ---
 
 ## H1 — Localhost MCP server is unauthenticated, unvalidated, and always-on · **High**
+
+> **Status: ✅ Fixed (2026-06-26).** The server is now opt-in (`mcp_enabled`, default off — when
+> off nothing binds the port), requires `Authorization: Bearer <per-install token>`, rejects any
+> browser `Origin`, and accepts only a loopback `Host` (anti-DNS-rebinding). The `enabled` flag is
+> re-checked per request so turning it off takes effect live. Settings exposes the toggle + the
+> token-bearing config snippet (`mcp_info`). See `src-tauri/src/mcp.rs` (`authorize`, unit-tested)
+> and `commands::maybe_start_mcp`. The description below documents the original vulnerability.
 
 **Where:** `src-tauri/src/mcp.rs` (whole module); spawned at `src-tauri/src/lib.rs:103-108`.
 
@@ -158,9 +165,9 @@ an allowed root.
   not an injection today. Residual: control chars/newlines aren't stripped (can break the command, not
   inject). Prefer passing the value via argv/stdin to `osascript`, or strip control chars. The
   Calendar script (`next_calendar_event`) is static — no injection.
-- **L3 — MCP runs migrations per request** (`mcp.rs:120`). Each call does `Db::open` → `migrate()`
-  (a `CREATE TABLE IF NOT EXISTS` write transaction). Harmless under WAL but it means an
-  unauthenticated endpoint triggers writes; open read-only / skip migrate on the MCP path.
+- **L3 — MCP ran migrations per request** (`mcp.rs`) — ✅ **fixed alongside H1.** Each call used to
+  `Db::open` → `migrate()` (a `CREATE TABLE IF NOT EXISTS` write transaction). The server now opens
+  a single connection for its lifetime and reuses it, so requests no longer trigger writes.
 - **L4 — Transient WAV in temp** (`commands.rs:153`). System-audio capture writes
   `temp_dir()/meetnotes-sys-<uuid>.wav`. On macOS `$TMPDIR` is per-user (not world-readable), so fine
   for the target OS; flag it if the app is ever ported to Linux/Windows where `/tmp` is shared.
@@ -207,11 +214,13 @@ These were checked and found sound — worth recording so a future reviewer does
 
 ## Recommended order of work
 
-1. **H1** — gate + token + `Host` check on the MCP server. (Blocks shipping; also reconciles the docs.)
+1. ~~**H1** — gate + token + `Host` check on the MCP server.~~ ✅ **Done (2026-06-26).** Also
+   reconciled the docs (`KILLER-FEATURES.md`). L3 (MCP migrate-per-request) was fixed in passing —
+   the server now opens one read connection for its lifetime.
 2. **M3** then **M2** — constrain the export paths, then add a strict CSP (the two compound).
 3. **M1** — pin model checksums.
-4. **L1–L3** — containment check, osascript hardening, MCP read-only open.
+4. **L1, L2** — vault-subfolder containment check, osascript hardening.
 
-> **Disclosure note:** H1 describes an unauthenticated local data-exfiltration path that is not yet
-> fixed. If this repository is or becomes public, consider landing the H1 remediation before
-> publishing this file, or keep the audit in a private location until then.
+> **Disclosure note:** H1 (the unauthenticated local data-exfiltration path) is now remediated, so
+> this audit no longer documents a live, unfixed exfiltration vector. The remaining open items
+> (M1–M3, L1–L2) are defense-in-depth; still prefer landing them before a public release.

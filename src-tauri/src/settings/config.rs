@@ -35,6 +35,9 @@ pub struct AppConfig {
     pub auto_organize: bool,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
+    /// Run the localhost MCP server (Claude Desktop/Code can read your meetings). Default off
+    /// for safety — see `docs/SECURITY-AUDIT.md` (H1). When off, nothing binds the port.
+    pub mcp_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -56,6 +59,7 @@ impl Default for AppConfig {
             note_style: "standard".to_string(),
             auto_organize: false,
             note_language: "auto".to_string(),
+            mcp_enabled: false,
         }
     }
 }
@@ -77,6 +81,7 @@ const K_ONBOARDED: &str = "onboarded";
 const K_NOTE_STYLE: &str = "note_style";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
+const K_MCP_ENABLED: &str = "mcp_enabled";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -141,6 +146,9 @@ impl AppConfig {
                 cfg.note_language = v;
             }
         }
+        if let Some(v) = db.get_setting(K_MCP_ENABLED)? {
+            cfg.mcp_enabled = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -179,6 +187,10 @@ impl AppConfig {
             if self.auto_organize { "true" } else { "false" },
         )?;
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
+        db.set_setting(
+            K_MCP_ENABLED,
+            if self.mcp_enabled { "true" } else { "false" },
+        )?;
         Ok(())
     }
 }
