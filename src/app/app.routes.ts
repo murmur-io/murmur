@@ -37,6 +37,11 @@ export const routes: Routes = [
       ),
   },
   {
+    path: "ask",
+    loadComponent: () =>
+      import("./features/ask/ask.component").then((m) => m.AskComponent),
+  },
+  {
     path: "bar",
     loadComponent: () =>
       import("./features/bar/bar.component").then(
