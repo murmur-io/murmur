@@ -11,6 +11,81 @@ pub enum MeetingStatus {
     Error,
 }
 
+/// The two entity kinds the self-assembling graph resolves from meeting notes.
+/// Stored as a stable lowercase string in `entities.kind` (mirrors `MeetingStatus`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum EntityKind {
+    Person,
+    Project,
+}
+
+/// A graph entity row (a person or project) — internal/DB-shaped, with its
+/// first-seen casing preserved in `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEntity {
+    pub id: String,
+    pub name: String,
+    pub kind: EntityKind,
+    pub created_at: String,
+}
+
+/// A graph node = an entity plus its VISIBLE mention count (sealed-and-not-unlocked
+/// meetings contribute zero). The directory + neighborhood views render these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub id: String,
+    pub name: String,
+    pub kind: EntityKind,
+    /// VISIBLE mention count — never the true count; sealed meetings drop out.
+    pub mention_count: i64,
+}
+
+/// An undirected co-occurrence edge between two entities sharing ≥1 VISIBLE meeting.
+/// `source`/`target` are entity ids with `source < target` (dedup), `weight` = shared count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub weight: i64,
+}
+
+/// The full graph payload returned by `get_graph`: every visible node + every visible edge.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphData {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    /// True when ≥1 folder is sealed-and-not-unlocked → some entities/mentions may be hidden.
+    /// The FE renders one honest disclosure banner; the count itself is never leaked.
+    pub has_hidden: bool,
+}
+
+/// A co-occurring neighbor of a selected entity (the neighborhood satellites), with the
+/// number of VISIBLE meetings the two share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityNeighbor {
+    pub id: String,
+    pub name: String,
+    pub kind: EntityKind,
+    pub shared_meetings: i64,
+}
+
+/// The detail payload for one entity: the entity, its visible backlinked meetings
+/// (reusing the `VaultSource` chip shape), and its top co-occurring neighbors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityDetail {
+    pub entity: GraphEntity,
+    /// Visible meetings mentioning this entity (sealed-not-unlocked meetings excluded).
+    pub meetings: Vec<VaultSource>,
+    pub neighbors: Vec<EntityNeighbor>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Meeting {
@@ -23,6 +98,36 @@ pub struct Meeting {
     pub duration_s: i64,
     pub audio_path: Option<String>,
     pub status: MeetingStatus,
+    /// Owning folder id (from the meeting's note rows), or `None` when at the vault root.
+    /// Derived from `notes.folder_id` — a meeting's folder = its note's folder.
+    pub folder_id: Option<String>,
+}
+
+/// A vault folder Murmur tracks for organization + per-folder locking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub parent_id: Option<String>,
+    pub locked: bool,
+    pub created_at: String,
+}
+
+/// A folder node for the tree UI: note count + current session lock state + children.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderNode {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub note_count: usize,
+    /// Folder is sealed (encrypted) on disk.
+    pub locked: bool,
+    /// Sealed AND unlocked in the current session (decrypted for view + MCP until relock).
+    pub unlocked: bool,
+    pub children: Vec<FolderNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

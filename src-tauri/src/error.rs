@@ -12,6 +12,12 @@ pub enum AppError {
     Export(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("migration error: {0}")]
+    Migration(String),
+    #[error("authentication error: {0}")]
+    Auth(String),
+    #[error("locked: {0}")]
+    Locked(String),
     #[error("secrets error: {0}")]
     Secrets(String),
     #[error("config error: {0}")]
