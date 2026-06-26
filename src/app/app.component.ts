@@ -15,6 +15,9 @@ import {
 } from "@angular/router";
 import { filter, map } from "rxjs";
 import { IpcService } from "./core/ipc.service";
+import { FoldersService } from "./services/folders.service";
+import { ScreenShareService } from "./services/screen-share.service";
+import { ToastService } from "./services/toast.service";
 
 @Component({
   selector: "app-root",
@@ -78,6 +81,53 @@ import { IpcService } from "./core/ipc.service";
             </span>
             <span class="brand-word">murmur</span>
           </a>
+
+          <!-- Subtle session-privacy indicator: how many locked folders are
+               currently unlocked (plaintext-exposed) for this session. Reads
+               straight off the folders signal store; absent at zero. -->
+          @if (unlockedCount() > 0) {
+            <span
+              class="unlocked-pill"
+              role="status"
+              [attr.aria-label]="
+                unlockedCount() +
+                ' locked folder' +
+                (unlockedCount() === 1 ? '' : 's') +
+                ' unlocked this session'
+              "
+              [attr.title]="
+                'These folders are decrypted into plaintext until you re-lock or a screen share starts.'
+              "
+            >
+              <svg
+                class="unlocked-glyph"
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect
+                  x="3.5"
+                  y="7"
+                  width="9"
+                  height="6"
+                  rx="1.4"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+                <path
+                  d="M5.5 7V5.4a2.5 2.5 0 0 1 4.9-0.65"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+              </svg>
+              <span class="unlocked-count">{{ unlockedCount() }}</span>
+              <span class="unlocked-label">unlocked</span>
+            </span>
+          }
+
           <nav class="app-nav">
             <a routerLink="/record" routerLinkActive="active">Record</a>
             <a routerLink="/library" routerLinkActive="active">Meetings</a>
@@ -91,6 +141,38 @@ import { IpcService } from "./core/ipc.service";
     <main class="app-main" [class.bare]="isBar()">
       <router-outlet></router-outlet>
     </main>
+
+    <!-- Toast viewport (MAIN window only): renders the app-wide queue from
+         ToastService — move-to-folder outcomes, screen-share re-lock notices. -->
+    @if (!isBar() && toasts().length > 0) {
+      <div class="toast-viewport" aria-live="polite" aria-atomic="false">
+        @for (t of toasts(); track t.id) {
+          <div class="toast" [class]="'is-' + t.kind" role="status">
+            <span class="toast-msg">{{ t.message }}</span>
+            <button
+              type="button"
+              class="toast-close"
+              aria-label="Dismiss notification"
+              (click)="dismissToast(t.id)"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="13"
+                height="13"
+                aria-hidden="true"
+              >
+                <path
+                  d="M4 4l8 8M12 4l-8 8"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+          </div>
+        }
+      </div>
+    }
   `,
   styles: [
     `
@@ -231,6 +313,36 @@ import { IpcService } from "./core/ipc.service";
         background: var(--accent-soft);
       }
 
+      /* --- Session-privacy pill (N folders unlocked this session) --------- */
+      .unlocked-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        height: 26px;
+        padding: 0 var(--space-3) 0 var(--space-2);
+        border: 1px solid transparent;
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 1;
+        white-space: nowrap;
+        animation: rise 240ms var(--transition) both;
+      }
+      .unlocked-glyph {
+        display: block;
+        flex: none;
+      }
+      .unlocked-count {
+        font-variant-numeric: tabular-nums;
+      }
+      .unlocked-label {
+        color: var(--accent-hover);
+        opacity: 0.85;
+      }
+
       .app-main {
         max-width: var(--content-max);
         margin: 0 auto;
@@ -243,12 +355,83 @@ import { IpcService } from "./core/ipc.service";
         padding: 0;
         min-height: 100vh;
       }
+
+      /* --- Toast viewport (bottom-right, frosted; stacks oldest → newest) --- */
+      .toast-viewport {
+        position: fixed;
+        right: var(--space-5);
+        bottom: var(--space-5);
+        z-index: 60;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        max-width: min(360px, calc(100vw - var(--space-6)));
+        pointer-events: none;
+      }
+      .toast {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--space-3);
+        padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+        border: 1px solid var(--glass-border);
+        border-left-width: 3px;
+        border-radius: var(--radius-md);
+        background: var(--surface-overlay);
+        color: var(--text-primary);
+        font-size: 0.875rem;
+        line-height: 1.45;
+        box-shadow: var(--shadow-md), var(--glass-highlight);
+        pointer-events: auto;
+        animation: rise 220ms var(--ease-spring) both;
+      }
+      .toast.is-info {
+        border-left-color: var(--accent);
+      }
+      .toast.is-success {
+        border-left-color: var(--success);
+      }
+      .toast.is-danger {
+        border-left-color: var(--danger);
+      }
+      .toast-msg {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .toast-close {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 24px;
+        height: 24px;
+        margin-top: -2px;
+        padding: 0;
+        border: none;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        transition:
+          color var(--transition),
+          background var(--transition);
+      }
+      .toast-close:hover {
+        color: var(--text-primary);
+        background: var(--surface-hover);
+      }
+      .toast-close:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
     `,
   ],
 })
 export class AppComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly ipc = inject(IpcService);
+  private readonly folders = inject(FoldersService);
+  private readonly screenShare = inject(ScreenShareService);
+  private readonly toast = inject(ToastService);
 
   /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
   readonly isBar = toSignal(
@@ -259,18 +442,40 @@ export class AppComponent implements OnInit {
     { initialValue: location.pathname.startsWith("/bar") },
   );
 
+  /** How many locked folders are unlocked (plaintext-exposed) this session. */
+  readonly unlockedCount = this.folders.unlockedCount;
+
+  /** The app-wide toast queue, rendered in the main-window viewport. */
+  readonly toasts = this.toast.toasts;
+
   /** Make the bar window's document transparent (no aurora/grain behind the pill). */
   private readonly _bodyClass = effect(() => {
     document.body.classList.toggle("bar-shell", this.isBar());
   });
 
+  /** Dismiss a toast by id (also cancels its auto-dismiss timer in the service). */
+  dismissToast(id: number): void {
+    this.toast.dismiss(id);
+  }
+
   /**
    * First-run gate (MAIN window only). On startup, if the user hasn't completed
    * onboarding, send them to the wizard. The floating-bar window is never gated —
    * it just mirrors recording state and must stay chromeless.
+   *
+   * The main window also arms the screen-share privacy guard and primes the
+   * folder tree (so the "N unlocked" pill + locked-meeting masking have state).
+   * The bar window does neither — it stays chromeless and side-effect-free.
    */
   async ngOnInit(): Promise<void> {
     if (this.isBar()) return;
+
+    // Arm the screen-share guard + prime the folder store (main window only).
+    // Best-effort and non-blocking: a folders/listen failure must not trap the
+    // user on a blank app, so each is fire-and-forget with its own catch.
+    void this.screenShare.init();
+    void this.folders.load();
+
     try {
       const cfg = await this.ipc.getConfig();
       if (!cfg.onboarded) {

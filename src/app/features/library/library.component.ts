@@ -11,7 +11,18 @@ import {
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 import { IpcService } from "../../core/ipc.service";
-import type { Meeting, MeetingStatus, SearchHit } from "../../core/models";
+import type {
+  FolderNode,
+  Meeting,
+  MeetingStatus,
+  SearchHit,
+} from "../../core/models";
+import {
+  FoldersService,
+  type FolderExposure,
+} from "../../services/folders.service";
+import { FolderTreeComponent } from "../folders/folder-tree.component";
+import { LockBadgeComponent } from "../folders/lock-badge.component";
 
 /** Debounce window for search-as-you-type — quick enough to feel instant. */
 const SEARCH_DEBOUNCE_MS = 180;
@@ -26,297 +37,411 @@ interface SnippetPart {
   selector: "app-library",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, FolderTreeComponent, LockBadgeComponent],
   template: `
     <section class="library">
-      <!-- Frosted search field, pinned to the top of the screen -->
-      <div class="search" [class.is-active]="searching()">
-        <span class="search-icon" aria-hidden="true">
-          <svg viewBox="0 0 20 20" width="18" height="18" fill="none">
-            <circle
-              cx="8.5"
-              cy="8.5"
-              r="5.5"
-              stroke="currentColor"
-              stroke-width="1.7"
-            />
-            <path
-              d="m13 13 4 4"
-              stroke="currentColor"
-              stroke-width="1.7"
-              stroke-linecap="round"
-            />
-          </svg>
-        </span>
-        <input
-          #searchInput
-          type="search"
-          class="search-input"
-          placeholder="Search meetings, transcripts & notes…"
-          autocapitalize="off"
-          autocomplete="off"
-          spellcheck="false"
-          aria-label="Search meetings"
-          [value]="query()"
-          (input)="onQueryInput($event)"
-          (keydown.escape)="clear()"
-        />
-        @if (query()) {
-          <button
-            type="button"
-            class="search-clear"
-            aria-label="Clear search"
-            (click)="clear()"
-          >
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <!-- ============ LEFT PANE — folder tree (lock-aware) ============ -->
+      <aside class="folders-pane card" aria-label="Folders">
+        <h3 class="folders-title">Folders</h3>
+        @if (foldersLoading()) {
+          <p class="folders-state empty">Loading folders…</p>
+        } @else {
+          <app-folder-tree
+            [nodes]="folderTree()"
+            [selectedId]="activeFolderId()"
+            (select)="selectFolder($event)"
+          />
+        }
+      </aside>
+
+      <!-- ============ RIGHT PANE — search, filters, meeting list ============ -->
+      <div class="meetings-pane">
+        <!-- Frosted search field, pinned to the top of the screen -->
+        <div class="search" [class.is-active]="searching()">
+          <span class="search-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" width="18" height="18" fill="none">
+              <circle
+                cx="8.5"
+                cy="8.5"
+                r="5.5"
+                stroke="currentColor"
+                stroke-width="1.7"
+              />
               <path
-                d="M4 4l8 8M12 4l-8 8"
+                d="m13 13 4 4"
                 stroke="currentColor"
                 stroke-width="1.7"
                 stroke-linecap="round"
               />
             </svg>
-          </button>
-        }
-      </div>
-
-      <!-- Tag filter chips (hidden during an active search; absent if no tags) -->
-      @if (!hasQuery() && tags().length > 0) {
-        <div class="tagbar" role="group" aria-label="Filter meetings by tag">
-          <button
-            type="button"
-            class="chip"
-            [class.is-active]="activeTag() === null"
-            [attr.aria-pressed]="activeTag() === null"
-            (click)="selectTag(null)"
-          >
-            All
-          </button>
-          @for (tag of tags(); track tag) {
+          </span>
+          <input
+            #searchInput
+            type="search"
+            class="search-input"
+            placeholder="Search meetings, transcripts & notes…"
+            autocapitalize="off"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Search meetings"
+            [value]="query()"
+            (input)="onQueryInput($event)"
+            (keydown.escape)="clear()"
+          />
+          @if (query()) {
             <button
               type="button"
-              class="chip"
-              [class.is-active]="activeTag() === tag"
-              [attr.aria-pressed]="activeTag() === tag"
-              (click)="selectTag(tag)"
+              class="search-clear"
+              aria-label="Clear search"
+              (click)="clear()"
             >
-              {{ tag }}
+              <svg
+                viewBox="0 0 16 16"
+                width="14"
+                height="14"
+                aria-hidden="true"
+              >
+                <path
+                  d="M4 4l8 8M12 4l-8 8"
+                  stroke="currentColor"
+                  stroke-width="1.7"
+                  stroke-linecap="round"
+                />
+              </svg>
             </button>
           }
         </div>
-      }
 
-      @if (hasQuery()) {
-        <!-- ===================== SEARCH RESULTS ===================== -->
-        <header class="library-head">
-          <h2>Search</h2>
-          @if (!searching() && results().length > 0) {
-            <span class="count">{{ results().length }}</span>
-          }
-        </header>
-
-        @if (searching()) {
-          <div class="card state-card">
-            <p class="empty searching">
-              <span class="spinner" aria-hidden="true"></span>
-              Searching…
-            </p>
-          </div>
-        } @else if (results().length === 0) {
-          <div class="card empty-state">
-            <span class="empty-mark" aria-hidden="true"></span>
-            <p class="empty-title">No matches for “{{ query().trim() }}”</p>
-            <p class="empty">Try a different word or a shorter phrase.</p>
-          </div>
-        } @else {
-          <ul class="list card">
-            @for (hit of results(); track hit.meeting.id; let i = $index) {
-              <li>
-                <a
-                  class="row"
-                  [routerLink]="['/meeting', hit.meeting.id]"
-                  [style.animation-delay.ms]="i * 35"
-                >
-                  <span class="row-main">
-                    <span class="title">{{
-                      hit.meeting.title || "(untitled)"
-                    }}</span>
-                    <span class="meta">
-                      <span
-                        class="badge"
-                        [class]="matchBadgeClass(hit.matchedIn)"
-                        >{{ matchLabel(hit.matchedIn) }}</span
-                      >
-                      <span class="date">{{
-                        formatDate(hit.meeting.startedAt)
-                      }}</span>
-                    </span>
-                    @if (hit.snippet) {
-                      <span class="snippet">
-                        @for (part of snippetParts(hit.snippet); track $index) {
-                          @if (part.hit) {
-                            <mark class="snippet-hit">{{ part.text }}</mark>
-                          } @else {
-                            {{ part.text }}
-                          }
-                        }
-                      </span>
-                    }
-                  </span>
-                  <span class="chevron" aria-hidden="true">›</span>
-                </a>
-              </li>
-            }
-          </ul>
-        }
-      } @else {
-        <!-- ===================== MEETINGS LIST (no query) ===================== -->
-        <header class="library-head">
-          <h2>{{ activeTag() === null ? "Meetings" : activeTag() }}</h2>
-          @if (!listLoading() && displayedMeetings().length > 0) {
-            <span class="count">{{ displayedMeetings().length }}</span>
-          }
-        </header>
-
-        @if (listLoading()) {
-          <div class="card state-card">
-            <p class="empty">Loading…</p>
-          </div>
-        } @else if (displayedMeetings().length === 0) {
-          <div class="card empty-state">
-            <span class="empty-mark" aria-hidden="true"></span>
-            @if (activeTag() === null) {
-              <p class="empty-title">No meetings yet</p>
-              <p class="empty">
-                Record one from the Record tab to see it here.
-              </p>
-            } @else {
-              <p class="empty-title">No meetings tagged “{{ activeTag() }}”</p>
-              <p class="empty">Pick another tag, or choose All.</p>
-            }
-          </div>
-        } @else {
-          <ul class="list card">
-            @for (m of displayedMeetings(); track m.id; let i = $index) {
-              <li
-                class="row-item"
-                [class.is-confirming]="pendingDeleteId() === m.id"
+        <!-- Tag filter chips (hidden during an active search; absent if no tags) -->
+        @if (!hasQuery() && tags().length > 0) {
+          <div class="tagbar" role="group" aria-label="Filter meetings by tag">
+            <button
+              type="button"
+              class="chip"
+              [class.is-active]="activeTag() === null"
+              [attr.aria-pressed]="activeTag() === null"
+              (click)="selectTag(null)"
+            >
+              All
+            </button>
+            @for (tag of tags(); track tag) {
+              <button
+                type="button"
+                class="chip"
+                [class.is-active]="activeTag() === tag"
+                [attr.aria-pressed]="activeTag() === tag"
+                (click)="selectTag(tag)"
               >
-                <a
-                  class="row"
-                  [routerLink]="['/meeting', m.id]"
-                  [style.animation-delay.ms]="i * 45"
-                >
-                  <span class="row-main">
-                    <span class="title">{{ m.title || "(untitled)" }}</span>
-                    <span class="meta">
-                      <span class="date">{{ formatDate(m.startedAt) }}</span>
-                      @if (m.durationS > 0) {
-                        <span class="dot" aria-hidden="true">·</span>
-                        <span class="duration">{{
-                          formatDuration(m.durationS)
+                {{ tag }}
+              </button>
+            }
+          </div>
+        }
+
+        @if (hasQuery()) {
+          <!-- ===================== SEARCH RESULTS ===================== -->
+          <header class="library-head">
+            <h2>Search</h2>
+            @if (!searching() && results().length > 0) {
+              <span class="count">{{ results().length }}</span>
+            }
+          </header>
+
+          @if (searching()) {
+            <div class="card state-card">
+              <p class="empty searching">
+                <span class="spinner" aria-hidden="true"></span>
+                Searching…
+              </p>
+            </div>
+          } @else if (results().length === 0) {
+            <div class="card empty-state">
+              <span class="empty-mark" aria-hidden="true"></span>
+              <p class="empty-title">No matches for “{{ query().trim() }}”</p>
+              <p class="empty">Try a different word or a shorter phrase.</p>
+            </div>
+          } @else {
+            <ul class="list card">
+              @for (hit of results(); track hit.meeting.id; let i = $index) {
+                <li>
+                  <a
+                    class="row"
+                    [routerLink]="['/meeting', hit.meeting.id]"
+                    [style.animation-delay.ms]="i * 35"
+                  >
+                    <span class="row-main">
+                      <span class="title">{{
+                        hit.meeting.title || "(untitled)"
+                      }}</span>
+                      <span class="meta">
+                        <span
+                          class="badge"
+                          [class]="matchBadgeClass(hit.matchedIn)"
+                          >{{ matchLabel(hit.matchedIn) }}</span
+                        >
+                        <span class="date">{{
+                          formatDate(hit.meeting.startedAt)
                         }}</span>
+                      </span>
+                      @if (hit.snippet) {
+                        <span class="snippet">
+                          @for (
+                            part of snippetParts(hit.snippet);
+                            track $index
+                          ) {
+                            @if (part.hit) {
+                              <mark class="snippet-hit">{{ part.text }}</mark>
+                            } @else {
+                              {{ part.text }}
+                            }
+                          }
+                        </span>
                       }
                     </span>
-                  </span>
-                  <span class="row-aside">
-                    <span class="pill" [class]="statusPillClass(m.status)">
-                      <span class="pill-dot"></span>
-                      {{ statusLabel(m.status) }}
-                    </span>
                     <span class="chevron" aria-hidden="true">›</span>
-                  </span>
-                </a>
+                  </a>
+                </li>
+              }
+            </ul>
+          }
+        } @else {
+          <!-- ===================== MEETINGS LIST (no query) ===================== -->
+          <header class="library-head">
+            <h2>{{ listHeading() }}</h2>
+            @if (activeFolderExposure(); as exp) {
+              <app-lock-badge [exposure]="exp" />
+            }
+            @if (!listLoading() && displayedMeetings().length > 0) {
+              <span class="count">{{ displayedMeetings().length }}</span>
+            }
+          </header>
 
-                <!-- Subtle delete affordance — a separate button (never the
-                     row's link). stop/prevent so a click can't navigate. -->
-                <button
-                  type="button"
-                  class="row-delete"
-                  [attr.aria-label]="
-                    'Delete meeting: ' + (m.title || '(untitled)')
-                  "
-                  (click)="
-                    $event.preventDefault();
-                    $event.stopPropagation();
-                    askDelete(m.id)
-                  "
+          @if (listLoading()) {
+            <div class="card state-card">
+              <p class="empty">Loading…</p>
+            </div>
+          } @else if (displayedMeetings().length === 0) {
+            <div class="card empty-state">
+              <span class="empty-mark" aria-hidden="true"></span>
+              @if (activeFolderId() !== null) {
+                <p class="empty-title">No notes in this folder</p>
+                <p class="empty">
+                  Move a meeting here from its detail view, or pick another
+                  folder.
+                </p>
+              } @else if (activeTag() === null) {
+                <p class="empty-title">No meetings yet</p>
+                <p class="empty">
+                  Record one from the Record tab to see it here.
+                </p>
+              } @else {
+                <p class="empty-title">
+                  No meetings tagged “{{ activeTag() }}”
+                </p>
+                <p class="empty">Pick another tag, or choose All.</p>
+              }
+            </div>
+          } @else {
+            <ul class="list card">
+              @for (m of displayedMeetings(); track m.id; let i = $index) {
+                <li
+                  class="row-item"
+                  [class.is-confirming]="pendingDeleteId() === m.id"
                 >
-                  <svg
-                    viewBox="0 0 16 16"
-                    width="15"
-                    height="15"
-                    aria-hidden="true"
+                  <a
+                    class="row"
+                    [routerLink]="['/meeting', m.id]"
+                    [style.animation-delay.ms]="i * 45"
                   >
-                    <path
-                      d="M3 4.5h10M6.5 4.5V3.5a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M5.5 4.5l.4 8a1 1 0 0 0 1 .95h2.2a1 1 0 0 0 1-.95l.4-8"
-                      stroke="currentColor"
-                      stroke-width="1.3"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      fill="none"
-                    />
-                  </svg>
-                </button>
+                    <span class="row-main">
+                      <span class="title-row">
+                        @if (folderExposureOf(m); as exp) {
+                          <app-lock-badge [exposure]="exp" />
+                        }
+                        @if (isMasked(m)) {
+                          <span class="title title--masked" aria-hidden="true"
+                            >•••••••••••••</span
+                          >
+                          <span class="sr-only"
+                            >Locked note — title hidden</span
+                          >
+                        } @else {
+                          <span class="title">{{
+                            m.title || "(untitled)"
+                          }}</span>
+                        }
+                      </span>
+                      <span class="meta">
+                        <span class="date">{{ formatDate(m.startedAt) }}</span>
+                        @if (m.durationS > 0) {
+                          <span class="dot" aria-hidden="true">·</span>
+                          <span class="duration">{{
+                            formatDuration(m.durationS)
+                          }}</span>
+                        }
+                      </span>
+                    </span>
+                    <span class="row-aside">
+                      <span class="pill" [class]="statusPillClass(m.status)">
+                        <span class="pill-dot"></span>
+                        {{ statusLabel(m.status) }}
+                      </span>
+                      <span class="chevron" aria-hidden="true">›</span>
+                    </span>
+                  </a>
 
-                @if (pendingDeleteId() === m.id) {
-                  <!-- In-app confirm (signal-driven; NOT window.confirm) -->
-                  <div
-                    class="confirm"
-                    role="alertdialog"
-                    aria-modal="true"
+                  <!-- Subtle delete affordance — a separate button (never the
+                     row's link). stop/prevent so a click can't navigate. -->
+                  <button
+                    type="button"
+                    class="row-delete"
                     [attr.aria-label]="
                       'Delete meeting: ' + (m.title || '(untitled)')
                     "
+                    (click)="
+                      $event.preventDefault();
+                      $event.stopPropagation();
+                      askDelete(m.id)
+                    "
                   >
-                    <p class="confirm-title">Delete this meeting?</p>
-                    <p class="confirm-body">
-                      This permanently removes the recording, transcript,
-                      summary and vault note. It can’t be undone.
-                    </p>
-                    @if (deleteError()) {
-                      <p class="confirm-error" role="alert">
-                        {{ deleteError() }}
+                    <svg
+                      viewBox="0 0 16 16"
+                      width="15"
+                      height="15"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M3 4.5h10M6.5 4.5V3.5a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M5.5 4.5l.4 8a1 1 0 0 0 1 .95h2.2a1 1 0 0 0 1-.95l.4-8"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        fill="none"
+                      />
+                    </svg>
+                  </button>
+
+                  @if (pendingDeleteId() === m.id) {
+                    <!-- In-app confirm (signal-driven; NOT window.confirm) -->
+                    <div
+                      class="confirm"
+                      role="alertdialog"
+                      aria-modal="true"
+                      [attr.aria-label]="
+                        'Delete meeting: ' + (m.title || '(untitled)')
+                      "
+                    >
+                      <p class="confirm-title">Delete this meeting?</p>
+                      <p class="confirm-body">
+                        This permanently removes the recording, transcript,
+                        summary and vault note. It can’t be undone.
                       </p>
-                    }
-                    <div class="confirm-actions">
-                      <button
-                        type="button"
-                        class="btn btn-ghost"
-                        [disabled]="deleting()"
-                        (click)="cancelDelete()"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        class="btn btn-danger"
-                        [disabled]="deleting()"
-                        (click)="confirmDelete(m.id)"
-                      >
-                        @if (deleting()) {
-                          <span class="spinner" aria-hidden="true"></span>
-                          Deleting…
-                        } @else {
-                          Delete
-                        }
-                      </button>
+                      @if (deleteError()) {
+                        <p class="confirm-error" role="alert">
+                          {{ deleteError() }}
+                        </p>
+                      }
+                      <div class="confirm-actions">
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          [disabled]="deleting()"
+                          (click)="cancelDelete()"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-danger"
+                          [disabled]="deleting()"
+                          (click)="confirmDelete(m.id)"
+                        >
+                          @if (deleting()) {
+                            <span class="spinner" aria-hidden="true"></span>
+                            Deleting…
+                          } @else {
+                            Delete
+                          }
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                }
-              </li>
-            }
-          </ul>
+                  }
+                </li>
+              }
+            </ul>
+          }
         }
-      }
+      </div>
+      <!-- /.meetings-pane -->
     </section>
   `,
   styles: [
     `
+      /* Two-pane: folder tree (left) + meeting list (right). Collapses to a
+         single column on narrow widths so the list never gets squeezed. */
       .library {
+        display: grid;
+        grid-template-columns: minmax(200px, 248px) minmax(0, 1fr);
+        align-items: start;
+        gap: var(--space-5);
+      }
+      @media (max-width: 720px) {
+        .library {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      /* --- Left pane: folder tree (lock-aware) --- */
+      .folders-pane {
+        position: sticky;
+        top: 0;
+        padding: var(--space-3);
+      }
+      .folders-title {
+        margin: 0 0 var(--space-2);
+        padding: 0 var(--space-2);
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .folders-state {
+        margin: var(--space-2);
+        font-size: 0.8125rem;
+      }
+
+      /* --- Right pane: stacks search, filters and the list --- */
+      .meetings-pane {
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
+        min-width: 0;
+      }
+
+      /* Masked title for a locked-folder note (hidden until session-unlock). */
+      .title-row {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        min-width: 0;
+      }
+      .title--masked {
+        color: var(--text-muted);
+        letter-spacing: 0.12em;
+        user-select: none;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        border: 0;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        clip-path: inset(50%);
+        white-space: nowrap;
       }
 
       /* --- Frosted search field (pinned, sticky to the scroll top) --- */
@@ -721,6 +846,7 @@ interface SnippetPart {
 export class LibraryComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly folders = inject(FoldersService);
 
   /** The search box element — focused after a clear. */
   private readonly searchInput =
@@ -729,6 +855,49 @@ export class LibraryComponent implements OnInit {
   // --- No-query meetings list (unchanged behaviour) -----------------------
   readonly meetings = signal<Meeting[]>([]);
   readonly loading = signal(true);
+
+  // --- Folder filter (left pane) ------------------------------------------
+  /** The lock-aware folder forest from the signal store. */
+  readonly folderTree = this.folders.tree;
+  /** True while the folder tree is loading (drives the left-pane state). */
+  readonly foldersLoading = this.folders.loading;
+  /**
+   * Selected folder id (null = no folder filter — show the tag/all list).
+   * Mutually exclusive with the tag filter: selecting one clears the other.
+   */
+  readonly activeFolderId = signal<string | null>(null);
+
+  /**
+   * Every folder node keyed by id (flattened) — for O(1) exposure/mask lookups
+   * keyed off a meeting's `folderId`. Recomputes whenever the tree reloads.
+   */
+  private readonly folderById = computed(() => {
+    const map = new Map<string, FolderNode>();
+    const walk = (nodes: FolderNode[]): void => {
+      for (const n of nodes) {
+        map.set(n.id, n);
+        if (n.children.length) {
+          walk(n.children);
+        }
+      }
+    };
+    walk(this.folderTree());
+    return map;
+  });
+
+  /**
+   * Meetings in the active folder. Derived from the already-loaded `meetings`
+   * list via the committed `Meeting.folderId` contract field (no extra IPC —
+   * the backend exposes no folder-scoped list command). When the field is
+   * absent (older backend) this is simply empty until notes carry a folderId.
+   */
+  readonly folderMeetings = computed(() => {
+    const fid = this.activeFolderId();
+    if (fid === null) {
+      return [];
+    }
+    return this.meetings().filter((m) => m.folderId === fid);
+  });
 
   // --- Tag filter ----------------------------------------------------------
   /** All distinct tags across meetings; empty → no filter bar is rendered. */
@@ -740,14 +909,49 @@ export class LibraryComponent implements OnInit {
   /** True while a tag's meetings are being fetched. */
   readonly tagLoading = signal(false);
 
-  /** The list to render when not searching: full list, or the tag-filtered one. */
-  readonly displayedMeetings = computed(() =>
-    this.activeTag() === null ? this.meetings() : this.tagMeetings(),
-  );
+  /**
+   * The list to render when not searching, in strict precedence (search is
+   * handled separately via `hasQuery()`):
+   *   folder selected → folder-filtered;
+   *   else tag selected → tag-filtered;
+   *   else → the full list.
+   * No existing branch is removed — the folder branch sits ABOVE the tag/all
+   * branches the screen already had.
+   */
+  readonly displayedMeetings = computed(() => {
+    if (this.activeFolderId() !== null) {
+      return this.folderMeetings();
+    }
+    return this.activeTag() === null ? this.meetings() : this.tagMeetings();
+  });
   /** Loading state for the visible no-query list (initial load or a tag fetch). */
-  readonly listLoading = computed(() =>
-    this.activeTag() === null ? this.loading() : this.tagLoading(),
-  );
+  readonly listLoading = computed(() => {
+    if (this.activeFolderId() !== null) {
+      // Folder filtering is client-side over `meetings`, so it shares the
+      // initial-load flag (and the tree's own loading shows in the left pane).
+      return this.loading();
+    }
+    return this.activeTag() === null ? this.loading() : this.tagLoading();
+  });
+
+  /** Heading for the no-query list: folder name → tag → "Meetings". */
+  readonly listHeading = computed(() => {
+    const fid = this.activeFolderId();
+    if (fid !== null) {
+      return this.folderById().get(fid)?.name ?? "Folder";
+    }
+    return this.activeTag() ?? "Meetings";
+  });
+
+  /** Exposure of the active folder (for the header lock badge); null when none. */
+  readonly activeFolderExposure = computed<FolderExposure | null>(() => {
+    const fid = this.activeFolderId();
+    if (fid === null) {
+      return null;
+    }
+    const node = this.folderById().get(fid);
+    return node ? this.folders.exposureOf(node) : null;
+  });
 
   // --- Delete affordance (in-app, signal-driven confirm) ------------------
   /** Id of the meeting whose inline confirm panel is open (null = none). */
@@ -814,6 +1018,11 @@ export class LibraryComponent implements OnInit {
     // Switching the view dismisses any open delete confirm to avoid a dangling
     // panel pointing at a row that may not be in the new list.
     this.cancelDelete();
+    // Tag + folder filters are mutually exclusive: picking a tag clears any
+    // active folder selection so the two never compose into an empty surprise.
+    if (tag !== null) {
+      this.activeFolderId.set(null);
+    }
     this.activeTag.set(tag);
 
     if (tag === null) {
@@ -838,6 +1047,57 @@ export class LibraryComponent implements OnInit {
         this.tagLoading.set(false);
       }
     }
+  }
+
+  // --- Folder filtering (left pane) ---------------------------------------
+
+  /**
+   * Select a folder (or `null` for "All notes" / the vault root). Mirrors the
+   * tag-filter machinery: it dismisses any open delete confirm, clears the
+   * mutually-exclusive tag filter, and (for a non-null folder) leaves the search
+   * alone — the right pane re-derives `folderMeetings` reactively. A null target
+   * (the tree's "All notes" row) returns to the full list. There is no async
+   * fetch (folder filtering is client-side over `meetings`), so no latest-wins
+   * race exists; the same idempotent-guard shape is kept for consistency.
+   */
+  selectFolder(folderId: string | null): void {
+    if (this.activeFolderId() === folderId) {
+      return;
+    }
+    this.cancelDelete();
+    // Folder + tag filters are mutually exclusive — picking a folder clears the
+    // tag selection (and its fetched list) so they never compose.
+    if (folderId !== null) {
+      this.activeTag.set(null);
+      this.tagMeetings.set([]);
+      this.tagLoading.set(false);
+    }
+    this.activeFolderId.set(folderId);
+  }
+
+  // --- Lock-aware row rendering -------------------------------------------
+
+  /**
+   * The exposure of the folder a meeting lives in (open / locked / session), or
+   * null when the note is at the vault root / its folder isn't known. Drives the
+   * inline lock badge on a meeting row.
+   */
+  folderExposureOf(m: Meeting): FolderExposure | null {
+    const fid = m.folderId ?? null;
+    if (fid === null) {
+      return null;
+    }
+    const node = this.folderById().get(fid);
+    return node ? this.folders.exposureOf(node) : null;
+  }
+
+  /**
+   * Whether a meeting's title must be masked: it lives in a folder that is
+   * sealed and NOT session-unlocked (`exposure === 'locked'`). A session-
+   * unlocked folder ('session') shows its titles normally.
+   */
+  isMasked(m: Meeting): boolean {
+    return this.folderExposureOf(m) === "locked";
   }
 
   // --- Search-as-you-type --------------------------------------------------
@@ -867,11 +1127,14 @@ export class LibraryComponent implements OnInit {
       return;
     }
 
-    // Search takes precedence over the tag filter: reset to the full list so
-    // that clearing the search returns to "All" (the chip bar is hidden while
-    // searching). Per-row delete still works against `meetings` underneath.
+    // Search takes precedence over BOTH the tag and folder filters: reset to
+    // the full list so clearing the search returns to "All" (the chip bar is
+    // hidden while searching). Per-row delete still works against `meetings`.
     if (this.activeTag() !== null) {
       void this.selectTag(null);
+    }
+    if (this.activeFolderId() !== null) {
+      this.activeFolderId.set(null);
     }
 
     this.searching.set(true);

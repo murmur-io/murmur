@@ -538,7 +538,16 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           </p>
         </div>
 
-        <!-- (2) Local MCP server -->
+        <!-- (2) Locked folders (honest encryption boundary) -->
+        <div class="privacy-section">
+          <span class="privacy-section-label text-muted">Locked folders</span>
+          <p class="text-secondary privacy-note">
+            Locked folders are encrypted and pulled out of your Obsidian vault;
+            open notes remain plaintext .md files Obsidian can read.
+          </p>
+        </div>
+
+        <!-- (3) Local MCP server -->
         <div class="privacy-section">
           <span class="privacy-section-label text-muted">Local MCP server</span>
           <p class="text-secondary privacy-note">
