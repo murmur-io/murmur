@@ -5,6 +5,7 @@ import {
   Injector,
   afterNextRender,
   computed,
+  forwardRef,
   inject,
   input,
   output,
@@ -12,6 +13,7 @@ import {
   viewChild,
 } from "@angular/core";
 import { FoldersService } from "../../services/folders.service";
+import { ToastService } from "../../services/toast.service";
 import type { FolderNode } from "../../core/models";
 import { FolderRowComponent } from "./folder-row.component";
 
@@ -33,7 +35,14 @@ import { FolderRowComponent } from "./folder-row.component";
   selector: "app-folder-tree",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FolderRowComponent],
+  // `folder-tree` ↔ `folder-row` are mutually recursive standalone components,
+  // so their ES modules form an import cycle. Referencing `FolderRowComponent`
+  // directly here is `undefined` at metadata-evaluation time and Angular then
+  // throws `getComponentDef(undefined)` (reading 'ɵcmp') the moment the `@for`
+  // below instantiates an `app-folder-row` — exactly the "view breaks after
+  // adding the first folder" bug. `forwardRef` defers the lookup, breaking the
+  // cycle. (See folder-row for the mirror.)
+  imports: [forwardRef(() => FolderRowComponent)],
   template: `
     <div class="tree" [class.is-root]="isRoot()">
       @if (isRoot()) {
@@ -75,7 +84,25 @@ import { FolderRowComponent } from "./folder-row.component";
       @if (isRoot()) {
         <!-- Inline "New folder" create (afterNextRender focus; not setTimeout) -->
         @if (creating()) {
-          <form class="new-folder" (submit)="confirmCreate($event)">
+          <form
+            class="new-folder"
+            [class.is-saving]="saving()"
+            (submit)="confirmCreate($event)"
+          >
+            <span class="new-folder-icon" aria-hidden="true">
+              @if (saving()) {
+                <span class="new-folder-spinner"></span>
+              } @else {
+                <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+                  <path
+                    d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              }
+            </span>
             <input
               #nameInput
               type="text"
@@ -98,16 +125,29 @@ import { FolderRowComponent } from "./folder-row.component";
             </button>
             <button
               type="button"
-              class="btn btn-ghost"
+              class="new-folder-cancel"
+              aria-label="Cancel new folder"
               [disabled]="saving()"
               (click)="cancelCreate()"
             >
-              Cancel
+              <svg
+                viewBox="0 0 16 16"
+                width="13"
+                height="13"
+                aria-hidden="true"
+              >
+                <path
+                  d="M4 4l8 8M12 4l-8 8"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                />
+              </svg>
             </button>
           </form>
-          @if (createError()) {
-            <p class="tree-error" role="alert">{{ createError() }}</p>
-          }
+          <p class="new-folder-hint" aria-hidden="true">
+            Enter to create · Esc to cancel
+          </p>
         } @else {
           <button
             type="button"
@@ -221,36 +261,128 @@ import { FolderRowComponent } from "./folder-row.component";
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
 
+      /* The inline create reads as one frosted field: an icon, the name input,
+         a primary "Add" and a quiet ✕ cancel — it slides in under the list. */
       .new-folder {
         display: flex;
         align-items: center;
         gap: var(--space-2);
         margin-top: var(--space-2);
+        padding: var(--space-1) var(--space-2);
+        border: 1px solid var(--accent);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+        animation: rise 200ms var(--ease-spring, var(--transition)) both;
+        transition:
+          border-color var(--transition),
+          box-shadow var(--transition),
+          opacity var(--transition);
+      }
+      .new-folder.is-saving {
+        opacity: 0.75;
+        border-color: var(--border-strong);
+        box-shadow: none;
+      }
+      .new-folder-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 20px;
+        height: 20px;
+        color: var(--accent-hover);
+      }
+      .new-folder-spinner {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid var(--border-strong);
+        border-top-color: var(--accent-hover);
+        animation: nf-spin 700ms linear infinite;
+      }
+      @keyframes nf-spin {
+        to {
+          transform: rotate(360deg);
+        }
       }
       .new-folder-input {
         flex: 1 1 auto;
         min-width: 0;
-        height: 36px;
+        height: 32px;
+        padding: 0 var(--space-1);
+        border: none;
+        background: transparent;
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 0.9rem;
+        letter-spacing: -0.01em;
+      }
+      .new-folder-input:hover,
+      .new-folder-input:focus {
+        border: none;
+        background: transparent;
+        box-shadow: none;
+        outline: none;
+      }
+      .new-folder-input::placeholder {
+        color: var(--text-muted);
       }
       .new-folder-add {
-        height: 36px;
+        height: 28px;
         flex: none;
+        padding: 0 var(--space-3);
+        font-size: 0.8rem;
       }
-      .new-folder .btn-ghost {
-        height: 36px;
+      .new-folder-cancel {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         flex: none;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: none;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        transition:
+          color var(--transition),
+          background var(--transition);
       }
-
-      .tree-error {
-        margin: var(--space-1) 0 0;
-        color: var(--danger);
-        font-size: 0.78rem;
+      .new-folder-cancel:hover:not(:disabled) {
+        color: var(--text-primary);
+        background: var(--surface-hover);
+      }
+      .new-folder-cancel:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .new-folder-cancel:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .new-folder-hint {
+        margin: var(--space-1) 0 0 var(--space-2);
+        color: var(--text-muted);
+        font-size: 0.72rem;
+        letter-spacing: 0.01em;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .new-folder {
+          animation: none;
+        }
+        .new-folder-spinner {
+          animation-duration: 1400ms;
+        }
       }
     `,
   ],
 })
 export class FolderTreeComponent {
   private readonly folders = inject(FoldersService);
+  private readonly toast = inject(ToastService);
   private readonly injector = inject(Injector);
 
   /** Nodes to render at this level. */
@@ -273,8 +405,6 @@ export class FolderTreeComponent {
   readonly draftName = signal("");
   /** True while the create IPC is in flight. */
   readonly saving = signal(false);
-  /** Create error (cleared when re-opening / re-submitting). */
-  readonly createError = signal<string | null>(null);
 
   /** The name field — focused after it renders (afterNextRender; no setTimeout). */
   private readonly nameInput =
@@ -282,7 +412,6 @@ export class FolderTreeComponent {
 
   /** Open the inline create field and move focus into it once it has rendered. */
   openCreate(): void {
-    this.createError.set(null);
     this.draftName.set("");
     this.creating.set(true);
     afterNextRender(() => this.nameInput()?.nativeElement.focus(), {
@@ -297,7 +426,6 @@ export class FolderTreeComponent {
     }
     this.creating.set(false);
     this.draftName.set("");
-    this.createError.set(null);
   }
 
   onNameInput(event: Event): void {
@@ -306,8 +434,10 @@ export class FolderTreeComponent {
 
   /**
    * Submit the new folder at the vault root. Awaits the service (which reloads
-   * the tree), then closes the field. On failure keeps the field open with an
-   * inline error so the user can retry.
+   * the tree), then closes the field and SELECTS the freshly-created folder so
+   * it's highlighted and its (empty) note list is shown — a clear success
+   * signal. On failure we keep the field open (so the typed name isn't lost)
+   * and surface a single danger toast; no inline error noise.
    */
   async confirmCreate(event: Event): Promise<void> {
     event.preventDefault();
@@ -316,13 +446,15 @@ export class FolderTreeComponent {
       return;
     }
     this.saving.set(true);
-    this.createError.set(null);
     try {
-      await this.folders.create(name, null);
+      const folder = await this.folders.create(name, null);
       this.creating.set(false);
       this.draftName.set("");
+      // Surface the new folder: select + highlight it (its row now exists in the
+      // reloaded tree). The parent screen filters the meeting list to it.
+      this.select.emit(folder.id);
     } catch {
-      this.createError.set("Couldn’t create that folder. Try another name.");
+      this.toast.danger("Couldn’t create that folder. Try another name.");
     } finally {
       this.saving.set(false);
     }

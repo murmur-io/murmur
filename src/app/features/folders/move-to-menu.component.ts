@@ -306,7 +306,8 @@ export class MoveToMenuComponent {
     const walk = (nodes: FolderNode[], depth: number): void => {
       for (const node of nodes) {
         out.push({ node, depth });
-        if (node.children.length) {
+        // Defensive: tolerate a node without a `children` array.
+        if (node.children?.length) {
           walk(node.children, depth + 1);
         }
       }

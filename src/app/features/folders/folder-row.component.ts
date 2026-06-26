@@ -2,6 +2,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  forwardRef,
   inject,
   input,
   output,
@@ -33,11 +34,17 @@ import { LockBadgeComponent } from "./lock-badge.component";
   selector: "app-folder-row",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [LockBadgeComponent, FolderTreeComponent],
+  // `folder-row` ↔ `folder-tree` are mutually recursive standalone components
+  // (a row renders its children through another tree). Their ES modules form a
+  // cycle, so a direct reference here is `undefined` at metadata-evaluation time
+  // — Angular would then hit `getComponentDef(undefined)` (reading 'ɵcmp') the
+  // first time a row instantiates a child tree. `forwardRef` defers the lookup
+  // until the def exists, breaking the cycle. (See folder-tree for the mirror.)
+  imports: [LockBadgeComponent, forwardRef(() => FolderTreeComponent)],
   template: `
     <div class="row-line" [style.--depth]="depth()">
       <!-- Disclosure caret (only when the folder has children) -->
-      @if (node().children.length) {
+      @if (childCount()) {
         <button
           type="button"
           class="caret"
@@ -204,9 +211,9 @@ import { LockBadgeComponent } from "./lock-badge.component";
     }
 
     <!-- Children: child-component recursion (NOT a nested @for of rows). -->
-    @if (expanded() && node().children.length) {
+    @if (expanded() && childCount()) {
       <app-folder-tree
-        [nodes]="node().children"
+        [nodes]="children()"
         [selectedId]="selectedId()"
         [depth]="depth() + 1"
         (select)="select.emit($event)"
@@ -397,6 +404,15 @@ export class FolderRowComponent {
   readonly exposure = computed<FolderExposure>(() =>
     this.folders.exposureOf(this.node()),
   );
+
+  /**
+   * This folder's children — always an array, even if the backend node omits
+   * the field. Keeps the disclosure caret + child recursion from ever reading
+   * `.length` off `undefined` (which would throw and blank the tree).
+   */
+  readonly children = computed<FolderNode[]>(() => this.node().children ?? []);
+  /** Number of children (drives the caret + recursion guards). */
+  readonly childCount = computed(() => this.children().length);
 
   toggleExpanded(): void {
     this.expanded.update((v) => !v);
