@@ -10,6 +10,56 @@ use crate::transcribe::types::{Segment, Transcript};
 /// Whisper emits segment timestamps in centiseconds (1/100 s). Divide to get seconds.
 const CENTISECONDS_PER_SECOND: f64 = 100.0;
 
+/// Decoding profile — selects the latency/quality trade-off for a transcription run.
+///
+/// The two paths genuinely want different decoders, so we parameterise the ONE
+/// `transcribe` implementation with this enum instead of duplicating the body:
+///
+/// - [`TranscribeQuality::Accurate`] — the BATCH path (`pipeline.rs`, run once after Stop).
+///   Beam search + temperature fallback + anti-hallucination thresholds + previous-text
+///   conditioning. Slower, but maximises wording/inflection quality — critical for
+///   Polish, which is heavily inflected and where greedy decoding hallucinates more.
+///
+/// - [`TranscribeQuality::Fast`] — the LIVE path (`live.rs` captions) and the
+///   VOICE-TRIGGER path (`audio/listener.rs`). Greedy, single-best, no fallback ladder:
+///   lowest latency so a caption/wake-word tick stays snappy. These run on short
+///   overlapping windows many times per recording, so beam search there would burn CPU
+///   for output the user barely reads — quality is not the goal on those paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscribeQuality {
+    /// Low-latency greedy decoding for live captions + voice-trigger windows.
+    Fast,
+    /// High-quality batch decoding for the authoritative post-Stop transcript.
+    Accurate,
+}
+
+// ── Accurate (batch) decoding constants — see `build_params`. ──
+//
+// whisper.cpp's defaults already encode the canonical OpenAI-Whisper anti-hallucination
+// values; we set them EXPLICITLY so the batch profile is self-documenting and immune to a
+// future upstream default change.
+
+/// Beam width for the batch path. 5 = OpenAI Whisper's reference beam size.
+const BATCH_BEAM_SIZE: i32 = 5;
+/// `patience` is unimplemented in whisper.cpp (v1.7.x); -1.0 keeps its documented default.
+const BATCH_BEAM_PATIENCE: f32 = -1.0;
+/// Start of the temperature-fallback ladder (greedy/deterministic first pass).
+const BATCH_TEMPERATURE: f32 = 0.0;
+/// Ladder step: 0.0 → 0.2 → … → 1.0 (6 rungs). Whisper falls back up the ladder only when
+/// a decode trips the entropy/logprob gates below.
+const BATCH_TEMPERATURE_INC: f32 = 0.2;
+/// Entropy (a.k.a. gzip-compression-ratio) gate. whisper.cpp uses token entropy as its
+/// analog of OpenAI's `compression_ratio_threshold`; 2.4 is the reference value. Above it,
+/// the segment is treated as repetitive/hallucinated and the next temperature rung is tried.
+const BATCH_ENTROPY_THOLD: f32 = 2.4;
+/// Average-logprob gate; below -1.0 the decode is "low confidence" → temperature fallback.
+const BATCH_LOGPROB_THOLD: f32 = -1.0;
+/// No-speech probability gate; above 0.6 a segment is treated as silence (not hallucinated).
+const BATCH_NO_SPEECH_THOLD: f32 = 0.6;
+/// Max tokens of PRIOR text fed back as the decoder prompt (coreference / grammar carry-over).
+/// whisper.cpp's own default; set explicitly to document that previous-text conditioning is ON.
+const BATCH_N_MAX_TEXT_CTX: i32 = 16384;
+
 /// Wraps a loaded whisper.cpp model (Metal). Construct once; reuse per transcription.
 ///
 /// `WhisperContext` is `Send + Sync`, so a single `Transcriber` can live in shared state
@@ -43,9 +93,25 @@ impl Transcriber {
         Ok(Self { ctx })
     }
 
-    /// Transcribe 16 kHz mono f32 samples. `lang = Some("en")` forces a language;
-    /// `None` lets whisper auto-detect.
+    /// Transcribe 16 kHz mono f32 samples at the [`TranscribeQuality::Fast`] profile.
+    ///
+    /// `lang = Some("en")`/`Some("pl")` forces a language; `None` lets whisper auto-detect.
+    /// This is the low-latency greedy path used by live captions + the voice trigger. The
+    /// batch pipeline calls [`Transcriber::transcribe_with`] with
+    /// [`TranscribeQuality::Accurate`] instead.
     pub fn transcribe(&self, samples_16k_mono: &[f32], lang: Option<&str>) -> Result<Transcript> {
+        self.transcribe_with(samples_16k_mono, lang, TranscribeQuality::Fast)
+    }
+
+    /// Transcribe 16 kHz mono f32 samples at an explicit [`TranscribeQuality`] profile.
+    ///
+    /// `lang = Some("en")` forces a language; `None` lets whisper auto-detect.
+    pub fn transcribe_with(
+        &self,
+        samples_16k_mono: &[f32],
+        lang: Option<&str>,
+        quality: TranscribeQuality,
+    ) -> Result<Transcript> {
         if samples_16k_mono.is_empty() {
             return Ok(Transcript {
                 full_text: String::new(),
@@ -59,9 +125,10 @@ impl Transcriber {
             .create_state()
             .map_err(|e| AppError::Transcribe(format!("create whisper state: {e}")))?;
 
-        // Greedy sampling is the fast, deterministic default for batch transcription.
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        // `None` => auto-detect language; `Some("en")` => force it.
+        let mut params = build_params(quality);
+        // `None` => auto-detect language; `Some("en")`/`Some("pl")` => force it. Forcing
+        // "pl" (the global Polish option) skips language detection and biases the decoder's
+        // token priors toward Polish — the single biggest win for Polish quality.
         params.set_language(lang);
         // Silence whisper.cpp's own stdout chatter — we surface progress via events.
         params.set_print_special(false);
@@ -102,6 +169,10 @@ impl Transcriber {
                 start_s: t0 as f64 / CENTISECONDS_PER_SECOND,
                 end_s: t1 as f64 / CENTISECONDS_PER_SECOND,
                 text: trimmed.to_string(),
+                // The transcriber is stream-agnostic: speaker attribution ("me"/"others") is
+                // assigned by the wall-clock merge in `audio::merge` from which stream produced
+                // these segments, not here. Live/voice-trigger callers leave it as `None`.
+                speaker: None,
             });
         }
 
@@ -122,6 +193,48 @@ impl Transcriber {
     pub fn transcribe_wav(&self, wav_path: &Path, lang: Option<&str>) -> Result<Transcript> {
         let samples = read_wav_16k_mono(wav_path)?;
         self.transcribe(&samples, lang)
+    }
+}
+
+/// Build the decoder [`FullParams`] for a given [`TranscribeQuality`] profile.
+///
+/// Only the sampling strategy + decoding-hygiene knobs differ here; the caller still sets
+/// `language` and silences the print flags. Keeping this in ONE place is why batch vs live
+/// can diverge without duplicating the `transcribe` body.
+fn build_params<'a>(quality: TranscribeQuality) -> FullParams<'a, 'a> {
+    match quality {
+        // LIVE captions + VOICE TRIGGER: keep greedy / best_of:1. These run on short,
+        // overlapping windows every couple of seconds, so latency dominates — beam search +
+        // a 6-rung temperature ladder would multiply the per-tick cost for output the user
+        // only glances at. Quality is the batch path's job, NOT the live path's. Do NOT add
+        // beam search here.
+        TranscribeQuality::Fast => FullParams::new(SamplingStrategy::Greedy { best_of: 1 }),
+
+        // BATCH (post-Stop authoritative transcript): the anti-hallucination + inflection
+        // levers. Beam search explores multiple hypotheses (better wording/grammar — matters
+        // for heavily-inflected Polish); the temperature ladder + entropy/logprob/no-speech
+        // gates let whisper retry a segment at a higher temperature when a decode looks
+        // repetitive or low-confidence (the classic anti-hallucination loop); previous-text
+        // conditioning carries grammar/coreference across segment boundaries.
+        TranscribeQuality::Accurate => {
+            let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+                beam_size: BATCH_BEAM_SIZE,
+                patience: BATCH_BEAM_PATIENCE,
+            });
+            // Temperature-fallback ladder: 0.0 → +0.2 → … → 1.0.
+            params.set_temperature(BATCH_TEMPERATURE);
+            params.set_temperature_inc(BATCH_TEMPERATURE_INC);
+            // Anti-hallucination gates that trigger the next ladder rung.
+            params.set_entropy_thold(BATCH_ENTROPY_THOLD);
+            params.set_logprob_thold(BATCH_LOGPROB_THOLD);
+            params.set_no_speech_thold(BATCH_NO_SPEECH_THOLD);
+            // Previous-text conditioning ON: feed prior decoded text back as the prompt.
+            // whisper.cpp's flag is `no_context` (inverted) and defaults to TRUE (conditioning
+            // OFF), so we MUST flip it to false to keep coreference/grammar carry-over.
+            params.set_no_context(false);
+            params.set_n_max_text_ctx(BATCH_N_MAX_TEXT_CTX);
+            params
+        }
     }
 }
 
@@ -172,4 +285,37 @@ fn read_wav_16k_mono(wav_path: &Path) -> Result<Vec<f32>> {
         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
         .collect();
     Ok(mono)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_profiles_are_distinct_and_copy() {
+        // `Copy` lets call sites pass the profile by value without ceremony.
+        let q = TranscribeQuality::Accurate;
+        let _also = q;
+        assert_ne!(TranscribeQuality::Fast, TranscribeQuality::Accurate);
+    }
+
+    #[test]
+    fn build_params_constructs_both_profiles() {
+        // `whisper_full_default_params` is a pure C struct-filler — no model/context needed —
+        // so this exercises the batch setter chain (beam search + thresholds + no_context)
+        // and the live greedy path without GPU work. A panic/UB here would fail the test.
+        let _fast = build_params(TranscribeQuality::Fast);
+        let _accurate = build_params(TranscribeQuality::Accurate);
+    }
+
+    #[test]
+    fn batch_constants_match_whispercpp_reference_values() {
+        // Guards against an accidental drift away from the OpenAI-Whisper reference hygiene.
+        assert_eq!(BATCH_BEAM_SIZE, 5);
+        assert_eq!(BATCH_TEMPERATURE, 0.0);
+        assert_eq!(BATCH_TEMPERATURE_INC, 0.2);
+        assert_eq!(BATCH_ENTROPY_THOLD, 2.4);
+        assert_eq!(BATCH_LOGPROB_THOLD, -1.0);
+        assert_eq!(BATCH_NO_SPEECH_THOLD, 0.6);
+    }
 }

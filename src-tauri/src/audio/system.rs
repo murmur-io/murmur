@@ -27,6 +27,11 @@ pub fn is_available() -> bool {
 pub struct SystemAudioRecorder {
     child: Child,
     wav_path: PathBuf,
+    /// Host wall-clock instant when the sidecar was spawned (capture start). The mic (cpal) and
+    /// this ScreenCaptureKit stream run on INDEPENDENT clocks, so the wall-clock merge anchors
+    /// each stream's segments to its own host start instead of aligning by sample count (which
+    /// drifts seconds/hour). See `audio::merge`.
+    started_at: std::time::Instant,
 }
 
 impl SystemAudioRecorder {
@@ -42,7 +47,16 @@ impl SystemAudioRecorder {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AppError::Audio(format!("failed to spawn system-audio sidecar: {e}")))?;
-        Ok(Self { child, wav_path })
+        Ok(Self {
+            child,
+            wav_path,
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Host wall-clock instant when this system-audio stream started capturing (for the merge).
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
     }
 
     /// SIGTERM the sidecar so it finalizes the WAV, wait for it, and return the WAV path

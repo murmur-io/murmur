@@ -1,10 +1,13 @@
 pub mod audio;
+pub mod biometric;
 pub mod commands;
+pub mod crypto;
 pub mod error;
 pub mod events;
 pub mod export;
 pub mod mcp;
 pub mod pipeline;
+pub mod screenshare;
 pub mod secrets;
 pub mod settings;
 pub mod state;
@@ -49,6 +52,8 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             commands::recording_level,
+            commands::set_mic_muted,
+            commands::is_mic_muted,
             commands::get_last_note,
             commands::update_note,
             commands::get_config,
@@ -79,6 +84,8 @@ pub fn run() {
             commands::add_reminder,
             commands::pin_moment,
             commands::link_meeting_entities,
+            commands::get_graph,
+            commands::get_entity_detail,
             commands::ask_vault,
             commands::generate_digest,
             commands::topic_threads,
@@ -92,6 +99,15 @@ pub fn run() {
             commands::model_present,
             commands::download_model,
             commands::toggle_bar,
+            commands::list_folders,
+            commands::create_folder,
+            commands::move_note,
+            commands::lock_folder,
+            commands::unlock_folder,
+            commands::unlock_meeting,
+            commands::relock_folder,
+            commands::relock_all,
+            commands::remove_lock,
         ])
         .setup(|app| {
             create_bar_window(app.handle())?;
@@ -101,11 +117,22 @@ pub fn run() {
             commands::restart_voice_listener(app.handle().clone());
             setup_tray(app.handle())?;
             // Localhost MCP server (read-only meeting tools for Claude Desktop/Code; no egress).
+            // Share the session unlock set so sealed-and-not-unlocked notes stay invisible.
             if let Some(db_path) =
                 dirs::data_dir().map(|b| b.join("MeetNotes").join("meetnotes.sqlite"))
             {
-                crate::mcp::spawn(db_path);
+                let state = app.state::<AppState>();
+                let unlocked = state.unlocked_folders.clone();
+                let require_token = state
+                    .config
+                    .lock()
+                    .map(|c| c.mcp_require_token)
+                    .unwrap_or(false);
+                crate::mcp::spawn(db_path, unlocked, require_token);
             }
+            // Screen-share auto-relock watcher: on capture START, relock all session-unlocked
+            // folders + zeroize the KEK and toast the UI. Gated by K_RELOCK_ON_SCREENSHARE.
+            crate::screenshare::spawn(app.handle().clone());
             // Closing the main window HIDES it (recoverable from the tray) instead of
             // quitting — so the floating bar is never the only way back into the app.
             if let Some(main) = app.get_webview_window("main") {

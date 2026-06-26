@@ -87,6 +87,10 @@ impl VoiceListener {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                // VOICE TRIGGER uses the Fast (greedy/best_of:1) profile via `transcribe` —
+                // NOT the batch beam-search path. We only need a wake-phrase match on a short
+                // ~2s window many times over; low latency matters far more than transcript
+                // quality here, so beam search would be wasted CPU. Keep it greedy.
                 if let Ok(t) = transcriber.transcribe(&s16, language.as_deref()) {
                     if is_wake_phrase(&t.full_text) {
                         tracing::info!(target: "voice", "wake phrase detected");
