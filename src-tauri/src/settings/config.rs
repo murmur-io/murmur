@@ -23,7 +23,9 @@ pub struct AppConfig {
     pub claude_binary: String,
     /// Capture system audio (the other side of the call) via ScreenCaptureKit. Default off.
     pub capture_system_audio: bool,
-    /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3". Default "small".
+    /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
+    /// "large-v3". Default "large-v3" (~3 GB, multilingual) — best transcription quality,
+    /// notably for Polish; downloaded on demand via `download_model`.
     pub model_size: String,
     /// Voice trigger: start recording when a wake phrase is heard. Default off.
     pub voice_trigger: bool,
@@ -61,7 +63,7 @@ impl Default for AppConfig {
             ollama_model: "llama3.1".to_string(),
             claude_binary: "claude".to_string(),
             capture_system_audio: false,
-            model_size: "small".to_string(),
+            model_size: "large-v3".to_string(),
             voice_trigger: false,
             onboarded: false,
             note_style: "standard".to_string(),

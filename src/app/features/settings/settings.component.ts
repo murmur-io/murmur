@@ -26,13 +26,14 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         </div>
       }
 
-      <!-- Transcription model: language + quality + auto-download -->
+      <!-- Transcription model: language + quality + on-demand download -->
       <div class="card model-card">
         <div class="model-copy">
           <h3>Transcription model</h3>
           <p class="text-secondary model-sub">
-            Runs on-device. Pick your language and quality — the matching
-            Whisper model downloads automatically.
+            Runs entirely on-device. Pick your language and quality — the
+            matching Whisper model is fetched once and reused for every
+            recording.
           </p>
         </div>
 
@@ -41,8 +42,8 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
             <span class="field-label">Language</span>
             <select formControlName="language" (change)="onModelChoiceChange()">
               <option value="">Auto-detect</option>
-              <option value="en">English</option>
               <option value="pl">Polski</option>
+              <option value="en">English</option>
               <option value="de">Deutsch</option>
               <option value="es">Español</option>
               <option value="fr">Français</option>
@@ -51,6 +52,10 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
               <option value="uk">Українська</option>
               <option value="nl">Nederlands</option>
             </select>
+            <span class="field-help text-muted">
+              Force the transcription language. Polish recommended if you record
+              mostly in Polish (auto-detect can misfire on short clips).
+            </span>
           </label>
 
           <label class="field">
@@ -61,10 +66,19 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
             >
               <option value="tiny">Tiny — fastest (~75 MB)</option>
               <option value="base">Base (~150 MB)</option>
-              <option value="small">Small — recommended (~470 MB)</option>
-              <option value="medium">Medium — accurate (~1.5 GB)</option>
-              <option value="large-v3">Large — best (~3 GB)</option>
+              <option value="small">Small (~470 MB)</option>
+              <option value="medium">Medium (~1.5 GB)</option>
+              <option value="large-v3-turbo">
+                Large v3 Turbo — fast &amp; accurate (~1.6 GB)
+              </option>
+              <option value="large-v3">
+                Large v3 — best accuracy, recommended (~3 GB)
+              </option>
             </select>
+            <span class="field-help text-muted">
+              Large v3 is the most accurate and the default — it’s a one-time ~3
+              GB download. Turbo is nearly as good and much smaller.
+            </span>
           </label>
         </div>
 
@@ -72,7 +86,10 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           @if (modelPresent() === true) {
             <span class="pill is-success">
               <span class="pill-dot"></span>
-              Model ready
+              Downloaded ✓
+            </span>
+            <span class="text-muted model-note">
+              Stored on this Mac — used for every recording.
             </span>
           } @else if (modelPresent() === false) {
             <button
@@ -82,11 +99,19 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
               [disabled]="downloadingModel()"
             >
               @if (downloadingModel()) {
+                <span class="spin-ring" aria-hidden="true"></span>
                 Downloading…
               } @else {
-                Download model ({{ downloadHint() }})
+                Download ({{ downloadHint() }})
               }
             </button>
+            <span class="text-muted model-note">
+              @if (downloadingModel()) {
+                Fetching the model — large models can take a few minutes.
+              } @else {
+                {{ downloadHint() }}, one time, on-device.
+              }
+            </span>
           } @else {
             <span class="pill">
               <span class="pill-dot"></span>
@@ -694,6 +719,34 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
       .model-status-row {
         display: flex;
         align-items: center;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+        min-height: 40px;
+      }
+      .model-note {
+        font-size: 0.85rem;
+      }
+      /* Inline spinner on the Download button (matches the onboarding wizard). */
+      .spin-ring {
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 255, 255, 0.35);
+        border-top-color: var(--text-on-accent);
+        animation: spin 0.8s linear infinite;
+        margin-right: var(--space-2);
+        vertical-align: -2px;
+        display: inline-block;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .spin-ring {
+          animation: none;
+        }
       }
 
       /* --- Notes card (summary style + auto-organize) --- */
@@ -1107,7 +1160,7 @@ export class SettingsComponent implements OnInit {
     ollamaModel: "llama3.1",
     claudeBinary: "claude",
     captureSystemAudio: false,
-    modelSize: "small",
+    modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
     autoOrganize: false,
@@ -1154,7 +1207,7 @@ export class SettingsComponent implements OnInit {
   readonly modelDownloadError = signal<string | null>(null);
 
   /** Approx download size for the selected quality (shown on the Download button). */
-  readonly downloadHint = signal("~470 MB");
+  readonly downloadHint = signal("~3 GB");
 
   /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
   private loadedOnboarded = true;
@@ -1174,7 +1227,7 @@ export class SettingsComponent implements OnInit {
         ollamaModel: cfg.ollamaModel,
         claudeBinary: cfg.claudeBinary,
         captureSystemAudio: cfg.captureSystemAudio ?? false,
-        modelSize: cfg.modelSize ?? "small",
+        modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
         autoOrganize: cfg.autoOrganize ?? false,
@@ -1258,6 +1311,7 @@ export class SettingsComponent implements OnInit {
       base: "~150 MB",
       small: "~470 MB",
       medium: "~1.5 GB",
+      "large-v3-turbo": "~1.6 GB",
       "large-v3": "~3 GB",
     };
     this.downloadHint.set(hints[this.form.getRawValue().modelSize] ?? "");
