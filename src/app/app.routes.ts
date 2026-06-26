@@ -42,6 +42,11 @@ export const routes: Routes = [
       import("./features/ask/ask.component").then((m) => m.AskComponent),
   },
   {
+    path: "graph",
+    loadComponent: () =>
+      import("./features/graph/graph.component").then((m) => m.GraphComponent),
+  },
+  {
     path: "bar",
     loadComponent: () =>
       import("./features/bar/bar.component").then(
