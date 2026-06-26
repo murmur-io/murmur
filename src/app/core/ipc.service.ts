@@ -270,6 +270,17 @@ export class IpcService {
     return invoke<MeetingDetail | null>("get_meeting_detail", { meetingId });
   }
 
+  /**
+   * Resolve this meeting's owning folder and run the biometric unlock_folder
+   * path (Touch ID). Returns the updated `FolderNode` for the folder, or null
+   * when the meeting is at the vault root / in an open folder. After a success,
+   * re-fetch `getMeetingDetail` to get the full unmasked content. Rejects when
+   * the biometric prompt is denied / cancelled.
+   */
+  unlockMeeting(meetingId: string): Promise<FolderNode | null> {
+    return invoke<FolderNode | null>("unlock_meeting", { meetingId });
+  }
+
   /** AI-derived speaker + topic timeline for a meeting (generated + cached on first call). */
   getTimeline(meetingId: string): Promise<MeetingTimeline> {
     return invoke<MeetingTimeline>("get_timeline", { meetingId });
