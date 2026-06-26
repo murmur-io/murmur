@@ -7,8 +7,8 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, BuiltinRecipe, ChatTurn, Meeting, MeetingStatus, MeetingTimeline,
-    NoteRecord, PinResult, RecipeRecord, SearchHit,
+    ActionItem, Analytics, AskVaultResult, BuiltinRecipe, ChatTurn, DigestResult, Meeting,
+    MeetingStatus, MeetingTimeline, NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -748,6 +748,147 @@ pub async fn link_meeting_entities(
         crate::export::entity_stub::ensure_entity_backlink(vault_path, "Projects", pr, &title)?;
     }
     Ok(payload)
+}
+
+/// Ask-My-Vault: answer a question across ALL past meetings' notes (grounded, with sources).
+#[tauri::command]
+pub async fn ask_vault(
+    state: State<'_, AppState>,
+    question: String,
+    history: Vec<ChatTurn>,
+) -> Result<AskVaultResult, AppError> {
+    if question.trim().is_empty() {
+        return Err(AppError::InvalidArg("question is empty".into()));
+    }
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let (corpus, sources) = crate::summarize::vault_context::build_vault_context(
+        &state.db,
+        &question,
+        &config.provider_id,
+    )?;
+    if corpus.trim().is_empty() {
+        return Ok(AskVaultResult {
+            answer: "No meeting notes to search yet — record and summarize a meeting first."
+                .to_string(),
+            sources: Vec::new(),
+        });
+    }
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let (system, user) = crate::summarize::vault_chat::build(&corpus, &history, &question);
+    let answer = provider.complete(&system, &user).await?;
+    Ok(AskVaultResult { answer, sources })
+}
+
+/// Generate a Weekly Vault Digest synthesizing meetings from the last `days` days; writes it
+/// into the vault's Digests/ folder and returns the markdown + path.
+#[tauri::command]
+pub async fn generate_digest(
+    state: State<'_, AppState>,
+    days: i64,
+) -> Result<DigestResult, AppError> {
+    let days = days.clamp(1, 90);
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let budget = if config.provider_id == "ollama" {
+        4_000
+    } else {
+        80_000
+    };
+    let mut corpus = String::new();
+    let mut count = 0usize;
+    for m in state.db.list_meetings(300)? {
+        if m.started_at.as_str() < cutoff.as_str() {
+            continue;
+        }
+        if corpus.len() >= budget {
+            break;
+        }
+        let Some(note) = state.db.get_latest_note_for_meeting(&m.id)? else {
+            continue;
+        };
+        let title = m.title.clone().unwrap_or_else(|| "(untitled)".to_string());
+        let date = m.started_at.split(['T', ' ']).next().unwrap_or("").to_string();
+        let header = format!("\n\n### [[{title}]] · {date}\n");
+        let remaining = budget.saturating_sub(corpus.len() + header.len());
+        if remaining < 200 {
+            break;
+        }
+        corpus.push_str(&header);
+        corpus.push_str(&note.markdown.chars().take(remaining).collect::<String>());
+        count += 1;
+    }
+    if count == 0 {
+        return Err(AppError::InvalidArg(format!(
+            "no summarized meetings in the last {days} days"
+        )));
+    }
+    let range_label = format!("the last {days} days");
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let (system, user) =
+        crate::summarize::digest::build_digest_prompt(&corpus, &range_label, &config.note_language);
+    let markdown = provider.complete(&system, &user).await?;
+
+    let exported_path = match config.vault_path.as_deref().filter(|p| !p.is_empty()) {
+        Some(vault) => {
+            let now = chrono::Utc::now().to_rfc3339();
+            crate::export::write_note(
+                std::path::Path::new(vault),
+                Some("Digests"),
+                "Weekly Digest",
+                &now,
+                &markdown,
+            )
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+        }
+        None => None,
+    };
+    Ok(DigestResult {
+        markdown,
+        exported_path,
+    })
+}
+
+/// Topic Threads: cluster the per-meeting topic spans (from cached timelines) across the whole
+/// library into cross-meeting threads. Deterministic, no LLM. Only meetings whose timeline has
+/// been generated (viewed at least once) contribute.
+#[tauri::command]
+pub fn topic_threads(state: State<'_, AppState>) -> Result<Vec<TopicThread>, AppError> {
+    let mut input = Vec::new();
+    for m in state.db.list_meetings(500)? {
+        let Some(json) = state.db.get_timeline_data(&m.id)? else {
+            continue;
+        };
+        let Ok(tl) = serde_json::from_str::<MeetingTimeline>(&json) else {
+            continue;
+        };
+        if tl.topics.is_empty() {
+            continue;
+        }
+        input.push(crate::summarize::threads::MeetingTopics {
+            meeting_id: m.id,
+            title: m.title.unwrap_or_else(|| "(untitled)".to_string()),
+            started_at: m.started_at,
+            topics: tl
+                .topics
+                .iter()
+                .map(|t| (t.label.clone(), t.start_s, t.end_s))
+                .collect(),
+        });
+    }
+    Ok(crate::summarize::threads::build_threads(&input))
 }
 
 /// Read current config (settings table), without secrets.

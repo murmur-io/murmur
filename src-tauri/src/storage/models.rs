@@ -155,3 +155,48 @@ pub struct PinResult {
     pub block_id: String,
     pub mmss: String,
 }
+
+/// A meeting referenced as a source in an Ask-My-Vault answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultSource {
+    pub meeting_id: String,
+    pub title: String,
+    pub started_at: String,
+}
+
+/// Result of an Ask-My-Vault query: the grounded answer + the source meetings used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskVaultResult {
+    pub answer: String,
+    pub sources: Vec<VaultSource>,
+}
+
+/// Result of generating a vault digest: the markdown + the path written into the vault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DigestResult {
+    pub markdown: String,
+    pub exported_path: Option<String>,
+}
+
+/// One occurrence of a topic in a meeting (a node in a Topic Thread).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicMention {
+    pub meeting_id: String,
+    pub title: String,
+    pub started_at: String,
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+/// A cross-meeting topic thread: every mention of a topic across the whole library.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicThread {
+    pub label: String,
+    pub count: usize,
+    pub mentions: Vec<TopicMention>,
+}
