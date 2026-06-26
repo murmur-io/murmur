@@ -11,8 +11,10 @@ import type {
   CalendarEvent,
   ChatTurn,
   DigestResult,
+  EntityDetail,
   Folder,
   FolderNode,
+  GraphData,
   GraphPayload,
   Meeting,
   MeetingDetail,
@@ -164,6 +166,20 @@ export class IpcService {
   /** Build the self-assembling graph: write [[Person]]/[[Project]] stub notes + backlinks. */
   linkMeetingEntities(meetingId: string): Promise<GraphPayload> {
     return invoke<GraphPayload>("link_meeting_entities", { meetingId });
+  }
+
+  /**
+   * The self-assembling graph: all VISIBLE entity nodes (with visible mention counts) + all
+   * VISIBLE co-occurrence edges + a `hasHidden` flag. Sealed-not-unlocked meetings contribute
+   * nothing; re-fetch on a FoldersService lock-state change to drop sealed entities live.
+   */
+  getGraph(): Promise<GraphData> {
+    return invoke<GraphData>("get_graph");
+  }
+
+  /** Detail for one entity: the entity + its visible backlinked meetings + top neighbors. */
+  getEntityDetail(entityId: string): Promise<EntityDetail> {
+    return invoke<EntityDetail>("get_entity_detail", { entityId });
   }
 
   /** Ask-My-Vault: grounded Q&A across ALL meetings, with source meetings. */
