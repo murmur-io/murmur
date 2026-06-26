@@ -137,6 +137,14 @@ interface FolderOption {
         padding: var(--space-3);
         min-width: 260px;
         max-width: 320px;
+        /* Floating popover OVER the meeting list → must be OPAQUE. The global .card is a
+           frosted/translucent surface, which bled the list through (broken-looking modal). */
+        background: var(--surface-overlay);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-lg);
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
       }
       .menu-head {
         display: flex;
@@ -245,7 +253,9 @@ interface FolderOption {
         padding: var(--space-3);
         border: 1px solid var(--warning);
         border-radius: var(--radius-md);
-        background: var(--warning-soft);
+        /* Opaque so nothing behind shows through; the warning border + halo carry the caution. */
+        background: var(--surface-overlay);
+        box-shadow: 0 0 0 4px var(--warning-soft);
       }
       .confirm-title {
         margin: 0 0 var(--space-1);
