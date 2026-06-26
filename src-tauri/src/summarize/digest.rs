@@ -15,12 +15,12 @@ pub fn build_digest_prompt(
     let system = format!(
         "You write ONE Obsidian DIGEST note synthesizing several meetings from {range_label}. \
 Base everything ONLY on the meeting notes provided (each headed by `### [[Title]] · date`). \
-Output Markdown with these sections:\n\
+Output clean, scannable Markdown with these sections (keep the emoji):\n\
 - a 2-3 sentence overview of the period,\n\
-- ## Recurring themes,\n\
-- ## Decisions (each citing its [[Title]] source),\n\
-- ## Open action items — rolled forward and grouped by owner ('who owes what'),\n\
-- ## Meetings — a bullet [[Title]] list of every source.\n\
+- ## 🔁 Recurring themes,\n\
+- ## ✅ Decisions (each citing its [[Title]] source),\n\
+- ## ⏳ Open action items — rolled forward and grouped by owner ('who owes what'),\n\
+- ## 🗂 Meetings — a bullet [[Title]] list of every source.\n\
 Cite sources with their [[Title]] exactly as given. Never invent facts, decisions, or owners. \
 Do not emit YAML front-matter.\n\n{lang}",
         lang = language_directive(note_language)
