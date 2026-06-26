@@ -256,7 +256,10 @@ impl Db {
     pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status
+            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
+                    (SELECT n.folder_id FROM notes n
+                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id
                FROM meetings WHERE id = ?1",
             rusqlite::params![id],
             row_to_meeting,
@@ -269,7 +272,10 @@ impl Db {
     pub fn latest_meeting(&self) -> Result<Option<Meeting>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status
+            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
+                    (SELECT n.folder_id FROM notes n
+                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id
                FROM meetings ORDER BY started_at DESC, id DESC LIMIT 1",
             [],
             row_to_meeting,
@@ -284,7 +290,10 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, started_at, ended_at, title, duration_s, audio_path, status
+                "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
+                        (SELECT n.folder_id FROM notes n
+                          WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
+                          AS folder_id
                    FROM meetings ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
             .map_err(map_err)?;
@@ -311,7 +320,10 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
-                        m.audio_path, m.status
+                        m.audio_path, m.status, \
+                        (SELECT nf.folder_id FROM notes nf \
+                          WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
+                          AS folder_id
                    FROM meetings m
                    LEFT JOIN segments s ON s.meeting_id = m.id
                    LEFT JOIN notes n ON n.meeting_id = m.id
@@ -562,7 +574,10 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, \
-                        m.status
+                        m.status, \
+                        (SELECT nf.folder_id FROM notes nf \
+                          WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
+                          AS folder_id
                    FROM meetings m
                    JOIN meeting_tags t ON t.meeting_id = m.id
                   WHERE t.tag = ?1
@@ -873,9 +888,11 @@ impl Db {
         Ok(out)
     }
 
-    /// Assign (or clear) a note's folder. Targets every provider row for the meeting so the
-    /// note moves as a unit.
-    pub fn set_note_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
+    /// Assign (or clear) a MEETING's folder. A meeting's folder = its note's folder, so this
+    /// updates `folder_id` on EVERY provider row of the meeting (`WHERE meeting_id = ?1`) — the
+    /// note moves as a unit and the seal/unlock lifecycle (which iterates provider rows) stays
+    /// coherent (no row left in a stale folder). `None` clears the folder (move to vault root).
+    pub fn set_meeting_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE notes SET folder_id = ?2 WHERE meeting_id = ?1",
@@ -883,6 +900,11 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Back-compat alias for [`Db::set_meeting_folder`] — a note's folder is the meeting's folder.
+    pub fn set_note_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
+        self.set_meeting_folder(meeting_id, folder_id)
     }
 
     /// Notes assigned to a folder (the rows needed to seal/unseal): the meeting, provider,
@@ -1023,7 +1045,10 @@ impl Db {
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
             "SELECT DISTINCT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
-                    m.audio_path, m.status
+                    m.audio_path, m.status, \
+                    (SELECT nf.folder_id FROM notes nf \
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
+                      AS folder_id
                FROM meetings m
                LEFT JOIN segments s ON s.meeting_id = m.id
                LEFT JOIN notes n ON n.meeting_id = m.id
@@ -1069,7 +1094,10 @@ impl Db {
         // sibling visible note exists. Simpler + correct: keep the meeting if it has zero notes
         // OR at least one visible note.
         let sql = format!(
-            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status
+            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
+                    (SELECT nf.folder_id FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id
                FROM meetings m
               WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
                  OR EXISTS (
@@ -1180,6 +1208,9 @@ fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>> {
     let duration_s: i64 = row.get(4)?;
     let audio_path: Option<String> = row.get(5)?;
     let status_str: String = row.get(6)?;
+    // Trailing column: the meeting's folder, derived from its note rows (NULL = vault root).
+    // Every SELECT feeding this mapper appends a `folder_id` column in this position.
+    let folder_id: Option<String> = row.get(7)?;
 
     Ok(MeetingStatus::from_str(&status_str).map(|status| Meeting {
         id,
@@ -1189,6 +1220,7 @@ fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>> {
         duration_s,
         audio_path,
         status,
+        folder_id,
     }))
 }
 
@@ -1341,6 +1373,7 @@ mod tests {
             duration_s: 0,
             audio_path: None,
             status: MeetingStatus::Draft,
+            folder_id: None,
         }
     }
 
@@ -1488,6 +1521,117 @@ mod tests {
             ]
         );
     }
+
+    use crate::storage::models::Folder;
+
+    fn seed_folder(db: &Db, id: &str, name: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: name.to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    fn note_for(db: &Db, meeting_id: &str, provider_id: &str, markdown: &str) {
+        db.upsert_note(&NoteRecord {
+            meeting_id: meeting_id.to_string(),
+            provider_id: provider_id.to_string(),
+            markdown: markdown.to_string(),
+            created_at: "2026-06-26T09:05:00Z".to_string(),
+            exported_path: Some(format!("/vault/{meeting_id}-{provider_id}.md")),
+        })
+        .unwrap();
+    }
+
+    fn folder_id_of<'a>(meetings: &'a [Meeting], id: &str) -> &'a Option<String> {
+        &meetings
+            .iter()
+            .find(|m| m.id == id)
+            .expect("meeting present")
+            .folder_id
+    }
+
+    #[test]
+    fn meeting_folder_id_surfaces_in_list_and_search() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Secret");
+        // Meeting WITH a note moved into a folder.
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "# planning the budget review");
+        db.set_meeting_folder("m1", Some("f1")).unwrap();
+
+        // Meeting with a note but NO folder (root) → folder_id None.
+        db.insert_meeting(&sample_meeting("m2", "2026-06-24T11:00:00Z"))
+            .unwrap();
+        note_for(&db, "m2", "claude_code", "# budget at the root level");
+
+        // Meeting with NO note at all → folder_id None (no note rows to derive from).
+        db.insert_meeting(&sample_meeting("m3", "2026-06-24T12:00:00Z"))
+            .unwrap();
+
+        // list_meetings carries the derived folder_id.
+        let listed = db.list_meetings(50).unwrap();
+        assert_eq!(folder_id_of(&listed, "m1").as_deref(), Some("f1"));
+        assert_eq!(*folder_id_of(&listed, "m2"), None);
+        assert_eq!(*folder_id_of(&listed, "m3"), None);
+
+        // get_meeting carries it too.
+        assert_eq!(
+            db.get_meeting("m1").unwrap().unwrap().folder_id.as_deref(),
+            Some("f1")
+        );
+        assert_eq!(db.get_meeting("m2").unwrap().unwrap().folder_id, None);
+        assert_eq!(db.get_meeting("m3").unwrap().unwrap().folder_id, None);
+
+        // search hits carry the derived folder_id on the embedded meeting.
+        let hits = db.search("budget", 50).unwrap();
+        let h1 = hits.iter().find(|h| h.meeting.id == "m1").expect("m1 hit");
+        let h2 = hits.iter().find(|h| h.meeting.id == "m2").expect("m2 hit");
+        assert_eq!(h1.meeting.folder_id.as_deref(), Some("f1"));
+        assert_eq!(h2.meeting.folder_id, None);
+    }
+
+    #[test]
+    fn multi_provider_meeting_reports_one_consistent_folder_id() {
+        // A meeting re-summarized with TWO providers has two note rows. set_meeting_folder
+        // updates BOTH (WHERE meeting_id), so the correlated subselect returns a single,
+        // consistent folder regardless of which row it picks.
+        let db = mem_db();
+        seed_folder(&db, "f1", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "# claude budget note");
+        note_for(&db, "m1", "ollama", "# ollama budget note");
+        db.set_meeting_folder("m1", Some("f1")).unwrap();
+
+        // Both provider rows carry the same folder.
+        let folders: Vec<Option<String>> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare("SELECT folder_id FROM notes WHERE meeting_id = 'm1' ORDER BY provider_id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, Option<String>>(0))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(folders, vec![Some("f1".to_string()), Some("f1".to_string())]);
+
+        // list_meetings reports a single consistent folder_id (LIMIT 1 subselect, no dup rows).
+        let listed = db.list_meetings(50).unwrap();
+        let m1_rows: Vec<&Meeting> = listed.iter().filter(|m| m.id == "m1").collect();
+        assert_eq!(m1_rows.len(), 1, "one meeting row despite two provider notes");
+        assert_eq!(m1_rows[0].folder_id.as_deref(), Some("f1"));
+
+        // Clearing the folder (move to root) clears it for every provider row.
+        db.set_meeting_folder("m1", None).unwrap();
+        assert_eq!(db.get_meeting("m1").unwrap().unwrap().folder_id, None);
+    }
 }
 
 #[cfg(test)]
@@ -1544,6 +1688,7 @@ mod lock_tests {
             duration_s: 60,
             audio_path: None,
             status: MeetingStatus::Summarized,
+            folder_id: None,
         })
         .unwrap();
         db.upsert_note(&NoteRecord {

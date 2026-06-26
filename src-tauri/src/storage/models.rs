@@ -23,6 +23,9 @@ pub struct Meeting {
     pub duration_s: i64,
     pub audio_path: Option<String>,
     pub status: MeetingStatus,
+    /// Owning folder id (from the meeting's note rows), or `None` when at the vault root.
+    /// Derived from `notes.folder_id` — a meeting's folder = its note's folder.
+    pub folder_id: Option<String>,
 }
 
 /// A vault folder Murmur tracks for organization + per-folder locking.

@@ -129,6 +129,7 @@ pub async fn start_recording(
         duration_s: 0,
         audio_path: None,
         status: MeetingStatus::Recording,
+        folder_id: None,
     })?;
 
     // Free the mic from the voice listener (if any) before opening it for the recording.
@@ -1465,8 +1466,10 @@ pub fn move_note(
     // "no movable file" and skip the FS move entirely.
     let exported = note.as_ref().and_then(|n| n.exported_path.clone());
 
-    // Reassign in the DB first (the source-of-truth association).
-    state.db.set_note_folder(&meeting_id, folder_id.as_deref())?;
+    // Reassign in the DB first (the source-of-truth association). Targets EVERY provider row of
+    // the meeting (WHERE meeting_id = ?1) so the meeting's folder is consistent across providers
+    // and the seal/unlock lifecycle (which iterates provider rows) stays coherent.
+    state.db.set_meeting_folder(&meeting_id, folder_id.as_deref())?;
 
     // Best-effort FS move only when a plaintext .md exists and the target is open.
     if let (Some(src_path), false) = (exported, target_locked) {
