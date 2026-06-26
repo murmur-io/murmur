@@ -20,6 +20,7 @@ import type {
   GraphPayload,
   MeetingDetail,
   MeetingTimeline,
+  Segment,
 } from "../../core/models";
 import {
   FoldersService,
@@ -682,6 +683,14 @@ interface ParsedNote {
                       (click)="seekTo(s.startS)"
                     >
                       <span class="seg-time">{{ fmt(s.startS) }}</span>
+                      @if (speakerChip(s.speaker); as chip) {
+                        <span
+                          class="seg-speaker"
+                          [style.background]="chip.bg"
+                          [style.color]="chip.fg"
+                          >{{ chip.label }}</span
+                        >
+                      }
                       <span class="seg-text">{{ s.text }}</span>
                     </button>
                   </li>
@@ -765,10 +774,6 @@ interface ParsedNote {
         gap: var(--space-2);
         color: var(--text-muted);
         font-size: 0.8125rem;
-      }
-      .meta-item,
-      .meta-sep {
-        color: var(--text-muted);
       }
 
       /* --- Tag editor (chips + inline add) --- */
@@ -984,7 +989,6 @@ interface ParsedNote {
         flex: none;
       }
       .audio-off-text {
-        color: var(--text-muted);
         font-size: 0.875rem;
       }
 
@@ -1169,10 +1173,6 @@ interface ParsedNote {
       }
       .section:hover {
         border-color: var(--border-strong);
-      }
-      .section-head {
-        margin: 0 0 var(--space-3);
-        color: var(--text-primary);
       }
 
       .prose p {
@@ -1372,11 +1372,9 @@ interface ParsedNote {
       }
       .editor-hint,
       .graph-caption {
+        margin: 0;
         color: var(--text-muted);
         font-size: 0.8125rem;
-      }
-      .graph-caption {
-        margin: 0;
       }
 
       /* Transient "Saved" confirmation */
@@ -1478,6 +1476,17 @@ interface ParsedNote {
         font-size: 0.8125rem;
         font-variant-numeric: tabular-nums;
         padding-top: 0.1em;
+      }
+
+      /* Speaker chip: an optional Me/Others tag between the time + text
+         (colours bound inline). Legacy/null segments render unlabeled. */
+      .seg-speaker {
+        flex: none;
+        padding: 2px var(--space-2);
+        border-radius: var(--radius-pill);
+        font-size: 0.6875rem;
+        font-weight: 700;
+        line-height: 1.5;
       }
 
       /* --- Empty / loading wells (.count/.state-card/.empty* are global) --- */
@@ -2551,6 +2560,37 @@ export class DetailComponent implements OnInit {
   /** Strip surrounding quotes/whitespace from a YAML scalar. */
   private cleanScalar(s: string): string {
     return s.trim().replace(/^["']/, "").replace(/["']$/, "").trim();
+  }
+
+  /**
+   * Map a transcript segment's `speaker` to a small presentational chip:
+   * "Me" (the local mic, accent) vs "Others" (captured system audio, neutral/
+   * violet). Returns null for legacy / mic-only segments (`null` / unknown) so
+   * they render unlabeled exactly as before. This is independent of the AI
+   * timeline's manual speaker-rename — that feature relabels timeline lanes, not
+   * these per-segment Me/Others tags.
+   */
+  speakerChip(
+    speaker: Segment["speaker"],
+  ): { label: string; bg: string; fg: string } | null {
+    switch (speaker) {
+      case "me":
+        // Local mic — the calm accent.
+        return {
+          label: "Me",
+          bg: "var(--accent-soft)",
+          fg: "var(--accent-hover)",
+        };
+      case "others":
+        // Captured system audio — a neutral violet, distinct from "Me".
+        return {
+          label: "Others",
+          bg: "rgba(157, 123, 255, 0.16)",
+          fg: "#b9a4ff",
+        };
+      default:
+        return null;
+    }
   }
 
   /** Seconds → m:ss for timestamps + player times. */

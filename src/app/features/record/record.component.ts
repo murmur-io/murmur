@@ -6,18 +6,20 @@ import {
   computed,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 import { RecorderStore } from "../../core/recorder.store";
 import { IpcService } from "../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../core/models";
 import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
+import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 
 @Component({
   selector: "app-record",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, PreMeetingBriefComponent],
+  imports: [RouterLink, PreMeetingBriefComponent, MicMuteToggleComponent],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
     <section class="record">
@@ -101,6 +103,11 @@ import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
                 <span class="wbar" [style.--i]="b"></span>
               }
             </div>
+            <!-- Mic-mute: silences only the local mic; system audio keeps
+                 recording. Sits beside Stop but never starts/stops anything.
+                 Compact (icon-only) so the pill stays uncrowded; the descriptive
+                 "still capturing others" copy rides the stage hint below. -->
+            <app-mic-mute-toggle [compact]="true" #micToggle />
             <button
               type="button"
               class="stop-btn"
@@ -875,6 +882,9 @@ export class RecordComponent implements OnInit {
   /** Bars in the live waveform (driven by the real mic level signal). */
   readonly bars = Array.from({ length: 28 }, (_, i) => i);
 
+  /** The in-pill mic-mute toggle — its `muted()` signal drives the stage hint. */
+  private readonly micToggle = viewChild(MicMuteToggleComponent);
+
   /** Latest partial transcript, trimmed — drives the ephemeral caption line. */
   readonly liveCaption = computed(() => this.store.liveCaption().trim());
 
@@ -950,8 +960,13 @@ export class RecordComponent implements OnInit {
 
   /** Context line beneath the bar. */
   readonly hint = computed(() => {
-    if (this.store.isRecording())
+    if (this.store.isRecording()) {
+      // When the mic is muted the recording continues from system audio only —
+      // make that unmistakable in the prominent hint line beneath the pill.
+      if (this.micToggle()?.muted())
+        return "Mic muted — still capturing others. Press ⌘R or Stop when done.";
       return "Recording — press ⌘R or Stop when done.";
+    }
     if (this.isProcessing()) return "Transcribing on-device, then summarizing…";
     if (this.vaultMissing()) return "Set a vault folder in Settings to start.";
     if (this.modelPresent() === false) return "Download the model to start.";
