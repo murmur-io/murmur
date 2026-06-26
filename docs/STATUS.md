@@ -1,7 +1,9 @@
 # MeetNotes — Status
 
-> Updated 2026-06-24. Authoritative current state. Honest by construction: every
-> "verified" claim below is backed by `bash scripts/ci.sh` passing on this machine.
+> Updated 2026-06-26. Authoritative current state. Honest by construction: every
+> "verified" claim below is backed by `bash scripts/ci.sh` passing on this machine,
+> **or** explicitly attributed to a maintainer run on real hardware (kept distinct from
+> the headless-CI claims).
 
 ## TL;DR
 - **Implemented + verified (CI-green):** Phase 0 (skeleton), Phase 1 (3 AI providers,
@@ -9,16 +11,19 @@
   core pipeline E2E and the CI gate.
 - **One command proves it:** `bash scripts/ci.sh` → clippy (`-D warnings`) + cargo test
   (31) + cargo build + `ng lint` + `ng build` + headless E2E, all green.
-- **Remaining for prod-ready (all require YOU / a real Mac — cannot be verified in a
-  headless build):** Phase 2 system-audio **runtime** verification (code is implemented +
-  compiles + typechecks; capturing live audio needs a desktop + the Screen Recording
-  permission), Apple code-signing + notarization, and a real GUI + microphone run.
+- **Confirmed on real hardware (maintainer, not headless CI):** a live **microphone**
+  recording end-to-end — Record → Whisper → AI note in the vault — runs in the real GUI
+  on a Mac. This closes the Phase-0 "real GUI + mic run" DoD item.
+- **Remaining for prod-ready (require YOU / a real Mac — not reproducible in a headless
+  build):** a documented repro of the **mic + system-audio mix** on a real call (the
+  ScreenCaptureKit sidecar path; mic-only is confirmed), and Apple code-signing +
+  notarization.
 
 ## Implemented & verified
 | Area | What | Verified by |
 |---|---|---|
 | Skeleton | Tauri (Rust core) + Angular (zoneless, signals) frontend | `cargo build`, `ng build` |
-| Capture | Mic via cpal → 16 kHz mono WAV; **system audio via ScreenCaptureKit Swift sidecar (opt-in)** | unit tests + swiftc typecheck (capture runtime: user-gated) |
+| Capture | Mic via cpal → 16 kHz mono WAV; **system audio via ScreenCaptureKit Swift sidecar (opt-in)** | unit tests + swiftc typecheck; **live mic capture confirmed on real hardware (maintainer)**; system-audio mix runtime still user-gated |
 | Transcription | whisper.cpp (`whisper-rs`, Metal) | **headless E2E** (real audio→text) |
 | AI providers | `SummarizerProvider` trait + ClaudeCode (default) / Anthropic / Ollama | unit tests + **E2E** (ClaudeCode) |
 | Storage | SQLite (meetings/segments/notes/settings) | unit tests |
@@ -38,15 +43,19 @@ pipeline is proven end-to-end, minus the parts that need a desktop (below).
    `build.rs`, typechecked in CI) + `audio::system::SystemAudioRecorder` + a unit-tested
    mic/system `mixer`, opt-in via the Settings "Capture system audio" toggle (default
    off). The compile, typecheck, mixer tests, and the graceful no-permission exit are
-   verified. **Unverified (needs a real Mac):** capturing *live* system audio — that
-   requires a desktop session + the Screen Recording (TCC) permission + real audio.
-   Enable the toggle and confirm a mixed recording. Design notes: `docs/PHASE2-SYSTEM-AUDIO.md`.
+   verified. **Live mic capture is confirmed on real hardware (maintainer run).**
+   **Still to document:** a repro of capturing *live system* audio and the mic+system
+   **mix** on a real call — that requires a desktop session + the Screen Recording (TCC)
+   permission + real audio. Enable the toggle and capture a mixed recording, then record
+   the steps here. Design notes: `docs/PHASE2-SYSTEM-AUDIO.md`.
 2. **Apple code-sign + notarize / styled DMG.** The release `.app` builds, **ad-hoc-signs,
    and passes `codesign --verify --deep --strict`**, and a functional `.dmg` builds via
    `hdiutil` — all headless (`scripts/release.sh`). What remains is account/GUI-gated: a
    **Developer-ID identity** + **notarization** (paid Apple account; template in
    `scripts/macos-sign-notarize.sh`) and Tauri's *styled* DMG layout (Finder/AppleScript).
-3. **Real GUI + mic run** (closes the last Phase-0 DoD item). See §Run below.
+3. ~~**Real GUI + mic run** (closes the last Phase-0 DoD item).~~ **Done** — confirmed by
+   the maintainer on a real Mac: Record → Whisper → AI note in the vault works in the GUI.
+   See §Run below.
 
 ## Toolchain (installed in this environment)
 ```bash
@@ -77,7 +86,8 @@ run Ollama. Then **Record → speak → Stop** and confirm a note appears in the
 
 ## Phase roadmap
 - **0/1/3 + hygiene** — done (this session).
-- **2** — system audio: **implemented + compile-verified**; live-capture runtime is user-gated.
+- **2** — system audio: **implemented + compile-verified**; **live mic capture confirmed on
+  real hardware**, system-audio mix repro still user-gated.
 - **4** — signing/notarization (template ready), Tauri auto-updater (needs a signing
   keypair + release endpoint), then later: hosted provider tier, OpenAI/Groq/Gemini,
   diarization, live transcription, Windows (WASAPI loopback).

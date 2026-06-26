@@ -63,8 +63,15 @@ half (rename a speaker per meeting, feature #10) is shipped today.
 
 Every feature passed: `cargo clippy -D warnings`, `cargo test` (71 passing), `ng lint`,
 `ng build` (per-component style budgets respected), and each UI lane went through an adversarial
-verify pass. The full gate is `scripts/ci.sh`.
+verify pass. The full gate is `scripts/ci.sh`. Separately, **live microphone capture
+(Record → Whisper → note) is confirmed on real hardware by the maintainer** (see `docs/STATUS.md`).
 
 The MCP server's JSON-RPC protocol layer is unit-tested (initialize / tools/list / tools/call /
 notifications / errors); end-to-end interop with a running Claude Desktop should be confirmed by
 adding the config snippet (Settings → Local MCP server) and restarting Claude Desktop.
+
+> ⚠️ **Security caveat (see `docs/SECURITY-AUDIT.md`, finding H1):** the MCP server currently
+> starts unconditionally and has **no authentication** and **no `Host`/`Origin` validation**, so
+> any local process — or a web page via DNS-rebinding — can read your meetings over
+> `127.0.0.1:8765`. Treat "Settings → Local MCP server" as documentation-only until the audit's
+> remediation (opt-in toggle + per-install token + `Host` check) lands.
