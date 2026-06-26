@@ -140,7 +140,14 @@ async fn run_inner(
     let lang_owned = lang.map(str::to_string);
     let transcript = tokio::task::spawn_blocking(move || -> Result<_> {
         let transcriber = Transcriber::load(&model_path_owned)?;
-        transcriber.transcribe(&samples_16k, lang_owned.as_deref())
+        // BATCH path → Accurate profile (beam search + temperature fallback +
+        // anti-hallucination thresholds + previous-text conditioning). Live captions and the
+        // voice trigger keep the Fast greedy profile for latency — see transcribe::whisper.
+        transcriber.transcribe_with(
+            &samples_16k,
+            lang_owned.as_deref(),
+            crate::transcribe::TranscribeQuality::Accurate,
+        )
     })
     .await
     .map_err(|e| AppError::Transcribe(format!("transcription task panicked: {e}")))??;

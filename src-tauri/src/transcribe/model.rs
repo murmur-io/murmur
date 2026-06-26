@@ -18,12 +18,20 @@ pub const MODELS_SUBDIR: &str = "models";
 
 /// Map a chosen size + language to a whisper.cpp GGML model filename.
 ///
+/// Supported sizes (all served by the ggerganov/whisper.cpp HF mirror):
+/// `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3`.
+///
 /// English-only (`.en`) builds exist for tiny/base/small/medium — smaller + faster — and
 /// are used ONLY when the user explicitly selects English. Any other language (incl.
-/// Polish) or auto-detect needs the multilingual build. `large-v3` is multilingual-only.
+/// Polish) or auto-detect needs the multilingual build. `large-v3` and `large-v3-turbo`
+/// are multilingual-only (no `.en` variant), so Polish always resolves the full
+/// multilingual `ggml-large-v3.bin`.
+///
+/// An empty size falls back to the app default (`large-v3`), matching
+/// `AppConfig::default().model_size`.
 pub fn model_filename(size: &str, language: &str) -> String {
     let size = match size.trim() {
-        "" => "small",
+        "" => "large-v3",
         s => s,
     };
     let en_only = language == "en" && matches!(size, "tiny" | "base" | "small" | "medium");
@@ -144,4 +152,58 @@ async fn download_model(url: &str, dest: &Path) -> Result<()> {
         "whisper model ready"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn english_resolves_en_only_build_for_small_sizes() {
+        assert_eq!(model_filename("tiny", "en"), "ggml-tiny.en.bin");
+        assert_eq!(model_filename("base", "en"), "ggml-base.en.bin");
+        assert_eq!(model_filename("small", "en"), "ggml-small.en.bin");
+        assert_eq!(model_filename("medium", "en"), "ggml-medium.en.bin");
+    }
+
+    #[test]
+    fn large_v3_is_multilingual_only_even_for_english() {
+        // large-v3 / large-v3-turbo have no `.en` build — never append `.en`.
+        assert_eq!(model_filename("large-v3", "en"), "ggml-large-v3.bin");
+        assert_eq!(
+            model_filename("large-v3-turbo", "en"),
+            "ggml-large-v3-turbo.bin"
+        );
+    }
+
+    #[test]
+    fn polish_always_resolves_multilingual_build() {
+        // The global "Polish" option (language = "pl") must NEVER get an `.en` model.
+        assert_eq!(model_filename("large-v3", "pl"), "ggml-large-v3.bin");
+        assert_eq!(model_filename("medium", "pl"), "ggml-medium.bin");
+        assert_eq!(model_filename("small", "pl"), "ggml-small.bin");
+        assert_eq!(model_filename("tiny", "pl"), "ggml-tiny.bin");
+    }
+
+    #[test]
+    fn autodetect_resolves_multilingual_build() {
+        // Empty language (auto-detect) → multilingual for every size.
+        assert_eq!(model_filename("medium", ""), "ggml-medium.bin");
+        assert_eq!(model_filename("large-v3", ""), "ggml-large-v3.bin");
+    }
+
+    #[test]
+    fn empty_size_falls_back_to_large_v3_default() {
+        // Mirrors AppConfig::default().model_size.
+        assert_eq!(model_filename("", ""), "ggml-large-v3.bin");
+        assert_eq!(model_filename("   ", "pl"), "ggml-large-v3.bin");
+    }
+
+    #[test]
+    fn url_points_at_whispercpp_hf_mirror() {
+        assert_eq!(
+            model_url("ggml-large-v3.bin"),
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
+        );
+    }
 }

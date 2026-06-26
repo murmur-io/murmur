@@ -79,6 +79,10 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             }
         };
 
+        // LIVE captions use the Fast (greedy/best_of:1) profile via `transcribe` — NOT the
+        // batch beam-search path. Captions tick every few seconds on overlapping windows, so
+        // latency must dominate; beam search + temperature fallback would burn CPU per tick.
+        // The authoritative high-quality transcript is produced once at Stop (pipeline.rs).
         match transcriber.transcribe(&samples_16k, lang.as_deref()) {
             Ok(t) => {
                 let text = t
