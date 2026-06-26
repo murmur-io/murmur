@@ -1334,17 +1334,15 @@ interface ParsedNote {
         gap: var(--space-2);
         align-self: flex-start;
         padding: var(--space-1) var(--space-3);
-        height: 28px;
+        min-height: 28px;
         border-radius: var(--radius-pill);
         background: var(--success-soft);
-        border: 1px solid transparent;
         color: var(--success);
         font-size: 0.8125rem;
         font-weight: 600;
         animation: rise 280ms var(--transition) both;
       }
       .canvas-toast {
-        height: auto;
         word-break: break-all;
       }
       .saved-toast-check {
