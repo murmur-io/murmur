@@ -12,6 +12,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
 import type { ChatTurn } from "../../core/models";
+import { MarkdownComponent } from "../../shared/markdown.component";
 
 /** The starter prompts shown in the empty state — tap to ask immediately. */
 const STARTERS: readonly string[] = [
@@ -38,6 +39,7 @@ const STARTERS: readonly string[] = [
   selector: "app-meeting-chat",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [MarkdownComponent],
   template: `
     <div class="chat card">
       <div class="chat-head">
@@ -105,7 +107,11 @@ const STARTERS: readonly string[] = [
                   (turn.role === 'user' ? 'You' : 'Assistant') + ' said'
                 "
               >
-                {{ turn.content }}
+                @if (turn.role === "assistant") {
+                  <app-markdown [markdown]="turn.content" compact />
+                } @else {
+                  {{ turn.content }}
+                }
               </div>
             </div>
           }
@@ -349,6 +355,8 @@ const STARTERS: readonly string[] = [
         color: var(--text-primary);
         border-bottom-left-radius: var(--radius-sm);
         box-shadow: var(--glass-highlight);
+        /* Markdown renders its own block layout — don't let pre-wrap inject blank lines. */
+        white-space: normal;
       }
 
       /* --- Typing indicator --- */
