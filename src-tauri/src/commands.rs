@@ -7,8 +7,9 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BuiltinRecipe, ChatTurn, DigestResult, Meeting,
-    MeetingStatus, MeetingTimeline, NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
+    ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarEvent, ChatTurn,
+    DigestResult, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, PinResult, RecipeRecord,
+    SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -944,6 +945,71 @@ pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<S
     std::fs::write(&path, canvas)
         .map_err(|e| AppError::Export(format!("write canvas failed: {e}")))?;
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Pre-Meeting Brief: grounded prep card for an upcoming meeting `subject`, built from related
+/// past meeting notes.
+#[tauri::command]
+pub async fn pre_meeting_brief(
+    state: State<'_, AppState>,
+    subject: String,
+) -> Result<BriefResult, AppError> {
+    if subject.trim().is_empty() {
+        return Err(AppError::InvalidArg("subject is empty".into()));
+    }
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let (corpus, sources) = crate::summarize::vault_context::build_vault_context(
+        &state.db,
+        &subject,
+        &config.provider_id,
+    )?;
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let (system, user) =
+        crate::summarize::brief::build_brief_prompt(&corpus, &subject, &config.note_language);
+    let markdown = provider.complete(&system, &user).await?;
+    Ok(BriefResult { markdown, sources })
+}
+
+/// Best-effort: the soonest macOS Calendar event in the next 60 minutes (title only). Returns
+/// None if Calendar access is denied or there's nothing upcoming — never errors the UI.
+#[tauri::command]
+pub async fn next_calendar_event() -> Result<Option<CalendarEvent>, AppError> {
+    let script = r#"set now to (current date)
+set laterT to now + (60 * minutes)
+set out to ""
+try
+  tell application "Calendar"
+    repeat with c in calendars
+      repeat with e in (every event of c whose start date is greater than or equal to now and start date is less than or equal to laterT)
+        set out to out & (summary of e) & linefeed
+      end repeat
+    end repeat
+  end tell
+end try
+return out"#;
+    let res = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+    })
+    .await;
+    let stdout = match res {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Ok(None),
+    };
+    let title = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string);
+    Ok(title.map(|title| CalendarEvent { title, start: None }))
 }
 
 /// Read current config (settings table), without secrets.

@@ -8,6 +8,7 @@ use crate::summarize::provider::SummarizerProvider;
 
 pub mod action_items;
 pub mod anthropic;
+pub mod brief;
 pub mod chat;
 pub mod claude_code;
 pub mod digest;

@@ -82,6 +82,8 @@ pub fn run() {
             commands::generate_digest,
             commands::topic_threads,
             commands::export_canvas,
+            commands::pre_meeting_brief,
+            commands::next_calendar_event,
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,
