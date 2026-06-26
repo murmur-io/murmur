@@ -10,13 +10,17 @@ pub mod action_items;
 pub mod anthropic;
 pub mod chat;
 pub mod claude_code;
+pub mod digest;
 pub mod graph;
 pub mod ollama;
 pub mod organize;
 pub mod provider;
 pub mod recipes;
 pub mod template;
+pub mod threads;
 pub mod timeline;
+pub mod vault_chat;
+pub mod vault_context;
 
 pub use provider::{Availability, MeetingMeta, SummarizeRequest, SummarizerProvider as _};
 
