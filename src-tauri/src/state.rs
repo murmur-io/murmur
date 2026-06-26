@@ -31,7 +31,14 @@ impl AppState {
     /// Open DB at the app-data dir, run migrations, load config. Called once in `lib::run`.
     pub fn init() -> Result<Self> {
         let db_path = Self::db_path()?;
-        let db = Db::open(&db_path)?;
+        // SQLCipher at-rest: fetch (or create) the DEK once, migrate any existing PLAINTEXT DB to
+        // encrypted (safe: original untouched until a verified atomic swap), then open keyed.
+        let dek = crate::secrets::get_or_create_db_dek()?;
+        if crate::storage::migration::needs_encryption(&db_path)? {
+            tracing::info!(target: "state", "plaintext DB detected — encrypting at rest");
+            crate::storage::migration::encrypt_in_place(&db_path, &dek)?;
+        }
+        let db = Db::open_with_key(&db_path, &dek)?;
         let config = AppConfig::load(&db)?;
 
         tracing::info!(target: "state", "app state initialized");
