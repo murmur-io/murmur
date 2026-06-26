@@ -8,8 +8,8 @@ use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarEvent, ChatTurn,
-    DigestResult, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, PinResult, RecipeRecord,
-    SearchHit, TopicThread,
+    DigestResult, Folder, FolderNode, Meeting, MeetingStatus, MeetingTimeline, NoteRecord,
+    PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -71,6 +71,8 @@ pub struct AppConfigDto {
     pub note_style: String,
     pub auto_organize: bool,
     pub note_language: String,
+    #[serde(default)]
+    pub mcp_require_token: bool,
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -1061,6 +1063,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_style: c.note_style.clone(),
         auto_organize: c.auto_organize,
         note_language: c.note_language.clone(),
+        mcp_require_token: c.mcp_require_token,
     }
 }
 
@@ -1096,6 +1099,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         } else {
             d.note_language
         },
+        mcp_require_token: d.mcp_require_token,
     }
 }
 
@@ -1312,6 +1316,496 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
 #[tauri::command]
 pub fn toggle_bar(app: AppHandle) {
     crate::toggle_bar(&app);
+}
+
+// ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
+//
+// Lock model: default OPEN (note exported to vault + visible in MCP). Lock is explicit per
+// folder. Sealing encrypts each note's markdown into `content_blob` under a per-folder content
+// key (CK), blanks the markdown column, removes the `.md` from the vault, and stores the
+// KEK-wrapped CK in `folders.wrapped_key`. Session-unlock decrypts back into the markdown column
+// for the session (no re-export). relock re-blanks. remove_lock is permanent (re-exports).
+
+/// Build the folder tree (roots → children) from the flat folder list + per-folder note counts +
+/// the current session unlock set.
+#[tauri::command]
+pub fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderNode>, AppError> {
+    let folders = state.db.list_folders()?;
+    let counts = state.db.count_notes_per_folder()?;
+    let unlocked = {
+        state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone()
+    };
+    Ok(build_folder_tree(&folders, &counts, &unlocked))
+}
+
+/// Assemble `FolderNode` roots (parent_id == None) and recurse children. Sealed-but-session-
+/// unlocked folders carry `unlocked = true`.
+fn build_folder_tree(
+    folders: &[Folder],
+    counts: &std::collections::HashMap<String, usize>,
+    unlocked: &std::collections::HashSet<String>,
+) -> Vec<FolderNode> {
+    fn node(
+        f: &Folder,
+        folders: &[Folder],
+        counts: &std::collections::HashMap<String, usize>,
+        unlocked: &std::collections::HashSet<String>,
+    ) -> FolderNode {
+        let children = folders
+            .iter()
+            .filter(|c| c.parent_id.as_deref() == Some(f.id.as_str()))
+            .map(|c| node(c, folders, counts, unlocked))
+            .collect();
+        FolderNode {
+            id: f.id.clone(),
+            name: f.name.clone(),
+            parent_id: f.parent_id.clone(),
+            note_count: counts.get(&f.id).copied().unwrap_or(0),
+            locked: f.locked,
+            unlocked: f.locked && unlocked.contains(&f.id),
+            children,
+        }
+    }
+    folders
+        .iter()
+        .filter(|f| f.parent_id.is_none())
+        .map(|f| node(f, folders, counts, unlocked))
+        .collect()
+}
+
+/// Create a folder under an optional parent. The vault-relative path is derived from the parent
+/// path + the sanitized folder name; the matching vault subdirectory is created on disk.
+#[tauri::command]
+pub fn create_folder(
+    state: State<'_, AppState>,
+    name: String,
+    parent_id: Option<String>,
+) -> Result<Folder, AppError> {
+    let clean = crate::summarize::organize::sanitize_folder(&name)
+        .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
+
+    // Resolve the parent's vault-relative path (if any) and compose the child path.
+    let parent_path = match parent_id.as_deref() {
+        Some(pid) => {
+            let parent = state
+                .db
+                .folder_by_id(pid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no parent folder {pid}")))?;
+            Some(parent.path)
+        }
+        None => None,
+    };
+    let rel_path = match &parent_path {
+        Some(p) if !p.is_empty() => format!("{p}/{clean}"),
+        _ => clean.clone(),
+    };
+
+    // Create the vault subdirectory (best-effort but surfaced): only when a vault is configured.
+    if let Some(vault) = vault_path(&state) {
+        let dir = std::path::Path::new(&vault).join(&rel_path);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Export(format!("create folder dir failed: {e}")))?;
+    }
+
+    let folder = Folder {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: clean,
+        path: rel_path,
+        parent_id,
+        locked: false,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.db.insert_folder(&folder)?;
+    Ok(folder)
+}
+
+/// Move a note into a folder (or to the root with `folder_id = None`). If the note has an
+/// exported `.md` and NEITHER the source nor the target folder is locked, the file is moved on
+/// disk (copy-then-remove, best-effort, never loses bytes). Moving into/out of a locked folder
+/// does not touch the vault here (sealing/unsealing owns that lifecycle).
+#[tauri::command]
+pub fn move_note(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
+    // Resolve current + target folder lock state.
+    let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
+    let target_locked = match folder_id.as_deref() {
+        Some(fid) => {
+            state
+                .db
+                .folder_by_id(fid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no folder {fid}")))?
+                .locked
+        }
+        None => false,
+    };
+    // The source folder's lock state: derive from the note's exported_path being present
+    // (sealed notes have exported_path = NULL). If exported_path is None we treat the source as
+    // "no movable file" and skip the FS move entirely.
+    let exported = note.as_ref().and_then(|n| n.exported_path.clone());
+
+    // Reassign in the DB first (the source-of-truth association).
+    state.db.set_note_folder(&meeting_id, folder_id.as_deref())?;
+
+    // Best-effort FS move only when a plaintext .md exists and the target is open.
+    if let (Some(src_path), false) = (exported, target_locked) {
+        if let Some(vault) = vault_path(&state) {
+            let target_rel = match folder_id.as_deref() {
+                Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
+                None => None,
+            };
+            move_note_file(&state, &meeting_id, &src_path, &vault, target_rel.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+/// Move the exported `.md` to the target folder's vault subdir, preserving content. Re-points
+/// the note's `exported_path`. Copy-then-remove so a failure never loses bytes.
+fn move_note_file(
+    state: &State<'_, AppState>,
+    meeting_id: &str,
+    src_path: &str,
+    vault: &str,
+    target_rel: Option<&str>,
+) -> Result<(), AppError> {
+    let src = std::path::Path::new(src_path);
+    let bytes = match std::fs::read_to_string(src) {
+        Ok(b) => b,
+        // Source file already gone → nothing to move; leave DB association as set.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::Export(format!("read note for move failed: {e}"))),
+    };
+    let file_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Export("note path has no filename".into()))?;
+    let dest_dir = match target_rel.filter(|p| !p.is_empty()) {
+        Some(rel) => std::path::Path::new(vault).join(rel),
+        None => std::path::Path::new(vault).to_path_buf(),
+    };
+    let dest = dest_dir.join(file_name);
+    if dest == src {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
+    // Write the destination atomically, THEN remove the source (never lose bytes).
+    crate::export::overwrite_note(&dest, &bytes)?;
+    let _ = std::fs::remove_file(src);
+    // Re-point the exported path for every provider row of this meeting.
+    if let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? {
+        state.db.set_note_exported_path(
+            meeting_id,
+            &existing.provider_id,
+            &dest.to_string_lossy(),
+        )?;
+    }
+    Ok(())
+}
+
+/// SEAL a folder: generate a content key, KEK-wrap it, encrypt every governed note's markdown
+/// into `content_blob`, then (after a DB commit) blank the markdown + delete the vault `.md`.
+/// Atomicity: each note's blob is verified decryptable BEFORE we blank/delete; a crash after the
+/// DB write but before the `.md` delete leaves a stale plaintext `.md` (reconcilable) — never
+/// lost content.
+#[tauri::command]
+pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if folder.locked {
+        return Ok(()); // already sealed — idempotent.
+    }
+
+    let kek = crate::secrets::get_or_create_master_kek()?;
+    let ck = crate::crypto::random_key()?;
+    let wrapped = crate::crypto::encrypt(&kek, &ck)?;
+
+    // Gather the notes to seal. A meeting may have MULTIPLE provider rows (e.g. re-summarized
+    // with ollama then anthropic) each with DISTINCT markdown — seal EVERY (meeting, provider)
+    // row into its OWN blob. Collapsing to one blob per meeting would destroy every provider's
+    // content but the first (the PRIME-DIRECTIVE content-loss bug this guards against).
+    let notes = state.db.notes_in_folder(&folder_id)?;
+    let mut sealed_rows: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for n in &notes {
+        // Encrypt this row's markdown and VERIFY it reads back before we touch the plaintext.
+        let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes())?;
+        let check = crate::crypto::decrypt(&ck, &blob)?;
+        if check != n.markdown.as_bytes() {
+            return Err(AppError::Storage(
+                "seal verification failed (decrypted blob mismatch)".into(),
+            ));
+        }
+        sealed_rows.push((n.meeting_id.clone(), n.provider_id.clone(), blob));
+    }
+
+    // Capture every governed note's .md path BEFORE any seal_note nulls exported_path.
+    let exported_paths: Vec<String> = notes.iter().filter_map(|n| n.exported_path.clone()).collect();
+
+    // Persist: mark the folder locked (+ wrapped key) and write every sealed blob per provider
+    // row (markdown blanked, exported_path cleared). Each write is guarded by the verification
+    // above, so a crash mid-loop leaves already-sealed rows recoverable and not-yet-sealed rows
+    // with intact plaintext — never lost content.
+    state
+        .db
+        .set_folder_locked(&folder_id, true, Some(&wrapped))?;
+    for (meeting_id, provider_id, blob) in &sealed_rows {
+        state.db.seal_note(meeting_id, provider_id, blob)?;
+    }
+
+    // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
+    // lost content is not — so this is last).
+    for p in exported_paths {
+        let _ = std::fs::remove_file(&p);
+    }
+    Ok(())
+}
+
+/// SESSION-unlock a sealed folder: KEK → unwrap CK → decrypt each note's `content_blob` back into
+/// the plaintext markdown column for the session, and add the folder id to the session unlock set.
+/// Does NOT re-export to the vault. Returns the refreshed folder node.
+#[tauri::command]
+pub fn unlock_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<FolderNode, AppError> {
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if !folder.locked {
+        return Err(AppError::InvalidArg("folder is not locked".into()));
+    }
+    let wrapped = state
+        .db
+        .folder_wrapped_key(&folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+
+    let kek = crate::secrets::get_or_create_master_kek()?;
+    let ck_bytes = crate::crypto::decrypt(&kek, &wrapped)?;
+    let ck: [u8; 32] = ck_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?;
+
+    // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
+    // session (no dedup by meeting — every provider's distinct content is restored independently).
+    let notes = state.db.notes_in_folder(&folder_id)?;
+    for n in &notes {
+        let Some(blob) = &n.content_blob else {
+            continue; // open note (shouldn't happen in a sealed folder) — skip.
+        };
+        let pt = crate::crypto::decrypt(&ck, blob)?;
+        let markdown = String::from_utf8(pt)
+            .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
+        state
+            .db
+            .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
+    }
+
+    // Cache the KEK for the session (zeroized on relock-all) + add to the unlock set.
+    {
+        let mut g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        *g = Some(kek);
+    }
+    {
+        let mut g = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+        g.insert(folder_id.clone());
+    }
+
+    // Return the refreshed node.
+    let counts = state.db.count_notes_per_folder()?;
+    let unlocked = {
+        state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone()
+    };
+    Ok(FolderNode {
+        id: folder.id.clone(),
+        name: folder.name.clone(),
+        parent_id: folder.parent_id.clone(),
+        note_count: counts.get(&folder.id).copied().unwrap_or(0),
+        locked: true,
+        unlocked: unlocked.contains(&folder.id),
+        children: Vec::new(),
+    })
+}
+
+/// Re-seal a session-unlocked folder for the rest of this session: re-blank the plaintext
+/// markdown of its sealed notes and drop the folder from the unlock set. The `content_blob`
+/// stays — the folder is still `locked=1` on disk.
+#[tauri::command]
+pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    {
+        let mut g = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+        g.remove(&folder_id);
+    }
+    let mut one = std::collections::HashSet::new();
+    one.insert(folder_id);
+    state.db.blank_sealed_notes_in_folders(&one)?;
+    Ok(())
+}
+
+/// Relock ALL session-unlocked folders + zeroize the cached KEK (called on screen-share start in
+/// Stage E, and exposed as a command). Re-blanks the plaintext markdown of every sealed note.
+#[tauri::command]
+pub fn relock_all(state: State<'_, AppState>) -> Result<(), AppError> {
+    relock_all_inner(&state)
+}
+
+/// Inner relock-all usable without a command boundary (Stage E screen-share watcher).
+pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
+    // Clear the session set.
+    {
+        let mut g = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+        g.clear();
+    }
+    // Zeroize the cached KEK copy.
+    {
+        let mut g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        if let Some(mut k) = g.take() {
+            k.iter_mut().for_each(|b| *b = 0);
+        }
+    }
+    // Re-blank every sealed note across all locked folders.
+    let locked: std::collections::HashSet<String> =
+        state.db.locked_folder_ids()?.into_iter().collect();
+    state.db.blank_sealed_notes_in_folders(&locked)?;
+    Ok(())
+}
+
+/// PERMANENTLY remove a folder's lock: KEK → unwrap CK → decrypt each note back to plaintext
+/// markdown, clear `content_blob`, set `locked=0` + `wrapped_key=NULL`, and re-export each note's
+/// `.md` to the vault. The folder returns to the default OPEN state.
+#[tauri::command]
+pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if !folder.locked {
+        return Ok(()); // already open — idempotent.
+    }
+    let wrapped = state
+        .db
+        .folder_wrapped_key(&folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+    let kek = crate::secrets::get_or_create_master_kek()?;
+    let ck_bytes = crate::crypto::decrypt(&kek, &wrapped)?;
+    let ck: [u8; 32] = ck_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?;
+
+    let vault = vault_path(&state);
+    let notes = state.db.notes_in_folder(&folder_id)?;
+
+    // Step 1: restore EVERY provider row's plaintext from ITS OWN blob (or keep the in-memory
+    // markdown if the folder is session-unlocked and the blob is absent). This must happen for
+    // every row BEFORE any blob is cleared — otherwise a sibling provider's content is lost.
+    for n in &notes {
+        let markdown = if let Some(blob) = &n.content_blob {
+            let pt = crate::crypto::decrypt(&ck, blob)?;
+            String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?
+        } else {
+            n.markdown.clone()
+        };
+        state
+            .db
+            .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
+    }
+
+    // Step 2: per meeting, clear the blobs (all rows now hold plaintext) and re-export ONE `.md`
+    // (the latest provider's note — matching how the rest of the app treats "the note" for a
+    // meeting). All provider rows for that meeting share the re-exported path.
+    let mut seen = std::collections::HashSet::new();
+    for n in &notes {
+        if !seen.insert(n.meeting_id.clone()) {
+            continue;
+        }
+        state.db.clear_note_content_blob(&n.meeting_id)?;
+
+        let Some(vault) = vault.as_deref() else {
+            continue;
+        };
+        let latest = match state.db.get_latest_note_for_meeting(&n.meeting_id)? {
+            Some(l) => l,
+            None => continue,
+        };
+        let meeting = state.db.get_meeting(&n.meeting_id)?;
+        let (title, date) = match meeting {
+            Some(m) => (
+                m.title.clone().unwrap_or_else(|| "Untitled".into()),
+                m.started_at.clone(),
+            ),
+            None => ("Untitled".to_string(), chrono::Utc::now().to_rfc3339()),
+        };
+        let sub = if folder.path.is_empty() {
+            None
+        } else {
+            Some(folder.path.as_str())
+        };
+        if let Ok(path) = crate::export::write_note(
+            std::path::Path::new(vault),
+            sub,
+            &title,
+            &date,
+            &latest.markdown,
+        ) {
+            state.db.set_note_exported_path(
+                &n.meeting_id,
+                &latest.provider_id,
+                &path.to_string_lossy(),
+            )?;
+        }
+    }
+
+    // Flip the folder back to OPEN + drop it from the session set.
+    state.db.set_folder_locked(&folder_id, false, None)?;
+    {
+        let mut g = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+        g.remove(&folder_id);
+    }
+    Ok(())
+}
+
+/// The configured vault path (non-empty), or `None`.
+fn vault_path(state: &State<'_, AppState>) -> Option<String> {
+    state
+        .config
+        .lock()
+        .ok()
+        .and_then(|c| c.vault_path.clone())
+        .filter(|p| !p.is_empty())
 }
 
 /// (Re)start the voice-trigger listener if enabled — model present and not recording —

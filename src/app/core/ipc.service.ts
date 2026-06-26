@@ -11,6 +11,8 @@ import type {
   CalendarEvent,
   ChatTurn,
   DigestResult,
+  Folder,
+  FolderNode,
   GraphPayload,
   Meeting,
   MeetingDetail,
@@ -269,6 +271,48 @@ export class IpcService {
   /** Show/hide the floating always-on-top recorder bar window. */
   toggleBar(): Promise<void> {
     return invoke<void>("toggle_bar");
+  }
+
+  // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
+
+  /** The folder tree (roots → children) with per-folder note counts + session lock state. */
+  listFolders(): Promise<FolderNode[]> {
+    return invoke<FolderNode[]>("list_folders");
+  }
+
+  /** Create a folder under an optional parent; creates the matching vault subdirectory. */
+  createFolder(name: string, parentId: string | null): Promise<Folder> {
+    return invoke<Folder>("create_folder", { name, parentId });
+  }
+
+  /** Move a note into a folder (or to the vault root with `folderId = null`). */
+  moveNote(meetingId: string, folderId: string | null): Promise<void> {
+    return invoke<void>("move_note", { meetingId, folderId });
+  }
+
+  /** Seal a folder: encrypt its notes into content blobs, blank markdown, remove vault .md. */
+  lockFolder(folderId: string): Promise<void> {
+    return invoke<void>("lock_folder", { folderId });
+  }
+
+  /** Session-unlock a sealed folder (decrypt into markdown for this session; no re-export). */
+  unlockFolder(folderId: string): Promise<FolderNode> {
+    return invoke<FolderNode>("unlock_folder", { folderId });
+  }
+
+  /** Re-seal a single session-unlocked folder (re-blank markdown; folder stays locked on disk). */
+  relockFolder(folderId: string): Promise<void> {
+    return invoke<void>("relock_folder", { folderId });
+  }
+
+  /** Re-seal ALL session-unlocked folders + zeroize the cached KEK (e.g. on screen-share). */
+  relockAll(): Promise<void> {
+    return invoke<void>("relock_all");
+  }
+
+  /** Permanently remove a folder's lock: decrypt to plaintext + re-export to the vault. */
+  removeLock(folderId: string): Promise<void> {
+    return invoke<void>("remove_lock", { folderId });
   }
 
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {

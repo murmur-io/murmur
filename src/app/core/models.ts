@@ -77,6 +77,34 @@ export interface Meeting {
   durationS: number;
   audioPath: string | null;
   status: MeetingStatus;
+  /** Owning folder id, or null when at the vault root. */
+  folderId?: string | null;
+}
+
+/** A folder row as returned by createFolder (mirrors the Rust `Folder` DTO). */
+export interface Folder {
+  id: string;
+  name: string;
+  /** Vault-relative folder path. */
+  path: string;
+  parentId: string | null;
+  locked: boolean;
+  createdAt: string;
+}
+
+/**
+ * A folder node for the tree UI. `locked` = sealed (encrypted) on disk; `unlocked` = sealed AND
+ * decrypted for this session (visible in-app + MCP until relock). An open folder is
+ * `locked=false, unlocked=false`.
+ */
+export interface FolderNode {
+  id: string;
+  name: string;
+  parentId: string | null;
+  noteCount: number;
+  locked: boolean;
+  unlocked: boolean;
+  children: FolderNode[];
 }
 
 export interface Segment {

@@ -31,9 +31,10 @@ pub async fn classify_subfolder(
     sanitize_folder(&reply)
 }
 
-/// Reduce a model reply to a single safe folder name (first non-empty line, reserved
-/// path/link chars stripped). Returns `None` for empty/oversized results.
-fn sanitize_folder(reply: &str) -> Option<String> {
+/// Reduce a model reply (or user input) to a single safe folder name (first non-empty line,
+/// reserved path/link chars stripped). Returns `None` for empty/oversized results. Reused by the
+/// folder commands to sanitize user-supplied folder names into vault-safe path segments.
+pub fn sanitize_folder(reply: &str) -> Option<String> {
     let first = reply.lines().find(|l| !l.trim().is_empty())?.trim();
     let cleaned: String = first
         .chars()

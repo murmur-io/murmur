@@ -93,6 +93,14 @@ pub fn run() {
             commands::model_present,
             commands::download_model,
             commands::toggle_bar,
+            commands::list_folders,
+            commands::create_folder,
+            commands::move_note,
+            commands::lock_folder,
+            commands::unlock_folder,
+            commands::relock_folder,
+            commands::relock_all,
+            commands::remove_lock,
         ])
         .setup(|app| {
             create_bar_window(app.handle())?;
@@ -102,10 +110,18 @@ pub fn run() {
             commands::restart_voice_listener(app.handle().clone());
             setup_tray(app.handle())?;
             // Localhost MCP server (read-only meeting tools for Claude Desktop/Code; no egress).
+            // Share the session unlock set so sealed-and-not-unlocked notes stay invisible.
             if let Some(db_path) =
                 dirs::data_dir().map(|b| b.join("MeetNotes").join("meetnotes.sqlite"))
             {
-                crate::mcp::spawn(db_path);
+                let state = app.state::<AppState>();
+                let unlocked = state.unlocked_folders.clone();
+                let require_token = state
+                    .config
+                    .lock()
+                    .map(|c| c.mcp_require_token)
+                    .unwrap_or(false);
+                crate::mcp::spawn(db_path, unlocked, require_token);
             }
             // Closing the main window HIDES it (recoverable from the tray) instead of
             // quitting — so the floating bar is never the only way back into the app.
