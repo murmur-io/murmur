@@ -169,6 +169,10 @@ impl Transcriber {
                 start_s: t0 as f64 / CENTISECONDS_PER_SECOND,
                 end_s: t1 as f64 / CENTISECONDS_PER_SECOND,
                 text: trimmed.to_string(),
+                // The transcriber is stream-agnostic: speaker attribution ("me"/"others") is
+                // assigned by the wall-clock merge in `audio::merge` from which stream produced
+                // these segments, not here. Live/voice-trigger callers leave it as `None`.
+                speaker: None,
             });
         }
 
