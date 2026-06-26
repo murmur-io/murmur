@@ -13,6 +13,15 @@ pub const ACCOUNT_DB_DEK: &str = "murmur_db_dek";
 /// (per-folder biometric locking, added later, covers that). Hex form ⇒ SQLCipher treats it as a
 /// raw key blob (`PRAGMA key = x'…'`) with no KDF.
 pub fn get_or_create_db_dek() -> Result<String> {
+    // Dev-only escape hatch: a fixed DEK via `MURMUR_DEV_DEK` (64 hex chars) avoids a macOS
+    // Keychain prompt on every rebuild — each recompiled dev binary has a new signature, so the
+    // OS re-prompts for access to the existing item. NEVER compiled into release builds.
+    #[cfg(debug_assertions)]
+    if let Ok(dev) = std::env::var("MURMUR_DEV_DEK") {
+        if dev.len() == 64 && dev.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(dev);
+        }
+    }
     if let Some(dek) = get_secret(ACCOUNT_DB_DEK)? {
         return Ok(dek);
     }

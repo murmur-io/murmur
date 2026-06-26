@@ -25,6 +25,11 @@ pub struct AppState {
     /// In-memory cache of the settings table.
     pub config: Mutex<AppConfig>,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
+    /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
+    /// MCP until relock (cleared on screen-share start or app exit).
+    pub unlocked_folders: Mutex<std::collections::HashSet<String>>,
+    /// Master KEK released by biometric; None until first unlock, zeroized on relock.
+    pub master_kek: Mutex<Option<[u8; 32]>>,
 }
 
 impl AppState {
@@ -50,6 +55,8 @@ impl AppState {
             db,
             config: Mutex::new(config),
             current_meeting: Mutex::new(None),
+            unlocked_folders: Mutex::new(std::collections::HashSet::new()),
+            master_kek: Mutex::new(None),
         })
     }
 
