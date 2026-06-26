@@ -5,8 +5,12 @@ import type {
   ActionItem,
   Analytics,
   AppConfigDto,
+  AskVaultResult,
+  BriefResult,
   BuiltinRecipe,
+  CalendarEvent,
   ChatTurn,
+  DigestResult,
   GraphPayload,
   Meeting,
   MeetingDetail,
@@ -19,6 +23,7 @@ import type {
   StartResult,
   StatusPayload,
   StopResult,
+  TopicThread,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -157,6 +162,36 @@ export class IpcService {
   /** Build the self-assembling graph: write [[Person]]/[[Project]] stub notes + backlinks. */
   linkMeetingEntities(meetingId: string): Promise<GraphPayload> {
     return invoke<GraphPayload>("link_meeting_entities", { meetingId });
+  }
+
+  /** Ask-My-Vault: grounded Q&A across ALL meetings, with source meetings. */
+  askVault(question: string, history: ChatTurn[]): Promise<AskVaultResult> {
+    return invoke<AskVaultResult>("ask_vault", { question, history });
+  }
+
+  /** Generate a Weekly Vault Digest over the last `days` days (writes to vault Digests/). */
+  generateDigest(days: number): Promise<DigestResult> {
+    return invoke<DigestResult>("generate_digest", { days });
+  }
+
+  /** Topic Threads: cross-meeting topic clusters from cached timelines. */
+  topicThreads(): Promise<TopicThread[]> {
+    return invoke<TopicThread[]>("topic_threads");
+  }
+
+  /** Export a meeting as an Obsidian Canvas (.canvas) board. Returns the written path. */
+  exportCanvas(meetingId: string): Promise<string> {
+    return invoke<string>("export_canvas", { meetingId });
+  }
+
+  /** Pre-Meeting Brief: grounded prep card for an upcoming meeting subject, from history. */
+  preMeetingBrief(subject: string): Promise<BriefResult> {
+    return invoke<BriefResult>("pre_meeting_brief", { subject });
+  }
+
+  /** Best-effort next macOS Calendar event (title) in the next hour, or null. */
+  nextCalendarEvent(): Promise<CalendarEvent | null> {
+    return invoke<CalendarEvent | null>("next_calendar_event");
   }
 
   /** Copy a meeting's recording (WAV) to a chosen path. */
