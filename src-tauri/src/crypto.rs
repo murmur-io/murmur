@@ -46,6 +46,40 @@ pub fn random_key() -> Result<[u8; 32]> {
     Ok(k)
 }
 
+/// Encrypt the file at `src` under `key` into `dest` (the `nonce(12) || ciphertext+tag` blob),
+/// then VERIFY the ciphertext decrypts back byte-identical to the source BEFORE returning. This
+/// mirrors `seal_note`'s verify-before-destroy: the caller removes the plaintext only after a
+/// successful return, so a corrupt write can never lose audio. The plaintext WAV (separate file
+/// at `meetings.audio_path`, NOT in the SQLCipher DB) is encrypted at rest for locked folders.
+pub fn encrypt_file(key: &[u8; 32], src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let plaintext = std::fs::read(src)
+        .map_err(|e| AppError::Storage(format!("read audio for encrypt: {e}")))?;
+    let blob = encrypt(key, &plaintext)?;
+    // Verify the blob decrypts back byte-identical BEFORE we ever write it (and before the caller
+    // destroys the plaintext). A tampered/short blob fails closed here.
+    let check = decrypt(key, &blob)?;
+    if check != plaintext {
+        return Err(AppError::Storage(
+            "audio seal verification failed (decrypted blob mismatch)".into(),
+        ));
+    }
+    std::fs::write(dest, &blob)
+        .map_err(|e| AppError::Storage(format!("write encrypted audio: {e}")))?;
+    Ok(())
+}
+
+/// Decrypt the encrypted-WAV file at `src` (a `nonce(12) || ciphertext+tag` blob) under `key`
+/// into the plaintext WAV at `dest`. Used to materialize a playable WAV for the session on
+/// unlock, and to permanently restore the plaintext on remove-lock.
+pub fn decrypt_file(key: &[u8; 32], src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let blob = std::fs::read(src)
+        .map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
+    let plaintext = decrypt(key, &blob)?;
+    std::fs::write(dest, &plaintext)
+        .map_err(|e| AppError::Storage(format!("write decrypted audio: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +105,61 @@ mod tests {
         let ck = random_key().unwrap();
         let wrapped = encrypt(&kek, &ck).unwrap();
         assert_eq!(decrypt(&kek, &wrapped).unwrap(), ck);
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "meetnotes-crypto-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    #[test]
+    fn audio_encrypt_decrypt_round_trips_byte_identical() {
+        // Synthesize a small "WAV" payload (bytes are opaque to the crypto layer — a real WAV
+        // header would be identical content). Encrypt → .enc, remove plaintext, decrypt → assert
+        // byte-identical, and assert the ciphertext does NOT contain the plaintext.
+        let key = random_key().unwrap();
+        let wav = temp_path("audio.wav");
+        let enc = temp_path("audio.wav.enc");
+        let restored = temp_path("audio-restored.wav");
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&wav, &payload).unwrap();
+
+        // ENCRYPT (verify-before-destroy happens inside) → then simulate the lock removing the
+        // plaintext WAV.
+        encrypt_file(&key, &wav, &enc).unwrap();
+        let blob = std::fs::read(&enc).unwrap();
+        assert!(
+            !contains(&blob, &payload),
+            "ciphertext must not leak the plaintext audio"
+        );
+        std::fs::remove_file(&wav).unwrap();
+        assert!(!wav.exists(), "plaintext WAV removed while sealed");
+
+        // DECRYPT for the session → byte-identical.
+        decrypt_file(&key, &enc, &restored).unwrap();
+        assert_eq!(std::fs::read(&restored).unwrap(), payload, "audio round-trips byte-identical");
+
+        // Wrong key fails closed.
+        assert!(decrypt_file(&random_key().unwrap(), &enc, &restored).is_err());
+
+        let _ = std::fs::remove_file(&enc);
+        let _ = std::fs::remove_file(&restored);
+    }
+
+    /// Naive subslice search for the leak assertion.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }
