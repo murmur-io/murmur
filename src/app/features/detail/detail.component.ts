@@ -420,6 +420,7 @@ interface ParsedNote {
           (seek)="seekTo($event)"
           (retry)="loadTimeline()"
           (pin)="onPin($event)"
+          (renameSpeaker)="onRenameSpeaker($event)"
         />
 
         <!-- Pin confirmation / error (driven by the timeline's (pin) output). -->
@@ -1718,6 +1719,29 @@ export class DetailComponent implements OnInit {
       (t) => seconds >= t.startS && seconds < t.endS,
     );
     return topic?.label?.trim() || "Pinned moment";
+  }
+
+  /**
+   * Apply a manual speaker re-label from the timeline legend (e.g. "User 1" →
+   * "Sarah"): call `renameSpeaker`, then fold the returned timeline into the
+   * `timeline` signal so the lanes + legend relabel immediately. Errors are
+   * handled silently inline — the previous timeline stays put, no crash.
+   */
+  async onRenameSpeaker(change: {
+    oldLabel: string;
+    newLabel: string;
+  }): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id) {
+      return;
+    }
+    try {
+      this.timeline.set(
+        await this.ipc.renameSpeaker(id, change.oldLabel, change.newLabel),
+      );
+    } catch {
+      // Keep the existing timeline; the relabel simply didn't take.
+    }
   }
 
   /** Show the pin confirmation for a moment (tracked timeout — cancelled on destroy). */

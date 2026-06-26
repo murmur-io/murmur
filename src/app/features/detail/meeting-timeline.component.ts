@@ -1,10 +1,15 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
   computed,
+  inject,
   input,
   output,
   signal,
+  viewChild,
 } from "@angular/core";
 import type { MeetingTimeline as MeetingTimelineData } from "../../core/models";
 
@@ -175,7 +180,34 @@ interface AxisTick {
                       [style.background]="dotColor(lane.hue)"
                       aria-hidden="true"
                     ></span>
-                    <span class="legend-name">{{ lane.speaker }}</span>
+                    @if (editingLabel() === lane.speaker) {
+                      <!-- Inline rename field — commits on Enter/blur, cancels on Escape. -->
+                      <input
+                        #renameInput
+                        type="text"
+                        class="legend-edit"
+                        aria-label="Speaker name"
+                        autocapitalize="words"
+                        autocomplete="off"
+                        spellcheck="false"
+                        [value]="labelDraft()"
+                        (input)="onRenameInput($event)"
+                        (keydown.enter)="commitRename(lane.speaker)"
+                        (keydown.escape)="cancelRename($event)"
+                        (blur)="commitRename(lane.speaker)"
+                        (click)="$event.stopPropagation()"
+                      />
+                    } @else {
+                      <button
+                        type="button"
+                        class="legend-rename"
+                        [attr.aria-label]="'Rename ' + lane.speaker"
+                        (click)="startRename($event, lane.speaker)"
+                      >
+                        <span class="legend-name">{{ lane.speaker }}</span>
+                        <span class="legend-pencil" aria-hidden="true">✎</span>
+                      </button>
+                    }
                     <span class="legend-time">{{ fmt(lane.talkS) }}</span>
                   </span>
                 }
@@ -483,6 +515,56 @@ interface AxisTick {
         font-family: var(--font-mono);
         font-size: 0.75rem;
         font-variant-numeric: tabular-nums;
+      }
+
+      /* --- Click-to-rename a speaker (manual labelling) --- */
+      .legend-rename {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        min-width: 0;
+        max-width: 100%;
+        padding: 2px var(--space-2);
+        margin: -2px 0;
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        cursor: text;
+        transition:
+          background var(--transition),
+          border-color var(--transition);
+      }
+      .legend-rename:hover {
+        background: var(--surface-hover);
+        border-color: var(--border-subtle);
+      }
+      .legend-rename:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .legend-pencil {
+        color: var(--text-muted);
+        font-size: 0.6875rem;
+        line-height: 1;
+        opacity: 0;
+        transform: translateY(0.5px);
+        transition: opacity var(--transition);
+        pointer-events: none;
+      }
+      .legend-rename:hover .legend-pencil,
+      .legend-rename:focus-visible .legend-pencil {
+        opacity: 1;
+      }
+      .legend-edit {
+        width: auto;
+        max-width: 16ch;
+        height: 24px;
+        padding: 0 var(--space-2);
+        border-radius: var(--radius-sm);
+        font-size: 0.8125rem;
+        font-weight: 550;
       }
 
       /* --- The shared scale tracks --- */
@@ -995,6 +1077,22 @@ export class MeetingTimelineComponent {
    * presentational — the parent is responsible for the IPC pin + clipboard.
    */
   readonly pin = output<number>();
+  /**
+   * Manual speaker re-labelling — fired when an inline legend edit is committed
+   * with a non-empty, changed name (e.g. "User 1" → "Sarah"). Purely
+   * presentational: the parent owns the IPC call + timeline refresh.
+   */
+  readonly renameSpeaker = output<{ oldLabel: string; newLabel: string }>();
+
+  private readonly injector = inject(Injector);
+
+  /** The speaker currently being inline-renamed (its original label), or null. */
+  readonly editingLabel = signal<string | null>(null);
+  /** Working copy of the inline rename field (input → signal). */
+  readonly labelDraft = signal("");
+  /** Focusable rename field — focused after it renders (afterNextRender). */
+  private readonly renameInput =
+    viewChild<ElementRef<HTMLInputElement>>("renameInput");
 
   /**
    * Live hover-scrub position on the shared time track, 0–100 (% of total),
@@ -1227,6 +1325,56 @@ export class MeetingTimelineComponent {
   onPin(event: MouseEvent): void {
     event.stopPropagation();
     this.pin.emit(Math.max(0, this.currentTime()));
+  }
+
+  // --- Inline speaker rename (manual labelling; stays presentational) ------
+
+  /**
+   * Enter inline-edit mode for a legend speaker: seed the draft with the
+   * current label and focus the field once it renders (zoneless-safe; no
+   * setTimeout). The (renameSpeaker) output fires only on a committed change.
+   */
+  startRename(event: Event, speaker: string): void {
+    event.stopPropagation();
+    this.labelDraft.set(speaker);
+    this.editingLabel.set(speaker);
+    afterNextRender(
+      () => {
+        const el = this.renameInput()?.nativeElement;
+        el?.focus();
+        el?.select();
+      },
+      { injector: this.injector },
+    );
+  }
+
+  /** Mirror the inline rename field value into the `labelDraft` signal. */
+  onRenameInput(event: Event): void {
+    this.labelDraft.set((event.target as HTMLInputElement).value);
+  }
+
+  /**
+   * Commit the inline rename: ignore empty/unchanged names, else emit
+   * `renameSpeaker` with the original + new label. Always leaves edit mode (so
+   * a blur after Enter/Escape doesn't re-fire — the guard below also no-ops once
+   * `editingLabel` is cleared).
+   */
+  commitRename(oldLabel: string): void {
+    if (this.editingLabel() !== oldLabel) {
+      return;
+    }
+    const newLabel = this.labelDraft().trim();
+    this.editingLabel.set(null);
+    if (!newLabel || newLabel === oldLabel) {
+      return;
+    }
+    this.renameSpeaker.emit({ oldLabel, newLabel });
+  }
+
+  /** Escape cancels the inline rename without emitting. */
+  cancelRename(event: Event): void {
+    event.stopPropagation();
+    this.editingLabel.set(null);
   }
 
   /** True when the playhead sits inside a chapter — highlights its label. */
