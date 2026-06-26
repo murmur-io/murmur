@@ -4,6 +4,7 @@ import {
   computed,
   input,
   output,
+  signal,
 } from "@angular/core";
 import type { MeetingTimeline as MeetingTimelineData } from "../../core/models";
 
@@ -122,12 +123,20 @@ interface AxisTick {
           [attr.aria-valuemax]="totalRounded()"
           [attr.aria-valuenow]="currentRounded()"
           (click)="seekFromTrack($event)"
+          (mousemove)="onScrubMove($event)"
+          (mouseleave)="onScrubLeave()"
           (keydown)="onAxisKey($event)"
         >
           @for (t of ticks(); track t.pct) {
             <span class="tl-tick" [style.left.%]="t.pct">
               <span class="tl-tick-mark" aria-hidden="true"></span>
               <span class="tl-tick-label">{{ t.label }}</span>
+            </span>
+          }
+          <!-- Hover-scrub preview: a thin line + a m:ss bubble at the cursor. -->
+          @if (hoverPct(); as hp) {
+            <span class="tl-scrub" [style.left.%]="hp" aria-hidden="true">
+              <span class="tl-scrub-bubble">{{ hoverLabel() }}</span>
             </span>
           }
           <!-- Shared playhead — sits in the axis, spans up over both tracks. -->
@@ -139,6 +148,17 @@ interface AxisTick {
             >
               <span class="tl-playhead-knob"></span>
             </span>
+            <!-- Pin-this-moment: emits the current playhead time (seconds). -->
+            <button
+              type="button"
+              class="tl-pin"
+              [style.left.%]="playheadPct()"
+              [attr.aria-label]="'Pin this moment at ' + fmt(currentTime())"
+              (click)="onPin($event)"
+            >
+              <span class="tl-pin-glyph" aria-hidden="true">📌</span>
+              <span class="tl-pin-tip" aria-hidden="true">Pin moment</span>
+            </button>
           }
         </div>
 
@@ -171,8 +191,17 @@ interface AxisTick {
               [attr.aria-valuemax]="totalRounded()"
               [attr.aria-valuenow]="currentRounded()"
               (click)="seekFromTrack($event)"
+              (mousemove)="onScrubMove($event)"
+              (mouseleave)="onScrubLeave()"
               (keydown)="onAxisKey($event)"
             >
+              @if (hoverPct(); as hp) {
+                <span
+                  class="tl-track-scrub"
+                  [style.left.%]="hp"
+                  aria-hidden="true"
+                ></span>
+              }
               @for (lane of lanes(); track lane.speaker) {
                 <div class="tl-lane">
                   @for (blk of lane.blocks; track blk.order) {
@@ -216,7 +245,34 @@ interface AxisTick {
           <div class="tl-group">
             <div class="tl-group-head">
               <span class="tl-group-label">Topics</span>
+              <span class="tl-group-hint">Jump to a chapter</span>
             </div>
+
+            <!-- CHAPTERS — the topic spans as a clickable chapter list. -->
+            <div class="tl-chapters" role="list" aria-label="Chapters">
+              @for (ch of chapters(); track ch.order) {
+                <button
+                  type="button"
+                  class="tl-chapter"
+                  role="listitem"
+                  [class.is-active]="isActiveChapter(ch.startS, ch.endS)"
+                  [style.--i]="ch.order"
+                  [attr.aria-label]="
+                    'Chapter ' + ch.label + ', starts ' + fmt(ch.startS)
+                  "
+                  (click)="onBlock($event, ch.startS)"
+                >
+                  <span
+                    class="tl-chapter-dot"
+                    [style.background]="dotColor(ch.hue)"
+                    aria-hidden="true"
+                  ></span>
+                  <span class="tl-chapter-label">{{ ch.label }}</span>
+                  <span class="tl-chapter-time">{{ fmt(ch.startS) }}</span>
+                </button>
+              }
+            </div>
+
             <div
               class="tl-track tl-track--ribbon"
               role="slider"
@@ -226,8 +282,17 @@ interface AxisTick {
               [attr.aria-valuemax]="totalRounded()"
               [attr.aria-valuenow]="currentRounded()"
               (click)="seekFromTrack($event)"
+              (mousemove)="onScrubMove($event)"
+              (mouseleave)="onScrubLeave()"
               (keydown)="onAxisKey($event)"
             >
+              @if (hoverPct(); as hp) {
+                <span
+                  class="tl-track-scrub"
+                  [style.left.%]="hp"
+                  aria-hidden="true"
+                ></span>
+              }
               @for (top of topics(); track top.order) {
                 <button
                   type="button"
@@ -698,6 +763,182 @@ interface AxisTick {
         font-size: 0.8125rem;
       }
 
+      /* --- Hover-scrub preview (axis bubble + per-track guide line) --- */
+      .tl-group-hint {
+        color: var(--text-muted);
+        font-size: 0.6875rem;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+      }
+      .tl-scrub {
+        position: absolute;
+        top: -2px;
+        bottom: -2px;
+        width: 1px;
+        transform: translateX(-50%);
+        background: var(--border-strong);
+        pointer-events: none;
+        z-index: 9;
+      }
+      .tl-scrub-bubble {
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 4px);
+        transform: translateX(-50%);
+        padding: 2px var(--space-2);
+        border-radius: var(--radius-sm);
+        background: var(--surface-overlay);
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow-sm);
+        color: var(--text-secondary);
+        font-family: var(--font-mono);
+        font-size: 0.6875rem;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .tl-track-scrub {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 1px;
+        transform: translateX(-50%);
+        background: rgba(246, 246, 250, 0.28);
+        pointer-events: none;
+        z-index: 6;
+      }
+
+      /* --- Pin-this-moment (rides the axis playhead) --- */
+      .tl-pin {
+        position: absolute;
+        top: -30px;
+        transform: translateX(-50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-pill);
+        background: var(--surface-overlay);
+        box-shadow: var(--shadow-sm);
+        cursor: pointer;
+        z-index: 10;
+        transition:
+          transform var(--transition-fast),
+          box-shadow var(--transition),
+          border-color var(--transition);
+      }
+      .tl-pin:hover {
+        transform: translateX(-50%) translateY(-1px) scale(1.08);
+        border-color: var(--accent);
+        box-shadow: var(--shadow-accent);
+      }
+      .tl-pin:active {
+        transform: translateX(-50%) scale(0.94);
+      }
+      .tl-pin:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .tl-pin-glyph {
+        font-size: 0.75rem;
+        line-height: 1;
+      }
+      .tl-pin-tip {
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 6px);
+        transform: translateX(-50%) translateY(3px);
+        padding: 2px var(--space-2);
+        border-radius: var(--radius-sm);
+        background: var(--surface-overlay);
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow-sm);
+        color: var(--text-primary);
+        font-size: 0.6875rem;
+        font-weight: 600;
+        white-space: nowrap;
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity var(--transition),
+          transform var(--transition);
+      }
+      .tl-pin:hover .tl-pin-tip,
+      .tl-pin:focus-visible .tl-pin-tip {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+
+      /* --- Chapters (topic spans as a clickable list) --- */
+      .tl-chapters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+      }
+      .tl-chapter {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        max-width: 100%;
+        padding: var(--space-1) var(--space-3);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-pill);
+        background: var(--surface-input);
+        color: var(--text-secondary);
+        font: inherit;
+        font-size: 0.75rem;
+        cursor: pointer;
+        animation: rise 320ms var(--transition) both;
+        animation-delay: calc(var(--i, 0) * 30ms + 180ms);
+        transition:
+          background var(--transition),
+          border-color var(--transition),
+          color var(--transition),
+          transform var(--transition-fast);
+      }
+      .tl-chapter:hover {
+        background: var(--surface-hover);
+        border-color: var(--border-strong);
+        color: var(--text-primary);
+        transform: translateY(-1px);
+      }
+      .tl-chapter:active {
+        transform: translateY(0);
+      }
+      .tl-chapter:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .tl-chapter.is-active {
+        background: var(--accent-soft);
+        border-color: transparent;
+        color: var(--text-primary);
+      }
+      .tl-chapter-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex: none;
+      }
+      .tl-chapter-label {
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 22ch;
+      }
+      .tl-chapter-time {
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+        font-size: 0.6875rem;
+        font-variant-numeric: tabular-nums;
+      }
+      .tl-chapter.is-active .tl-chapter-time {
+        color: var(--accent-hover);
+      }
+
       @keyframes grow-in {
         from {
           opacity: 0;
@@ -719,7 +960,8 @@ interface AxisTick {
 
       @media (prefers-reduced-motion: reduce) {
         .tl-block,
-        .tl-topic {
+        .tl-topic,
+        .tl-chapter {
           animation: none;
         }
         .tl-playhead,
@@ -748,6 +990,27 @@ export class MeetingTimelineComponent {
   readonly seek = output<number>();
   /** Re-run getTimeline(). */
   readonly retry = output<void>();
+  /**
+   * Pin request carrying the CURRENT playhead position in seconds. Purely
+   * presentational — the parent is responsible for the IPC pin + clipboard.
+   */
+  readonly pin = output<number>();
+
+  /**
+   * Live hover-scrub position on the shared time track, 0–100 (% of total),
+   * or null when the pointer is not over a track/axis. Drives a thin preview
+   * line + a floating time read-out without disturbing the real playhead.
+   */
+  readonly hoverPct = signal<number | null>(null);
+
+  /** The hovered position formatted m:ss — shown in the scrub bubble. */
+  readonly hoverLabel = computed(() => {
+    const pct = this.hoverPct();
+    if (pct === null) {
+      return "";
+    }
+    return this.fmt((pct / 100) * this.span());
+  });
 
   /** Static decoration for the loading skeleton (no data yet). */
   protected readonly skeletonBars = [
@@ -846,6 +1109,21 @@ export class MeetingTimelineComponent {
     });
   });
 
+  /**
+   * The topic spans presented as an ordered chapter list (a label row above
+   * the ribbon). Each chapter seeks to its start when clicked — the ribbon and
+   * the label row are two views onto the same data + the same `seek`.
+   */
+  readonly chapters = computed(() =>
+    this.topics().map((t) => ({
+      label: t.label,
+      startS: t.startS,
+      endS: t.endS,
+      hue: t.hue,
+      order: t.order,
+    })),
+  );
+
   /** True once we have at least one lane or topic to draw. */
   readonly ready = computed(
     () =>
@@ -918,6 +1196,42 @@ export class MeetingTimelineComponent {
     }
     const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 1);
     this.seek.emit(ratio * total);
+  }
+
+  /**
+   * Track the pointer across a time track/axis → update the hover-scrub preview
+   * (a thin line + a m:ss bubble). Pure UI state; never seeks until clicked.
+   */
+  onScrubMove(event: MouseEvent): void {
+    if (this.span() <= 0) {
+      return;
+    }
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    if (rect.width <= 0) {
+      return;
+    }
+    this.hoverPct.set(
+      clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100),
+    );
+  }
+
+  /** Pointer left a time track → clear the scrub preview. */
+  onScrubLeave(): void {
+    this.hoverPct.set(null);
+  }
+
+  /**
+   * "Pin this moment" → emit the CURRENT playhead position in seconds. The
+   * component stays presentational; the parent owns the IPC + clipboard.
+   */
+  onPin(event: MouseEvent): void {
+    event.stopPropagation();
+    this.pin.emit(Math.max(0, this.currentTime()));
+  }
+
+  /** True when the playhead sits inside a chapter — highlights its label. */
+  isActiveChapter(startS: number, endS: number): boolean {
+    return this.isActive(startS, endS);
   }
 
   /** Keyboard seeking on the focusable axis (← / → by 5s, Home/End). */
