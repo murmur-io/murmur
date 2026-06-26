@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod biometric;
 pub mod commands;
 pub mod crypto;
 pub mod error;
@@ -6,6 +7,7 @@ pub mod events;
 pub mod export;
 pub mod mcp;
 pub mod pipeline;
+pub mod screenshare;
 pub mod secrets;
 pub mod settings;
 pub mod state;
@@ -123,6 +125,9 @@ pub fn run() {
                     .unwrap_or(false);
                 crate::mcp::spawn(db_path, unlocked, require_token);
             }
+            // Screen-share auto-relock watcher: on capture START, relock all session-unlocked
+            // folders + zeroize the KEK and toast the UI. Gated by K_RELOCK_ON_SCREENSHARE.
+            crate::screenshare::spawn(app.handle().clone());
             // Closing the main window HIDES it (recoverable from the tray) instead of
             // quitting — so the floating bar is never the only way back into the app.
             if let Some(main) = app.get_webview_window("main") {
