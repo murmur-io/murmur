@@ -16,6 +16,7 @@ import { FoldersService } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
 import type { FolderNode } from "../../core/models";
 import { FolderRowComponent } from "./folder-row.component";
+import { FolderDropDirective } from "./folder-drop.directive";
 
 /**
  * The recursive folder tree. Renders `nodes` as {@link FolderRowComponent}s; the
@@ -42,16 +43,20 @@ import { FolderRowComponent } from "./folder-row.component";
   // below instantiates an `app-folder-row` — exactly the "view breaks after
   // adding the first folder" bug. `forwardRef` defers the lookup, breaking the
   // cycle. (See folder-row for the mirror.)
-  imports: [forwardRef(() => FolderRowComponent)],
+  imports: [FolderDropDirective, forwardRef(() => FolderRowComponent)],
   template: `
     <div class="tree" [class.is-root]="isRoot()">
       @if (isRoot()) {
-        <!-- "Vault root" — selecting it filters to notes outside any folder. -->
+        <!-- "Vault root" — selecting it filters to notes outside any folder,
+             and it's a DROP TARGET so a note can be dragged out to the root. -->
         <button
           type="button"
           class="root-row"
           [class.is-selected]="selectedId() === null"
           [attr.aria-pressed]="selectedId() === null"
+          appFolderDrop
+          [dropFolderId]="null"
+          (dropNote)="dropNote.emit({ meetingId: $event, folderId: null })"
           (click)="select.emit(null)"
         >
           <span class="root-icon" aria-hidden="true">
@@ -74,6 +79,7 @@ import { FolderRowComponent } from "./folder-row.component";
           [selectedId]="selectedId()"
           [depth]="depth()"
           (select)="select.emit($event)"
+          (dropNote)="dropNote.emit($event)"
         />
       } @empty {
         @if (isRoot()) {
@@ -215,6 +221,26 @@ import { FolderRowComponent } from "./folder-row.component";
       .root-row.is-selected {
         color: var(--accent-hover);
         background: var(--accent-soft);
+      }
+      /* Drop target — armed (faint) while any note drags; lit under the pointer. */
+      .root-row {
+        border: 1px solid transparent;
+        transition:
+          color var(--transition),
+          background var(--transition),
+          border-color var(--transition),
+          box-shadow var(--transition);
+      }
+      .root-row.is-drop-armed {
+        border-color: var(--border-strong);
+        border-style: dashed;
+      }
+      .root-row.is-drop-target {
+        border-style: solid;
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        box-shadow: 0 0 0 3px var(--accent-ring);
       }
       .root-icon {
         display: inline-flex;
@@ -394,6 +420,9 @@ export class FolderTreeComponent {
 
   /** Bubbles the chosen folder id (or null for the vault root) to the screen. */
   readonly select = output<string | null>();
+
+  /** Bubbles a note dropped onto a folder (or the root) up to the screen. */
+  readonly dropNote = output<{ meetingId: string; folderId: string | null }>();
 
   /** Whether THIS level is the tree root (owns "All notes" + create UI). */
   readonly isRoot = computed(() => this.depth() === 0);

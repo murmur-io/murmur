@@ -23,6 +23,9 @@ import {
 } from "../../services/folders.service";
 import { FolderTreeComponent } from "../folders/folder-tree.component";
 import { LockBadgeComponent } from "../folders/lock-badge.component";
+import { MoveToMenuComponent } from "../folders/move-to-menu.component";
+import { NoteDragService } from "../folders/note-drag.service";
+import { ToastService } from "../../services/toast.service";
 
 /** Debounce window for search-as-you-type — quick enough to feel instant. */
 const SEARCH_DEBOUNCE_MS = 180;
@@ -37,12 +40,56 @@ interface SnippetPart {
   selector: "app-library",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, FolderTreeComponent, LockBadgeComponent],
+  imports: [
+    RouterLink,
+    FolderTreeComponent,
+    LockBadgeComponent,
+    MoveToMenuComponent,
+  ],
   template: `
     <section class="library">
       <!-- ============ LEFT PANE — folder tree (lock-aware) ============ -->
       <aside class="folders-pane card" aria-label="Folders">
-        <h3 class="folders-title">Folders</h3>
+        <div class="folders-head">
+          <h3 class="folders-title">Folders</h3>
+          @if (unlockedCount() > 0) {
+            <button
+              type="button"
+              class="relock-pill"
+              [disabled]="relockingAll()"
+              [attr.aria-label]="
+                'Re-seal all ' + unlockedCount() + ' unlocked folders now'
+              "
+              title="Re-seal every unlocked folder now"
+              (click)="relockAll()"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect
+                  x="3.5"
+                  y="7"
+                  width="9"
+                  height="6"
+                  rx="1.4"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                />
+                <path
+                  d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                />
+              </svg>
+              Lock all
+            </button>
+          }
+        </div>
         @if (foldersLoading()) {
           <p class="folders-state empty">Loading folders…</p>
         } @else {
@@ -50,6 +97,7 @@ interface SnippetPart {
             [nodes]="folderTree()"
             [selectedId]="activeFolderId()"
             (select)="selectFolder($event)"
+            (dropNote)="onDropNote($event)"
           />
         }
       </aside>
@@ -222,19 +270,90 @@ interface SnippetPart {
             </div>
           } @else if (displayedMeetings().length === 0) {
             <div class="card empty-state">
-              <span class="empty-mark" aria-hidden="true"></span>
               @if (activeFolderId() !== null) {
-                <p class="empty-title">No notes in this folder</p>
+                <!-- ACTIONABLE empty folder: on-brand "drop here" illustration
+                     plus the two concrete ways to file a note. -->
+                <span class="empty-illo" aria-hidden="true">
+                  <svg viewBox="0 0 64 64" width="64" height="64" fill="none">
+                    <defs>
+                      <linearGradient
+                        id="emptyFolderGrad"
+                        x1="8"
+                        y1="14"
+                        x2="56"
+                        y2="52"
+                        gradientUnits="userSpaceOnUse"
+                      >
+                        <stop stop-color="#6e76ff" />
+                        <stop offset="1" stop-color="#9d7bff" />
+                      </linearGradient>
+                    </defs>
+                    <!-- open folder, dashed mouth inviting a drop -->
+                    <path
+                      d="M9 22c0-2.2 1.8-4 4-4h9.5c1.3 0 2.5.6 3.3 1.7l1.6 2.3H51c2.2 0 4 1.8 4 4v20c0 2.2-1.8 4-4 4H13c-2.2 0-4-1.8-4-4z"
+                      stroke="url(#emptyFolderGrad)"
+                      stroke-width="2.2"
+                      stroke-linejoin="round"
+                    />
+                    <path
+                      d="M14 31h36"
+                      stroke="url(#emptyFolderGrad)"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-dasharray="3 4"
+                      opacity="0.7"
+                    />
+                    <!-- a note card dropping in, with the soundwave mark -->
+                    <g opacity="0.95">
+                      <rect
+                        x="24"
+                        y="9"
+                        width="16"
+                        height="20"
+                        rx="3"
+                        fill="var(--surface-overlay)"
+                        stroke="url(#emptyFolderGrad)"
+                        stroke-width="2"
+                      />
+                      <path
+                        d="M28 19v0M31 16.5v5M34 14v10M37 17.5v3"
+                        stroke="url(#emptyFolderGrad)"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                      />
+                    </g>
+                  </svg>
+                </span>
+                <p class="empty-title">Nothing filed here yet</p>
                 <p class="empty">
-                  Move a meeting here from its detail view, or pick another
-                  folder.
+                  Drag a meeting onto this folder, or use the
+                  <span class="empty-chip-hint">
+                    <svg
+                      viewBox="0 0 16 16"
+                      width="11"
+                      height="11"
+                      fill="none"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                    folder button</span
+                  >
+                  on any meeting to move it in.
                 </p>
               } @else if (activeTag() === null) {
+                <span class="empty-mark" aria-hidden="true"></span>
                 <p class="empty-title">No meetings yet</p>
                 <p class="empty">
                   Record one from the Record tab to see it here.
                 </p>
               } @else {
+                <span class="empty-mark" aria-hidden="true"></span>
                 <p class="empty-title">
                   No meetings tagged “{{ activeTag() }}”
                 </p>
@@ -247,17 +366,36 @@ interface SnippetPart {
                 <li
                   class="row-item"
                   [class.is-confirming]="pendingDeleteId() === m.id"
+                  [class.is-dragging]="draggingId() === m.id"
+                  [class.is-menu-open]="movePopoverId() === m.id"
                 >
                   <a
                     class="row"
                     [routerLink]="['/meeting', m.id]"
                     [style.animation-delay.ms]="i * 45"
+                    draggable="true"
+                    (dragstart)="onRowDragStart($event, m)"
+                    (dragend)="onRowDragEnd()"
                   >
+                    <!-- Drag grip: signals the row is draggable; not a button so
+                         it never steals the row's navigation click. -->
+                    <span
+                      class="grip"
+                      aria-hidden="true"
+                      title="Drag to a folder"
+                    >
+                      <svg viewBox="0 0 16 16" width="14" height="14">
+                        <circle cx="6" cy="4" r="1.05" fill="currentColor" />
+                        <circle cx="10" cy="4" r="1.05" fill="currentColor" />
+                        <circle cx="6" cy="8" r="1.05" fill="currentColor" />
+                        <circle cx="10" cy="8" r="1.05" fill="currentColor" />
+                        <circle cx="6" cy="12" r="1.05" fill="currentColor" />
+                        <circle cx="10" cy="12" r="1.05" fill="currentColor" />
+                      </svg>
+                    </span>
+
                     <span class="row-main">
                       <span class="title-row">
-                        @if (folderExposureOf(m); as exp) {
-                          <app-lock-badge [exposure]="exp" />
-                        }
                         @if (isMasked(m)) {
                           <span class="title title--masked" aria-hidden="true"
                             >•••••••••••••</span
@@ -282,6 +420,58 @@ interface SnippetPart {
                       </span>
                     </span>
                     <span class="row-aside">
+                      <!-- FOLDER CHIP — the primary "choose which goes where"
+                           affordance. Shows the current folder (or "+ Add to
+                           folder" at root). A button (stop/prevent) so the row's
+                           link never fires; opens the Move-to popover below. -->
+                      <button
+                        type="button"
+                        class="folder-chip"
+                        [class.is-filed]="folderNameOf(m) !== null"
+                        [attr.aria-expanded]="movePopoverId() === m.id"
+                        aria-haspopup="menu"
+                        [attr.aria-label]="
+                          folderNameOf(m)
+                            ? 'In folder ' +
+                              folderNameOf(m) +
+                              ' — move to another folder'
+                            : 'Add this meeting to a folder'
+                        "
+                        (click)="
+                          $event.preventDefault();
+                          $event.stopPropagation();
+                          toggleMovePopover(m.id)
+                        "
+                      >
+                        @if (folderExposureOf(m); as exp) {
+                          <app-lock-badge [exposure]="exp" />
+                        } @else {
+                          <svg
+                            class="folder-chip-icon"
+                            viewBox="0 0 16 16"
+                            width="13"
+                            height="13"
+                            fill="none"
+                            aria-hidden="true"
+                          >
+                            <path
+                              d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
+                              stroke="currentColor"
+                              stroke-width="1.3"
+                              stroke-linejoin="round"
+                            />
+                          </svg>
+                        }
+                        <span class="folder-chip-label">{{
+                          folderNameOf(m) ?? "Add to folder"
+                        }}</span>
+                        @if (folderNameOf(m) === null) {
+                          <span class="folder-chip-plus" aria-hidden="true"
+                            >+</span
+                          >
+                        }
+                      </button>
+
                       <span class="pill" [class]="statusPillClass(m.status)">
                         <span class="pill-dot"></span>
                         {{ statusLabel(m.status) }}
@@ -289,6 +479,20 @@ interface SnippetPart {
                       <span class="chevron" aria-hidden="true">›</span>
                     </span>
                   </a>
+
+                  <!-- "Move to…" popover, anchored to the row's right edge. The
+                       picker owns the cross-encryption-boundary confirm + IPC; we
+                       just reconcile the local list on its moved event. -->
+                  @if (movePopoverId() === m.id) {
+                    <div class="move-anchor">
+                      <app-move-to-menu
+                        [meetingId]="m.id"
+                        [currentFolderId]="m.folderId ?? null"
+                        (moved)="onMoved(m.id, $event)"
+                        (close)="closeMovePopover()"
+                      />
+                    </div>
+                  }
 
                   <!-- Subtle delete affordance — a separate button (never the
                      row's link). stop/prevent so a click can't navigate. -->
@@ -397,14 +601,56 @@ interface SnippetPart {
         top: 0;
         padding: var(--space-3);
       }
+      .folders-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-2);
+        margin-bottom: var(--space-2);
+        min-height: 24px;
+      }
       .folders-title {
-        margin: 0 0 var(--space-2);
+        margin: 0;
         padding: 0 var(--space-2);
         color: var(--text-muted);
         font-size: 0.75rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
+      }
+      /* "Lock all" — quiet accent pill, only present when a folder is exposed. */
+      .relock-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        height: 24px;
+        padding: 0 var(--space-2);
+        border: 1px solid transparent;
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-family: inherit;
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        cursor: pointer;
+        transition:
+          filter var(--transition),
+          transform var(--transition-fast);
+      }
+      .relock-pill:hover:not(:disabled) {
+        filter: brightness(1.12);
+      }
+      .relock-pill:active:not(:disabled) {
+        transform: scale(0.95);
+      }
+      .relock-pill:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .relock-pill:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
       }
       .folders-state {
         margin: var(--space-2);
@@ -425,6 +671,149 @@ interface SnippetPart {
         align-items: center;
         gap: var(--space-2);
         min-width: 0;
+      }
+
+      /* --- Drag grip (signals a row is draggable; reveals on row hover) ----- */
+      .grip {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 18px;
+        margin-left: calc(var(--space-2) * -1);
+        color: var(--text-muted);
+        cursor: grab;
+        opacity: 0;
+        transition:
+          opacity var(--transition),
+          color var(--transition);
+      }
+      .row:hover .grip,
+      .row:focus-visible .grip {
+        opacity: 0.65;
+      }
+      .row:hover .grip:hover {
+        opacity: 1;
+        color: var(--text-secondary);
+      }
+      .row[draggable="true"]:active .grip {
+        cursor: grabbing;
+      }
+
+      /* --- Folder chip — the primary filing affordance on every row -------- */
+      .folder-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        max-width: 168px;
+        height: 26px;
+        padding: 0 var(--space-2);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-pill);
+        background: var(--surface-input);
+        color: var(--text-muted);
+        font-family: inherit;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: -0.005em;
+        line-height: 1;
+        white-space: nowrap;
+        cursor: pointer;
+        transition:
+          color var(--transition),
+          background var(--transition),
+          border-color var(--transition),
+          transform var(--transition-fast);
+      }
+      .folder-chip:hover {
+        color: var(--text-primary);
+        background: var(--surface-hover);
+        border-color: var(--border-strong);
+      }
+      .folder-chip:active {
+        transform: scale(0.96);
+      }
+      .folder-chip:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      /* A note that IS filed reads in the accent voice — its folder is "real". */
+      .folder-chip.is-filed {
+        background: var(--accent-soft);
+        border-color: transparent;
+        color: var(--accent-hover);
+      }
+      .folder-chip.is-filed:hover {
+        background: var(--accent-soft);
+        filter: brightness(1.12);
+      }
+      .row-item.is-menu-open .folder-chip {
+        background: var(--accent-soft);
+        border-color: var(--accent);
+        color: var(--accent-hover);
+      }
+      .folder-chip-icon {
+        flex: none;
+      }
+      .folder-chip-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .folder-chip-plus {
+        font-size: 0.95rem;
+        line-height: 0;
+        margin-left: 1px;
+        opacity: 0.8;
+      }
+
+      /* --- "Move to…" popover anchor (right edge of the row) --------------- */
+      .move-anchor {
+        position: absolute;
+        top: calc(100% - var(--space-2));
+        right: var(--space-3);
+        z-index: 40;
+        animation: rise 160ms var(--transition) both;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .move-anchor {
+          animation: none;
+        }
+      }
+
+      /* --- Drag source: dim the row being dragged for a tidy affordance ---- */
+      .row-item.is-dragging {
+        opacity: 0.45;
+      }
+      .row-item.is-dragging .row {
+        background: var(--surface-hover);
+      }
+
+      /* --- Actionable empty-folder illustration --------------------------- */
+      .empty-illo {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: var(--space-3);
+        filter: drop-shadow(0 8px 24px rgba(110, 118, 255, 0.25));
+        animation: rise 420ms var(--transition) both;
+      }
+      .empty-chip-hint {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 1px var(--space-2);
+        margin: 0 2px;
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-weight: 600;
+        white-space: nowrap;
+        vertical-align: baseline;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .empty-illo {
+          animation: none;
+        }
       }
       .title--masked {
         color: var(--text-muted);
@@ -847,6 +1236,14 @@ export class LibraryComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly folders = inject(FoldersService);
+  private readonly drag = inject(NoteDragService);
+  private readonly toast = inject(ToastService);
+
+  /** The meeting id whose "Move to…" folder-chip popover is open (null = none). */
+  readonly movePopoverId = signal<string | null>(null);
+
+  /** The meeting id currently being dragged (mirrors the shared drag signal). */
+  readonly draggingId = this.drag.draggingId;
 
   /** The search box element — focused after a clear. */
   private readonly searchInput =
@@ -861,6 +1258,10 @@ export class LibraryComponent implements OnInit {
   readonly folderTree = this.folders.tree;
   /** True while the folder tree is loading (drives the left-pane state). */
   readonly foldersLoading = this.folders.loading;
+  /** How many sealed folders are session-unlocked right now (drives "Lock all"). */
+  readonly unlockedCount = this.folders.unlockedCount;
+  /** True while a "Lock all" op is in flight. */
+  readonly relockingAll = signal(false);
   /**
    * Selected folder id (null = no folder filter — show the tag/all list).
    * Mutually exclusive with the tag filter: selecting one clears the other.
@@ -1076,6 +1477,118 @@ export class LibraryComponent implements OnInit {
       this.tagLoading.set(false);
     }
     this.activeFolderId.set(folderId);
+  }
+
+  // --- Filing: the per-row folder chip + "Move to…" popover ----------------
+
+  /**
+   * The display name of a meeting's current folder, or null when it's at the
+   * vault root. Drives the folder chip's label ("Marketing" vs "+ Add to folder").
+   */
+  folderNameOf(m: Meeting): string | null {
+    const fid = m.folderId ?? null;
+    if (fid === null) {
+      return null;
+    }
+    return this.folderById().get(fid)?.name ?? null;
+  }
+
+  /** Open / close / toggle the row's folder picker popover (one open at a time). */
+  toggleMovePopover(id: string): void {
+    this.movePopoverId.update((cur) => (cur === id ? null : id));
+  }
+  closeMovePopover(): void {
+    this.movePopoverId.set(null);
+  }
+
+  /** Re-seal every session-unlocked folder at once (privacy "panic" affordance). */
+  async relockAll(): Promise<void> {
+    if (this.relockingAll()) {
+      return;
+    }
+    this.relockingAll.set(true);
+    try {
+      await this.folders.relockAll();
+      this.toast.success("All folders re-sealed");
+    } catch {
+      this.toast.danger("Couldn’t re-seal folders. Please try again.");
+    } finally {
+      this.relockingAll.set(false);
+    }
+  }
+
+  /**
+   * Apply a move (from the row chip popover OR a drag-drop) into `folderId` (null
+   * = vault root). The FoldersService reloads the tree (so counts refresh), and
+   * we patch the LIBRARY-LOCAL `meetings` signal's `folderId` so the derived
+   * `folderMeetings` recomputes at once — the moved note leaves the current
+   * folder view without a manual reload. `tagMeetings` is patched in lockstep so
+   * a tag view stays coherent if one is active.
+   */
+  private async applyMove(
+    meetingId: string,
+    folderId: string | null,
+  ): Promise<void> {
+    const patch = (list: Meeting[]): Meeting[] =>
+      list.map((m) => (m.id === meetingId ? { ...m, folderId } : m));
+    this.meetings.update(patch);
+    this.tagMeetings.update(patch);
+  }
+
+  /**
+   * The popover's `moved` output already ran the IPC move via FoldersService;
+   * here we only reconcile the local list + close the popover.
+   */
+  onMoved(meetingId: string, folderId: string | null): void {
+    void this.applyMove(meetingId, folderId);
+    this.closeMovePopover();
+  }
+
+  // --- Filing: drag a row onto a folder (the enhancement path) -------------
+
+  /** Begin a row drag: stash the meeting id on the transfer + the shared signal. */
+  onRowDragStart(event: DragEvent, m: Meeting): void {
+    // A locked-and-not-unlocked note is masked; dragging it is still fine (the
+    // move runs through the same load-bearing confirm at the destination), so we
+    // allow it. The transfer carries the id under our private MIME type.
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData(NoteDragService.MIME, m.id);
+    }
+    this.drag.begin(m.id);
+  }
+
+  /** End a row drag (fires whether or not it landed on a target). */
+  onRowDragEnd(): void {
+    this.drag.end();
+  }
+
+  /**
+   * A note was dropped onto a folder (or "All notes"). Run the move through the
+   * FoldersService (which owns the cross-encryption-boundary semantics + tree
+   * reload), then reconcile the local list. A no-op when it's already there.
+   */
+  async onDropNote(payload: {
+    meetingId: string;
+    folderId: string | null;
+  }): Promise<void> {
+    const { meetingId, folderId } = payload;
+    const current =
+      this.meetings().find((m) => m.id === meetingId)?.folderId ?? null;
+    if (current === folderId) {
+      return; // already filed here — nothing to do.
+    }
+    try {
+      await this.folders.moveNote(meetingId, folderId);
+      await this.applyMove(meetingId, folderId);
+      const name =
+        folderId === null
+          ? "All notes"
+          : (this.folderById().get(folderId)?.name ?? "folder");
+      this.toast.success(`Moved to ${name}`);
+    } catch {
+      this.toast.danger("Couldn’t move this note. Please try again.");
+    }
   }
 
   // --- Lock-aware row rendering -------------------------------------------
