@@ -14,13 +14,25 @@ import {
 } from "../../services/folders.service";
 import type { FolderNode } from "../../core/models";
 import { FolderTreeComponent } from "./folder-tree.component";
-import { LockBadgeComponent } from "./lock-badge.component";
+import { FolderDropDirective } from "./folder-drop.directive";
 
 /**
- * One folder row in the tree: disclosure caret · name · note-count chip · inline
- * {@link LockBadgeComponent} · a hover lock/unlock affordance. Selecting the row
- * emits `select` (the folder id) so the parent screen can filter the meeting
- * list; the row itself owns no selection state.
+ * One folder row in the tree: disclosure caret · folder glyph · name · note-count
+ * chip · ONE unambiguous lock control. Selecting the row emits `select` (the
+ * folder id) so the parent screen can filter the meeting list; the row itself
+ * owns no selection state.
+ *
+ * SINGLE lock control (was a confusing double padlock — a passive badge AND a
+ * toggle). Now exactly one `lock-toggle` button per row carries BOTH the state
+ * and the action:
+ *   - open    → a faint open-padlock, revealed on hover; click = "Encrypt".
+ *   - locked  → a solid closed padlock, ALWAYS visible; click = "Unlock for
+ *               this session".
+ *   - session → an accent open-padlock, ALWAYS visible; click = "Re-seal now".
+ * State is read straight from the lock control, so there is no second glyph.
+ *
+ * The row is also a DROP TARGET (`appFolderDrop`): a meeting dragged from the
+ * list can be dropped here to file it into this folder.
  *
  * Recursion is by CHILD COMPONENT — a row renders its children through a nested
  * {@link FolderTreeComponent}, never a `@for`-of-rows inside a row. Each level's
@@ -40,9 +52,17 @@ import { LockBadgeComponent } from "./lock-badge.component";
   // — Angular would then hit `getComponentDef(undefined)` (reading 'ɵcmp') the
   // first time a row instantiates a child tree. `forwardRef` defers the lookup
   // until the def exists, breaking the cycle. (See folder-tree for the mirror.)
-  imports: [LockBadgeComponent, forwardRef(() => FolderTreeComponent)],
+  imports: [FolderDropDirective, forwardRef(() => FolderTreeComponent)],
   template: `
-    <div class="row-line" [style.--depth]="depth()">
+    <div
+      class="row-line"
+      [class.is-exposure-locked]="exposure() === 'locked'"
+      [class.is-exposure-session]="exposure() === 'session'"
+      [style.--depth]="depth()"
+      appFolderDrop
+      [dropFolderId]="node().id"
+      (dropNote)="dropNote.emit({ meetingId: $event, folderId: node().id })"
+    >
       <!-- Disclosure caret (only when the folder has children) -->
       @if (childCount()) {
         <button
@@ -70,7 +90,8 @@ import { LockBadgeComponent } from "./lock-badge.component";
         <span class="caret caret--leaf" aria-hidden="true"></span>
       }
 
-      <!-- The selectable folder button: name + lock badge + count chip -->
+      <!-- The selectable folder button: glyph + name + count chip.
+           NO lock badge here — the single lock control (below) owns lock state. -->
       <button
         type="button"
         class="folder"
@@ -89,58 +110,26 @@ import { LockBadgeComponent } from "./lock-badge.component";
           </svg>
         </span>
         <span class="folder-name">{{ node().name }}</span>
-        <app-lock-badge [exposure]="exposure()" />
         @if (node().noteCount > 0) {
           <span class="count folder-count">{{ node().noteCount }}</span>
         }
       </button>
 
-      <!-- Lock / unlock affordance (revealed on hover/focus of the row) -->
+      <!-- ONE lock control. It is the state AND the action: a single padlock per
+           row. Always visible while locked/session (so the privacy state always
+           reads); revealed on hover for an open folder (the "encrypt" action). -->
       <div class="row-actions">
         @switch (exposure()) {
           @case ("open") {
             <button
               type="button"
-              class="act-btn"
+              class="lock-toggle"
               [disabled]="busy()"
               [attr.aria-label]="'Lock ' + node().name"
               title="Encrypt this folder"
               (click)="onLock()"
             >
-              <svg
-                viewBox="0 0 16 16"
-                width="14"
-                height="14"
-                fill="none"
-                aria-hidden="true"
-              >
-                <rect
-                  x="3.5"
-                  y="7"
-                  width="9"
-                  height="6"
-                  rx="1.4"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                />
-                <path
-                  d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </button>
-          }
-          @case ("locked") {
-            <button
-              type="button"
-              class="act-btn"
-              [disabled]="busy()"
-              [attr.aria-label]="'Unlock ' + node().name + ' for this session'"
-              title="Unlock for this session"
-              (click)="onUnlock()"
-            >
+              <!-- open padlock (shackle up & off the body) -->
               <svg
                 viewBox="0 0 16 16"
                 width="14"
@@ -166,15 +155,53 @@ import { LockBadgeComponent } from "./lock-badge.component";
               </svg>
             </button>
           }
+          @case ("locked") {
+            <button
+              type="button"
+              class="lock-toggle is-locked"
+              [disabled]="busy()"
+              [attr.aria-label]="'Unlock ' + node().name + ' for this session'"
+              title="Locked — click to unlock for this session"
+              (click)="onUnlock()"
+            >
+              <!-- closed padlock, filled body -->
+              <svg
+                viewBox="0 0 16 16"
+                width="14"
+                height="14"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect
+                  x="3.5"
+                  y="7"
+                  width="9"
+                  height="6"
+                  rx="1.4"
+                  fill="currentColor"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+                <path
+                  d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+                <circle cx="8" cy="10" r="1" fill="var(--surface-base)" />
+              </svg>
+            </button>
+          }
           @case ("session") {
             <button
               type="button"
-              class="act-btn is-session"
+              class="lock-toggle is-session"
               [disabled]="busy()"
               [attr.aria-label]="'Re-lock ' + node().name"
-              title="Re-seal now"
+              title="Unlocked this session — click to re-seal now"
               (click)="onRelock()"
             >
+              <!-- open padlock, accent — plaintext exposed this session -->
               <svg
                 viewBox="0 0 16 16"
                 width="14"
@@ -189,14 +216,15 @@ import { LockBadgeComponent } from "./lock-badge.component";
                   height="6"
                   rx="1.4"
                   stroke="currentColor"
-                  stroke-width="1.3"
+                  stroke-width="1.4"
                 />
                 <path
-                  d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
+                  d="M5.5 7V5.4a2.5 2.5 0 0 1 4.9-0.65"
                   stroke="currentColor"
-                  stroke-width="1.3"
+                  stroke-width="1.4"
                   stroke-linecap="round"
                 />
+                <circle cx="8" cy="10" r="1.05" fill="currentColor" />
               </svg>
             </button>
           }
@@ -217,6 +245,7 @@ import { LockBadgeComponent } from "./lock-badge.component";
         [selectedId]="selectedId()"
         [depth]="depth() + 1"
         (select)="select.emit($event)"
+        (dropNote)="dropNote.emit($event)"
       />
     }
   `,
@@ -230,11 +259,33 @@ import { LockBadgeComponent } from "./lock-badge.component";
         align-items: center;
         gap: var(--space-1);
         padding-left: calc(var(--depth, 0) * var(--space-4));
+        border: 1px solid transparent;
         border-radius: var(--radius-md);
-        transition: background var(--transition);
+        transition:
+          background var(--transition),
+          border-color var(--transition),
+          box-shadow var(--transition);
       }
       .row-line:hover {
         background: var(--surface-hover);
+      }
+
+      /* --- Drop target (a note dragged from the list) --------------------- */
+      /* Armed: every folder shows a faint dashed hint the instant a drag starts. */
+      .row-line.is-drop-armed {
+        border-color: var(--border-strong);
+        border-style: dashed;
+      }
+      /* Active: the folder under the pointer lights up with the accent. */
+      .row-line.is-drop-target {
+        border-style: solid;
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .row-line.is-drop-target .folder,
+      .row-line.is-drop-target .folder-icon {
+        color: var(--accent-hover);
       }
 
       .caret {
@@ -322,18 +373,14 @@ import { LockBadgeComponent } from "./lock-badge.component";
         height: 20px;
       }
 
+      /* --- ONE lock control: state + action in a single button ----------- */
       .row-actions {
         display: inline-flex;
         align-items: center;
         flex: none;
-        opacity: 0;
-        transition: opacity var(--transition);
+        margin-right: 2px;
       }
-      .row-line:hover .row-actions,
-      .row-line:focus-within .row-actions {
-        opacity: 1;
-      }
-      .act-btn {
+      .lock-toggle {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -342,33 +389,72 @@ import { LockBadgeComponent } from "./lock-badge.component";
         padding: 0;
         border: 1px solid transparent;
         border-radius: var(--radius-sm);
-        background: var(--surface-input);
-        color: var(--text-secondary);
+        background: transparent;
+        color: var(--text-muted);
         cursor: pointer;
+        /* OPEN folders: the lock action is quiet until the row is hovered. */
+        opacity: 0;
         transition:
           color var(--transition),
           background var(--transition),
           border-color var(--transition),
+          opacity var(--transition),
           transform var(--transition-fast);
       }
-      .act-btn:hover {
+      .row-line:hover .lock-toggle,
+      .row-line:focus-within .lock-toggle {
+        opacity: 1;
+      }
+      /* LOCKED / SESSION: always visible — the control IS the state badge. */
+      .lock-toggle.is-locked,
+      .lock-toggle.is-session {
+        opacity: 1;
+        background: var(--surface-input);
+      }
+      .lock-toggle.is-locked {
+        color: var(--text-secondary);
+      }
+      .lock-toggle.is-session {
+        color: var(--accent-hover);
+        background: var(--accent-soft);
+        /* a gentle one-shot pop when a folder unseals for the session */
+        animation: lock-pop 220ms var(--ease-spring) both;
+      }
+      .lock-toggle:hover:not(:disabled) {
         color: var(--text-primary);
+        background: var(--surface-hover);
         border-color: var(--border-strong);
       }
-      .act-btn.is-session {
+      .lock-toggle.is-session:hover:not(:disabled) {
         color: var(--accent-hover);
+        border-color: var(--accent);
       }
-      .act-btn:active {
+      .lock-toggle:active:not(:disabled) {
         transform: scale(0.92);
       }
-      .act-btn:focus-visible {
+      .lock-toggle:focus-visible {
         outline: none;
         opacity: 1;
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
-      .act-btn:disabled {
+      .lock-toggle:disabled {
         opacity: 0.4;
         cursor: not-allowed;
+      }
+      @keyframes lock-pop {
+        from {
+          transform: scale(0.55);
+          opacity: 0;
+        }
+        to {
+          transform: scale(1);
+          opacity: 1;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .lock-toggle.is-session {
+          animation: none;
+        }
       }
 
       .row-error {
@@ -392,6 +478,9 @@ export class FolderRowComponent {
 
   /** Emits the folder id when this row (or a descendant) is chosen. */
   readonly select = output<string | null>();
+
+  /** Emits when a dragged meeting is dropped onto this row (or a descendant). */
+  readonly dropNote = output<{ meetingId: string; folderId: string | null }>();
 
   /** Whether this row's children subtree is shown. Roots start expanded. */
   readonly expanded = signal(true);
