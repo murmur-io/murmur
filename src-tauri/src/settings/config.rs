@@ -39,6 +39,13 @@ pub struct AppConfig {
     /// existing local Claude connection keeps working; discovery (initialize/tools/list/ping)
     /// stays open regardless. Bind is always 127.0.0.1.
     pub mcp_require_token: bool,
+    /// Require a passing biometric (Touch ID, falling back to device passcode) before unlocking a
+    /// sealed folder. Default ON. Degrades to allow when no biometric/passcode policy is available
+    /// (no Touch ID hardware / CI), so it never locks the user out.
+    pub lock_require_biometric: bool,
+    /// Auto-relock all session-unlocked folders (and zeroize the cached KEK) when screen
+    /// capture/sharing STARTS. Default ON.
+    pub relock_on_screenshare: bool,
 }
 
 impl Default for AppConfig {
@@ -61,6 +68,8 @@ impl Default for AppConfig {
             auto_organize: false,
             note_language: "auto".to_string(),
             mcp_require_token: false,
+            lock_require_biometric: true,
+            relock_on_screenshare: true,
         }
     }
 }
@@ -83,6 +92,8 @@ const K_NOTE_STYLE: &str = "note_style";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
+const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
+const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -150,6 +161,12 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_MCP_REQUIRE_TOKEN)? {
             cfg.mcp_require_token = v == "true";
         }
+        if let Some(v) = db.get_setting(K_LOCK_REQUIRE_BIOMETRIC)? {
+            cfg.lock_require_biometric = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_RELOCK_ON_SCREENSHARE)? {
+            cfg.relock_on_screenshare = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -192,6 +209,14 @@ impl AppConfig {
             K_MCP_REQUIRE_TOKEN,
             if self.mcp_require_token { "true" } else { "false" },
         )?;
+        db.set_setting(
+            K_LOCK_REQUIRE_BIOMETRIC,
+            if self.lock_require_biometric { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_RELOCK_ON_SCREENSHARE,
+            if self.relock_on_screenshare { "true" } else { "false" },
+        )?;
         Ok(())
     }
 }
@@ -232,6 +257,23 @@ mod tests {
         assert_eq!(cfg.provider_id, "claude_code");
         assert_eq!(cfg.anthropic_model, "claude-opus-4-8");
         assert!(cfg.vault_path.is_none());
+        // Stage E security flags default ON.
+        assert!(cfg.lock_require_biometric);
+        assert!(cfg.relock_on_screenshare);
+    }
+
+    #[test]
+    fn security_flags_round_trip() {
+        let db = temp_db();
+        let cfg = AppConfig {
+            lock_require_biometric: false,
+            relock_on_screenshare: false,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert!(!loaded.lock_require_biometric);
+        assert!(!loaded.relock_on_screenshare);
     }
 
     #[test]

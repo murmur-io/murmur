@@ -73,6 +73,17 @@ pub struct AppConfigDto {
     pub note_language: String,
     #[serde(default)]
     pub mcp_require_token: bool,
+    /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
+    #[serde(default = "default_true")]
+    pub lock_require_biometric: bool,
+    /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
+    #[serde(default = "default_true")]
+    pub relock_on_screenshare: bool,
+}
+
+/// serde default for the Stage E security flags (which default ON in `AppConfig`).
+fn default_true() -> bool {
+    true
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -1064,6 +1075,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         auto_organize: c.auto_organize,
         note_language: c.note_language.clone(),
         mcp_require_token: c.mcp_require_token,
+        lock_require_biometric: c.lock_require_biometric,
+        relock_on_screenshare: c.relock_on_screenshare,
     }
 }
 
@@ -1100,6 +1113,8 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
             d.note_language
         },
         mcp_require_token: d.mcp_require_token,
+        lock_require_biometric: d.lock_require_biometric,
+        relock_on_screenshare: d.relock_on_screenshare,
     }
 }
 
@@ -1573,10 +1588,25 @@ pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), 
 /// the plaintext markdown column for the session, and add the folder id to the session unlock set.
 /// Does NOT re-export to the vault. Returns the refreshed folder node.
 #[tauri::command]
-pub fn unlock_folder(
+pub async fn unlock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
+    // Biometric gate (Stage E teeth): require a passing Touch ID / device-owner auth before we
+    // release the KEK and decrypt any sealed note. Gated by K_LOCK_REQUIRE_BIOMETRIC (default on)
+    // so it can be disabled. On hardware/policy unavailability the gate degrades to allow (see
+    // biometric::authenticate), so this never locks out a Mac without Touch ID.
+    let require_biometric = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Storage("config mutex poisoned".into()))?;
+        cfg.lock_require_biometric
+    };
+    if require_biometric && !crate::biometric::authenticate("Unlock this folder").await? {
+        return Err(AppError::Auth("biometric authentication failed".into()));
+    }
+
     let folder = state
         .db
         .folder_by_id(&folder_id)?
