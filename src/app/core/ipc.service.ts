@@ -243,6 +243,19 @@ export class IpcService {
     return invoke<MeetingTimeline>("get_timeline", { meetingId });
   }
 
+  /** Rename a speaker across a meeting's timeline (e.g. "User 1" → "Sarah"). */
+  renameSpeaker(
+    meetingId: string,
+    oldLabel: string,
+    newLabel: string,
+  ): Promise<MeetingTimeline> {
+    return invoke<MeetingTimeline>("rename_speaker", {
+      meetingId,
+      oldLabel,
+      newLabel,
+    });
+  }
+
   /** Whether a usable Whisper model is present (configured path or default models dir). */
   modelPresent(): Promise<boolean> {
     return invoke<boolean>("model_present");

@@ -8,6 +8,8 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
 import type { Analytics } from "../../core/models";
+import { TopicThreadsComponent } from "./topic-threads.component";
+import { WeeklyDigestComponent } from "./weekly-digest.component";
 
 /** One rendered column of the 30-day activity chart (zero-filled for gaps). */
 interface ChartBar {
@@ -44,6 +46,7 @@ const STATUS_ORDER = [
 @Component({
   selector: "app-analytics",
   standalone: true,
+  imports: [TopicThreadsComponent, WeeklyDigestComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <section class="analytics">
@@ -164,6 +167,12 @@ const STATUS_ORDER = [
             </div>
           </div>
         </div>
+
+        <!-- Topic threads (cross-meeting clusters from cached timelines) -->
+        <app-topic-threads />
+
+        <!-- Weekly digest (on-demand synthesis of recent meetings) -->
+        <app-weekly-digest />
       }
     </section>
   `,

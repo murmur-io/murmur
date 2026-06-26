@@ -228,7 +228,24 @@ interface ParsedNote {
                 >
                   Save as PDF
                 </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost export-btn"
+                  (click)="exportCanvas(d.meeting.id)"
+                  [disabled]="editing() || exportingCanvas()"
+                >
+                  {{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}
+                </button>
               </div>
+            }
+            @if (canvasMsg(); as path) {
+              <div class="saved-toast canvas-toast" role="status">
+                <span class="saved-toast-check" aria-hidden="true"></span>
+                Canvas saved · {{ path }}
+              </div>
+            }
+            @if (canvasError(); as err) {
+              <span class="msg msg-error" role="alert">{{ err }}</span>
             }
 
             <!-- CONNECT TO GRAPH: resolve people + projects into vault stubs.
@@ -1326,6 +1343,10 @@ interface ParsedNote {
         font-weight: 600;
         animation: rise 280ms var(--transition) both;
       }
+      .canvas-toast {
+        height: auto;
+        word-break: break-all;
+      }
       .saved-toast-check {
         position: relative;
         width: 14px;
@@ -1524,6 +1545,16 @@ export class DetailComponent implements OnInit {
   readonly exportError = signal("");
   /** Tracked so we can cancel the pending export-label reset on destroy. */
   private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // --- Export Canvas (Obsidian .canvas board) ------------------------------
+  /** True while an exportCanvas IPC call is in flight (disables the button). */
+  readonly exportingCanvas = signal(false);
+  /** The written .canvas path, shown briefly as a "Canvas saved" confirmation. */
+  readonly canvasMsg = signal("");
+  /** Inline error surfaced when the canvas export fails (e.g. no timeline yet). */
+  readonly canvasError = signal("");
+  /** Tracked so we can cancel the pending canvas-confirmation reset on destroy. */
+  private canvasResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- Meeting tags (editable; persisted via set/getMeetingTags) -----------
   /** The meeting's current tags (loaded in ngOnInit; updated optimistically). */
@@ -2152,6 +2183,43 @@ export class DetailComponent implements OnInit {
     } finally {
       document.body.classList.remove("murmur-printing");
     }
+  }
+
+  /**
+   * Export this meeting as an Obsidian Canvas board: call `exportCanvas` (which
+   * writes `vault/Canvas/<title>.canvas` and returns the path), then flash a
+   * brief "Canvas saved" confirmation with that path. Gated on a parsed note
+   * existing; errors (e.g. "open the meeting once to generate its timeline
+   * first") surface inline and leave the rest of the page untouched.
+   */
+  async exportCanvas(id: string): Promise<void> {
+    if (this.editing() || this.exportingCanvas() || !this.note()) {
+      return;
+    }
+    this.canvasError.set("");
+    this.exportingCanvas.set(true);
+    try {
+      const path = await this.ipc.exportCanvas(id);
+      this.flashCanvas(path);
+    } catch (e) {
+      this.canvasError.set("Couldn’t export Canvas: " + String(e));
+    } finally {
+      this.exportingCanvas.set(false);
+    }
+  }
+
+  /** Show the "Canvas saved" confirmation (tracked timeout — cancelled on destroy). */
+  private flashCanvas(path: string): void {
+    this.canvasMsg.set(path);
+    if (this.canvasResetTimer) {
+      clearTimeout(this.canvasResetTimer);
+    }
+    this.canvasResetTimer = setTimeout(() => this.canvasMsg.set(""), 4000);
+    this.destroyRef.onDestroy(() => {
+      if (this.canvasResetTimer) {
+        clearTimeout(this.canvasResetTimer);
+      }
+    });
   }
 
   /**

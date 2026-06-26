@@ -17,6 +17,7 @@ pub mod ollama;
 pub mod organize;
 pub mod provider;
 pub mod recipes;
+pub mod redact;
 pub mod template;
 pub mod threads;
 pub mod timeline;
@@ -49,9 +50,12 @@ pub fn make_provider(
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
             let api_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?;
-            Ok(Arc::new(AnthropicProvider::new(
-                api_key,
-                config.anthropic_model.clone(),
+            let inner: Arc<dyn SummarizerProvider> =
+                Arc::new(AnthropicProvider::new(api_key, config.anthropic_model.clone()));
+            // Redaction firewall: scrub emails/cards/phones before they reach the cloud API
+            // (restored in the reply). Local providers (claude_code/ollama) need no firewall.
+            Ok(Arc::new(crate::summarize::redact::RedactingProvider::new(
+                inner,
             )))
         }
         PROVIDER_OLLAMA => Ok(Arc::new(OllamaProvider::new(
