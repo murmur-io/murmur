@@ -15,7 +15,11 @@ import { ActivatedRoute, Router, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
-import type { MeetingDetail, MeetingTimeline } from "../../core/models";
+import type {
+  GraphPayload,
+  MeetingDetail,
+  MeetingTimeline,
+} from "../../core/models";
 import { MeetingActionsComponent } from "./meeting-actions.component";
 import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingRecipesComponent } from "./meeting-recipes.component";
@@ -227,6 +231,21 @@ interface ParsedNote {
               </div>
             }
 
+            <!-- CONNECT TO GRAPH: resolve people + projects into vault stubs.
+                 Gated on a parsed note existing; disabled while editing it. -->
+            @if (note() && !renaming()) {
+              <div class="graph-connect" role="group" aria-label="Graph">
+                <button
+                  type="button"
+                  class="btn btn-ghost export-btn"
+                  (click)="linkGraph()"
+                  [disabled]="editing() || linking()"
+                >
+                  {{ linking() ? "Linking…" : "Link people &amp; projects" }}
+                </button>
+              </div>
+            }
+
             @if (exportError(); as err) {
               <span class="msg msg-error" role="alert">{{ err }}</span>
             }
@@ -235,6 +254,48 @@ interface ParsedNote {
             }
           </div>
         </header>
+
+        <!-- Graph link result: resolved people + projects as chips + caption. -->
+        @if (graphError(); as err) {
+          <div class="card graph-card graph-card--error" role="alert">
+            {{ err }}
+          </div>
+        }
+        @if (graph(); as g) {
+          <div class="card graph-card" role="status">
+            @if (g.people.length || g.projects.length) {
+              <div class="graph-groups">
+                @if (g.people.length) {
+                  <div class="graph-group">
+                    <span class="graph-group-label">People</span>
+                    <div class="graph-pills">
+                      @for (p of g.people; track p) {
+                        <span class="pill tag">{{ p }}</span>
+                      }
+                    </div>
+                  </div>
+                }
+                @if (g.projects.length) {
+                  <div class="graph-group">
+                    <span class="graph-group-label">Projects</span>
+                    <div class="graph-pills">
+                      @for (pr of g.projects; track pr) {
+                        <span class="pill tag graph-pill--project">{{
+                          pr
+                        }}</span>
+                      }
+                    </div>
+                  </div>
+                }
+              </div>
+              <p class="graph-caption">
+                Added to your Obsidian vault graph (People/ &amp; Projects/)
+              </p>
+            } @else {
+              <p class="graph-caption">No people or projects to link yet.</p>
+            }
+          </div>
+        }
 
         <!-- In-app delete confirmation (signal-driven; no window.confirm) ----- -->
         @if (confirmingDelete()) {
@@ -341,7 +402,21 @@ interface ParsedNote {
           [hasAudio]="!!audioSrc()"
           (seek)="seekTo($event)"
           (retry)="loadTimeline()"
+          (pin)="onPin($event)"
         />
+
+        <!-- Pin confirmation / error (driven by the timeline's (pin) output). -->
+        @if (pinMsg(); as m) {
+          <div class="saved-toast pin-toast" role="status">
+            <span class="pin-toast-dot" aria-hidden="true"></span>
+            {{ m }}
+          </div>
+        }
+        @if (pinError(); as err) {
+          <div class="saved-toast pin-toast pin-toast--error" role="alert">
+            {{ err }}
+          </div>
+        }
 
         <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
         <section class="block print-keep">
@@ -605,7 +680,8 @@ interface ParsedNote {
         justify-content: space-between;
         gap: var(--space-4);
       }
-      .head-text {
+      .head-text,
+      .graph-group {
         display: flex;
         flex-direction: column;
         gap: var(--space-2);
@@ -701,8 +777,9 @@ interface ParsedNote {
         color: var(--danger);
       }
 
-      /* --- Export menu (compact ghost buttons + a soft leading divider) --- */
-      .export {
+      /* --- Export menu + graph-connect (ghost buttons; leading divider) --- */
+      .export,
+      .graph-connect {
         display: inline-flex;
         flex-wrap: wrap;
         align-items: center;
@@ -714,6 +791,25 @@ interface ParsedNote {
         height: 36px;
         padding: 0 var(--space-3);
         font-size: 0.875rem;
+      }
+      /* Pin toast reuses .saved-toast box (accent variant). */
+      .pin-toast {
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+      }
+      .pin-toast--error,
+      .graph-card--error {
+        background: var(--danger-soft);
+        color: var(--danger);
+      }
+      .graph-groups {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-4) var(--space-5);
+      }
+      .graph-pill--project {
+        background: var(--success-soft);
+        color: var(--success);
       }
 
       /* --- Inline title rename --- */
@@ -951,7 +1047,8 @@ interface ParsedNote {
       /* 2) Rich analysis                                           */
       /* ========================================================== */
       .tags,
-      .people {
+      .people,
+      .graph-pills {
         display: flex;
         flex-wrap: wrap;
         gap: var(--space-2);
@@ -966,14 +1063,16 @@ interface ParsedNote {
         font-weight: 600;
       }
 
-      .meta-card {
+      .meta-card,
+      .graph-card {
         display: flex;
         flex-direction: column;
-        gap: var(--space-2);
+        gap: var(--space-3);
         padding: var(--space-4) var(--space-5);
         animation: rise 420ms var(--transition) both;
       }
-      .meta-card-label {
+      .meta-card-label,
+      .graph-group-label {
         color: var(--text-muted);
         font-size: 0.75rem;
         font-weight: 600;
@@ -1116,13 +1215,18 @@ interface ParsedNote {
         padding: var(--space-3) var(--space-4);
         animation: rise 420ms var(--transition) both;
       }
-      .saved-icon {
+      .saved-icon,
+      .pin-toast-dot {
         flex: none;
         width: 8px;
         height: 8px;
         border-radius: 50%;
         background: var(--success);
         box-shadow: 0 0 0 4px var(--success-soft);
+      }
+      .pin-toast-dot {
+        background: var(--accent);
+        box-shadow: 0 0 0 4px var(--accent-soft);
       }
       .saved-body {
         display: flex;
@@ -1197,9 +1301,13 @@ interface ParsedNote {
         justify-content: space-between;
         gap: var(--space-3);
       }
-      .editor-hint {
+      .editor-hint,
+      .graph-caption {
         color: var(--text-muted);
         font-size: 0.8125rem;
+      }
+      .graph-caption {
+        margin: 0;
       }
 
       /* Transient "Saved" confirmation */
@@ -1460,6 +1568,24 @@ export class DetailComponent implements OnInit {
   readonly timelineLoading = signal(false);
   readonly timelineError = signal(false);
 
+  // --- Pin-this-moment (timeline (pin) → pinMoment IPC + clipboard) --------
+  /** Transient confirmation after a successful pin, e.g. "Pinned 2:14 — …". */
+  readonly pinMsg = signal("");
+  /** Inline error surfaced when a pin (or its clipboard copy) fails. */
+  readonly pinError = signal("");
+  /** True while a pinMoment IPC call is in flight (debounces rapid clicks). */
+  readonly pinning = signal(false);
+  /** Tracked so we can cancel the pending pin-confirmation reset on destroy. */
+  private pinResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // --- Connect-to-graph (linkMeetingEntities → People/ & Projects/ stubs) --
+  /** True while a linkMeetingEntities IPC call is in flight. */
+  readonly linking = signal(false);
+  /** The resolved graph entities after a successful link (null until run). */
+  readonly graph = signal<GraphPayload | null>(null);
+  /** Inline error surfaced when the graph link fails. */
+  readonly graphError = signal("");
+
   /**
    * Total length for the shared timeline scale: the meeting duration, falling
    * back to the furthest end across speakers / topics / transcript segments.
@@ -1522,6 +1648,82 @@ export class DetailComponent implements OnInit {
       this.timelineError.set(true);
     } finally {
       this.timelineLoading.set(false);
+    }
+  }
+
+  /**
+   * Pin the timeline's current moment: derive a short label (the topic span
+   * under the playhead, else "Pinned moment"), call `pinMoment` to write a
+   * `^block-ref` + obsidian:// deep link, copy the link to the clipboard, then
+   * flash a brief confirmation. Errors surface inline; nothing else is touched.
+   */
+  async onPin(seconds: number): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id || this.pinning()) {
+      return;
+    }
+    this.pinError.set("");
+    this.pinning.set(true);
+    try {
+      const result = await this.ipc.pinMoment(
+        id,
+        seconds,
+        this.pinLabel(seconds),
+      );
+      try {
+        await navigator.clipboard.writeText(result.url);
+      } catch {
+        // Pin still landed in the note; only the clipboard copy was refused.
+      }
+      this.flashPin(`Pinned ${result.mmss} — Obsidian link copied`);
+    } catch (e) {
+      this.pinError.set("Couldn’t pin: " + String(e));
+    } finally {
+      this.pinning.set(false);
+    }
+  }
+
+  /** Short pin label: the topic span containing `seconds`, else a default. */
+  private pinLabel(seconds: number): string {
+    const topic = this.timeline()?.topics.find(
+      (t) => seconds >= t.startS && seconds < t.endS,
+    );
+    return topic?.label?.trim() || "Pinned moment";
+  }
+
+  /** Show the pin confirmation for a moment (tracked timeout — cancelled on destroy). */
+  private flashPin(message: string): void {
+    this.pinMsg.set(message);
+    if (this.pinResetTimer) {
+      clearTimeout(this.pinResetTimer);
+    }
+    this.pinResetTimer = setTimeout(() => this.pinMsg.set(""), 3200);
+    this.destroyRef.onDestroy(() => {
+      if (this.pinResetTimer) {
+        clearTimeout(this.pinResetTimer);
+      }
+    });
+  }
+
+  /**
+   * Connect this meeting to the Obsidian vault graph: resolve its people +
+   * projects into `People/` / `Projects/` stub notes with backlinks, then show
+   * the resolved entities as chips. Gated on a note existing. Errors inline.
+   */
+  async linkGraph(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id || !this.note() || this.linking()) {
+      return;
+    }
+    this.graphError.set("");
+    this.linking.set(true);
+    try {
+      this.graph.set(await this.ipc.linkMeetingEntities(id));
+    } catch (e) {
+      this.graph.set(null);
+      this.graphError.set("Couldn’t connect to graph: " + String(e));
+    } finally {
+      this.linking.set(false);
     }
   }
 
