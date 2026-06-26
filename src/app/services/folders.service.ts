@@ -1,6 +1,6 @@
 import { Injectable, computed, inject, signal } from "@angular/core";
 import { IpcService } from "../core/ipc.service";
-import type { FolderNode } from "../core/models";
+import type { Folder, FolderNode } from "../core/models";
 
 /**
  * A folder's privacy exposure, derived from its lock flags:
@@ -75,13 +75,15 @@ export class FoldersService {
   /**
    * Create a folder under `parentId` (null = vault root). The IPC returns the new
    * `Folder` row (no counts/children), so we reload the tree to fold it in with
-   * the rest of the forest rather than splice a partial node.
+   * the rest of the forest rather than splice a partial node. The created
+   * `Folder` is returned so the caller can select/highlight it once it appears.
    */
-  async create(name: string, parentId: string | null = null): Promise<void> {
+  async create(name: string, parentId: string | null = null): Promise<Folder> {
     this._error.set(null);
     try {
-      await this.ipc.createFolder(name, parentId);
+      const folder = await this.ipc.createFolder(name, parentId);
       await this.load();
+      return folder;
     } catch (e) {
       this._error.set(String(e));
       throw e;
@@ -166,7 +168,8 @@ export class FoldersService {
     const walk = (list: FolderNode[]): void => {
       for (const node of list) {
         out.push(node);
-        if (node.children.length) {
+        // Defensive: tolerate a node that omits `children` (older backend).
+        if (node.children?.length) {
           walk(node.children);
         }
       }

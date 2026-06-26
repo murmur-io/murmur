@@ -876,7 +876,10 @@ export class LibraryComponent implements OnInit {
     const walk = (nodes: FolderNode[]): void => {
       for (const n of nodes) {
         map.set(n.id, n);
-        if (n.children.length) {
+        // Defensive: a node from an older/odd backend may omit `children`.
+        // Never let a missing array throw here — that would take the whole
+        // Library view (both panes) down, not just the folder tree.
+        if (n.children?.length) {
           walk(n.children);
         }
       }
