@@ -181,6 +181,22 @@ pub struct DigestResult {
     pub exported_path: Option<String>,
 }
 
+/// An upcoming Calendar event (best-effort; absent if Calendar access is denied).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarEvent {
+    pub title: String,
+    pub start: Option<String>,
+}
+
+/// A pre-meeting brief: grounded markdown + the source meetings used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefResult {
+    pub markdown: String,
+    pub sources: Vec<VaultSource>,
+}
+
 /// One occurrence of a topic in a meeting (a node in a Topic Thread).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
