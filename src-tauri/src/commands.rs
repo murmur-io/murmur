@@ -93,6 +93,10 @@ pub struct MeetingDetailDto {
     pub meeting: Meeting,
     pub note: Option<NoteDto>,
     pub segments: Vec<Segment>,
+    /// Phase 0.5 — `true` when the meeting's folder is sealed AND not session-unlocked. The FE
+    /// renders a locked state (Touch-ID-to-unlock) instead of content; `note`/`segments` are
+    /// empty in that case (the content is encrypted at rest, decrypted only on session-unlock).
+    pub locked: bool,
 }
 
 // ── Commands (PHASE0-PLAN §7) ──
@@ -468,6 +472,14 @@ pub fn export_audio(
     meeting_id: String,
     dest_path: String,
 ) -> Result<(), AppError> {
+    // Phase 0.5 READ-GATE: refuse to export the audio of a sealed-and-not-unlocked meeting. Its
+    // WAV is AES-GCM-encrypted at rest (audio_path → <file>.enc) and there is no plaintext on disk
+    // to copy until the folder is session-unlocked; fail closed with a Locked error.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to export the audio".into(),
+        ));
+    }
     let meeting = state
         .db
         .get_meeting(&meeting_id)?
@@ -1368,6 +1380,12 @@ pub async fn get_timeline(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<MeetingTimeline, AppError> {
+    // Phase 0.5 READ-GATE: a sealed-and-not-unlocked meeting returns an EMPTY timeline (its
+    // `timelines.data` is blanked at rest while sealed, but mask explicitly + skip regeneration so
+    // we never re-derive a timeline from now-blank segments).
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Ok(MeetingTimeline::default());
+    }
     if let Some(json) = state.db.get_timeline_data(&meeting_id)? {
         if let Ok(t) = serde_json::from_str::<MeetingTimeline>(&json) {
             return Ok(t);
@@ -1408,6 +1426,24 @@ pub fn get_meeting_detail(
     let Some(meeting) = state.db.get_meeting(&meeting_id)? else {
         return Ok(None);
     };
+
+    // Phase 0.5 READ-GATE: a meeting in a locked-and-NOT-session-unlocked folder returns a MASKED
+    // DTO — `locked: true`, no note, no segments. The plaintext columns are blanked at rest while
+    // sealed (and the audio is encrypted), but we mask explicitly so the FE never shows the empty
+    // shell as if it were real content, and so the title can be masked too.
+    //
+    // `audio_path` is NULLED here too: the FE feeds it straight into `convertFileSrc` (the Tauri
+    // `asset:` protocol, scoped to the audio dir) which serves the file to the webview WITHOUT
+    // touching the `export_audio` command — i.e. the only audio read path that does NOT pass
+    // through `meeting_is_unlocked`. While sealed the on-disk file is the AES-GCM `.enc` (so even a
+    // leaked path serves ciphertext), but we must not depend on that single invariant: nulling the
+    // path here means the gate covers the asset protocol regardless of the on-disk seal state, so a
+    // plaintext WAV that briefly survives in the scoped dir (e.g. recorded into an already-sealed
+    // folder, or a crash window) can never be served to a locked meeting's view.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Ok(Some(masked_detail(meeting)));
+    }
+
     let note = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
@@ -1422,7 +1458,28 @@ pub fn get_meeting_detail(
         meeting,
         note,
         segments,
+        locked: false,
     }))
+}
+
+/// Build the MASKED detail DTO for a sealed-and-not-session-unlocked meeting. Pure (no DB / state)
+/// so the read-gate's masking contract is unit-testable. EVERY content channel is closed:
+/// - `title` → "🔒 Locked" (the real title lives in `meetings.title`, plaintext-at-rest);
+/// - `audio_path` → `None` so the FE has nothing to hand `convertFileSrc` (the `asset:` protocol
+///   serve path that bypasses the `export_audio` command + `meeting_is_unlocked` gate);
+/// - `note` / `segments` → empty;
+/// - `locked` → true so the FE renders the unlock affordance, not an empty shell.
+fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
+    MeetingDetailDto {
+        meeting: Meeting {
+            title: Some("🔒 Locked".to_string()),
+            audio_path: None,
+            ..meeting
+        },
+        note: None,
+        segments: Vec::new(),
+        locked: true,
+    }
 }
 
 /// Whether a usable Whisper model is present for the chosen size + language (or the
@@ -1716,6 +1773,11 @@ pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), 
         state.db.seal_note(meeting_id, provider_id, blob)?;
     }
 
+    // Phase 0.5 — seal the TRANSCRIPT + TIMELINE (defense-in-depth in the OPEN db) and the AUDIO
+    // WAV at rest, all under the SAME folder CK. Verify-before-destroy inside (no transcript /
+    // audio loss). Done after the note seal so a partial-seal crash still leaves recoverable blobs.
+    seal_folder_extras(state.inner(), &folder_id, &ck)?;
+
     // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
     // lost content is not — so this is last).
     for p in exported_paths {
@@ -1781,6 +1843,10 @@ pub async fn unlock_folder(
             .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
     }
 
+    // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
+    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK.
+    unseal_folder_extras(state.inner(), &folder_id, &ck)?;
+
     // Cache the KEK for the session (zeroized on relock-all) + add to the unlock set.
     {
         let mut g = state
@@ -1830,8 +1896,11 @@ pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<()
         g.remove(&folder_id);
     }
     let mut one = std::collections::HashSet::new();
-    one.insert(folder_id);
+    one.insert(folder_id.clone());
     state.db.blank_sealed_notes_in_folders(&one)?;
+    // Phase 0.5 — re-blank the transcript + timeline plaintext and drop the decrypted session WAV
+    // (the .enc + the *_blob columns stay; the folder is still locked=1 on disk).
+    reblank_folder_extras(state.inner(), &folder_id)?;
     Ok(())
 }
 
@@ -1866,6 +1935,11 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     let locked: std::collections::HashSet<String> =
         state.db.locked_folder_ids()?.into_iter().collect();
     state.db.blank_sealed_notes_in_folders(&locked)?;
+    // Phase 0.5 — re-blank the transcript + timeline + drop the decrypted session WAVs for every
+    // locked folder too (the .enc + *_blob columns stay).
+    for fid in &locked {
+        reblank_folder_extras(state, fid)?;
+    }
     Ok(())
 }
 
@@ -1956,6 +2030,10 @@ pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), 
         }
     }
 
+    // Phase 0.5 — permanently restore the TRANSCRIPT + TIMELINE plaintext (clear *_blob columns)
+    // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio.
+    unseal_folder_extras_permanent(state.inner(), &folder_id, &ck)?;
+
     // Flip the folder back to OPEN + drop it from the session set.
     state.db.set_folder_locked(&folder_id, false, None)?;
     {
@@ -1966,6 +2044,225 @@ pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), 
         g.remove(&folder_id);
     }
     Ok(())
+}
+
+/// SESSION-unlock the folder OWNING a meeting (so the FE can unlock straight from the locked
+/// Detail view). Resolves the meeting's folder, then delegates to the existing biometric
+/// `unlock_folder` path (Touch ID → KEK → unwrap CK → decrypt note + transcript + timeline + audio
+/// for the session). A meeting at the vault root or in an open folder is already unlocked → no-op
+/// (returns `None`); a sealed folder returns the refreshed `FolderNode`.
+#[tauri::command]
+pub async fn unlock_meeting(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Option<FolderNode>, AppError> {
+    let Some(folder_id) = state.db.folder_for_meeting(&meeting_id)? else {
+        return Ok(None); // vault root — nothing to unlock.
+    };
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if !folder.locked {
+        return Ok(None); // open folder — already visible.
+    }
+    // Reuse the SAME biometric unlock path (do not fork the lifecycle).
+    unlock_folder(state, folder_id).await.map(Some)
+}
+
+// ── Phase 0.5 full per-folder lock: transcript + timeline + audio seal helpers ──
+//
+// The note markdown was already sealed (encrypt→content_blob, blank plaintext). These helpers
+// extend the SAME lifecycle to a folder's TRANSCRIPT (segments.text), TIMELINE (timelines.data),
+// and the AUDIO WAV (a file at meetings.audio_path, NOT in the SQLCipher DB → plaintext on disk).
+// All key off the folder content key (CK) the caller has already unwrapped.
+
+/// Suffix marking an audio file as AES-GCM-encrypted-at-rest (sealed folder). The presence of
+/// this suffix on `meetings.audio_path` is the on-disk "audio is sealed" signal.
+const ENC_SUFFIX: &str = ".enc";
+
+/// SEAL every governed meeting's transcript + timeline under `ck`, then the audio WAV. Mirrors
+/// `lock_folder`'s note seal: each blob is verified-decryptable BEFORE the plaintext is blanked /
+/// the plaintext WAV is removed — content (transcript / audio) is never lost.
+fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+    for mid in &meeting_ids {
+        // Transcript: encrypt each segment's plaintext text, verify, then seal (blank text).
+        let segs = state.db.raw_segments(mid)?;
+        let mut sealed_segs: Vec<(i64, Vec<u8>)> = Vec::new();
+        for s in &segs {
+            // Skip rows already sealed (text_blob present, text blank) — idempotent.
+            if s.text_blob.is_some() && s.text.is_empty() {
+                continue;
+            }
+            let blob = crate::crypto::encrypt(ck, s.text.as_bytes())?;
+            if crate::crypto::decrypt(ck, &blob)? != s.text.as_bytes() {
+                return Err(AppError::Storage(
+                    "transcript seal verification failed (segment blob mismatch)".into(),
+                ));
+            }
+            sealed_segs.push((s.idx, blob));
+        }
+        for (idx, blob) in &sealed_segs {
+            state.db.seal_segment(mid, *idx, blob)?;
+        }
+
+        // Timeline: encrypt the cached JSON (if any), verify, then seal (blank data).
+        if let Some(tl) = state.db.raw_timeline(mid)? {
+            if !(tl.data_blob.is_some() && tl.data.is_empty()) {
+                let blob = crate::crypto::encrypt(ck, tl.data.as_bytes())?;
+                if crate::crypto::decrypt(ck, &blob)? != tl.data.as_bytes() {
+                    return Err(AppError::Storage(
+                        "timeline seal verification failed (blob mismatch)".into(),
+                    ));
+                }
+                state.db.seal_timeline(mid, &blob)?;
+            }
+        }
+
+        // Audio: encrypt the plaintext WAV → <file>.enc (verify-before-destroy inside
+        // encrypt_file), then remove the plaintext and re-point audio_path at the .enc.
+        if let Some(path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
+            if !path.ends_with(ENC_SUFFIX) && std::path::Path::new(&path).exists() {
+                let enc_path = format!("{path}{ENC_SUFFIX}");
+                crate::crypto::encrypt_file(ck, std::path::Path::new(&path), std::path::Path::new(&enc_path))?;
+                // Only NOW (a verified .enc exists) is the plaintext safe to remove.
+                let _ = std::fs::remove_file(&path);
+                state.db.set_meeting_audio_path(mid, Some(&enc_path))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SESSION-unlock: decrypt every governed meeting's transcript + timeline back into the plaintext
+/// columns and materialize a playable WAV (decrypt <file>.enc → <file>) re-pointing audio_path at
+/// it. Keeps the `.enc` + the `*_blob` columns (folder is still locked on disk).
+fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+    for mid in &meeting_ids {
+        for s in state.db.raw_segments(mid)? {
+            let Some(blob) = &s.text_blob else { continue };
+            let pt = crate::crypto::decrypt(ck, blob)?;
+            let text = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
+            state.db.restore_segment_text(mid, s.idx, &text)?;
+        }
+        if let Some(tl) = state.db.raw_timeline(mid)? {
+            if let Some(blob) = &tl.data_blob {
+                let pt = crate::crypto::decrypt(ck, blob)?;
+                let data = String::from_utf8(pt)
+                    .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
+                state.db.restore_timeline_data(mid, &data)?;
+            }
+        }
+        if let Some(enc_path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
+            if enc_path.ends_with(ENC_SUFFIX) {
+                let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
+                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain))?;
+                state.db.set_meeting_audio_path(mid, Some(&plain))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// RE-BLANK (relock): re-blank the plaintext transcript + timeline of every governed meeting and
+/// remove the decrypted session WAV, re-pointing audio_path back at the `.enc`. The `*_blob`
+/// columns + the `.enc` stay (the folder is still `locked=1`). Idempotent.
+fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    for mid in state.db.meeting_ids_in_folder(folder_id)? {
+        for s in state.db.raw_segments(&mid)? {
+            if s.text_blob.is_some() && !s.text.is_empty() {
+                state.db.restore_segment_text(&mid, s.idx, "")?;
+            }
+        }
+        if let Some(tl) = state.db.raw_timeline(&mid)? {
+            if tl.data_blob.is_some() && !tl.data.is_empty() {
+                state.db.restore_timeline_data(&mid, "")?;
+            }
+        }
+        if let Some(path) = state.db.get_meeting(&mid)?.and_then(|m| m.audio_path) {
+            if !path.ends_with(ENC_SUFFIX) {
+                let enc_path = format!("{path}{ENC_SUFFIX}");
+                if std::path::Path::new(&enc_path).exists() {
+                    // The .enc is the durable copy; drop the decrypted session WAV + re-point.
+                    let _ = std::fs::remove_file(&path);
+                    state.db.set_meeting_audio_path(&mid, Some(&enc_path))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// PERMANENT remove-lock: decrypt every governed meeting's transcript + timeline back to plaintext,
+/// clear the `*_blob` columns, and permanently restore the plaintext WAV (decrypt .enc → file,
+/// remove the .enc). NEVER lose audio — the plaintext is written + the file decrypts before the
+/// `.enc` is removed.
+fn unseal_folder_extras_permanent(
+    state: &AppState,
+    folder_id: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    for mid in state.db.meeting_ids_in_folder(folder_id)? {
+        // Transcript: restore each segment from its blob (or keep the in-memory text if the folder
+        // was session-unlocked and the blob is absent), then clear all blobs for the meeting.
+        for s in state.db.raw_segments(&mid)? {
+            if let Some(blob) = &s.text_blob {
+                let pt = crate::crypto::decrypt(ck, blob)?;
+                let text = String::from_utf8(pt)
+                    .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
+                state.db.restore_segment_text(&mid, s.idx, &text)?;
+            }
+        }
+        state.db.clear_segment_blobs(&mid)?;
+
+        if let Some(tl) = state.db.raw_timeline(&mid)? {
+            if let Some(blob) = &tl.data_blob {
+                let pt = crate::crypto::decrypt(ck, blob)?;
+                let data = String::from_utf8(pt)
+                    .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
+                state.db.restore_timeline_data(&mid, &data)?;
+            }
+        }
+        state.db.clear_timeline_blob(&mid)?;
+
+        // Audio: permanently restore the plaintext WAV from the .enc, then drop the .enc.
+        if let Some(enc_path) = state.db.get_meeting(&mid)?.and_then(|m| m.audio_path) {
+            if enc_path.ends_with(ENC_SUFFIX) {
+                let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
+                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain))?;
+                // Verified plaintext exists → safe to remove the .enc.
+                let _ = std::fs::remove_file(&enc_path);
+                state.db.set_meeting_audio_path(&mid, Some(&plain))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// READ-GATE predicate (the user's actual complaint): a meeting is unlocked iff its folder is open
+/// (NULL / not locked) OR its folder id is in the current session unlock set. Used by
+/// `get_meeting_detail` / `get_segments` / `get_timeline` / `export_audio` to refuse a sealed-and-
+/// not-session-unlocked meeting's content even though the SQLCipher DB is open.
+fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
+    let folder_id = match state.db.folder_for_meeting(meeting_id)? {
+        Some(f) => f,
+        None => return Ok(true), // no folder / vault root → always open.
+    };
+    let folder = match state.db.folder_by_id(&folder_id)? {
+        Some(f) => f,
+        None => return Ok(true),
+    };
+    if !folder.locked {
+        return Ok(true); // open folder.
+    }
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+    Ok(unlocked.contains(&folder_id))
 }
 
 /// The configured vault path (non-empty), or `None`.
@@ -2020,5 +2317,62 @@ pub fn stop_voice_listener(app: &AppHandle) {
     let state = app.state::<AppState>();
     if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
         l.stop();
+    }
+}
+
+#[cfg(test)]
+mod lock_read_gate_tests {
+    use super::*;
+
+    fn meeting_with_audio(audio_path: Option<&str>) -> Meeting {
+        Meeting {
+            id: "m1".to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Quarterly board strategy".to_string()),
+            duration_s: 1800,
+            audio_path: audio_path.map(|s| s.to_string()),
+            status: MeetingStatus::Summarized,
+            folder_id: Some("secret-folder".to_string()),
+        }
+    }
+
+    /// REGRESSION (audio asset-protocol leak): `get_meeting_detail`'s masked DTO for a sealed-and-
+    /// not-session-unlocked meeting MUST null `audio_path`. The FE feeds `audio_path` straight into
+    /// `convertFileSrc` (the Tauri `asset:` protocol, scoped to the audio dir) which serves the
+    /// file to the webview WITHOUT going through the `export_audio` command or `meeting_is_unlocked`
+    /// — the one audio read path outside the command gate. Before the fix the masked DTO kept
+    /// `audio_path` via `..meeting`; if a PLAINTEXT WAV lived in the scoped dir (e.g. a recording
+    /// auto-filed / moved into an already-sealed folder, where the pipeline writes
+    /// `<audio>/{id}.wav` with no seal-awareness, or a crash window before re-seal) the locked
+    /// view would serve raw audio. Nulling the path closes the bypass regardless of on-disk state.
+    #[test]
+    fn masked_detail_nulls_audio_path_so_asset_protocol_cannot_serve_a_locked_recording() {
+        // The dangerous case: a PLAINTEXT WAV still on disk in the scoped audio dir.
+        let plaintext_wav = "/Users/x/Library/Application Support/MeetNotes/audio/m1.wav";
+        let masked = masked_detail(meeting_with_audio(Some(plaintext_wav)));
+
+        // The single load-bearing assertion: no path for `convertFileSrc` to serve.
+        assert_eq!(
+            masked.meeting.audio_path, None,
+            "masked detail must NULL audio_path — the FE asset-protocol serve path bypasses the command gate"
+        );
+        // And the rest of the mask: title hidden, no note, no segments, locked flag set.
+        assert_eq!(masked.meeting.title.as_deref(), Some("🔒 Locked"));
+        assert!(masked.note.is_none(), "no note while locked");
+        assert!(masked.segments.is_empty(), "no segments while locked");
+        assert!(masked.locked, "locked flag set so the FE renders the unlock affordance");
+        // Non-content metadata is preserved so the FE can offer "unlock this folder".
+        assert_eq!(masked.meeting.id, "m1");
+        assert_eq!(masked.meeting.folder_id.as_deref(), Some("secret-folder"));
+    }
+
+    /// Even with NO audio (already `.enc`-renamed or never recorded), the masked DTO is `None` —
+    /// the mask is unconditional, not dependent on the on-disk seal state.
+    #[test]
+    fn masked_detail_nulls_audio_path_even_when_already_absent() {
+        let masked = masked_detail(meeting_with_audio(None));
+        assert_eq!(masked.meeting.audio_path, None);
+        assert!(masked.locked);
     }
 }

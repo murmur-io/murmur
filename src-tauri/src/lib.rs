@@ -104,6 +104,7 @@ pub fn run() {
             commands::move_note,
             commands::lock_folder,
             commands::unlock_folder,
+            commands::unlock_meeting,
             commands::relock_folder,
             commands::relock_all,
             commands::remove_lock,

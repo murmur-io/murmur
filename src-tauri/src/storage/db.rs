@@ -199,6 +199,12 @@ impl Db {
         // pattern) — NULL for legacy rows transcribed before dual-stream, which read back as
         // `speaker: None` (unattributed). NOT per-remote-person diarization; see types::Segment.
         Self::add_column_if_missing(&conn, "segments", "speaker", "TEXT")?;
+        // Phase 0.5 — full per-folder lock (defense-in-depth beyond SQLCipher-at-rest):
+        // sealed-folder transcripts + timelines carry an AES-GCM blob under the folder CK while
+        // sealed; the plaintext `text`/`data` column is blanked. Reversed on session-unlock.
+        // Guarded ALTER (idempotent); NULL for every row in an open folder.
+        Self::add_column_if_missing(&conn, "segments", "text_blob", "BLOB")?;
+        Self::add_column_if_missing(&conn, "timelines", "data_blob", "BLOB")?;
         Ok(())
     }
 
@@ -1072,6 +1078,174 @@ impl Db {
         Ok(out)
     }
 
+    // ── transcript + timeline sealing (Phase 0.5 full per-folder lock) ─────────
+    //
+    // Segments + timelines live IN the SQLCipher DB (encrypted at rest already), but were NOT
+    // gated in-app: a meeting in a locked-and-not-unlocked folder still returned its transcript +
+    // timeline. These helpers add the SAME defense-in-depth the note markdown already has — an
+    // AES-GCM blob under the folder CK in an OPEN db, with the plaintext column blanked while
+    // sealed, reversed on session-unlock / re-blanked on relock / permanently restored on
+    // remove-lock. All keyed off the meeting set of a folder (a meeting's folder = its notes'
+    // folder, derived from `notes.folder_id`).
+
+    /// Distinct meeting ids whose notes live in `folder_id` (the meetings governed by the
+    /// folder's lock). Used to seal/unseal each meeting's transcript + timeline.
+    pub fn meeting_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The owning folder id for a meeting (its notes' `folder_id`), or `None` at the vault root.
+    /// Drives the read-gate predicate `meeting_is_unlocked`.
+    pub fn folder_for_meeting(&self, meeting_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT folder_id FROM notes
+              WHERE meeting_id = ?1 AND folder_id IS NOT NULL LIMIT 1",
+            rusqlite::params![meeting_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
+    }
+
+    /// The RAW segment rows of a meeting (idx, plaintext text, sealed `text_blob`), regardless of
+    /// seal state — for the seal/unseal lifecycle (NOT a user-facing read; that is `get_segments`).
+    pub fn raw_segments(&self, meeting_id: &str) -> Result<Vec<RawSegment>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT idx, text, text_blob FROM segments
+                   WHERE meeting_id = ?1 ORDER BY idx",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                Ok(RawSegment {
+                    idx: r.get(0)?,
+                    text: r.get(1)?,
+                    text_blob: r.get(2)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Seal ONE segment row: store its AES-GCM `text_blob` and blank the plaintext `text`.
+    /// Verified-before-blank by the caller (mirrors `seal_note`).
+    pub fn seal_segment(&self, meeting_id: &str, idx: i64, text_blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE segments SET text_blob = ?3, text = '' WHERE meeting_id = ?1 AND idx = ?2",
+            rusqlite::params![meeting_id, idx, text_blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Restore ONE segment row's plaintext `text` (session-unlock / remove-lock). Leaves
+    /// `text_blob` intact (the caller clears it only on permanent remove-lock).
+    pub fn restore_segment_text(&self, meeting_id: &str, idx: i64, text: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE segments SET text = ?3 WHERE meeting_id = ?1 AND idx = ?2",
+            rusqlite::params![meeting_id, idx, text],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear the sealed `text_blob` for every segment of a meeting (permanent remove-lock, after
+    /// the plaintext is restored).
+    pub fn clear_segment_blobs(&self, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE segments SET text_blob = NULL WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The RAW timeline row of a meeting (plaintext `data`, sealed `data_blob`), regardless of
+    /// seal state — for the seal/unseal lifecycle. `None` if the meeting has no timeline cached.
+    pub fn raw_timeline(&self, meeting_id: &str) -> Result<Option<RawTimeline>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT data, data_blob FROM timelines WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| {
+                Ok(RawTimeline {
+                    data: r.get(0)?,
+                    data_blob: r.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Seal a meeting's timeline: store its AES-GCM `data_blob`, blank the plaintext `data`.
+    pub fn seal_timeline(&self, meeting_id: &str, data_blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE timelines SET data_blob = ?2, data = '' WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id, data_blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Restore a meeting's timeline plaintext `data` (session-unlock / remove-lock). Leaves
+    /// `data_blob` intact (cleared only on permanent remove-lock).
+    pub fn restore_timeline_data(&self, meeting_id: &str, data: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE timelines SET data = ?2 WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id, data],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear the sealed `data_blob` for a meeting's timeline (permanent remove-lock).
+    pub fn clear_timeline_blob(&self, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE timelines SET data_blob = NULL WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Set (or clear) a meeting's `audio_path` — used by the audio-at-rest encryption lifecycle
+    /// to re-point at the decrypted-for-session copy and back to the plaintext WAV on remove-lock.
+    pub fn set_meeting_audio_path(&self, meeting_id: &str, audio_path: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET audio_path = ?2 WHERE id = ?1",
+            rusqlite::params![meeting_id, audio_path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     // ── exposure-aware reads (MCP visibility filter, Stage D) ──────────────────
     //
     // A note is visible iff its folder is NULL or open (`locked=0`) OR its folder id is in the
@@ -1593,6 +1767,23 @@ pub struct SealableNote {
     pub markdown: String,
     pub exported_path: Option<String>,
     pub content_blob: Option<Vec<u8>>,
+}
+
+/// One transcript segment row in either seal state (Phase 0.5 lock lifecycle). When the folder is
+/// open `text_blob` is NULL and `text` is plaintext; when sealed-and-not-unlocked `text` is blank
+/// and `text_blob` holds the AES-GCM ciphertext.
+#[derive(Debug, Clone)]
+pub struct RawSegment {
+    pub idx: i64,
+    pub text: String,
+    pub text_blob: Option<Vec<u8>>,
+}
+
+/// A meeting's cached timeline JSON in either seal state (Phase 0.5 lock lifecycle).
+#[derive(Debug, Clone)]
+pub struct RawTimeline {
+    pub data: String,
+    pub data_blob: Option<Vec<u8>>,
 }
 
 /// Build the SQL predicate (no params) that selects notes whose folder is open or
@@ -2372,6 +2563,298 @@ mod lock_tests {
         assert!(db
             .meeting_is_visible("m1", &HashSet::new())
             .unwrap());
+    }
+
+    // ── Phase 0.5 full-lock helpers (transcript + timeline + audio) ──────────────
+
+    use crate::transcribe::types::Segment;
+
+    /// Seed transcript segments + a cached timeline JSON for a meeting (open state).
+    fn seed_transcript_and_timeline(db: &Db, meeting_id: &str, texts: &[&str], timeline_json: &str) {
+        let segs: Vec<Segment> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Segment {
+                idx: i as i64,
+                start_s: i as f64,
+                end_s: (i + 1) as f64,
+                text: t.to_string(),
+                speaker: if i % 2 == 0 { Some("me".into()) } else { Some("others".into()) },
+            })
+            .collect();
+        db.insert_segments(meeting_id, &segs).unwrap();
+        db.set_timeline_data(meeting_id, timeline_json).unwrap();
+    }
+
+    /// Mirror of `seal_folder_extras`: seal every governed meeting's transcript + timeline under CK
+    /// (verify-before-blank), and the audio file at `audio_path` → `<file>.enc` (then "remove" the
+    /// plaintext + re-point audio_path), exactly like the command.
+    fn seal_extras(db: &Db, folder_id: &str, ck: &[u8; 32]) {
+        for mid in db.meeting_ids_in_folder(folder_id).unwrap() {
+            // transcript
+            let segs = db.raw_segments(&mid).unwrap();
+            for s in &segs {
+                if s.text_blob.is_some() && s.text.is_empty() {
+                    continue;
+                }
+                let blob = crate::crypto::encrypt(ck, s.text.as_bytes()).unwrap();
+                assert_eq!(crate::crypto::decrypt(ck, &blob).unwrap(), s.text.as_bytes());
+                db.seal_segment(&mid, s.idx, &blob).unwrap();
+            }
+            // timeline
+            if let Some(tl) = db.raw_timeline(&mid).unwrap() {
+                if !(tl.data_blob.is_some() && tl.data.is_empty()) {
+                    let blob = crate::crypto::encrypt(ck, tl.data.as_bytes()).unwrap();
+                    db.seal_timeline(&mid, &blob).unwrap();
+                }
+            }
+            // audio
+            if let Some(path) = db.get_meeting(&mid).unwrap().and_then(|m| m.audio_path) {
+                if !path.ends_with(".enc") && std::path::Path::new(&path).exists() {
+                    let enc = format!("{path}.enc");
+                    crate::crypto::encrypt_file(
+                        ck,
+                        std::path::Path::new(&path),
+                        std::path::Path::new(&enc),
+                    )
+                    .unwrap();
+                    std::fs::remove_file(&path).unwrap();
+                    db.set_meeting_audio_path(&mid, Some(&enc)).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Mirror of `unseal_folder_extras`: decrypt transcript + timeline back into plaintext columns
+    /// and materialize a playable WAV for the session.
+    fn unseal_extras(db: &Db, folder_id: &str, ck: &[u8; 32]) {
+        for mid in db.meeting_ids_in_folder(folder_id).unwrap() {
+            for s in db.raw_segments(&mid).unwrap() {
+                if let Some(blob) = &s.text_blob {
+                    let text = String::from_utf8(crate::crypto::decrypt(ck, blob).unwrap()).unwrap();
+                    db.restore_segment_text(&mid, s.idx, &text).unwrap();
+                }
+            }
+            if let Some(tl) = db.raw_timeline(&mid).unwrap() {
+                if let Some(blob) = &tl.data_blob {
+                    let data = String::from_utf8(crate::crypto::decrypt(ck, blob).unwrap()).unwrap();
+                    db.restore_timeline_data(&mid, &data).unwrap();
+                }
+            }
+            if let Some(enc) = db.get_meeting(&mid).unwrap().and_then(|m| m.audio_path) {
+                if enc.ends_with(".enc") {
+                    let plain = enc.trim_end_matches(".enc").to_string();
+                    crate::crypto::decrypt_file(
+                        ck,
+                        std::path::Path::new(&enc),
+                        std::path::Path::new(&plain),
+                    )
+                    .unwrap();
+                    db.set_meeting_audio_path(&mid, Some(&plain)).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The READ-GATE predicate (`meeting_is_unlocked`): folder open/NULL OR folder id in the
+    /// session set. The gated commands return masked/empty content when this is false.
+    fn meeting_unlocked(db: &Db, meeting_id: &str, unlocked: &HashSet<String>) -> bool {
+        match db.folder_for_meeting(meeting_id).unwrap() {
+            None => true,
+            Some(fid) => match db.folder_by_id(&fid).unwrap() {
+                None => true,
+                Some(f) => !f.locked || unlocked.contains(&fid),
+            },
+        }
+    }
+
+    #[test]
+    fn seal_transcript_timeline_round_trips_byte_identical() {
+        let db = file_db("extras-roundtrip");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "f1", "Secret");
+        seed_note(&db, "m1", "# note", Some("f1"));
+        let texts = ["zażółć gęślą jaźń 🔒", "second segment with budget 1_000_000 EUR", ""];
+        let timeline = r#"{"turns":[{"speaker":"me","topic":"secret topic","start_s":0.0,"end_s":1.0}]}"#;
+        seed_transcript_and_timeline(&db, "m1", &texts, timeline);
+        let ck = crate::crypto::random_key().unwrap();
+        // Wrap CK so the folder carries a real wrapped_key (parity with the command).
+        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
+
+        // SEAL transcript + timeline.
+        seal_extras(&db, "f1", &ck);
+
+        // At rest while sealed: plaintext blanked, blobs present, ciphertext does NOT leak.
+        let sealed = db.raw_segments("m1").unwrap();
+        assert_eq!(sealed.len(), 3);
+        for (s, expected) in sealed.iter().zip(texts) {
+            assert_eq!(s.text, "", "segment text blanked while sealed");
+            assert!(s.text_blob.is_some(), "segment text_blob present");
+            if !expected.is_empty() {
+                assert!(
+                    !contains_subslice(s.text_blob.as_ref().unwrap(), expected.as_bytes()),
+                    "segment ciphertext must not leak plaintext"
+                );
+            }
+        }
+        let raw_tl = db.raw_timeline("m1").unwrap().unwrap();
+        assert_eq!(raw_tl.data, "", "timeline data blanked while sealed");
+        assert!(raw_tl.data_blob.is_some());
+        assert!(
+            !contains_subslice(raw_tl.data_blob.as_ref().unwrap(), timeline.as_bytes()),
+            "timeline ciphertext must not leak plaintext"
+        );
+        // The user-facing reads see blank while sealed.
+        assert!(db.get_segments("m1").unwrap().iter().all(|s| s.text.is_empty()));
+        assert_eq!(db.get_timeline_data("m1").unwrap().as_deref(), Some(""));
+
+        // UNLOCK → byte-identical round-trip of EVERY segment + the timeline.
+        unseal_extras(&db, "f1", &ck);
+        let restored = db.get_segments("m1").unwrap();
+        let restored_texts: Vec<&str> = restored.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(restored_texts, texts, "transcript round-trips byte-identical");
+        assert_eq!(
+            db.get_timeline_data("m1").unwrap().as_deref(),
+            Some(timeline),
+            "timeline round-trips byte-identical"
+        );
+        // speaker attribution survives (it is not sealed — only text is).
+        assert_eq!(restored[0].speaker.as_deref(), Some("me"));
+        assert_eq!(restored[1].speaker.as_deref(), Some("others"));
+    }
+
+    #[test]
+    fn audio_encrypt_decrypt_round_trips_byte_identical() {
+        // Encrypt a temp WAV under the CK, assert the plaintext is removed while sealed, decrypt,
+        // assert byte-identical (mirrors the audio-at-rest seal lifecycle through the DB helpers).
+        let db = file_db("extras-audio");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "f1", "Secret");
+        seed_note(&db, "m1", "# note", Some("f1"));
+
+        // A temp "WAV" file (opaque bytes — the crypto layer is content-agnostic).
+        let wav = temp_db_path("audio").with_extension("wav");
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&wav, &payload).unwrap();
+        db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy())).unwrap();
+
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
+
+        // SEAL → .enc written, plaintext removed, audio_path re-pointed at the .enc.
+        seal_extras(&db, "f1", &ck);
+        assert!(!wav.exists(), "plaintext WAV removed while sealed");
+        let enc_path = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
+        assert!(enc_path.ends_with(".enc"), "audio_path points at the encrypted file");
+        assert!(std::path::Path::new(&enc_path).exists(), ".enc exists");
+        let blob = std::fs::read(&enc_path).unwrap();
+        assert!(
+            !contains_subslice(&blob, &payload),
+            "encrypted audio must not leak plaintext"
+        );
+
+        // UNLOCK → plaintext WAV materialized again, byte-identical.
+        unseal_extras(&db, "f1", &ck);
+        let plain_path = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
+        assert!(!plain_path.ends_with(".enc"), "audio_path re-points at the plaintext WAV");
+        assert_eq!(
+            std::fs::read(&plain_path).unwrap(),
+            payload,
+            "audio round-trips byte-identical"
+        );
+
+        let _ = std::fs::remove_file(&enc_path);
+        let _ = std::fs::remove_file(&plain_path);
+    }
+
+    #[test]
+    fn locked_meeting_detail_is_masked() {
+        // get_meeting_detail / get_segments / get_timeline return MASKED/EMPTY + the gate says
+        // "locked" when the folder is sealed-and-not-unlocked; full content after the folder id is
+        // added to the session unlock set.
+        let db = file_db("masked-read");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "f1", "Secret");
+        seed_note(&db, "m1", "# secret note", Some("f1"));
+        seed_transcript_and_timeline(&db, "m1", &["secret words"], r#"{"turns":[]}"#);
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
+        seal_folder(&db, "f1", &kek); // seals the note (markdown)
+        // Re-seal extras under the folder's own CK (unwrap the wrapped we just set is the SAME CK
+        // the note seal used? No — seal_folder mints its OWN CK). Use the folder's wrapped CK.
+        let folder_wrapped = db.folder_wrapped_key("f1").unwrap().unwrap();
+        let folder_ck: [u8; 32] = crate::crypto::decrypt(&kek, &folder_wrapped)
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        seal_extras(&db, "f1", &folder_ck);
+
+        let empty: HashSet<String> = HashSet::new();
+
+        // SEALED-not-unlocked → masked: gate says locked, plaintext columns blank.
+        assert!(!meeting_unlocked(&db, "m1", &empty), "gate: meeting is locked");
+        assert!(
+            db.get_segments("m1").unwrap().iter().all(|s| s.text.is_empty()),
+            "transcript empty while locked"
+        );
+        assert_eq!(db.get_timeline_data("m1").unwrap().as_deref(), Some(""));
+        assert!(
+            db.get_latest_note_for_meeting("m1").unwrap().unwrap().markdown.is_empty(),
+            "note markdown blank while locked"
+        );
+
+        // SESSION-UNLOCK (add folder id to the set + decrypt back) → full content.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f1".to_string());
+        session_unlock(&db, "f1", &kek); // note markdown
+        unseal_extras(&db, "f1", &folder_ck); // transcript + timeline
+        assert!(meeting_unlocked(&db, "m1", &unlocked), "gate: meeting unlocked");
+        assert_eq!(db.get_segments("m1").unwrap()[0].text, "secret words");
+        assert_eq!(db.get_timeline_data("m1").unwrap().as_deref(), Some(r#"{"turns":[]}"#));
+        assert_eq!(
+            db.get_latest_note_for_meeting("m1").unwrap().unwrap().markdown,
+            "# secret note"
+        );
+    }
+
+    #[test]
+    fn export_audio_refused_when_locked() {
+        // The export_audio gate: refuse (Locked) while sealed-not-unlocked; allowed once the
+        // folder id is in the session set. Mirrors the `meeting_is_unlocked` early-return.
+        let db = file_db("export-audio-gate");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "f1", "Secret");
+        seed_note(&db, "m1", "# note", Some("f1"));
+        let wav = temp_db_path("export-audio").with_extension("wav");
+        std::fs::write(&wav, b"RIFF....WAVEfmt fake-pcm").unwrap();
+        db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy())).unwrap();
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
+        seal_extras(&db, "f1", &ck);
+
+        let empty: HashSet<String> = HashSet::new();
+        // LOCKED → export refused (the command early-returns AppError::Locked when the gate is
+        // false). There is also no plaintext WAV on disk to copy.
+        assert!(!meeting_unlocked(&db, "m1", &empty), "export refused while locked");
+        let enc = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
+        assert!(enc.ends_with(".enc"));
+        assert!(!std::path::Path::new(enc.trim_end_matches(".enc")).exists());
+
+        // UNLOCKED → allowed.
+        unseal_extras(&db, "f1", &ck);
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f1".to_string());
+        assert!(meeting_unlocked(&db, "m1", &unlocked), "export allowed once unlocked");
+        let plain = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
+        assert!(std::path::Path::new(&plain).exists(), "plaintext WAV available for export");
+
+        let _ = std::fs::remove_file(&enc);
+        let _ = std::fs::remove_file(&plain);
     }
 
     /// Naive subslice search for the leak assertion.
