@@ -53,18 +53,19 @@ pub fn spawn(app: AppHandle) {
         return;
     }
 
-    tauri::async_runtime::spawn(async move {
-        watch(app).await;
-    });
+    // Poll on a DEDICATED OS THREAD (not the async runtime): the NSScreen read MUST be marshaled
+    // to the main thread — AppKit is main-thread-affine, and calling it off-main throws an
+    // Objective-C exception that aborts the whole process ("Rust cannot catch foreign exceptions").
+    // A std thread can safely block on the main-thread reply between polls.
+    std::thread::Builder::new()
+        .name("murmur-screenshare".into())
+        .spawn(move || watch(app))
+        .ok();
 }
 
-/// The poll loop. Holds the rising-edge state (`was_captured`) and acts only on false→true.
-async fn watch(app: AppHandle) {
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    // If a tick is missed (e.g. the runtime was busy) skip rather than burst-catch-up.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut was_captured = is_any_screen_captured();
+/// The poll loop (dedicated OS thread). Holds the rising-edge state and acts only on false→true.
+fn watch(app: AppHandle) {
+    let mut was_captured = captured_on_main(&app);
     tracing::info!(
         target: "screenshare",
         initial_captured = was_captured,
@@ -72,8 +73,8 @@ async fn watch(app: AppHandle) {
     );
 
     loop {
-        ticker.tick().await;
-        let now_captured = is_any_screen_captured();
+        std::thread::sleep(POLL_INTERVAL);
+        let now_captured = captured_on_main(&app);
 
         // Rising edge only: fire on START (false → true). We do not re-fire while it stays true,
         // and we silently reset on the falling edge.
@@ -86,6 +87,22 @@ async fn watch(app: AppHandle) {
         }
         was_captured = now_captured;
     }
+}
+
+/// Read `is_any_screen_captured()` on the MAIN THREAD (AppKit requirement) via Tauri's main-thread
+/// dispatch, returning the result over a channel. Returns false if the app is shutting down or the
+/// main thread does not reply promptly (never blocks forever, never throws across the boundary).
+fn captured_on_main(app: &AppHandle) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if app
+        .run_on_main_thread(move || {
+            let _ = tx.send(is_any_screen_captured());
+        })
+        .is_err()
+    {
+        return false; // app is tearing down
+    }
+    rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false)
 }
 
 /// React to a capture-start rising edge: relock everything + emit the UI event.
@@ -109,34 +126,19 @@ fn on_capture_started(app: &AppHandle) {
     }
 }
 
-/// True if ANY attached screen reports `isCaptured`. macOS implementation via objc2/AppKit.
+/// Capture-state probe. Returns `false` for now (detection inactive — see below).
+///
+/// DISABLED PENDING A CORRECT API: the earlier attempt sent `-isCaptured` to `NSScreen`, but that
+/// is NOT a valid `NSScreen` selector — `msg_send![screen, isCaptured]` raises an "unrecognized
+/// selector" `NSException`, which crosses the FFI boundary as a foreign exception and ABORTS the
+/// whole process ("Rust cannot catch foreign exceptions") right after launch. A correct macOS
+/// screen-capture/share detection (e.g. ScreenCaptureKit `SCShareableContent`, or observing the
+/// system capture indicator) needs to be wired AND verified on a signed build before re-enabling.
+/// Until then this returns `false` so the watcher never fires and never crashes. Everything else
+/// in the lock model — encryption, per-folder seal, MCP-hiding, and MANUAL relock — is unaffected;
+/// only the *automatic* relock-on-screen-share trigger is inactive.
 #[cfg(target_os = "macos")]
 fn is_any_screen_captured() -> bool {
-    use objc2::rc::Retained;
-    use objc2::{class, msg_send};
-    use objc2_app_kit::NSScreen;
-    use objc2_foundation::NSArray;
-
-    // `+[NSScreen screens]` is documented as main-thread-affine, but the generated binding demands
-    // a `MainThreadMarker` we don't hold on this background task. Sending the class message
-    // directly returns the screens array; reading the `isCaptured` BOOL property off-main is a
-    // benign property read for polling. We never mutate AppKit state here.
-    //
-    // SAFETY: `+screens` returns an autoreleased `NSArray<NSScreen>*`; `-isCaptured` is a `BOOL`
-    // property on `NSScreen` (macOS 10.0+, the capture semantics since 12). We only read; the
-    // Retained handle manages the lifetime.
-    unsafe {
-        let cls = class!(NSScreen);
-        let screens: Retained<NSArray<NSScreen>> = msg_send![cls, screens];
-        let count = screens.count();
-        for i in 0..count {
-            let screen = screens.objectAtIndex(i);
-            let captured: bool = msg_send![&*screen, isCaptured];
-            if captured {
-                return true;
-            }
-        }
-    }
     false
 }
 
