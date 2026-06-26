@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -17,6 +17,13 @@ use crate::error::{AppError, Result};
 struct Shared {
     samples: Mutex<Vec<f32>>,
     peak: AtomicU32,
+    /// Live mic-mute flag, toggled mid-recording via `set_mic_muted`. When `true`, the cpal
+    /// data callback writes SILENCE (zeros) for the muted frames into `samples` — it does NOT
+    /// drop them. Keeping full-length silence preserves the mic stream's wall-clock timeline so
+    /// later segments stay aligned (dropping samples would shift everything after the mute and
+    /// corrupt the wall-clock merge). Privacy is preserved: no real mic audio is captured while
+    /// muted.
+    muted: AtomicBool,
 }
 
 impl Shared {
@@ -24,6 +31,7 @@ impl Shared {
         Self {
             samples: Mutex::new(Vec::new()),
             peak: AtomicU32::new(0),
+            muted: AtomicBool::new(false),
         }
     }
 
@@ -33,6 +41,14 @@ impl Shared {
 
     fn load_peak(&self) -> f32 {
         f32::from_bits(self.peak.load(Ordering::Relaxed))
+    }
+
+    fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
     }
 }
 
@@ -62,6 +78,12 @@ struct StartInfo {
 pub struct Recorder {
     shared: Arc<Shared>,
     source_sample_rate: u32,
+    /// Host wall-clock instant captured the moment cpal capture started, used to anchor this
+    /// stream's sample-relative segment timestamps onto an absolute timeline in the wall-clock
+    /// merge (see `audio::merge`). The mic (cpal) and system (ScreenCaptureKit) streams run on
+    /// INDEPENDENT clocks, so sample-count alignment drifts seconds/hour — anchoring each stream
+    /// to its own host start is what keeps "me" and "others" segments correctly interleaved.
+    started_at: std::time::Instant,
     stop_tx: Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -99,6 +121,10 @@ impl Recorder {
         Ok(Self {
             shared,
             source_sample_rate: info.source_sample_rate,
+            // Anchor right after the stream reports ready (i.e. capture is live). The few-ms gap
+            // between the device actually opening and this line is negligible against the
+            // seconds/hour cross-clock drift this anchoring exists to defeat.
+            started_at: std::time::Instant::now(),
             stop_tx,
             thread: Some(thread),
         })
@@ -137,6 +163,23 @@ impl Recorder {
     /// The device's native capture sample rate (Hz).
     pub fn source_sample_rate(&self) -> u32 {
         self.source_sample_rate
+    }
+
+    /// Host wall-clock instant when this stream's capture started (for the wall-clock merge).
+    pub fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
+
+    /// Live-toggle the mic mute mid-recording (no stream teardown). While muted the cpal data
+    /// callback writes SILENCE into the buffer instead of the captured mic frames — the stream
+    /// stays full-length so the timeline never shifts. Lock-free; safe to call from a command.
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.set_muted(muted);
+    }
+
+    /// Read the current mute flag (lock-free).
+    pub fn is_muted(&self) -> bool {
+        self.shared.is_muted()
     }
 
     /// Clone up to the last `max_samples` captured mono samples WITHOUT draining — used by
@@ -252,25 +295,7 @@ where
 
     let err_shared = shared.clone();
     let data_cb = move |data: &[T], _: &cpal::InputCallbackInfo| {
-        // Downmix interleaved frames to mono by averaging channels.
-        let mut mono = Vec::with_capacity(data.len() / channels + 1);
-        let mut peak = 0.0f32;
-        for frame in data.chunks(channels) {
-            let mut acc = 0.0f32;
-            for s in frame {
-                acc += f32::from_sample(*s);
-            }
-            let v = acc / channels as f32;
-            let mag = v.abs();
-            if mag > peak {
-                peak = mag;
-            }
-            mono.push(v);
-        }
-        shared.store_peak(peak.clamp(0.0, 1.0));
-        if let Ok(mut buf) = shared.samples.lock() {
-            buf.extend_from_slice(&mono);
-        }
+        accumulate_frames(&shared, data, channels);
     };
 
     let err_cb = move |err| {
@@ -282,4 +307,102 @@ where
     device
         .build_input_stream(config, data_cb, err_cb, None)
         .map_err(|e| AppError::Audio(format!("failed to build input stream: {e}")))
+}
+
+/// Process one cpal capture buffer: downmix interleaved `data` to mono and append it to
+/// `shared.samples`, tracking the peak meter — UNLESS muted, in which case append the SAME
+/// number of SILENT (zero) frames and force the meter to 0.0.
+///
+/// Pulled out of the closure so the mute/silence behaviour is unit-testable without a device.
+/// CRITICAL: the muted branch appends `frame_count` zeros (NOT zero samples) so the mic stream
+/// stays exactly as long as it would have been live — that full-length silence is what keeps the
+/// stream's wall-clock timeline intact for the merge.
+fn accumulate_frames<T>(shared: &Arc<Shared>, data: &[T], channels: usize)
+where
+    T: Sample,
+    f32: cpal::FromSample<T>,
+{
+    let channels = channels.max(1);
+    let frame_count = data.len() / channels;
+
+    if shared.is_muted() {
+        shared.store_peak(0.0);
+        if let Ok(mut buf) = shared.samples.lock() {
+            let new_len = buf.len() + frame_count;
+            buf.resize(new_len, 0.0);
+        }
+        return;
+    }
+
+    let mut mono = Vec::with_capacity(frame_count + 1);
+    let mut peak = 0.0f32;
+    for frame in data.chunks(channels) {
+        let mut acc = 0.0f32;
+        for s in frame {
+            acc += f32::from_sample(*s);
+        }
+        let v = acc / channels as f32;
+        let mag = v.abs();
+        if mag > peak {
+            peak = mag;
+        }
+        mono.push(v);
+    }
+    shared.store_peak(peak.clamp(0.0, 1.0));
+    if let Ok(mut buf) = shared.samples.lock() {
+        buf.extend_from_slice(&mono);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A live (un-muted) buffer is downmixed to mono and appended; the meter tracks the peak.
+    #[test]
+    fn unmuted_appends_downmixed_audio() {
+        let shared = Arc::new(Shared::new());
+        // 2 mono frames at 1 channel.
+        accumulate_frames(&shared, &[0.5f32, -0.25f32], 1);
+        let buf = shared.samples.lock().unwrap();
+        assert_eq!(&*buf, &[0.5f32, -0.25f32]);
+        assert!((shared.load_peak() - 0.5).abs() < 1e-6);
+    }
+
+    /// MUTE: the buffer grows by the right number of SILENT frames (length preserved, content
+    /// zeroed) and the meter is forced to 0 — the privacy + timeline-alignment guarantee.
+    #[test]
+    fn muted_writes_silence_but_keeps_length() {
+        let shared = Arc::new(Shared::new());
+        // Seed one real frame, then mute and feed a loud 3-frame stereo buffer (6 samples).
+        accumulate_frames(&shared, &[1.0f32], 1);
+        shared.set_muted(true);
+        assert!(shared.is_muted());
+        accumulate_frames(&shared, &[0.9f32, 0.9, -0.9, -0.9, 0.8, 0.8], 2);
+
+        let buf = shared.samples.lock().unwrap();
+        // 1 live frame + 3 muted frames (6 samples / 2 channels) = 4 samples, no dropped frames.
+        assert_eq!(buf.len(), 4, "muted span must keep the stream full-length");
+        assert_eq!(&buf[1..], &[0.0f32, 0.0, 0.0], "muted frames must be silence");
+        assert_eq!(shared.load_peak(), 0.0, "meter reads 0 while muted");
+    }
+
+    /// The mute flag flips both ways and is observed by the helper.
+    #[test]
+    fn mute_flag_flips() {
+        let shared = Arc::new(Shared::new());
+        assert!(!shared.is_muted(), "starts unmuted");
+        shared.set_muted(true);
+        assert!(shared.is_muted());
+        shared.set_muted(false);
+        assert!(!shared.is_muted());
+
+        // Un-muting resumes capturing real audio.
+        shared.set_muted(true);
+        accumulate_frames(&shared, &[0.5f32], 1);
+        shared.set_muted(false);
+        accumulate_frames(&shared, &[0.5f32], 1);
+        let buf = shared.samples.lock().unwrap();
+        assert_eq!(&*buf, &[0.0f32, 0.5f32], "silence then real audio after unmute");
+    }
 }

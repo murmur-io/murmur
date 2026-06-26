@@ -195,6 +195,10 @@ impl Db {
         // `ALTER ADD COLUMN` errors if the column already exists, so check pragma_table_info first.
         Self::add_column_if_missing(&conn, "notes", "folder_id", "TEXT")?;
         Self::add_column_if_missing(&conn, "notes", "content_blob", "BLOB")?;
+        // Phase B: 2-way stream attribution ("me"/"others"). Guarded ALTER (same idempotent
+        // pattern) — NULL for legacy rows transcribed before dual-stream, which read back as
+        // `speaker: None` (unattributed). NOT per-remote-person diarization; see types::Segment.
+        Self::add_column_if_missing(&conn, "segments", "speaker", "TEXT")?;
         Ok(())
     }
 
@@ -406,8 +410,8 @@ impl Db {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR REPLACE INTO segments
-                       (meeting_id, idx, start_s, end_s, text)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                       (meeting_id, idx, start_s, end_s, text, speaker)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .map_err(map_err)?;
             for seg in segments {
@@ -417,6 +421,7 @@ impl Db {
                     seg.start_s,
                     seg.end_s,
                     seg.text,
+                    seg.speaker,
                 ])
                 .map_err(map_err)?;
             }
@@ -430,7 +435,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT idx, start_s, end_s, text
+                "SELECT idx, start_s, end_s, text, speaker
                    FROM segments WHERE meeting_id = ?1 ORDER BY idx",
             )
             .map_err(map_err)?;
@@ -441,6 +446,8 @@ impl Db {
                     start_s: row.get(1)?,
                     end_s: row.get(2)?,
                     text: row.get(3)?,
+                    // NULL (legacy / unattributed rows) → None.
+                    speaker: row.get(4)?,
                 })
             })
             .map_err(map_err)?;
@@ -1849,12 +1856,14 @@ mod tests {
                 start_s: 0.0,
                 end_s: 1.5,
                 text: "hello".into(),
+                speaker: Some("me".into()),
             },
             Segment {
                 idx: 1,
                 start_s: 1.5,
                 end_s: 3.0,
                 text: "world".into(),
+                speaker: None,
             },
         ];
         db.insert_segments("m1", &segs).unwrap();
@@ -1871,6 +1880,11 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         drop(conn);
+
+        // Speaker attribution round-trips: "me" persists, None reads back as None.
+        let read = db.get_segments("m1").unwrap();
+        assert_eq!(read[0].speaker.as_deref(), Some("me"));
+        assert_eq!(read[1].speaker, None);
 
         // deleting the meeting cascades to its segments
         db.lock()

@@ -231,18 +231,26 @@ pub async fn stop_recording(
     };
     let meeting_id = meeting_uuid.to_string();
 
+    // Capture the mic stream's host start instant BEFORE consuming the recorder — it anchors the
+    // mic ("me") segments onto the absolute timeline in the wall-clock merge (pipeline.rs).
+    let mic_started_at = recorder.started_at();
     let (samples, src_rate) = recorder.stop()?;
 
-    // Stop the system-audio sidecar (if any) and collect its WAV for mixing.
-    let system_wav = {
+    // Stop the system-audio sidecar (if any) and collect its WAV + host start instant. The
+    // sidecar's start instant anchors the system ("others") segments; the two streams run on
+    // INDEPENDENT clocks, so we merge by wall-clock, not sample count (see audio::merge).
+    let (system_wav, system_started_at) = {
         let rec = state
             .system_recorder
             .lock()
             .ok()
             .and_then(|mut slot| slot.take());
         match rec {
-            Some(r) => r.stop().unwrap_or(None),
-            None => None,
+            Some(r) => {
+                let started = r.started_at();
+                (r.stop().unwrap_or(None), Some(started))
+            }
+            None => (None, None),
         }
     };
 
@@ -250,7 +258,15 @@ pub async fn stop_recording(
     let duration_s = compute_duration_s(&state, &meeting_id, samples.len(), src_rate);
 
     let result = pipeline::run_after_stop(
-        &app, &state, &meeting_id, samples, src_rate, duration_s, system_wav,
+        &app,
+        &state,
+        &meeting_id,
+        samples,
+        src_rate,
+        duration_s,
+        system_wav,
+        mic_started_at,
+        system_started_at,
     )
     .await?;
 
@@ -295,6 +311,32 @@ pub fn recording_level(state: State<'_, AppState>) -> Result<f32, AppError> {
         .lock()
         .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
     Ok(recorder.as_ref().map(|r| r.level()).unwrap_or(0.0))
+}
+
+/// Live-toggle the microphone mute mid-recording (no stream teardown). While muted, the cpal
+/// capture callback writes SILENCE into the mic buffer for those frames — the stream stays
+/// full-length so its wall-clock timeline (and thus "me"/"others" alignment) is preserved, and
+/// no real mic audio is captured (privacy). No-op if not recording.
+#[tauri::command]
+pub fn set_mic_muted(state: State<'_, AppState>, muted: bool) -> Result<(), AppError> {
+    let recorder = state
+        .recorder
+        .lock()
+        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+    if let Some(r) = recorder.as_ref() {
+        r.set_muted(muted);
+    }
+    Ok(())
+}
+
+/// Whether the mic is currently muted on the live recorder (false when not recording).
+#[tauri::command]
+pub fn is_mic_muted(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let recorder = state
+        .recorder
+        .lock()
+        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+    Ok(recorder.as_ref().map(|r| r.is_muted()).unwrap_or(false))
 }
 
 /// The most recent note (markdown + export path) for the last-note preview pane.
@@ -1188,7 +1230,10 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         claude_binary: d.claude_binary,
         capture_system_audio: d.capture_system_audio,
         model_size: if d.model_size.trim().is_empty() {
-            "small".to_string()
+            // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
+            // fall back to the multilingual large-v3 default (best Polish quality), NOT a
+            // smaller model that would silently downgrade transcription.
+            AppConfig::default().model_size
         } else {
             d.model_size
         },
