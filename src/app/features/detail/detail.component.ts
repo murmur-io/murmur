@@ -16,10 +16,17 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type {
+  FolderNode,
   GraphPayload,
   MeetingDetail,
   MeetingTimeline,
 } from "../../core/models";
+import {
+  FoldersService,
+  type FolderExposure,
+} from "../../services/folders.service";
+import { LockBadgeComponent } from "../folders/lock-badge.component";
+import { MoveToMenuComponent } from "../folders/move-to-menu.component";
 import { MeetingActionsComponent } from "./meeting-actions.component";
 import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingRecipesComponent } from "./meeting-recipes.component";
@@ -63,6 +70,8 @@ interface ParsedNote {
     MeetingActionsComponent,
     MeetingChatComponent,
     MeetingRecipesComponent,
+    LockBadgeComponent,
+    MoveToMenuComponent,
   ],
   template: `
     <section class="detail">
@@ -124,6 +133,18 @@ interface ParsedNote {
               <span class="meta-item">{{
                 formatDuration(d.meeting.durationS)
               }}</span>
+              <!-- Read-only folder + lock badge (where this note lives). -->
+              @if (folderBadge(); as fb) {
+                <span class="meta-sep" aria-hidden="true">·</span>
+                <span
+                  class="meta-item"
+                  style="display: inline-flex; align-items: center; gap: 4px"
+                  [attr.title]="fb.name"
+                >
+                  <app-lock-badge [exposure]="fb.exposure" />
+                  {{ fb.name }}
+                </span>
+              }
             </div>
 
             <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags) -->
@@ -186,6 +207,35 @@ interface ParsedNote {
               >
                 Delete
               </button>
+
+              <!-- MOVE TO FOLDER: opens the folder picker popover. The picker
+                   itself owns the load-bearing encrypt/decrypt confirm. Layout
+                   is inline (no component-stylesheet rule) so it stays anchored
+                   to its trigger without growing the per-component style budget. -->
+              <div style="position: relative; display: inline-flex">
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  [attr.aria-expanded]="moveOpen()"
+                  aria-haspopup="menu"
+                  (click)="toggleMove()"
+                  [disabled]="busy()"
+                >
+                  Move to folder
+                </button>
+                @if (moveOpen()) {
+                  <div
+                    style="position: absolute; top: calc(100% + 8px); left: 0; z-index: 30"
+                  >
+                    <app-move-to-menu
+                      [meetingId]="d.meeting.id"
+                      [currentFolderId]="d.meeting.folderId ?? null"
+                      (moved)="onMoved($event)"
+                      (close)="closeMove()"
+                    />
+                  </div>
+                }
+              </div>
             }
 
             <!-- EXPORT menu: copy / save note / save audio / print-to-PDF.
@@ -781,6 +831,7 @@ interface ParsedNote {
         font-size: 0.8125rem;
       }
 
+      /* Read-only folder + lock badge in the meta row. */
       .actions {
         display: flex;
         flex-wrap: wrap;
@@ -1489,6 +1540,7 @@ export class DetailComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly folders = inject(FoldersService);
 
   /** Exposed so the template can format aria values. */
   protected readonly Math = Math;
@@ -1497,6 +1549,30 @@ export class DetailComponent implements OnInit {
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly msg = signal("");
+
+  // --- Move-to-folder popover ---------------------------------------------
+  /** True while the folder-picker popover is open. */
+  readonly moveOpen = signal(false);
+
+  /**
+   * Read-only folder badge for the header: the owning folder's name + exposure
+   * (open / locked / session), or null when the note is at the vault root or the
+   * folder isn't (yet) in the loaded tree. Reactive to both the meeting's
+   * `folderId` and the folders store, so a move/lock updates it live.
+   */
+  readonly folderBadge = computed<{
+    name: string;
+    exposure: FolderExposure;
+  } | null>(() => {
+    const fid = this.detail()?.meeting.folderId ?? null;
+    if (fid === null) {
+      return null;
+    }
+    const node = this.findFolder(this.folders.tree(), fid);
+    return node
+      ? { name: node.name, exposure: this.folders.exposureOf(node) }
+      : null;
+  });
 
   // --- Inline title rename state ------------------------------------------
   /** True while the header title is swapped for an inline text input. */
@@ -1654,6 +1730,10 @@ export class DetailComponent implements OnInit {
     // tolerates the first-call LLM latency (backend caches the result).
     if (this.detail()) {
       void this.loadTimeline();
+      // Prime the folder tree so the read-only folder/lock badge + the move
+      // picker have state on a direct navigation (idempotent; the root component
+      // also loads it). Non-blocking — a failure just hides the badge.
+      void this.folders.load();
       // Load the meeting's tags (best-effort; failure leaves the chips empty).
       try {
         this.tags.set(await this.ipc.getMeetingTags(id));
@@ -1661,6 +1741,47 @@ export class DetailComponent implements OnInit {
         this.tags.set([]);
       }
     }
+  }
+
+  // --- Move to folder ------------------------------------------------------
+
+  /** Open/close the folder-picker popover (closed while the detail is busy). */
+  toggleMove(): void {
+    if (this.busy()) {
+      return;
+    }
+    this.moveOpen.update((v) => !v);
+  }
+
+  /** Dismiss the folder-picker popover. */
+  closeMove(): void {
+    this.moveOpen.set(false);
+  }
+
+  /**
+   * Apply a completed move locally: patch the in-memory meeting's `folderId` so
+   * the header badge updates immediately (the picker already moved it via the
+   * service + reloaded the tree). Then close the popover.
+   */
+  onMoved(folderId: string | null): void {
+    this.detail.update((d) =>
+      d ? { ...d, meeting: { ...d.meeting, folderId } } : d,
+    );
+    this.closeMove();
+  }
+
+  /** Depth-first search for a folder node by id across the forest. */
+  private findFolder(nodes: FolderNode[], id: string): FolderNode | null {
+    for (const n of nodes) {
+      if (n.id === id) {
+        return n;
+      }
+      const hit = this.findFolder(n.children, id);
+      if (hit) {
+        return hit;
+      }
+    }
+    return null;
   }
 
   /** Fetch (or re-fetch, via Retry) the AI-derived speaker + topic timeline. */
