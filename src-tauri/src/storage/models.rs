@@ -25,6 +25,33 @@ pub struct Meeting {
     pub status: MeetingStatus,
 }
 
+/// A vault folder Murmur tracks for organization + per-folder locking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub parent_id: Option<String>,
+    pub locked: bool,
+    pub created_at: String,
+}
+
+/// A folder node for the tree UI: note count + current session lock state + children.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderNode {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub note_count: usize,
+    /// Folder is sealed (encrypted) on disk.
+    pub locked: bool,
+    /// Sealed AND unlocked in the current session (decrypted for view + MCP until relock).
+    pub unlocked: bool,
+    pub children: Vec<FolderNode>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteRecord {
