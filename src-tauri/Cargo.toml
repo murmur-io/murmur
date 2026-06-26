@@ -1,9 +1,13 @@
 [package]
-name = "meetnotes"
-version = "0.0.0"
-description = "MeetNotes — local meeting capture, transcription, and AI notes for Obsidian"
+name = "murmur"
+version = "0.2.0"
+description = "Murmur — local meeting capture, transcription, and AI notes for Obsidian"
 edition = "2021"
 rust-version = "1.77"
+
+[[bin]]
+name = "Murmur"
+path = "src/main.rs"
 
 [lib]
 name = "meetnotes_lib"

@@ -2067,36 +2067,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meetnotes"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "cpal",
- "dirs 5.0.1",
- "hound",
- "keyring",
- "regex",
- "reqwest 0.12.28",
- "rubato",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-global-shortcut",
- "thiserror 1.0.69",
- "tiny_http",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "whisper-rs",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2163,6 +2133,36 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "murmur"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "cpal",
+ "dirs 5.0.1",
+ "hound",
+ "keyring",
+ "regex",
+ "reqwest 0.12.28",
+ "rubato",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-global-shortcut",
+ "thiserror 1.0.69",
+ "tiny_http",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "whisper-rs",
 ]
 
 [[package]]
