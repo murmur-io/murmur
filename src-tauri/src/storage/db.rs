@@ -8,8 +8,9 @@ use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
 use crate::storage::models::{
-    Analytics, DayCount, Folder, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
-    StatusCount,
+    Analytics, DayCount, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData, GraphEdge,
+    GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
+    StatusCount, VaultSource,
 };
 use crate::transcribe::types::Segment;
 
@@ -40,6 +41,29 @@ impl FromStr for MeetingStatus {
             "EXPORTED" => Ok(MeetingStatus::Exported),
             "ERROR" => Ok(MeetingStatus::Error),
             other => Err(AppError::Storage(format!("unknown meeting status: {other}"))),
+        }
+    }
+}
+
+impl EntityKind {
+    /// Stable lowercase string used as the on-disk `entities.kind` column value.
+    /// Kept in sync with the serde `rename_all = "camelCase"` on the enum.
+    fn as_str(&self) -> &'static str {
+        match self {
+            EntityKind::Person => "person",
+            EntityKind::Project => "project",
+        }
+    }
+}
+
+impl FromStr for EntityKind {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "person" => Ok(EntityKind::Person),
+            "project" => Ok(EntityKind::Project),
+            other => Err(AppError::Storage(format!("unknown entity kind: {other}"))),
         }
     }
 }
@@ -144,7 +168,26 @@ impl Db {
                wrapped_key BLOB,
                created_at TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);",
+             CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);
+             CREATE TABLE IF NOT EXISTS entities (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               name_ci TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               UNIQUE (name_ci, kind)
+             );
+             CREATE TABLE IF NOT EXISTS entity_mentions (
+               entity_id TEXT NOT NULL,
+               meeting_id TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY (entity_id, meeting_id),
+               FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_entity_mentions_meeting ON entity_mentions(meeting_id);
+             CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
+             CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -1164,6 +1207,375 @@ impl Db {
             .map_err(map_err)?;
         Ok(!has_notes || has_visible)
     }
+
+    // ── self-assembling graph (entities + mentions) ───────────────────────────
+    //
+    // Sink A of the dual-sink: the encrypted DB is the source of truth for the in-app
+    // graph. EVERY read below pushes the same `unlocked` set through `visibility_clause`
+    // over `entity_mentions → meetings → notes n LEFT JOIN folders f`, replicating the
+    // `EXISTS(visible note) OR NOT EXISTS(any note)` predicate of `list_meetings_visible`
+    // verbatim — so a sealed-and-not-unlocked meeting contributes ZERO to nodes, edges,
+    // and counts. The rows persist through sealing; they merely become invisible at read.
+
+    /// Upsert an entity by `(name_ci, kind)`, case-insensitively de-duplicated. Keeps the
+    /// FIRST-SEEN casing in `name` (a later "anna kowalska" does NOT overwrite "Anna Kowalska").
+    /// `name_ci` uses full-Unicode `to_lowercase()` (NOT ASCII-only folding) so accented names
+    /// dedup consistently. Returns the (new or existing) entity id. Race-safe: `INSERT OR IGNORE`
+    /// then re-read, so a concurrent insert resolves to the single winning row.
+    pub fn upsert_entity(&self, name: &str, kind: EntityKind) -> Result<String> {
+        let conn = self.lock();
+        let name = name.trim();
+        let name_ci = name.to_lowercase();
+        let kind_str = kind.as_str();
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        // INSERT OR IGNORE: if `(name_ci, kind)` already exists the insert is a no-op (the
+        // existing first-seen casing + id are kept). Either way we re-read the canonical id.
+        conn.execute(
+            "INSERT OR IGNORE INTO entities (id, name, name_ci, kind, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, name, name_ci, kind_str, created_at],
+        )
+        .map_err(map_err)?;
+        let resolved: String = conn
+            .query_row(
+                "SELECT id FROM entities WHERE name_ci = ?1 AND kind = ?2",
+                rusqlite::params![name_ci, kind_str],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(resolved)
+    }
+
+    /// Record that `entity_id` was mentioned in `meeting_id`. Idempotent via the PK
+    /// `(entity_id, meeting_id)` — re-summarize / re-extract never double-counts.
+    pub fn add_mention(&self, entity_id: &str, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_mentions (entity_id, meeting_id, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![entity_id, meeting_id, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// All entities that have ≥1 VISIBLE mention, with that visible mention count. An entity
+    /// mentioned ONLY in sealed-and-not-unlocked meetings has count 0 → dropped by `HAVING`,
+    /// so its name (which lived only in encrypted markdown) never reaches the renderer.
+    pub fn list_entities_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<GraphNode>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT e.id, e.name, e.kind, COUNT(em.meeting_id) AS cnt
+               FROM entities e
+               JOIN entity_mentions em ON em.entity_id = e.id
+               JOIN meetings m ON m.id = em.meeting_id
+              WHERE (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+              GROUP BY e.id, e.name, e.kind
+             HAVING cnt > 0
+              ORDER BY cnt DESC, e.name COLLATE NOCASE ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                let kind_str: String = r.get(2)?;
+                let mention_count: i64 = r.get(3)?;
+                Ok((id, name, kind_str, mention_count))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, name, kind_str, mention_count) = r.map_err(map_err)?;
+            out.push(GraphNode {
+                id,
+                name,
+                kind: EntityKind::from_str(&kind_str)?,
+                mention_count,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The VISIBLE meetings mentioning `entity_id`, newest first, as `VaultSource` chips
+    /// (the same shape the FE uses for backlink chips). Sealed-not-unlocked meetings excluded.
+    pub fn entity_mentions_visible(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<VaultSource>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT m.id, m.title, m.started_at
+               FROM entity_mentions em
+               JOIN meetings m ON m.id = em.meeting_id
+              WHERE em.entity_id = ?1
+                AND (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+              ORDER BY m.started_at DESC, m.id DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![entity_id], |r| {
+                let meeting_id: String = r.get(0)?;
+                let title: Option<String> = r.get(1)?;
+                let started_at: String = r.get(2)?;
+                Ok(VaultSource {
+                    meeting_id,
+                    title: title.unwrap_or_default(),
+                    started_at,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Entity↔entity co-occurrence edges: two entities sharing the SAME visible meeting, weighted
+    /// by the number of shared visible meetings. Pair-deduped via `a.entity_id < b.entity_id`
+    /// → exactly one undirected edge per pair, `source < target`. Both endpoints' meetings are
+    /// gated by the visibility predicate, so a co-occurrence in a sealed meeting yields no edge.
+    pub fn graph_edges_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<GraphEdge>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT a.entity_id, b.entity_id, COUNT(*) AS weight
+               FROM entity_mentions a
+               JOIN entity_mentions b
+                 ON a.meeting_id = b.meeting_id AND a.entity_id < b.entity_id
+               JOIN meetings m ON m.id = a.meeting_id
+              WHERE (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+              GROUP BY a.entity_id, b.entity_id
+              ORDER BY weight DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(GraphEdge {
+                    source: r.get(0)?,
+                    target: r.get(1)?,
+                    weight: r.get(2)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Whether `entity_id` has ≥1 VISIBLE mention right now — i.e. at least one mention lands in a
+    /// meeting that is visible under the SAME predicate as `list_meetings_visible` / the other
+    /// graph reads (`EXISTS(visible note) OR NOT EXISTS(any note)`). An entity mentioned ONLY in
+    /// sealed-and-not-unlocked meetings returns `false`, so its name (which lived only in encrypted
+    /// markdown) can never leak through `get_entity` / `build_entity_detail`. This is the gate the
+    /// detail path was missing: `get_entity` itself reads the raw `entities` row with no visibility
+    /// predicate, so callers that expose an entity to the FE MUST go through this check first.
+    pub fn entity_is_visible(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT EXISTS (
+                      SELECT 1
+                        FROM entity_mentions em
+                        JOIN meetings m ON m.id = em.meeting_id
+                       WHERE em.entity_id = ?1
+                         AND (
+                               NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                            OR EXISTS (
+                                 SELECT 1 FROM notes n
+                                  LEFT JOIN folders f ON f.id = n.folder_id
+                                  WHERE n.meeting_id = m.id AND {visible}
+                               )
+                             )
+                    )"
+        );
+        let visible: bool = conn
+            .query_row(&sql, rusqlite::params![entity_id], |r| {
+                Ok(r.get::<_, i64>(0)? != 0)
+            })
+            .map_err(map_err)?;
+        Ok(visible)
+    }
+
+    /// One entity row by id (`None` if absent), with its first-seen casing. NOTE: this reads the
+    /// raw `entities` row WITHOUT a visibility predicate — it must NOT be exposed to the FE for an
+    /// arbitrary id without first gating on [`entity_is_visible`] (see `build_entity_detail`).
+    pub fn get_entity(&self, entity_id: &str) -> Result<Option<GraphEntity>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, name, kind, created_at FROM entities WHERE id = ?1",
+                rusqlite::params![entity_id],
+                |r| {
+                    let id: String = r.get(0)?;
+                    let name: String = r.get(1)?;
+                    let kind_str: String = r.get(2)?;
+                    let created_at: String = r.get(3)?;
+                    Ok((id, name, kind_str, created_at))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        match row {
+            Some((id, name, kind_str, created_at)) => Ok(Some(GraphEntity {
+                id,
+                name,
+                kind: EntityKind::from_str(&kind_str)?,
+                created_at,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// The top-`limit` entities co-occurring with `entity_id` (the neighborhood satellites),
+    /// ranked by shared VISIBLE meeting count. Both the anchor's and the neighbor's mention must
+    /// land in a visible meeting, so sealed co-occurrences never surface a neighbor.
+    pub fn entity_neighbors_visible(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+        limit: i64,
+    ) -> Result<Vec<EntityNeighbor>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT e.id, e.name, e.kind, COUNT(*) AS shared
+               FROM entity_mentions a
+               JOIN entity_mentions b ON a.meeting_id = b.meeting_id AND b.entity_id != a.entity_id
+               JOIN entities e ON e.id = b.entity_id
+               JOIN meetings m ON m.id = a.meeting_id
+              WHERE a.entity_id = ?1
+                AND (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+              GROUP BY e.id, e.name, e.kind
+              ORDER BY shared DESC, e.name COLLATE NOCASE ASC
+              LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![entity_id, limit], |r| {
+                let id: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                let kind_str: String = r.get(2)?;
+                let shared_meetings: i64 = r.get(3)?;
+                Ok((id, name, kind_str, shared_meetings))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, name, kind_str, shared_meetings) = r.map_err(map_err)?;
+            out.push(EntityNeighbor {
+                id,
+                name,
+                kind: EntityKind::from_str(&kind_str)?,
+                shared_meetings,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether ANY folder is sealed-and-not-unlocked right now (i.e. a locked folder whose id is
+    /// NOT in the session `unlocked` set). Drives the FE's one honest "some entities hidden"
+    /// disclosure banner — it never leaks how many or which.
+    pub fn has_hidden_folders(&self, unlocked: &HashSet<String>) -> Result<bool> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM folders WHERE locked = 1")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        for r in rows {
+            let id = r.map_err(map_err)?;
+            if !unlocked.contains(&id) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Build the full graph payload (`get_graph`): all visible nodes + all visible edges +
+    /// the hidden-folder disclosure flag, snapshotting the passed-in session `unlocked` set.
+    pub fn build_graph(&self, unlocked: &HashSet<String>) -> Result<GraphData> {
+        let nodes = self.list_entities_visible(unlocked)?;
+        let edges = self.graph_edges_visible(unlocked)?;
+        let has_hidden = self.has_hidden_folders(unlocked)?;
+        Ok(GraphData {
+            nodes,
+            edges,
+            has_hidden,
+        })
+    }
+
+    /// Build the detail payload for one entity (`get_entity_detail`): the entity, its visible
+    /// backlinked meetings, and its top co-occurring neighbors. `None` if the entity is unknown
+    /// OR has ZERO visible mentions (mentioned only in sealed-not-unlocked meetings). The
+    /// visibility gate is mandatory here: `get_entity` reads the raw `entities` row with NO
+    /// predicate, so without this check a caller holding a stale entity id (cached from a prior
+    /// open-folder `get_graph`, before the folder was sealed/auto-relocked) could read back the
+    /// entity's `name` — which lived only in the sealed meeting's encrypted markdown. Routing
+    /// through `entity_is_visible` keeps the detail path consistent with every other graph read.
+    pub fn build_entity_detail(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+        neighbor_limit: i64,
+    ) -> Result<Option<EntityDetail>> {
+        // Anti-leak gate FIRST: a sealed-only entity is indistinguishable from an unknown id.
+        if !self.entity_is_visible(entity_id, unlocked)? {
+            return Ok(None);
+        }
+        let entity = match self.get_entity(entity_id)? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let meetings = self.entity_mentions_visible(entity_id, unlocked)?;
+        let neighbors = self.entity_neighbors_visible(entity_id, unlocked, neighbor_limit)?;
+        Ok(Some(EntityDetail {
+            entity,
+            meetings,
+            neighbors,
+        }))
+    }
 }
 
 /// One note row needed to seal/unseal a folder.
@@ -1954,5 +2366,403 @@ mod lock_tests {
             return false;
         }
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    //! File-backed (tempfile via `open_with_key` + a FIXED test key) tests for the in-app
+    //! self-assembling graph (entities + mentions). These NEVER touch the real Keychain — both
+    //! the SQLCipher DEK and the per-folder lock KEK are explicit literals. They exercise the
+    //! Sink-A DB helpers + the visibility predicate (the single highest-stakes anti-leak line),
+    //! and the Sink-B `locked`-gate (disk-truth, not session-unlock) for the vault stub mirror.
+
+    use super::*;
+    use crate::storage::models::{EntityKind, Folder, Meeting, MeetingStatus, NoteRecord};
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "meetnotes-graph-test-{}-{}-{}.sqlite",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    fn file_db(label: &str) -> Db {
+        Db::open_with_key(&temp_db_path(label), TEST_DEK).unwrap()
+    }
+
+    /// A scratch vault directory for Sink-B `.md` stub assertions (unique per test).
+    fn temp_vault(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "meetnotes-graph-vault-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn seed_folder(db: &Db, id: &str, name: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: name.to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// Seed a meeting + one note row, optionally filed into `folder_id`.
+    fn seed_note(db: &Db, meeting_id: &str, markdown: &str, folder_id: Option<&str>) {
+        db.insert_meeting(&Meeting {
+            id: meeting_id.to_string(),
+            started_at: format!("2026-06-26T09:00:00Z+{meeting_id}"),
+            ended_at: None,
+            title: Some(format!("title-{meeting_id}")),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: meeting_id.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: markdown.to_string(),
+            created_at: "2026-06-26T09:05:00Z".to_string(),
+            exported_path: Some(format!("/vault/{meeting_id}.md")),
+        })
+        .unwrap();
+        db.set_note_folder(meeting_id, folder_id).unwrap();
+    }
+
+    /// Mirror of `lock_folder`: encrypt each note into a content blob, blank markdown, seal.
+    fn seal_folder(db: &Db, folder_id: &str, kek: &[u8; 32]) {
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(kek, &ck).unwrap();
+        let notes = db.notes_in_folder(folder_id).unwrap();
+        let mut blobs = Vec::new();
+        for n in &notes {
+            let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes()).unwrap();
+            blobs.push((n.meeting_id.clone(), n.provider_id.clone(), blob));
+        }
+        db.set_folder_locked(folder_id, true, Some(&wrapped)).unwrap();
+        for (mid, pid, blob) in &blobs {
+            db.seal_note(mid, pid, blob).unwrap();
+        }
+    }
+
+    fn unlocked_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn entity_dedup() {
+        // Same name, different casing, same kind → ONE entity (case-insensitive on name_ci),
+        // FIRST-SEEN casing kept. Mentions across distinct meetings accumulate; a repeat mention
+        // is idempotent (PK). A same-name DIFFERENT kind is a distinct row.
+        let db = file_db("dedup");
+        seed_note(&db, "m1", "# note", None);
+        seed_note(&db, "m2", "# note", None);
+
+        let id1 = db.upsert_entity("Anna Kowalska", EntityKind::Person).unwrap();
+        let id2 = db.upsert_entity("anna kowalska", EntityKind::Person).unwrap();
+        assert_eq!(id1, id2, "case-insensitive dedup → same entity id");
+
+        // First-seen casing is preserved (the lowercase re-insert must NOT overwrite it).
+        let ent = db.get_entity(&id1).unwrap().unwrap();
+        assert_eq!(ent.name, "Anna Kowalska", "first-seen casing kept");
+
+        // Same name, DIFFERENT kind → a distinct entity row (the (name_ci, kind) unique index).
+        let proj = db.upsert_entity("Anna Kowalska", EntityKind::Project).unwrap();
+        assert_ne!(proj, id1, "same name + different kind = distinct entity");
+
+        // Mentions accumulate across meetings; a duplicate mention is idempotent.
+        db.add_mention(&id1, "m1").unwrap();
+        db.add_mention(&id1, "m1").unwrap(); // idempotent — no double count
+        db.add_mention(&id1, "m2").unwrap();
+
+        let empty = HashSet::new();
+        let nodes = db.list_entities_visible(&empty).unwrap();
+        let anna = nodes
+            .iter()
+            .find(|n| n.id == id1)
+            .expect("Anna present in visible nodes");
+        assert_eq!(anna.mention_count, 2, "two distinct meetings, idempotent repeat");
+        assert_eq!(anna.name, "Anna Kowalska");
+    }
+
+    #[test]
+    fn graph_visibility_filter() {
+        // The core anti-leak test. An entity mentioned ONLY in a SEALED folder's meeting is ABSENT
+        // from get_graph/list_entities_visible while the folder is locked + not in the unlocked
+        // set; it reappears when the folder id IS in the unlocked set. An entity also mentioned in
+        // an OPEN meeting keeps only its VISIBLE count (never the true count).
+        let db = file_db("visibility");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "secret", "Secret");
+        seed_note(&db, "open1", "# open", None); // root → always visible
+        seed_note(&db, "sealed1", "# sealed", Some("secret"));
+
+        // "Secret Person" mentioned ONLY in the sealed meeting.
+        let secret_p = db.upsert_entity("Secret Person", EntityKind::Person).unwrap();
+        db.add_mention(&secret_p, "sealed1").unwrap();
+        // "Shared Project" mentioned in BOTH the open and the sealed meeting.
+        let shared = db.upsert_entity("Shared Project", EntityKind::Project).unwrap();
+        db.add_mention(&shared, "open1").unwrap();
+        db.add_mention(&shared, "sealed1").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+
+        // BEFORE sealing: both entities present; Shared has count 2.
+        let before = db.list_entities_visible(&empty).unwrap();
+        assert!(before.iter().any(|n| n.id == secret_p));
+        assert_eq!(
+            before.iter().find(|n| n.id == shared).unwrap().mention_count,
+            2
+        );
+        // An edge exists between the two (they co-occur in sealed1) — pre-seal.
+        let (lo, hi) = if secret_p < shared {
+            (secret_p.clone(), shared.clone())
+        } else {
+            (shared.clone(), secret_p.clone())
+        };
+        assert!(
+            db.graph_edges_visible(&empty)
+                .unwrap()
+                .iter()
+                .any(|e| e.source == lo && e.target == hi),
+            "co-occurring entities have an edge before sealing"
+        );
+
+        // SEAL the folder, session NOT unlocked.
+        seal_folder(&db, "secret", &kek);
+        let nodes = db.list_entities_visible(&empty).unwrap();
+        assert!(
+            !nodes.iter().any(|n| n.id == secret_p),
+            "entity only in a sealed-not-unlocked meeting must be ABSENT"
+        );
+        // Shared survives but with VISIBLE count 1 (only the open meeting), never the true 2.
+        let shared_node = nodes
+            .iter()
+            .find(|n| n.id == shared)
+            .expect("shared entity still visible via its open meeting");
+        assert_eq!(
+            shared_node.mention_count, 1,
+            "visible count only — sealed mention drops out, never leaks count 2"
+        );
+        // No edge when the only co-occurrence is sealed.
+        assert!(
+            db.graph_edges_visible(&empty).unwrap().is_empty(),
+            "co-occurrence in a sealed meeting yields no edge"
+        );
+        // build_graph reflects the same + flags hidden folders.
+        let graph = db.build_graph(&empty).unwrap();
+        assert!(graph.has_hidden, "a sealed-not-unlocked folder sets has_hidden");
+        assert!(!graph.nodes.iter().any(|n| n.id == secret_p));
+        // entity_mentions_visible: the secret entity has zero visible backlinks while sealed.
+        assert!(db.entity_mentions_visible(&secret_p, &empty).unwrap().is_empty());
+
+        // SESSION-UNLOCK the folder id → the sealed contribution reappears.
+        let unlocked = unlocked_set(&["secret"]);
+        let nodes_u = db.list_entities_visible(&unlocked).unwrap();
+        assert!(
+            nodes_u.iter().any(|n| n.id == secret_p),
+            "entity reappears once its folder id is in the unlocked set"
+        );
+        assert_eq!(
+            nodes_u.iter().find(|n| n.id == shared).unwrap().mention_count,
+            2,
+            "both mentions visible again when unlocked"
+        );
+        // Edge with weight 1 returns (one shared visible meeting).
+        let edges_u = db.graph_edges_visible(&unlocked).unwrap();
+        assert_eq!(edges_u.len(), 1, "exactly one deduped edge per pair");
+        assert_eq!(edges_u[0].weight, 1);
+        // build_graph no longer flags hidden (the only locked folder is now unlocked).
+        assert!(!db.build_graph(&unlocked).unwrap().has_hidden);
+        // The secret entity's visible backlinks return when unlocked.
+        assert_eq!(
+            db.entity_mentions_visible(&secret_p, &unlocked).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dual_sink_skips_vault_when_locked() {
+        // Sink B gates on the meeting's folder `locked` flag (DISK truth, NOT session-unlock):
+        // a meeting in a locked folder → DB rows still written (Sink A), but ZERO vault `.md`
+        // stubs. An OPEN folder → both DB rows AND vault stubs. This mirrors the gate in
+        // `commands::build_and_persist_entities` without invoking the LLM provider.
+        let db = file_db("dualsink");
+        let kek = crate::crypto::random_key().unwrap();
+        let vault = temp_vault("dualsink");
+
+        seed_folder(&db, "locked_f", "Locked");
+        seed_folder(&db, "open_f", "Open");
+        seed_note(&db, "m_locked", "# locked note", Some("locked_f"));
+        seed_note(&db, "m_open", "# open note", Some("open_f"));
+        seal_folder(&db, "locked_f", &kek); // locked_f now locked=true on disk
+
+        // The dual-sink gate, replicated: Sink A always; Sink B only when folder NOT locked.
+        let sink = |meeting_id: &str, person: &str| {
+            // Sink A — always persist to the DB.
+            let id = db.upsert_entity(person, EntityKind::Person).unwrap();
+            db.add_mention(&id, meeting_id).unwrap();
+            // Sink B — vault stub only if the meeting's folder is unsealed on disk.
+            let folder_locked = match db.get_meeting(meeting_id).unwrap().and_then(|m| m.folder_id) {
+                Some(fid) => db.folder_by_id(&fid).unwrap().map(|f| f.locked).unwrap_or(false),
+                None => false,
+            };
+            if !folder_locked {
+                crate::export::entity_stub::ensure_entity_backlink(
+                    &vault, "People", person, &format!("title-{meeting_id}"),
+                )
+                .unwrap();
+            }
+        };
+
+        sink("m_locked", "Locked Person");
+        sink("m_open", "Open Person");
+
+        // Sink A: BOTH entities are in the DB regardless of lock state.
+        // (Read with the locked folder session-unlocked so both meetings are visible for the
+        //  assertion — Sink A wrote rows for both either way.)
+        let unlocked = unlocked_set(&["locked_f"]);
+        let nodes = db.list_entities_visible(&unlocked).unwrap();
+        assert!(
+            nodes.iter().any(|n| n.name == "Locked Person"),
+            "Sink A: DB row written even for a locked-folder meeting"
+        );
+        assert!(nodes.iter().any(|n| n.name == "Open Person"));
+
+        // Sink B: the OPEN folder's entity has a vault stub; the LOCKED folder's does NOT.
+        let open_stub = vault.join("People").join("Open Person.md");
+        let locked_stub = vault.join("People").join("Locked Person.md");
+        assert!(open_stub.exists(), "open folder → vault stub written");
+        assert!(
+            !locked_stub.exists(),
+            "locked folder → NO vault stub (no plaintext leak to disk)"
+        );
+    }
+
+    #[test]
+    fn no_vault_configured_db_sink_still_works() {
+        // Sink A must work with NO vault: no error, DB rows written, no stubs (no vault dir).
+        let db = file_db("novault");
+        seed_note(&db, "m1", "# note", None);
+        let id = db.upsert_entity("Some Person", EntityKind::Person).unwrap();
+        db.add_mention(&id, "m1").unwrap();
+        let nodes = db.list_entities_visible(&HashSet::new()).unwrap();
+        assert!(nodes.iter().any(|n| n.id == id));
+    }
+
+    #[test]
+    fn cascade_prunes_mentions_and_entity_drops_out() {
+        // delete_meeting cascades to entity_mentions (FK ON DELETE CASCADE); an entity with zero
+        // remaining mentions disappears from list_entities_visible (HAVING count > 0).
+        let db = file_db("cascade");
+        seed_note(&db, "m1", "# note", None);
+        let id = db.upsert_entity("Solo Person", EntityKind::Person).unwrap();
+        db.add_mention(&id, "m1").unwrap();
+        assert!(db
+            .list_entities_visible(&HashSet::new())
+            .unwrap()
+            .iter()
+            .any(|n| n.id == id));
+
+        db.delete_meeting("m1").unwrap();
+        assert!(
+            !db.list_entities_visible(&HashSet::new())
+                .unwrap()
+                .iter()
+                .any(|n| n.id == id),
+            "entity with no remaining mentions drops out"
+        );
+        // The entity row itself remains (orphan), but contributes nothing — harmless.
+        assert!(db.get_entity(&id).unwrap().is_some());
+    }
+
+    #[test]
+    fn entity_detail_neighbors_and_backlinks() {
+        // build_entity_detail returns the entity, its visible backlinked meetings, and its top
+        // co-occurring neighbors ranked by shared visible meetings.
+        let db = file_db("detail");
+        seed_note(&db, "m1", "# note", None);
+        seed_note(&db, "m2", "# note", None);
+        let anna = db.upsert_entity("Anna", EntityKind::Person).unwrap();
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        let bob = db.upsert_entity("Bob", EntityKind::Person).unwrap();
+        // Anna+Atlas co-occur in m1 AND m2 (weight 2); Anna+Bob only in m1 (weight 1).
+        for (e, m) in [(&anna, "m1"), (&anna, "m2"), (&atlas, "m1"), (&atlas, "m2"), (&bob, "m1")] {
+            db.add_mention(e, m).unwrap();
+        }
+        let detail = db
+            .build_entity_detail(&anna, &HashSet::new(), 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.entity.name, "Anna");
+        assert_eq!(detail.meetings.len(), 2, "Anna backlinks m1 + m2");
+        assert_eq!(detail.neighbors.first().unwrap().id, atlas, "Atlas is the top neighbor (shared 2)");
+        assert_eq!(detail.neighbors.first().unwrap().shared_meetings, 2);
+        assert!(detail.neighbors.iter().any(|n| n.id == bob));
+        // Unknown id → None.
+        assert!(db.build_entity_detail("nope", &HashSet::new(), 12).unwrap().is_none());
+    }
+
+    #[test]
+    fn entity_detail_hidden_when_only_sealed() {
+        // PRIME-DIRECTIVE anti-leak: an entity mentioned ONLY in a sealed-not-unlocked meeting
+        // must NEVER surface via get_entity_detail. The leak this guards: the FE held the entity
+        // id from a PRIOR open-folder get_graph; the folder is then sealed (or auto-relocked on
+        // screen-share); a subsequent get_entity_detail(id) must NOT return the entity — its
+        // `name` lived only in the sealed meeting's encrypted markdown. The detail returns None
+        // while sealed, and reappears only once the folder id is in the session `unlocked` set.
+        let db = file_db("detail-sealed");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "secret", "Secret");
+        seed_note(&db, "sealed1", "# sealed", Some("secret"));
+
+        let secret_p = db.upsert_entity("Secret Person", EntityKind::Person).unwrap();
+        db.add_mention(&secret_p, "sealed1").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+
+        // While OPEN: detail is available (sanity — proves the test wires a real, resolvable id).
+        let open_detail = db.build_entity_detail(&secret_p, &empty, 12).unwrap();
+        assert!(open_detail.is_some(), "open folder → detail resolves");
+
+        // SEAL, session NOT unlocked.
+        seal_folder(&db, "secret", &kek);
+        assert!(
+            db.build_entity_detail(&secret_p, &empty, 12).unwrap().is_none(),
+            "entity only in a sealed-not-unlocked meeting must NOT surface via get_entity_detail \
+             (its name lived only in the sealed meeting) — must be None, not an empty-backlink shell"
+        );
+
+        // SESSION-UNLOCK the folder id → the entity (and its visible backlinks) reappear.
+        let unlocked = unlocked_set(&["secret"]);
+        let detail = db
+            .build_entity_detail(&secret_p, &unlocked, 12)
+            .unwrap()
+            .expect("entity detail reappears once its folder id is in the unlocked set");
+        assert_eq!(detail.entity.name, "Secret Person");
+        assert_eq!(detail.meetings.len(), 1, "the (now visible) sealed meeting backlinks");
     }
 }

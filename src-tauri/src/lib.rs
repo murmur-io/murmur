@@ -82,6 +82,8 @@ pub fn run() {
             commands::add_reminder,
             commands::pin_moment,
             commands::link_meeting_entities,
+            commands::get_graph,
+            commands::get_entity_detail,
             commands::ask_vault,
             commands::generate_digest,
             commands::topic_threads,

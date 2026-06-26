@@ -8,8 +8,8 @@ use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarEvent, ChatTurn,
-    DigestResult, Folder, FolderNode, Meeting, MeetingStatus, MeetingTimeline, NoteRecord,
-    PinResult, RecipeRecord, SearchHit, TopicThread,
+    DigestResult, EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus,
+    MeetingTimeline, NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -724,8 +724,82 @@ pub fn pin_moment(
     })
 }
 
-/// Resolve the people + projects in a meeting note and write/append [[Person]] / [[Project]]
-/// stub notes in the vault with a backlink to this meeting — the graph self-assembles.
+/// Extract the people + projects from a meeting note and persist them through the dual-sink:
+///
+/// - **Sink A (always):** upsert each entity into the encrypted DB (`upsert_entity`, case-
+///   insensitive dedup) and record a mention (`add_mention`, idempotent). The DB is the
+///   source of truth for the in-app graph and works with NO vault configured.
+/// - **Sink B (gated):** mirror each entity as a `[[ ]]` vault stub via `ensure_entity_backlink`
+///   ONLY when a vault is configured AND the meeting's folder is NOT locked (`folder_by_id`
+///   disk-truth — NOT session unlock). A session-unlocked folder must NOT re-emit `.md` stubs
+///   (they were removed on seal and stay out until a permanent remove-lock), so the write gate
+///   uses `locked` while every READ uses `unlocked`. A meeting at the vault root (no folder)
+///   has no lock and gets its stubs.
+///
+/// Returns the extracted `GraphPayload`. The caller decides whether extraction failures are fatal
+/// (the `link_meeting_entities` command surfaces them; the pipeline hook swallows them).
+pub async fn build_and_persist_entities(
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<crate::summarize::graph::GraphPayload, AppError> {
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let payload =
+        crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
+
+    // Sink A — ALWAYS persist to the encrypted DB (the graph's source of truth).
+    for p in &payload.people {
+        let id = state.db.upsert_entity(p, crate::storage::models::EntityKind::Person)?;
+        state.db.add_mention(&id, meeting_id)?;
+    }
+    for pr in &payload.projects {
+        let id = state
+            .db
+            .upsert_entity(pr, crate::storage::models::EntityKind::Project)?;
+        state.db.add_mention(&id, meeting_id)?;
+    }
+
+    // Sink B — vault [[ ]] stubs, ONLY when a vault is configured AND the meeting's folder is
+    // NOT sealed on disk. Disk-truth `locked` (not session `unlocked`): a session-unlock must
+    // never re-write encrypted-content stubs back to plaintext on disk.
+    let vault = config.vault_path.clone().filter(|p| !p.is_empty());
+    if let Some(vault) = vault {
+        let folder_locked = match state.db.get_meeting(meeting_id)?.and_then(|m| m.folder_id) {
+            Some(folder_id) => state
+                .db
+                .folder_by_id(&folder_id)?
+                .map(|f| f.locked)
+                .unwrap_or(false),
+            None => false, // vault root → never locked
+        };
+        if !folder_locked {
+            let vault_path = std::path::Path::new(&vault);
+            for p in &payload.people {
+                crate::export::entity_stub::ensure_entity_backlink(vault_path, "People", p, title)?;
+            }
+            for pr in &payload.projects {
+                crate::export::entity_stub::ensure_entity_backlink(
+                    vault_path, "Projects", pr, title,
+                )?;
+            }
+        }
+    }
+
+    Ok(payload)
+}
+
+/// Resolve the people + projects in a meeting note → persist them to the encrypted DB graph
+/// (always) and mirror them as `[[Person]]` / `[[Project]]` vault stubs (only when a vault is
+/// configured + the meeting's folder is unsealed). The graph self-assembles. The DB sink works
+/// even with no vault set — hence no hard "set a vault folder" error anymore.
 #[tauri::command]
 pub async fn link_meeting_entities(
     state: State<'_, AppState>,
@@ -739,30 +813,48 @@ pub async fn link_meeting_entities(
         .db
         .get_latest_note_for_meeting(&meeting_id)?
         .ok_or_else(|| AppError::InvalidArg("this meeting has no note yet".into()))?;
-    let config = {
+    let title = meeting.title.clone().unwrap_or_else(|| "Meeting".to_string());
+    build_and_persist_entities(&state, &meeting_id, &title, &note.markdown).await
+}
+
+/// Max co-occurring neighbors returned with an entity's detail (the neighborhood satellites).
+const ENTITY_NEIGHBOR_LIMIT: i64 = 12;
+
+/// The self-assembling graph: all VISIBLE entity nodes (with their visible mention counts) + all
+/// VISIBLE co-occurrence edges. Snapshots the live session `unlocked` set (same as `list_folders`)
+/// and pushes it through the visibility predicate, so sealed-and-not-unlocked meetings contribute
+/// nothing — the graph can never disagree with Library/MCP about what's visible.
+#[tauri::command]
+pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
+    let unlocked = {
         state
-            .config
+            .unlocked_folders
             .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
             .clone()
     };
-    let vault = config
-        .vault_path
-        .clone()
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| AppError::InvalidArg("set a vault folder in Settings first".into()))?;
-    let title = meeting.title.clone().unwrap_or_else(|| "Meeting".to_string());
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
-    let payload =
-        crate::summarize::graph::extract_entities(provider.as_ref(), &title, &note.markdown).await?;
-    let vault_path = std::path::Path::new(&vault);
-    for p in &payload.people {
-        crate::export::entity_stub::ensure_entity_backlink(vault_path, "People", p, &title)?;
-    }
-    for pr in &payload.projects {
-        crate::export::entity_stub::ensure_entity_backlink(vault_path, "Projects", pr, &title)?;
-    }
-    Ok(payload)
+    state.db.build_graph(&unlocked)
+}
+
+/// Detail for one entity: the entity, its VISIBLE backlinked meetings (as `VaultSource` chips),
+/// and its top co-occurring neighbors. Snapshots the live `unlocked` set like `get_graph`.
+/// Errors with `InvalidArg` if the entity id is unknown.
+#[tauri::command]
+pub fn get_entity_detail(
+    state: State<'_, AppState>,
+    entity_id: String,
+) -> Result<EntityDetail, AppError> {
+    let unlocked = {
+        state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone()
+    };
+    state
+        .db
+        .build_entity_detail(&entity_id, &unlocked, ENTITY_NEIGHBOR_LIMIT)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no entity with id {entity_id}")))
 }
 
 /// Ask-My-Vault: answer a question across ALL past meetings' notes (grounded, with sources).

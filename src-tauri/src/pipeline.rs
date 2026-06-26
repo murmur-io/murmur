@@ -263,6 +263,16 @@ async fn summarize_and_export(
 
     emit_status(app, "done", "Note exported.", meeting_id);
 
+    // Best-effort self-assembling graph: persist entities/mentions to the encrypted DB (Sink A)
+    // + mirror vault stubs for unsealed folders (Sink B). NEVER fail the note on a graph error —
+    // a graph-extraction LLM hiccup must not block note export. `add_mention` idempotency makes
+    // the `resummarize_existing` path safe (re-extraction refreshes without double-counting).
+    if let Err(e) =
+        crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+    {
+        tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note export unaffected)");
+    }
+
     Ok(PipelineResult {
         note_markdown: markdown,
         exported_path,
