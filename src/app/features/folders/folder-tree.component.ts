@@ -192,10 +192,13 @@ import { FolderDropDirective } from "./folder-drop.directive";
       }
 
       .root-row {
-        display: inline-flex;
+        display: flex;
+        width: 100%;
+        min-width: 0;
         align-items: center;
         gap: var(--space-2);
         padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+        line-height: 1.3;
         border: 1px solid transparent;
         border-radius: var(--radius-md);
         background: transparent;
@@ -244,7 +247,15 @@ import { FolderDropDirective } from "./folder-drop.directive";
       }
       .root-icon {
         display: inline-flex;
+        flex: 0 0 auto;
         color: var(--text-muted);
+      }
+      .root-name {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       .root-row.is-selected .root-icon {
         color: var(--accent-hover);
