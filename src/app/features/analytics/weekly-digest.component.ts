@@ -7,6 +7,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
 import type { DigestResult } from "../../core/models";
+import { MarkdownComponent } from "../../shared/markdown.component";
 
 /** The selectable digest ranges, in days. */
 const RANGES = [7, 30] as const;
@@ -31,6 +32,7 @@ type Range = (typeof RANGES)[number];
   selector: "app-weekly-digest",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [MarkdownComponent],
   template: `
     <div class="card panel">
       <div class="panel-head">
@@ -87,7 +89,7 @@ type Range = (typeof RANGES)[number];
           aria-label="Generated digest"
           tabindex="0"
         >
-          {{ r.markdown }}
+          <app-markdown [markdown]="r.markdown" />
         </div>
       } @else if (!pending() && !error()) {
         <p class="empty">
@@ -205,8 +207,6 @@ type Range = (typeof RANGES)[number];
         color: var(--text-primary);
         font-size: 0.9375rem;
         line-height: 1.65;
-        /* Preserve the model's line breaks + spacing as plain text. */
-        white-space: pre-wrap;
         overflow-wrap: anywhere;
         overscroll-behavior: contain;
         animation: rise 320ms var(--transition) both;

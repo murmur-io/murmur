@@ -12,9 +12,10 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import { RouterLink } from "@angular/router";
 import { IpcService } from "../../core/ipc.service";
 import type { BriefResult, VaultSource } from "../../core/models";
+import { MarkdownComponent } from "../../shared/markdown.component";
+import { SourcesComponent } from "../../shared/sources.component";
 
 /**
  * "Prepare for a meeting" — a tasteful, dismissible prep affordance shown near
@@ -36,7 +37,7 @@ import type { BriefResult, VaultSource } from "../../core/models";
   selector: "app-pre-meeting-brief",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [MarkdownComponent, SourcesComponent],
   template: `
     <section class="brief card" role="group" aria-label="Prepare for a meeting">
       <div class="brief-head">
@@ -106,30 +107,14 @@ import type { BriefResult, VaultSource } from "../../core/models";
 
       @if (visibleBrief(); as brief) {
         <div class="brief-result" aria-live="polite">
-          <!-- LLM/markdown text rendered as PLAIN text (pre-wrap, no innerHTML). -->
-          <div class="brief-body">{{ brief.markdown }}</div>
+          <app-markdown
+            class="brief-body"
+            [markdown]="brief.markdown"
+            compact
+          />
 
           @if (brief.sources.length) {
-            <div
-              class="brief-sources"
-              role="group"
-              aria-label="Source meetings"
-            >
-              <span class="brief-sources-label">From</span>
-              @for (s of brief.sources; track s.meetingId) {
-                <a
-                  class="brief-chip"
-                  [style.--i]="$index"
-                  [routerLink]="['/meeting', s.meetingId]"
-                  [title]="chipTitle(s)"
-                >
-                  <span class="brief-chip-dot" aria-hidden="true"></span>
-                  <span class="brief-chip-text">{{
-                    s.title || "Untitled meeting"
-                  }}</span>
-                </a>
-              }
-            </div>
+            <app-sources class="brief-sources" [sources]="brief.sources" />
           }
         </div>
       }

@@ -13,6 +13,8 @@ import {
 import { RouterLink } from "@angular/router";
 import { IpcService } from "../../core/ipc.service";
 import type { ChatTurn, VaultSource } from "../../core/models";
+import { MarkdownComponent } from "../../shared/markdown.component";
+import { SourcesComponent } from "../../shared/sources.component";
 
 /**
  * A conversation turn as rendered on the Ask page. It mirrors {@link ChatTurn}
@@ -51,7 +53,7 @@ const STARTERS: readonly string[] = [
   selector: "app-ask",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, MarkdownComponent, SourcesComponent],
   template: `
     <section class="ask">
       <header class="ask-head">
@@ -137,31 +139,19 @@ const STARTERS: readonly string[] = [
                       (turn.role === 'user' ? 'You' : 'Assistant') + ' said'
                     "
                   >
-                    {{ turn.content }}
+                    @if (turn.role === "assistant") {
+                      <app-markdown [markdown]="turn.content" />
+                    } @else {
+                      {{ turn.content }}
+                    }
                   </div>
 
-                  <!-- Source meetings the answer was grounded in (chips). -->
+                  <!-- Source meetings the answer was grounded in (collapsible). -->
                   @if (turn.role === "assistant" && turn.sources?.length) {
-                    <div
+                    <app-sources
                       class="ask-sources"
-                      role="group"
-                      aria-label="Source meetings"
-                    >
-                      <span class="ask-sources-label">Sources</span>
-                      @for (src of turn.sources; track src.meetingId) {
-                        <a
-                          class="ask-source"
-                          [routerLink]="['/meeting', src.meetingId]"
-                        >
-                          <span class="ask-source-title">{{
-                            src.title || "(untitled)"
-                          }}</span>
-                          <span class="ask-source-date">{{
-                            formatDate(src.startedAt)
-                          }}</span>
-                        </a>
-                      }
-                    </div>
+                      [sources]="turn.sources ?? []"
+                    />
                   }
                 </div>
               }
@@ -419,6 +409,8 @@ const STARTERS: readonly string[] = [
         color: var(--text-primary);
         border-bottom-left-radius: var(--radius-sm);
         box-shadow: var(--glass-highlight);
+        /* Markdown renders its own block layout — don't let pre-wrap inject blank lines. */
+        white-space: normal;
       }
 
       /* --- Source chips (under an assistant answer) --- */

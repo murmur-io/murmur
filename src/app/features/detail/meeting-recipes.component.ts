@@ -14,6 +14,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
 import type { BuiltinRecipe, SavedRecipe } from "../../core/models";
+import { MarkdownComponent } from "../../shared/markdown.component";
 
 /**
  * "Recipes / Generate" — one-tap grounded generations over a single meeting's
@@ -34,6 +35,7 @@ import type { BuiltinRecipe, SavedRecipe } from "../../core/models";
   selector: "app-meeting-recipes",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [MarkdownComponent],
   template: `
     <div class="rec card">
       <div class="rec-head">
@@ -177,7 +179,7 @@ import type { BuiltinRecipe, SavedRecipe } from "../../core/models";
               </button>
             </div>
           </div>
-          <div class="rec-output-body">{{ out }}</div>
+          <app-markdown class="rec-output-body" [markdown]="out" compact />
         </article>
       } @else if (!pending() && !error()) {
         <!-- Empty / first-use hint. -->
@@ -471,11 +473,9 @@ import type { BuiltinRecipe, SavedRecipe } from "../../core/models";
         font-size: 0.8125rem;
       }
       .rec-output-body {
+        display: block;
         color: var(--text-primary);
         font-size: 0.9375rem;
-        line-height: 1.7;
-        /* Preserve the model's line breaks + spacing as plain text. */
-        white-space: pre-wrap;
         overflow-wrap: anywhere;
         max-height: 520px;
         overflow-y: auto;
