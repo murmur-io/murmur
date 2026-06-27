@@ -20,6 +20,12 @@ pub enum AppError {
     Locked(String),
     #[error("secrets error: {0}")]
     Secrets(String),
+    /// macOS Keychain access was denied or the secure store was unreachable at runtime (the user
+    /// clicked "Deny" on the keychain prompt, or the keychain is locked). Distinct from
+    /// [`AppError::Secrets`] so startup can branch on the "couldn't reach the keychain" case and
+    /// show a specific, non-technical message instead of crashing.
+    #[error("keychain access denied: {0}")]
+    KeychainDenied(String),
     #[error("config error: {0}")]
     Config(String),
     #[error("provider unavailable: {0}")]
