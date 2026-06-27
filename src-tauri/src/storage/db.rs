@@ -14,6 +14,19 @@ use crate::storage::models::{
 };
 use crate::transcribe::types::Segment;
 
+/// The at-rest audio columns of one locked-folder meeting, surfaced by
+/// [`Db::reblank_locked_folders_at_rest`] for the startup re-seal pass
+/// (`state::reconcile_locked_at_rest`). All THREE per-stream paths are carried — the playback WAV
+/// plus the two hi-res masters — because a crash-while-unlocked decrypts every sealed stream, so
+/// each must be reconciled, not just the playback copy (B1). Any column may be `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedMeetingAudio {
+    pub meeting_id: String,
+    pub audio_path: Option<String>,
+    pub mic_master_path: Option<String>,
+    pub sys_master_path: Option<String>,
+}
+
 impl MeetingStatus {
     /// Stable SCREAMING_SNAKE_CASE string used as the on-disk `status` column value.
     /// Kept in sync with the serde `rename_all = "SCREAMING_SNAKE_CASE"` on the enum.
@@ -937,6 +950,22 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Look up a folder by its vault-relative `path` (the `path` column is `NOT NULL UNIQUE`). Used
+    /// by the auto-organize seam to map a classifier-chosen subfolder name back to its folder row —
+    /// so a note auto-filed into a LOCKED folder's on-disk dir is sealed/rejected (it would
+    /// otherwise land plaintext with `folder_id = NULL`, which `lock_folder` + the at-rest reconcile
+    /// both key off `folder_id` and miss).
+    pub fn folder_by_path(&self, path: &str) -> Result<Option<Folder>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, name, path, parent_id, locked, created_at FROM folders WHERE path = ?1",
+            rusqlite::params![path],
+            row_to_folder,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     /// Set a folder's `locked` flag + its KEK-wrapped content key (`Some` when sealing,
     /// `None` to clear on permanent remove-lock).
     pub fn set_folder_locked(
@@ -1143,10 +1172,15 @@ impl Db {
     /// restart). Only rows WITH a blob are blanked (the blob is the recoverable source of truth); a
     /// blob-less plaintext row is left untouched so we never destroy unsealed content.
     ///
-    /// Returns the `(meeting_id, audio_path)` of every meeting in a locked folder so the caller can
-    /// re-seal stray plaintext WAVs (remove a plaintext WAV whose `.enc` already exists) on disk —
-    /// that filesystem step lives in `state::reconcile_locked_at_rest` (the DB layer stays pure-SQL).
-    pub fn reblank_locked_folders_at_rest(&self) -> Result<Vec<(String, String)>> {
+    /// Returns the at-rest audio columns of every meeting in a locked folder so the caller can
+    /// re-seal stray plaintext audio (remove a plaintext file whose `.enc` already exists, or
+    /// re-point a dangling column at a surviving `.enc`) on disk — that filesystem step lives in
+    /// `state::reconcile_locked_at_rest` (the DB layer stays pure-SQL). ALL THREE per-stream paths
+    /// are surfaced — the playback WAV (`audio_path`) AND the two hi-res masters
+    /// (`mic_master_path` / `sys_master_path`). A crash-while-unlocked decrypts EVERY stream that
+    /// was sealed, so re-pointing only `audio_path` would leave `{id}.mic.wav` / `{id}.sys.wav`
+    /// plaintext on disk forever (B1) — the masters must be reconciled with the same logic.
+    pub fn reblank_locked_folders_at_rest(&self) -> Result<Vec<LockedMeetingAudio>> {
         const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
              WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
         let mut conn = self.lock();
@@ -1168,18 +1202,28 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
-        // Collect the audio paths of locked meetings for the caller's filesystem re-seal pass.
+        // Collect the at-rest audio columns of locked meetings for the caller's filesystem re-seal
+        // pass — the playback WAV AND both hi-res masters (B1). A meeting is surfaced if ANY of the
+        // three columns is set; each path is reconciled independently by the caller.
         let mut audio = Vec::new();
         {
             let mut stmt = tx
                 .prepare(&format!(
-                    "SELECT id, audio_path FROM meetings \
-                       WHERE audio_path IS NOT NULL AND id IN ({LOCKED_MEETINGS})"
+                    "SELECT id, audio_path, mic_master_path, sys_master_path FROM meetings \
+                       WHERE (audio_path IS NOT NULL \
+                              OR mic_master_path IS NOT NULL \
+                              OR sys_master_path IS NOT NULL) \
+                         AND id IN ({LOCKED_MEETINGS})"
                 ))
                 .map_err(map_err)?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    Ok(LockedMeetingAudio {
+                        meeting_id: r.get::<_, String>(0)?,
+                        audio_path: r.get::<_, Option<String>>(1)?,
+                        mic_master_path: r.get::<_, Option<String>>(2)?,
+                        sys_master_path: r.get::<_, Option<String>>(3)?,
+                    })
                 })
                 .map_err(map_err)?;
             for r in rows {
