@@ -42,6 +42,27 @@ export interface AppConfigDto {
   noteStyle: string;
   autoOrganize: boolean;
   noteLanguage: string;
+  /**
+   * Stage E security flags. These are part of the `get_config` / `save_config`
+   * round-trip (Rust `AppConfigDto`), so the FE MUST read the current values and
+   * send them back unchanged on every save — otherwise the backend's serde
+   * defaults clobber them (`mcpRequireToken` → false, `cloudEgressConsented` →
+   * false). Never drop these from a `saveConfig` payload.
+   */
+  /** Require a bearer token on every MCP method (E3). Default true. */
+  mcpRequireToken: boolean;
+  /** Require biometric (Touch ID) before unlocking a sealed folder. Default true. */
+  lockRequireBiometric: boolean;
+  /** Auto-relock + zeroize the cached KEK when screen sharing starts. Default true. */
+  relockOnScreenshare: boolean;
+  /**
+   * E10 — one-time cloud-egress consent. Granted ONLY via the dedicated
+   * `consent_to_cloud_egress` command (the auditable, explicit user act);
+   * round-tripped on every `save_config` so a normal settings save PRESERVES it
+   * (never silently clears it). Default false (fail-closed): no meeting content
+   * leaves the device for a cloud LLM until the user has consented once.
+   */
+  cloudEgressConsented: boolean;
 }
 
 export interface NoteDto {
