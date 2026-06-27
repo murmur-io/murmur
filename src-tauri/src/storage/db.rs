@@ -846,9 +846,16 @@ impl Db {
         Ok(hits)
     }
 
-    /// Hybrid retrieval: fuse the FTS5/BM25 `search_visible` ranking with the vector
-    /// `search_semantic_visible` ranking by Reciprocal Rank Fusion, dedup by meeting, return up to
-    /// `limit` hits best-first. Both inputs are already visibility-gated, so the fused output is too.
+    /// Hybrid retrieval (GraphRAG-lite, Phase 2d): fuse THREE already-visibility-gated ranked lists
+    /// by Reciprocal Rank Fusion — the FTS5/BM25 `search_visible` ranking, the vector
+    /// `search_semantic_visible` ranking, AND the entity-graph neighbourhood
+    /// (`meetings_mentioning_entities_visible` for the entities the query names) — dedup by meeting,
+    /// return up to `limit` hits best-first. The graph leg is what a flat-RAG competitor lacks: a
+    /// query naming a known entity ("Project Atlas", "Anna") pulls in that entity's whole
+    /// cross-meeting neighbourhood, not just lexical/semantic hits. All three inputs route through
+    /// the SAME `visibility_clause`, so the fused output stays gated. When the query names no known
+    /// VISIBLE entity the graph list is empty and the fusion is byte-identical to the prior
+    /// FTS∪vector behaviour (RRF over an empty list is a no-op).
     pub fn search_hybrid_visible(
         &self,
         query: &str,
@@ -859,15 +866,35 @@ impl Db {
         let fts = self.search_visible(query, limit, unlocked)?;
         let semantic = self.search_semantic_visible(query_vec, limit, unlocked)?;
 
-        // The two ranked id-lists (each already best-first) feed RRF; capture them BEFORE moving the
-        // hits into the lookup map.
+        // GraphRAG-lite leg: resolve the query to known VISIBLE entities (deterministic, no LLM),
+        // then gather their co-mention neighbourhood. Both the resolver and the neighbour reader
+        // apply the same visibility predicate, so a sealed-not-unlocked meeting can never enter
+        // here. No entity match → empty vec → graph leg contributes nothing to the fusion.
+        let matched_entities = self.entities_matching_query(query, unlocked)?;
+        let graph = self.meetings_mentioning_entities_visible(&matched_entities, unlocked)?;
+
+        // The three ranked id-lists (each already best-first) feed RRF; capture them BEFORE moving
+        // the hits into the lookup map.
         let fts_ids: Vec<String> = fts.iter().map(|h| h.meeting.id.clone()).collect();
         let sem_ids: Vec<String> = semantic.iter().map(|h| h.meeting.id.clone()).collect();
+        let graph_ids: Vec<String> = graph.iter().map(|m| m.id.clone()).collect();
 
-        // One hit per meeting id (prefer the FTS hit's snippet when a meeting is in both lists, so
-        // the snippet matches the lexical query the user typed).
+        // One hit per meeting id. Insert the graph leg FIRST (lowest snippet priority): a meeting
+        // also hit by FTS/vector keeps the lexical/semantic snippet the user actually queried;
+        // a graph-only neighbour carries an "entity" marker + its title as the snippet.
         let mut by_id: std::collections::HashMap<String, SearchHit> =
             std::collections::HashMap::new();
+        for m in graph {
+            let snippet = m.title.clone().unwrap_or_default();
+            by_id.insert(
+                m.id.clone(),
+                SearchHit {
+                    meeting: m,
+                    snippet,
+                    matched_in: "entity".to_string(),
+                },
+            );
+        }
         for h in semantic {
             by_id.insert(h.meeting.id.clone(), h);
         }
@@ -875,7 +902,7 @@ impl Db {
             by_id.insert(h.meeting.id.clone(), h);
         }
 
-        let fused = crate::embed::rrf_fuse(&[fts_ids, sem_ids], crate::embed::RRF_K);
+        let fused = crate::embed::rrf_fuse(&[fts_ids, sem_ids, graph_ids], crate::embed::RRF_K);
         let cap = if limit < 0 { 0 } else { limit as usize };
         let mut out = Vec::new();
         for (id, _score) in fused.into_iter().take(cap) {
@@ -2459,6 +2486,107 @@ impl Db {
         Ok(out)
     }
 
+    /// QUERY→ENTITY resolution for GraphRAG-lite (Phase 2d) — DETERMINISTIC, no LLM. Returns the
+    /// ids of VISIBLE entities whose name appears as a whole-token match (see
+    /// [`name_matches_query_tokens`]) inside `query`, case-insensitively. Gated by EXACTLY the
+    /// `list_entities_visible` predicate: an entity mentioned ONLY in a sealed-and-not-unlocked
+    /// folder is never resolved (its name lived only in encrypted markdown, so resolving it would
+    /// leak its existence). A name shorter than [`MIN_ENTITY_NAME_LEN`] chars is skipped (noise
+    /// guard). Empty query or no match → empty vec, leaving the hybrid path unchanged.
+    pub fn entities_matching_query(
+        &self,
+        query: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let q_tokens = tokenize_lower(query);
+        if q_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        // Same visibility predicate as `list_entities_visible`: keep an entity iff it has ≥1
+        // mention in a meeting that is open/NULL-folder OR session-unlocked (or note-less).
+        let sql = format!(
+            "SELECT DISTINCT e.id, e.name_ci
+               FROM entities e
+               JOIN entity_mentions em ON em.entity_id = e.id
+               JOIN meetings m ON m.id = em.meeting_id
+              WHERE (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: String = r.get(0)?;
+                let name_ci: String = r.get(1)?;
+                Ok((id, name_ci))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, name_ci) = r.map_err(map_err)?;
+            if name_ci.chars().count() >= MIN_ENTITY_NAME_LEN
+                && name_matches_query_tokens(&q_tokens, &name_ci)
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// GATED entity-neighbour candidates for GraphRAG-lite (Phase 2d): the VISIBLE meetings
+    /// mentioning ANY of `entity_ids`, ranked by how many of the matched entities they touch (desc)
+    /// then recency. Uses EXACTLY the `list_meetings_visible`/graph visibility predicate, so a
+    /// sealed-and-not-unlocked meeting NEVER appears even if it mentions a matched entity. Empty
+    /// input → empty vec.
+    pub fn meetings_mentioning_entities_visible(
+        &self,
+        entity_ids: &[String],
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<Meeting>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let placeholders = (1..=entity_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status, \
+                    (SELECT nf.folder_id FROM notes nf \
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) AS folder_id \
+               FROM entity_mentions em \
+               JOIN meetings m ON m.id = em.meeting_id \
+              WHERE em.entity_id IN ({placeholders}) \
+                AND ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              GROUP BY m.id \
+              ORDER BY COUNT(DISTINCT em.entity_id) DESC, m.started_at DESC, m.id DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let params = rusqlite::params_from_iter(entity_ids.iter());
+        let rows = stmt.query_map(params, row_to_meeting).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)??);
+        }
+        Ok(out)
+    }
+
     /// Whether ANY folder is sealed-and-not-unlocked right now (i.e. a locked folder whose id is
     /// NOT in the session `unlocked` set). Drives the FE's one honest "some entities hidden"
     /// disclosure banner — it never leaks how many or which.
@@ -2567,6 +2695,39 @@ fn visibility_clause(_alias: &str, unlocked: &HashSet<String>) -> String {
     }
     clause.push(')');
     clause
+}
+
+/// Minimum entity-name length (in chars) eligible for QUERY→ENTITY resolution (GraphRAG-lite).
+/// Names shorter than this are too noisy as whole-query tokens (e.g. 2-letter initials) and are
+/// never resolved.
+const MIN_ENTITY_NAME_LEN: usize = 3;
+
+/// Lowercase + tokenize on Unicode non-alphanumeric boundaries (Polish-safe via
+/// `char::is_alphanumeric`). Empty tokens are dropped. Used by the deterministic QUERY→ENTITY
+/// resolver so matching is on whole tokens, never arbitrary substrings.
+fn tokenize_lower(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Whole-token match: `name_ci`'s tokens must appear as a CONTIGUOUS, in-order run inside
+/// `query_tokens` (already lowercased). So "atlas" matches the query "atlas status" but NOT the
+/// substring "atlasian"; a multi-token name like "anna kowalska" matches only when both tokens are
+/// adjacent and ordered. Guards the entity expansion against spurious substring noise.
+fn name_matches_query_tokens(query_tokens: &[String], name_ci: &str) -> bool {
+    let name_tokens: Vec<&str> = name_ci
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if name_tokens.is_empty() || name_tokens.len() > query_tokens.len() {
+        return false;
+    }
+    query_tokens
+        .windows(name_tokens.len())
+        .any(|w| w.iter().zip(name_tokens.iter()).all(|(a, b)| a == b))
 }
 
 // ── row mappers ──────────────────────────────────────────────────────────────
@@ -3486,6 +3647,211 @@ mod tests {
         // `both` is in BOTH ranked lists → must be the top fused result.
         assert_eq!(ids.first(), Some(&"both"), "meeting strong in both lists must rank first");
         assert!(ids.contains(&"fts_only") && ids.contains(&"vec_only"));
+    }
+
+    /// Insert a LOCKED folder directly (the `mod tests` `seed_folder` makes an OPEN one).
+    fn seed_locked_folder(db: &Db, id: &str, name: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: name.to_string(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// GRAPHRAG-LITE: the entity-graph leg surfaces a co-mentioned meeting that BOTH the FTS and
+    /// vector legs miss. Meeting `B` mentions the same entity as `A` but its note shares no query
+    /// term and it has no vector chunk — so only the entity-neighbour expansion can reach it.
+    #[test]
+    fn graph_leg_surfaces_co_mentioned_meeting_fts_and_vector_miss() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("A", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        db.insert_meeting(&sample_meeting("B", "2026-06-24T11:00:00Z"))
+            .unwrap();
+        note_for(&db, "A", "claude_code", "atlas project kickoff notes");
+        // B shares NO token with the query "atlas status" and gets no vector chunk.
+        note_for(&db, "B", "claude_code", "quarterly logistics review");
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "A").unwrap();
+        db.add_mention(&atlas, "B").unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let empty_vec: Vec<f32> = Vec::new();
+        // B is absent from FTS (note shares no query token) ...
+        assert!(
+            !db.search_visible("atlas status", 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.meeting.id == "B"),
+            "FTS must miss B"
+        );
+        // ... and absent from vector (no chunk at all → empty KNN).
+        assert!(
+            db.search_semantic_visible(&empty_vec, 10, &nothing)
+                .unwrap()
+                .is_empty(),
+            "vector must miss B"
+        );
+        // The query names entity Atlas → graph leg pulls in its neighbour B.
+        let hits = db
+            .search_hybrid_visible("atlas status", &empty_vec, 10, &nothing)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.meeting.id == "B"),
+            "co-mentioned B must surface via the entity-graph leg"
+        );
+    }
+
+    /// GATE: an entity-neighbour meeting in a SEALED-and-not-unlocked folder is EXCLUDED from the
+    /// expansion with an empty unlock set, and reappears once its folder id is unlocked. Also
+    /// covers the resolver gate: an entity mentioned ONLY in the sealed folder does not resolve.
+    /// (RED on an ungated neighbour query — both the resolver and the neighbour reader must gate.)
+    #[test]
+    fn graph_expansion_respects_lock_gate() {
+        let db = mem_db();
+        seed_locked_folder(&db, "f-secret", "Secret");
+        db.insert_meeting(&sample_meeting("A", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        db.insert_meeting(&sample_meeting("B", "2026-06-24T11:00:00Z"))
+            .unwrap();
+        note_for(&db, "A", "claude_code", "atlas open meeting");
+        note_for(&db, "B", "claude_code", "atlas sealed meeting");
+        db.set_note_folder("B", Some("f-secret")).unwrap();
+
+        // Atlas is visible (mentioned in open A); Phantom is mentioned ONLY in sealed B.
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "A").unwrap();
+        db.add_mention(&atlas, "B").unwrap();
+        let phantom = db.upsert_entity("Phantom", EntityKind::Project).unwrap();
+        db.add_mention(&phantom, "B").unwrap();
+
+        let empty = std::collections::HashSet::new();
+        // Neighbour reader: B (sealed) excluded, A (open) kept.
+        let nbrs = db
+            .meetings_mentioning_entities_visible(std::slice::from_ref(&atlas), &empty)
+            .unwrap();
+        assert!(nbrs.iter().any(|m| m.id == "A"), "open neighbour A present");
+        assert!(
+            !nbrs.iter().any(|m| m.id == "B"),
+            "sealed-folder neighbour B must be excluded with empty unlock set"
+        );
+        // Resolver: Phantom (sealed-only) does NOT resolve while locked.
+        assert!(
+            db.entities_matching_query("phantom report", &empty)
+                .unwrap()
+                .is_empty(),
+            "an entity mentioned only in a sealed folder must not resolve"
+        );
+
+        // Unlock f-secret → both reappear.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-secret".to_string());
+        let nbrs_u = db
+            .meetings_mentioning_entities_visible(&[atlas], &unlocked)
+            .unwrap();
+        assert!(
+            nbrs_u.iter().any(|m| m.id == "B"),
+            "sealed neighbour B reappears when its folder is unlocked"
+        );
+        assert_eq!(
+            db.entities_matching_query("phantom report", &unlocked)
+                .unwrap(),
+            vec![phantom],
+            "Phantom resolves once its folder is unlocked"
+        );
+    }
+
+    /// NOISE GUARD: a query that names no known entity leaves the hybrid result byte-identical to
+    /// the FTS∪vector RRF fusion (the graph leg is empty, no spurious expansion).
+    #[test]
+    fn no_entity_match_leaves_hybrid_identical_to_two_leg_fusion() {
+        let db = mem_db();
+        for (id, ts) in [
+            ("m1", "2026-06-24T10:00:00Z"),
+            ("m2", "2026-06-24T11:00:00Z"),
+        ] {
+            db.insert_meeting(&sample_meeting(id, ts)).unwrap();
+        }
+        note_for(&db, "m1", "claude_code", "budget planning notes");
+        note_for(&db, "m2", "claude_code", "budget review summary");
+        // An entity exists, but the query below does NOT name it.
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m1").unwrap();
+
+        let query = one_hot(0);
+        insert_known_chunk(&db, "m1", "budget planning notes", &one_hot(0));
+        insert_known_chunk(&db, "m2", "budget review summary", &one_hot(3));
+
+        let nothing = std::collections::HashSet::new();
+        // The query names no entity → resolver empty.
+        assert!(
+            db.entities_matching_query("budget planning", &nothing)
+                .unwrap()
+                .is_empty(),
+            "query must not resolve any entity"
+        );
+
+        // Expected = RRF over EXACTLY the two legs.
+        let fts = db.search_visible("budget planning", 10, &nothing).unwrap();
+        let sem = db.search_semantic_visible(&query, 10, &nothing).unwrap();
+        let fts_ids: Vec<String> = fts.iter().map(|h| h.meeting.id.clone()).collect();
+        let sem_ids: Vec<String> = sem.iter().map(|h| h.meeting.id.clone()).collect();
+        let expected: Vec<String> =
+            crate::embed::rrf_fuse(&[fts_ids, sem_ids], crate::embed::RRF_K)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+        let got: Vec<String> = db
+            .search_hybrid_visible("budget planning", &query, 10, &nothing)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.meeting.id)
+            .collect();
+        assert_eq!(got, expected, "no-entity hybrid must equal the 2-leg fusion");
+    }
+
+    /// 3-WAY RRF: a meeting present in ALL THREE legs (FTS + vector + entity-graph) ranks first,
+    /// and every meeting appears exactly once (dedup by meeting id across the legs).
+    #[test]
+    fn three_leg_rrf_ranks_multi_leg_first_and_dedups() {
+        let db = mem_db();
+        for (id, ts) in [
+            ("all3", "2026-06-24T10:00:00Z"),
+            ("fts_only", "2026-06-24T11:00:00Z"),
+            ("graph_only", "2026-06-24T12:00:00Z"),
+        ] {
+            db.insert_meeting(&sample_meeting(id, ts)).unwrap();
+        }
+        // all3 + fts_only match the FTS query "atlas budget"; graph_only does not.
+        note_for(&db, "all3", "claude_code", "atlas budget plan");
+        note_for(&db, "fts_only", "claude_code", "atlas budget review");
+        note_for(&db, "graph_only", "claude_code", "logistics offsite recap");
+        // Entity Atlas mentioned in all3 + graph_only → both in the graph leg.
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "all3").unwrap();
+        db.add_mention(&atlas, "graph_only").unwrap();
+        // Only all3 has a vector chunk aligned with the query → vector leg = {all3}.
+        let query = one_hot(0);
+        insert_known_chunk(&db, "all3", "atlas budget plan", &one_hot(0));
+
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_hybrid_visible("atlas budget", &query, 10, &nothing)
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
+        // Dedup: each meeting once.
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "3-leg fusion must dedup by meeting");
+        // all3 (in all three legs) outranks single-leg meetings.
+        assert_eq!(ids.first(), Some(&"all3"), "meeting in all 3 legs ranks first");
+        assert!(ids.contains(&"fts_only") && ids.contains(&"graph_only"));
     }
 
     fn chunk_count(db: &Db, meeting_id: &str) -> i64 {
