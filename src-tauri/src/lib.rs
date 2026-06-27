@@ -179,8 +179,8 @@ pub fn run() {
 
 /// Shared lifecycle cleanup (B12/C4): relock every session-unlocked folder (which re-blanks plaintext
 /// + zeroizes the cached master KEK) and checkpoint+truncate the WAL. Best-effort and panic-free —
-/// invoked from both the window-close and app-exit paths, where there is no Result to surface. No-op
-/// if AppState was never managed (the graceful-init failure path returns early without it).
+///   invoked from both the window-close and app-exit paths, where there is no Result to surface. No-op
+///   if AppState was never managed (the graceful-init failure path returns early without it).
 fn relock_and_zeroize_on_lifecycle(handle: &tauri::AppHandle, ctx: &str) {
     use crate::state::AppState;
     let Some(state) = handle.try_state::<AppState>() else {

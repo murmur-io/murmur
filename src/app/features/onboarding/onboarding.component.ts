@@ -1261,6 +1261,14 @@ export class OnboardingComponent implements OnInit {
       noteStyle: base?.noteStyle ?? "standard",
       autoOrganize: base?.autoOrganize ?? false,
       noteLanguage: base?.noteLanguage ?? "auto",
+      // Stage E security flags — read the current values from the snapshot and send
+      // them back unchanged so onboarding never resets them (the backend's serde
+      // defaults would otherwise clobber mcpRequireToken / cloudEgressConsented to
+      // false). Defaults here mirror AppConfig::default() for a truly fresh install.
+      mcpRequireToken: base?.mcpRequireToken ?? true,
+      lockRequireBiometric: base?.lockRequireBiometric ?? true,
+      relockOnScreenshare: base?.relockOnScreenshare ?? true,
+      cloudEgressConsented: base?.cloudEgressConsented ?? false,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

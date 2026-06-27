@@ -72,7 +72,11 @@ pub struct AppConfigDto {
     pub note_style: String,
     pub auto_organize: bool,
     pub note_language: String,
-    #[serde(default)]
+    /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
+    /// payload — an omitted flag must FAIL CLOSED (require a token), never silently disable MCP
+    /// auth. Was `#[serde(default)]` (=false), which let a partial save flip the token requirement
+    /// off; now defaults ON like its Stage-E siblings (BLK-3).
+    #[serde(default = "default_true")]
     pub mcp_require_token: bool,
     /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
     #[serde(default = "default_true")]
@@ -80,10 +84,11 @@ pub struct AppConfigDto {
     /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
     #[serde(default = "default_true")]
     pub relock_on_screenshare: bool,
-    /// E10: one-time cloud-egress consent. Round-tripped so a `save_config` preserves it (the FE
-    /// carries back whatever `get_config` returned). The canonical way to GRANT it is the
-    /// dedicated consent command, not a plain settings save; `#[serde(default)]` (false) keeps an
-    /// older FE payload that omits it from accidentally clearing consent on the next save.
+    /// E10: one-time cloud-egress consent. DISPLAY-ONLY on this DTO: `get_config` carries the
+    /// current value OUT so the FE can show consent status, but `dto_to_config` IGNORES whatever
+    /// the FE sends back and PRESERVES the value already in `AppConfig` (BLK-4). The ONLY mutator
+    /// is the dedicated `consent_to_cloud_egress` command, so a settings save can neither grant nor
+    /// clear consent — even a partial/omitting payload (`#[serde(default)]` = false) is inert here.
     #[serde(default)]
     pub cloud_egress_consented: bool,
 }
@@ -353,7 +358,10 @@ pub fn is_mic_muted(state: State<'_, AppState>) -> Result<bool, AppError> {
 /// The most recent note (markdown + export path) for the last-note preview pane.
 #[tauri::command]
 pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppError> {
-    let note = state.db.latest_note()?;
+    // BLK-2b: the latest VISIBLE note only — a sealed-and-not-unlocked latest note is skipped so the
+    // recorder bar never shows its blanked content (and never depends on at-rest blanking).
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let note = state.db.latest_note_visible(&unlocked)?;
     Ok(note.map(|n| NoteDto {
         meeting_id: n.meeting_id,
         provider_id: n.provider_id,
@@ -410,7 +418,10 @@ pub fn search_meetings(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<SearchHit>, AppError> {
-    state.db.search(&query, 100)
+    // BLK-2b: search only VISIBLE meetings (open/unlocked folders) so a sealed-and-not-unlocked
+    // meeting's title/transcript/note never surfaces in a hit — independent of at-rest blanking.
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.search_visible(&query, 100, &unlocked)
 }
 
 /// Permanently delete a meeting: its audio file, its exported vault note, and all DB rows
@@ -650,6 +661,13 @@ pub async fn run_recipe(
     if prompt.trim().is_empty() {
         return Err(AppError::InvalidArg("recipe prompt is empty".into()));
     }
+    // BLK-2b READ-GATE: a sealed-and-not-unlocked meeting's transcript is blanked; refuse to run a
+    // recipe over it (would feed a cloud provider blank/garbage and depend on at-rest blanking).
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to run a recipe".into(),
+        ));
+    }
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg("this meeting has no transcript yet".into()));
@@ -777,6 +795,14 @@ pub fn pin_moment(
     seconds: f64,
     label: String,
 ) -> Result<PinResult, AppError> {
+    // BLK-2b WRITE-GATE: refuse to pin into a sealed-and-not-unlocked meeting's note — its plaintext
+    // markdown is blanked, so appending a pin would persist the blanked value over the sealed
+    // content AND re-export a plaintext `.md`. Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to pin a moment".into(),
+        ));
+    }
     let existing = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
@@ -902,6 +928,13 @@ pub async fn link_meeting_entities(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<crate::summarize::graph::GraphPayload, AppError> {
+    // BLK-2b READ-GATE: a sealed-and-not-unlocked meeting's note is blanked; refuse to extract
+    // entities from it (would feed a cloud provider blank text + re-write vault stubs). Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to link entities".into(),
+        ));
+    }
     let meeting = state
         .db
         .get_meeting(&meeting_id)?
@@ -923,13 +956,7 @@ const ENTITY_NEIGHBOR_LIMIT: i64 = 12;
 /// nothing — the graph can never disagree with Library/MCP about what's visible.
 #[tauri::command]
 pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
-    let unlocked = {
-        state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
-            .clone()
-    };
+    let unlocked = unlocked_snapshot(state.inner())?;
     state.db.build_graph(&unlocked)
 }
 
@@ -941,13 +968,7 @@ pub fn get_entity_detail(
     state: State<'_, AppState>,
     entity_id: String,
 ) -> Result<EntityDetail, AppError> {
-    let unlocked = {
-        state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
-            .clone()
-    };
+    let unlocked = unlocked_snapshot(state.inner())?;
     state
         .db
         .build_entity_detail(&entity_id, &unlocked, ENTITY_NEIGHBOR_LIMIT)?
@@ -1010,16 +1031,21 @@ pub async fn generate_digest(
     } else {
         80_000
     };
+    // Finding 2 + BLK-2b: build the cloud corpus from VISIBLE meetings + VISIBLE notes only, so a
+    // sealed-and-not-unlocked meeting's TITLE (the `### [[title]]` header) AND markdown never leave
+    // the device. `list_meetings_visible` + `get_note_if_visible` push the session unlock set
+    // through the same predicate as MCP — correctness no longer depends on at-rest blanking.
+    let unlocked = unlocked_snapshot(state.inner())?;
     let mut corpus = String::new();
     let mut count = 0usize;
-    for m in state.db.list_meetings(300)? {
+    for m in state.db.list_meetings_visible(300, &unlocked)? {
         if m.started_at.as_str() < cutoff.as_str() {
             continue;
         }
         if corpus.len() >= budget {
             break;
         }
-        let Some(note) = state.db.get_latest_note_for_meeting(&m.id)? else {
+        let Some(note) = state.db.get_note_if_visible(&m.id, &unlocked)? else {
             continue;
         };
         let title = m.title.clone().unwrap_or_else(|| "(untitled)".to_string());
@@ -1070,8 +1096,12 @@ pub async fn generate_digest(
 /// been generated (viewed at least once) contribute.
 #[tauri::command]
 pub fn topic_threads(state: State<'_, AppState>) -> Result<Vec<TopicThread>, AppError> {
+    // BLK-2b: cluster only VISIBLE meetings' timelines — a sealed-and-not-unlocked meeting's
+    // timeline `data` is blanked at rest, but gate on visibility so threads never depend on that
+    // blanking (and a sealed meeting's topics never surface cross-meeting).
+    let unlocked = unlocked_snapshot(state.inner())?;
     let mut input = Vec::new();
-    for m in state.db.list_meetings(500)? {
+    for m in state.db.list_meetings_visible(500, &unlocked)? {
         let Some(json) = state.db.get_timeline_data(&m.id)? else {
             continue;
         };
@@ -1246,16 +1276,21 @@ pub fn save_config(
     state: State<'_, AppState>,
     config: AppConfigDto,
 ) -> Result<(), AppError> {
-    let new_config = dto_to_config(config);
-    new_config.save(&state.db)?;
+    // Merge against the CURRENT config under the config lock so the security-sensitive flags that
+    // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
+    // from the live value, not the incoming payload. Holding the guard across the merge+save+swap
+    // makes it atomic w.r.t. a concurrent `consent_to_cloud_egress`.
     {
         let mut cache = state
             .config
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        let new_config = dto_to_config(config, &cache);
+        new_config.save(&state.db)?;
         *cache = new_config;
     }
-    // Reconcile the voice-trigger listener with the new config.
+    // Reconcile the voice-trigger listener with the new config (re-locks the guard internally, so
+    // it MUST run after the guard above is dropped).
     restart_voice_listener(app);
     Ok(())
 }
@@ -1302,7 +1337,12 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
     }
 }
 
-fn dto_to_config(d: AppConfigDto) -> AppConfig {
+/// Build the persisted `AppConfig` from an incoming settings DTO, merged against the `current`
+/// config. Every plain field comes from the DTO (the Settings UI is authoritative for them), but
+/// the security-sensitive `cloud_egress_consented` is PRESERVED from `current` and never taken from
+/// the DTO (BLK-4) — so a settings save can neither grant nor clear cloud-egress consent. The
+/// dedicated `consent_to_cloud_egress` command is the only path that flips it.
+fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
     // Normalize empty strings on optional fields to None so they round-trip cleanly.
     let norm = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
     AppConfig {
@@ -1340,7 +1380,9 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         mcp_require_token: d.mcp_require_token,
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,
-        cloud_egress_consented: d.cloud_egress_consented,
+        // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
+        // `consent_to_cloud_egress` command may flip it. This makes an omitting/zeroed save inert.
+        cloud_egress_consented: current.cloud_egress_consented,
     }
 }
 
@@ -1400,6 +1442,15 @@ pub async fn resummarize(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<StopResult, AppError> {
+    // BLK-2b READ/WRITE-GATE: re-summarizing reads the stored transcript (blanked while sealed) and
+    // WRITES a fresh note + re-exports a plaintext `.md` to the vault. For a sealed-and-not-unlocked
+    // meeting that would (a) feed a cloud provider blank text and (b) leave plaintext markdown +
+    // a vault `.md` in a locked folder. Fail closed — the FE must unlock first.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to re-summarize".into(),
+        ));
+    }
     let result = pipeline::resummarize_existing(&app, &state, &meeting_id).await?;
     Ok(StopResult {
         meeting_id: result.meeting_id,
@@ -1432,6 +1483,14 @@ pub fn rename_speaker(
     let new_label = new_label.trim();
     if new_label.is_empty() {
         return Err(AppError::InvalidArg("new speaker name is empty".into()));
+    }
+    // BLK-2b WRITE-GATE: a sealed-and-not-unlocked meeting's timeline `data` is blanked; refuse to
+    // rename a speaker (would persist a near-empty plaintext timeline over the sealed blob in a
+    // locked folder). Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to rename a speaker".into(),
+        ));
     }
     let json = state
         .db
@@ -1711,10 +1770,17 @@ pub fn create_folder(
     Ok(folder)
 }
 
-/// Move a note into a folder (or to the root with `folder_id = None`). If the note has an
-/// exported `.md` and NEITHER the source nor the target folder is locked, the file is moved on
-/// disk (copy-then-remove, best-effort, never loses bytes). Moving into/out of a locked folder
-/// does not touch the vault here (sealing/unsealing owns that lifecycle).
+/// Move a note into a folder (or to the root with `folder_id = None`).
+///
+/// Three cases by TARGET:
+/// - **open / root:** if the note has an exported `.md` the file is moved on disk (copy-then-remove,
+///   best-effort, never loses bytes).
+/// - **locked + SESSION-UNLOCKED (CK available):** reassign, then SEAL the moved note to the
+///   folder's at-rest sealed shape (encrypt markdown/transcript/timeline into blobs, blank the
+///   plaintext, remove the vault `.md`, encrypt the WAV) so plaintext never lands in a locked
+///   folder (BLK-2). Verify-before-destroy throughout.
+/// - **locked + NOT session-unlocked:** REJECTED with [`AppError::Locked`] — there is no CK to seal
+///   with, so we refuse rather than leave plaintext in a locked folder. The FE must unlock first.
 #[tauri::command]
 pub fn move_note(
     state: State<'_, AppState>,
@@ -1733,6 +1799,14 @@ pub fn move_note(
         }
         None => false,
     };
+
+    // ── Target is a LOCKED folder: seal-or-reject (BLK-2) ───────────────────────────────────────
+    if target_locked {
+        let fid = folder_id.as_deref().expect("locked target implies Some(folder_id)");
+        return move_into_locked_folder(state.inner(), &meeting_id, fid);
+    }
+
+    // ── Target is OPEN / root: existing reassign + best-effort FS move ──────────────────────────
     // The source folder's lock state: derive from the note's exported_path being present
     // (sealed notes have exported_path = NULL). If exported_path is None we treat the source as
     // "no movable file" and skip the FS move entirely.
@@ -1743,8 +1817,8 @@ pub fn move_note(
     // and the seal/unlock lifecycle (which iterates provider rows) stays coherent.
     state.db.set_meeting_folder(&meeting_id, folder_id.as_deref())?;
 
-    // Best-effort FS move only when a plaintext .md exists and the target is open.
-    if let (Some(src_path), false) = (exported, target_locked) {
+    // Best-effort FS move only when a plaintext .md exists (target is open here).
+    if let Some(src_path) = exported {
         if let Some(vault) = vault_path(&state) {
             let target_rel = match folder_id.as_deref() {
                 Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
@@ -1752,6 +1826,105 @@ pub fn move_note(
             };
             move_note_file(&state, &meeting_id, &src_path, &vault, target_rel.as_deref())?;
         }
+    }
+    Ok(())
+}
+
+/// BLK-2: move a meeting's note INTO a `locked` folder, sealing it to the folder's at-rest shape so
+/// plaintext never lands in a locked folder. Requires the folder to be SESSION-UNLOCKED (its CK is
+/// derivable from the cached KEK); otherwise REJECTS with [`AppError::Locked`]. Holds the lifecycle
+/// guard for the whole reassign+seal so it can't interleave with a relock/remove-lock.
+fn move_into_locked_folder(
+    state: &AppState,
+    meeting_id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+
+    // Must be session-unlocked — otherwise we have no CK to seal the moved note with.
+    let session_unlocked = state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+        .contains(folder_id);
+    if !session_unlocked {
+        return Err(AppError::Locked(
+            "the destination folder is locked — unlock it first, then move the note".into(),
+        ));
+    }
+
+    // The folder's existence + locked state were already validated by `move_note` (target_locked).
+    let wrapped = state
+        .db
+        .folder_wrapped_key(folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+
+    // The KEK is cached for a session-unlocked folder. If it is somehow absent (e.g. zeroized by a
+    // concurrent relock between the unlock-set check and here), fail closed — never seal without a
+    // verified CK.
+    let kek: Zeroizing<[u8; 32]> = {
+        let g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        g.clone().ok_or_else(|| {
+            AppError::Locked("the destination folder is locked — unlock it first, then move the note".into())
+        })?
+    };
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id))?);
+    let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
+        ck_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
+    );
+
+    // Reassign EVERY provider row of the meeting into the locked folder (the source-of-truth
+    // association), THEN seal that one meeting's note + extras under the folder CK.
+    state.db.set_meeting_folder(meeting_id, Some(folder_id))?;
+    seal_moved_note(state, folder_id, meeting_id, &ck)?;
+    Ok(())
+}
+
+/// Seal ONE just-moved meeting's note (every provider row) + its transcript/timeline/audio under the
+/// folder CK, removing each row's vault `.md`. Verify-before-blank per row (mirrors `lock_folder`):
+/// the markdown is only blanked once its blob reads back identical, so a moved note is never lost.
+fn seal_moved_note(
+    state: &AppState,
+    folder_id: &str,
+    meeting_id: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    let notes = state.db.sealable_notes_for_meeting(meeting_id)?;
+    // Encrypt + VERIFY every provider row BEFORE any blank, so a failure leaves intact plaintext.
+    let mut sealed_rows: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut exported_paths: Vec<String> = Vec::new();
+    for n in &notes {
+        // Skip a row already sealed (blob present + markdown blanked) — idempotent.
+        if n.content_blob.is_some() && n.markdown.is_empty() {
+            continue;
+        }
+        let aad = aad_content(folder_id, meeting_id, &n.provider_id, "note");
+        let blob = crate::crypto::encrypt(ck, n.markdown.as_bytes(), &aad)?;
+        if crate::crypto::decrypt(ck, &blob, &aad)? != n.markdown.as_bytes() {
+            return Err(AppError::Storage(
+                "seal verification failed on moved note (decrypted blob mismatch)".into(),
+            ));
+        }
+        sealed_rows.push((n.provider_id.clone(), blob));
+        if let Some(p) = n.exported_path.clone() {
+            exported_paths.push(p);
+        }
+    }
+    for (provider_id, blob) in &sealed_rows {
+        state.db.seal_note(meeting_id, provider_id, blob)?;
+    }
+    // Seal the moved meeting's transcript + timeline + audio under the SAME CK.
+    seal_meeting_extras(state, folder_id, meeting_id, ck)?;
+    // AFTER the column writes, remove the vault `.md` files (a leftover .md is reconcilable; lost
+    // content is not — so this is last).
+    for p in exported_paths {
+        let _ = std::fs::remove_file(&p);
     }
     Ok(())
 }
@@ -1821,6 +1994,23 @@ fn move_note_file(
 /// lost content.
 #[tauri::command]
 pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    lock_folder_inner(state.inner(), folder_id)
+}
+
+/// BLK-1: acquire the coarse [`AppState::lifecycle`] guard so a folder-lock state-machine op never
+/// interleaves with another (notably the off-thread `relock_all_inner`). A `Mutex<()>` carries no
+/// state, so a poisoned lock is recovered via `into_inner()` — never bricking all future lock ops.
+fn lifecycle_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()> {
+    state
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Inner of [`lock_folder`] taking `&AppState` (so the lifecycle stress test can drive it without a
+/// `tauri::State`). Holds the [`AppState::lifecycle`] guard for the whole seal.
+pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
     let folder = state
         .db
         .folder_by_id(&folder_id)?
@@ -1872,7 +2062,7 @@ pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), 
     // Phase 0.5 — seal the TRANSCRIPT + TIMELINE (defense-in-depth in the OPEN db) and the AUDIO
     // WAV at rest, all under the SAME folder CK. Verify-before-destroy inside (no transcript /
     // audio loss). Done after the note seal so a partial-seal crash still leaves recoverable blobs.
-    seal_folder_extras(state.inner(), &folder_id, &ck)?;
+    seal_folder_extras(state, &folder_id, &ck)?;
     drop(kek); // explicit: KEK zeroized when this Zeroizing drops here.
     drop(ck); // explicit: CK zeroized after sealing all extras.
 
@@ -1963,6 +2153,14 @@ pub async fn unlock_folder(
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
 
+    // BLK-1: from here on we MUTATE plaintext columns (restore markdown / segments / timeline).
+    // Acquire the lifecycle guard for the whole synchronous restore so a concurrent
+    // `relock_all_inner` (screen-share / lifecycle) cannot blank these rows mid-restore. Acquired
+    // AFTER the keychain `.await` above — holding a std `MutexGuard` across an await would make this
+    // command's future `!Send`; everything below is synchronous, so the guard never crosses a
+    // suspend point.
+    let _lifecycle = lifecycle_guard(state.inner());
+
     // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
     // session (no dedup by meeting — every provider's distinct content is restored independently).
     // Bound to (folder|meeting|provider|note); legacy blobs fall back to empty AAD.
@@ -2025,6 +2223,9 @@ pub async fn unlock_folder(
 /// stays — the folder is still `locked=1` on disk.
 #[tauri::command]
 pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
+    // `remove_lock` is mid-restoring).
+    let _lifecycle = lifecycle_guard(state.inner());
     {
         let mut g = state
             .unlocked_folders
@@ -2048,8 +2249,14 @@ pub fn relock_all(state: State<'_, AppState>) -> Result<(), AppError> {
     relock_all_inner(&state)
 }
 
-/// Inner relock-all usable without a command boundary (Stage E screen-share watcher).
+/// Inner relock-all usable without a command boundary (Stage E screen-share watcher, window-close,
+/// app-exit). BLK-1: this is the OFF-THREAD blanker that races `remove_lock`; it acquires the
+/// [`AppState::lifecycle`] guard FIRST so its re-blank can never land between `remove_lock`'s
+/// restore-plaintext (Step 1) and clear-`content_blob` (Step 2). All three off-thread callers and
+/// the `relock_all` command funnel through here, so the guard lives HERE (the `relock_all` command
+/// must NOT take it separately — a std `Mutex` is non-reentrant and would self-deadlock).
 pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
     // Clear the session set.
     {
         let mut g = state
@@ -2092,6 +2299,16 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
 /// `.md` to the vault. The folder returns to the default OPEN state.
 #[tauri::command]
 pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    remove_lock_inner(state.inner(), folder_id)
+}
+
+/// Inner of [`remove_lock`] taking `&AppState` (so the BLK-1 lifecycle stress test can drive it
+/// without a `tauri::State`). BLK-1: holds the [`AppState::lifecycle`] guard across the ENTIRE
+/// restore→clear sequence (Step 1 decrypt-plaintext-into-`markdown`, Step 2 clear `content_blob`),
+/// so the off-thread `relock_all_inner` blanker can never blank `markdown` to `''` in the window
+/// between the two steps — the exact `markdown='' + content_blob=NULL` permanent-loss race.
+pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
     let folder = state
         .db
         .folder_by_id(&folder_id)?
@@ -2112,7 +2329,7 @@ pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), 
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
 
-    let vault = vault_path(&state);
+    let vault = vault_path(state);
     let notes = state.db.notes_in_folder(&folder_id)?;
 
     // Step 1: restore EVERY provider row's plaintext from ITS OWN blob (or keep the in-memory
@@ -2179,7 +2396,7 @@ pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), 
 
     // Phase 0.5 — permanently restore the TRANSCRIPT + TIMELINE plaintext (clear *_blob columns)
     // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio.
-    unseal_folder_extras_permanent(state.inner(), &folder_id, &ck)?;
+    unseal_folder_extras_permanent(state, &folder_id, &ck)?;
 
     // Flip the folder back to OPEN + drop it from the session set.
     state.db.set_folder_locked(&folder_id, false, None)?;
@@ -2280,52 +2497,66 @@ const AAD_NO_PROVIDER: &str = "-";
 fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     for mid in &meeting_ids {
-        // Transcript: encrypt each segment's plaintext text, verify, then seal (blank text).
-        let segs = state.db.raw_segments(mid)?;
-        let mut sealed_segs: Vec<(i64, Vec<u8>)> = Vec::new();
-        for s in &segs {
-            // Skip rows already sealed (text_blob present, text blank) — idempotent.
-            if s.text_blob.is_some() && s.text.is_empty() {
-                continue;
-            }
-            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
-            let blob = crate::crypto::encrypt(ck, s.text.as_bytes(), &aad)?;
-            if crate::crypto::decrypt(ck, &blob, &aad)? != s.text.as_bytes() {
+        seal_meeting_extras(state, folder_id, mid, ck)?;
+    }
+    Ok(())
+}
+
+/// Seal ONE meeting's transcript + timeline + audio WAV under the folder CK (the per-meeting body of
+/// [`seal_folder_extras`]). Reused by [`move_note`] to seal a note moved INTO a session-unlocked
+/// locked folder (BLK-2) without touching the folder's other meetings. Verify-before-destroy
+/// throughout (no transcript / audio loss); idempotent on already-sealed rows.
+fn seal_meeting_extras(
+    state: &AppState,
+    folder_id: &str,
+    mid: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    // Transcript: encrypt each segment's plaintext text, verify, then seal (blank text).
+    let segs = state.db.raw_segments(mid)?;
+    let mut sealed_segs: Vec<(i64, Vec<u8>)> = Vec::new();
+    for s in &segs {
+        // Skip rows already sealed (text_blob present, text blank) — idempotent.
+        if s.text_blob.is_some() && s.text.is_empty() {
+            continue;
+        }
+        let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
+        let blob = crate::crypto::encrypt(ck, s.text.as_bytes(), &aad)?;
+        if crate::crypto::decrypt(ck, &blob, &aad)? != s.text.as_bytes() {
+            return Err(AppError::Storage(
+                "transcript seal verification failed (segment blob mismatch)".into(),
+            ));
+        }
+        sealed_segs.push((s.idx, blob));
+    }
+    for (idx, blob) in &sealed_segs {
+        state.db.seal_segment(mid, *idx, blob)?;
+    }
+
+    // Timeline: encrypt the cached JSON (if any), verify, then seal (blank data).
+    if let Some(tl) = state.db.raw_timeline(mid)? {
+        if !(tl.data_blob.is_some() && tl.data.is_empty()) {
+            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
+            let blob = crate::crypto::encrypt(ck, tl.data.as_bytes(), &aad)?;
+            if crate::crypto::decrypt(ck, &blob, &aad)? != tl.data.as_bytes() {
                 return Err(AppError::Storage(
-                    "transcript seal verification failed (segment blob mismatch)".into(),
+                    "timeline seal verification failed (blob mismatch)".into(),
                 ));
             }
-            sealed_segs.push((s.idx, blob));
+            state.db.seal_timeline(mid, &blob)?;
         }
-        for (idx, blob) in &sealed_segs {
-            state.db.seal_segment(mid, *idx, blob)?;
-        }
+    }
 
-        // Timeline: encrypt the cached JSON (if any), verify, then seal (blank data).
-        if let Some(tl) = state.db.raw_timeline(mid)? {
-            if !(tl.data_blob.is_some() && tl.data.is_empty()) {
-                let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
-                let blob = crate::crypto::encrypt(ck, tl.data.as_bytes(), &aad)?;
-                if crate::crypto::decrypt(ck, &blob, &aad)? != tl.data.as_bytes() {
-                    return Err(AppError::Storage(
-                        "timeline seal verification failed (blob mismatch)".into(),
-                    ));
-                }
-                state.db.seal_timeline(mid, &blob)?;
-            }
-        }
-
-        // Audio: encrypt the plaintext WAV → <file>.enc (verify-before-destroy inside
-        // encrypt_file), bound to (meeting|folder), then remove the plaintext and re-point
-        // audio_path at the .enc.
-        if let Some(path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
-            if !path.ends_with(ENC_SUFFIX) && std::path::Path::new(&path).exists() {
-                let enc_path = format!("{path}{ENC_SUFFIX}");
-                crate::crypto::encrypt_file(ck, std::path::Path::new(&path), std::path::Path::new(&enc_path), &aad_audio(mid, folder_id))?;
-                // Only NOW (a verified .enc exists) is the plaintext safe to remove.
-                let _ = std::fs::remove_file(&path);
-                state.db.set_meeting_audio_path(mid, Some(&enc_path))?;
-            }
+    // Audio: encrypt the plaintext WAV → <file>.enc (verify-before-destroy inside
+    // encrypt_file), bound to (meeting|folder), then remove the plaintext and re-point
+    // audio_path at the .enc.
+    if let Some(path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
+        if !path.ends_with(ENC_SUFFIX) && std::path::Path::new(&path).exists() {
+            let enc_path = format!("{path}{ENC_SUFFIX}");
+            crate::crypto::encrypt_file(ck, std::path::Path::new(&path), std::path::Path::new(&enc_path), &aad_audio(mid, folder_id))?;
+            // Only NOW (a verified .enc exists) is the plaintext safe to remove.
+            let _ = std::fs::remove_file(&path);
+            state.db.set_meeting_audio_path(mid, Some(&enc_path))?;
         }
     }
     Ok(())
@@ -2446,6 +2677,17 @@ fn unseal_folder_extras_permanent(
 /// (NULL / not locked) OR its folder id is in the current session unlock set. Used by
 /// `get_meeting_detail` / `get_segments` / `get_timeline` / `export_audio` to refuse a sealed-and-
 /// not-session-unlocked meeting's content even though the SQLCipher DB is open.
+/// Snapshot the live session unlock set (the same source `list_folders` / the graph reads use).
+/// Passed to the `*_visible` DB reads (BLK-2b) so a sealed-and-not-unlocked meeting contributes
+/// nothing to digests, search, last-note, topic threads, etc. — independent of at-rest blanking.
+fn unlocked_snapshot(state: &AppState) -> Result<std::collections::HashSet<String>, AppError> {
+    Ok(state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+        .clone())
+}
+
 fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
     let folder_id = match state.db.folder_for_meeting(meeting_id)? {
         Some(f) => f,
@@ -2465,8 +2707,9 @@ fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppEr
     Ok(unlocked.contains(&folder_id))
 }
 
-/// The configured vault path (non-empty), or `None`.
-fn vault_path(state: &State<'_, AppState>) -> Option<String> {
+/// The configured vault path (non-empty), or `None`. Takes `&AppState` (callers holding a
+/// `tauri::State` pass `&state`, which Deref-coerces) so the `&AppState` inner cores can call it too.
+fn vault_path(state: &AppState) -> Option<String> {
     state
         .config
         .lock()
@@ -2719,5 +2962,272 @@ mod lock_read_gate_tests {
         // wrapped-CK and audio AADs are distinct namespaces from content.
         assert_ne!(aad_wrapped_ck("f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
         assert_ne!(aad_audio("m", "f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
+    }
+}
+
+// ── BLK-1 lifecycle-race + BLK-2 move-into-locked + BLK-3/BLK-4 config tests ──────────────────────
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::storage::Db;
+    use crate::transcribe::types::Segment;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, Once};
+
+    // A fixed at-rest DB key (NOT the Keychain) — same shape the config tests use.
+    const DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // A fixed dev master KEK so lock/unlock/remove use a deterministic key WITHOUT the Keychain or a
+    // Touch ID prompt (the `MURMUR_DEV_KEK` debug-only escape hatch in `secrets::keychain`).
+    const DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    static KEK_ENV: Once = Once::new();
+    fn ensure_dev_kek() {
+        // Set once, before any thread reads it, so the concurrent readers only ever READ env.
+        KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", DEV_KEK));
+    }
+
+    fn tmp_db_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-lifecycle-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Construct an [`AppState`] backed by a real temp SQLCipher DB, no Keychain, no Tauri. The
+    /// recorder/listeners are `None`; the config is the default (no vault → remove-lock skips
+    /// re-export, keeping the test filesystem-quiet).
+    fn build_state(tag: &str) -> AppState {
+        ensure_dev_kek();
+        let db = Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap();
+        AppState {
+            recorder: Mutex::new(None),
+            system_recorder: Mutex::new(None),
+            voice_listener: Mutex::new(None),
+            db,
+            config: Mutex::new(AppConfig::default()),
+            current_meeting: Mutex::new(None),
+            unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
+            master_kek: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+        }
+    }
+
+    fn seed_meeting(db: &Db, mid: &str, markdown: &str, folder_id: Option<&str>) {
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Quarterly strategy".to_string()),
+            duration_s: 600,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None, // association lives on notes; set via set_meeting_folder below
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: markdown.to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.insert_segments(
+            mid,
+            &[
+                Segment { idx: 0, start_s: 0.0, end_s: 2.0, text: "alpha bravo".to_string(), speaker: None },
+                Segment { idx: 1, start_s: 2.0, end_s: 4.0, text: "charlie delta".to_string(), speaker: None },
+            ],
+        )
+        .unwrap();
+        db.set_timeline_data(mid, "{\"topics\":[],\"speakers\":[]}").unwrap();
+        db.set_meeting_folder(mid, folder_id).unwrap();
+    }
+
+    fn make_open_folder(db: &Db, id: &str, path: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: path.to_string(),
+            path: path.to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-27T08:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// BLK-1: hammer the off-thread `relock_all_inner` (the blanker) WHILE `remove_lock_inner` runs
+    /// its restore→clear sequence, across many seal/remove cycles, and assert the IRREVERSIBLE-LOSS
+    /// state — a note with `markdown=''` AND `content_blob=NULL` — NEVER occurs. The coarse
+    /// `AppState::lifecycle` mutex serializes the two so the blank can never land between
+    /// `remove_lock`'s Step 1 (restore plaintext) and Step 2 (clear blob).
+    #[test]
+    fn relock_all_never_destroys_a_note_being_remove_locked() {
+        const MID: &str = "m-blk1";
+        const FOLDER: &str = "f-blk1";
+        const ORIGINAL_MD: &str = "# Board notes\n\n- launch on the 14th\n- hire two engineers";
+
+        let state = Arc::new(build_state("blk1"));
+        make_open_folder(&state.db, FOLDER, "Confidential");
+        seed_meeting(&state.db, MID, ORIGINAL_MD, Some(FOLDER));
+
+        // A background thread that spams the off-thread blanker continuously.
+        let stop = Arc::new(AtomicBool::new(false));
+        let spammer = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Ignore errors — a busy WAL checkpoint etc. is non-fatal to the invariant.
+                    let _ = relock_all_inner(&state);
+                }
+            })
+        };
+
+        const ITERS: usize = 60;
+        for i in 0..ITERS {
+            // Seal the folder (note markdown → '' + content_blob set), then permanently remove the
+            // lock (restore plaintext, clear blob). The blanker is racing the whole time.
+            lock_folder_inner(&state, FOLDER.to_string()).unwrap();
+            remove_lock_inner(&state, FOLDER.to_string()).unwrap();
+
+            // The load-bearing invariant: no provider row is ever blanked-AND-blob-cleared, and the
+            // restore put the ORIGINAL content back with the blob gone (folder fully open again).
+            for n in state.db.sealable_notes_for_meeting(MID).unwrap() {
+                assert!(
+                    !(n.markdown.is_empty() && n.content_blob.is_none()),
+                    "IRREVERSIBLE DATA LOSS at iter {i}: markdown='' AND content_blob=NULL"
+                );
+                assert_eq!(n.markdown, ORIGINAL_MD, "note restored to original at iter {i}");
+                assert!(n.content_blob.is_none(), "content_blob cleared after remove_lock at iter {i}");
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        spammer.join().unwrap();
+
+        // Final state: open folder, original content, no residual blob anywhere.
+        assert!(!state.db.folder_by_id(FOLDER).unwrap().unwrap().locked);
+        let note = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
+        assert_eq!(note.markdown, ORIGINAL_MD);
+    }
+
+    /// BLK-2 (reject half): moving a note INTO a locked folder that is NOT session-unlocked must be
+    /// REJECTED (`AppError::Locked`) and leave the note untouched — never reassigned, never blanked.
+    #[test]
+    fn move_into_locked_not_unlocked_folder_rejects_and_leaves_note_intact() {
+        const MID: &str = "m-blk2r";
+        const TARGET: &str = "f-blk2r";
+        const MD: &str = "# secret meeting\n\nplaintext that must not move into a locked folder";
+
+        let state = build_state("blk2r");
+        seed_meeting(&state.db, MID, MD, None); // at the vault root (open)
+        make_open_folder(&state.db, TARGET, "Locked-Target-R");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap(); // seal it; NOT session-unlocked
+
+        let res = move_into_locked_folder(&state, MID, TARGET);
+        assert!(matches!(res, Err(AppError::Locked(_))), "must reject with Locked, got {res:?}");
+
+        // Untouched: still at the root, still plaintext, no blob.
+        assert_eq!(state.db.folder_for_meeting(MID).unwrap(), None, "note was NOT reassigned");
+        let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
+        assert_eq!(n.markdown, MD, "plaintext preserved");
+        assert!(n.content_blob.is_none(), "never sealed");
+    }
+
+    /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it to the
+    /// folder's at-rest shape — `content_blob` set, `markdown` blanked, transcript blanked — so no
+    /// plaintext ever lands in a locked folder, and the note is reassigned to the target.
+    #[test]
+    fn move_into_locked_unlocked_folder_seals_the_moved_note() {
+        const MID: &str = "m-blk2s";
+        const TARGET: &str = "f-blk2s";
+        const MD: &str = "# moving in\n\nthis becomes ciphertext at rest";
+
+        let state = build_state("blk2s");
+        seed_meeting(&state.db, MID, MD, None); // at the vault root (open, plaintext)
+        make_open_folder(&state.db, TARGET, "Locked-Target-S");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap(); // seal the (empty) target
+
+        // Make the target SESSION-UNLOCKED: in the unlock set + KEK cached (as a real unlock would).
+        state.unlocked_folders.lock().unwrap().insert(TARGET.to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        move_into_locked_folder(&state, MID, TARGET).unwrap();
+
+        // Reassigned into the target AND sealed at rest (blob set, plaintext blanked).
+        assert_eq!(state.db.folder_for_meeting(MID).unwrap().as_deref(), Some(TARGET));
+        let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
+        assert!(n.content_blob.is_some(), "moved note must be sealed (content_blob set)");
+        assert!(n.markdown.is_empty(), "moved note plaintext markdown blanked at rest");
+        assert!(n.exported_path.is_none(), "no vault .md for a note in a locked folder");
+        // Transcript sealed too (text blanked, text_blob present).
+        for s in state.db.raw_segments(MID).unwrap() {
+            assert!(s.text.is_empty(), "segment text blanked");
+            assert!(s.text_blob.is_some(), "segment text_blob present");
+        }
+
+        // And it round-trips: a permanent remove-lock restores the original plaintext (no loss).
+        remove_lock_inner(&state, TARGET.to_string()).unwrap();
+        let restored = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
+        assert_eq!(restored.markdown, MD, "remove-lock restores the moved note's original content");
+    }
+
+    /// BLK-3: an `AppConfigDto` payload that OMITS `mcpRequireToken` deserializes to `true`
+    /// (fail-closed), matching its Stage-E siblings — never silently `false`.
+    #[test]
+    fn dto_omitting_mcp_require_token_defaults_true() {
+        let json = r#"{
+            "providerId":"claude_code",
+            "anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434",
+            "ollamaModel":"llama3.1",
+            "claudeBinary":"claude",
+            "captureSystemAudio":false,
+            "modelSize":"large-v3",
+            "voiceTrigger":false,
+            "onboarded":true,
+            "noteStyle":"standard",
+            "autoOrganize":false,
+            "noteLanguage":"auto"
+        }"#;
+        let dto: AppConfigDto = serde_json::from_str(json).unwrap();
+        assert!(dto.mcp_require_token, "omitted mcpRequireToken must fail closed to true (BLK-3)");
+        assert!(dto.lock_require_biometric, "Stage-E flags default ON");
+        assert!(dto.relock_on_screenshare, "Stage-E flags default ON");
+        assert!(!dto.cloud_egress_consented, "consent defaults OFF (fail-closed)");
+    }
+
+    /// BLK-4: `save_config`'s merge (`dto_to_config`) NEVER lets the DTO set cloud-egress consent —
+    /// an omitting/zeroed save preserves an existing `true`, and a save carrying `true` cannot GRANT
+    /// it. Only `consent_to_cloud_egress` may flip it.
+    #[test]
+    fn save_config_merge_never_clobbers_or_grants_consent() {
+        // (a) preserve an existing grant even when the DTO carries false.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.cloud_egress_consented = false;
+        let current = AppConfig { cloud_egress_consented: true, ..AppConfig::default() };
+        assert!(
+            dto_to_config(dto, &current).cloud_egress_consented,
+            "an omitting/false save must NOT clobber an existing consent (BLK-4)"
+        );
+
+        // (b) a save carrying true cannot GRANT consent (default-off stays off).
+        let mut dto2 = config_to_dto(&AppConfig::default());
+        dto2.cloud_egress_consented = true;
+        let current2 = AppConfig::default(); // consent off
+        assert!(
+            !dto_to_config(dto2, &current2).cloud_egress_consented,
+            "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
+        );
     }
 }

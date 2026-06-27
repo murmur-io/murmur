@@ -557,10 +557,56 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
           >
           <p class="text-secondary privacy-note">
             Emails, card numbers and phone numbers are automatically scrubbed
-            before any text is sent to the Anthropic API, then restored in your
-            notes. Local providers (Claude Code / Ollama) send nothing to the
-            cloud.
+            before any text is sent to a cloud model — that's both the Anthropic
+            API and Claude Code (the <code>claude</code> CLI uploads your
+            transcript to Anthropic too), then restored in your notes. Only
+            Ollama runs fully on-device and sends nothing to the cloud.
           </p>
+          <p class="text-secondary privacy-note">
+            Heads up: names are <strong>not</strong> redacted — the firewall is
+            regex-only (emails, cards, phone numbers), so people's names can
+            leave your device alongside the transcript when you use a cloud
+            provider.
+          </p>
+        </div>
+
+        <!-- (1b) Cloud processing consent (E10) -->
+        <div class="privacy-section">
+          <span class="privacy-section-label text-muted">Cloud processing</span>
+          <p class="text-secondary privacy-note">
+            Claude Code and the Anthropic API send your (redacted) transcript to
+            Anthropic's cloud to write each summary — your data leaves this Mac.
+            Ollama stays fully on-device. Until you allow this once, cloud
+            summaries are turned off and won't run.
+          </p>
+          @if (cloudConsented()) {
+            <span class="pill is-success cloud-consent-pill">
+              <span class="pill-dot"></span>
+              Cloud processing allowed
+            </span>
+          } @else {
+            <div class="cloud-consent-row">
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="allowCloudProcessing()"
+                [disabled]="consenting()"
+              >
+                @if (consenting()) {
+                  <span class="spin-ring" aria-hidden="true"></span>
+                  Enabling…
+                } @else {
+                  Allow cloud processing
+                }
+              </button>
+              <span class="text-muted cloud-consent-hint">
+                One-time. You can keep using Ollama with no cloud at all.
+              </span>
+            </div>
+          }
+          @if (consentError(); as cerr) {
+            <p class="text-danger privacy-note">{{ cerr }}</p>
+          }
         </div>
 
         <!-- (2) Locked folders (honest encryption boundary) -->
@@ -1073,6 +1119,25 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         letter-spacing: -0.01em;
       }
 
+      /* Cloud-processing consent — button + reassurance, or the granted pill. */
+      .cloud-consent-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+        margin-top: var(--space-1);
+      }
+      .cloud-consent-row .btn {
+        flex: none;
+      }
+      .cloud-consent-hint {
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+      .cloud-consent-pill {
+        align-self: flex-start;
+      }
+
       /* Copyable JSON well — a quiet inset block with its own copy button. */
       .mcp-config {
         display: flex;
@@ -1212,10 +1277,32 @@ export class SettingsComponent implements OnInit {
   /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
   private loadedOnboarded = true;
 
+  /**
+   * Stage E security flags — preserved from the loaded config (not form-edited)
+   * so save() round-trips them instead of letting the backend default them off.
+   */
+  private loadedMcpRequireToken = true;
+  private loadedLockRequireBiometric = true;
+  private loadedRelockOnScreenshare = true;
+
+  /** Cloud-egress consent state — drives the "Cloud processing" section; round-tripped on save. */
+  readonly cloudConsented = signal(false);
+  /** True while the one-time consent command is in flight. */
+  readonly consenting = signal(false);
+  /** Surfaced if granting consent rejects. */
+  readonly consentError = signal<string | null>(null);
+
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
       this.loadedOnboarded = cfg.onboarded ?? true;
+      // Stage E security flags are not form-edited here — snapshot them so save()
+      // round-trips them instead of letting the backend's serde defaults clobber
+      // them (mcpRequireToken / cloudEgressConsented would otherwise reset to false).
+      this.loadedMcpRequireToken = cfg.mcpRequireToken ?? true;
+      this.loadedLockRequireBiometric = cfg.lockRequireBiometric ?? true;
+      this.loadedRelockOnScreenshare = cfg.relockOnScreenshare ?? true;
+      this.cloudConsented.set(cfg.cloudEgressConsented ?? false);
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -1272,6 +1359,13 @@ export class SettingsComponent implements OnInit {
       noteStyle: v.noteStyle,
       autoOrganize: v.autoOrganize,
       noteLanguage: v.noteLanguage,
+      // Round-trip the Stage E security flags so a settings save never silently
+      // resets them. Cloud-egress consent is GRANTED only via the dedicated
+      // command (allowCloudProcessing) — here we just carry the current value back.
+      mcpRequireToken: this.loadedMcpRequireToken,
+      lockRequireBiometric: this.loadedLockRequireBiometric,
+      relockOnScreenshare: this.loadedRelockOnScreenshare,
+      cloudEgressConsented: this.cloudConsented(),
     };
     try {
       await this.ipc.saveConfig(cfg);
@@ -1296,6 +1390,27 @@ export class SettingsComponent implements OnInit {
 
   async refreshProviders(): Promise<void> {
     this.providers.set(await this.ipc.providerStatuses());
+  }
+
+  /**
+   * E10 — grant the one-time cloud-egress consent via the dedicated command (an
+   * explicit, auditable user act — NOT a side effect of a normal settings save).
+   * After it resolves, cloud providers (Claude Code / Anthropic) can summarize, so
+   * we re-probe provider availability. There is no FE "revoke": consent is granted
+   * once; save() simply carries the current value back so it isn't cleared.
+   */
+  async allowCloudProcessing(): Promise<void> {
+    this.consentError.set(null);
+    this.consenting.set(true);
+    try {
+      await this.ipc.consentToCloudEgress();
+      this.cloudConsented.set(true);
+      await this.refreshProviders();
+    } catch (e) {
+      this.consentError.set(String(e));
+    } finally {
+      this.consenting.set(false);
+    }
   }
 
   /** Persist the chosen language + quality, then re-check which model is present. */

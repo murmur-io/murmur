@@ -54,9 +54,12 @@ pub struct AppConfig {
     /// `true` via the dedicated `consent_to_cloud_egress` command. Default OFF (fail-closed): no
     /// content leaves the device until the user has explicitly acknowledged it once.
     ///
-    /// SECURITY: this flag is intentionally NOT part of `AppConfigDto` / `save_config` — the FE
-    /// cannot set it as a side effect of a normal settings save. It is mutated ONLY by the
-    /// purpose-built consent command, so flipping it is an explicit, auditable user act.
+    /// SECURITY: this flag DOES round-trip through `AppConfigDto` (so `get_config` can carry the
+    /// current value out for the FE to DISPLAY consent status), but `dto_to_config`/`save_config`
+    /// IGNORE the incoming DTO value and PRESERVE whatever is already stored — the FE cannot set,
+    /// clear, or clobber it as a side effect of a normal settings save (BLK-4). It is mutated ONLY
+    /// by the purpose-built `consent_to_cloud_egress` command, so flipping it is an explicit,
+    /// auditable user act.
     pub cloud_egress_consented: bool,
 }
 
