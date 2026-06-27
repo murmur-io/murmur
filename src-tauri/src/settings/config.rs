@@ -26,6 +26,9 @@ pub struct AppConfig {
     pub input_device: Option<String>,
     /// Capture system audio (the other side of the call) via ScreenCaptureKit. Default off.
     pub capture_system_audio: bool,
+    /// Voice-activity-detection pre-segmentation + ASR-feed loudness normalisation for the
+    /// Accurate batch transcription. Default ON; off = transcribe the whole buffer (legacy).
+    pub vad_enabled: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
     /// "large-v3". Default "large-v3" (~3 GB, multilingual) — best transcription quality,
     /// notably for Polish; downloaded on demand via `download_model`.
@@ -67,6 +70,7 @@ impl Default for AppConfig {
             claude_binary: "claude".to_string(),
             input_device: None,
             capture_system_audio: false,
+            vad_enabled: true,
             model_size: "large-v3".to_string(),
             voice_trigger: false,
             onboarded: false,
@@ -92,6 +96,7 @@ const K_OLLAMA_MODEL: &str = "ollama_model";
 const K_CLAUDE_BINARY: &str = "claude_binary";
 const K_INPUT_DEVICE: &str = "input_device";
 const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
+const K_VAD_ENABLED: &str = "vad_enabled";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
@@ -141,6 +146,9 @@ impl AppConfig {
         cfg.input_device = opt(db.get_setting(K_INPUT_DEVICE)?);
         if let Some(v) = db.get_setting(K_CAPTURE_SYSTEM_AUDIO)? {
             cfg.capture_system_audio = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_VAD_ENABLED)? {
+            cfg.vad_enabled = v == "true";
         }
         if let Some(v) = db.get_setting(K_MODEL_SIZE)? {
             if !v.is_empty() {
@@ -201,6 +209,10 @@ impl AppConfig {
         db.set_setting(
             K_CAPTURE_SYSTEM_AUDIO,
             if self.capture_system_audio { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_VAD_ENABLED,
+            if self.vad_enabled { "true" } else { "false" },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         db.set_setting(

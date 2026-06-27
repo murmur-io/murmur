@@ -16,6 +16,10 @@ use crate::error::{AppError, Result};
 /// App-data subdirectory that holds downloaded GGUF models.
 pub const MODELS_SUBDIR: &str = "models";
 
+/// The whisper.cpp ggml Silero VAD model (~885 kB) used by the Accurate batch path's VAD
+/// pre-segmentation. Served by the ggml-org/whisper-vad HF repo.
+pub const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
+
 /// Map a chosen size + language to a whisper.cpp GGML model filename.
 ///
 /// Supported sizes (all served by the ggerganov/whisper.cpp HF mirror):
@@ -46,6 +50,12 @@ pub fn model_filename(size: &str, language: &str) -> String {
 /// `resolve/main` serves the raw file; whisper-rs loads the GGML/GGUF binary directly.
 pub fn model_url(filename: &str) -> String {
     format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{filename}")
+}
+
+/// Hugging Face repo for whisper.cpp's ggml Silero VAD model (separate from the main
+/// whisper models, which live in the ggerganov/whisper.cpp repo).
+pub fn vad_model_url(filename: &str) -> String {
+    format!("https://huggingface.co/ggml-org/whisper-vad/resolve/main/{filename}")
 }
 
 /// The directory where MeetNotes keeps downloaded models:
@@ -112,6 +122,18 @@ pub async fn ensure_model(
     let file = model_filename(size, language);
     let dest = dir.join(&file);
     download_model(&model_url(&file), &dest).await?;
+    Ok(dest)
+}
+
+/// Ensure the Silero VAD model exists in [`models_dir`] and return its path (best-effort,
+/// atomic download). Used by the Accurate batch path's VAD pre-segmentation; a failure is
+/// non-fatal — the caller transcribes the whole buffer instead.
+pub async fn ensure_vad_model() -> Result<PathBuf> {
+    let dest = models_dir()?.join(VAD_MODEL_FILE);
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    download_model(&vad_model_url(VAD_MODEL_FILE), &dest).await?;
     Ok(dest)
 }
 
@@ -204,6 +226,14 @@ mod tests {
         assert_eq!(
             model_url("ggml-large-v3.bin"),
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
+        );
+    }
+
+    #[test]
+    fn vad_url_points_at_whisper_vad_repo() {
+        assert_eq!(
+            vad_model_url(VAD_MODEL_FILE),
+            "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
         );
     }
 }

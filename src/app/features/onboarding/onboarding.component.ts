@@ -1256,6 +1256,7 @@ export class OnboardingComponent implements OnInit {
       claudeBinary: base?.claudeBinary ?? "claude",
       inputDevice: base?.inputDevice ?? null,
       captureSystemAudio: base?.captureSystemAudio ?? false,
+      vadEnabled: base?.vadEnabled ?? true,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),

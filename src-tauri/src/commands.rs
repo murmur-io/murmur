@@ -67,6 +67,8 @@ pub struct AppConfigDto {
     #[serde(default)]
     pub input_device: Option<String>,
     pub capture_system_audio: bool,
+    #[serde(default = "default_true")]
+    pub vad_enabled: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -1219,6 +1221,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         claude_binary: c.claude_binary.clone(),
         input_device: c.input_device.clone(),
         capture_system_audio: c.capture_system_audio,
+        vad_enabled: c.vad_enabled,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -1246,6 +1249,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         claude_binary: d.claude_binary,
         input_device: norm(d.input_device),
         capture_system_audio: d.capture_system_audio,
+        vad_enabled: d.vad_enabled,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a
