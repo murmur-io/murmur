@@ -1254,6 +1254,7 @@ export class OnboardingComponent implements OnInit {
       ollamaBaseUrl: base?.ollamaBaseUrl ?? "http://localhost:11434",
       ollamaModel: base?.ollamaModel ?? "llama3.1",
       claudeBinary: base?.claudeBinary ?? "claude",
+      inputDevice: base?.inputDevice ?? null,
       captureSystemAudio: base?.captureSystemAudio ?? false,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,

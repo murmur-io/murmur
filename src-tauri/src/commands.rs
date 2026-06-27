@@ -64,6 +64,8 @@ pub struct AppConfigDto {
     pub ollama_base_url: String,
     pub ollama_model: String,
     pub claude_binary: String,
+    #[serde(default)]
+    pub input_device: Option<String>,
     pub capture_system_audio: bool,
     pub model_size: String,
     pub voice_trigger: bool,
@@ -142,8 +144,9 @@ pub async fn start_recording(
         let _ = tokio::task::spawn_blocking(move || stop_voice_listener(&app2)).await;
     }
 
-    // Start mic capture.
-    let recorder = Recorder::start()?;
+    // Start mic capture on the configured input device (falls back to default if unset/gone).
+    let input_device = state.config.lock().ok().and_then(|c| c.input_device.clone());
+    let recorder = Recorder::start(input_device)?;
     {
         let mut slot = state
             .recorder
@@ -1214,6 +1217,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         ollama_base_url: c.ollama_base_url.clone(),
         ollama_model: c.ollama_model.clone(),
         claude_binary: c.claude_binary.clone(),
+        input_device: c.input_device.clone(),
         capture_system_audio: c.capture_system_audio,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
@@ -1240,6 +1244,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         ollama_base_url: d.ollama_base_url,
         ollama_model: d.ollama_model,
         claude_binary: d.claude_binary,
+        input_device: norm(d.input_device),
         capture_system_audio: d.capture_system_audio,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
@@ -1266,6 +1271,12 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,
     }
+}
+
+/// List available microphone input devices for the FE picker (name + default flag).
+#[tauri::command]
+pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppError> {
+    Ok(crate::audio::list_input_devices())
 }
 
 /// Store/replace the Anthropic API key in Keychain (account "anthropic_api_key").

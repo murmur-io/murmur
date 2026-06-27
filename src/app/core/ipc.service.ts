@@ -5,6 +5,7 @@ import type {
   ActionItem,
   Analytics,
   AppConfigDto,
+  InputDeviceInfo,
   AskVaultResult,
   BriefResult,
   BuiltinRecipe,
@@ -65,6 +66,11 @@ export class IpcService {
   /** Whether the live recorder's mic is currently muted (false when not recording). */
   isMicMuted(): Promise<boolean> {
     return invoke<boolean>("is_mic_muted");
+  }
+
+  /** Available microphone input devices for the picker (name + system-default flag). */
+  listInputDevices(): Promise<InputDeviceInfo[]> {
+    return invoke<InputDeviceInfo[]>("list_input_devices");
   }
 
   getLastNote(): Promise<NoteDto | null> {

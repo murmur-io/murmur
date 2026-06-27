@@ -35,6 +35,7 @@ export interface AppConfigDto {
   ollamaBaseUrl: string;
   ollamaModel: string;
   claudeBinary: string;
+  inputDevice: string | null;
   captureSystemAudio: boolean;
   modelSize: string;
   voiceTrigger: boolean;
@@ -42,6 +43,12 @@ export interface AppConfigDto {
   noteStyle: string;
   autoOrganize: boolean;
   noteLanguage: string;
+}
+
+/** A selectable microphone input device (from `list_input_devices`). */
+export interface InputDeviceInfo {
+  name: string;
+  isDefault: boolean;
 }
 
 export interface NoteDto {

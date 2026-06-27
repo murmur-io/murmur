@@ -10,7 +10,11 @@ import { FormBuilder, FormControl, ReactiveFormsModule } from "@angular/forms";
 import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
-import type { AppConfigDto, ProviderStatus } from "../../core/models";
+import type {
+  AppConfigDto,
+  InputDeviceInfo,
+  ProviderStatus,
+} from "../../core/models";
 
 @Component({
   selector: "app-settings",
@@ -399,6 +403,25 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
             <input formControlName="claudeBinary" />
           </label>
         </fieldset>
+      </div>
+
+      <!-- Microphone input device -->
+      <div class="card">
+        <label class="field">
+          <span class="field-label">Microphone</span>
+          <select formControlName="inputDevice">
+            <option value="">System default</option>
+            @for (dev of inputDevices(); track dev.name) {
+              <option [value]="dev.name">
+                {{ dev.name }}{{ dev.isDefault ? " (default)" : "" }}
+              </option>
+            }
+          </select>
+          <span class="field-help text-muted">
+            Which microphone to record. “System default” follows your macOS input
+            selection; a chosen device falls back to the default if it’s unplugged.
+          </span>
+        </label>
       </div>
 
       <!-- Capture system audio — toggle row -->
@@ -1159,6 +1182,7 @@ export class SettingsComponent implements OnInit {
     ollamaBaseUrl: "http://localhost:11434",
     ollamaModel: "llama3.1",
     claudeBinary: "claude",
+    inputDevice: "",
     captureSystemAudio: false,
     modelSize: "large-v3",
     voiceTrigger: false,
@@ -1169,6 +1193,8 @@ export class SettingsComponent implements OnInit {
   readonly keyControl = new FormControl("", { nonNullable: true });
 
   readonly providers = signal<ProviderStatus[]>([]);
+  /** Available mic input devices for the picker (loaded best-effort in ngOnInit). */
+  readonly inputDevices = signal<InputDeviceInfo[]>([]);
   readonly hasKey = signal(false);
   readonly saved = signal(false);
   readonly loadError = signal<string | null>(null);
@@ -1226,6 +1252,7 @@ export class SettingsComponent implements OnInit {
         ollamaBaseUrl: cfg.ollamaBaseUrl,
         ollamaModel: cfg.ollamaModel,
         claudeBinary: cfg.claudeBinary,
+        inputDevice: cfg.inputDevice ?? "",
         captureSystemAudio: cfg.captureSystemAudio ?? false,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
@@ -1234,6 +1261,7 @@ export class SettingsComponent implements OnInit {
         noteLanguage: cfg.noteLanguage ?? "auto",
       });
       this.updateDownloadHint();
+      this.inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       this.hasKey.set(await this.ipc.hasAnthropicKey());
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
@@ -1265,6 +1293,7 @@ export class SettingsComponent implements OnInit {
       ollamaBaseUrl: v.ollamaBaseUrl,
       ollamaModel: v.ollamaModel,
       claudeBinary: v.claudeBinary,
+      inputDevice: v.inputDevice || null,
       captureSystemAudio: v.captureSystemAudio,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,

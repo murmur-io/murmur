@@ -21,6 +21,9 @@ pub struct AppConfig {
     pub ollama_model: String,
     /// default "claude"
     pub claude_binary: String,
+    /// Preferred microphone input device by NAME (cpal exposes no stable id). None = system
+    /// default. A saved device that is no longer present falls back to default at capture time.
+    pub input_device: Option<String>,
     /// Capture system audio (the other side of the call) via ScreenCaptureKit. Default off.
     pub capture_system_audio: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
@@ -62,6 +65,7 @@ impl Default for AppConfig {
             ollama_base_url: "http://localhost:11434".to_string(),
             ollama_model: "llama3.1".to_string(),
             claude_binary: "claude".to_string(),
+            input_device: None,
             capture_system_audio: false,
             model_size: "large-v3".to_string(),
             voice_trigger: false,
@@ -86,6 +90,7 @@ const K_ANTHROPIC_MODEL: &str = "anthropic_model";
 const K_OLLAMA_BASE_URL: &str = "ollama_base_url";
 const K_OLLAMA_MODEL: &str = "ollama_model";
 const K_CLAUDE_BINARY: &str = "claude_binary";
+const K_INPUT_DEVICE: &str = "input_device";
 const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
@@ -133,6 +138,7 @@ impl AppConfig {
                 cfg.claude_binary = v;
             }
         }
+        cfg.input_device = opt(db.get_setting(K_INPUT_DEVICE)?);
         if let Some(v) = db.get_setting(K_CAPTURE_SYSTEM_AUDIO)? {
             cfg.capture_system_audio = v == "true";
         }
@@ -191,6 +197,7 @@ impl AppConfig {
         db.set_setting(K_OLLAMA_BASE_URL, &self.ollama_base_url)?;
         db.set_setting(K_OLLAMA_MODEL, &self.ollama_model)?;
         db.set_setting(K_CLAUDE_BINARY, &self.claude_binary)?;
+        db.set_setting(K_INPUT_DEVICE, self.input_device.as_deref().unwrap_or(""))?;
         db.set_setting(
             K_CAPTURE_SYSTEM_AUDIO,
             if self.capture_system_audio { "true" } else { "false" },
