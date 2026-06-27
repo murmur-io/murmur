@@ -8,10 +8,34 @@ use crate::error::{AppError, Result};
 use crate::settings::AppConfig;
 use crate::storage::Db;
 
-/// App-data folder name (mirrors the human-friendly name used by `transcribe::model`).
-const APP_DIR: &str = "MeetNotes";
 /// SQLite database filename inside the app-data folder.
 const DB_FILE: &str = "meetnotes.sqlite";
+
+/// App-data folder name for the DB + recorded audio, isolated PER BUILD PROFILE.
+///
+/// A DEBUG build (`tauri dev`, `cargo test`) — or any run with an explicit dev DEK
+/// (`MURMUR_DEV_DEK`) — uses `MeetNotes-dev`; the notarized RELEASE build keeps `MeetNotes`.
+/// `cfg!(debug_assertions)` is true for `tauri dev` and false for the release build, so the
+/// isolation is automatic with NO env var required; the `MURMUR_DEV_DEK` clause also covers
+/// an explicit dev-DEK run of a release-profile binary.
+///
+/// WHY: dev and release key the whole-DB SQLCipher file with DIFFERENT DEKs (release pulls the
+/// real keychain DEK; dev uses the fixed `MURMUR_DEV_DEK`/debug hatch — see lock-model). Sharing
+/// one app-data dir means each build opens the other's DB with the wrong key and fails read-only
+/// — the recurring "Murmur can't open your library" on `npm run dev`. A separate dir keeps each
+/// build's library intact. This is the ONLY source of truth for the DB + audio dir name; do not
+/// re-derive the `cfg!` logic elsewhere.
+///
+/// NOTE: the whisper models dir (`transcribe::model::models_dir`) deliberately stays on the
+/// SHARED `MeetNotes` name on purpose — the ~3GB model is not sensitive and must not be
+/// re-downloaded for every dev run — so it does NOT call this helper.
+pub fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) || std::env::var_os("MURMUR_DEV_DEK").is_some() {
+        "MeetNotes-dev"
+    } else {
+        "MeetNotes"
+    }
+}
 
 pub struct AppState {
     /// Some while recording.
@@ -109,11 +133,12 @@ impl AppState {
         })
     }
 
-    /// `<app-data>/MeetNotes/meetnotes.sqlite`, creating the directory if absent.
+    /// `<app-data>/<app_dir_name()>/meetnotes.sqlite`, creating the directory if absent.
+    /// The folder is `MeetNotes` for release and `MeetNotes-dev` for dev/debug ([`app_dir_name`]).
     fn db_path() -> Result<PathBuf> {
         let base = dirs::data_dir()
             .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
-        let dir = base.join(APP_DIR);
+        let dir = base.join(app_dir_name());
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
         Ok(dir.join(DB_FILE))
@@ -247,6 +272,26 @@ mod tests {
 
     const GOOD_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const WRONG_KEY: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    /// The dev/release app-data dir split: a DEBUG build (the test binary always is one) must
+    /// resolve to the ISOLATED `MeetNotes-dev` so `npm run dev` can never collide with the
+    /// installed release library; a release build with no dev-DEK keeps the shared `MeetNotes`.
+    #[test]
+    fn app_dir_name_isolates_dev_from_release() {
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                app_dir_name(),
+                "MeetNotes-dev",
+                "debug/dev build must use the isolated app-data dir"
+            );
+        } else if std::env::var_os("MURMUR_DEV_DEK").is_none() {
+            assert_eq!(
+                app_dir_name(),
+                "MeetNotes",
+                "release build keeps the installed library dir name"
+            );
+        }
+    }
 
     fn tmp_path(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
