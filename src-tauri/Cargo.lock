@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "murmur"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2226,6 +2226,8 @@ dependencies = [
  "keyring",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation",
  "objc2-local-authentication",
  "regex",
