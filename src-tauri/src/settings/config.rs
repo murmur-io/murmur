@@ -76,6 +76,14 @@ pub struct AppConfig {
     /// by the purpose-built `consent_to_cloud_egress` command, so flipping it is an explicit,
     /// auditable user act.
     pub cloud_egress_consented: bool,
+    /// brain2 RAG Phase 2b — master gate for the on-device semantic (vector) retrieval layer.
+    /// Default OFF (`#[serde(default)]` ⇒ a config persisted before this field existed loads as
+    /// `false`). When OFF, NOTHING in the vector path runs: no chunk indexing on note creation, the
+    /// Ask-My-Vault corpus stays pure FTS, and the MCP `search_semantic` tool reports "disabled" —
+    /// so shipping this changes NOTHING vs today. It is wired ON only once a real embedding model
+    /// (Phase 2c) replaces the stub; until then the only embedder is the deterministic `StubEmbedder`.
+    #[serde(default)]
+    pub semantic_search_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -106,6 +114,7 @@ impl Default for AppConfig {
             lock_require_biometric: true,
             relock_on_screenshare: true,
             cloud_egress_consented: false,
+            semantic_search_enabled: false,
         }
     }
 }
@@ -136,6 +145,7 @@ const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
 const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
+const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -225,6 +235,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_CLOUD_EGRESS_CONSENTED)? {
             cfg.cloud_egress_consented = v == "true";
         }
+        if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
+            cfg.semantic_search_enabled = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -296,6 +309,10 @@ impl AppConfig {
             K_CLOUD_EGRESS_CONSENTED,
             if self.cloud_egress_consented { "true" } else { "false" },
         )?;
+        db.set_setting(
+            K_SEMANTIC_SEARCH_ENABLED,
+            if self.semantic_search_enabled { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -355,6 +372,44 @@ mod tests {
         assert!(cfg.relock_on_screenshare);
         // E10 cloud-egress consent is fail-closed (OFF) until explicitly granted.
         assert!(!cfg.cloud_egress_consented);
+        // Phase 2b semantic search is OFF by default — shipping it changes nothing.
+        assert!(!cfg.semantic_search_enabled);
+    }
+
+    /// A config persisted before `semantic_search_enabled` existed (key absent from both the JSON
+    /// DTO and the settings table) must load with the flag defaulting to `false` — `#[serde(default)]`
+    /// for the JSON path, the missing-key fallthrough for the settings-table path. Proves the
+    /// prod-safe default for existing installs.
+    #[test]
+    fn missing_semantic_flag_defaults_off() {
+        // JSON path: deserialize a payload that omits the field entirely.
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.semantic_search_enabled, "serde default must be false");
+
+        // Settings-table path: an empty DB (no key written) loads false.
+        let db = temp_db();
+        assert!(!AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    #[test]
+    fn semantic_search_flag_round_trips() {
+        let db = temp_db();
+        let cfg = AppConfig {
+            semantic_search_enabled: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(AppConfig::load(&db).unwrap().semantic_search_enabled);
     }
 
     #[test]
