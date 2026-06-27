@@ -12,6 +12,7 @@ use crate::storage::models::{
     GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
     StatusCount, VaultSource,
 };
+use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
 
 /// The at-rest audio columns of one locked-folder meeting, surfaced by
@@ -86,6 +87,46 @@ fn map_err(e: rusqlite::Error) -> AppError {
     AppError::Storage(e.to_string())
 }
 
+/// Process-global, one-time registration of the sqlite-vec `vec0` virtual-table module through
+/// SQLite's auto-extension hook, so EVERY connection opened afterwards (the main keyed handle, the
+/// MCP reader thread, file-backed test DBs) can CREATE and query `vec_chunks`. MUST run BEFORE
+/// `Connection::open`: the auto-extension list is consulted at connection-open time, and a module
+/// registered after a handle is open does not attach to it (the macOS sqlite-vec #169 footgun).
+/// Registering only installs a vtab module + scalar fns — it reads NO database pages — so a caller
+/// that runs this immediately before `Connection::open` still has `PRAGMA key` as the first SQL on
+/// the keyed handle.
+/// Stable FNV-1a 64-bit hash of a chunk's text, stored as `note_chunks.content_hash` so a later
+/// incremental re-index can skip unchanged chunks. Deterministic (no `DefaultHasher` seed).
+fn chunk_hash(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn register_vec_extension() {
+    use std::sync::Once;
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: `sqlite3_vec_init` has the C `xEntryPoint` ABI that `sqlite3_auto_extension`
+        // expects; the transmute reinterprets the bare fn pointer as that signature (the exact
+        // wiring proven by the de-risking spike). sqlite-vec only installs a virtual-table module
+        // + scalar functions, so no page is read and the bundled SQLCipher key flow is untouched.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+                *const (),
+                unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut std::os::raw::c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> std::os::raw::c_int,
+            >(sqlite_vec::sqlite3_vec_init as *const ())));
+        }
+    });
+}
+
 /// Thread-safe SQLite wrapper (internal Mutex<rusqlite::Connection>).
 pub struct Db {
     conn: Mutex<Connection>,
@@ -102,6 +143,11 @@ impl Db {
     /// Opens an (SQLCipher-encrypted) DB with an explicit raw-hex key. The `PRAGMA key` MUST be
     /// the first statement on the connection, before any other PRAGMA or query.
     pub fn open_with_key(path: &Path, dek_hex: &str) -> Result<Self> {
+        // Phase 2a: install the sqlite-vec `vec0` virtual-table module via SQLite's auto-extension
+        // hook BEFORE opening the connection (the list is consulted at open time; registering after
+        // open does not attach to that handle — the macOS #169 footgun). Idempotent + page-free, so
+        // `PRAGMA key` remains the first SQL to touch the keyed handle.
+        register_vec_extension();
         let conn = Connection::open(path).map_err(map_err)?;
         // SQLCipher: key the connection FIRST (raw 32-byte key as a hex blob ⇒ no KDF). Hold the
         // formatted `PRAGMA key` string in a Zeroizing buffer (C6) so the hex key is wiped from the
@@ -240,6 +286,45 @@ impl Db {
         // and ranking uses bm25(). SQLCipher is built with FTS5 compiled in (bundled-sqlcipher) —
         // ZERO new deps. Runs on the same locked connection as the rest of migrate().
         Self::migrate_fts(&conn)?;
+        // Phase 2a — vector retrieval layer (note_chunks + the vec0 KNN table). Additive + guarded
+        // (CREATE TABLE / CREATE VIRTUAL TABLE IF NOT EXISTS) so migrate() stays idempotent.
+        Self::migrate_vector(&conn)?;
+        Ok(())
+    }
+
+    /// Idempotent vector-layer schema: the `note_chunks` plaintext-chunk table (the embed source +
+    /// snippet store) and the `vec_chunks` sqlite-vec `vec0` KNN table whose rowid/`chunk_id` maps
+    /// 1:1 to `note_chunks.id`. `vec0` requires the auto-extension module to be registered on this
+    /// connection (done in `open_with_key` / the test helper BEFORE `Connection::open`).
+    ///
+    /// Lock model: `note_chunks.text` is plaintext DERIVED from a note, and an embedding is
+    /// invertible, so chunks/vectors exist ONLY for visible content — they are PURGED in the same
+    /// transaction that blanks a folder's plaintext on lock (see `purge_chunks_for_meetings`,
+    /// wired into `blank_sealed_notes_in_folders` + `reblank_locked_folders_at_rest` + `lock_folder`).
+    fn migrate_vector(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS note_chunks (
+               id INTEGER PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               provider_id TEXT NOT NULL,
+               chunk_idx INTEGER NOT NULL,
+               source_type TEXT NOT NULL DEFAULT 'voice',
+               text TEXT NOT NULL,
+               content_hash TEXT,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_note_chunks_meeting ON note_chunks(meeting_id);",
+        )
+        .map_err(map_err)?;
+        // The vec0 column width is the embedder's EMBED_DIM. Format the DDL (no user input).
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+                 chunk_id INTEGER PRIMARY KEY,
+                 embedding float[{dim}]
+             );",
+            dim = crate::embed::EMBED_DIM
+        ))
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -453,9 +538,16 @@ impl Db {
     /// Delete a meeting and (via ON DELETE CASCADE) its segments, notes, and timeline.
     /// Audio + vault files are removed by the caller before this.
     pub fn delete_meeting(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // Drop derived chunks/vectors FIRST, in the same tx. `vec_chunks` is a vec0 virtual table
+        // with no foreign key, so the `meetings` ON DELETE CASCADE reaches `note_chunks` but NOT
+        // `vec_chunks` — without this the deleted meeting's (invertible) embeddings would persist
+        // orphaned at rest, and a future rowid reuse could PK-conflict on the stale chunk_id.
+        Self::purge_chunks_tx(&tx, &[id.to_string()])?;
+        tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -577,6 +669,221 @@ impl Db {
             });
         }
         Ok(hits)
+    }
+
+    // ── vector retrieval (Phase 2a) ───────────────────────────────────────────
+    //
+    // note_chunks holds plaintext chunks DERIVED from a visible note; vec_chunks (vec0) holds the
+    // matching embeddings (1:1 by id). Both exist ONLY for visible content — purged on lock. The
+    // semantic read is GATED by exactly the `search_visible` visibility predicate as defense-in-
+    // depth, so even a stray chunk that escaped purge can never surface a sealed meeting.
+
+    /// (Re)index a VISIBLE meeting's latest note into `note_chunks` + `vec_chunks`. Old rows for the
+    /// meeting are deleted first (so re-summarize/re-index is a clean replace, keyed by
+    /// (meeting_id, provider_id, chunk_idx)). Caller MUST only invoke this for visible/unlocked
+    /// content — a sealed note's plaintext is blank, so this becomes a no-op if it is ever called on
+    /// one (nothing to chunk), but the contract is "visible only".
+    pub fn index_meeting_chunks(&self, meeting_id: &str, embedder: &dyn Embedder) -> Result<()> {
+        // Resolve title + date + latest note markdown (all plaintext = visible content).
+        let meeting = self.get_meeting(meeting_id)?;
+        let Some(meeting) = meeting else {
+            return Ok(()); // unknown meeting — nothing to index.
+        };
+        let Some(note) = self.get_latest_note_for_meeting(meeting_id)? else {
+            return Ok(()); // no note yet.
+        };
+        let title = meeting.title.clone().unwrap_or_else(|| "(untitled)".to_string());
+        let date = meeting
+            .started_at
+            .split(['T', ' '])
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let chunks = crate::embed::chunk_note(&title, &date, &note.markdown);
+
+        // Always purge this meeting's prior rows first (clean replace), then insert the fresh set in
+        // ONE transaction. A meeting with a now-empty note simply ends up with zero chunks.
+        let provider_id = note.provider_id.clone();
+        let vectors = if chunks.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed(&chunks)?
+        };
+
+        let this_meeting = [meeting_id.to_string()];
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_chunks_tx(&tx, &this_meeting)?;
+        {
+            let mut ins_chunk = tx
+                .prepare(
+                    "INSERT INTO note_chunks
+                       (meeting_id, provider_id, chunk_idx, source_type, text, content_hash)
+                     VALUES (?1, ?2, ?3, 'voice', ?4, ?5)",
+                )
+                .map_err(map_err)?;
+            let mut ins_vec = tx
+                .prepare("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
+                .map_err(map_err)?;
+            for (idx, (text, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
+                let content_hash = format!("{:016x}", chunk_hash(text));
+                ins_chunk
+                    .execute(rusqlite::params![
+                        meeting_id,
+                        provider_id,
+                        idx as i64,
+                        text,
+                        content_hash
+                    ])
+                    .map_err(map_err)?;
+                let chunk_id = tx.last_insert_rowid();
+                let blob = crate::embed::vec_to_blob(vector);
+                ins_vec
+                    .execute(rusqlite::params![chunk_id, blob])
+                    .map_err(map_err)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Purge (delete) every `note_chunks` + `vec_chunks` row for the given meetings. The vec0 row is
+    /// deleted by its `chunk_id` (== note_chunks.id) BEFORE the note_chunks row, then the note_chunks
+    /// rows go. Used standalone (lock_folder) and inside the relock transactions.
+    pub fn purge_chunks_for_meetings(&self, meeting_ids: &[String]) -> Result<()> {
+        if meeting_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_chunks_tx(&tx, meeting_ids)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete chunk rows for `meeting_ids` within an EXISTING transaction (so the purge lands in the
+    /// same atomic unit as the plaintext blanking on lock — no window where a vector outlives the
+    /// sealed plaintext it was derived from).
+    fn purge_chunks_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+        for mid in meeting_ids {
+            // vec0 first (its FK-less rowid mirrors note_chunks.id), then the source rows.
+            tx.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id IN
+                   (SELECT id FROM note_chunks WHERE meeting_id = ?1)",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+            tx.execute(
+                "DELETE FROM note_chunks WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// GATED semantic (vector KNN) search. Runs a `vec0` KNN for the top-`k` nearest chunks, then
+    /// applies EXACTLY the `search_visible` visibility predicate (a meeting is kept iff it has a
+    /// VISIBLE note row — open/NULL folder OR session-unlocked) so a sealed-and-not-unlocked meeting
+    /// is excluded even if a stray chunk survived. Dedups to one hit per meeting (best/nearest).
+    pub fn search_semantic_visible(
+        &self,
+        query_vec: &[f32],
+        k: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<SearchHit>> {
+        if query_vec.is_empty() || k <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        // KNN is isolated to the vec0 table in a CTE (only a single MATCH+k constraint is allowed on
+        // a vec0 query); visibility + meeting columns are joined OUTSIDE it.
+        let sql = format!(
+            "WITH knn(chunk_id, distance) AS (
+                 SELECT chunk_id, distance FROM vec_chunks
+                  WHERE embedding MATCH ?1 AND k = ?2
+                  ORDER BY distance
+             )
+             SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
+                    (SELECT nf.folder_id FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) AS folder_id,
+                    nc.text, knn.distance
+               FROM knn
+               JOIN note_chunks nc ON nc.id = knn.chunk_id
+               JOIN meetings m ON m.id = nc.meeting_id
+              WHERE EXISTS (
+                      SELECT 1 FROM notes n
+                       LEFT JOIN folders f ON f.id = n.folder_id
+                       WHERE n.meeting_id = m.id AND {visible}
+                    )
+              ORDER BY knn.distance ASC, m.id ASC"
+        );
+        let blob = crate::embed::vec_to_blob(query_vec);
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![blob, k], |row| {
+                let meeting = row_to_meeting(row)?;
+                let snippet: String = row.get(8)?;
+                Ok((meeting, snippet))
+            })
+            .map_err(map_err)?;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut hits = Vec::new();
+        for r in rows {
+            let (meeting, snippet) = r.map_err(map_err)?;
+            let meeting = meeting?;
+            if !seen.insert(meeting.id.clone()) {
+                continue; // already have a nearer chunk for this meeting.
+            }
+            hits.push(SearchHit {
+                meeting,
+                snippet,
+                matched_in: "semantic".to_string(),
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Hybrid retrieval: fuse the FTS5/BM25 `search_visible` ranking with the vector
+    /// `search_semantic_visible` ranking by Reciprocal Rank Fusion, dedup by meeting, return up to
+    /// `limit` hits best-first. Both inputs are already visibility-gated, so the fused output is too.
+    pub fn search_hybrid_visible(
+        &self,
+        query: &str,
+        query_vec: &[f32],
+        limit: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<SearchHit>> {
+        let fts = self.search_visible(query, limit, unlocked)?;
+        let semantic = self.search_semantic_visible(query_vec, limit, unlocked)?;
+
+        // The two ranked id-lists (each already best-first) feed RRF; capture them BEFORE moving the
+        // hits into the lookup map.
+        let fts_ids: Vec<String> = fts.iter().map(|h| h.meeting.id.clone()).collect();
+        let sem_ids: Vec<String> = semantic.iter().map(|h| h.meeting.id.clone()).collect();
+
+        // One hit per meeting id (prefer the FTS hit's snippet when a meeting is in both lists, so
+        // the snippet matches the lexical query the user typed).
+        let mut by_id: std::collections::HashMap<String, SearchHit> =
+            std::collections::HashMap::new();
+        for h in semantic {
+            by_id.insert(h.meeting.id.clone(), h);
+        }
+        for h in fts {
+            by_id.insert(h.meeting.id.clone(), h);
+        }
+
+        let fused = crate::embed::rrf_fuse(&[fts_ids, sem_ids], crate::embed::RRF_K);
+        let cap = if limit < 0 { 0 } else { limit as usize };
+        let mut out = Vec::new();
+        for (id, _score) in fused.into_iter().take(cap) {
+            if let Some(hit) = by_id.remove(&id) {
+                out.push(hit);
+            }
+        }
+        Ok(out)
     }
 
     // ── segments ────────────────────────────────────────────────────────────
@@ -1344,6 +1651,24 @@ impl Db {
             for id in folder_ids {
                 stmt.execute(rusqlite::params![id]).map_err(map_err)?;
             }
+            // Phase 2a LOCK-SAFETY: purge plaintext-derived chunks + their (invertible) vectors for
+            // every meeting in these folders, in the SAME transaction as the plaintext blanking —
+            // so a re-blanked (sealed) folder never leaves a semantic vector at rest. Resolve the
+            // folders' meetings from their note rows (mirrors `meeting_ids_in_folder`).
+            let mut mids = tx
+                .prepare("SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1")
+                .map_err(map_err)?;
+            let mut meeting_ids: Vec<String> = Vec::new();
+            for id in folder_ids {
+                let rows = mids
+                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .map_err(map_err)?;
+                for r in rows {
+                    meeting_ids.push(r.map_err(map_err)?);
+                }
+            }
+            drop(mids);
+            Self::purge_chunks_tx(&tx, &meeting_ids)?;
         }
         tx.commit().map_err(map_err)?;
         Ok(())
@@ -1383,6 +1708,23 @@ impl Db {
         .map_err(map_err)?;
         tx.execute(
             &format!("UPDATE timelines SET data = '' WHERE data_blob IS NOT NULL AND meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // Phase 2a LOCK-SAFETY: purge plaintext-derived chunks + vectors for every meeting in a
+        // locked folder, in this same reconciliation transaction — so a crash-while-unlocked (which
+        // may have re-indexed) cannot leave a semantic vector of sealed content at rest after a
+        // restart. Delete vec0 rows first (by chunk_id), then the source note_chunks rows.
+        tx.execute(
+            &format!(
+                "DELETE FROM vec_chunks WHERE chunk_id IN \
+                   (SELECT id FROM note_chunks WHERE meeting_id IN ({LOCKED_MEETINGS}))"
+            ),
+            [],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("DELETE FROM note_chunks WHERE meeting_id IN ({LOCKED_MEETINGS})"),
             [],
         )
         .map_err(map_err)?;
@@ -2442,7 +2784,10 @@ mod tests {
     use crate::storage::models::{Meeting, MeetingStatus, NoteRecord};
 
     fn mem_db() -> Db {
-        // In-memory DB shares the same open/migrate path as on-disk.
+        // In-memory DB shares the same open/migrate path as on-disk. The vec0 module must be
+        // auto-registered BEFORE the connection is opened (migrate() creates the vec_chunks vtab),
+        // exactly as `open_with_key` does for real handles.
+        register_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         let db = Db {
@@ -2923,6 +3268,246 @@ mod tests {
             shown.iter().any(|h| h.meeting.id == "titled"),
             "session-unlocked sealed meeting should be findable by its title again"
         );
+    }
+
+    // ── Phase 2a: vector retrieval (note_chunks + vec0) ───────────────────────
+
+    /// Insert a controlled `note_chunks` + `vec_chunks` pair directly (bypassing the embedder) so
+    /// ordering tests can use known vectors. Returns the new chunk_id.
+    fn insert_known_chunk(db: &Db, meeting_id: &str, text: &str, vector: &[f32]) -> i64 {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO note_chunks (meeting_id, provider_id, chunk_idx, source_type, text)
+             VALUES (?1, 'claude_code', 0, 'voice', ?2)",
+            rusqlite::params![meeting_id, text],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        let blob = crate::embed::vec_to_blob(vector);
+        conn.execute(
+            "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![chunk_id, blob],
+        )
+        .unwrap();
+        chunk_id
+    }
+
+    /// A one-hot EMBED_DIM vector with `1.0` at `dim` (controlled distinct directions for KNN).
+    fn one_hot(dim: usize) -> Vec<f32> {
+        let mut v = vec![0f32; crate::embed::EMBED_DIM];
+        v[dim] = 1.0;
+        v
+    }
+
+    /// KNN ordering: the chunk whose vector equals the query is nearest; a near-aligned one is
+    /// next; an orthogonal one is farthest.
+    #[test]
+    fn vec_knn_orders_nearest_first() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m-near", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        db.insert_meeting(&sample_meeting("m-mid", "2026-06-24T11:00:00Z"))
+            .unwrap();
+        db.insert_meeting(&sample_meeting("m-far", "2026-06-24T12:00:00Z"))
+            .unwrap();
+        // Every meeting needs a (visible, open-folder) note so the gate admits it.
+        note_for(&db, "m-near", "claude_code", "near");
+        note_for(&db, "m-mid", "claude_code", "mid");
+        note_for(&db, "m-far", "claude_code", "far");
+
+        // query == one_hot(0). near = one_hot(0) (identical), mid = mix of dim 0+1, far = one_hot(2).
+        let query = one_hot(0);
+        insert_known_chunk(&db, "m-near", "near", &one_hot(0));
+        let mut mid = vec![0f32; crate::embed::EMBED_DIM];
+        mid[0] = 0.9;
+        mid[1] = 0.1;
+        insert_known_chunk(&db, "m-mid", "mid", &mid);
+        insert_known_chunk(&db, "m-far", "far", &one_hot(2));
+
+        let nothing = std::collections::HashSet::new();
+        let hits = db.search_semantic_visible(&query, 3, &nothing).unwrap();
+        let order: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["m-near", "m-mid", "m-far"],
+            "KNN must return nearest-first"
+        );
+        assert!(hits.iter().all(|h| h.matched_in == "semantic"));
+    }
+
+    /// GATE: a sealed-and-not-session-unlocked meeting is ABSENT from semantic results with an
+    /// empty unlock set, and PRESENT when its folder id is in the set. (Mirrors the FTS gate test;
+    /// here the chunk row deliberately still EXISTS so exclusion comes from the gate, not purge.)
+    #[test]
+    fn vec_semantic_search_is_gated_by_visibility() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "sealed", "claude_code", "secret body");
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+        insert_known_chunk(&db, "sealed", "secret body", &one_hot(0));
+        // Flip the folder to locked=1 (visibility_clause keys off folders.locked). The chunk row
+        // still exists — so exclusion can ONLY come from the gate here.
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let query = one_hot(0);
+        // Empty unlock set → excluded.
+        let nothing = std::collections::HashSet::new();
+        let hidden = db.search_semantic_visible(&query, 10, &nothing).unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed-not-unlocked meeting leaked through the semantic gate"
+        );
+        // Folder session-unlocked → present.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db.search_semantic_visible(&query, 10, &unlocked).unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "sealed"),
+            "session-unlocked meeting must reappear in semantic results"
+        );
+    }
+
+    /// PURGE-ON-LOCK: index a meeting's chunks while visible, then re-blank its folder (the relock
+    /// path) → no `note_chunks`/`vec_chunks` row for that meeting survives at rest.
+    #[test]
+    fn vec_chunks_purged_on_lock() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(
+            &db,
+            "m1",
+            "claude_code",
+            "First budget paragraph.\n\nSecond hiring paragraph.",
+        );
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+
+        // Index while visible (open folder) with the deterministic stub embedder.
+        db.index_meeting_chunks("m1", &crate::embed::StubEmbedder)
+            .unwrap();
+        assert!(chunk_count(&db, "m1") > 0, "expected chunks after indexing");
+        assert!(vec_count(&db, "m1") > 0, "expected vectors after indexing");
+
+        // Seal: blank the note (content_blob present so blank_sealed_notes_in_folders acts), then
+        // run the relock blanker for the folder.
+        db.seal_note("m1", "claude_code", b"ciphertext").unwrap();
+        let mut folders = std::collections::HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        assert_eq!(
+            chunk_count(&db, "m1"),
+            0,
+            "note_chunks must be purged on lock (no plaintext chunk at rest)"
+        );
+        assert_eq!(
+            vec_count(&db, "m1"),
+            0,
+            "vec_chunks must be purged on lock (no invertible vector at rest)"
+        );
+    }
+
+    /// `delete_meeting` must also purge the vec0 layer. `vec_chunks` is an FK-less vec0 vtab, so the
+    /// `meetings` ON DELETE CASCADE reaches `note_chunks` but NOT `vec_chunks` — without an explicit
+    /// purge the deleted meeting's invertible embeddings ORPHAN at rest (and a reused rowid could
+    /// later PK-conflict). Counts the RAW `vec_chunks` table on purpose: a JOIN-through-note_chunks
+    /// count would false-green, since the cascade already removed the note_chunks rows. (Closes
+    /// lock-security-review finding 2.)
+    #[test]
+    fn vec_chunks_purged_on_delete_meeting() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(
+            &db,
+            "m1",
+            "claude_code",
+            "First budget paragraph.\n\nSecond hiring paragraph.",
+        );
+        db.index_meeting_chunks("m1", &crate::embed::StubEmbedder)
+            .unwrap();
+        let raw_vecs = |db: &Db| -> i64 {
+            db.lock()
+                .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(raw_vecs(&db) > 0, "expected vectors after indexing");
+
+        db.delete_meeting("m1").unwrap();
+
+        assert_eq!(
+            chunk_count(&db, "m1"),
+            0,
+            "note_chunks gone after delete_meeting (FK cascade)"
+        );
+        assert_eq!(
+            raw_vecs(&db),
+            0,
+            "vec_chunks must be purged on delete_meeting — no orphaned invertible vector at rest"
+        );
+    }
+
+    /// HYBRID RRF fusion over real FTS + vector inputs: a meeting strong in BOTH lists ranks above
+    /// one strong in only one; dedup is one hit per meeting.
+    #[test]
+    fn vec_hybrid_fuses_fts_and_vector() {
+        let db = mem_db();
+        for (id, ts) in [
+            ("both", "2026-06-24T10:00:00Z"),
+            ("fts_only", "2026-06-24T11:00:00Z"),
+            ("vec_only", "2026-06-24T12:00:00Z"),
+        ] {
+            db.insert_meeting(&sample_meeting(id, ts)).unwrap();
+        }
+        // FTS term "alpha": present in `both` and `fts_only` notes.
+        note_for(&db, "both", "claude_code", "alpha shared topic");
+        note_for(&db, "fts_only", "claude_code", "alpha only here");
+        note_for(&db, "vec_only", "claude_code", "unrelated lexical");
+
+        // Vector dim 0: `both` and `vec_only` chunks align with the query; `fts_only` is orthogonal.
+        let query = one_hot(0);
+        insert_known_chunk(&db, "both", "alpha shared topic", &one_hot(0));
+        insert_known_chunk(&db, "vec_only", "unrelated lexical", &one_hot(0));
+        insert_known_chunk(&db, "fts_only", "alpha only here", &one_hot(5));
+
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_hybrid_visible("alpha", &query, 10, &nothing)
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
+        // One hit per meeting (dedup).
+        let mut uniq = ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "hybrid must dedup by meeting");
+        // `both` is in BOTH ranked lists → must be the top fused result.
+        assert_eq!(ids.first(), Some(&"both"), "meeting strong in both lists must rank first");
+        assert!(ids.contains(&"fts_only") && ids.contains(&"vec_only"));
+    }
+
+    fn chunk_count(db: &Db, meeting_id: &str) -> i64 {
+        let conn = db.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM note_chunks WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn vec_count(db: &Db, meeting_id: &str) -> i64 {
+        let conn = db.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM vec_chunks v
+               JOIN note_chunks nc ON nc.id = v.chunk_id
+              WHERE nc.meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 }
 

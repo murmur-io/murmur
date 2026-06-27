@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod commands;
 pub mod crypto;
+pub mod embed;
 pub mod error;
 pub mod events;
 pub mod export;
