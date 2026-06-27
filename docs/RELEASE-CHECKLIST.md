@@ -1,5 +1,11 @@
 # MeetNotes — Release checklist (the only steps left to be prod-ready)
 
+> **⚠️ SUPERSEDED (2026-06-27).** This doc predates the Murmur rename — it says
+> `MeetNotes.app` and ad-hoc signing. The current, proven release runbook is the
+> **`/release-murmur`** skill (`.claude/skills/release-murmur/SKILL.md`): universal build →
+> Developer-ID sign **by identity hash** → notarize → staple → `gh release`. Use that.
+> The notes below are kept only for the first-run / mic / system-audio manual checks.
+
 Everything that can be built and verified without a physical Mac + Apple account is **done
 and green**: `bash scripts/ci.sh` (clippy `-D warnings`, 34 tests, ng lint/build, core +
 mixing headless E2E) and `bash scripts/release.sh` (builds a `MeetNotes.app` that
