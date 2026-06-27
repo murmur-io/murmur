@@ -38,9 +38,28 @@ pub fn sidecar_path(app: &AppHandle) -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-/// Whether this build has a usable system-audio sidecar (bundled resource or dev fallback).
+/// Whether this build can capture system audio — the Core Audio tap (macOS 14.4+) OR the
+/// ScreenCaptureKit sidecar (13–14.3), bundled resource or dev fallback.
 pub fn is_available(app: &AppHandle) -> bool {
-    sidecar_path(app).is_some()
+    crate::audio::tap::is_available(app) || sidecar_path(app).is_some()
+}
+
+/// Pick the system-audio helper binary: prefer the Core Audio process tap (macOS 14.4+,
+/// app-scoped global-minus-self), else the ScreenCaptureKit sidecar (13–14.3). Both helpers
+/// share the `<wav_path> [maxSeconds]` + SIGTERM-to-finalize protocol, so the spawn path is
+/// identical regardless of which is chosen.
+fn select_helper(app: &AppHandle) -> Option<PathBuf> {
+    if crate::audio::tap::is_available(app) {
+        if let Some(p) = crate::audio::tap::tap_helper_path(app) {
+            tracing::info!(target: "audio", "system capture path: Core Audio process tap");
+            return Some(p);
+        }
+    }
+    if let Some(p) = sidecar_path(app) {
+        tracing::info!(target: "audio", "system capture path: ScreenCaptureKit sidecar");
+        return Some(p);
+    }
+    None
 }
 
 /// Spawns the sidecar to capture system audio into `wav_path`. Call [`stop`] to finalize.
@@ -58,8 +77,8 @@ impl SystemAudioRecorder {
     /// Spawn the sidecar writing to `wav_path`. Errors only if the sidecar can't be
     /// spawned at all; a *capture* failure (no permission) surfaces later in [`stop`].
     pub fn start(app: &AppHandle, wav_path: PathBuf) -> Result<Self> {
-        let bin = sidecar_path(app)
-            .ok_or_else(|| AppError::Audio("system-audio sidecar not built".into()))?;
+        let bin = select_helper(app)
+            .ok_or_else(|| AppError::Audio("no system-audio helper available".into()))?;
         let child = Command::new(&bin)
             .arg(&wav_path)
             .stdin(Stdio::null())
