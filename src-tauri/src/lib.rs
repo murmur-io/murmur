@@ -1,5 +1,4 @@
 pub mod audio;
-pub mod biometric;
 pub mod commands;
 pub mod crypto;
 pub mod error;

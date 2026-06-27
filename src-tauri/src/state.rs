@@ -122,34 +122,71 @@ impl AppState {
 
 /// SHOULD-FIX startup reconciliation (filesystem half of [`Db::reblank_locked_folders_at_rest`]).
 /// Re-blanks the locked folders' plaintext columns at the DB level, then re-seals stray plaintext
-/// WAVs on disk: for each locked meeting whose `audio_path` is a PLAINTEXT WAV (not `.enc`) but a
-/// sibling `<wav>.enc` exists, remove the plaintext WAV and re-point `audio_path` at the `.enc`. We
-/// only DROP a plaintext WAV when its encrypted twin is already present (never destroy the only
-/// copy, and never try to ENCRYPT here — there is no content key at startup). Best-effort and
-/// panic-free: every failure is logged, never fatal to launch.
+/// audio on disk for ALL THREE per-stream files of each locked meeting — the playback WAV
+/// (`audio_path`) AND the two hi-res masters (`mic_master_path` / `sys_master_path`). A
+/// crash-while-unlocked decrypts EVERY sealed stream, so reconciling only the playback copy would
+/// leave `{id}.mic.wav` / `{id}.sys.wav` plaintext on disk forever (B1).
+///
+/// For each path: if it is a PLAINTEXT file (not `.enc`) with a sibling `<file>.enc` present, drop
+/// the plaintext and re-point the column at the `.enc`. This covers both crash shapes — the
+/// plaintext still on disk (drop it) and the plaintext already gone but the column still pointing at
+/// it (`remove_file` no-ops, the dangling column is re-pointed at the surviving `.enc`). We only
+/// re-point when the encrypted twin exists (never destroy the only copy, and never ENCRYPT here —
+/// there is no content key at startup). Best-effort and panic-free: every failure is logged, never
+/// fatal to launch.
 fn reconcile_locked_at_rest(db: &Db) {
-    let audio = match db.reblank_locked_folders_at_rest() {
+    let rows = match db.reblank_locked_folders_at_rest() {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
             return;
         }
     };
+    for row in rows {
+        let crate::storage::LockedMeetingAudio {
+            meeting_id,
+            audio_path,
+            mic_master_path,
+            sys_master_path,
+        } = row;
+        reseal_stray_audio(audio_path.as_deref(), "playback WAV", |enc| {
+            db.set_meeting_audio_path(&meeting_id, Some(enc))
+        });
+        reseal_stray_audio(mic_master_path.as_deref(), "mic master", |enc| {
+            db.set_meeting_mic_master_path(&meeting_id, Some(enc))
+        });
+        reseal_stray_audio(sys_master_path.as_deref(), "sys master", |enc| {
+            db.set_meeting_sys_master_path(&meeting_id, Some(enc))
+        });
+    }
+}
+
+/// Re-seal one at-rest audio column left by a crash-while-unlocked. If `path` is a plaintext file
+/// (not `.enc`) whose sibling `<path>.enc` (the durable encrypted copy) exists, remove the stray
+/// plaintext and call `repoint` to re-point the column at the `.enc`. No-op when the column is
+/// absent, already `.enc`, or has no encrypted twin (never destroy the only copy). `repoint` is the
+/// matching DB setter (`set_meeting_audio_path` / `…_mic_master_path` / `…_sys_master_path`); a
+/// setter error is logged, never fatal. `label` names the stream for the log line only.
+fn reseal_stray_audio(
+    path: Option<&str>,
+    label: &str,
+    repoint: impl FnOnce(&str) -> crate::error::Result<()>,
+) {
     const ENC_SUFFIX: &str = ".enc";
-    for (meeting_id, path) in audio {
-        if path.ends_with(ENC_SUFFIX) {
-            continue; // already sealed at rest.
-        }
-        let enc_path = format!("{path}{ENC_SUFFIX}");
-        // Only drop the plaintext WAV if its encrypted twin already exists (the durable copy).
-        if std::path::Path::new(&enc_path).exists() {
-            let _ = std::fs::remove_file(&path);
-            if let Err(e) = db.set_meeting_audio_path(&meeting_id, Some(&enc_path)) {
-                tracing::warn!(target: "state", error = %e, "startup reconciliation: re-point audio_path to .enc failed");
-            } else {
-                tracing::warn!(target: "state", "startup reconciliation: re-sealed a stray plaintext WAV left by a crash while unlocked");
-            }
-        }
+    let Some(path) = path else { return };
+    if path.ends_with(ENC_SUFFIX) {
+        return; // already sealed at rest.
+    }
+    let enc_path = format!("{path}{ENC_SUFFIX}");
+    // Only re-point when the encrypted twin already exists (the durable copy).
+    if !std::path::Path::new(&enc_path).exists() {
+        return;
+    }
+    let _ = std::fs::remove_file(path); // no-op if the plaintext is already gone (dangling column).
+    if let Err(e) = repoint(&enc_path) {
+        tracing::warn!(target: "state", error = %e, stream = label, "startup reconciliation: re-point of stray plaintext audio to .enc failed");
+    } else {
+        tracing::warn!(target: "state", stream = label, "startup reconciliation: re-sealed a stray plaintext audio file left by a crash while unlocked");
     }
 }
 
@@ -360,6 +397,134 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2, "rows intact after the failed wrong-key open");
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// B1 regression: a crash WHILE a locked folder was session-unlocked can strand PLAINTEXT audio
+    /// on disk for every stream that had been decrypted — not just the playback WAV but BOTH hi-res
+    /// masters. Startup reconciliation must re-seal all three: drop the stray plaintext and re-point
+    /// the column at the surviving `.enc`. This mirrors the playback-WAV reconciliation, exercised
+    /// here for `mic_master_path` + `sys_master_path` across BOTH crash shapes (plaintext still on
+    /// disk; plaintext already gone but the column still dangling at it).
+    #[test]
+    fn reconcile_reseals_stray_master_plaintext_for_locked_meeting() {
+        let p = tmp_path("reconcile-masters");
+        let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
+
+        // A locked folder governing meeting m1 (reconcile keys off notes.folder_id + folders.locked).
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-26T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m1".into(),
+            started_at: "2026-06-26T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("t".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: "m1".into(),
+            provider_id: "claude_code".into(),
+            markdown: String::new(),
+            created_at: "2026-06-26T09:05:00Z".into(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_note_folder("m1", Some("f1")).unwrap();
+
+        // Sibling files derived from the unique db path so concurrent test runs never collide.
+        let base = p.to_string_lossy().to_string();
+        let mic_plain = format!("{base}.m1.mic.wav");
+        let mic_enc = format!("{base}.m1.mic.wav.enc");
+        let sys_plain = format!("{base}.m1.sys.wav");
+        let sys_enc = format!("{base}.m1.sys.wav.enc");
+
+        // Crash shape A (mic): plaintext STILL present + sibling .enc present.
+        std::fs::write(&mic_plain, b"PLAINTEXT-MIC-MASTER").unwrap();
+        std::fs::write(&mic_enc, b"ENC-MIC").unwrap();
+        // Crash shape B (sys): plaintext ALREADY GONE, only the .enc survives, column still dangles.
+        std::fs::write(&sys_enc, b"ENC-SYS").unwrap();
+        assert!(!std::path::Path::new(&sys_plain).exists(), "sys plaintext is gone (crash shape B)");
+
+        db.set_meeting_mic_master_path("m1", Some(&mic_plain)).unwrap();
+        db.set_meeting_sys_master_path("m1", Some(&sys_plain)).unwrap();
+
+        // RECONCILE — the production startup pass.
+        reconcile_locked_at_rest(&db);
+
+        // mic: stray plaintext dropped; sys: dangling column re-pointed. Both columns now at the .enc.
+        assert!(!std::path::Path::new(&mic_plain).exists(), "stray plaintext mic master removed");
+        let (mic_after, sys_after) = db.get_meeting_master_paths("m1").unwrap();
+        assert_eq!(mic_after.as_deref(), Some(mic_enc.as_str()), "mic master re-pointed at .enc");
+        assert_eq!(sys_after.as_deref(), Some(sys_enc.as_str()), "sys master dangling column re-pointed at .enc");
+        // The encrypted masters (the durable copies) are never touched.
+        assert!(std::path::Path::new(&mic_enc).exists(), "encrypted mic master preserved");
+        assert!(std::path::Path::new(&sys_enc).exists(), "encrypted sys master preserved");
+
+        let _ = std::fs::remove_file(&mic_enc);
+        let _ = std::fs::remove_file(&sys_enc);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A locked meeting whose master is ALREADY sealed at rest (column points at the `.enc`, no
+    /// plaintext on disk) must be left exactly as-is by reconciliation — it must not churn the column
+    /// or fabricate a missing plaintext file.
+    #[test]
+    fn reconcile_leaves_already_sealed_masters_untouched() {
+        let p = tmp_path("reconcile-sealed");
+        let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-26T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m1".into(),
+            started_at: "2026-06-26T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("t".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: "m1".into(),
+            provider_id: "claude_code".into(),
+            markdown: String::new(),
+            created_at: "2026-06-26T09:05:00Z".into(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_note_folder("m1", Some("f1")).unwrap();
+
+        let base = p.to_string_lossy().to_string();
+        let mic_enc = format!("{base}.m1.mic.wav.enc");
+        std::fs::write(&mic_enc, b"ENC-MIC").unwrap();
+        db.set_meeting_mic_master_path("m1", Some(&mic_enc)).unwrap();
+
+        reconcile_locked_at_rest(&db);
+
+        let (mic_after, _sys_after) = db.get_meeting_master_paths("m1").unwrap();
+        assert_eq!(mic_after.as_deref(), Some(mic_enc.as_str()), "already-sealed master left as-is");
+        assert!(!std::path::Path::new(&format!("{base}.m1.mic.wav")).exists(), "no plaintext fabricated");
+
+        let _ = std::fs::remove_file(&mic_enc);
         let _ = std::fs::remove_file(&p);
     }
 }
