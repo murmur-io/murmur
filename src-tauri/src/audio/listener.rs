@@ -67,7 +67,7 @@ impl VoiceListener {
             tracing::info!(target: "voice", "voice listener started");
 
             while !stop_flag.load(Ordering::Relaxed) {
-                let rec = match Recorder::start() {
+                let rec = match Recorder::start(None) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(target: "voice", error = %e, "voice listener: mic open failed");

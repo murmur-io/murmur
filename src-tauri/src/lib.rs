@@ -51,6 +51,7 @@ pub fn run() {
             commands::recording_level,
             commands::set_mic_muted,
             commands::is_mic_muted,
+            commands::list_input_devices,
             commands::get_last_note,
             commands::update_note,
             commands::get_config,
