@@ -1,11 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core permissions for the main + floating bar windows. No fs/shell exposed to the webview.",
+  "description": "Core permissions for the main + floating bar windows. No fs/shell exposed to the webview. core:default is intentionally NOT used — only the explicit core surface the app actually invokes is granted (events for the IPC status stream, app metadata, and the specific window ops), dropping the unused core:image / core:menu / core:path / core:resources / core:tray / core:webview surface.",
   "windows": ["main", "bar"],
   "permissions": [
-    "core:default",
+    "core:event:default",
+    "core:app:default",
     "dialog:allow-open",
+    "dialog:allow-save",
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-set-focus",

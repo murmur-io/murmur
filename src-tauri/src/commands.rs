@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::audio::Recorder;
 use crate::error::AppError;
@@ -79,6 +80,12 @@ pub struct AppConfigDto {
     /// Stage E: default true (matches AppConfig::default) when the FE omits it on an older payload.
     #[serde(default = "default_true")]
     pub relock_on_screenshare: bool,
+    /// E10: one-time cloud-egress consent. Round-tripped so a `save_config` preserves it (the FE
+    /// carries back whatever `get_config` returned). The canonical way to GRANT it is the
+    /// dedicated consent command, not a plain settings save; `#[serde(default)]` (false) keeps an
+    /// older FE payload that omits it from accidentally clearing consent on the next save.
+    #[serde(default)]
+    pub cloud_egress_consented: bool,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -363,6 +370,14 @@ pub fn update_note(
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
+    // D4 READ/WRITE-GATE: refuse to mutate a sealed-and-not-session-unlocked meeting's note. Its
+    // plaintext markdown is blanked while sealed, so an edit here would overwrite the (sealed)
+    // content with the blanked value and corrupt it. Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to edit the note".into(),
+        ));
+    }
     let existing = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
@@ -442,6 +457,13 @@ pub async fn chat_meeting(
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
+    // D4 READ-GATE: a sealed-and-not-unlocked meeting's transcript is blanked; refuse to chat over
+    // it (it would otherwise answer from an empty transcript or leak via the provider). Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to chat about this meeting".into(),
+        ));
+    }
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg(
@@ -499,6 +521,13 @@ pub fn export_note(
     meeting_id: String,
     dest_path: String,
 ) -> Result<(), AppError> {
+    // D4 READ-GATE: refuse to export a sealed-and-not-unlocked meeting's note (its plaintext
+    // markdown is blanked while sealed — exporting would write an empty/garbage file). Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to export the note".into(),
+        ));
+    }
     let note = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
@@ -653,6 +682,13 @@ pub fn get_action_items(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Vec<ActionItem>, AppError> {
+    // D4 READ-GATE: a sealed-and-not-unlocked meeting's note markdown is blanked; refuse to parse
+    // action items from it (would silently return none / leak a stale plaintext). Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to see action items".into(),
+        ));
+    }
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
     Ok(match note {
         Some(n) => crate::summarize::action_items::parse_action_items(&n.markdown),
@@ -667,6 +703,13 @@ pub fn patch_note_tasks(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<NoteDto, AppError> {
+    // D4 WRITE-GATE: refuse to rewrite a sealed-and-not-unlocked meeting's note (its plaintext is
+    // blanked; patching would persist the blanked value over the sealed content). Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to rewrite the note's tasks".into(),
+        ));
+    }
     let existing = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
@@ -1056,6 +1099,13 @@ pub fn topic_threads(state: State<'_, AppState>) -> Result<Vec<TopicThread>, App
 /// Requires the timeline (open the meeting once). Returns the written path.
 #[tauri::command]
 pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<String, AppError> {
+    // D4 READ-GATE: a sealed-and-not-unlocked meeting's timeline is blanked; refuse to build a
+    // canvas from it. Fail closed.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to export the canvas".into(),
+        ));
+    }
     let meeting = state
         .db
         .get_meeting(&meeting_id)?
@@ -1082,7 +1132,9 @@ pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<S
     }
     .filter(|p| !p.is_empty())
     .ok_or_else(|| AppError::InvalidArg("set a vault folder in Settings first".into()))?;
-    let dir = std::path::Path::new(&vault).join("Canvas");
+    let vault_root = std::path::Path::new(&vault);
+    // D5: the Canvas dir must resolve inside the vault root.
+    let dir = assert_in_vault(vault_root, std::path::Path::new("Canvas"))?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Export(format!("create Canvas dir failed: {e}")))?;
     let fname: String = title
@@ -1101,7 +1153,12 @@ pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<S
     } else {
         fname
     };
-    let path = dir.join(format!("{fname}.canvas"));
+    // D5: re-assert the final file path stays inside the vault (fname is sanitized, but bind the
+    // guarantee at the write site).
+    let path = assert_in_vault(
+        vault_root,
+        &std::path::Path::new("Canvas").join(format!("{fname}.canvas")),
+    )?;
     std::fs::write(&path, canvas)
         .map_err(|e| AppError::Export(format!("write canvas failed: {e}")))?;
     Ok(path.to_string_lossy().to_string())
@@ -1203,6 +1260,23 @@ pub fn save_config(
     Ok(())
 }
 
+/// E10 — grant the one-time cloud-egress consent. This is the ONLY supported way to flip
+/// `cloud_egress_consented` true: it persists the flag AND updates the in-memory config cache, so
+/// the next `make_provider(claude_code|anthropic)` is allowed to build. Idempotent.
+///
+/// TODO(FE): call this from a first-cloud-send confirmation dialog. Until the user confirms,
+/// every cloud summarize/chat returns `AppError::Unavailable("cloud egress not consented …")`,
+/// which the FE should detect and surface as the consent prompt.
+#[tauri::command]
+pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_cloud_egress_consent(&state.db)?;
+    Ok(())
+}
+
 fn config_to_dto(c: &AppConfig) -> AppConfigDto {
     AppConfigDto {
         provider_id: c.provider_id.clone(),
@@ -1224,6 +1298,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         mcp_require_token: c.mcp_require_token,
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
+        cloud_egress_consented: c.cloud_egress_consented,
     }
 }
 
@@ -1265,6 +1340,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         mcp_require_token: d.mcp_require_token,
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,
+        cloud_egress_consented: d.cloud_egress_consented,
     }
 }
 
@@ -1615,8 +1691,10 @@ pub fn create_folder(
     };
 
     // Create the vault subdirectory (best-effort but surfaced): only when a vault is configured.
+    // D5: canonicalize + assert the composed dir stays inside the vault root before any mkdir.
     if let Some(vault) = vault_path(&state) {
-        let dir = std::path::Path::new(&vault).join(&rel_path);
+        let vault_root = std::path::Path::new(&vault);
+        let dir = assert_in_vault(vault_root, std::path::Path::new(&rel_path))?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Export(format!("create folder dir failed: {e}")))?;
     }
@@ -1698,12 +1776,26 @@ fn move_note_file(
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| AppError::Export("note path has no filename".into()))?;
-    let dest_dir = match target_rel.filter(|p| !p.is_empty()) {
-        Some(rel) => std::path::Path::new(vault).join(rel),
-        None => std::path::Path::new(vault).to_path_buf(),
+    let vault_root = std::path::Path::new(vault);
+    // D5: the destination (vault root + target folder rel-path + filename) must stay inside the
+    // vault. Compose the vault-relative candidate and canonicalize+assert containment before any FS
+    // write. `file_name` is derived from the real source path, but we still re-check it carries no
+    // traversal segment.
+    let rel_candidate = match target_rel.filter(|p| !p.is_empty()) {
+        Some(rel) => std::path::Path::new(rel).join(file_name),
+        None => std::path::PathBuf::from(file_name),
     };
-    let dest = dest_dir.join(file_name);
-    if dest == src {
+    let dest = assert_in_vault(vault_root, &rel_candidate)?;
+    let dest_dir = dest
+        .parent()
+        .ok_or_else(|| AppError::Export("destination has no parent dir".into()))?
+        .to_path_buf();
+    // Same-location no-op. `dest` is canonicalized (absolute, symlinks resolved) but `src` from the
+    // DB is not — compare the CANONICALIZED source so a move to the same underlying file is detected
+    // even when the path strings differ (e.g. /var vs /private/var on macOS). Skipping this would let
+    // the copy-then-remove below delete the file it just wrote (data loss).
+    let src_canon = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+    if dest == src_canon || dest == src {
         return Ok(());
     }
     std::fs::create_dir_all(&dest_dir)
@@ -1737,9 +1829,11 @@ pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), 
         return Ok(()); // already sealed — idempotent.
     }
 
-    let kek = crate::secrets::get_or_create_master_kek()?;
-    let ck = crate::crypto::random_key()?;
-    let wrapped = crate::crypto::encrypt(&kek, &ck)?;
+    let kek = Zeroizing::new(crate::secrets::get_or_create_master_kek()?);
+    let ck = Zeroizing::new(crate::crypto::random_key()?);
+    // Wrapped CK is AAD-bound to the folder id (B7): the wrapped key cannot be lifted onto a
+    // different folder row and unwrapped there.
+    let wrapped = crate::crypto::encrypt(&kek, &*ck, &aad_wrapped_ck(&folder_id))?;
 
     // Gather the notes to seal. A meeting may have MULTIPLE provider rows (e.g. re-summarized
     // with ollama then anthropic) each with DISTINCT markdown — seal EVERY (meeting, provider)
@@ -1748,9 +1842,11 @@ pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), 
     let notes = state.db.notes_in_folder(&folder_id)?;
     let mut sealed_rows: Vec<(String, String, Vec<u8>)> = Vec::new();
     for n in &notes {
-        // Encrypt this row's markdown and VERIFY it reads back before we touch the plaintext.
-        let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes())?;
-        let check = crate::crypto::decrypt(&ck, &blob)?;
+        // Encrypt this row's markdown bound to (folder|meeting|provider|note|v) and VERIFY it
+        // reads back before we touch the plaintext.
+        let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
+        let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes(), &aad)?;
+        let check = crate::crypto::decrypt(&ck, &blob, &aad)?;
         if check != n.markdown.as_bytes() {
             return Err(AppError::Storage(
                 "seal verification failed (decrypted blob mismatch)".into(),
@@ -1777,6 +1873,8 @@ pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), 
     // WAV at rest, all under the SAME folder CK. Verify-before-destroy inside (no transcript /
     // audio loss). Done after the note seal so a partial-seal crash still leaves recoverable blobs.
     seal_folder_extras(state.inner(), &folder_id, &ck)?;
+    drop(kek); // explicit: KEK zeroized when this Zeroizing drops here.
+    drop(ck); // explicit: CK zeroized after sealing all extras.
 
     // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
     // lost content is not — so this is last).
@@ -1833,13 +1931,13 @@ pub async fn unlock_folder(
     // `require_biometric` flag does not gate this read (see the note above); it is referenced so the
     // value is intentionally consumed and so a future eager-relock path can branch on it.
     let _ = require_biometric;
-    let kek = {
-        let cached = {
+    let kek: Zeroizing<[u8; 32]> = {
+        let cached: Option<Zeroizing<[u8; 32]>> = {
             let g = state
                 .master_kek
                 .lock()
                 .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
-            *g
+            g.clone()
         };
         match cached {
             Some(k) => k,
@@ -1847,28 +1945,34 @@ pub async fn unlock_folder(
                 // The biometric-gated keychain read BLOCKS while the Touch ID sheet is up, so run it
                 // on the blocking pool — never on an async-runtime worker thread (same discipline the
                 // old biometric::authenticate used). This is the single Touch ID prompt.
-                tokio::task::spawn_blocking(|| {
+                let bytes = tokio::task::spawn_blocking(|| {
                     crate::secrets::get_or_create_master_kek_with_reason("Unlock this folder")
                 })
                 .await
-                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))??
+                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))??;
+                Zeroizing::new(bytes)
             }
         }
     };
-    let ck_bytes = crate::crypto::decrypt(&kek, &wrapped)?;
-    let ck: [u8; 32] = ck_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?;
+    // Wrapped CK is bound to the folder id (legacy folders fall back to empty AAD transparently).
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id))?);
+    let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
+        ck_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
+    );
 
     // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
     // session (no dedup by meeting — every provider's distinct content is restored independently).
+    // Bound to (folder|meeting|provider|note); legacy blobs fall back to empty AAD.
     let notes = state.db.notes_in_folder(&folder_id)?;
     for n in &notes {
         let Some(blob) = &n.content_blob else {
             continue; // open note (shouldn't happen in a sealed folder) — skip.
         };
-        let pt = crate::crypto::decrypt(&ck, blob)?;
+        let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
+        let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
         let markdown = String::from_utf8(pt)
             .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
         state
@@ -1880,13 +1984,13 @@ pub async fn unlock_folder(
     // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK.
     unseal_folder_extras(state.inner(), &folder_id, &ck)?;
 
-    // Cache the KEK for the session (zeroized on relock-all) + add to the unlock set.
+    // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
     {
         let mut g = state
             .master_kek
             .lock()
             .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
-        *g = Some(kek);
+        *g = Some(kek.clone());
     }
     {
         let mut g = state
@@ -1954,14 +2058,16 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.clear();
     }
-    // Zeroize the cached KEK copy.
+    // Zeroize the cached KEK copy (C5: use zeroize::Zeroize, not a hand byte-loop the optimizer
+    // could elide — `Zeroize::zeroize` is a guaranteed, non-elidable wipe). Taking the `Zeroizing`
+    // out and dropping it ALSO wipes it; the explicit call makes the intent unmistakable.
     {
         let mut g = state
             .master_kek
             .lock()
             .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
         if let Some(mut k) = g.take() {
-            k.iter_mut().for_each(|b| *b = 0);
+            k.zeroize();
         }
     }
     // Re-blank every sealed note across all locked folders.
@@ -1972,6 +2078,11 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     // locked folder too (the .enc + *_blob columns stay).
     for fid in &locked {
         reblank_folder_extras(state, fid)?;
+    }
+    // B12: checkpoint + truncate the WAL so the just-re-blanked plaintext does not linger in the
+    // sidecar. Best-effort — a busy checkpoint is logged, not fatal to the relock.
+    if let Err(e) = state.db.checkpoint_truncate() {
+        tracing::warn!(target: "lock", error = %e, "wal_checkpoint(TRUNCATE) on relock_all failed");
     }
     Ok(())
 }
@@ -1992,12 +2103,14 @@ pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), 
         .db
         .folder_wrapped_key(&folder_id)?
         .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
-    let kek = crate::secrets::get_or_create_master_kek()?;
-    let ck_bytes = crate::crypto::decrypt(&kek, &wrapped)?;
-    let ck: [u8; 32] = ck_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?;
+    let kek = Zeroizing::new(crate::secrets::get_or_create_master_kek()?);
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id))?);
+    let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
+        ck_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
+    );
 
     let vault = vault_path(&state);
     let notes = state.db.notes_in_folder(&folder_id)?;
@@ -2007,7 +2120,8 @@ pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), 
     // every row BEFORE any blob is cleared — otherwise a sibling provider's content is lost.
     for n in &notes {
         let markdown = if let Some(blob) = &n.content_blob {
-            let pt = crate::crypto::decrypt(&ck, blob)?;
+            let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
+            let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
             String::from_utf8(pt)
                 .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?
         } else {
@@ -2114,6 +2228,52 @@ pub async fn unlock_meeting(
 /// this suffix on `meetings.audio_path` is the on-disk "audio is sealed" signal.
 const ENC_SUFFIX: &str = ".enc";
 
+// ── B7/B8 AAD context binding ──────────────────────────────────────────────────────────────────
+//
+// Every AES-GCM blob is bound to its STORAGE CONTEXT via additional authenticated data so a
+// ciphertext cannot be swapped between folders/meetings/providers/record-types. The AAD is NOT
+// stored — it is RECONSTRUCTED deterministically from the row's identity at decrypt time. Format is
+// a fixed, pipe-joined, versioned byte string; `crypto::decrypt` transparently falls back to empty
+// AAD for legacy (pre-AAD) blobs and reports `AadUsed::Legacy` so we re-bind on the next write.
+//
+// SCHEMA VERSION is part of the content-blob AAD so a future format change is itself
+// context-bound; bump it only alongside a migration. Audio + wrapped-CK AADs are intentionally
+// minimal (the task spec: audio = meeting|folder, wrapped-CK = folder).
+
+/// AAD schema version for content blobs (notes / transcript segments / timeline). Part of the bound
+/// context, so a v1→v2 change cannot be silently down-mixed.
+const AAD_SCHEMA_VERSION: &str = "1";
+
+/// AAD for a folder's wrapped content-key: bound to the `folder_id` only (the wrapped CK lives on
+/// the folder row; nothing else identifies it).
+fn aad_wrapped_ck(folder_id: &str) -> Vec<u8> {
+    format!("murmur:wrapck:v{AAD_SCHEMA_VERSION}|folder={folder_id}").into_bytes()
+}
+
+/// AAD for a content blob (note / transcript segment / timeline). Bound to
+/// `folder_id | meeting_id | provider_id | record_type | schema_version`. `provider_id` is the note
+/// provider for note rows, or a fixed sentinel for transcript/timeline rows (which have no provider).
+fn aad_content(
+    folder_id: &str,
+    meeting_id: &str,
+    provider_id: &str,
+    record_type: &str,
+) -> Vec<u8> {
+    format!(
+        "murmur:content:v{AAD_SCHEMA_VERSION}|folder={folder_id}|meeting={meeting_id}|provider={provider_id}|type={record_type}"
+    )
+    .into_bytes()
+}
+
+/// AAD for an audio `.enc` blob: bound to `meeting_id | folder_id` (per the B8 spec).
+fn aad_audio(meeting_id: &str, folder_id: &str) -> Vec<u8> {
+    format!("murmur:audio:v{AAD_SCHEMA_VERSION}|meeting={meeting_id}|folder={folder_id}").into_bytes()
+}
+
+/// Sentinel provider id for content blobs that have no note-provider (transcript segments, timeline)
+/// — keeps the AAD shape uniform across record types.
+const AAD_NO_PROVIDER: &str = "-";
+
 /// SEAL every governed meeting's transcript + timeline under `ck`, then the audio WAV. Mirrors
 /// `lock_folder`'s note seal: each blob is verified-decryptable BEFORE the plaintext is blanked /
 /// the plaintext WAV is removed — content (transcript / audio) is never lost.
@@ -2128,8 +2288,9 @@ fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Resul
             if s.text_blob.is_some() && s.text.is_empty() {
                 continue;
             }
-            let blob = crate::crypto::encrypt(ck, s.text.as_bytes())?;
-            if crate::crypto::decrypt(ck, &blob)? != s.text.as_bytes() {
+            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
+            let blob = crate::crypto::encrypt(ck, s.text.as_bytes(), &aad)?;
+            if crate::crypto::decrypt(ck, &blob, &aad)? != s.text.as_bytes() {
                 return Err(AppError::Storage(
                     "transcript seal verification failed (segment blob mismatch)".into(),
                 ));
@@ -2143,8 +2304,9 @@ fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Resul
         // Timeline: encrypt the cached JSON (if any), verify, then seal (blank data).
         if let Some(tl) = state.db.raw_timeline(mid)? {
             if !(tl.data_blob.is_some() && tl.data.is_empty()) {
-                let blob = crate::crypto::encrypt(ck, tl.data.as_bytes())?;
-                if crate::crypto::decrypt(ck, &blob)? != tl.data.as_bytes() {
+                let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
+                let blob = crate::crypto::encrypt(ck, tl.data.as_bytes(), &aad)?;
+                if crate::crypto::decrypt(ck, &blob, &aad)? != tl.data.as_bytes() {
                     return Err(AppError::Storage(
                         "timeline seal verification failed (blob mismatch)".into(),
                     ));
@@ -2154,11 +2316,12 @@ fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Resul
         }
 
         // Audio: encrypt the plaintext WAV → <file>.enc (verify-before-destroy inside
-        // encrypt_file), then remove the plaintext and re-point audio_path at the .enc.
+        // encrypt_file), bound to (meeting|folder), then remove the plaintext and re-point
+        // audio_path at the .enc.
         if let Some(path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
             if !path.ends_with(ENC_SUFFIX) && std::path::Path::new(&path).exists() {
                 let enc_path = format!("{path}{ENC_SUFFIX}");
-                crate::crypto::encrypt_file(ck, std::path::Path::new(&path), std::path::Path::new(&enc_path))?;
+                crate::crypto::encrypt_file(ck, std::path::Path::new(&path), std::path::Path::new(&enc_path), &aad_audio(mid, folder_id))?;
                 // Only NOW (a verified .enc exists) is the plaintext safe to remove.
                 let _ = std::fs::remove_file(&path);
                 state.db.set_meeting_audio_path(mid, Some(&enc_path))?;
@@ -2176,14 +2339,16 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
     for mid in &meeting_ids {
         for s in state.db.raw_segments(mid)? {
             let Some(blob) = &s.text_blob else { continue };
-            let pt = crate::crypto::decrypt(ck, blob)?;
+            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
+            let pt = crate::crypto::decrypt(ck, blob, &aad)?;
             let text = String::from_utf8(pt)
                 .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
             state.db.restore_segment_text(mid, s.idx, &text)?;
         }
         if let Some(tl) = state.db.raw_timeline(mid)? {
             if let Some(blob) = &tl.data_blob {
-                let pt = crate::crypto::decrypt(ck, blob)?;
+                let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
+                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
                 let data = String::from_utf8(pt)
                     .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
                 state.db.restore_timeline_data(mid, &data)?;
@@ -2192,7 +2357,7 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
         if let Some(enc_path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
             if enc_path.ends_with(ENC_SUFFIX) {
                 let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain))?;
+                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain), &aad_audio(mid, folder_id))?;
                 state.db.set_meeting_audio_path(mid, Some(&plain))?;
             }
         }
@@ -2243,7 +2408,8 @@ fn unseal_folder_extras_permanent(
         // was session-unlocked and the blob is absent), then clear all blobs for the meeting.
         for s in state.db.raw_segments(&mid)? {
             if let Some(blob) = &s.text_blob {
-                let pt = crate::crypto::decrypt(ck, blob)?;
+                let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "segment");
+                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
                 let text = String::from_utf8(pt)
                     .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
                 state.db.restore_segment_text(&mid, s.idx, &text)?;
@@ -2253,7 +2419,8 @@ fn unseal_folder_extras_permanent(
 
         if let Some(tl) = state.db.raw_timeline(&mid)? {
             if let Some(blob) = &tl.data_blob {
-                let pt = crate::crypto::decrypt(ck, blob)?;
+                let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "timeline");
+                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
                 let data = String::from_utf8(pt)
                     .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
                 state.db.restore_timeline_data(&mid, &data)?;
@@ -2265,7 +2432,7 @@ fn unseal_folder_extras_permanent(
         if let Some(enc_path) = state.db.get_meeting(&mid)?.and_then(|m| m.audio_path) {
             if enc_path.ends_with(ENC_SUFFIX) {
                 let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain))?;
+                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain), &aad_audio(&mid, folder_id))?;
                 // Verified plaintext exists → safe to remove the .enc.
                 let _ = std::fs::remove_file(&enc_path);
                 state.db.set_meeting_audio_path(&mid, Some(&plain))?;
@@ -2306,6 +2473,68 @@ fn vault_path(state: &State<'_, AppState>) -> Option<String> {
         .ok()
         .and_then(|c| c.vault_path.clone())
         .filter(|p| !p.is_empty())
+}
+
+// ── D5 path containment: every vault FS op must stay inside the vault root ──────────────────────
+//
+// `create_folder` / `move_note_file` / `export_canvas` compose a vault-relative path from
+// user-influenced input (a folder name, a note filename). A crafted `..` segment or an absolute
+// component could otherwise escape the vault and write/overwrite an arbitrary file. These helpers
+// CANONICALIZE the candidate and assert it is contained in the canonicalized vault root BEFORE any
+// FS write, failing closed with `AppError::InvalidArg` on escape.
+
+/// Canonicalize `vault` and assert `candidate` (which may not yet exist) resolves INSIDE it. Returns
+/// the verified, vault-contained absolute path. Non-existent leaf components are allowed (the path is
+/// about to be created) — the deepest EXISTING ancestor is canonicalized (so symlinks are resolved)
+/// and the remaining components are appended after rejecting any `..` / root / prefix component that
+/// could climb out. The vault root itself must exist (it is the user-configured directory).
+fn assert_in_vault(vault: &std::path::Path, candidate: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
+    use std::path::Component;
+
+    let root = vault
+        .canonicalize()
+        .map_err(|e| AppError::InvalidArg(format!("vault path is not accessible: {e}")))?;
+
+    // Walk the candidate, splitting into the longest existing prefix (canonicalized) + a tail of
+    // not-yet-existing components. Reject any `..`/RootDir/Prefix in the candidate outright — a
+    // legitimate vault-relative target never needs to climb out of or re-anchor the path.
+    let mut resolved = root.clone();
+    // If the candidate is absolute, start from its root and let the containment check below decide;
+    // but still forbid `..` traversal. We rebuild purely from Normal components joined onto either
+    // the canonical existing ancestor or the vault root.
+    let mut existing = root.clone();
+    for comp in candidate.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let next = resolved.join(seg);
+                resolved = next;
+                // Track the deepest path that actually exists so we can canonicalize through
+                // symlinks for the portion on disk.
+                let probe = existing.join(seg);
+                if probe.exists() {
+                    existing = probe
+                        .canonicalize()
+                        .map_err(|e| AppError::InvalidArg(format!("resolve path component: {e}")))?;
+                }
+            }
+            Component::CurDir => {}
+            // `..`, an absolute root, or a Windows prefix could escape the vault — reject.
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::InvalidArg(
+                    "path must stay inside the vault (no '..' or absolute segments)".into(),
+                ));
+            }
+        }
+    }
+
+    // The canonicalized existing-prefix MUST be inside the vault root (defeats a symlink that points
+    // out of the vault), and the fully-resolved target likewise.
+    if !existing.starts_with(&root) || !resolved.starts_with(&root) {
+        return Err(AppError::InvalidArg(
+            "resolved path escapes the vault root".into(),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// (Re)start the voice-trigger listener if enabled — model present and not recording —
@@ -2407,5 +2636,88 @@ mod lock_read_gate_tests {
         let masked = masked_detail(meeting_with_audio(None));
         assert_eq!(masked.meeting.audio_path, None);
         assert!(masked.locked);
+    }
+
+    // ── D5 vault-containment (`assert_in_vault`) ────────────────────────────────────────────────
+
+    fn tmp_vault(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "murmur-vault-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn assert_in_vault_accepts_legit_relative_and_nonexistent_leaf() {
+        let vault = tmp_vault("ok");
+        // A not-yet-existing nested target inside the vault is allowed (it's about to be created).
+        let resolved = assert_in_vault(&vault, std::path::Path::new("Projects/Q3/note.md")).unwrap();
+        assert!(resolved.starts_with(vault.canonicalize().unwrap()), "stays inside the vault root");
+        // The empty path resolves to the vault root itself.
+        let root = assert_in_vault(&vault, std::path::Path::new("")).unwrap();
+        assert_eq!(root, vault.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[test]
+    fn assert_in_vault_rejects_parent_dir_traversal_and_absolute() {
+        let vault = tmp_vault("escape");
+        // `..` traversal that would climb out of the vault.
+        assert!(
+            assert_in_vault(&vault, std::path::Path::new("../../etc/passwd")).is_err(),
+            "must reject a '..' traversal"
+        );
+        // A `..` even mid-path is rejected outright.
+        assert!(
+            assert_in_vault(&vault, std::path::Path::new("Projects/../../secret")).is_err(),
+            "must reject any embedded '..'"
+        );
+        // An absolute path is rejected (re-anchors outside the vault).
+        assert!(
+            assert_in_vault(&vault, std::path::Path::new("/etc/passwd")).is_err(),
+            "must reject an absolute path"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[test]
+    fn assert_in_vault_rejects_symlink_escape() {
+        let vault = tmp_vault("symlink");
+        // A symlink INSIDE the vault that points OUTSIDE must not let a write escape.
+        let outside = std::env::temp_dir().join(format!("murmur-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = vault.join("escape-link");
+        #[cfg(unix)]
+        {
+            // Best-effort: if symlink creation fails (e.g. sandbox), skip the assertion.
+            if std::os::unix::fs::symlink(&outside, &link).is_ok() {
+                let res = assert_in_vault(&vault, std::path::Path::new("escape-link/evil.md"));
+                assert!(res.is_err(), "a symlink that points outside the vault must be rejected");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // ── B7/B8 AAD context-binding regression at the helper level (defense-in-depth over crypto::) ──
+
+    #[test]
+    fn content_aad_distinguishes_every_context_axis() {
+        // The five axes (folder, meeting, provider, record-type, schema-version) must each change
+        // the AAD so a blob cannot be swapped across any of them.
+        let base = aad_content("f", "m", "p", "note");
+        assert_ne!(base, aad_content("F", "m", "p", "note"), "folder axis binds");
+        assert_ne!(base, aad_content("f", "M", "p", "note"), "meeting axis binds");
+        assert_ne!(base, aad_content("f", "m", "P", "note"), "provider axis binds");
+        assert_ne!(base, aad_content("f", "m", "p", "segment"), "record-type axis binds");
+        // wrapped-CK and audio AADs are distinct namespaces from content.
+        assert_ne!(aad_wrapped_ck("f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
+        assert_ne!(aad_audio("m", "f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
     }
 }

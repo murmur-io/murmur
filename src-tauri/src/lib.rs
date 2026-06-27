@@ -55,6 +55,7 @@ pub fn run() {
             commands::update_note,
             commands::get_config,
             commands::save_config,
+            commands::consent_to_cloud_egress,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::provider_statuses,
@@ -148,19 +149,52 @@ pub fn run() {
             crate::screenshare::spawn(app.handle().clone());
             // Closing the main window HIDES it (recoverable from the tray) instead of
             // quitting — so the floating bar is never the only way back into the app.
+            // B12/C4: on a window close, relock all session-unlocked folders + zeroize the cached
+            // master KEK + checkpoint the WAL — even though the app keeps running in the tray, the
+            // unlocked content should not survive the user closing the window.
             if let Some(main) = app.get_webview_window("main") {
                 let w = main.clone();
+                let handle = app.handle().clone();
                 main.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
+                        relock_and_zeroize_on_lifecycle(&handle, "window-close");
                         let _ = w.hide();
                     }
                 });
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|handle, event| {
+            // B12/C4 app-quit hook: on ExitRequested, relock everything, zeroize the cached KEK, and
+            // checkpoint+truncate the WAL so no plaintext lingers past the process. This is the
+            // last-chance cleanup before the process tears down.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                relock_and_zeroize_on_lifecycle(handle, "app-exit");
+            }
+        });
+}
+
+/// Shared lifecycle cleanup (B12/C4): relock every session-unlocked folder (which re-blanks plaintext
+/// + zeroizes the cached master KEK) and checkpoint+truncate the WAL. Best-effort and panic-free —
+/// invoked from both the window-close and app-exit paths, where there is no Result to surface. No-op
+/// if AppState was never managed (the graceful-init failure path returns early without it).
+fn relock_and_zeroize_on_lifecycle(handle: &tauri::AppHandle, ctx: &str) {
+    use crate::state::AppState;
+    let Some(state) = handle.try_state::<AppState>() else {
+        return; // init failed / state not managed — nothing to clean up.
+    };
+    // relock_all_inner clears the unlock set, zeroizes the cached KEK, re-blanks all sealed notes,
+    // and (as of B12) checkpoints the WAL.
+    if let Err(e) = crate::commands::relock_all_inner(state.inner()) {
+        tracing::warn!(target: "lock", error = %e, ctx, "lifecycle relock_all failed");
+    }
+    // Belt-and-suspenders WAL checkpoint in case relock_all short-circuited before its own.
+    if let Err(e) = state.db.checkpoint_truncate() {
+        tracing::warn!(target: "lock", error = %e, ctx, "lifecycle wal_checkpoint(TRUNCATE) failed");
+    }
 }
 
 /// Startup-failure handler: AppState::init() returned Err. Show a clear, non-technical native
