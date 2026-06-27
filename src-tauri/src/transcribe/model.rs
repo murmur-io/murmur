@@ -69,6 +69,12 @@ pub fn vad_model_url(filename: &str) -> String {
 /// Uses `dirs::data_dir()` (e.g. `~/Library/Application Support` on macOS). The
 /// application identifier mirrors `tauri.conf.json` (`com.meetnotes.app`); we use the
 /// human-friendly `MeetNotes` folder name to match the rest of the app-data layout.
+///
+/// INTENTIONALLY SHARED across dev + release: unlike the DB + audio dirs (which split via
+/// `crate::state::app_dir_name` into `MeetNotes-dev` for dev), the models dir hard-codes
+/// `MeetNotes` so the ~3GB whisper model is downloaded ONCE and reused by every build. The model
+/// is not sensitive and is keyless, so there is no cross-build collision. Do NOT route this
+/// through `app_dir_name()`.
 pub fn models_dir() -> Result<PathBuf> {
     let base = dirs::data_dir()
         .ok_or_else(|| AppError::Transcribe("could not resolve app-data directory".into()))?;
