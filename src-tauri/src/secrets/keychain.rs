@@ -99,15 +99,30 @@ fn hex_to_key32(hex: &str) -> Option<[u8; 32]> {
 /// Build a keyring entry for `(SERVICE, account)`. `account` is the provider key name,
 /// e.g. "anthropic_api_key".
 fn entry(account: &str) -> Result<Entry> {
-    Entry::new(SERVICE, account)
-        .map_err(|e| AppError::Secrets(format!("failed to open keychain entry: {e}")))
+    Entry::new(SERVICE, account).map_err(|e| classify("open keychain entry", e))
+}
+
+/// Map a keyring error to a typed [`AppError`]. Runtime access failures — the user clicked
+/// "Deny" on the macOS keychain prompt, or the keychain is locked/unreachable — become
+/// [`AppError::KeychainDenied`] so startup can show a specific, recoverable message and exit
+/// cleanly instead of crashing. Everything else (malformed item, length, ambiguity) stays a
+/// generic [`AppError::Secrets`]. `NoEntry` is handled by callers (it means "not set", not error).
+/// The message carries only the platform error text — never the secret value — so it is safe to
+/// log under the no-PII rule.
+fn classify(ctx: impl std::fmt::Display, e: KeyringError) -> AppError {
+    match e {
+        KeyringError::PlatformFailure(_) | KeyringError::NoStorageAccess(_) => {
+            AppError::KeychainDenied(format!("{ctx}: {e}"))
+        }
+        other => AppError::Secrets(format!("{ctx}: {other}")),
+    }
 }
 
 /// Store/replace a secret in the macOS Keychain.
 pub fn set_secret(account: &str, secret: &str) -> Result<()> {
     entry(account)?
         .set_password(secret)
-        .map_err(|e| AppError::Secrets(format!("failed to set secret: {e}")))
+        .map_err(|e| classify("set secret", e))
 }
 
 /// Read a secret from the Keychain. `Ok(None)` if no entry exists (not an error).
@@ -115,7 +130,7 @@ pub fn get_secret(account: &str) -> Result<Option<String>> {
     match entry(account)?.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(KeyringError::NoEntry) => Ok(None),
-        Err(e) => Err(AppError::Secrets(format!("failed to get secret: {e}"))),
+        Err(e) => Err(classify("get secret", e)),
     }
 }
 
@@ -124,7 +139,7 @@ pub fn delete_secret(account: &str) -> Result<()> {
     match entry(account)?.delete_credential() {
         Ok(()) => Ok(()),
         Err(KeyringError::NoEntry) => Ok(()),
-        Err(e) => Err(AppError::Secrets(format!("failed to delete secret: {e}"))),
+        Err(e) => Err(classify("delete secret", e)),
     }
 }
 

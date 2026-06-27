@@ -33,8 +33,6 @@ pub fn run() {
         )
         .init();
 
-    let state = AppState::init().expect("failed to initialize app state");
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -47,7 +45,6 @@ pub fn run() {
                 })
                 .build(),
         )
-        .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::start_recording,
             commands::stop_recording,
@@ -110,6 +107,22 @@ pub fn run() {
             commands::remove_lock,
         ])
         .setup(|app| {
+            // Open the encrypted library FIRST. If it fails (keychain access denied, or the DB
+            // key doesn't match / the file is corrupt) we must NOT panic/abort — that is the
+            // v0.3.0 hard-crash. Instead show a friendly dialog and exit cleanly, leaving the DB
+            // and its backups untouched on disk.
+            let state = match AppState::init() {
+                Ok(s) => s,
+                Err(e) => {
+                    show_fatal_init_dialog(app.handle().clone(), &e);
+                    // Return Ok so the event loop spins: the dialog runs on a worker thread and
+                    // dispatches to the main run loop, then calls std::process::exit(1). We do NOT
+                    // run the rest of setup (windows/tray/MCP) without a valid AppState.
+                    return Ok(());
+                }
+            };
+            app.manage(state);
+
             create_bar_window(app.handle())?;
             if let Err(e) = app.global_shortcut().register(SUMMON_SHORTCUT) {
                 tracing::warn!(target: "shortcut", error = %e, "could not register global shortcut");
@@ -148,6 +161,63 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Startup-failure handler: AppState::init() returned Err. Show a clear, non-technical native
+/// dialog explaining that the encrypted library couldn't be opened, then exit cleanly with code 1
+/// — NEVER a Rust panic/abort (the v0.3.0 hard-crash). The two failure modes are distinguished in
+/// both the message and the log:
+///   (a) [`AppError::KeychainDenied`] — macOS refused keychain access (user clicked "Deny", or the
+///       keychain is locked).
+///   (b) anything else (storage / migration) — the DB couldn't be opened: the key doesn't match
+///       the data (e.g. restored from another Mac) or the file is damaged.
+/// This NEVER touches the database or its backups — it is a read-only, fail-safe exit path.
+fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError) {
+    use crate::error::AppError;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    const TITLE: &str = "Murmur can't open your library";
+
+    let (body, log_reason) = match err {
+        AppError::KeychainDenied(_) => (
+            "macOS didn't grant access to your keychain, so Murmur couldn't unlock its encrypted \
+             database.\n\nYour notes are safe and have not been changed. Please reopen Murmur and \
+             choose \"Always Allow\" when macOS asks for keychain access. If this keeps happening, \
+             contact support.",
+            "keychain access denied or unavailable",
+        ),
+        _ => (
+            "Murmur couldn't unlock its encrypted database. This can happen if the database key \
+             doesn't match the data on this Mac (for example after restoring from a backup or \
+             another computer) or if the file is damaged.\n\nYour notes have NOT been changed or \
+             deleted. Please reopen Murmur, and if this keeps happening, contact support.",
+            "database could not be opened (key mismatch / corruption)",
+        ),
+    };
+
+    // Technical detail goes to the log only (Display carries no PII / no secret material).
+    tracing::error!(target: "state", error = %err, reason = log_reason, "startup aborted: AppState::init failed");
+
+    // Hide the config-created main window so its webview can't flash a broken state behind the
+    // dialog (its commands would have no managed AppState).
+    if let Some(main) = handle.get_webview_window("main") {
+        let _ = main.hide();
+    }
+
+    // blocking_show() MUST run off the main thread — it dispatches the native dialog to the main
+    // run loop and blocks the caller, so calling it on the main thread would deadlock. Spawn a
+    // worker that shows the modal, then exits cleanly (code 1) once the user clicks OK.
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        handle
+            .dialog()
+            .message(body)
+            .title(TITLE)
+            .kind(MessageDialogKind::Error)
+            .buttons(MessageDialogButtons::Ok)
+            .blocking_show();
+        std::process::exit(1);
+    });
 }
 
 /// Create the always-on-top, frameless, transparent floating recorder bar (hidden until
