@@ -438,6 +438,20 @@ import type {
         </label>
       </div>
 
+      <!-- Smart transcription (VAD) — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Smart speech detection</span>
+            <span class="text-secondary toggle-sub">
+              Skips silence and resets context between pauses for cleaner, faster
+              transcripts (voice-activity detection). Recommended.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="vadEnabled" />
+        </label>
+      </div>
+
       <!-- Voice trigger — toggle row -->
       <div class="card">
         <label class="toggle-row">
@@ -1184,6 +1198,7 @@ export class SettingsComponent implements OnInit {
     claudeBinary: "claude",
     inputDevice: "",
     captureSystemAudio: false,
+    vadEnabled: true,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -1254,6 +1269,7 @@ export class SettingsComponent implements OnInit {
         claudeBinary: cfg.claudeBinary,
         inputDevice: cfg.inputDevice ?? "",
         captureSystemAudio: cfg.captureSystemAudio ?? false,
+        vadEnabled: cfg.vadEnabled ?? true,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
@@ -1295,6 +1311,7 @@ export class SettingsComponent implements OnInit {
       claudeBinary: v.claudeBinary,
       inputDevice: v.inputDevice || null,
       captureSystemAudio: v.captureSystemAudio,
+      vadEnabled: v.vadEnabled,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,

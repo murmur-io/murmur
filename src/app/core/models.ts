@@ -37,6 +37,7 @@ export interface AppConfigDto {
   claudeBinary: string;
   inputDevice: string | null;
   captureSystemAudio: boolean;
+  vadEnabled: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;

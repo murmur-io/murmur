@@ -130,6 +130,27 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
+/// In-place loudness normalisation for the 16 kHz ASR FEED ONLY — never the archive master
+/// (rec #6). A single scalar peak gain toward `TARGET_PEAK`, capped at `MAX_GAIN` so a
+/// near-silent buffer isn't amplified into noise, then hard-clamped to [-1, 1]. It only ever
+/// AMPLIFIES quiet audio (never attenuates loud speech) and has no attack/release, so it can't
+/// introduce pumping artefacts that would confuse the decoder.
+pub fn normalize_for_asr(samples: &mut [f32]) {
+    const TARGET_PEAK: f32 = 0.95;
+    const MAX_GAIN: f32 = 8.0;
+    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak <= 0.0 {
+        return;
+    }
+    let gain = (TARGET_PEAK / peak).min(MAX_GAIN);
+    if gain <= 1.0 {
+        return; // already at/above target — don't touch loud speech
+    }
+    for s in samples.iter_mut() {
+        *s = (*s * gain).clamp(-1.0, 1.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +171,30 @@ mod tests {
     #[test]
     fn zero_rate_is_error() {
         assert!(resample_to_16k(&[0.0], 0).is_err());
+    }
+
+    #[test]
+    fn normalize_amplifies_quiet_audio_capped() {
+        let mut s = vec![0.1f32, -0.05, 0.1];
+        normalize_for_asr(&mut s);
+        // peak 0.1 → ideal gain 9.5, capped at MAX_GAIN 8.0 → 0.1*8 = 0.8.
+        assert!((s[0] - 0.8).abs() < 1e-5, "got {}", s[0]);
+        assert!((s[1] + 0.4).abs() < 1e-5, "got {}", s[1]);
+    }
+
+    #[test]
+    fn normalize_leaves_loud_audio_untouched() {
+        let mut s = vec![0.98f32, -0.97, 0.5];
+        let orig = s.clone();
+        normalize_for_asr(&mut s);
+        assert_eq!(s, orig, "peak >= target must not change the buffer");
+    }
+
+    #[test]
+    fn normalize_silence_is_noop() {
+        let mut s = vec![0.0f32; 8];
+        normalize_for_asr(&mut s);
+        assert!(s.iter().all(|&v| v == 0.0));
     }
 
     #[test]
