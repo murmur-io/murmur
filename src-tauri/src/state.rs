@@ -29,8 +29,10 @@ pub struct AppState {
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
     /// thread shares the SAME set as the command surface.
     pub unlocked_folders: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Master KEK released by biometric; None until first unlock, zeroized on relock.
-    pub master_kek: Mutex<Option<[u8; 32]>>,
+    /// Master KEK released by biometric; None until first unlock, zeroized on relock. Held in a
+    /// `Zeroizing` so the bytes are wiped from RAM whenever the cached copy is dropped/replaced (C4),
+    /// in addition to the explicit `zeroize()` on relock-all.
+    pub master_kek: Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
 }
 
 impl AppState {
@@ -57,6 +59,13 @@ impl AppState {
     /// swap), then opens the keyed connection. A wrong/garbage key makes `Db::open_with_key` fail
     /// before any write, so the file is left unchanged.
     fn init_at(db_path: &std::path::Path, dek: &str) -> Result<Self> {
+        // B4 startup sweep: remove any PLAINTEXT-era `*.pre-encrypt.bak` snapshot an older build may
+        // have left in the app-data dir (the live at-rest leak this audit closes). Runs BEFORE the
+        // migration so the fresh KEYED backup that `encrypt_in_place` writes survives. LEAVES
+        // `*.session-encrypted.bak` untouched — those are ENCRYPTED user data, not a leak.
+        if let Some(dir) = db_path.parent() {
+            sweep_pre_encrypt_baks(dir);
+        }
         if crate::storage::migration::needs_encryption(db_path)? {
             tracing::info!(target: "state", "plaintext DB detected — encrypting at rest");
             crate::storage::migration::encrypt_in_place(db_path, dek)?;
@@ -86,6 +95,56 @@ impl AppState {
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
         Ok(dir.join(DB_FILE))
+    }
+}
+
+/// Does `path` start with the plaintext-SQLite magic ("SQLite format 3\0")? A SQLCipher-encrypted
+/// file begins with random salt, so the magic is absent. Used by the B4 sweep to delete ONLY the
+/// genuinely-plaintext recovery snapshots an older build leaked — never a keyed (encrypted) one.
+fn is_plaintext_sqlite_file(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 16];
+    matches!(f.read(&mut buf), Ok(16)) && &buf == b"SQLite format 3\0"
+}
+
+/// B4 startup sweep: delete every PLAINTEXT `*.pre-encrypt.bak` snapshot in `dir` (the live at-rest
+/// leak older builds wrote during migration). A `*.pre-encrypt.bak` that is KEYED/encrypted (the
+/// modern recovery copy) is LEFT IN PLACE — it is not a leak. `*.session-encrypted.bak` files are
+/// NEVER touched (they are encrypted user data). Best-effort: a failed remove is logged, not fatal.
+fn sweep_pre_encrypt_baks(dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Only `*.pre-encrypt.bak`. Explicitly skip `*.session-encrypted.bak` (encrypted user data).
+        if !name.ends_with(".pre-encrypt.bak") {
+            continue;
+        }
+        // Only remove the genuinely-plaintext leak; preserve a keyed recovery backup.
+        if !is_plaintext_sqlite_file(&path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::warn!(
+                target: "state",
+                "B4 sweep: removed a leaked plaintext pre-encrypt backup"
+            ),
+            Err(e) => tracing::warn!(
+                target: "state",
+                error = %e,
+                "B4 sweep: failed to remove a plaintext pre-encrypt backup"
+            ),
+        }
     }
 }
 
@@ -128,6 +187,92 @@ mod tests {
         crate::storage::migration::encrypt_in_place(path, GOOD_KEY).unwrap();
         // Fold any sidecar WAL/SHM into the main file so the byte-equality check below is stable.
         assert!(path.exists());
+    }
+
+    /// B4 sweep: a PLAINTEXT `*.pre-encrypt.bak` (the live at-rest leak older builds wrote) is
+    /// removed at startup; a KEYED (encrypted) `*.pre-encrypt.bak` and any `*.session-encrypted.bak`
+    /// (encrypted user data) are LEFT IN PLACE.
+    #[test]
+    fn b4_sweep_removes_plaintext_bak_keeps_encrypted_and_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (a) a genuinely-plaintext pre-encrypt backup → MUST be swept.
+        let plaintext_bak = dir.join("meetnotes.sqlite.pre-encrypt.bak");
+        {
+            let c = Connection::open(&plaintext_bak).unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);").unwrap();
+        }
+        assert!(is_plaintext_sqlite_file(&plaintext_bak), "fixture is plaintext");
+
+        // (b) a KEYED (encrypted) pre-encrypt backup → MUST be kept (not a leak).
+        let keyed_bak = dir.join("other.sqlite.pre-encrypt.bak");
+        {
+            let c = Connection::open(&keyed_bak).unwrap();
+            c.pragma_update(None, "key", "x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'").unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);").unwrap();
+        }
+        assert!(!is_plaintext_sqlite_file(&keyed_bak), "keyed backup is not plaintext");
+
+        // (c) a session-encrypted backup (encrypted user data) → MUST be kept regardless of content.
+        let session_bak = dir.join("meetnotes.sqlite.session-encrypted.bak");
+        std::fs::write(&session_bak, b"SQLite format 3\0 but this is session-encrypted user data").unwrap();
+
+        sweep_pre_encrypt_baks(&dir);
+
+        assert!(!plaintext_bak.exists(), "plaintext pre-encrypt backup must be swept (B4)");
+        assert!(keyed_bak.exists(), "a keyed pre-encrypt backup is encrypted at rest — keep it");
+        assert!(session_bak.exists(), "session-encrypted backups are user data — never swept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `encrypt_in_place` (run via `init_at`) must NEVER leave a plaintext `.pre-encrypt.bak` — the
+    /// recovery backup is keyed. After a full init, no plaintext bak exists in the dir.
+    #[test]
+    fn init_leaves_no_plaintext_pre_encrypt_bak() {
+        let p = tmp_path("nobak");
+        // Seed a PLAINTEXT db so init_at performs the migration (which writes the keyed backup).
+        {
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE meetings(id TEXT PRIMARY KEY, started_at TEXT, title TEXT);
+                 CREATE TABLE segments(meeting_id TEXT, idx INTEGER, text TEXT);
+                 CREATE TABLE notes(meeting_id TEXT, markdown TEXT);
+                 INSERT INTO meetings VALUES('m1','2026-07-01','Sync');
+                 PRAGMA user_version=7;",
+            )
+            .unwrap();
+        }
+        let _state = AppState::init_at(&p, GOOD_KEY).expect("init should encrypt + open");
+
+        // The main DB is now encrypted, and the recovery backup (if present) is NOT plaintext.
+        let bak = {
+            let mut s = p.as_os_str().to_os_string();
+            s.push(".pre-encrypt.bak");
+            PathBuf::from(s)
+        };
+        if bak.exists() {
+            let mut f = std::fs::File::open(&bak).unwrap();
+            use std::io::Read;
+            let mut buf = [0u8; 16];
+            let n = f.read(&mut buf).unwrap();
+            assert!(
+                !(n == 16 && &buf == b"SQLite format 3\0"),
+                "B4: init must never leave a PLAINTEXT pre-encrypt backup"
+            );
+        }
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&bak);
     }
 
     /// A wrong/garbage DEK must make `init_at` return `Err` (NOT panic) AND leave the on-disk

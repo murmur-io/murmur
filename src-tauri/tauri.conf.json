@@ -11,6 +11,7 @@
   },
   "app": {
     "macOSPrivateApi": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "Murmur",
@@ -19,10 +20,21 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; media-src 'self' asset:; object-src 'none'; frame-ancestors 'none'; connect-src 'self' ipc: http://ipc.localhost",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/Library/Application Support/MeetNotes/audio/**"]
+        "scope": {
+          "allow": [
+            "$HOME/Library/Application Support/MeetNotes/audio/*.wav"
+          ],
+          "deny": [
+            "$HOME/Library/Application Support/MeetNotes/audio/**/*.enc",
+            "$HOME/Library/Application Support/MeetNotes/audio/*.enc",
+            "$HOME/Library/Application Support/MeetNotes/audio/**/*.encrypting",
+            "$HOME/Library/Application Support/MeetNotes/audio/*.encrypting"
+          ],
+          "requireLiteralLeadingDot": false
+        }
       }
     }
   },

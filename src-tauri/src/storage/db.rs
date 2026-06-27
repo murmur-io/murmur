@@ -90,13 +90,22 @@ impl Db {
     /// the first statement on the connection, before any other PRAGMA or query.
     pub fn open_with_key(path: &Path, dek_hex: &str) -> Result<Self> {
         let conn = Connection::open(path).map_err(map_err)?;
-        // SQLCipher: key the connection FIRST (raw 32-byte key as a hex blob ⇒ no KDF).
-        conn.pragma_update(None, "key", format!("x'{dek_hex}'"))
+        // SQLCipher: key the connection FIRST (raw 32-byte key as a hex blob ⇒ no KDF). Hold the
+        // formatted `PRAGMA key` string in a Zeroizing buffer (C6) so the hex key is wiped from the
+        // stack as soon as the pragma runs — it is the most sensitive transient in this function.
+        let key_pragma = zeroize::Zeroizing::new(format!("x'{dek_hex}'"));
+        conn.pragma_update(None, "key", key_pragma.as_str())
             .map_err(map_err)?;
-        // Enforce FK cascades (segments/notes → meetings) and use WAL for
-        // concurrent reads while a write is in progress.
+        drop(key_pragma); // explicit: wipe the hex key string now.
+        // Harden SQLCipher's transient memory (B2/B10): keep temp tables / indices / materialized
+        // subqueries in RAM (never spilled to an unencrypted temp FILE), and have SQLCipher wipe its
+        // internal allocations (page buffers, KDF state) when freed. These MUST follow `PRAGMA key`
+        // on EVERY connection (the keyed handle is what they harden). Enforce FK cascades
+        // (segments/notes → meetings) and use WAL for concurrent reads while a write is in progress.
         conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
+            "PRAGMA cipher_memory_security = ON;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;",
         )
         .map_err(map_err)?;
@@ -235,6 +244,17 @@ impl Db {
         // A poisoned lock means a prior writer panicked mid-statement; recover the
         // guard so the DB stays usable rather than cascading the panic.
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// B12: fold the WAL back into the main DB and TRUNCATE the `-wal` sidecar. Called on relock-all
+    /// and on app quit so freshly-written-then-relocked plaintext does not linger in the unencrypted-
+    /// at-the-OS-level WAL longer than necessary (the WAL is SQLCipher-encrypted, but checkpointing
+    /// minimizes the window and shrinks the sidecar). Best-effort: a checkpoint failure (e.g. another
+    /// reader holds the WAL) is returned so the caller can log it, but is never fatal.
+    pub fn checkpoint_truncate(&self) -> Result<()> {
+        let conn = self.lock();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(map_err)
     }
 
     // ── meetings ────────────────────────────────────────────────────────────
@@ -2348,13 +2368,13 @@ mod lock_tests {
     /// row), seal. One blob per (meeting, provider) — distinct provider markdown must not collide.
     fn seal_folder(db: &Db, folder_id: &str, kek: &[u8; 32]) {
         let ck = crate::crypto::random_key().unwrap();
-        let wrapped = crate::crypto::encrypt(kek, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(kek, &ck, b"").unwrap();
         let notes = db.notes_in_folder(folder_id).unwrap();
         let mut blobs = Vec::new();
         for n in &notes {
-            let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes()).unwrap();
+            let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes(), b"").unwrap();
             // Verify decryptable BEFORE blanking (the command's atomicity rule).
-            assert_eq!(crate::crypto::decrypt(&ck, &blob).unwrap(), n.markdown.as_bytes());
+            assert_eq!(crate::crypto::decrypt(&ck, &blob, b"").unwrap(), n.markdown.as_bytes());
             blobs.push((n.meeting_id.clone(), n.provider_id.clone(), blob));
         }
         db.set_folder_locked(folder_id, true, Some(&wrapped)).unwrap();
@@ -2366,12 +2386,12 @@ mod lock_tests {
     /// Mirror of `unlock_folder`: KEK→unwrap CK→decrypt each blob back into ITS OWN row.
     fn session_unlock(db: &Db, folder_id: &str, kek: &[u8; 32]) {
         let wrapped = db.folder_wrapped_key(folder_id).unwrap().unwrap();
-        let ck_bytes = crate::crypto::decrypt(kek, &wrapped).unwrap();
+        let ck_bytes = crate::crypto::decrypt(kek, &wrapped, b"").unwrap();
         let ck: [u8; 32] = ck_bytes.as_slice().try_into().unwrap();
         let notes = db.notes_in_folder(folder_id).unwrap();
         for n in &notes {
             let blob = n.content_blob.as_ref().unwrap();
-            let pt = crate::crypto::decrypt(&ck, blob).unwrap();
+            let pt = crate::crypto::decrypt(&ck, blob, b"").unwrap();
             db.restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
                 .unwrap();
         }
@@ -2541,10 +2561,10 @@ mod lock_tests {
 
         // Mirror of remove_lock: KEK→unwrap CK→decrypt→restore plaintext→clear blob→unlock folder.
         let wrapped = db.folder_wrapped_key("f1").unwrap().unwrap();
-        let ck_bytes = crate::crypto::decrypt(&kek, &wrapped).unwrap();
+        let ck_bytes = crate::crypto::decrypt(&kek, &wrapped, b"").unwrap();
         let ck: [u8; 32] = ck_bytes.as_slice().try_into().unwrap();
         for n in db.notes_in_folder("f1").unwrap() {
-            let pt = crate::crypto::decrypt(&ck, n.content_blob.as_ref().unwrap()).unwrap();
+            let pt = crate::crypto::decrypt(&ck, n.content_blob.as_ref().unwrap(), b"").unwrap();
             let markdown = String::from_utf8(pt).unwrap();
             db.restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)
                 .unwrap();
@@ -2597,14 +2617,14 @@ mod lock_tests {
                 if s.text_blob.is_some() && s.text.is_empty() {
                     continue;
                 }
-                let blob = crate::crypto::encrypt(ck, s.text.as_bytes()).unwrap();
-                assert_eq!(crate::crypto::decrypt(ck, &blob).unwrap(), s.text.as_bytes());
+                let blob = crate::crypto::encrypt(ck, s.text.as_bytes(), b"").unwrap();
+                assert_eq!(crate::crypto::decrypt(ck, &blob, b"").unwrap(), s.text.as_bytes());
                 db.seal_segment(&mid, s.idx, &blob).unwrap();
             }
             // timeline
             if let Some(tl) = db.raw_timeline(&mid).unwrap() {
                 if !(tl.data_blob.is_some() && tl.data.is_empty()) {
-                    let blob = crate::crypto::encrypt(ck, tl.data.as_bytes()).unwrap();
+                    let blob = crate::crypto::encrypt(ck, tl.data.as_bytes(), b"").unwrap();
                     db.seal_timeline(&mid, &blob).unwrap();
                 }
             }
@@ -2616,6 +2636,7 @@ mod lock_tests {
                         ck,
                         std::path::Path::new(&path),
                         std::path::Path::new(&enc),
+                        b"",
                     )
                     .unwrap();
                     std::fs::remove_file(&path).unwrap();
@@ -2631,13 +2652,13 @@ mod lock_tests {
         for mid in db.meeting_ids_in_folder(folder_id).unwrap() {
             for s in db.raw_segments(&mid).unwrap() {
                 if let Some(blob) = &s.text_blob {
-                    let text = String::from_utf8(crate::crypto::decrypt(ck, blob).unwrap()).unwrap();
+                    let text = String::from_utf8(crate::crypto::decrypt(ck, blob, b"").unwrap()).unwrap();
                     db.restore_segment_text(&mid, s.idx, &text).unwrap();
                 }
             }
             if let Some(tl) = db.raw_timeline(&mid).unwrap() {
                 if let Some(blob) = &tl.data_blob {
-                    let data = String::from_utf8(crate::crypto::decrypt(ck, blob).unwrap()).unwrap();
+                    let data = String::from_utf8(crate::crypto::decrypt(ck, blob, b"").unwrap()).unwrap();
                     db.restore_timeline_data(&mid, &data).unwrap();
                 }
             }
@@ -2648,6 +2669,7 @@ mod lock_tests {
                         ck,
                         std::path::Path::new(&enc),
                         std::path::Path::new(&plain),
+                        b"",
                     )
                     .unwrap();
                     db.set_meeting_audio_path(&mid, Some(&plain)).unwrap();
@@ -2679,7 +2701,7 @@ mod lock_tests {
         seed_transcript_and_timeline(&db, "m1", &texts, timeline);
         let ck = crate::crypto::random_key().unwrap();
         // Wrap CK so the folder carries a real wrapped_key (parity with the command).
-        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
         db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
 
         // SEAL transcript + timeline.
@@ -2740,7 +2762,7 @@ mod lock_tests {
         db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy())).unwrap();
 
         let ck = crate::crypto::random_key().unwrap();
-        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
         db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
 
         // SEAL → .enc written, plaintext removed, audio_path re-pointed at the .enc.
@@ -2780,13 +2802,13 @@ mod lock_tests {
         seed_note(&db, "m1", "# secret note", Some("f1"));
         seed_transcript_and_timeline(&db, "m1", &["secret words"], r#"{"turns":[]}"#);
         let ck = crate::crypto::random_key().unwrap();
-        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
         db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
         seal_folder(&db, "f1", &kek); // seals the note (markdown)
         // Re-seal extras under the folder's own CK (unwrap the wrapped we just set is the SAME CK
         // the note seal used? No — seal_folder mints its OWN CK). Use the folder's wrapped CK.
         let folder_wrapped = db.folder_wrapped_key("f1").unwrap().unwrap();
-        let folder_ck: [u8; 32] = crate::crypto::decrypt(&kek, &folder_wrapped)
+        let folder_ck: [u8; 32] = crate::crypto::decrypt(&kek, &folder_wrapped, b"")
             .unwrap()
             .as_slice()
             .try_into()
@@ -2833,7 +2855,7 @@ mod lock_tests {
         std::fs::write(&wav, b"RIFF....WAVEfmt fake-pcm").unwrap();
         db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy())).unwrap();
         let ck = crate::crypto::random_key().unwrap();
-        let wrapped = crate::crypto::encrypt(&kek, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
         db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
         seal_extras(&db, "f1", &ck);
 
@@ -2952,11 +2974,11 @@ mod graph_tests {
     /// Mirror of `lock_folder`: encrypt each note into a content blob, blank markdown, seal.
     fn seal_folder(db: &Db, folder_id: &str, kek: &[u8; 32]) {
         let ck = crate::crypto::random_key().unwrap();
-        let wrapped = crate::crypto::encrypt(kek, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(kek, &ck, b"").unwrap();
         let notes = db.notes_in_folder(folder_id).unwrap();
         let mut blobs = Vec::new();
         for n in &notes {
-            let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes()).unwrap();
+            let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes(), b"").unwrap();
             blobs.push((n.meeting_id.clone(), n.provider_id.clone(), blob));
         }
         db.set_folder_locked(folder_id, true, Some(&wrapped)).unwrap();
