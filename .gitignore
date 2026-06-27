@@ -6,6 +6,7 @@
 .idea/
 .playwright-mcp/
 /settings-audio-controls.png
+.claude/worktrees/
 *.gguf
 *.wav
 *.mp4

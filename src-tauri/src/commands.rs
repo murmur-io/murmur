@@ -2122,6 +2122,11 @@ fn seal_moved_note(
     for p in exported_paths {
         let _ = std::fs::remove_file(&p);
     }
+    // The note's chunks/vectors are plaintext-derived and a dense embedding is invertible, so they
+    // must NOT survive at rest for a meeting now sealed into a locked folder — same invariant the
+    // lock_folder / relock / startup-reconcile paths enforce. Covers both the manual move-into-locked
+    // and the auto-file callers. (Re-indexed on unlock once indexing ships.)
+    state.db.purge_chunks_for_meetings(&[meeting_id.to_string()])?;
     Ok(())
 }
 
@@ -2261,6 +2266,15 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     seal_folder_extras(state, &folder_id, &ck)?;
     drop(kek); // explicit: KEK zeroized when this Zeroizing drops here.
     drop(ck); // explicit: CK zeroized after sealing all extras.
+
+    // Phase 2a LOCK-SAFETY: purge plaintext-derived semantic chunks + their (invertible) vectors
+    // for every meeting now sealed in this folder — a vector is PII derived from the plaintext, so
+    // it must not survive at rest in a locked folder. Done AFTER the seal so the index is dropped
+    // only once the recoverable blobs exist. Re-index-on-unlock is a separate later step; until it
+    // lands a locked-then-unlocked folder is simply not semantically searchable (degraded, not
+    // leaky).
+    let sealed_meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
+    state.db.purge_chunks_for_meetings(&sealed_meeting_ids)?;
 
     // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
     // lost content is not — so this is last).
