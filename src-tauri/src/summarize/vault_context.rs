@@ -22,7 +22,11 @@ fn budget_for(provider_id: &str) -> usize {
     if provider_id == "ollama" {
         4_000
     } else {
-        80_000
+        // Cited Ask: pack toward the model context window so more relevant notes (each kept under its
+        // `### [[Title]] · date · id:` header, so the answer can cite [[Title]]) fit. ~200k chars ≈
+        // 50k tokens, comfortably inside Claude's 200k-token window with room for the system prompt,
+        // chat history, and the answer. Still bounded so a huge vault can't blow the prompt.
+        200_000
     }
 }
 

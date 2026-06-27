@@ -234,6 +234,119 @@ impl Db {
         // masked DTO; they are export-only via gated commands.
         Self::add_column_if_missing(&conn, "meetings", "mic_master_path", "TEXT")?;
         Self::add_column_if_missing(&conn, "meetings", "sys_master_path", "TEXT")?;
+        // Phase 1 — FTS5/BM25 full-text retrieval over the three text sources
+        // (meeting titles, transcript segments, note markdown). Replaces the prior
+        // substring LIKE search so word-order/term retrieval works ("alpha beta" == "beta alpha")
+        // and ranking uses bm25(). SQLCipher is built with FTS5 compiled in (bundled-sqlcipher) —
+        // ZERO new deps. Runs on the same locked connection as the rest of migrate().
+        Self::migrate_fts(&conn)?;
+        Ok(())
+    }
+
+    /// Idempotent FTS5 setup: three external-content FTS tables (one per text source) kept in sync
+    /// by INSERT/UPDATE/DELETE triggers, plus a one-time backfill from existing rows.
+    ///
+    /// Why THREE external-content tables instead of one aggregate table: external-content FTS5
+    /// (`content='meetings'` / `content='segments'` / `content='notes'`) mirrors each base table's
+    /// implicit `rowid` 1:1, so the standard `_ai`/`_ad`/`_au` trigger trio keeps the index exact
+    /// with no re-aggregation and no manual rowid bookkeeping. Critically for the lock model: when a
+    /// folder is sealed, `seal_note`/`seal_segment` BLANK the plaintext column
+    /// (`UPDATE notes SET markdown=''` / `UPDATE segments SET text=''`). That UPDATE fires the `_au`
+    /// trigger, which deletes the OLD tokens from the FTS index and inserts the now-empty value — so
+    /// NO stale tokens of sealed content survive in the index. (Round-trip verified by
+    /// `sealed_tokens_purged_from_fts_after_blank`.)
+    ///
+    /// Tokenizer: `unicode61 remove_diacritics 2` — Unicode-aware word boundaries and full
+    /// diacritic folding (Unicode 6.1 NFD), so Polish ("zażółć"/"zazolc") and English fold/match
+    /// alike. `remove_diacritics 2` is the strict mode that strips diacritics even from combined
+    /// codepoints (the `1` mode misses some), which matters for Polish ł/ż/ó/ą/ę/ś/ć/ń/ź.
+    fn migrate_fts(conn: &Connection) -> Result<()> {
+        let already_built: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fts_meetings'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_meetings USING fts5(
+                 title,
+                 content='meetings',
+                 content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS fts_segments USING fts5(
+                 text,
+                 content='segments',
+                 content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(
+                 markdown,
+                 content='notes',
+                 content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+
+             -- meetings → fts_meetings (title only)
+             CREATE TRIGGER IF NOT EXISTS fts_meetings_ai AFTER INSERT ON meetings BEGIN
+                 INSERT INTO fts_meetings(rowid, title) VALUES (new.rowid, new.title);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_meetings_ad AFTER DELETE ON meetings BEGIN
+                 INSERT INTO fts_meetings(fts_meetings, rowid, title)
+                   VALUES ('delete', old.rowid, old.title);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_meetings_au AFTER UPDATE ON meetings BEGIN
+                 INSERT INTO fts_meetings(fts_meetings, rowid, title)
+                   VALUES ('delete', old.rowid, old.title);
+                 INSERT INTO fts_meetings(rowid, title) VALUES (new.rowid, new.title);
+             END;
+
+             -- segments → fts_segments (text). UPDATE fires on seal-blanking (text='') → stale
+             -- tokens deleted, empty value re-indexed: no sealed transcript survives the index.
+             CREATE TRIGGER IF NOT EXISTS fts_segments_ai AFTER INSERT ON segments BEGIN
+                 INSERT INTO fts_segments(rowid, text) VALUES (new.rowid, new.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_segments_ad AFTER DELETE ON segments BEGIN
+                 INSERT INTO fts_segments(fts_segments, rowid, text)
+                   VALUES ('delete', old.rowid, old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_segments_au AFTER UPDATE ON segments BEGIN
+                 INSERT INTO fts_segments(fts_segments, rowid, text)
+                   VALUES ('delete', old.rowid, old.text);
+                 INSERT INTO fts_segments(rowid, text) VALUES (new.rowid, new.text);
+             END;
+
+             -- notes → fts_notes (markdown). Same: seal-blanking (markdown='') purges note tokens.
+             CREATE TRIGGER IF NOT EXISTS fts_notes_ai AFTER INSERT ON notes BEGIN
+                 INSERT INTO fts_notes(rowid, markdown) VALUES (new.rowid, new.markdown);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_notes_ad AFTER DELETE ON notes BEGIN
+                 INSERT INTO fts_notes(fts_notes, rowid, markdown)
+                   VALUES ('delete', old.rowid, old.markdown);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_notes_au AFTER UPDATE ON notes BEGIN
+                 INSERT INTO fts_notes(fts_notes, rowid, markdown)
+                   VALUES ('delete', old.rowid, old.markdown);
+                 INSERT INTO fts_notes(rowid, markdown) VALUES (new.rowid, new.markdown);
+             END;",
+        )
+        .map_err(map_err)?;
+
+        // One-time backfill from existing rows (only the first time the FTS tables are created — on
+        // every later launch they already exist and the triggers have kept them current, so this is
+        // a no-op and `migrate()` stays idempotent).
+        if !already_built {
+            conn.execute_batch(
+                "INSERT INTO fts_meetings(rowid, title) SELECT rowid, title FROM meetings;
+                 INSERT INTO fts_segments(rowid, text) SELECT rowid, text FROM segments;
+                 INSERT INTO fts_notes(rowid, markdown) SELECT rowid, markdown FROM notes;",
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -405,36 +518,55 @@ impl Db {
     /// newest-first hits, each with a short snippet around the match. Case-insensitive.
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
         let q = query.trim();
-        if q.is_empty() {
+        let Some(match_expr) = fts_match_query(q) else {
             return Ok(Vec::new());
-        }
-        let like = format!("%{}%", escape_like(q));
+        };
         let conn = self.lock();
+        // FTS5/BM25 over the three sources. Each FTS table is external-content (its `rowid` == the
+        // base row's rowid), so we join the FTS rowid back to the owning meeting. A meeting can
+        // match in >1 source; we keep its BEST (lowest = most relevant) bm25 score and rank by it,
+        // tie-broken newest-first (mirrors the prior ORDER BY started_at DESC).
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
+                "WITH hits(meeting_id, rank) AS (
+                     SELECT m.id, bm25(fts_meetings)
+                       FROM fts_meetings
+                       JOIN meetings m ON m.rowid = fts_meetings.rowid
+                      WHERE fts_meetings MATCH ?1
+                     UNION ALL
+                     SELECT s.meeting_id, bm25(fts_segments)
+                       FROM fts_segments
+                       JOIN segments s ON s.rowid = fts_segments.rowid
+                      WHERE fts_segments MATCH ?1
+                     UNION ALL
+                     SELECT n.meeting_id, bm25(fts_notes)
+                       FROM fts_notes
+                       JOIN notes n ON n.rowid = fts_notes.rowid
+                      WHERE fts_notes MATCH ?1
+                 ),
+                 ranked(meeting_id, rank) AS (
+                     SELECT meeting_id, MIN(rank) FROM hits GROUP BY meeting_id
+                 )
+                 SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
                         m.audio_path, m.status, \
                         (SELECT nf.folder_id FROM notes nf \
                           WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
                           AS folder_id
-                   FROM meetings m
-                   LEFT JOIN segments s ON s.meeting_id = m.id
-                   LEFT JOIN notes n ON n.meeting_id = m.id
-                  WHERE m.title LIKE ?1 ESCAPE '\\'
-                     OR s.text LIKE ?1 ESCAPE '\\'
-                     OR n.markdown LIKE ?1 ESCAPE '\\'
-                  ORDER BY m.started_at DESC, m.id DESC
+                   FROM ranked r
+                   JOIN meetings m ON m.id = r.meeting_id
+                  ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
                   LIMIT ?2",
             )
             .map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![like, limit], row_to_meeting)
+            .query_map(rusqlite::params![match_expr, limit], row_to_meeting)
             .map_err(map_err)?;
         let mut meetings = Vec::new();
         for r in rows {
             meetings.push(r.map_err(map_err)??);
         }
 
+        let like = format!("%{}%", escape_like(q));
         let mut hits = Vec::with_capacity(meetings.len());
         for m in meetings {
             let (snippet, matched_in) = search_snippet(&conn, &m, q, &like)?;
@@ -1525,37 +1657,64 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<SearchHit>> {
         let q = query.trim();
-        if q.is_empty() {
+        let Some(match_expr) = fts_match_query(q) else {
             return Ok(Vec::new());
-        }
-        let like = format!("%{}%", escape_like(q));
+        };
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
+        // FTS5/BM25 candidates (same UNION/MIN(bm25) ranking as `search`), THEN gated by exactly the
+        // prior visibility predicate so a sealed-and-not-session-unlocked meeting is excluded: keep
+        // a meeting iff it has NO note rows, OR it has at least one VISIBLE note row (folder
+        // NULL/open OR session-unlocked). This mirrors the old LEFT JOIN notes/folders + {visible}
+        // WHERE — and is defense-in-depth on top of seal-blanking + the FTS `_au` purge: even if a
+        // stale token somehow survived in the index, a sealed-not-unlocked meeting can never pass
+        // this clause. (Note's text content is itself purged from fts_notes on blanking, so it can't
+        // even produce a candidate.)
         let sql = format!(
-            "SELECT DISTINCT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
+            "WITH hits(meeting_id, rank) AS (
+                 SELECT m.id, bm25(fts_meetings)
+                   FROM fts_meetings
+                   JOIN meetings m ON m.rowid = fts_meetings.rowid
+                  WHERE fts_meetings MATCH ?1
+                 UNION ALL
+                 SELECT s.meeting_id, bm25(fts_segments)
+                   FROM fts_segments
+                   JOIN segments s ON s.rowid = fts_segments.rowid
+                  WHERE fts_segments MATCH ?1
+                 UNION ALL
+                 SELECT n.meeting_id, bm25(fts_notes)
+                   FROM fts_notes
+                   JOIN notes n ON n.rowid = fts_notes.rowid
+                  WHERE fts_notes MATCH ?1
+             ),
+             ranked(meeting_id, rank) AS (
+                 SELECT meeting_id, MIN(rank) FROM hits GROUP BY meeting_id
+             )
+             SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
                     m.audio_path, m.status, \
                     (SELECT nf.folder_id FROM notes nf \
                       WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
                       AS folder_id
-               FROM meetings m
-               LEFT JOIN segments s ON s.meeting_id = m.id
-               LEFT JOIN notes n ON n.meeting_id = m.id
-               LEFT JOIN folders f ON f.id = n.folder_id
-              WHERE (m.title LIKE ?1 ESCAPE '\\'
-                  OR s.text LIKE ?1 ESCAPE '\\'
-                  OR n.markdown LIKE ?1 ESCAPE '\\')
-                AND {visible}
-              ORDER BY m.started_at DESC, m.id DESC
+               FROM ranked r
+               JOIN meetings m ON m.id = r.meeting_id
+              WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                 OR EXISTS (
+                      SELECT 1 FROM notes n
+                       LEFT JOIN folders f ON f.id = n.folder_id
+                       WHERE n.meeting_id = m.id AND {visible}
+                    )
+              ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
               LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![like, limit], row_to_meeting)
+            .query_map(rusqlite::params![match_expr, limit], row_to_meeting)
             .map_err(map_err)?;
         let mut meetings = Vec::new();
         for r in rows {
             meetings.push(r.map_err(map_err)??);
         }
+        let like = format!("%{}%", escape_like(q));
         let mut hits = Vec::with_capacity(meetings.len());
         for m in meetings {
             let (snippet, matched_in) = search_snippet(&conn, &m, q, &like)?;
@@ -2103,6 +2262,42 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
+/// Build a SAFE FTS5 `MATCH` expression from a raw user query.
+///
+/// FTS5's MATCH grammar treats bare `"`, `*`, `(`, `:`, `^`, `AND`/`OR`/`NOT`, etc. as operators,
+/// so feeding raw user text into MATCH can raise "fts5: syntax error near …" and crash the query.
+/// We defuse that completely: split the input into Unicode-alphanumeric tokens, drop everything
+/// else (punctuation/operators), wrap EACH token in double quotes (an FTS5 string literal — never
+/// an operator), and join with implicit AND (whitespace). The result is a conjunction of literal
+/// terms, so word ORDER is irrelevant ("alpha beta" matches the same docs as "beta alpha"), and
+/// empty / punctuation-only input yields `None` (→ caller returns no hits, never errors).
+///
+/// A double-quote inside a token is itself escaped by doubling it (`"` → `""`), per FTS5 quoting.
+fn fts_match_query(q: &str) -> Option<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in q.chars() {
+        if ch.is_alphanumeric() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            terms.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        terms.push(cur);
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    Some(
+        terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// Build a `(snippet, matched_in)` pair for a search hit, reusing the open connection.
 fn search_snippet(
     conn: &Connection,
@@ -2174,12 +2369,31 @@ fn excerpt(text: &str, q: &str) -> String {
 
 #[cfg(test)]
 mod search_helper_tests {
-    use super::{escape_like, excerpt};
+    use super::{escape_like, excerpt, fts_match_query};
 
     #[test]
     fn escape_like_escapes_wildcards() {
         // '%' → '\%', '_' → '\_', '\' → '\\'
         assert_eq!(escape_like("a%b_c\\d"), "a\\%b\\_c\\\\d");
+    }
+
+    #[test]
+    fn fts_match_query_quotes_terms_and_drops_operators() {
+        // Each alnum token becomes a quoted literal joined by implicit-AND whitespace.
+        assert_eq!(fts_match_query("alpha beta"), Some("\"alpha\" \"beta\"".into()));
+        // Order is just term order; the conjunction is order-independent at the SQL level.
+        assert_eq!(fts_match_query("beta alpha"), Some("\"beta\" \"alpha\"".into()));
+        // FTS5 operators / punctuation are stripped, leaving only the literal terms.
+        assert_eq!(
+            fts_match_query("a* b\"c( AND d:e"),
+            Some("\"a\" \"b\" \"c\" \"AND\" \"d\" \"e\"".into())
+        );
+        // Unicode (Polish) is alphanumeric → preserved as a quoted term.
+        assert_eq!(fts_match_query("budżet!"), Some("\"budżet\"".into()));
+        // Empty / punctuation-only → None (caller returns no hits, never errors MATCH).
+        assert_eq!(fts_match_query(""), None);
+        assert_eq!(fts_match_query("   "), None);
+        assert_eq!(fts_match_query("\"*():^"), None);
     }
 
     #[test]
@@ -2538,6 +2752,177 @@ mod tests {
         // Clearing the folder (move to root) clears it for every provider row.
         db.set_meeting_folder("m1", None).unwrap();
         assert_eq!(db.get_meeting("m1").unwrap().unwrap().folder_id, None);
+    }
+
+    // ── Phase 1: FTS5/BM25 retrieval ──────────────────────────────────────────
+
+    /// RED-on-LIKE / GREEN-on-FTS: a doc containing BOTH terms is returned for either word order.
+    /// The old `LIKE '%alpha beta%'` only matched the contiguous substring, so "beta alpha" missed
+    /// it. FTS5 indexes per-token, so order is irrelevant — both queries return the meeting.
+    #[test]
+    fn fts_word_order_symmetry() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "the alpha and the beta of the plan");
+
+        let fwd = db.search("alpha beta", 50).unwrap();
+        assert!(
+            fwd.iter().any(|h| h.meeting.id == "m1"),
+            "'alpha beta' must match the note containing both terms"
+        );
+        let rev = db.search("beta alpha", 50).unwrap();
+        assert!(
+            rev.iter().any(|h| h.meeting.id == "m1"),
+            "'beta alpha' must ALSO match (word order is irrelevant under FTS5) — this is the bug \
+             the old LIKE substring search had"
+        );
+    }
+
+    /// Punctuation-only / empty queries must not crash the FTS MATCH parser — they yield no hits.
+    #[test]
+    fn fts_punctuation_and_empty_queries_are_safe() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "quarterly planning notes");
+        // Operators / punctuation that would be FTS5 syntax if passed raw.
+        for q in ["", "   ", "\"", "*", "AND OR NOT", "(", ":", "^foo", "a* b\"c("] {
+            let hits = db.search(q, 50);
+            assert!(hits.is_ok(), "query {q:?} must not error the FTS parser");
+        }
+        // A real term inside punctuation still matches.
+        let hits = db.search("(planning)", 50).unwrap();
+        assert!(hits.iter().any(|h| h.meeting.id == "m1"));
+    }
+
+    /// Sealed exclusion under FTS: a sealed-and-NOT-session-unlocked meeting does NOT appear in
+    /// `search_visible` MATCH results, and once its note plaintext is blanked, its tokens are gone
+    /// from the FTS index (the `_au` trigger purged them on the blanking UPDATE).
+    #[test]
+    fn fts_sealed_meeting_excluded_and_tokens_purged() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "sealed", "claude_code", "ACQUISITION zarządzanie tajemnica");
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+
+        // Sanity: before sealing, with the folder session-unlocked it IS findable.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let pre = db.search_visible("ACQUISITION", 50, &unlocked).unwrap();
+        assert!(pre.iter().any(|h| h.meeting.id == "sealed"));
+
+        // Seal: blank the plaintext markdown (what seal_note does). The `_au` trigger re-syncs FTS.
+        db.seal_note("sealed", "claude_code", b"ciphertext-not-real")
+            .unwrap();
+
+        // (a) NOT in search_visible when NOT session-unlocked (empty set).
+        let nothing = std::collections::HashSet::new();
+        let hidden = db.search_visible("ACQUISITION", 50, &nothing).unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed-not-unlocked meeting leaked into search_visible MATCH results"
+        );
+
+        // (b) The token is GONE from the raw FTS note index after blanking (no stale plaintext).
+        let raw_match: i64 = {
+            let conn = db.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM fts_notes WHERE fts_notes MATCH 'ACQUISITION'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            raw_match, 0,
+            "sealed note's tokens must be purged from the FTS index after blanking"
+        );
+
+        // (c) Even with the folder session-unlocked, the now-blanked plaintext is no longer in the
+        // index, so the term doesn't match — consistent with the at-rest sealed state (the real
+        // content only returns after unlock decrypts content_blob back into markdown, which
+        // re-fires the FTS trigger).
+        let post = db.search_visible("ACQUISITION", 50, &unlocked).unwrap();
+        assert!(!post.iter().any(|h| h.meeting.id == "sealed"));
+    }
+
+    /// Lock-GATE (not token-purge) closes the FTS title path. A meeting's TITLE is NOT blanked on
+    /// seal — the real title stays plaintext-at-rest in `meetings.title` — so its title token
+    /// survives in `fts_meetings` and still produces an FTS candidate after sealing. The
+    /// `search_visible` visibility predicate, not the `_au` trigger, is what must exclude a
+    /// sealed-and-not-session-unlocked meeting matched by its title. (Closes the coverage gap the
+    /// lock-security review flagged: every prior sealed-exclusion test matched via the note branch
+    /// and/or relied on token-purge with a never-actually-locked folder.)
+    #[test]
+    fn fts_sealed_meeting_title_match_excluded_by_gate() {
+        let db = mem_db();
+        let kek = [7u8; 32];
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&Meeting {
+            id: "titled".to_string(),
+            started_at: "2026-06-24T10:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Zebra Quarterly Sync".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        note_for(&db, "titled", "claude_code", "innocuous body text");
+        db.set_note_folder("titled", Some("f-locked")).unwrap();
+
+        // Sanity (folder not yet locked): the title token is findable with an empty unlock set.
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.search_visible("Zebra", 50, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.meeting.id == "titled"),
+            "title token should be findable before the folder is locked"
+        );
+
+        // Lock the folder (locked=1) + seal the note (blank markdown). The TITLE stays plaintext.
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
+        db.set_folder_locked("f-locked", true, Some(&wrapped)).unwrap();
+        let blob = crate::crypto::encrypt(&ck, b"innocuous body text", b"").unwrap();
+        db.seal_note("titled", "claude_code", &blob).unwrap();
+
+        // The title token IS still present in the raw FTS meetings index (titles are not blanked) —
+        // so exclusion CANNOT come from token-purge here; it must come from the visibility gate.
+        let title_in_index: i64 = {
+            let conn = db.lock();
+            conn.query_row(
+                "SELECT COUNT(*) FROM fts_meetings WHERE fts_meetings MATCH 'Zebra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            title_in_index, 1,
+            "sealed meeting's plaintext title token must remain in the FTS index (titles aren't blanked)"
+        );
+
+        // GATE must exclude it with an empty unlock set, despite the surviving title token.
+        let hidden = db.search_visible("Zebra", 50, &nothing).unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "titled"),
+            "sealed-not-unlocked meeting leaked via its plaintext TITLE token through the FTS gate"
+        );
+
+        // Session-unlocking the folder admits it again (title still matches).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db.search_visible("Zebra", 50, &unlocked).unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "titled"),
+            "session-unlocked sealed meeting should be findable by its title again"
+        );
     }
 }
 
