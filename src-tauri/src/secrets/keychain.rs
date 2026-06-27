@@ -69,7 +69,7 @@ pub fn get_or_create_db_dek() -> Result<String> {
 /// a Mac without Touch ID is never locked out; accessibility
 /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`). Reading that item makes macOS present the Touch
 /// ID sheet directly — with the supplied `reason` string — and return the key on success. THAT
-/// single sheet IS the unlock auth: the caller must NOT also call [`crate::biometric::authenticate`]
+/// single sheet IS the unlock auth: the caller must NOT also run a separate biometric prompt
 /// (doing so would double-prompt). `reason` is shown verbatim on the sheet (e.g. "Unlock this
 /// folder").
 ///
@@ -86,7 +86,7 @@ pub fn get_or_create_master_kek() -> Result<[u8; 32]> {
 
 /// As [`get_or_create_master_kek`], but the `reason` string is shown verbatim on the Touch ID /
 /// passcode sheet that the biometric-gated keychain read presents (e.g. "Unlock this folder").
-/// THAT sheet is the unlock auth — do NOT also call [`crate::biometric::authenticate`].
+/// THAT sheet is the unlock auth — do NOT also run a separate biometric prompt.
 pub fn get_or_create_master_kek_with_reason(reason: &str) -> Result<[u8; 32]> {
     // Dev-only escape hatch mirroring MURMUR_DEV_DEK, but a SEPARATE env var so the at-rest DEK
     // and the lock KEK can be fixed independently in tests/dev. Returns FIRST so dev needs no Touch
