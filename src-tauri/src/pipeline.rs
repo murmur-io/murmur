@@ -206,19 +206,23 @@ async fn run_inner(
         let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
         if let Err(e) = audio::write_wav_f32(&mic_master, &samples, src_rate, 1) {
             tracing::warn!(target: "audio", error = %e, "mic master write failed");
-        } else {
-            state
-                .db
-                .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))?;
+        } else if let Err(e) = state
+            .db
+            .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))
+        {
+            // Best-effort: a stranded, untracked master plaintext is unreferenced + ungated-out;
+            // never fail the recording over it.
+            tracing::warn!(target: "audio", error = %e, "persisting mic master path failed");
         }
         if let Some((sys, sys_rate)) = &sys_native {
             let sys_master = wav_dir.join(format!("{meeting_id}.sys.wav"));
             if let Err(e) = audio::write_wav_f32(&sys_master, sys, *sys_rate, 1) {
                 tracing::warn!(target: "audio", error = %e, "system master write failed");
-            } else {
-                state
-                    .db
-                    .set_meeting_sys_master_path(meeting_id, Some(sys_master.to_string_lossy().as_ref()))?;
+            } else if let Err(e) = state
+                .db
+                .set_meeting_sys_master_path(meeting_id, Some(sys_master.to_string_lossy().as_ref()))
+            {
+                tracing::warn!(target: "audio", error = %e, "persisting system master path failed");
             }
         }
     }
