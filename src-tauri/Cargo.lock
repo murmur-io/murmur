@@ -2212,13 +2212,14 @@ dependencies = [
 
 [[package]]
 name = "murmur"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
  "block2",
  "chrono",
+ "core-foundation 0.10.1",
  "cpal",
  "dirs 5.0.1",
  "getrandom 0.2.17",
@@ -2234,6 +2235,8 @@ dependencies = [
  "reqwest 0.12.28",
  "rubato",
  "rusqlite",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tauri",

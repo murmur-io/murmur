@@ -26,6 +26,14 @@ pub enum AppError {
     /// show a specific, non-technical message instead of crashing.
     #[error("keychain access denied: {0}")]
     KeychainDenied(String),
+    /// The biometric-gated master KEK read was cancelled or failed at the Touch ID / passcode sheet
+    /// (the user pressed Cancel, the prompt timed out, or `errSecUserCanceled` / `errSecAuthFailed`
+    /// came back from `SecItemCopyMatching`). Distinct from [`AppError::KeychainDenied`] (the legacy
+    /// password-prompt deny) so the unlock flow can show "Touch ID was cancelled — try again" rather
+    /// than a generic keychain error, and from [`AppError::Auth`] so callers can tell a presence
+    /// failure from an internal auth bug. Carries only the OSStatus / context — never the key value.
+    #[error("biometric authentication failed or was cancelled: {0}")]
+    BiometricFailed(String),
     #[error("config error: {0}")]
     Config(String),
     #[error("provider unavailable: {0}")]
