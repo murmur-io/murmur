@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -24,6 +24,11 @@ struct Shared {
     /// corrupt the wall-clock merge). Privacy is preserved: no real mic audio is captured while
     /// muted.
     muted: AtomicBool,
+    /// Host wall-clock instant captured in the FIRST cpal data callback — the true
+    /// capture-start anchor for the wall-clock merge. Anchoring here (rather than after the
+    /// stream "ready" signal) drops the thread-spawn + stream-build latency from the offset.
+    /// Set exactly once; later callbacks leave it untouched.
+    first_frame: OnceLock<std::time::Instant>,
 }
 
 impl Shared {
@@ -32,6 +37,7 @@ impl Shared {
             samples: Mutex::new(Vec::new()),
             peak: AtomicU32::new(0),
             muted: AtomicBool::new(false),
+            first_frame: OnceLock::new(),
         }
     }
 
@@ -92,7 +98,7 @@ impl Recorder {
     /// Open the default input device and start capturing on a dedicated thread.
     /// Non-blocking: returns once the stream is built and playing (or with the build
     /// error surfaced from the capture thread).
-    pub fn start() -> Result<Self> {
+    pub fn start(device_name: Option<String>) -> Result<Self> {
         let shared = Arc::new(Shared::new());
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<StartInfo>>();
@@ -100,7 +106,7 @@ impl Recorder {
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("meetnotes-audio-capture".into())
-            .spawn(move || capture_thread(thread_shared, stop_rx, ready_tx))
+            .spawn(move || capture_thread(thread_shared, device_name, stop_rx, ready_tx))
             .map_err(|e| AppError::Audio(format!("failed to spawn capture thread: {e}")))?;
 
         // Wait for the thread to report stream-build success/failure.
@@ -121,9 +127,9 @@ impl Recorder {
         Ok(Self {
             shared,
             source_sample_rate: info.source_sample_rate,
-            // Anchor right after the stream reports ready (i.e. capture is live). The few-ms gap
-            // between the device actually opening and this line is negligible against the
-            // seconds/hour cross-clock drift this anchoring exists to defeat.
+            // Fallback anchor: the moment the stream reported ready. `started_at()` prefers the
+            // first-frame instant captured in the data callback (tighter); this is used only if
+            // no frame ever arrived (e.g. a dead device).
             started_at: std::time::Instant::now(),
             stop_tx,
             thread: Some(thread),
@@ -166,8 +172,14 @@ impl Recorder {
     }
 
     /// Host wall-clock instant when this stream's capture started (for the wall-clock merge).
+    /// Prefers the instant captured in the FIRST data callback (true capture start); falls back
+    /// to the stream-ready instant if no frame ever arrived.
     pub fn started_at(&self) -> std::time::Instant {
-        self.started_at
+        self.shared
+            .first_frame
+            .get()
+            .copied()
+            .unwrap_or(self.started_at)
     }
 
     /// Live-toggle the mic mute mid-recording (no stream teardown). While muted the cpal data
@@ -207,10 +219,11 @@ impl Drop for Recorder {
 /// a stop signal arrives. The `Stream` lives only here and is dropped on the way out.
 fn capture_thread(
     shared: Arc<Shared>,
+    device_name: Option<String>,
     stop_rx: Receiver<()>,
     ready_tx: Sender<Result<StartInfo>>,
 ) {
-    let built = build_and_play(&shared);
+    let built = build_and_play(&shared, device_name.as_deref());
     match built {
         Ok((stream, info)) => {
             // Notify the owner the stream is live; keep the stream alive on this thread.
@@ -233,13 +246,34 @@ fn capture_thread(
     }
 }
 
+/// Pick the input device: the saved device by name if it's present and still available,
+/// otherwise the system default. Device names are PII-adjacent — never log them.
+fn select_input_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
+    if let Some(want) = name {
+        if let Ok(devices) = host.input_devices() {
+            for d in devices {
+                if d.name().map(|n| n == want).unwrap_or(false) {
+                    return Ok(d);
+                }
+            }
+        }
+        tracing::warn!(
+            target: "audio",
+            "saved input device unavailable; falling back to the default device"
+        );
+    }
+    host.default_input_device()
+        .ok_or_else(|| AppError::Audio("no default input device available".into()))
+}
+
 /// Build + start the input stream on the current thread, returning it plus the source
 /// sample rate.
-fn build_and_play(shared: &Arc<Shared>) -> Result<(cpal::Stream, StartInfo)> {
+fn build_and_play(
+    shared: &Arc<Shared>,
+    device_name: Option<&str>,
+) -> Result<(cpal::Stream, StartInfo)> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| AppError::Audio("no default input device available".into()))?;
+    let device = select_input_device(&host, device_name)?;
 
     let supported = device
         .default_input_config()
@@ -322,6 +356,11 @@ where
     T: Sample,
     f32: cpal::FromSample<T>,
 {
+    // Anchor the capture timeline on the first frame we ever see (set once; later frames leave
+    // it). This is the true capture start the wall-clock merge anchors to (rec #7).
+    if shared.first_frame.get().is_none() {
+        let _ = shared.first_frame.set(std::time::Instant::now());
+    }
     let channels = channels.max(1);
     let frame_count = data.len() / channels;
 
@@ -352,6 +391,31 @@ where
     if let Ok(mut buf) = shared.samples.lock() {
         buf.extend_from_slice(&mono);
     }
+}
+
+/// Lightweight description of an input device for the FE device picker.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Enumerate available input devices by name and flag the system default. Best-effort: an
+/// empty list if enumeration fails. Names are surfaced only in the picker UI (never logged).
+pub fn list_input_devices() -> Vec<InputDeviceInfo> {
+    let host = cpal::default_host();
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
+    let mut out = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for d in devices {
+            if let Ok(name) = d.name() {
+                let is_default = default_name.as_deref() == Some(name.as_str());
+                out.push(InputDeviceInfo { name, is_default });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -404,5 +468,21 @@ mod tests {
         accumulate_frames(&shared, &[0.5f32], 1);
         let buf = shared.samples.lock().unwrap();
         assert_eq!(&*buf, &[0.0f32, 0.5f32], "silence then real audio after unmute");
+    }
+
+    /// The capture-start anchor is taken from the FIRST frame callback and set exactly once —
+    /// later callbacks never move it (rec #7: tighten the merge anchor to true capture start).
+    #[test]
+    fn first_frame_anchor_is_set_once() {
+        let shared = Arc::new(Shared::new());
+        assert!(shared.first_frame.get().is_none(), "unset before any frame");
+        accumulate_frames(&shared, &[0.1f32], 1);
+        let first = *shared.first_frame.get().expect("set after the first frame");
+        accumulate_frames(&shared, &[0.2f32], 1);
+        assert_eq!(
+            *shared.first_frame.get().unwrap(),
+            first,
+            "anchor must never move after the first frame"
+        );
     }
 }
