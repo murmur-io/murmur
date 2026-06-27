@@ -80,7 +80,12 @@ impl SystemAudioRecorder {
         let bin = select_helper(app)
             .ok_or_else(|| AppError::Audio("no system-audio helper available".into()))?;
         let mut cmd = Command::new(&bin);
+        // Pass the protocol's optional `[maxSeconds]` so the helper self-limits to the SAME hard
+        // cap as the cpal mic (`recorder::MAX_RECORDING_SECONDS`): if the app is killed without a
+        // clean SIGTERM, an orphaned sidecar still stops itself instead of writing a system-audio
+        // WAV unbounded. The two streams therefore cap together and stay length-aligned.
         cmd.arg(&wav_path)
+            .arg(crate::audio::recorder::MAX_RECORDING_SECONDS.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());

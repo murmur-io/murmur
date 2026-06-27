@@ -22,6 +22,34 @@ pub struct PipelineResult {
 const APP_DIR: &str = "MeetNotes";
 const AUDIO_SUBDIR: &str = "audio";
 
+/// RAII guard that deletes a transient sidecar scratch WAV (AEC mic / system-audio) when it
+/// drops — on EVERY exit path of the pipeline, success OR error OR panic-unwind. These helper
+/// outputs are PLAINTEXT audio fragments in `$TMPDIR`; the old code removed them only on the
+/// happy path, so a read/resample/transcribe error left a plaintext fragment behind (a
+/// data-at-rest leak). Holding one guard per scratch file for the whole of `run_inner` makes the
+/// cleanup unconditional, regardless of which `?` returns first.
+struct ScratchWav(Option<PathBuf>);
+
+impl ScratchWav {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
+    /// Borrow the wrapped path (if any) for reading — without giving up the delete-on-drop.
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for ScratchWav {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            // Best-effort: an already-gone file or a remove error must never abort cleanup.
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Emit a `StatusPayload` on `EVENT_STATUS`. Best-effort: a failed emit is logged but
 /// never aborts the pipeline.
 fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
@@ -162,15 +190,21 @@ async fn run_inner(
     // playback — its output is NEVER fed to Whisper. If there's no system stream (capture off
     // or ScreenCaptureKit permission denied → sidecar produced no WAV), we fall back to the
     // mic-only single pass (today's behaviour, everything attributed "me").
+    // Wrap the transient sidecar scratch WAVs in delete-on-drop guards so the plaintext fragments
+    // are removed on EVERY exit path below (success, any `?`-error, or panic) — not just the Ok
+    // branch. Previously a `read_wav_mono` failure (AEC + system) and a `resample_to_16k` failure
+    // (system, whose `?` ran BEFORE the remove) each stranded a plaintext audio fragment in $TMPDIR.
+    let aec_scratch = ScratchWav::new(aec_mic_wav);
+    let system_scratch = ScratchWav::new(system_wav);
+
     let mut mic_16k = audio::resample_to_16k(&samples, src_rate)?;
     // AEC'd mic for the ASR feed (rec #5): when the VPIO helper produced a WAV, transcribe THAT and
     // keep the RAW cpal mic for the archive (`mic_16k_archive`); otherwise archive == ASR (today).
     // `mem::replace` avoids cloning the (large) mic buffer in the common no-AEC path.
     let mut mic_16k_archive: Option<Vec<f32>> = None;
-    if let Some(aec) = &aec_mic_wav {
+    if let Some(aec) = aec_scratch.path() {
         match audio::read_wav_mono(aec) {
             Ok((a, rate)) => {
-                let _ = std::fs::remove_file(aec); // transient helper output
                 let asr = audio::resample_to_16k(&a, rate)?;
                 mic_16k_archive = Some(std::mem::replace(&mut mic_16k, asr));
             }
@@ -181,11 +215,10 @@ async fn run_inner(
     }
     // Native system audio (pre-resample) — kept ONLY for the optional hi-res master.
     let mut sys_native: Option<(Vec<f32>, u32)> = None;
-    let mut sys_16k: Option<Vec<f32>> = match &system_wav {
+    let mut sys_16k: Option<Vec<f32>> = match system_scratch.path() {
         Some(path) => match audio::read_wav_mono(path) {
             Ok((sys, sys_rate)) => {
                 let resampled = audio::resample_to_16k(&sys, sys_rate)?;
-                let _ = std::fs::remove_file(path); // transient sidecar output
                 if config.keep_hires_masters {
                     sys_native = Some((sys, sys_rate));
                 }
@@ -198,6 +231,12 @@ async fn run_inner(
         },
         None => None,
     };
+    // Both scratch WAVs are now read into memory (or were absent/unreadable); delete them NOW to
+    // keep the plaintext-on-disk window minimal. The guards already covered every early-return path
+    // above; this just reclaims them as soon as they're no longer needed (and is a safe no-op if a
+    // later `?` re-drops them).
+    drop(aec_scratch);
+    drop(system_scratch);
 
     // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
     // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed.
@@ -479,9 +518,23 @@ async fn summarize_and_export(
     let title = derive_title(&markdown, date_iso);
     let subfolder =
         resolve_subfolder(config, provider.as_ref(), vault_path, &title, &markdown).await;
+
+    // Auto-organize safety (BLK-2 parity): if the classifier chose a subfolder that maps to a LOCKED
+    // folder, plaintext must NEVER land in its sealed on-disk dir — not even transiently. Decide
+    // BEFORE writing.
+    let auto_file = crate::commands::classify_auto_file_target(state, subfolder.as_deref())?;
+    let write_subfolder = match auto_file {
+        // Open / root / unmanaged subfolder → write into the chosen subfolder as usual.
+        crate::commands::AutoFileTarget::Open => subfolder.as_deref(),
+        // Any LOCKED target → write at the vault ROOT instead. `SealInto` then seals the note INTO
+        // the folder (encrypting it + removing this root `.md`); `RejectToRoot` simply leaves it at
+        // the root. Either way no plaintext is ever written into the sealed on-disk dir.
+        crate::commands::AutoFileTarget::SealInto(_)
+        | crate::commands::AutoFileTarget::RejectToRoot => None,
+    };
     let exported_path = export::write_note(
         Path::new(vault_path),
-        subfolder.as_deref(),
+        write_subfolder,
         &title,
         when_iso,
         &markdown,
@@ -496,6 +549,17 @@ async fn summarize_and_export(
     state
         .db
         .update_meeting_status(meeting_id, MeetingStatus::Exported)?;
+
+    // Seal the note INTO a session-unlocked locked folder (encrypts the markdown/extras and removes
+    // the plaintext `.md` we just wrote) — the same outcome a manual move would produce.
+    if let crate::commands::AutoFileTarget::SealInto(folder_id) = &auto_file {
+        if let Err(e) = crate::commands::seal_auto_filed_note(state, meeting_id, folder_id) {
+            // Rare relock race: the `.md` is on disk but the folder is now locked. Never leave
+            // plaintext in a sealed dir — drop the stray `.md` (the note markdown is still in the DB).
+            let _ = std::fs::remove_file(&exported_path);
+            return Err(e);
+        }
+    }
 
     emit_status(app, "done", "Note exported.", meeting_id);
 
@@ -681,5 +745,38 @@ mod tests {
     fn derive_title_default_when_nothing() {
         let md = "plain text with no title";
         assert_eq!(derive_title(md, "2026-06-24"), "Meeting 2026-06-24");
+    }
+
+    /// The scratch-WAV guard deletes its plaintext file when dropped — the leak fix's core
+    /// guarantee, covering the error/early-return paths the old happy-path-only remove missed.
+    #[test]
+    fn scratch_wav_removed_on_drop() {
+        let p = std::env::temp_dir().join(format!(
+            "murmur-scratch-drop-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, b"RIFF....plaintext-audio-fragment").unwrap();
+        assert!(p.exists());
+        {
+            let _guard = ScratchWav::new(Some(p.clone()));
+        } // dropped here
+        assert!(!p.exists(), "scratch WAV must be removed when its guard drops");
+    }
+
+    /// A `None` scratch guard (no AEC/system WAV produced) and a guard whose file was already
+    /// removed must both drop without panicking.
+    #[test]
+    fn scratch_wav_none_or_missing_is_noop() {
+        drop(ScratchWav::new(None));
+        let p = std::env::temp_dir().join(format!(
+            "murmur-scratch-missing-{}.wav",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        drop(ScratchWav::new(Some(p))); // file doesn't exist — must not panic
     }
 }
