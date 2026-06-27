@@ -61,6 +61,7 @@ pub async fn run_after_stop(
     src_rate: u32,
     duration_s: i64,
     system_wav: Option<PathBuf>,
+    aec_mic_wav: Option<PathBuf>,
     mic_started_at: std::time::Instant,
     system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
@@ -72,6 +73,7 @@ pub async fn run_after_stop(
         src_rate,
         duration_s,
         system_wav,
+        aec_mic_wav,
         mic_started_at,
         system_started_at,
     )
@@ -89,6 +91,44 @@ pub async fn run_after_stop(
     }
 }
 
+/// Transcribe one 16 kHz stream at the Accurate profile, VAD-segmented. With a `VadSegmenter`,
+/// only speech REGIONS are decoded — each region is a SEPARATE `transcribe_with` call (fresh
+/// whisper state → `condition_on_previous_text` reset across long gaps) whose timestamps are
+/// re-offset back onto the stream timeline. Without VAD it decodes the whole buffer; an empty
+/// region list (VAD ran, found only silence) yields no segments — the "skip muted/silence" path.
+fn transcribe_stream(
+    transcriber: &Transcriber,
+    vad: Option<&mut crate::transcribe::vad::VadSegmenter>,
+    samples_16k: &[f32],
+    lang: Option<&str>,
+) -> Result<Vec<crate::transcribe::types::Segment>> {
+    use crate::transcribe::TranscribeQuality;
+
+    let regions: Vec<(usize, usize)> = match vad {
+        Some(v) => v.speech_regions(samples_16k)?,
+        None => vec![(0, samples_16k.len())],
+    };
+
+    let mut out: Vec<crate::transcribe::types::Segment> = Vec::new();
+    let mut idx: i64 = 0;
+    for (start, end) in regions {
+        if end <= start {
+            continue;
+        }
+        let offset_s = start as f64 / crate::audio::TARGET_RATE_HZ as f64;
+        let tx =
+            transcriber.transcribe_with(&samples_16k[start..end], lang, TranscribeQuality::Accurate)?;
+        for mut seg in tx.segments {
+            seg.idx = idx;
+            seg.start_s += offset_s;
+            seg.end_s += offset_s;
+            idx += 1;
+            out.push(seg);
+        }
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
     app: &AppHandle,
@@ -98,6 +138,7 @@ async fn run_inner(
     src_rate: u32,
     duration_s: i64,
     system_wav: Option<PathBuf>,
+    aec_mic_wav: Option<PathBuf>,
     mic_started_at: std::time::Instant,
     system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
@@ -121,12 +162,33 @@ async fn run_inner(
     // playback — its output is NEVER fed to Whisper. If there's no system stream (capture off
     // or ScreenCaptureKit permission denied → sidecar produced no WAV), we fall back to the
     // mic-only single pass (today's behaviour, everything attributed "me").
-    let mic_16k = audio::resample_to_16k(&samples, src_rate)?;
-    let sys_16k: Option<Vec<f32>> = match &system_wav {
+    let mut mic_16k = audio::resample_to_16k(&samples, src_rate)?;
+    // AEC'd mic for the ASR feed (rec #5): when the VPIO helper produced a WAV, transcribe THAT and
+    // keep the RAW cpal mic for the archive (`mic_16k_archive`); otherwise archive == ASR (today).
+    // `mem::replace` avoids cloning the (large) mic buffer in the common no-AEC path.
+    let mut mic_16k_archive: Option<Vec<f32>> = None;
+    if let Some(aec) = &aec_mic_wav {
+        match audio::read_wav_mono(aec) {
+            Ok((a, rate)) => {
+                let _ = std::fs::remove_file(aec); // transient helper output
+                let asr = audio::resample_to_16k(&a, rate)?;
+                mic_16k_archive = Some(std::mem::replace(&mut mic_16k, asr));
+            }
+            Err(e) => {
+                tracing::warn!(target: "audio", error = %e, "AEC mic unreadable; raw mic for ASR")
+            }
+        }
+    }
+    // Native system audio (pre-resample) — kept ONLY for the optional hi-res master.
+    let mut sys_native: Option<(Vec<f32>, u32)> = None;
+    let mut sys_16k: Option<Vec<f32>> = match &system_wav {
         Some(path) => match audio::read_wav_mono(path) {
             Ok((sys, sys_rate)) => {
                 let resampled = audio::resample_to_16k(&sys, sys_rate)?;
                 let _ = std::fs::remove_file(path); // transient sidecar output
+                if config.keep_hires_masters {
+                    sys_native = Some((sys, sys_rate));
+                }
                 Some(resampled)
             }
             Err(e) => {
@@ -138,12 +200,14 @@ async fn run_inner(
     };
 
     // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
+    // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed.
+    let archive_src = mic_16k_archive.as_ref().unwrap_or(&mic_16k);
     let archive_16k = match &sys_16k {
         Some(sys) => {
             tracing::info!(target: "audio", "archiving mixed mic + system-audio track");
-            audio::mix(&mic_16k, sys)
+            audio::mix(archive_src, sys)
         }
-        None => mic_16k.clone(),
+        None => archive_src.clone(),
     };
     let wav_dir = audio_dir()?;
     let wav_path = wav_dir.join(format!("{meeting_id}.wav"));
@@ -155,11 +219,64 @@ async fn run_inner(
         &wav_path.to_string_lossy(),
     )?;
 
+    // Rec #3: faithful per-stream MASTER archives (opt-in). Written from the PRE-resample,
+    // PRE-normalize buffers so they stay faithful; they live in the audio dir and are sealed at
+    // rest by the lock lifecycle exactly like audio_path. Best-effort: a write failure never fails
+    // the recording. NOT exposed to the FE — reachable only via the gated export commands.
+    if config.keep_hires_masters {
+        let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
+        if let Err(e) = audio::write_wav_f32(&mic_master, &samples, src_rate, 1) {
+            tracing::warn!(target: "audio", error = %e, "mic master write failed");
+        } else if let Err(e) = state
+            .db
+            .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))
+        {
+            // Best-effort: a stranded, untracked master plaintext is unreferenced + ungated-out;
+            // never fail the recording over it.
+            tracing::warn!(target: "audio", error = %e, "persisting mic master path failed");
+        }
+        if let Some((sys, sys_rate)) = &sys_native {
+            let sys_master = wav_dir.join(format!("{meeting_id}.sys.wav"));
+            if let Err(e) = audio::write_wav_f32(&sys_master, sys, *sys_rate, 1) {
+                tracing::warn!(target: "audio", error = %e, "system master write failed");
+            } else if let Err(e) = state
+                .db
+                .set_meeting_sys_master_path(meeting_id, Some(sys_master.to_string_lossy().as_ref()))
+            {
+                tracing::warn!(target: "audio", error = %e, "persisting system master path failed");
+            }
+        }
+    }
+
     // ── 2 + 3. Transcribe EACH stream separately, then MERGE by wall-clock ────
     emit_status(app, "transcribing", "Transcribing audio…", meeting_id);
 
+    // Loudness-normalise the ASR FEEDS only (rec #6). The archive WAV was written above from the
+    // un-normalised mix, so the master stays faithful. Gated by the same flag as VAD so the whole
+    // batch-ASR enhancement is one reversible switch.
+    if config.vad_enabled {
+        audio::normalize_for_asr(&mut mic_16k);
+        if let Some(sys) = sys_16k.as_mut() {
+            audio::normalize_for_asr(sys);
+        }
+    }
+
     let model_path = resolve_model_path(&config)?;
     let lang = config.language.as_deref();
+
+    // Resolve the Silero VAD model (best-effort async download on first use). Any failure → None
+    // → transcribe the whole buffer (today's behaviour).
+    let vad_model_path: Option<std::path::PathBuf> = if config.vad_enabled {
+        match crate::transcribe::ensure_vad_model().await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(target: "transcribe", error = %e, "VAD model unavailable; transcribing whole buffer");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Whisper load + inference are CPU/GPU-bound and blocking; run the WHOLE transcription off
     // the async runtime's worker so we don't stall other tasks. We load the model ONCE and reuse
@@ -167,28 +284,76 @@ async fn run_inner(
     let model_path_owned = model_path.clone();
     let lang_owned = lang.map(str::to_string);
     let has_system = sys_16k.is_some();
+
+    // Resolve diarization models (best-effort async download) when diarization is ON and there's a
+    // system stream to diarize. Any failure → None → keep the single "others" label.
+    let diarize_models: Option<(std::path::PathBuf, std::path::PathBuf)> =
+        if config.diarize_others && has_system {
+            match crate::transcribe::ensure_diarization_models().await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::warn!(target: "transcribe", error = %e, "diarization models unavailable; single 'others' label");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let merged_segments = tokio::task::spawn_blocking(move || -> Result<Vec<crate::transcribe::types::Segment>> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
-        use crate::transcribe::TranscribeQuality;
 
         let transcriber = Transcriber::load(&model_path_owned)?;
-        // BATCH path → Accurate profile (beam search + temperature fallback + anti-hallucination
-        // thresholds + previous-text conditioning) for BOTH streams. Live captions + voice
-        // trigger keep the Fast greedy profile for latency — see transcribe::whisper.
-        let mic_tx =
-            transcriber.transcribe_with(&mic_16k, lang_owned.as_deref(), TranscribeQuality::Accurate)?;
+        // Load the Silero VAD once and reuse it for both streams (best-effort; None → whole buffer).
+        let mut vad = vad_model_path.as_deref().and_then(|p| {
+            match crate::transcribe::vad::VadSegmenter::load(p) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(target: "transcribe", error = %e, "VAD load failed; transcribing whole buffer");
+                    None
+                }
+            }
+        });
+        // Diarizer (best-effort): created once when models resolved — used on the system stream only.
+        let diarizer = diarize_models.and_then(|(seg, emb)| {
+            match crate::transcribe::diarize::Diarizer::load(&seg, &emb) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!(target: "transcribe", error = %e, "diarizer load failed; single 'others' label");
+                    None
+                }
+            }
+        });
+
+        // BATCH path → Accurate profile for BOTH streams, VAD-segmented so each speech region is a
+        // FRESH decode (context reset across long gaps; never decode through silence). Live captions
+        // + voice trigger keep the Fast greedy profile for latency — see transcribe::whisper.
+        let mic_segments =
+            transcribe_stream(&transcriber, vad.as_mut(), &mic_16k, lang_owned.as_deref())?;
 
         let mut streams = vec![StreamInput {
-            segments: mic_tx.segments,
+            segments: mic_segments,
             started_at: mic_started_at,
             speaker: SPEAKER_ME,
         }];
 
         if let (Some(sys), Some(sys_started)) = (sys_16k, system_started_at) {
-            let sys_tx =
-                transcriber.transcribe_with(&sys, lang_owned.as_deref(), TranscribeQuality::Accurate)?;
+            let mut sys_segments =
+                transcribe_stream(&transcriber, vad.as_mut(), &sys, lang_owned.as_deref())?;
+            // N-way diarization on the "others" stream ONLY — relabel segments to others-0/1/2.
+            if let Some(d) = &diarizer {
+                match d.diarize(&sys) {
+                    Ok(spans) => {
+                        crate::transcribe::diarize::relabel_others(&mut sys_segments, &spans)
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "transcribe", error = %e,
+                        "diarization failed; single 'others' label"
+                    ),
+                }
+            }
             streams.push(StreamInput {
-                segments: sys_tx.segments,
+                segments: sys_segments,
                 started_at: sys_started,
                 speaker: SPEAKER_OTHERS,
             });

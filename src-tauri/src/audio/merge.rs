@@ -82,7 +82,12 @@ pub fn merge_streams(streams: Vec<StreamInput>) -> Vec<Segment> {
                 start_s: seg.start_s + offset_s,
                 end_s: seg.end_s + offset_s,
                 text: seg.text.clone(),
-                speaker: Some(stream.speaker.to_string()),
+                // Preserve a per-segment speaker (diarized "others-N") if set; else the stream default.
+                speaker: Some(
+                    seg.speaker
+                        .clone()
+                        .unwrap_or_else(|| stream.speaker.to_string()),
+                ),
             });
         }
     }

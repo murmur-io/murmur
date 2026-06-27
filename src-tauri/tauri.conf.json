@@ -41,6 +41,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "binaries/meetnotes-sysaudio": "meetnotes-sysaudio",
+      "binaries/meetnotes-audiocap": "meetnotes-audiocap",
+      "binaries/meetnotes-aeccap": "meetnotes-aeccap"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -49,7 +54,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "13.4"
     }
   },
   "plugins": {}
