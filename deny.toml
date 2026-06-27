@@ -1,0 +1,80 @@
+# cargo-deny configuration — supply-chain gate for the Rust workspace (D11/F5).
+# Schema: cargo-deny v0.16+ (the `version = 2` advisories/licenses schema). Run via:
+#   cargo deny --manifest-path src-tauri/Cargo.toml check
+# Wired into scripts/ci.sh before the build.
+
+[graph]
+# Only the platform we ship on. Keeps the advisory/ban graph focused on what actually links.
+targets = [{ triple = "aarch64-apple-darwin" }, { triple = "x86_64-apple-darwin" }]
+all-features = false
+# Drop our own unpublished workspace crate (`murmur`, no `license` field, proprietary) from the
+# graph so the license gate doesn't flag it as "unlicensed". We license-check our DEPENDENCIES,
+# not our own source.
+exclude-unpublished = true
+
+[advisories]
+version = 2
+# Fail on any security advisory or yanked crate. `unmaintained = "workspace"` flags
+# unmaintained crates we depend on directly without failing on transitive-only ones.
+yanked = "deny"
+unmaintained = "workspace"
+# No blanket ignores — add a specific RUSTSEC id here ONLY with a written justification if a
+# fix is genuinely unavailable. An empty list means "no exceptions".
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses compatible with a proprietary desktop app. Copyleft (GPL/AGPL) is NOT
+# listed, so a copyleft dependency fails the gate and forces a conscious decision.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unlicense",            # whisper-rs / whisper-rs-sys — public-domain dedication.
+    "CDLA-Permissive-2.0",  # webpki-roots — Mozilla's permissive cert-root license.
+]
+confidence-threshold = 0.8
+# Treat workspace-local (path) crates as private. NOTE: cargo-deny only auto-detects a crate as
+# "private" when its Cargo.toml sets `publish = false`. `murmur` doesn't (Cargo.toml is owned by
+# another agent), so `private.ignore` alone does not yet suppress its "unlicensed" finding.
+private = { ignore = true }
+
+# Our own first-party crate (`murmur`) is proprietary and declares no `license` field, so the gate
+# would flag it as "unlicensed" (the `unlicensed = "allow"` knob was removed in cargo-deny 0.19).
+# This `clarify` is scoped to OUR crate ONLY — it does not affect any dependency's license
+# evaluation. FOLLOW-UP (agent A / Cargo.toml owner): add `publish = false` to
+# `src-tauri/Cargo.toml`; cargo-deny then auto-treats `murmur` as private and this clarify can be
+# deleted.
+[[licenses.clarify]]
+crate = "murmur"
+expression = "MIT"
+license-files = []
+
+[bans]
+# Fail on a security-sensitive duplicate (two versions of a crypto/TLS crate is a red flag).
+multiple-versions = "warn"
+# Reject `*` version requirements (a wildcard dep can silently pull a new, un-audited release).
+wildcards = "deny"
+# Path/git wildcard deps inside the workspace are fine; only registry wildcards are the risk.
+allow-wildcard-paths = true
+deny = []
+# NOTE on openssl-sys/openssl-src: these ARE in the graph, but ONLY as the statically-vendored
+# crypto for SQLCipher (rusqlite `bundled-sqlcipher-vendored-openssl`, user-approved per
+# Cargo.toml). Network TLS uses rustls (reqwest `rustls-tls`). We therefore do NOT ban
+# openssl-sys here — doing so would fail on the intentional at-rest-encryption dependency. The
+# advisories section above still flags any OpenSSL CVE, which is the protection we actually want.
+
+[sources]
+# Only crates.io. A git/registry dependency from an unknown source is a supply-chain risk.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -53,7 +53,15 @@ thiserror = "1"
 # ── Secrets ──
 keyring = { version = "3", features = ["apple-native"] }
 getrandom = "0.2"
-aes-gcm = "0.10"
+# `zeroize` feature: wipe the AES key schedule from memory on drop (C4/C5/C6 hardening).
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# Scrub secret material (master KEK, content keys, hex PRAGMA-key strings, returned secrets) from
+# RAM as soon as it is no longer needed. The `derive` feature pulls in `zeroize_derive` and
+# re-exports `#[derive(ZeroizeOnDrop)]` from the `zeroize` crate root. User-approved new deps for
+# the security audit (`zeroize` is already in the graph transitively via rustls).
+zeroize = { version = "1", features = ["derive"] }
+# Constant-time equality / conditional selection for secret comparisons (C4/C5/C6). User-approved.
+subtle = "2"
 
 # ── Misc ──
 chrono = { version = "0.4", features = ["clock", "serde"] }

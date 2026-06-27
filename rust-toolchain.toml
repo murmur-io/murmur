@@ -1,0 +1,8 @@
+# Pin the Rust toolchain so every build (local CI + contributors + release) is reproducible and
+# uses the same compiler/std. The crate's declared MSRV (src-tauri/Cargo.toml) is 1.77, but the
+# transitive dependency graph now requires Cargo's stabilized `edition2024` feature (Rust ≥ 1.85),
+# so the pin must be at least that. We pin a current stable. Bump deliberately, never implicitly.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

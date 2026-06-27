@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -8,6 +9,27 @@ use tokio::process::Command;
 use crate::error::AppError;
 use crate::summarize::provider::*;
 use crate::summarize::template;
+
+/// Hard wall-clock ceiling for a single `claude -p` run. A wedged CLI (network stall, hung
+/// node child) is killed rather than blocking the pipeline forever (F6).
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Minimal, non-secret environment a child `claude` (and the `node` it spawns) needs. We start
+/// from an EMPTY environment (`env_clear`) and re-add ONLY these, so `MURMUR_DEV_*`, API keys,
+/// tokens, and anything else in the app's environment can NEVER be inherited by the child (F2).
+const PASSTHROUGH_ENV: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL"];
+
+/// Apply the F2 hardened environment to a tokio `Command`: clear everything, set `PATH` to the
+/// resolved shell PATH, and re-add only the minimal non-secret vars that exist in our process.
+fn harden_env(cmd: &mut Command) {
+    cmd.env_clear();
+    cmd.env("PATH", shell_path());
+    for key in PASSTHROUGH_ENV {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+}
 
 /// Default binary name (resolved via PATH) used to invoke the Claude Code CLI.
 const DEFAULT_BINARY: &str = "claude";
@@ -69,19 +91,75 @@ fn shell_path() -> &'static str {
     })
 }
 
-/// Resolve a bare binary name to an absolute path found in [`shell_path`]; pass through any
-/// value containing `/` unchanged. Falls back to the bare name if not located.
-fn resolve_binary(binary: &str) -> String {
+/// Resolve `binary` to a VETTED ABSOLUTE path we are willing to execute (F3).
+///
+/// - A configured value containing `/` is taken as an explicit path and validated directly.
+/// - A bare name is located by walking [`shell_path`] (never a raw `PATH` lookup by the OS) and
+///   each candidate is validated before acceptance.
+///
+/// Validation ([`vet_binary`]) requires a regular file owned by the current user and not
+/// world-writable, so a binary an attacker could swap (world-writable, or planted under a dir
+/// they own) is rejected. On success returns the absolute, validated path; otherwise the error
+/// explains why — and is intentionally PII-free.
+fn resolve_binary(binary: &str) -> crate::error::Result<String> {
     if binary.contains('/') {
-        return binary.to_string();
+        let p = Path::new(binary);
+        vet_binary(p)?;
+        return Ok(p.to_string_lossy().into_owned());
     }
     for dir in shell_path().split(':').filter(|d| !d.is_empty()) {
         let candidate = Path::new(dir).join(binary);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
+        if candidate.is_file() && vet_binary(&candidate).is_ok() {
+            return Ok(candidate.to_string_lossy().into_owned());
         }
     }
-    binary.to_string()
+    Err(AppError::Unavailable(format!(
+        "`{binary}` not found on a trusted PATH (or failed integrity checks)"
+    )))
+}
+
+/// Reject a binary path unless it is a regular file, owned by the current uid, and not
+/// world-writable (F3). A symlink is resolved first so the *target's* metadata is what we check.
+fn vet_binary(path: &Path) -> crate::error::Result<()> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        AppError::Unavailable(format!("claude binary path is not resolvable: {e}"))
+    })?;
+    let meta = std::fs::metadata(&canonical).map_err(|e| {
+        AppError::Unavailable(format!("cannot stat claude binary: {e}"))
+    })?;
+    if !meta.is_file() {
+        return Err(AppError::Unavailable(
+            "configured claude binary is not a regular file".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        // Must be owned by us — a binary owned by another (unprivileged) user could be swapped.
+        // SAFETY: getuid() is always-succeeds FFI.
+        let our_uid = unsafe { libc_getuid() };
+        if meta.uid() != our_uid {
+            return Err(AppError::Unavailable(
+                "claude binary is not owned by the current user".to_string(),
+            ));
+        }
+        // World-writable (o+w) means anyone could replace its contents.
+        if meta.permissions().mode() & 0o002 != 0 {
+            return Err(AppError::Unavailable(
+                "claude binary is world-writable — refusing to execute".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// `getuid(2)` without pulling in the `libc` crate (not an approved dep). Declared locally; the
+// symbol is in libSystem, always linked on macOS.
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
 }
 
 /// Spawns the local `claude -p` CLI in headless print mode to generate the note.
@@ -129,18 +207,20 @@ impl SummarizerProvider for ClaudeCodeProvider {
     }
 
     /// Probe whether the `claude` binary is reachable by running `claude --version`.
-    /// Non-failing: any spawn/exec error is reported as `Unavailable`.
+    /// Non-failing: any spawn/exec/validation error is reported as `Unavailable`.
     async fn availability(&self) -> Availability {
-        let bin = resolve_binary(&self.binary);
-        match Command::new(&bin)
-            .arg("--version")
-            .env("PATH", shell_path())
+        let bin = match resolve_binary(&self.binary) {
+            Ok(b) => b,
+            Err(e) => return Availability::Unavailable { reason: e.to_string() },
+        };
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .await
-        {
+            .kill_on_drop(true);
+        harden_env(&mut cmd); // F2: env_clear + minimal PATH so no secrets leak to the child.
+        match cmd.status().await {
             Ok(status) if status.success() => Availability::Available,
             Ok(status) => Availability::Unavailable {
                 reason: format!(
@@ -168,17 +248,19 @@ impl SummarizerProvider for ClaudeCodeProvider {
         // stdin = metadata + vault link targets + transcript (the "user" content).
         let stdin_content = template::render_user_content(req);
 
-        let bin = resolve_binary(&self.binary);
-        let mut child = Command::new(&bin)
-            .arg("-p")
+        let bin = resolve_binary(&self.binary)?;
+        let mut cmd = Command::new(&bin);
+        cmd.arg("-p")
             .arg("--system-prompt")
             .arg(&system_prompt)
             .arg("--disallowedTools")
             .arg(DISALLOWED_TOOLS.join(" "))
-            .env("PATH", shell_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true); // F6: a dropped future (cancel/panic) reaps the child.
+        harden_env(&mut cmd); // F2: env_clear + minimal PATH.
+        let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
 
@@ -198,17 +280,34 @@ impl SummarizerProvider for ClaudeCodeProvider {
                 .map_err(|e| AppError::Summarize(format!("failed closing claude stdin: {e}")))?;
         }
 
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| AppError::Summarize(format!("failed waiting on claude: {e}")))?;
+        // F6: bound the run. On timeout, kill the child (kill_on_drop also covers this) and fail.
+        let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                return Err(AppError::Summarize(format!("failed waiting on claude: {e}")))
+            }
+            Err(_elapsed) => {
+                // The future is dropped here → kill_on_drop(true) reaps the process.
+                return Err(AppError::Summarize(format!(
+                    "claude timed out after {}s",
+                    CLAUDE_TIMEOUT.as_secs()
+                )));
+            }
+        };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            // F6: do NOT echo claude's stderr at a PII-retaining level. stderr can contain prompt
+            // fragments / transcript echoes; surface only the exit code, and log stderr length
+            // (not content) at debug for diagnostics.
+            tracing::debug!(
+                target: "summarize",
+                code = output.status.code().unwrap_or(-1),
+                stderr_len = output.stderr.len(),
+                "claude exited non-zero"
+            );
             return Err(AppError::Summarize(format!(
-                "claude exited with status {}: {}",
+                "claude exited with status {} (stderr suppressed: may contain transcript content)",
                 output.status.code().unwrap_or(-1),
-                stderr.trim()
             )));
         }
 
@@ -227,17 +326,19 @@ impl SummarizerProvider for ClaudeCodeProvider {
     }
 
     async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
-        let bin = resolve_binary(&self.binary);
-        let mut child = Command::new(&bin)
-            .arg("-p")
+        let bin = resolve_binary(&self.binary)?;
+        let mut cmd = Command::new(&bin);
+        cmd.arg("-p")
             .arg("--system-prompt")
             .arg(system)
             .arg("--disallowedTools")
             .arg(DISALLOWED_TOOLS.join(" "))
-            .env("PATH", shell_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true); // F6
+        harden_env(&mut cmd); // F2
+        let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
         {
@@ -254,15 +355,30 @@ impl SummarizerProvider for ClaudeCodeProvider {
                 .await
                 .map_err(|e| AppError::Summarize(format!("failed closing claude stdin: {e}")))?;
         }
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| AppError::Summarize(format!("failed waiting on claude: {e}")))?;
+        // F6: bound the run; on timeout the dropped future + kill_on_drop reaps the child.
+        let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                return Err(AppError::Summarize(format!("failed waiting on claude: {e}")))
+            }
+            Err(_elapsed) => {
+                return Err(AppError::Summarize(format!(
+                    "claude timed out after {}s",
+                    CLAUDE_TIMEOUT.as_secs()
+                )))
+            }
+        };
         if !output.status.success() {
+            // F6: suppress stderr content (may carry prompt/transcript text); code only.
+            tracing::debug!(
+                target: "summarize",
+                code = output.status.code().unwrap_or(-1),
+                stderr_len = output.stderr.len(),
+                "claude (complete) exited non-zero"
+            );
             return Err(AppError::Summarize(format!(
-                "claude exited with status {}: {}",
+                "claude exited with status {} (stderr suppressed: may contain prompt content)",
                 output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
         String::from_utf8(output.stdout)

@@ -40,11 +40,23 @@ impl SystemAudioRecorder {
     pub fn start(wav_path: PathBuf) -> Result<Self> {
         let bin = sidecar_path()
             .ok_or_else(|| AppError::Audio("system-audio sidecar not built".into()))?;
-        let child = Command::new(&bin)
-            .arg(&wav_path)
+        let mut cmd = Command::new(&bin);
+        cmd.arg(&wav_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // F2: start from an EMPTY environment and re-add only the minimal non-secret vars the
+        // sidecar needs, so MURMUR_DEV_* / API keys / tokens in the app environment can never be
+        // inherited by this child. PATH is a fixed system list (the sidecar runs no helpers), HOME
+        // is needed for the macOS per-user TCC/container context.
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        for key in ["HOME", "USER", "LOGNAME", "TMPDIR"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| AppError::Audio(format!("failed to spawn system-audio sidecar: {e}")))?;
         Ok(Self {

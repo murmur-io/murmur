@@ -38,6 +38,24 @@ export const EVENT_LIVE_CAPTION = "murmur://live-caption";
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
  * (PHASE0-PLAN §7) plus onStatus() for the EVENT_STATUS event stream.
+ *
+ * SECURITY TODO (D9 — Rust-side, NOT fixed here; this layer must not be trusted as a
+ * validation boundary). With `withGlobalTauri: false` the IPC surface is not exposed on
+ * `window.__TAURI__`, but the following commands still take UNBOUNDED, user-controlled
+ * string inputs that reach the backend (DB / LLM-prompt / filesystem) with no length or
+ * content cap on the FE. The Rust command handlers MUST enforce the real bound (reject /
+ * truncate over a max length, reject control chars / NUL, normalize) — a malicious or
+ * buggy renderer can send arbitrarily large or hostile strings:
+ *   - search_meetings(query)            — free-text search term
+ *   - rename_meeting(title)             — note title
+ *   - chat_meeting(question, history)   — chat prompt + full history array
+ *   - ask_vault(question, history)      — vault-wide chat prompt + history
+ *   - save_recipe(title, prompt)        — recipe title + prompt body
+ *   - run_recipe(prompt)                — ad-hoc prompt body
+ *   - add_reminder(text)                — reminder text
+ *   - create_folder(name)              — folder name (also a path component → reject `/`, `..`, NUL)
+ *   - rename_speaker(...)               — speaker label
+ * Do NOT rely on this TS wrapper for any of the above limits — enforce in the #[tauri::command].
  */
 @Injectable({ providedIn: "root" })
 export class IpcService {
