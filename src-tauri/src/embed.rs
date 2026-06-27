@@ -54,6 +54,16 @@ impl Embedder for StubEmbedder {
     }
 }
 
+/// The single active embedding backend used by BOTH the index path (chunking a note on creation)
+/// and the query path (Ask-My-Vault / MCP `search_semantic`). Returning a boxed trait object keeps
+/// the model a swappable seam: today it is the deterministic [`StubEmbedder`]; Phase 2c swaps in the
+/// real BGE-M3 model here and NOTHING else changes. Cheap to construct (the stub is zero-sized), so
+/// callers build one per operation rather than caching. NEVER invoked when `semantic_search_enabled`
+/// is off (the gate short-circuits before this is called).
+pub fn active_embedder() -> Box<dyn Embedder> {
+    Box::new(StubEmbedder)
+}
+
 /// FNV-1a 64-bit hash of a string (stable across runs/platforms — no `DefaultHasher` randomization).
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;

@@ -73,6 +73,49 @@ pub fn build_vault_context_visible(
         meetings = db.list_meetings_visible(30, unlocked)?;
     }
 
+    pack_meetings(db, meetings, budget, unlocked)
+}
+
+/// brain2 RAG Phase 2b — HYBRID candidate selection for Ask-My-Vault, GATED by the caller (only
+/// invoked when `semantic_search_enabled` is on). Picks candidate meetings via
+/// [`Db::search_hybrid_visible`] (FTS5 ∪ vector KNN, fused by RRF), which is ALREADY gated by the
+/// SAME `visibility_clause` against `unlocked` as the FTS path — so a sealed-and-not-unlocked folder
+/// is excluded identically. The notes are packed with the EXACT same budget + `[[Title]]` citation
+/// logic as the FTS path ([`pack_meetings`]), so the only change is which meetings are chosen.
+///
+/// Graceful fallback: when the vector index is empty the hybrid query degenerates to the FTS ranking
+/// (RRF over a single non-empty list preserves its order), and when there are no hybrid hits at all
+/// it falls back to the most recent VISIBLE meetings — identical behavior to the FTS path.
+pub fn build_vault_context_hybrid_visible(
+    db: &Db,
+    query: &str,
+    provider_id: &str,
+    query_vec: &[f32],
+    unlocked: &HashSet<String>,
+) -> Result<(String, Vec<VaultSource>)> {
+    let budget = budget_for(provider_id);
+    let mut meetings: Vec<crate::storage::models::Meeting> = db
+        .search_hybrid_visible(query, query_vec, 40, unlocked)?
+        .into_iter()
+        .map(|h| h.meeting)
+        .collect();
+    if meetings.is_empty() {
+        meetings = db.list_meetings_visible(30, unlocked)?;
+    }
+    pack_meetings(db, meetings, budget, unlocked)
+}
+
+/// Pack the candidate `meetings`' VISIBLE notes into a `budget`-capped corpus, each headed by a
+/// `### [[Title]] · date · id:` citation. Shared by the FTS and hybrid candidate selectors so the
+/// packing / citation / second-gate logic is identical. The `get_note_if_visible` second gate means
+/// a sealed-not-unlocked note's content can never enter the corpus even if it slipped into the
+/// candidate list.
+fn pack_meetings(
+    db: &Db,
+    meetings: Vec<crate::storage::models::Meeting>,
+    budget: usize,
+    unlocked: &HashSet<String>,
+) -> Result<(String, Vec<VaultSource>)> {
     let mut corpus = String::new();
     let mut sources: Vec<VaultSource> = Vec::new();
     for m in meetings {
@@ -209,5 +252,50 @@ mod tests {
             build_vault_context_visible(&db, "SECRET", "anthropic", &unlocked).unwrap();
         assert!(corpus2.contains("LOCKED-SECRET"), "unlocked content must reappear");
         assert!(sources2.iter().any(|s| s.meeting_id == "sealed"));
+    }
+
+    /// Phase 2b: the HYBRID corpus builder is gated by the SAME visibility predicate. A sealed-not-
+    /// unlocked folder's content must be absent from the hybrid corpus and reappear once unlocked —
+    /// the exact gate guarantee of the FTS path, now via `search_hybrid_visible`.
+    #[test]
+    fn hybrid_corpus_respects_visibility_gate() {
+        let db = temp_db();
+        seed_note(&db, "open", "Open Meeting", "OPEN-SECRET project Apollo budget", None);
+        seed_folder(&db, "f-locked");
+        seed_note(
+            &db,
+            "sealed",
+            "Sealed Meeting",
+            "LOCKED-SECRET acquisition budget price",
+            Some("f-locked"),
+        );
+
+        // Index BEFORE sealing (content visible) so a vec_chunks row for the sealed meeting exists —
+        // proving the READ-time gate (not just absence of an index row) excludes it.
+        let emb = crate::embed::active_embedder();
+        db.index_meeting_chunks("open", emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", emb.as_ref()).unwrap();
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let qv = emb
+            .embed(std::slice::from_ref(&"SECRET budget".to_string()))
+            .unwrap();
+        let qvec = qv.into_iter().next().unwrap_or_default();
+
+        let nothing = HashSet::new();
+        let (corpus, sources) =
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing).unwrap();
+        assert!(corpus.contains("OPEN-SECRET"), "open note must be in the hybrid corpus");
+        assert!(
+            !corpus.contains("LOCKED-SECRET"),
+            "sealed-not-unlocked content leaked into the hybrid corpus (gate violation)"
+        );
+        assert!(sources.iter().all(|s| s.meeting_id != "sealed"));
+
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let (corpus2, _) =
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked).unwrap();
+        assert!(corpus2.contains("LOCKED-SECRET"), "unlocked content must reappear in hybrid corpus");
     }
 }
