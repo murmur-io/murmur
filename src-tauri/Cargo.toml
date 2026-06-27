@@ -45,6 +45,13 @@ async-trait = "0.1"
 # bundled-sqlcipher-vendored-openssl: whole-DB at-rest encryption, no system OpenSSL dependency
 # (universal-capable). Fallback if the universal build breaks: "bundled-sqlcipher".
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+# ── Vector retrieval (Phase 2a) ──
+# sqlite-vec `vec0` virtual table for on-device KNN, registered into the SAME bundled SQLCipher
+# handle via SQLite's auto-extension hook (db::register_vec_extension). Build-proven (de-risking
+# spike) under bundled-sqlcipher-vendored-openssl on macOS; rusqlite 0.32 is on the good side of
+# the #169 / 0.34 API break and load_extension is compiled in. No heavy ML dep: the embedding
+# model is a deliberate later swap (the `Embedder` seam ships with a deterministic StubEmbedder).
+sqlite-vec = "0.1.9"
 
 # ── Serde ──
 serde = { version = "1", features = ["derive"] }
