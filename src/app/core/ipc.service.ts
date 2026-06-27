@@ -385,6 +385,24 @@ export class IpcService {
     return invoke<Folder>("create_folder", { name, parentId });
   }
 
+  /**
+   * Rename a folder: change its display name + the matching vault subdirectory + every governed path,
+   * without ever touching sealed content (a LOCKED folder rename is metadata-only). Returns the
+   * updated `Folder`. Rejects with InvalidArg for an empty/invalid name.
+   */
+  renameFolder(folderId: string, newName: string): Promise<Folder> {
+    return invoke<Folder>("rename_folder", { folderId, newName });
+  }
+
+  /**
+   * Delete a folder, NEVER losing a note. Its notes move to the vault root ("All notes"); the folder
+   * row + (now-empty) vault subdir are removed. Rejects with `Locked` when the folder is sealed and
+   * NOT session-unlocked (unlock it first), and with InvalidArg when it still has subfolders.
+   */
+  deleteFolder(folderId: string): Promise<void> {
+    return invoke<void>("delete_folder", { folderId });
+  }
+
   /** Move a note into a folder (or to the vault root with `folderId = null`). */
   moveNote(meetingId: string, folderId: string | null): Promise<void> {
     return invoke<void>("move_note", { meetingId, folderId });
