@@ -71,6 +71,8 @@ pub struct AppConfigDto {
     pub vad_enabled: bool,
     #[serde(default)]
     pub keep_hires_masters: bool,
+    #[serde(default)]
+    pub diarize_others: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -1284,6 +1286,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         capture_system_audio: c.capture_system_audio,
         vad_enabled: c.vad_enabled,
         keep_hires_masters: c.keep_hires_masters,
+        diarize_others: c.diarize_others,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -1313,6 +1316,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         capture_system_audio: d.capture_system_audio,
         vad_enabled: d.vad_enabled,
         keep_hires_masters: d.keep_hires_masters,
+        diarize_others: d.diarize_others,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a

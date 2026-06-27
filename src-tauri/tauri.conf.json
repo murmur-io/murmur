@@ -41,7 +41,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "13.4"
     }
   },
   "plugins": {}

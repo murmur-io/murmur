@@ -1,3 +1,4 @@
+pub mod diarize;
 pub mod live;
 pub mod model;
 pub mod types;

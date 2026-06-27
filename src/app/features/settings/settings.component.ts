@@ -467,6 +467,21 @@ import type {
         </label>
       </div>
 
+      <!-- Speaker diarization — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Identify remote speakers</span>
+            <span class="text-secondary toggle-sub">
+              Label individual people on the other side of the call (Speaker
+              1/2/3) instead of one “Others”. Needs system-audio capture;
+              downloads ~40 MB of models on first use.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="diarizeOthers" />
+        </label>
+      </div>
+
       <!-- Voice trigger — toggle row -->
       <div class="card">
         <label class="toggle-row">
@@ -1215,6 +1230,7 @@ export class SettingsComponent implements OnInit {
     captureSystemAudio: false,
     vadEnabled: true,
     keepHiresMasters: false,
+    diarizeOthers: false,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -1287,6 +1303,7 @@ export class SettingsComponent implements OnInit {
         captureSystemAudio: cfg.captureSystemAudio ?? false,
         vadEnabled: cfg.vadEnabled ?? true,
         keepHiresMasters: cfg.keepHiresMasters ?? false,
+        diarizeOthers: cfg.diarizeOthers ?? false,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
@@ -1330,6 +1347,7 @@ export class SettingsComponent implements OnInit {
       captureSystemAudio: v.captureSystemAudio,
       vadEnabled: v.vadEnabled,
       keepHiresMasters: v.keepHiresMasters,
+      diarizeOthers: v.diarizeOthers,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,

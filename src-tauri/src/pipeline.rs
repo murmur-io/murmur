@@ -263,6 +263,22 @@ async fn run_inner(
     let model_path_owned = model_path.clone();
     let lang_owned = lang.map(str::to_string);
     let has_system = sys_16k.is_some();
+
+    // Resolve diarization models (best-effort async download) when diarization is ON and there's a
+    // system stream to diarize. Any failure → None → keep the single "others" label.
+    let diarize_models: Option<(std::path::PathBuf, std::path::PathBuf)> =
+        if config.diarize_others && has_system {
+            match crate::transcribe::ensure_diarization_models().await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::warn!(target: "transcribe", error = %e, "diarization models unavailable; single 'others' label");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let merged_segments = tokio::task::spawn_blocking(move || -> Result<Vec<crate::transcribe::types::Segment>> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
@@ -273,6 +289,16 @@ async fn run_inner(
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::warn!(target: "transcribe", error = %e, "VAD load failed; transcribing whole buffer");
+                    None
+                }
+            }
+        });
+        // Diarizer (best-effort): created once when models resolved — used on the system stream only.
+        let diarizer = diarize_models.and_then(|(seg, emb)| {
+            match crate::transcribe::diarize::Diarizer::load(&seg, &emb) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!(target: "transcribe", error = %e, "diarizer load failed; single 'others' label");
                     None
                 }
             }
@@ -291,8 +317,20 @@ async fn run_inner(
         }];
 
         if let (Some(sys), Some(sys_started)) = (sys_16k, system_started_at) {
-            let sys_segments =
+            let mut sys_segments =
                 transcribe_stream(&transcriber, vad.as_mut(), &sys, lang_owned.as_deref())?;
+            // N-way diarization on the "others" stream ONLY — relabel segments to others-0/1/2.
+            if let Some(d) = &diarizer {
+                match d.diarize(&sys) {
+                    Ok(spans) => {
+                        crate::transcribe::diarize::relabel_others(&mut sys_segments, &spans)
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "transcribe", error = %e,
+                        "diarization failed; single 'others' label"
+                    ),
+                }
+            }
             streams.push(StreamInput {
                 segments: sys_segments,
                 started_at: sys_started,
