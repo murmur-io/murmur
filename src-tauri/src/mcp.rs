@@ -233,9 +233,19 @@ fn tools_spec() -> Value {
             "name": "list_recent_meetings",
             "description": "List the most recent meetings (title, date, status, id).",
             "inputSchema": { "type": "object", "properties": { "limit": { "type": "number" } } }
+        },
+        {
+            "name": "search_semantic",
+            "description": "Semantic (meaning-based) search across your meeting notes, fused with full-text search. Finds relevant meetings even when they don't share the exact words. Requires semantic search to be enabled in Murmur settings.",
+            "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         }
     ])
 }
+
+/// A tool-dispatch error mapped to a JSON-RPC `(code, message)`. Kept separate from the `Value`
+/// builders so the dispatch logic is testable against an injected `Db` without the HTTP/JSON-RPC
+/// envelope (and without `handle_tool_call`'s `Db::open` → Keychain).
+type ToolError = (i64, String);
 
 fn handle_tool_call(
     db_path: &Path,
@@ -257,35 +267,66 @@ fn handle_tool_call(
     };
     // Snapshot the session unlock set so every query in this call sees a consistent view.
     let unlocked_set = unlocked.lock().map(|g| g.clone()).unwrap_or_default();
-    let text = match name {
+    match dispatch_tool(&db, name, &args, &unlocked_set) {
+        Ok(text) => text_result(id, text),
+        Err((code, msg)) => rpc_err(id, code, &msg),
+    }
+}
+
+/// Dispatch a `tools/call` against an OPEN `Db`. Every read here is visibility-gated against
+/// `unlocked_set` (`search_visible` / `meeting_is_visible` / `get_note_if_visible` /
+/// `list_meetings_visible` / `search_hybrid_visible`), so a sealed-and-not-unlocked meeting is
+/// invisible to all of them. Returns the tool's text payload or a `(code, message)` error.
+fn dispatch_tool(
+    db: &Db,
+    name: &str,
+    args: &Value,
+    unlocked_set: &HashSet<String>,
+) -> std::result::Result<String, ToolError> {
+    match name {
         "search_meetings" => {
             let q = args.get("query").and_then(Value::as_str).unwrap_or("");
-            match db.search_visible(q, 20, &unlocked_set) {
-                Ok(hits) if hits.is_empty() => format!("No meetings match \"{q}\"."),
-                Ok(hits) => hits
-                    .iter()
-                    .map(|h| {
-                        format!(
-                            "- {} ({}) [id:{}] — {}",
-                            h.meeting.title.clone().unwrap_or_else(|| "(untitled)".into()),
-                            h.meeting.started_at,
-                            h.meeting.id,
-                            h.snippet
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                Err(e) => return rpc_err(id, -32000, &format!("search failed: {e}")),
+            match db.search_visible(q, 20, unlocked_set) {
+                Ok(hits) if hits.is_empty() => Ok(format!("No meetings match \"{q}\".")),
+                Ok(hits) => Ok(format_hits(&hits)),
+                Err(e) => Err((-32000, format!("search failed: {e}"))),
+            }
+        }
+        "search_semantic" => {
+            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
+            // GATE: the master flag lives in the (whole-DB-encrypted) settings table, so the MCP
+            // reader thread reads it from the same DB. When OFF, return an explicit "disabled" result
+            // — do NOT silently fall back to an ungated read. No `vec_chunks` row is ever touched.
+            let enabled = crate::settings::AppConfig::load(db)
+                .map(|c| c.semantic_search_enabled)
+                .unwrap_or(false);
+            if !enabled {
+                return Ok(
+                    "Semantic search is disabled. Enable it in Murmur settings to use this tool."
+                        .to_string(),
+                );
+            }
+            // Embed the query with the SAME active embedder used to index, then HYBRID-search through
+            // the SAME visibility gate as `search_meetings` (both FTS + vector legs are gated).
+            let embedder = crate::embed::active_embedder();
+            let query_vec = match embedder.embed(std::slice::from_ref(&q.to_string())) {
+                Ok(v) => v.into_iter().next().unwrap_or_default(),
+                Err(e) => return Err((-32000, format!("embed failed: {e}"))),
+            };
+            match db.search_hybrid_visible(q, &query_vec, 20, unlocked_set) {
+                Ok(hits) if hits.is_empty() => Ok(format!("No meetings match \"{q}\".")),
+                Ok(hits) => Ok(format_hits(&hits)),
+                Err(e) => Err((-32000, format!("semantic search failed: {e}"))),
             }
         }
         "get_meeting" => {
             let mid = args.get("meetingId").and_then(Value::as_str).unwrap_or("");
             // A sealed-and-not-unlocked meeting is invisible — including its transcript.
-            match db.meeting_is_visible(mid, &unlocked_set) {
-                Ok(false) => format!("No data for meeting {mid}."),
-                Err(e) => return rpc_err(id, -32000, &format!("visibility check failed: {e}")),
+            match db.meeting_is_visible(mid, unlocked_set) {
+                Ok(false) => Ok(format!("No data for meeting {mid}.")),
+                Err(e) => Err((-32000, format!("visibility check failed: {e}"))),
                 Ok(true) => {
-                    let note = db.get_note_if_visible(mid, &unlocked_set).ok().flatten();
+                    let note = db.get_note_if_visible(mid, unlocked_set).ok().flatten();
                     let segs = db.get_segments(mid).unwrap_or_default();
                     let transcript = segs
                         .iter()
@@ -294,9 +335,9 @@ fn handle_tool_call(
                         .collect::<Vec<_>>()
                         .join(" ");
                     match note {
-                        Some(n) => format!("NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}", n.markdown),
-                        None if !transcript.is_empty() => format!("TRANSCRIPT:\n{transcript}"),
-                        None => format!("No data for meeting {mid}."),
+                        Some(n) => Ok(format!("NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}", n.markdown)),
+                        None if !transcript.is_empty() => Ok(format!("TRANSCRIPT:\n{transcript}")),
+                        None => Ok(format!("No data for meeting {mid}.")),
                     }
                 }
             }
@@ -307,8 +348,8 @@ fn handle_tool_call(
                 .and_then(Value::as_i64)
                 .unwrap_or(20)
                 .clamp(1, 100);
-            match db.list_meetings_visible(limit, &unlocked_set) {
-                Ok(ms) => ms
+            match db.list_meetings_visible(limit, unlocked_set) {
+                Ok(ms) => Ok(ms
                     .iter()
                     .map(|m| {
                         format!(
@@ -320,13 +361,28 @@ fn handle_tool_call(
                         )
                     })
                     .collect::<Vec<_>>()
-                    .join("\n"),
-                Err(e) => return rpc_err(id, -32000, &format!("list failed: {e}")),
+                    .join("\n")),
+                Err(e) => Err((-32000, format!("list failed: {e}"))),
             }
         }
-        other => return rpc_err(id, -32602, &format!("unknown tool: {other}")),
-    };
-    text_result(id, text)
+        other => Err((-32602, format!("unknown tool: {other}"))),
+    }
+}
+
+/// Render a list of search hits (FTS or hybrid) into the MCP text payload — one line per meeting.
+fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
+    hits.iter()
+        .map(|h| {
+            format!(
+                "- {} ({}) [id:{}] — {}",
+                h.meeting.title.clone().unwrap_or_else(|| "(untitled)".into()),
+                h.meeting.started_at,
+                h.meeting.id,
+                h.snippet
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -355,9 +411,14 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_three_tools() {
+    fn tools_list_has_four_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 3);
+        let tools = r["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        // The Phase 2b semantic tool is advertised.
+        assert!(tools
+            .iter()
+            .any(|t| t["name"] == "search_semantic"));
     }
 
     #[test]
@@ -447,6 +508,119 @@ mod tests {
         ] {
             assert!(!ALLOWED_HOSTS.contains(&bad), "{bad} must not be allowed");
         }
+    }
+
+    // ── Phase 2b: search_semantic MCP tool (gated) ─────────────────────────────────────────────
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn temp_db() -> (Db, PathBuf) {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-mcp-test-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open_with_key(&p, TEST_DEK).unwrap();
+        (db, p)
+    }
+
+    fn seed(db: &Db, mid: &str, title: &str, md: &str, folder: Option<&str>) {
+        use crate::storage::models::{Meeting, MeetingStatus, NoteRecord};
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some(title.to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: md.to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_note_folder(mid, folder).unwrap();
+    }
+
+    /// Flag OFF (the default): `search_semantic` returns the explicit "disabled" result and does NOT
+    /// fall through to any vector read — the prod-safe default for the MCP surface.
+    #[test]
+    fn search_semantic_disabled_when_flag_off() {
+        let (db, p) = temp_db();
+        seed(&db, "m1", "Budget", "budget planning hiring quarter", None);
+        // Flag defaults OFF (never written).
+        let out = dispatch_tool(
+            &db,
+            "search_semantic",
+            &json!({ "query": "budget" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("disabled"),
+            "flag-off semantic tool must report disabled, got: {out}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Flag ON: `search_semantic` routes through `search_hybrid_visible`, which applies the SAME
+    /// visibility gate as `search_meetings`. A sealed-and-not-unlocked meeting is EXCLUDED from the
+    /// results and reappears once its folder is session-unlocked.
+    #[test]
+    fn search_semantic_is_visibility_gated_when_enabled() {
+        use crate::storage::models::Folder;
+        let (db, p) = temp_db();
+        // Enable the flag in the settings table.
+        let cfg = crate::settings::AppConfig {
+            semantic_search_enabled: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false, // index while visible, then lock.
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed(&db, "open", "Open", "budget planning hiring quarter apollo", None);
+        seed(&db, "sealed", "Sealed", "budget planning hiring quarter secret", Some("f-lock"));
+
+        let emb = crate::embed::active_embedder();
+        db.index_meeting_chunks("open", emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", emb.as_ref()).unwrap();
+        // Seal the folder AFTER indexing (a stray vec row now exists for a sealed meeting).
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let args = json!({ "query": "budget planning hiring quarter" });
+
+        // Not unlocked → sealed meeting must NOT appear.
+        let out = dispatch_tool(&db, "search_semantic", &args, &HashSet::new()).unwrap();
+        assert!(out.contains("id:open"), "open meeting must surface");
+        assert!(
+            !out.contains("id:sealed"),
+            "sealed-not-unlocked meeting leaked through search_semantic (gate violation)"
+        );
+
+        // Session-unlock → sealed meeting reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = dispatch_tool(&db, "search_semantic", &args, &unlocked).unwrap();
+        assert!(out2.contains("id:sealed"), "unlocked meeting must reappear in semantic results");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

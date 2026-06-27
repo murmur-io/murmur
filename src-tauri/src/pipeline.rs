@@ -511,6 +511,26 @@ async fn summarize_and_export(
         exported_path: None,
     })?;
 
+    // brain2 RAG Phase 2b — index the just-persisted note into the on-device vector layer, GATED by
+    // the master flag AND the meeting's visibility (never index a sealed-not-unlocked folder's
+    // plaintext). Best-effort: a failure logs (no PII) and NEVER fails the pipeline. Flag-off ⇒ this
+    // does literally nothing (no embedder built, no writes). A note that is subsequently sealed into
+    // a locked folder (the `SealInto` auto-file path below) has its chunks purged by the seal, so the
+    // net at-rest state never carries a sealed meeting's vectors.
+    if config.semantic_search_enabled {
+        let unlocked = state
+            .unlocked_folders
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let embedder = crate::embed::active_embedder();
+        if let Err(e) =
+            index_meeting_if_enabled(&state.db, meeting_id, true, &unlocked, embedder.as_ref())
+        {
+            tracing::warn!(target: "rag", error = %e, "semantic index of new note failed (note unaffected)");
+        }
+    }
+
     // No vault configured → the note is ALREADY fully saved in Murmur's canonical DB above
     // (upsert_note + status Summarized). The Obsidian vault is EXPORT-ONLY: skip the whole
     // export / auto-organize / seal block, leave `exported_path = None`, and finish in the
@@ -621,6 +641,30 @@ fn finalize_note_without_vault(
     let title = derive_title(markdown, date_iso);
     db.set_meeting_title(meeting_id, &title)?;
     Ok(title)
+}
+
+/// brain2 RAG Phase 2b — the GATED entry point for indexing a note into the vector layer. Pure +
+/// AppState-free (takes only the `Db`, the flag, the live `unlocked` set, and the embedder) so the
+/// gate is unit-testable in isolation. Two short-circuits before any embedding/write:
+///   1. `enabled == false` ⇒ no-op (the prod-safe default ⇒ NOTHING is indexed).
+///   2. the meeting is sealed-and-not-session-unlocked (`meeting_is_visible == false`) ⇒ no-op, so a
+///      locked folder's plaintext is NEVER chunked/embedded (same visibility predicate as every read).
+///
+/// Only a visible meeting under an ENABLED flag reaches `index_meeting_chunks`.
+pub(crate) fn index_meeting_if_enabled(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    enabled: bool,
+    unlocked: &std::collections::HashSet<String>,
+    embedder: &dyn crate::embed::Embedder,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if !db.meeting_is_visible(meeting_id, unlocked)? {
+        return Ok(()); // sealed-not-unlocked: never index its plaintext.
+    }
+    db.index_meeting_chunks(meeting_id, embedder)
 }
 
 /// Pick the vault subfolder for a note: AI thematic filing (nested under the configured
@@ -901,5 +945,121 @@ mod tests {
             "no-vault recording must finish Summarized, never Error"
         );
         assert_ne!(meeting.status, MeetingStatus::Error);
+    }
+
+    // ── Phase 2b: gated semantic indexing on note creation ──────────────────────────────────────
+
+    use crate::storage::models::{Folder, Meeting, NoteRecord as Note};
+    use std::collections::HashSet;
+
+    fn seed_meeting_note(db: &crate::storage::Db, mid: &str, folder: Option<&str>) {
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Budget Sync".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&Note {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "Budget planning for the next quarter and hiring runway.".to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_note_folder(mid, folder).unwrap();
+    }
+
+    /// Count vec0 rows for a meeting via the GATED public read: if a chunk exists for `mid` AND the
+    /// meeting is visible under `unlocked`, the query vector (same text) returns it. Returns true iff
+    /// the meeting surfaces in the semantic results.
+    fn semantic_finds(
+        db: &crate::storage::Db,
+        mid: &str,
+        unlocked: &HashSet<String>,
+    ) -> bool {
+        let emb = crate::embed::active_embedder();
+        let qv = emb
+            .embed(std::slice::from_ref(&"budget planning hiring quarter".to_string()))
+            .unwrap();
+        let qvec = qv.into_iter().next().unwrap_or_default();
+        db.search_semantic_visible(&qvec, 10, unlocked)
+            .unwrap()
+            .iter()
+            .any(|h| h.meeting.id == mid)
+    }
+
+    /// Flag OFF (the prod-safe default): `index_meeting_if_enabled` must write NOTHING — a
+    /// pipeline-equivalent note insert leaves zero chunks, so the semantic read returns nothing.
+    #[test]
+    fn index_gate_flag_off_writes_no_chunks() {
+        let db = crate::storage::Db::open_with_key(&temp_db_path("idx-off"), TEST_DEK).unwrap();
+        seed_meeting_note(&db, "m1", None);
+        let nothing = HashSet::new();
+        let emb = crate::embed::active_embedder();
+        // enabled = false → no-op.
+        index_meeting_if_enabled(&db, "m1", false, &nothing, emb.as_ref()).unwrap();
+        assert!(
+            !semantic_finds(&db, "m1", &nothing),
+            "flag OFF must not index any chunk (prod-safe default)"
+        );
+    }
+
+    /// Flag ON + visible meeting: indexing runs on note creation, and the meeting surfaces in the
+    /// gated semantic read.
+    #[test]
+    fn index_gate_flag_on_indexes_visible_meeting() {
+        let db = crate::storage::Db::open_with_key(&temp_db_path("idx-on"), TEST_DEK).unwrap();
+        seed_meeting_note(&db, "m1", None); // open (no folder) → visible.
+        let nothing = HashSet::new();
+        let emb = crate::embed::active_embedder();
+        index_meeting_if_enabled(&db, "m1", true, &nothing, emb.as_ref()).unwrap();
+        assert!(
+            semantic_finds(&db, "m1", &nothing),
+            "flag ON must index a visible meeting's note"
+        );
+    }
+
+    /// Flag ON but the meeting is sealed-and-NOT-session-unlocked: the visibility gate stops the
+    /// index BEFORE any plaintext is chunked — no chunk row is ever written. Once the folder is
+    /// session-unlocked, indexing proceeds and the meeting reappears (mirrors
+    /// `vec_semantic_search_is_gated_by_visibility`).
+    #[test]
+    fn index_gate_skips_sealed_meeting_until_unlocked() {
+        let db = crate::storage::Db::open_with_key(&temp_db_path("idx-sealed"), TEST_DEK).unwrap();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed_meeting_note(&db, "m1", Some("f-lock"));
+
+        let emb = crate::embed::active_embedder();
+        let nothing = HashSet::new();
+        // Sealed + not unlocked → index is a no-op (gate), so the semantic read (even under the same
+        // empty set) finds nothing.
+        index_meeting_if_enabled(&db, "m1", true, &nothing, emb.as_ref()).unwrap();
+        assert!(
+            !semantic_finds(&db, "m1", &nothing),
+            "a sealed-not-unlocked meeting must never be indexed (gate holds)"
+        );
+
+        // Session-unlock the folder → indexing now proceeds and the meeting reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        index_meeting_if_enabled(&db, "m1", true, &unlocked, emb.as_ref()).unwrap();
+        assert!(
+            semantic_finds(&db, "m1", &unlocked),
+            "an unlocked folder's meeting must be indexed + visible"
+        );
     }
 }
