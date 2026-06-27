@@ -2,14 +2,16 @@
 
 Guidance for Claude Code when working in this repository. These instructions are **binding** and override default behavior.
 
-## ⚠️ MANDATORY READING BEFORE ANY CODE
+## ⚠️ Binding rules — AUTO-LOADED every session
 
-Before touching `src-tauri/` (Rust) or `src/app/` (Angular), read the binding rules — every forbidden pattern in them is genuinely forbidden, no exceptions without explicit user approval:
+The four rule files below are **imported into context automatically** via the `@` references — you don't need to open, read, or invoke anything; treat them as part of these instructions. Every forbidden pattern in them is genuinely forbidden, no exceptions without explicit user approval.
 
-- [`.claude/rules/rust-tauri.md`](.claude/rules/rust-tauri.md) — Rust/Tauri backend: errors, commands, SQLCipher, additive migrations, **verify-before-destroy**, **gate every content read**, **crash-safe macOS FFI**, `cargo test --lib` only.
-- [`.claude/rules/angular-zoneless.md`](.claude/rules/angular-zoneless.md) — Angular 18 **zoneless** FE: signals-first, standalone/OnPush, `@if/@for`, IPC→signals (no NgRx, no subscribe-for-state), and the three Murmur traps (NG0600, recursive-component `forwardRef` cycle, opaque overlays).
-- [`.claude/rules/lock-model.md`](.claude/rules/lock-model.md) — the per-folder encryption/lock **invariants** (gate every read; verify-before-destroy every seal; the `convertFileSrc` asset-path leak trap).
-- [`.claude/rules/agentic-workflow.md`](.claude/rules/agentic-workflow.md) — how to use the Workflow tool + the **adversarial-verify** discipline that has caught every real bug here.
+@.claude/rules/rust-tauri.md
+@.claude/rules/angular-zoneless.md
+@.claude/rules/lock-model.md
+@.claude/rules/agentic-workflow.md
+
+*(Orientation: `rust-tauri` = errors/commands/SQLCipher/additive-migrations/verify-before-destroy/gate-every-read/crash-safe-FFI/`cargo test --lib` only; `angular-zoneless` = signals-first/standalone/`@if`-`@for`/IPC→signals/the three traps; `lock-model` = gate every read + verify-before-destroy every seal + the `convertFileSrc` leak trap; `agentic-workflow` = Workflow tool + adversarial-verify discipline.)*
 
 ## What Murmur is
 
@@ -64,8 +66,12 @@ The full step-by-step runbook is **[`.claude/skills/release-murmur`](.claude/ski
 
 ## Agents, skills & rules (this repo's `.claude/`)
 
-- **Agents** (`.claude/agents/`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `murmur-researcher`.
-- **Skills** (`.claude/skills/`): `release-murmur` (deploy runbook), `tauri-dev` (run/iterate dev), `ship-feature` (the plan→build→adversarial-verify→PR pattern), `research`.
-- **Rules** (`.claude/rules/`): `rust-tauri`, `angular-zoneless`, `lock-model`, `agentic-workflow`.
+- **Rules** (`.claude/rules/`): `rust-tauri`, `angular-zoneless`, `lock-model`, `agentic-workflow` — **always-on** (auto-imported at the top of this file); apply them without being asked.
+- **Skills** (`.claude/skills/`): **invoke these PROACTIVELY the moment a task matches — the user should NOT have to type the slash command:**
+  - cutting a build / version bump / publishing a release → **`release-murmur`**
+  - starting, iterating, or debugging the dev app → **`tauri-dev`**
+  - shipping a feature or a bug fix → **`ship-feature`**
+  - a "should we / can we / how would we add X" question → **`research`**
+- **Agents** (`.claude/agents/`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `murmur-researcher` — dispatch as subagents; the implementer never owns the verdict.
 
-When a task is multi-step (a feature, a refactor, a release), reach for the **Workflow tool** and let an independent **adversarial-verifier** own the verdict — see `.claude/rules/agentic-workflow.md`.
+When a task is multi-step (a feature, a refactor, a release), reach for the **Workflow tool** and let an independent **adversarial-verifier** own the verdict.
