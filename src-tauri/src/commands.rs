@@ -2581,6 +2581,315 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     Ok(())
 }
 
+/// Rename a folder: change its display `name` (and the matching vault subdirectory + every governed
+/// `path`) without ever touching sealed content.
+///
+/// Steps, ordered so a crash never loses content:
+///  1. Sanitize the new name (same component-safe rule as `create_folder`; reject `/`, `..`, NUL).
+///  2. Recompose this folder's vault-relative path = parent path + sanitized name.
+///  3. If a vault is configured, MOVE the on-disk subdir `old_path` → `new_path` (best-effort rename;
+///     a missing source is fine). The dir holds only the OPEN folder's plaintext `.md`s — sealed
+///     folders keep their `.md`s deleted, so a locked-folder rename just renames an empty/absent dir.
+///  4. Update the `folders` row (name + path) and re-prefix the path of EVERY descendant folder, and
+///     re-point EVERY affected note's `exported_path` from `old_path/...` → `new_path/...`. Sealed
+///     notes have `exported_path = NULL` and are skipped — a LOCKED folder rename is metadata-only and
+///     never reaches the sealed blob / wrapped key (no decrypt, no re-seal).
+///
+/// Idempotent-ish: renaming to the same (sanitized) name is a no-op move + a column rewrite to the
+/// same values.
+#[tauri::command]
+pub fn rename_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+    new_name: String,
+) -> Result<Folder, AppError> {
+    rename_folder_inner(state.inner(), folder_id, new_name)
+}
+
+/// Inner of [`rename_folder`] taking `&AppState` (so tests can drive it without a `tauri::State`).
+/// Holds the [`AppState::lifecycle`] guard across the whole rename (path rewrites the seal/unseal
+/// lifecycle keys FS ops off — see the command doc).
+pub(crate) fn rename_folder_inner(
+    state: &AppState,
+    folder_id: String,
+    new_name: String,
+) -> Result<Folder, AppError> {
+    // BLK-1: serialize with the rest of the lock state machine. A rename never decrypts, but it
+    // rewrites `path` columns that the seal/unseal lifecycle keys vault FS ops off — hold the guard
+    // so it can't interleave with a concurrent lock/unlock/remove that also rewrites paths.
+    let _lifecycle = lifecycle_guard(state);
+
+    let clean = crate::summarize::organize::sanitize_folder(&new_name)
+        .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
+
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    let old_path = folder.path.clone();
+
+    // Recompose this folder's path from its PARENT's path + the new sanitized name.
+    let parent_path = match folder.parent_id.as_deref() {
+        Some(pid) => state.db.folder_by_id(pid)?.map(|p| p.path),
+        None => None,
+    };
+    let new_path = match parent_path.as_deref() {
+        Some(p) if !p.is_empty() => format!("{p}/{clean}"),
+        _ => clean.clone(),
+    };
+
+    // No-op fast path: same path AND same name → nothing to move/rewrite.
+    if new_path == old_path && clean == folder.name {
+        return Ok(Folder { name: clean, path: new_path, ..folder });
+    }
+
+    // Move the on-disk vault subdir, if a vault is configured. Both ends are containment-checked.
+    // `std::fs::rename` moves the WHOLE subtree (including descendant `.md`s) in one atomic op.
+    let mut vault_configured = false;
+    if new_path != old_path {
+        if let Some(vault) = vault_path(state) {
+            vault_configured = true;
+            let vault_root = std::path::Path::new(&vault);
+            // Destination must stay inside the vault; the source is an existing in-vault dir.
+            let dest = assert_in_vault(vault_root, std::path::Path::new(&new_path))?;
+            let src = assert_in_vault(vault_root, std::path::Path::new(&old_path))?;
+            if src.exists() {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        AppError::Export(format!("create rename parent dir failed: {e}"))
+                    })?;
+                }
+                // A plain rename within the same vault is atomic on the same filesystem.
+                std::fs::rename(&src, &dest)
+                    .map_err(|e| AppError::Export(format!("rename folder dir failed: {e}")))?;
+            } else {
+                // Source absent (a locked folder's dir, or never materialized): ensure the
+                // destination exists so future plaintext `.md`s land in the renamed dir.
+                std::fs::create_dir_all(&dest).map_err(|e| {
+                    AppError::Export(format!("create renamed folder dir failed: {e}"))
+                })?;
+            }
+        }
+    }
+
+    // Rewrite the DB: this folder's name+path, then re-prefix every DESCENDANT folder's path. Order
+    // doesn't risk content loss — no markdown/blob column is touched; only path strings move.
+    state.db.rename_folder(&folder_id, &clean, &new_path)?;
+    if new_path != old_path {
+        reprefix_descendant_folder_paths(state, &folder_id, &new_path)?;
+        // Re-derive every governed note's `exported_path` to point under its (possibly renamed)
+        // folder's NEW on-disk dir. We rebuild from the file basename + the folder's new dir rather
+        // than swapping path prefixes — robust to `/var` vs `/private/var` canonicalization drift in
+        // the stored absolute path. The `fs::rename` already moved the bytes; this only re-points the
+        // DB. Sealed notes (NULL exported_path) are skipped. Walks this folder + the whole subtree.
+        if vault_configured {
+            reexport_notes_under_subtree(state, &folder_id)?;
+        }
+    }
+
+    Ok(Folder { name: clean, path: new_path, ..folder })
+}
+
+/// Recursively re-prefix the vault-relative `path` of every DESCENDANT folder of `folder_id` to sit
+/// under `new_prefix` after the folder itself was renamed. Walks the tree one level at a time via
+/// [`Db::child_folders`]; each child's recomposed path is `new_prefix` + the child's own name (so the
+/// rewrite is structural, not a brittle string-replace). Does NOT touch the child's `name`, lock
+/// state, or any note content — only the `path` column (the descendants' notes are re-pointed by the
+/// single absolute-dir swap in the caller, since `fs::rename` moved the whole subtree at once).
+fn reprefix_descendant_folder_paths(
+    state: &AppState,
+    folder_id: &str,
+    new_prefix: &str,
+) -> Result<(), AppError> {
+    for child in state.db.child_folders(folder_id)? {
+        let child_old = child.path.clone();
+        let child_new = if new_prefix.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{new_prefix}/{}", child.name)
+        };
+        if child_new != child_old {
+            state.db.rename_folder(&child.id, &child.name, &child_new)?;
+        }
+        // Recurse into this child's own subtree.
+        reprefix_descendant_folder_paths(state, &child.id, &child_new)?;
+    }
+    Ok(())
+}
+
+/// After a folder rename moved the on-disk subtree, re-point the `exported_path` of every governed
+/// note in `folder_id` AND its descendants to its folder's NEW vault dir. Each note's new path is
+/// `<vault>/<folder.path>/<basename of the old exported_path>` (the `fs::rename` preserved the
+/// filename). Rebuilding from the basename (not a string-prefix swap on the stored absolute path) is
+/// robust to canonicalization drift (`/var` vs `/private/var`) and to where the original export wrote
+/// the path. Sealed notes carry `exported_path = NULL` and are skipped. Requires a configured vault.
+fn reexport_notes_under_subtree(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    let Some(vault) = vault_path(state) else {
+        return Ok(());
+    };
+    let vault_root = std::path::Path::new(&vault);
+
+    let folder = match state.db.folder_by_id(folder_id)? {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+    // The folder's NEW absolute dir (containment-checked).
+    let new_dir = assert_in_vault(vault_root, std::path::Path::new(&folder.path))?;
+
+    for n in state.db.notes_in_folder(folder_id)? {
+        let Some(old) = n.exported_path else {
+            continue; // sealed note (no .md) — nothing to re-point.
+        };
+        let Some(name) = std::path::Path::new(&old).file_name() else {
+            continue;
+        };
+        let new_path = new_dir.join(name);
+        state
+            .db
+            .set_note_exported_path(&n.meeting_id, &n.provider_id, &new_path.to_string_lossy())?;
+    }
+
+    // Recurse into descendant folders (their dirs moved with the same single `fs::rename`).
+    for child in state.db.child_folders(folder_id)? {
+        reexport_notes_under_subtree(state, &child.id)?;
+    }
+    Ok(())
+}
+
+/// Delete a folder, NEVER losing a note. SECURITY-CRITICAL — a folder may hold notes and may be
+/// sealed (LOCKED). Rules, fail-closed:
+///
+///  - **Has child folders →** REJECT (`InvalidArg`). The FE deletes leaf-first; refusing here keeps
+///    a subtree from being silently orphaned (a child's `parent_id` would dangle).
+///  - **LOCKED + NOT session-unlocked →** REJECT (`AppError::Locked`). We have no CK to unseal the
+///    folder's notes, so deleting the row would orphan encrypted-and-unrecoverable content (the
+///    wrapped key lives on the row we'd delete). Tell the user to unlock first.
+///  - **LOCKED + SESSION-UNLOCKED →** PERMANENTLY remove the lock first (`remove_lock_inner`:
+///    KEK → unwrap CK → decrypt every note/transcript/timeline/audio back to plaintext, re-export the
+///    `.md`, clear the blobs, flip the folder open). Only then does it become the OPEN case below, so
+///    nothing is ever left encrypted-and-orphaned.
+///  - **OPEN (now) →** move every note to the vault ROOT (`folder_id = NULL`), delete the folder row,
+///    and remove the (now-empty) vault subdir. Notes survive at "All notes".
+#[tauri::command]
+pub fn delete_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    delete_folder_inner(state.inner(), folder_id)
+}
+
+/// Inner of [`delete_folder`] taking `&AppState` (so tests can drive it without a `tauri::State`).
+/// See the command doc for the fail-closed rules.
+pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+
+    // Refuse a non-empty SUBTREE — never orphan child folders by dangling their parent_id.
+    if !state.db.child_folders(&folder_id)?.is_empty() {
+        return Err(AppError::InvalidArg(
+            "this folder has subfolders — delete or move them first".into(),
+        ));
+    }
+
+    // If sealed, it MUST be session-unlocked so we can unseal its notes back to plaintext before the
+    // folder row (which carries the wrapped key) is destroyed. Otherwise refuse — never orphan
+    // sealed content.
+    if folder.locked {
+        let session_unlocked = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .contains(&folder_id);
+        if !session_unlocked {
+            return Err(AppError::Locked(
+                "unlock this folder first to delete it (its notes are sealed)".into(),
+            ));
+        }
+        // Permanently unseal back to plaintext + re-export the `.md`s, then the folder is OPEN.
+        // remove_lock_inner takes the lifecycle guard itself (so we do NOT hold it across this call —
+        // the std Mutex is non-reentrant and would self-deadlock).
+        remove_lock_inner(state, folder_id.clone())?;
+    }
+
+    // OPEN folder now (or was open all along): move its notes to the vault ROOT, then drop the row.
+    // Serialize the reassign + row delete + FS cleanup under the lifecycle guard so it can't race a
+    // concurrent lock/move on the same folder.
+    let _lifecycle = lifecycle_guard(state);
+
+    // Move every note in this folder to the vault root (folder_id = NULL). The notes' plaintext `.md`
+    // files already live in this folder's vault subdir; we re-point each meeting's exported_path to
+    // the root by moving the file (best-effort, copy-then-remove — never loses bytes).
+    let notes = state.db.notes_in_folder(&folder_id)?;
+    let mut moved_meetings = std::collections::HashSet::new();
+    for n in &notes {
+        if !moved_meetings.insert(n.meeting_id.clone()) {
+            continue;
+        }
+        // Reassign every provider row of this meeting to the root.
+        state.db.set_meeting_folder(&n.meeting_id, None)?;
+        // Best-effort move of the plaintext `.md` to the vault root (only when one exists).
+        if let Some(src_path) = n.exported_path.clone() {
+            if let Some(vault) = vault_path(state) {
+                move_note_file_to_root(state, &n.meeting_id, &src_path, &vault)?;
+            }
+        }
+    }
+
+    // Delete the folder row, then remove the (now note-free) vault subdir. Row first: a leftover
+    // empty dir is harmless/reconcilable; a dangling row is not.
+    state.db.delete_folder(&folder_id)?;
+    if let Some(vault) = vault_path(state) {
+        let vault_root = std::path::Path::new(&vault);
+        if let Ok(dir) = assert_in_vault(vault_root, std::path::Path::new(&folder.path)) {
+            // remove_dir (not _all): only an EMPTY dir is removed, so a stray user file is never
+            // clobbered. The notes' `.md`s were moved out above, so the dir should be empty.
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+    Ok(())
+}
+
+/// Move a meeting's plaintext `.md` to the vault ROOT (copy-then-remove, never losing bytes) and
+/// re-point its `exported_path`. A `&AppState`-only twin of [`move_note_file`] (whose `&State`
+/// signature can't be reached from the `_inner` delete path). Used when deleting a folder demotes its
+/// notes to "All notes".
+fn move_note_file_to_root(
+    state: &AppState,
+    meeting_id: &str,
+    src_path: &str,
+    vault: &str,
+) -> Result<(), AppError> {
+    let src = std::path::Path::new(src_path);
+    let bytes = match std::fs::read_to_string(src) {
+        Ok(b) => b,
+        // Source already gone → nothing to move; the DB association is already NULL.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::Export(format!("read note for move failed: {e}"))),
+    };
+    let file_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Export("note path has no filename".into()))?;
+    let vault_root = std::path::Path::new(vault);
+    let dest = assert_in_vault(vault_root, std::path::Path::new(file_name))?;
+    let src_canon = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+    if dest == src_canon || dest == src {
+        return Ok(()); // already at the root.
+    }
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
+    }
+    // Write the destination atomically, THEN remove the source (never lose bytes).
+    crate::export::overwrite_note(&dest, &bytes)?;
+    let _ = std::fs::remove_file(src);
+    if let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? {
+        state
+            .db
+            .set_note_exported_path(meeting_id, &existing.provider_id, &dest.to_string_lossy())?;
+    }
+    Ok(())
+}
+
 /// SESSION-unlock the folder OWNING a meeting (so the FE can unlock straight from the locked
 /// Detail view). Resolves the meeting's folder, then delegates to the existing biometric
 /// `unlock_folder` path (Touch ID → KEK → unwrap CK → decrypt note + transcript + timeline + audio
@@ -3721,5 +4030,247 @@ mod lifecycle_tests {
             !dto_to_config(dto2, &current2).cloud_egress_consented,
             "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
         );
+    }
+
+    // ── rename_folder / delete_folder (folder lifecycle) ────────────────────────────────────────
+
+    /// A fresh, unique temp vault dir for the FS-side rename/delete tests.
+    fn tmp_vault(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "murmur-folderlc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// An [`AppState`] with a REAL temp vault dir configured, so the FS-side of rename/delete (dir
+    /// move/remove + note `.md` move) actually runs (the keyless `build_state` skips it).
+    fn build_state_with_vault(tag: &str, vault: &std::path::Path) -> AppState {
+        let s = build_state(tag);
+        {
+            let mut c = s.config.lock().unwrap();
+            c.vault_path = Some(vault.to_string_lossy().to_string());
+        }
+        s
+    }
+
+    fn make_child_folder(db: &Db, id: &str, name: &str, path: &str, parent_id: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            parent_id: Some(parent_id.to_string()),
+            locked: false,
+            created_at: "2026-06-27T08:30:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// Renaming an OPEN folder updates `name` + `path`, MOVES the on-disk vault subdir, and re-points
+    /// each note's `exported_path` — content (the `.md` bytes) survives byte-identical.
+    #[test]
+    fn rename_open_folder_moves_dir_and_reprefixes_paths() {
+        let vault = tmp_vault("rename-open");
+        let state = build_state_with_vault("rename-open", &vault);
+
+        // An open folder "Work" with one note whose `.md` lives in <vault>/Work/.
+        make_open_folder(&state.db, "f1", "Work");
+        let work_dir = vault.join("Work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let md_path = work_dir.join("note.md");
+        std::fs::write(&md_path, "# real content").unwrap();
+        seed_meeting(&state.db, "m1", "# real content", Some("f1"));
+        state
+            .db
+            .set_note_exported_path("m1", "claude_code", &md_path.to_string_lossy())
+            .unwrap();
+
+        let renamed = rename_folder_inner(&state, "f1".into(), "Projects".into()).unwrap();
+        assert_eq!(renamed.name, "Projects");
+        assert_eq!(renamed.path, "Projects");
+
+        // DB row updated.
+        let f = state.db.folder_by_id("f1").unwrap().unwrap();
+        assert_eq!(f.name, "Projects");
+        assert_eq!(f.path, "Projects");
+
+        // On-disk subdir moved (old gone, new present with the SAME bytes).
+        assert!(!work_dir.exists(), "old dir gone after rename");
+        let new_md = vault.join("Projects").join("note.md");
+        assert!(new_md.exists(), "note .md moved into the renamed dir");
+        assert_eq!(std::fs::read_to_string(&new_md).unwrap(), "# real content");
+
+        // exported_path re-pointed under the new dir (compare canonicalized — the stored path is the
+        // canonicalized absolute form, which on macOS is /private/var… vs the test's /var…).
+        let n = state.db.get_latest_note_for_meeting("m1").unwrap().unwrap();
+        let stored = n.exported_path.expect("note still has an exported path");
+        assert_eq!(
+            std::fs::canonicalize(&stored).unwrap(),
+            std::fs::canonicalize(&new_md).unwrap(),
+            "exported_path points at the moved .md"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Renaming a LOCKED folder is METADATA-ONLY: the row name+path change, but no sealed content is
+    /// touched — `locked` stays true, the `wrapped_key` is unchanged, and the note's `content_blob`
+    /// (the ciphertext) is byte-identical before/after. The blanked plaintext stays blanked.
+    #[test]
+    fn rename_locked_folder_is_metadata_only_and_never_touches_sealed_content() {
+        let vault = tmp_vault("rename-locked");
+        let state = build_state_with_vault("rename-locked", &vault);
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        make_open_folder(&state.db, "lf", "Secret");
+        seed_meeting(&state.db, "ms", "# top secret strategy", Some("lf"));
+        lock_folder_inner(&state, "lf".to_string()).unwrap(); // seal it (NOT session-unlocked)
+
+        let wrapped_before = state.db.folder_wrapped_key("lf").unwrap();
+        let blob_before = state.db.sealable_notes_for_meeting("ms").unwrap()[0]
+            .content_blob
+            .clone();
+        assert!(blob_before.is_some(), "sealed note has a content_blob");
+
+        let renamed = rename_folder_inner(&state, "lf".into(), "Vault".into()).unwrap();
+        assert_eq!(renamed.name, "Vault");
+
+        let f = state.db.folder_by_id("lf").unwrap().unwrap();
+        assert!(f.locked, "still sealed after a metadata rename");
+        assert_eq!(f.name, "Vault");
+        assert_eq!(f.path, "Vault");
+        assert_eq!(
+            state.db.folder_wrapped_key("lf").unwrap(),
+            wrapped_before,
+            "the wrapped CK is untouched by a rename"
+        );
+        let after = &state.db.sealable_notes_for_meeting("ms").unwrap()[0];
+        assert_eq!(after.content_blob, blob_before, "ciphertext byte-identical after rename");
+        assert!(after.markdown.is_empty(), "blanked plaintext stays blanked");
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A rename re-prefixes DESCENDANT folder paths too (a child of the renamed folder moves with it).
+    #[test]
+    fn rename_reprefixes_descendant_folder_paths() {
+        let state = build_state("rename-desc"); // no vault → pure DB path rewrite
+        make_open_folder(&state.db, "parent", "Work");
+        make_child_folder(&state.db, "child", "Q3", "Work/Q3", "parent");
+
+        rename_folder_inner(&state, "parent".into(), "Projects".into()).unwrap();
+
+        assert_eq!(state.db.folder_by_id("parent").unwrap().unwrap().path, "Projects");
+        assert_eq!(
+            state.db.folder_by_id("child").unwrap().unwrap().path,
+            "Projects/Q3",
+            "the child's path moves under the renamed parent"
+        );
+    }
+
+    /// Deleting an OPEN folder moves its notes to the vault ROOT (folder_id = NULL), survives the
+    /// note bytes (the `.md` moves to the root), deletes the folder row, and removes the empty subdir.
+    #[test]
+    fn delete_open_folder_demotes_notes_to_root_and_removes_dir() {
+        let vault = tmp_vault("del-open");
+        let state = build_state_with_vault("del-open", &vault);
+
+        make_open_folder(&state.db, "f", "Trash-Me");
+        let dir = vault.join("Trash-Me");
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("keep.md");
+        std::fs::write(&md, "# must survive").unwrap();
+        seed_meeting(&state.db, "m", "# must survive", Some("f"));
+        state
+            .db
+            .set_note_exported_path("m", "claude_code", &md.to_string_lossy())
+            .unwrap();
+
+        delete_folder_inner(&state, "f".into()).unwrap();
+
+        // Folder row gone.
+        assert!(state.db.folder_by_id("f").unwrap().is_none(), "folder row deleted");
+        // Note survived, now at the root (folder_id NULL).
+        assert_eq!(state.db.folder_for_meeting("m").unwrap(), None, "note demoted to All notes");
+        let n = state.db.get_latest_note_for_meeting("m").unwrap().unwrap();
+        assert_eq!(n.markdown, "# must survive", "note content never lost");
+        let root_md = vault.join("keep.md");
+        assert!(root_md.exists(), ".md moved to the vault root");
+        assert_eq!(std::fs::read_to_string(&root_md).unwrap(), "# must survive");
+        assert!(!dir.exists(), "emptied folder dir removed");
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// SECURITY: deleting a LOCKED folder that is NOT session-unlocked is REFUSED (`AppError::Locked`)
+    /// — the row (with the wrapped key) and the sealed `content_blob` are untouched, so nothing is
+    /// orphaned encrypted-and-unrecoverable.
+    #[test]
+    fn delete_locked_not_unlocked_folder_refuses_and_keeps_sealed_content() {
+        let state = build_state("del-locked");
+        make_open_folder(&state.db, "lf", "Sealed");
+        seed_meeting(&state.db, "m", "# confidential", Some("lf"));
+        lock_folder_inner(&state, "lf".to_string()).unwrap(); // sealed, NOT session-unlocked
+
+        let res = delete_folder_inner(&state, "lf".into());
+        assert!(matches!(res, Err(AppError::Locked(_))), "must refuse with Locked, got {res:?}");
+
+        // Folder + sealed content intact.
+        assert!(state.db.folder_by_id("lf").unwrap().is_some(), "folder NOT deleted");
+        assert!(state.db.folder_wrapped_key("lf").unwrap().is_some(), "wrapped key kept");
+        let n = &state.db.sealable_notes_for_meeting("m").unwrap()[0];
+        assert!(n.content_blob.is_some(), "ciphertext kept (never orphaned)");
+        assert_eq!(state.db.folder_for_meeting("m").unwrap().as_deref(), Some("lf"));
+    }
+
+    /// SECURITY: deleting a LOCKED + SESSION-UNLOCKED folder UNSEALS its notes back to plaintext
+    /// (remove-lock) BEFORE the row is destroyed, then demotes them to the root — so nothing is left
+    /// encrypted-and-orphaned and no note is lost.
+    #[test]
+    fn delete_locked_session_unlocked_folder_unseals_then_demotes_notes() {
+        let vault = tmp_vault("del-unlocked");
+        let state = build_state_with_vault("del-unlocked", &vault);
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        make_open_folder(&state.db, "lf", "Secret");
+        seed_meeting(&state.db, "m", "# decrypt me back", Some("lf"));
+        lock_folder_inner(&state, "lf".to_string()).unwrap();
+
+        // Make it SESSION-UNLOCKED: in the unlock set + KEK cached (as a real unlock would leave it).
+        state.unlocked_folders.lock().unwrap().insert("lf".to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        delete_folder_inner(&state, "lf".into()).unwrap();
+
+        // Folder gone; note unsealed (plaintext restored, blob cleared) and demoted to the root.
+        assert!(state.db.folder_by_id("lf").unwrap().is_none(), "folder row deleted");
+        assert_eq!(state.db.folder_for_meeting("m").unwrap(), None, "note demoted to All notes");
+        let n = &state.db.sealable_notes_for_meeting("m").unwrap()[0];
+        assert_eq!(n.markdown, "# decrypt me back", "plaintext restored before delete");
+        assert!(n.content_blob.is_none(), "no orphaned ciphertext left behind");
+        // The session set no longer references the deleted folder.
+        assert!(!state.unlocked_folders.lock().unwrap().contains("lf"));
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Deleting a folder that still has CHILD folders is refused (`InvalidArg`) — never orphan a
+    /// subtree by dangling a child's parent_id.
+    #[test]
+    fn delete_folder_with_children_refuses() {
+        let state = build_state("del-children");
+        make_open_folder(&state.db, "parent", "Work");
+        make_child_folder(&state.db, "child", "Q3", "Work/Q3", "parent");
+
+        let res = delete_folder_inner(&state, "parent".into());
+        assert!(matches!(res, Err(AppError::InvalidArg(_))), "must refuse, got {res:?}");
+        assert!(state.db.folder_by_id("parent").unwrap().is_some(), "parent NOT deleted");
+        assert!(state.db.folder_by_id("child").unwrap().is_some(), "child NOT orphaned");
     }
 }

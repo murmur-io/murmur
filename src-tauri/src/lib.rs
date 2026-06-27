@@ -101,6 +101,8 @@ pub fn run() {
             commands::toggle_bar,
             commands::list_folders,
             commands::create_folder,
+            commands::rename_folder,
+            commands::delete_folder,
             commands::move_note,
             commands::lock_folder,
             commands::unlock_folder,
