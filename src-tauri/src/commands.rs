@@ -1104,12 +1104,33 @@ pub async fn ask_vault(
     // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
     // again, while sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
     let unlocked = unlocked_snapshot(state.inner())?;
-    let (corpus, sources) = crate::summarize::vault_context::build_vault_context_visible(
-        &state.db,
-        &question,
-        &config.provider_id,
-        &unlocked,
-    )?;
+    // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪ vector
+    // KNN, RRF-fused) — embedding the query with the active embedder — then pack with the SAME
+    // budget/citation logic and the SAME visibility gate. When OFF (the default) OR the index is
+    // empty, this falls back to the existing FTS-only path UNCHANGED (the hybrid query degenerates to
+    // FTS when no vectors exist, and the flag-off branch is byte-for-byte the prior behavior).
+    let (corpus, sources) = if config.semantic_search_enabled {
+        let embedder = crate::embed::active_embedder();
+        let query_vec = embedder
+            .embed(std::slice::from_ref(&question))?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        crate::summarize::vault_context::build_vault_context_hybrid_visible(
+            &state.db,
+            &question,
+            &config.provider_id,
+            &query_vec,
+            &unlocked,
+        )?
+    } else {
+        crate::summarize::vault_context::build_vault_context_visible(
+            &state.db,
+            &question,
+            &config.provider_id,
+            &unlocked,
+        )?
+    };
     if corpus.trim().is_empty() {
         return Ok(AskVaultResult {
             answer: "No meeting notes to search yet — record and summarize a meeting first."
@@ -1510,6 +1531,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
         // `consent_to_cloud_egress` command may flip it. This makes an omitting/zeroed save inert.
         cloud_egress_consented: current.cloud_egress_consented,
+        // Phase 2b: the semantic-search master flag is not (yet) carried on the settings DTO, so a
+        // settings save can neither set nor clobber it — preserve the live value (default OFF).
+        semantic_search_enabled: current.semantic_search_enabled,
     }
 }
 
