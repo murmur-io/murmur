@@ -269,6 +269,27 @@ export class IpcService {
     return invoke<void>("export_audio", { meetingId, destPath });
   }
 
+  /**
+   * Copy a meeting's MIC hi-res master archive (the faithful native-rate float32
+   * WAV kept when "Keep high-fidelity masters" was on) to a chosen path. Rejects
+   * with InvalidArg ("…has no master for that stream") when the meeting was
+   * recorded without that archive, and fails closed with Locked for a
+   * sealed-and-not-session-unlocked folder — surface both as friendly messages.
+   */
+  exportMicMaster(meetingId: string, destPath: string): Promise<void> {
+    return invoke<void>("export_mic_master", { meetingId, destPath });
+  }
+
+  /**
+   * Copy a meeting's SYSTEM hi-res master archive (the faithful 48 kHz float32
+   * WAV of the captured "others" stream) to a chosen path. Same failure modes as
+   * {@link exportMicMaster}: InvalidArg when no system master exists, Locked when
+   * the meeting's folder is sealed and not session-unlocked.
+   */
+  exportSysMaster(meetingId: string, destPath: string): Promise<void> {
+    return invoke<void>("export_sys_master", { meetingId, destPath });
+  }
+
   /** Write a meeting's note markdown to a chosen path. */
   exportNote(meetingId: string, destPath: string): Promise<void> {
     return invoke<void>("export_note", { meetingId, destPath });

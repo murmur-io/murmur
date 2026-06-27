@@ -1404,9 +1404,9 @@ pub fn save_config(
 /// `cloud_egress_consented` true: it persists the flag AND updates the in-memory config cache, so
 /// the next `make_provider(claude_code|anthropic)` is allowed to build. Idempotent.
 ///
-/// TODO(FE): call this from a first-cloud-send confirmation dialog. Until the user confirms,
-/// every cloud summarize/chat returns `AppError::Unavailable("cloud egress not consented …")`,
-/// which the FE should detect and surface as the consent prompt.
+/// The FE calls this from its first-cloud-send confirmation dialog. Until the user confirms, every
+/// cloud summarize/chat returns `AppError::Unavailable("cloud egress not consented …")`, which the
+/// FE detects and surfaces as the consent prompt.
 #[tauri::command]
 pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
     let mut cache = state
@@ -2007,6 +2007,67 @@ fn move_into_locked_folder(
     Ok(())
 }
 
+/// The auto-organize safety decision for a classifier-chosen vault subfolder (BLK-2 parity for the
+/// summarize pipeline). A freshly auto-filed note's plaintext `.md` must NEVER land in a LOCKED
+/// folder's on-disk directory with `folder_id = NULL`: a later `lock_folder` and the at-rest
+/// reconcile both key off `folder_id` and would miss it, leaving plaintext in a sealed dir forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoFileTarget {
+    /// The subfolder is open / root / unmanaged (no matching folder row, or not locked) — write the
+    /// plaintext note there as usual.
+    Open,
+    /// The subfolder is a SESSION-UNLOCKED locked folder — write the note, then seal it INTO this
+    /// folder id (encrypt markdown/extras, remove the plaintext `.md`), exactly like a manual move.
+    SealInto(String),
+    /// The subfolder is a LOCKED, NOT-session-unlocked folder — there is no CK to seal with, so the
+    /// note must NOT be written here. The caller writes it at the vault root instead (reject).
+    RejectToRoot,
+}
+
+/// Classify where a summarize-pipeline note may be auto-filed, given the classifier-chosen
+/// vault-relative `subfolder`. Pure lookup — performs NO writes. See [`AutoFileTarget`]. A subfolder
+/// matching no folder row, or a non-locked folder, is [`AutoFileTarget::Open`]. The pipeline calls
+/// this BEFORE writing the note so plaintext is never written into a sealed dir in the first place.
+pub fn classify_auto_file_target(
+    state: &AppState,
+    subfolder: Option<&str>,
+) -> Result<AutoFileTarget, AppError> {
+    let Some(sub) = subfolder.filter(|s| !s.is_empty()) else {
+        return Ok(AutoFileTarget::Open);
+    };
+    let Some(folder) = state.db.folder_by_path(sub)? else {
+        return Ok(AutoFileTarget::Open);
+    };
+    if !folder.locked {
+        return Ok(AutoFileTarget::Open);
+    }
+    let session_unlocked = state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+        .contains(&folder.id);
+    if session_unlocked {
+        Ok(AutoFileTarget::SealInto(folder.id))
+    } else {
+        Ok(AutoFileTarget::RejectToRoot)
+    }
+}
+
+/// Seal a just-auto-filed note INTO a session-unlocked locked folder — the SAME BLK-2 path a manual
+/// [`move_note`] into a locked folder takes (reassign every provider row + encrypt markdown/extras +
+/// remove the plaintext `.md`). Called by the pipeline only after [`classify_auto_file_target`]
+/// returned [`AutoFileTarget::SealInto`]. On the rare race where the folder was relocked in between,
+/// [`move_into_locked_folder`] returns `Err(Locked)` BEFORE touching state; the caller then removes
+/// the stray plaintext `.md` so it never survives in a sealed dir (the note's markdown is still in
+/// the DB, recoverable).
+pub fn seal_auto_filed_note(
+    state: &AppState,
+    meeting_id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    move_into_locked_folder(state, meeting_id, folder_id)
+}
+
 /// Seal ONE just-moved meeting's note (every provider row) + its transcript/timeline/audio under the
 /// folder CK, removing each row's vault `.md`. Verify-before-blank per row (mirrors `lock_folder`):
 /// the markdown is only blanked once its blob reads back identical, so a moved note is never lost.
@@ -2203,26 +2264,18 @@ pub async fn unlock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    // v0.3.2 — the master KEK is now a BIOMETRIC-GATED keychain item. Reading it makes macOS present
-    // the Touch ID / passcode sheet directly (with our reason string) and hand back the key — THAT
-    // single sheet IS the unlock auth. So we no longer call `biometric::authenticate` separately
-    // (that would double-prompt: Touch ID, then a keychain-password dialog). Result: exactly ONE
-    // Touch ID prompt, no "app wants to use keychain, enter password" dialog, no "Always Allow".
+    // v0.3.2 — the master KEK is a BIOMETRIC-GATED keychain item. Reading it makes macOS present the
+    // Touch ID / passcode sheet directly (with our reason string) and hand back the key — THAT single
+    // sheet IS the unlock auth, so there is no separate app-side authentication step (which would
+    // double-prompt: Touch ID, then a keychain-password dialog). Result: exactly ONE Touch ID prompt,
+    // no "app wants to use keychain, enter password" dialog, no "Always Allow".
     //
-    // lock_require_biometric (K_LOCK_REQUIRE_BIOMETRIC, default true): this preference is retained
-    // for forward-compat, but NOTE — the protection is now enforced by the keychain item's
-    // kSecAttrAccessControl (an OS-level gate), not by an app-side `if`. An app boolean cannot waive
-    // the OS access control: even with the flag false, reading the gated item still presents the
-    // system sheet. The flag therefore no longer suppresses the OS prompt; it is read only so a
-    // future build could choose to RE-LOCK more eagerly. The honest one-Touch-ID guarantee holds in
-    // the default (true) case, which is the shipped configuration.
-    let require_biometric = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Storage("config mutex poisoned".into()))?;
-        cfg.lock_require_biometric
-    };
+    // The `lock_require_biometric` preference (K_LOCK_REQUIRE_BIOMETRIC, default true) is INFORMATIONAL
+    // only: the biometric requirement is enforced by the keychain item's kSecAttrAccessControl (an
+    // OS-level gate), not by any app-side `if`. An app boolean cannot waive the OS access control —
+    // even with the flag false, reading the gated item still presents the system sheet. It is NOT read
+    // here precisely because it cannot change this code path; it is surfaced in settings so the user
+    // can see the guarantee, and is retained on the config DTO for forward-compat.
 
     let folder = state
         .db
@@ -2238,10 +2291,7 @@ pub async fn unlock_folder(
 
     // Reuse the KEK cached from an earlier unlock in this session so repeated unlocks do NOT
     // re-prompt for Touch ID (the cache is zeroized on relock-all). Only fall through to the
-    // biometric-gated keychain read — the single Touch ID prompt — when nothing is cached. The
-    // `require_biometric` flag does not gate this read (see the note above); it is referenced so the
-    // value is intentionally consumed and so a future eager-relock path can branch on it.
-    let _ = require_biometric;
+    // biometric-gated keychain read — the single Touch ID prompt — when nothing is cached.
     let kek: Zeroizing<[u8; 32]> = {
         let cached: Option<Zeroizing<[u8; 32]>> = {
             let g = state
@@ -2254,8 +2304,8 @@ pub async fn unlock_folder(
             Some(k) => k,
             None => {
                 // The biometric-gated keychain read BLOCKS while the Touch ID sheet is up, so run it
-                // on the blocking pool — never on an async-runtime worker thread (same discipline the
-                // old biometric::authenticate used). This is the single Touch ID prompt.
+                // on the blocking pool — never on an async-runtime worker thread. This is the single
+                // Touch ID prompt.
                 let bytes = tokio::task::spawn_blocking(|| {
                     crate::secrets::get_or_create_master_kek_with_reason("Unlock this folder")
                 })
@@ -2603,9 +2653,60 @@ fn aad_content(
     .into_bytes()
 }
 
-/// AAD for an audio `.enc` blob: bound to `meeting_id | folder_id` (per the B8 spec).
+/// The ROLE-LESS audio AAD (the historical B8 form): bound to `meeting_id | folder_id`. Retained as
+/// the lower rung of the decrypt ladder so masters/playback sealed BEFORE stream-role binding (which
+/// carry exactly this NON-empty AAD) still decrypt — see [`aad_audio_role`] and
+/// [`crate::crypto::decrypt_file_multi`].
 fn aad_audio(meeting_id: &str, folder_id: &str) -> Vec<u8> {
     format!("murmur:audio:v{AAD_SCHEMA_VERSION}|meeting={meeting_id}|folder={folder_id}").into_bytes()
+}
+
+/// Which audio stream a `.enc` belongs to. Bound into the audio AAD ([`aad_audio_role`]) so the
+/// three per-meeting files — playback WAV (`audio_path`), mic master, sys master — which previously
+/// shared the SAME `aad_audio(meeting,folder)` and were therefore cross-decryptable within a meeting,
+/// can no longer be swapped for one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamRole {
+    Playback,
+    Mic,
+    Sys,
+}
+
+impl StreamRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            StreamRole::Playback => "playback",
+            StreamRole::Mic => "mic",
+            StreamRole::Sys => "sys",
+        }
+    }
+}
+
+/// ROLE-BOUND audio AAD: [`aad_audio`] PLUS the stream role, so a mic master can't be swapped for the
+/// sys master (or the playback WAV) within the same meeting. New seals bind THIS form.
+///
+/// ⚠ BACKWARD-COMPAT: existing masters/playback `.enc` were sealed with the role-LESS [`aad_audio`]
+/// (a NON-empty AAD). A role-bound decrypt alone would NOT match them, and the empty-AAD legacy
+/// fallback would NOT match them either (they are non-empty) → DATA LOSS. So decrypt ALWAYS goes
+/// through [`audio_decrypt_ladder`] (role form → role-less form → empty), never a bare role decrypt.
+/// A file re-binds to this role form on its next seal.
+fn aad_audio_role(meeting_id: &str, folder_id: &str, role: StreamRole) -> Vec<u8> {
+    format!(
+        "murmur:audio:v{AAD_SCHEMA_VERSION}|meeting={meeting_id}|folder={folder_id}|stream={}",
+        role.as_str()
+    )
+    .into_bytes()
+}
+
+/// The two AAD rungs to TRY when decrypting one audio stream, newest-binding first:
+/// `[role-bound, role-less]`. (The empty-AAD pre-AAD fallback is built into `crypto::decrypt`, so it
+/// is covered by the first rung — see [`crate::crypto::decrypt_file_multi`].) Returned owned so the
+/// caller can borrow both as `&[&[u8]]`.
+fn audio_decrypt_ladder(meeting_id: &str, folder_id: &str, role: StreamRole) -> (Vec<u8>, Vec<u8>) {
+    (
+        aad_audio_role(meeting_id, folder_id, role),
+        aad_audio(meeting_id, folder_id),
+    )
 }
 
 /// Sentinel provider id for content blobs that have no note-provider (transcript segments, timeline)
@@ -2619,10 +2720,13 @@ const AAD_NO_PROVIDER: &str = "-";
 // per-file means a crash mid-loop leaves already-sealed `.enc` + not-yet-sealed plaintext — never
 // lost audio. Each returns the new path to persist, or `None` when there's nothing to do.
 //
-// Each crypto-touching stage takes an `aad: &[u8]` (the caller passes `&aad_audio(meeting, folder)`)
-// so every audio blob at rest stays AAD-bound to its (meeting|folder) context (B7/B8) — the same
-// guarantee the content blobs get. `reblank_audio` performs no crypto (it only drops the decrypted
-// session copy and re-points at the durable `.enc`), so it needs no AAD.
+// The SEAL stage takes a single `aad: &[u8]` — the ROLE-bound `aad_audio_role(meeting, folder, role)`
+// it binds the new ciphertext to. The two DECRYPT stages take an `aads: &[&[u8]]` LADDER (role form,
+// then the historical role-less form) so a master/playback sealed before stream-role binding still
+// decrypts and then re-binds on next seal — see `audio_decrypt_ladder` / `crypto::decrypt_file_multi`.
+// Every audio blob at rest thus stays AAD-bound to its (meeting|folder|stream) context (B7/B8 + the
+// stream-role hardening) — the same guarantee the content blobs get. `reblank_audio` performs no
+// crypto (it only drops the decrypted session copy and re-points at the durable `.enc`), so no AAD.
 
 /// SEAL: encrypt `<file>` → `<file>.enc` (verify inside), remove the plaintext only after the
 /// verified `.enc` exists. `None` when already sealed, missing on disk, or absent. Idempotent.
@@ -2647,22 +2751,23 @@ fn seal_audio_at_rest(
 }
 
 /// SESSION-unseal: decrypt `<file>.enc` → `<file>` for the session, KEEPING the `.enc`. Returns
-/// the plaintext path to persist (`None` if not sealed).
+/// the plaintext path to persist (`None` if not sealed). `aads` is the role→role-less decrypt ladder
+/// (see [`audio_decrypt_ladder`]) so a pre-role master still decrypts.
 fn session_unseal_audio(
     ck: &[u8; 32],
     enc_path: Option<String>,
-    aad: &[u8],
+    aads: &[&[u8]],
 ) -> Result<Option<String>, AppError> {
     let Some(enc_path) = enc_path else { return Ok(None) };
     if !enc_path.ends_with(ENC_SUFFIX) {
         return Ok(None);
     }
     let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-    crate::crypto::decrypt_file(
+    crate::crypto::decrypt_file_multi(
         ck,
         std::path::Path::new(&enc_path),
         std::path::Path::new(&plain),
-        aad,
+        aads,
     )?;
     Ok(Some(plain))
 }
@@ -2683,22 +2788,23 @@ fn reblank_audio(path: Option<String>) -> Result<Option<String>, AppError> {
 }
 
 /// PERMANENT-unseal (remove-lock): decrypt `<file>.enc` → `<file>`, then remove the `.enc`.
-/// Returns the plaintext path to persist (`None` if not sealed). Never loses audio.
+/// Returns the plaintext path to persist (`None` if not sealed). Never loses audio. `aads` is the
+/// role→role-less decrypt ladder (see [`audio_decrypt_ladder`]) so a pre-role master still decrypts.
 fn permanent_unseal_audio(
     ck: &[u8; 32],
     enc_path: Option<String>,
-    aad: &[u8],
+    aads: &[&[u8]],
 ) -> Result<Option<String>, AppError> {
     let Some(enc_path) = enc_path else { return Ok(None) };
     if !enc_path.ends_with(ENC_SUFFIX) {
         return Ok(None);
     }
     let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-    crate::crypto::decrypt_file(
+    crate::crypto::decrypt_file_multi(
         ck,
         std::path::Path::new(&enc_path),
         std::path::Path::new(&plain),
-        aad,
+        aads,
     )?;
     let _ = std::fs::remove_file(&enc_path);
     Ok(Some(plain))
@@ -2762,21 +2868,21 @@ fn seal_meeting_extras(
 
     // Audio at rest: the playback WAV + both masters, each encrypted → <file>.enc with
     // verify-before-destroy (inside encrypt_file), then the plaintext removed and the column
-    // re-pointed at the .enc. Every blob is AAD-bound to (meeting|folder) so a sealed audio file
-    // can't be swapped between contexts (B7/B8). The timeline was already sealed just above — do
-    // NOT re-seal it here.
+    // re-pointed at the .enc. Each blob is AAD-bound to (meeting|folder|STREAM-ROLE) so a sealed
+    // audio file can't be swapped between contexts OR between the three streams of one meeting
+    // (B7/B8 + stream-role hardening). The timeline was already sealed just above — do NOT re-seal it.
     if let Some(enc) = seal_audio_at_rest(
         ck,
         state.db.get_meeting(mid)?.and_then(|m| m.audio_path),
-        &aad_audio(mid, folder_id),
+        &aad_audio_role(mid, folder_id, StreamRole::Playback),
     )? {
         state.db.set_meeting_audio_path(mid, Some(&enc))?;
     }
     let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
-    if let Some(enc) = seal_audio_at_rest(ck, mic, &aad_audio(mid, folder_id))? {
+    if let Some(enc) = seal_audio_at_rest(ck, mic, &aad_audio_role(mid, folder_id, StreamRole::Mic))? {
         state.db.set_meeting_mic_master_path(mid, Some(&enc))?;
     }
-    if let Some(enc) = seal_audio_at_rest(ck, sys, &aad_audio(mid, folder_id))? {
+    if let Some(enc) = seal_audio_at_rest(ck, sys, &aad_audio_role(mid, folder_id, StreamRole::Sys))? {
         state.db.set_meeting_sys_master_path(mid, Some(&enc))?;
     }
     Ok(())
@@ -2805,20 +2911,24 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
                 state.db.restore_timeline_data(mid, &data)?;
             }
         }
-        // Audio at rest: materialize a playable WAV for the session (playback + both masters),
-        // each AAD-bound to (meeting|folder); the .enc is kept (folder still locked on disk).
+        // Audio at rest: materialize a playable WAV for the session (playback + both masters), each
+        // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts); the
+        // .enc is kept (folder still locked on disk).
+        let (pb_role, pb_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Playback);
         if let Some(plain) = session_unseal_audio(
             ck,
             state.db.get_meeting(mid)?.and_then(|m| m.audio_path),
-            &aad_audio(mid, folder_id),
+            &[&pb_role, &pb_less],
         )? {
             state.db.set_meeting_audio_path(mid, Some(&plain))?;
         }
         let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
-        if let Some(plain) = session_unseal_audio(ck, mic, &aad_audio(mid, folder_id))? {
+        let (mic_role, mic_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Mic);
+        if let Some(plain) = session_unseal_audio(ck, mic, &[&mic_role, &mic_less])? {
             state.db.set_meeting_mic_master_path(mid, Some(&plain))?;
         }
-        if let Some(plain) = session_unseal_audio(ck, sys, &aad_audio(mid, folder_id))? {
+        let (sys_role, sys_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Sys);
+        if let Some(plain) = session_unseal_audio(ck, sys, &[&sys_role, &sys_less])? {
             state.db.set_meeting_sys_master_path(mid, Some(&plain))?;
         }
     }
@@ -2888,20 +2998,24 @@ fn unseal_folder_extras_permanent(
         }
         state.db.clear_timeline_blob(&mid)?;
 
-        // Audio at rest: permanently restore the playback WAV + both masters from their .enc,
-        // each AAD-bound to (meeting|folder); the .enc is dropped only after the plaintext is back.
+        // Audio at rest: permanently restore the playback WAV + both masters from their .enc, each
+        // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts); the
+        // .enc is dropped only after the plaintext is back.
+        let (pb_role, pb_less) = audio_decrypt_ladder(&mid, folder_id, StreamRole::Playback);
         if let Some(plain) = permanent_unseal_audio(
             ck,
             state.db.get_meeting(&mid)?.and_then(|m| m.audio_path),
-            &aad_audio(&mid, folder_id),
+            &[&pb_role, &pb_less],
         )? {
             state.db.set_meeting_audio_path(&mid, Some(&plain))?;
         }
         let (mic, sys) = state.db.get_meeting_master_paths(&mid)?;
-        if let Some(plain) = permanent_unseal_audio(ck, mic, &aad_audio(&mid, folder_id))? {
+        let (mic_role, mic_less) = audio_decrypt_ladder(&mid, folder_id, StreamRole::Mic);
+        if let Some(plain) = permanent_unseal_audio(ck, mic, &[&mic_role, &mic_less])? {
             state.db.set_meeting_mic_master_path(&mid, Some(&plain))?;
         }
-        if let Some(plain) = permanent_unseal_audio(ck, sys, &aad_audio(&mid, folder_id))? {
+        let (sys_role, sys_less) = audio_decrypt_ladder(&mid, folder_id, StreamRole::Sys);
+        if let Some(plain) = permanent_unseal_audio(ck, sys, &[&sys_role, &sys_less])? {
             state.db.set_meeting_sys_master_path(&mid, Some(&plain))?;
         }
     }
@@ -3084,16 +3198,18 @@ mod lock_read_gate_tests {
     #[test]
     fn master_seal_stage_round_trips_byte_identical() {
         let ck = [7u8; 32];
-        // The SAME AAD must bind seal + unseal (B7/B8 audio context binding); a mismatch would fail
-        // the AES-GCM tag check, so passing it through both calls exercises the real bound round-trip.
-        let aad = aad_audio("m-master", "f-master");
+        // Seal binds the ROLE form (mic master); unseal goes through the role→role-less ladder. A
+        // mismatch would fail the AES-GCM tag check, so this exercises the real bound round-trip
+        // under the stream-role hardening.
+        let mic_aad = aad_audio_role("m-master", "f-master", StreamRole::Mic);
+        let (mic_role, mic_less) = audio_decrypt_ladder("m-master", "f-master", StreamRole::Mic);
         let plain =
             std::env::temp_dir().join(format!("murmur-seal-stage-{}.bin", std::process::id()));
         let original = b"RIFF\x00\x01\x02\xfffake-master-pcm....\x10\x20".to_vec();
         std::fs::write(&plain, &original).unwrap();
         let plain_s = plain.to_string_lossy().to_string();
 
-        let enc = seal_audio_at_rest(&ck, Some(plain_s.clone()), &aad)
+        let enc = seal_audio_at_rest(&ck, Some(plain_s.clone()), &mic_aad)
             .unwrap()
             .expect("a fresh plaintext path seals");
         assert!(enc.ends_with(ENC_SUFFIX));
@@ -3103,11 +3219,18 @@ mod lock_read_gate_tests {
         );
         assert!(std::path::Path::new(&enc).exists(), ".enc written");
         // Idempotent: an already-sealed path is a no-op (never double-encrypts).
-        assert!(seal_audio_at_rest(&ck, Some(enc.clone()), &aad)
+        assert!(seal_audio_at_rest(&ck, Some(enc.clone()), &mic_aad)
             .unwrap()
             .is_none());
 
-        let restored = permanent_unseal_audio(&ck, Some(enc.clone()), &aad)
+        // A mic master must NOT decrypt under the SYS ladder (no cross-stream swap within a meeting).
+        let (sys_role, sys_less) = audio_decrypt_ladder("m-master", "f-master", StreamRole::Sys);
+        assert!(
+            permanent_unseal_audio(&ck, Some(enc.clone()), &[&sys_role, &sys_less]).is_err(),
+            "the mic master must not unseal under the sys role ladder"
+        );
+
+        let restored = permanent_unseal_audio(&ck, Some(enc.clone()), &[&mic_role, &mic_less])
             .unwrap()
             .expect("a .enc path unseals");
         assert_eq!(restored, plain_s);
@@ -3240,6 +3363,28 @@ mod lock_read_gate_tests {
         // wrapped-CK and audio AADs are distinct namespaces from content.
         assert_ne!(aad_wrapped_ck("f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
         assert_ne!(aad_audio("m", "f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
+    }
+
+    /// Stream-role hardening: each of the three per-meeting audio roles produces a DISTINCT AAD, and
+    /// each differs from the historical role-LESS form — so within ONE meeting a mic master can't be
+    /// swapped for the sys master or the playback WAV. The role-less form is retained verbatim as the
+    /// backward-compat decrypt rung (it must equal the v1 string an existing master was sealed with).
+    #[test]
+    fn audio_role_aad_distinguishes_each_stream_and_keeps_legacy_form() {
+        let pb = aad_audio_role("m", "f", StreamRole::Playback);
+        let mic = aad_audio_role("m", "f", StreamRole::Mic);
+        let sys = aad_audio_role("m", "f", StreamRole::Sys);
+        assert_ne!(pb, mic, "playback vs mic binds");
+        assert_ne!(pb, sys, "playback vs sys binds");
+        assert_ne!(mic, sys, "mic vs sys binds");
+
+        let role_less = aad_audio("m", "f");
+        assert_ne!(role_less, mic, "the role form differs from the role-less form");
+        // Each role form is the role-less string PLUS a |stream=… suffix → a role-less blob can never
+        // match a role AAD, which is exactly why the decrypt ladder must also try the role-less rung.
+        assert!(mic.starts_with(&role_less), "role AAD extends the role-less form");
+        // The role-less form is the EXACT v1 string existing masters carry (no drift = no data loss).
+        assert_eq!(role_less, b"murmur:audio:v1|meeting=m|folder=f".to_vec());
     }
 }
 
@@ -3459,6 +3604,74 @@ mod lifecycle_tests {
         remove_lock_inner(&state, TARGET.to_string()).unwrap();
         let restored = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
         assert_eq!(restored.markdown, MD, "remove-lock restores the moved note's original content");
+    }
+
+    /// Auto-organize seam: [`classify_auto_file_target`] maps a classifier-chosen subfolder to the
+    /// right BLK-2 outcome — Open for an unmanaged / open subfolder, RejectToRoot for a locked +
+    /// not-session-unlocked folder (so plaintext never lands in a sealed dir), and SealInto for a
+    /// locked + session-unlocked folder (write then seal, like a manual move).
+    #[test]
+    fn classify_auto_file_target_covers_open_locked_and_unlocked() {
+        let state = build_state("autofile");
+
+        // No subfolder / unmanaged subfolder → Open.
+        assert_eq!(classify_auto_file_target(&state, None).unwrap(), AutoFileTarget::Open);
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Nonexistent")).unwrap(),
+            AutoFileTarget::Open,
+            "a subfolder with no matching folder row writes as usual"
+        );
+
+        // An OPEN folder row → Open.
+        make_open_folder(&state.db, "f-open", "Standups");
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Standups")).unwrap(),
+            AutoFileTarget::Open
+        );
+
+        // A LOCKED, not-session-unlocked folder → RejectToRoot (no CK to seal with).
+        make_open_folder(&state.db, "f-locked", "Confidential");
+        lock_folder_inner(&state, "f-locked".to_string()).unwrap();
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Confidential")).unwrap(),
+            AutoFileTarget::RejectToRoot,
+            "plaintext must not be written into a locked, not-unlocked folder"
+        );
+
+        // Make it SESSION-UNLOCKED (in the set + KEK cached) → SealInto(folder_id).
+        state.unlocked_folders.lock().unwrap().insert("f-locked".to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Confidential")).unwrap(),
+            AutoFileTarget::SealInto("f-locked".to_string()),
+            "a session-unlocked locked folder seals the auto-filed note in"
+        );
+    }
+
+    /// Auto-organize seam (seal half): a note auto-filed into a session-unlocked locked folder via
+    /// [`seal_auto_filed_note`] is sealed to the folder's at-rest shape (blob set, markdown blanked)
+    /// and reassigned — exactly like a manual move. No plaintext survives in the sealed dir.
+    #[test]
+    fn seal_auto_filed_note_seals_into_unlocked_locked_folder() {
+        const MID: &str = "m-autofile";
+        const TARGET: &str = "f-autofile";
+        const MD: &str = "# auto-filed\n\nthis becomes ciphertext at rest";
+
+        let state = build_state("autofile-seal");
+        seed_meeting(&state.db, MID, MD, None);
+        make_open_folder(&state.db, TARGET, "AutoLocked");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap();
+        state.unlocked_folders.lock().unwrap().insert(TARGET.to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        seal_auto_filed_note(&state, MID, TARGET).unwrap();
+
+        assert_eq!(state.db.folder_for_meeting(MID).unwrap().as_deref(), Some(TARGET));
+        let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
+        assert!(n.content_blob.is_some(), "auto-filed note sealed (content_blob set)");
+        assert!(n.markdown.is_empty(), "auto-filed note plaintext blanked at rest");
     }
 
     /// BLK-3: an `AppConfigDto` payload that OMITS `mcpRequireToken` deserializes to `true`
