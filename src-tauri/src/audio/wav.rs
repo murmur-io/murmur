@@ -40,6 +40,29 @@ pub fn write_wav_16k_mono(path: &Path, samples: &[f32], src_rate: u32) -> Result
     Ok(())
 }
 
+/// Write f32 samples to a 32-bit FLOAT WAV at `sample_rate` WITHOUT resampling — the faithful
+/// per-stream MASTER archive (rec #3). `channels` is the interleave factor (1 = mono). Unlike
+/// `write_wav_16k_mono` this preserves the native rate AND full float precision (no i16 quantize).
+pub fn write_wav_f32(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) -> Result<()> {
+    let spec = WavSpec {
+        channels: channels.max(1),
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path, spec)
+        .map_err(|e| AppError::Audio(format!("failed to create master WAV: {e}")))?;
+    for &s in samples {
+        writer
+            .write_sample(s)
+            .map_err(|e| AppError::Audio(format!("failed to write master sample: {e}")))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| AppError::Audio(format!("failed to finalize master WAV: {e}")))?;
+    Ok(())
+}
+
 /// Resample mono f32 @ src_rate to 16 kHz mono f32 (in-memory, for Whisper input).
 ///
 /// Whisper expects 16 kHz mono `f32` in [-1.0, 1.0]. If the source is already 16 kHz
@@ -171,6 +194,20 @@ mod tests {
     #[test]
     fn zero_rate_is_error() {
         assert!(resample_to_16k(&[0.0], 0).is_err());
+    }
+
+    #[test]
+    fn master_wav_f32_round_trips() {
+        let p = std::env::temp_dir().join(format!("murmur-master-rt-{}.wav", std::process::id()));
+        let samples = vec![0.0f32, 0.5, -0.5, 0.123_456, -0.987_654, 1.0, -1.0];
+        write_wav_f32(&p, &samples, 48_000, 1).unwrap();
+        let (back, rate) = read_wav_mono(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(rate, 48_000);
+        assert_eq!(back.len(), samples.len());
+        for (a, b) in samples.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-6, "master float WAV not faithful: {a} vs {b}");
+        }
     }
 
     #[test]

@@ -69,6 +69,8 @@ pub struct AppConfigDto {
     pub capture_system_audio: bool,
     #[serde(default = "default_true")]
     pub vad_enabled: bool,
+    #[serde(default)]
+    pub keep_hires_masters: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -413,6 +415,14 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
             let _ = std::fs::remove_file(audio);
         }
     }
+    // Masters too — a master path may be the plaintext WAV or its `.enc`; clear both forms.
+    if let Ok((mic, sys)) = state.db.get_meeting_master_paths(&meeting_id) {
+        for p in [mic, sys].into_iter().flatten() {
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_file(format!("{p}{ENC_SUFFIX}"));
+            let _ = std::fs::remove_file(p.trim_end_matches(ENC_SUFFIX));
+        }
+    }
     if let Some(note) = state.db.get_latest_note_for_meeting(&meeting_id)? {
         if let Some(path) = note.exported_path.as_deref() {
             let _ = std::fs::remove_file(path);
@@ -495,6 +505,57 @@ pub fn export_audio(
     std::fs::copy(&src, &dest_path)
         .map_err(|e| AppError::Storage(format!("copy audio failed: {e}")))?;
     Ok(())
+}
+
+/// Which per-stream master to export.
+enum MasterStream {
+    Mic,
+    Sys,
+}
+
+/// Shared READ-GATED export for a per-stream master archive (faithful float32 WAV). Refuses a
+/// sealed-and-not-unlocked meeting (the master is `.enc` at rest, no plaintext to copy) and never
+/// hands a path to the FE — the masters are reachable ONLY through these gated commands.
+fn export_master(
+    state: State<'_, AppState>,
+    meeting_id: &str,
+    dest_path: &str,
+    which: MasterStream,
+) -> Result<(), AppError> {
+    if !meeting_is_unlocked(state.inner(), meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to export the master".into(),
+        ));
+    }
+    let (mic, sys) = state.db.get_meeting_master_paths(meeting_id)?;
+    let src = match which {
+        MasterStream::Mic => mic,
+        MasterStream::Sys => sys,
+    }
+    .ok_or_else(|| AppError::InvalidArg("this meeting has no master for that stream".into()))?;
+    std::fs::copy(&src, dest_path)
+        .map_err(|e| AppError::Storage(format!("copy master failed: {e}")))?;
+    Ok(())
+}
+
+/// Export a meeting's MIC master archive (faithful native-rate float32 WAV) to a chosen path.
+#[tauri::command]
+pub fn export_mic_master(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    dest_path: String,
+) -> Result<(), AppError> {
+    export_master(state, &meeting_id, &dest_path, MasterStream::Mic)
+}
+
+/// Export a meeting's SYSTEM master archive (faithful 48 kHz float32 WAV) to a chosen path.
+#[tauri::command]
+pub fn export_sys_master(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    dest_path: String,
+) -> Result<(), AppError> {
+    export_master(state, &meeting_id, &dest_path, MasterStream::Sys)
 }
 
 /// Write a meeting's note markdown to a user-chosen path (FE picks it via a save dialog).
@@ -1222,6 +1283,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         input_device: c.input_device.clone(),
         capture_system_audio: c.capture_system_audio,
         vad_enabled: c.vad_enabled,
+        keep_hires_masters: c.keep_hires_masters,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -1250,6 +1312,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         input_device: norm(d.input_device),
         capture_system_audio: d.capture_system_audio,
         vad_enabled: d.vad_enabled,
+        keep_hires_masters: d.keep_hires_masters,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a
@@ -2096,6 +2159,84 @@ pub async fn unlock_meeting(
 /// this suffix on `meetings.audio_path` is the on-disk "audio is sealed" signal.
 const ENC_SUFFIX: &str = ".enc";
 
+// ── per-file audio-at-rest stages (audio_path + the two masters all share these) ──────────────
+// A meeting carries up to THREE at-rest audio files — the playback WAV (`audio_path`) and the two
+// faithful masters (`mic_master_path` / `sys_master_path`). All follow the SAME seal lifecycle, so
+// these run once PER FILE. Verify-before-destroy lives inside `crypto::encrypt_file`; running
+// per-file means a crash mid-loop leaves already-sealed `.enc` + not-yet-sealed plaintext — never
+// lost audio. Each returns the new path to persist, or `None` when there's nothing to do.
+
+/// SEAL: encrypt `<file>` → `<file>.enc` (verify inside), remove the plaintext only after the
+/// verified `.enc` exists. `None` when already sealed, missing on disk, or absent. Idempotent.
+fn seal_audio_at_rest(ck: &[u8; 32], path: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(path) = path else { return Ok(None) };
+    if path.ends_with(ENC_SUFFIX) || !std::path::Path::new(&path).exists() {
+        return Ok(None);
+    }
+    let enc_path = format!("{path}{ENC_SUFFIX}");
+    crate::crypto::encrypt_file(
+        ck,
+        std::path::Path::new(&path),
+        std::path::Path::new(&enc_path),
+    )?;
+    let _ = std::fs::remove_file(&path);
+    Ok(Some(enc_path))
+}
+
+/// SESSION-unseal: decrypt `<file>.enc` → `<file>` for the session, KEEPING the `.enc`. Returns
+/// the plaintext path to persist (`None` if not sealed).
+fn session_unseal_audio(
+    ck: &[u8; 32],
+    enc_path: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let Some(enc_path) = enc_path else { return Ok(None) };
+    if !enc_path.ends_with(ENC_SUFFIX) {
+        return Ok(None);
+    }
+    let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
+    crate::crypto::decrypt_file(
+        ck,
+        std::path::Path::new(&enc_path),
+        std::path::Path::new(&plain),
+    )?;
+    Ok(Some(plain))
+}
+
+/// RE-BLANK (relock): drop the decrypted session copy + re-point at the durable `.enc`. Returns
+/// the `.enc` path to persist (`None` if already sealed or the `.enc` is missing).
+fn reblank_audio(path: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(path) = path else { return Ok(None) };
+    if path.ends_with(ENC_SUFFIX) {
+        return Ok(None);
+    }
+    let enc_path = format!("{path}{ENC_SUFFIX}");
+    if !std::path::Path::new(&enc_path).exists() {
+        return Ok(None);
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(Some(enc_path))
+}
+
+/// PERMANENT-unseal (remove-lock): decrypt `<file>.enc` → `<file>`, then remove the `.enc`.
+/// Returns the plaintext path to persist (`None` if not sealed). Never loses audio.
+fn permanent_unseal_audio(
+    ck: &[u8; 32],
+    enc_path: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let Some(enc_path) = enc_path else { return Ok(None) };
+    if !enc_path.ends_with(ENC_SUFFIX) {
+        return Ok(None);
+    }
+    let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
+    crate::crypto::decrypt_file(
+        ck,
+        std::path::Path::new(&enc_path),
+        std::path::Path::new(&plain),
+    )?;
+    let _ = std::fs::remove_file(&enc_path);
+    Ok(Some(plain))
+}
+
 /// SEAL every governed meeting's transcript + timeline under `ck`, then the audio WAV. Mirrors
 /// `lock_folder`'s note seal: each blob is verified-decryptable BEFORE the plaintext is blanked /
 /// the plaintext WAV is removed — content (transcript / audio) is never lost.
@@ -2135,16 +2276,19 @@ fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Resul
             }
         }
 
-        // Audio: encrypt the plaintext WAV → <file>.enc (verify-before-destroy inside
-        // encrypt_file), then remove the plaintext and re-point audio_path at the .enc.
-        if let Some(path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
-            if !path.ends_with(ENC_SUFFIX) && std::path::Path::new(&path).exists() {
-                let enc_path = format!("{path}{ENC_SUFFIX}");
-                crate::crypto::encrypt_file(ck, std::path::Path::new(&path), std::path::Path::new(&enc_path))?;
-                // Only NOW (a verified .enc exists) is the plaintext safe to remove.
-                let _ = std::fs::remove_file(&path);
-                state.db.set_meeting_audio_path(mid, Some(&enc_path))?;
-            }
+        // Audio at rest: the playback WAV + both masters, each encrypted → <file>.enc with
+        // verify-before-destroy, then the plaintext removed and the column re-pointed at the .enc.
+        if let Some(enc) =
+            seal_audio_at_rest(ck, state.db.get_meeting(mid)?.and_then(|m| m.audio_path))?
+        {
+            state.db.set_meeting_audio_path(mid, Some(&enc))?;
+        }
+        let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
+        if let Some(enc) = seal_audio_at_rest(ck, mic)? {
+            state.db.set_meeting_mic_master_path(mid, Some(&enc))?;
+        }
+        if let Some(enc) = seal_audio_at_rest(ck, sys)? {
+            state.db.set_meeting_sys_master_path(mid, Some(&enc))?;
         }
     }
     Ok(())
@@ -2171,12 +2315,17 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
                 state.db.restore_timeline_data(mid, &data)?;
             }
         }
-        if let Some(enc_path) = state.db.get_meeting(mid)?.and_then(|m| m.audio_path) {
-            if enc_path.ends_with(ENC_SUFFIX) {
-                let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain))?;
-                state.db.set_meeting_audio_path(mid, Some(&plain))?;
-            }
+        if let Some(plain) =
+            session_unseal_audio(ck, state.db.get_meeting(mid)?.and_then(|m| m.audio_path))?
+        {
+            state.db.set_meeting_audio_path(mid, Some(&plain))?;
+        }
+        let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
+        if let Some(plain) = session_unseal_audio(ck, mic)? {
+            state.db.set_meeting_mic_master_path(mid, Some(&plain))?;
+        }
+        if let Some(plain) = session_unseal_audio(ck, sys)? {
+            state.db.set_meeting_sys_master_path(mid, Some(&plain))?;
         }
     }
     Ok(())
@@ -2197,15 +2346,15 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
                 state.db.restore_timeline_data(&mid, "")?;
             }
         }
-        if let Some(path) = state.db.get_meeting(&mid)?.and_then(|m| m.audio_path) {
-            if !path.ends_with(ENC_SUFFIX) {
-                let enc_path = format!("{path}{ENC_SUFFIX}");
-                if std::path::Path::new(&enc_path).exists() {
-                    // The .enc is the durable copy; drop the decrypted session WAV + re-point.
-                    let _ = std::fs::remove_file(&path);
-                    state.db.set_meeting_audio_path(&mid, Some(&enc_path))?;
-                }
-            }
+        if let Some(enc) = reblank_audio(state.db.get_meeting(&mid)?.and_then(|m| m.audio_path))? {
+            state.db.set_meeting_audio_path(&mid, Some(&enc))?;
+        }
+        let (mic, sys) = state.db.get_meeting_master_paths(&mid)?;
+        if let Some(enc) = reblank_audio(mic)? {
+            state.db.set_meeting_mic_master_path(&mid, Some(&enc))?;
+        }
+        if let Some(enc) = reblank_audio(sys)? {
+            state.db.set_meeting_sys_master_path(&mid, Some(&enc))?;
         }
     }
     Ok(())
@@ -2243,15 +2392,18 @@ fn unseal_folder_extras_permanent(
         }
         state.db.clear_timeline_blob(&mid)?;
 
-        // Audio: permanently restore the plaintext WAV from the .enc, then drop the .enc.
-        if let Some(enc_path) = state.db.get_meeting(&mid)?.and_then(|m| m.audio_path) {
-            if enc_path.ends_with(ENC_SUFFIX) {
-                let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-                crate::crypto::decrypt_file(ck, std::path::Path::new(&enc_path), std::path::Path::new(&plain))?;
-                // Verified plaintext exists → safe to remove the .enc.
-                let _ = std::fs::remove_file(&enc_path);
-                state.db.set_meeting_audio_path(&mid, Some(&plain))?;
-            }
+        // Audio at rest: permanently restore the playback WAV + both masters from their .enc.
+        if let Some(plain) =
+            permanent_unseal_audio(ck, state.db.get_meeting(&mid)?.and_then(|m| m.audio_path))?
+        {
+            state.db.set_meeting_audio_path(&mid, Some(&plain))?;
+        }
+        let (mic, sys) = state.db.get_meeting_master_paths(&mid)?;
+        if let Some(plain) = permanent_unseal_audio(ck, mic)? {
+            state.db.set_meeting_mic_master_path(&mid, Some(&plain))?;
+        }
+        if let Some(plain) = permanent_unseal_audio(ck, sys)? {
+            state.db.set_meeting_sys_master_path(&mid, Some(&plain))?;
         }
     }
     Ok(())
@@ -2350,6 +2502,44 @@ mod lock_read_gate_tests {
             status: MeetingStatus::Summarized,
             folder_id: Some("secret-folder".to_string()),
         }
+    }
+
+    /// The master seal stages (`seal_audio_at_rest` → `permanent_unseal_audio`) round-trip a file
+    /// byte-identical with verify-before-destroy: the plaintext is removed only after a verified
+    /// `.enc` exists, and the `.enc` only after the plaintext is restored. These run per-file for
+    /// `audio_path` AND both masters, so this covers the masters' at-rest crypto + crash-safety.
+    #[test]
+    fn master_seal_stage_round_trips_byte_identical() {
+        let ck = [7u8; 32];
+        let plain =
+            std::env::temp_dir().join(format!("murmur-seal-stage-{}.bin", std::process::id()));
+        let original = b"RIFF\x00\x01\x02\xfffake-master-pcm....\x10\x20".to_vec();
+        std::fs::write(&plain, &original).unwrap();
+        let plain_s = plain.to_string_lossy().to_string();
+
+        let enc = seal_audio_at_rest(&ck, Some(plain_s.clone()))
+            .unwrap()
+            .expect("a fresh plaintext path seals");
+        assert!(enc.ends_with(ENC_SUFFIX));
+        assert!(
+            !std::path::Path::new(&plain_s).exists(),
+            "plaintext removed only after a verified .enc"
+        );
+        assert!(std::path::Path::new(&enc).exists(), ".enc written");
+        // Idempotent: an already-sealed path is a no-op (never double-encrypts).
+        assert!(seal_audio_at_rest(&ck, Some(enc.clone())).unwrap().is_none());
+
+        let restored = permanent_unseal_audio(&ck, Some(enc.clone()))
+            .unwrap()
+            .expect("a .enc path unseals");
+        assert_eq!(restored, plain_s);
+        assert!(
+            !std::path::Path::new(&enc).exists(),
+            ".enc removed only after the plaintext is restored"
+        );
+        let back = std::fs::read(&restored).unwrap();
+        let _ = std::fs::remove_file(&restored);
+        assert_eq!(back, original, "master survives seal -> unseal byte-identical");
     }
 
     /// REGRESSION (audio asset-protocol leak): `get_meeting_detail`'s masked DTO for a sealed-and-

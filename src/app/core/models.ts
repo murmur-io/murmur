@@ -38,6 +38,7 @@ export interface AppConfigDto {
   inputDevice: string | null;
   captureSystemAudio: boolean;
   vadEnabled: boolean;
+  keepHiresMasters: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;
