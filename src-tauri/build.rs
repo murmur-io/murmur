@@ -67,15 +67,23 @@ fn build_swift_helper(
     // Dev fallback path.
     println!("cargo:rustc-env={env_var}={}", out_bin.display());
 
-    // Stage a copy at the stable in-crate path that `bundle.resources` embeds.
+    // Stage a copy at the stable in-crate path that `bundle.resources` embeds — and that
+    // `tauri_build` validates exists, even in dev. RELEASE refreshes it every build; DEV only
+    // CREATES it when ABSENT. Rewriting it each build would retrigger Tauri's dev file-watcher
+    // (resources are registered `rerun-if-changed`) into an infinite rebuild loop. In dev the
+    // helper actually executes via the `OUT_DIR` env fallback above; this staged copy only
+    // satisfies the resource check.
     let bundled = Path::new("binaries").join(bin);
-    if let Some(parent) = bundled.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::copy(&out_bin, &bundled) {
-        println!(
-            "cargo:warning=could not stage {bin} for bundling ({e}); a release bundle may lack it"
-        );
+    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
+    if is_release || !bundled.exists() {
+        if let Some(parent) = bundled.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::copy(&out_bin, &bundled) {
+            println!(
+                "cargo:warning=could not stage {bin} for bundling ({e}); a release bundle may lack it"
+            );
+        }
     }
 }
 
