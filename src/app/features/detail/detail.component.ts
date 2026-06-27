@@ -298,6 +298,47 @@ interface ParsedNote {
                   </button>
                 </div>
               }
+
+              <!-- HI-RES MASTERS: retrieve the faithful per-stream float32 WAV
+                   archives. Shown only when this install keeps masters AND the
+                   meeting has audio; the backend is the source of truth and fails
+                   closed (Locked when sealed, "no master for that stream" when a
+                   given stream wasn't archived) — both surfaced as friendly inline
+                   messages, never a crash. -->
+              @if (keepsMasters() && audioSrc() && !renaming()) {
+                <div
+                  class="export"
+                  role="group"
+                  aria-label="Export hi-res master"
+                >
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    title="Save the faithful float32 mic archive (kept because high-fidelity masters is on)."
+                    (click)="exportMaster('mic', d.meeting.id, d.meeting.title)"
+                    [disabled]="editing() || exporting()"
+                  >
+                    {{
+                      exportMsg() === "mic-master-saved"
+                        ? "Saved"
+                        : "Export master (mic)…"
+                    }}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    title="Save the faithful float32 system-audio archive (when the other side was captured)."
+                    (click)="exportMaster('sys', d.meeting.id, d.meeting.title)"
+                    [disabled]="editing() || exporting()"
+                  >
+                    {{
+                      exportMsg() === "sys-master-saved"
+                        ? "Saved"
+                        : "Export master (system)…"
+                    }}
+                  </button>
+                </div>
+              }
               @if (canvasMsg(); as path) {
                 <div class="saved-toast canvas-toast" role="status">
                   <span class="saved-toast-check" aria-hidden="true"></span>
@@ -1719,6 +1760,16 @@ export class DetailComponent implements OnInit {
   /** Tracked so we can cancel the pending export-label reset on destroy. */
   private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Whether this install keeps high-fidelity per-stream master archives (the
+   * "Keep high-fidelity masters" setting). Loaded best-effort in ngOnInit; gates
+   * the master-export actions, since a meeting only has masters when it was
+   * recorded with this on. Install-global (not per-meeting), so the backend
+   * stays the source of truth — it rejects a stream with no master (InvalidArg)
+   * or a sealed folder (Locked), both surfaced as friendly inline messages.
+   */
+  readonly keepsMasters = signal(false);
+
   // --- Export Canvas (Obsidian .canvas board) ------------------------------
   /** True while an exportCanvas IPC call is in flight (disables the button). */
   readonly exportingCanvas = signal(false);
@@ -1823,6 +1874,14 @@ export class DetailComponent implements OnInit {
       this.detail.set(await this.ipc.getMeetingDetail(id));
     } finally {
       this.loading.set(false);
+    }
+    // Whether this install keeps hi-res masters — gates the master-export
+    // actions. Install-global, so load it regardless of lock state (best-effort;
+    // a failure simply hides the actions). The backend remains the real gate.
+    try {
+      this.keepsMasters.set((await this.ipc.getConfig()).keepHiresMasters);
+    } catch {
+      this.keepsMasters.set(false);
     }
     // Locked (masked) meetings render the lock gate only — skip priming the
     // timeline/tags (they're empty/masked) and focus the Unlock button instead.
@@ -2460,6 +2519,63 @@ export class DetailComponent implements OnInit {
     } finally {
       this.exporting.set(false);
     }
+  }
+
+  /**
+   * Prompt for a destination via the native save dialog, then copy the meeting's
+   * hi-res master archive (faithful per-stream float32 WAV) there through the
+   * gated `exportMicMaster` / `exportSysMaster` commands — the ONLY way these
+   * archives leave the app. A dismissed dialog (null path) is a no-op. The
+   * backend fails closed: a sealed-and-not-unlocked folder rejects with Locked,
+   * and a stream that was never archived rejects with "no master" — both are
+   * mapped to a clear, actionable message (never a crash).
+   */
+  async exportMaster(
+    stream: "mic" | "sys",
+    id: string,
+    title: string | null,
+  ): Promise<void> {
+    if (this.editing() || this.exporting()) {
+      return;
+    }
+    this.exportError.set("");
+    this.exporting.set(true);
+    try {
+      const path = await save({
+        defaultPath: `${this.sanitizeTitle(title)}.${stream}.wav`,
+        filters: [{ name: "Audio", extensions: ["wav"] }],
+      });
+      if (path) {
+        if (stream === "mic") {
+          await this.ipc.exportMicMaster(id, path);
+          this.flashExport("mic-master-saved");
+        } else {
+          await this.ipc.exportSysMaster(id, path);
+          this.flashExport("sys-master-saved");
+        }
+      }
+    } catch (e) {
+      this.exportError.set(this.masterErrorMessage(stream, e));
+    } finally {
+      this.exporting.set(false);
+    }
+  }
+
+  /**
+   * Map a master-export failure to a clear message: a Locked folder → unlock to
+   * export; a missing per-stream archive → none was kept; anything else verbatim.
+   */
+  private masterErrorMessage(stream: "mic" | "sys", error: unknown): string {
+    const raw = String(error);
+    if (/locked/i.test(raw)) {
+      return "This meeting is locked — unlock it to export the master.";
+    }
+    if (/no master/i.test(raw)) {
+      return stream === "mic"
+        ? "No hi-res mic master was kept for this meeting."
+        : "No hi-res system master was kept for this meeting.";
+    }
+    return "Couldn’t export the master: " + raw;
   }
 
   /**

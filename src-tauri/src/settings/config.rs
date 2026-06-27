@@ -304,10 +304,10 @@ impl AppConfig {
     /// it is deliberately separate from `save_config` so consent can never be granted as an
     /// incidental side effect of a settings write.
     ///
-    /// TODO(FE): wire a first-cloud-send confirmation prompt that calls the
-    /// `consent_to_cloud_egress` Tauri command before the first claude_code/anthropic run. Until
-    /// then the egress path returns `AppError::Unavailable("cloud egress not consented …")`, which
-    /// the FE can detect to surface the consent dialog.
+    /// The FE wires a first-cloud-send confirmation prompt that calls the `consent_to_cloud_egress`
+    /// Tauri command before the first claude_code/anthropic run. Until the user confirms, the egress
+    /// path returns `AppError::Unavailable("cloud egress not consented …")`, which the FE detects to
+    /// surface the consent dialog.
     pub fn grant_cloud_egress_consent(&mut self, db: &Db) -> Result<()> {
         self.cloud_egress_consented = true;
         db.set_setting(K_CLOUD_EGRESS_CONSENTED, "true")
