@@ -18,6 +18,8 @@ pub struct AppState {
     pub recorder: Mutex<Option<Recorder>>,
     /// Some while recording AND system-audio capture is enabled + available.
     pub system_recorder: Mutex<Option<SystemAudioRecorder>>,
+    /// Some while recording AND echo-cancellation (VPIO AEC) capture is enabled + available.
+    pub aec_recorder: Mutex<Option<crate::audio::aec::AecRecorder>>,
     /// Some while the voice-trigger listener is running.
     pub voice_listener: Mutex<Option<VoiceListener>>,
     /// Db is internally Send+Sync (Mutex<Connection>).
@@ -96,6 +98,7 @@ impl AppState {
         Ok(Self {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
+            aec_recorder: Mutex::new(None),
             voice_listener: Mutex::new(None),
             db,
             config: Mutex::new(config),

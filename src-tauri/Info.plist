@@ -4,6 +4,8 @@
   <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Murmur records meeting audio from your microphone to transcribe it locally on your Mac.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Murmur captures the other participants' audio playing on your Mac to transcribe meetings locally on device.</string>
     <key>NSRemindersUsageDescription</key>
     <string>Murmur can add your meeting action items to Apple Reminders.</string>
     <key>NSCalendarsUsageDescription</key>
