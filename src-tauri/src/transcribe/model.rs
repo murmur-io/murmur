@@ -20,6 +20,11 @@ pub const MODELS_SUBDIR: &str = "models";
 /// pre-segmentation. Served by the ggml-org/whisper-vad HF repo.
 pub const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
 
+/// Diarization (#8): pyannote segmentation + CAM++ embedding ONNX models (sherpa-converted),
+/// downloaded on demand to [`models_dir`]. ~12 MB + ~28 MB.
+pub const DIARIZE_SEG_MODEL_FILE: &str = "sherpa-pyannote-segmentation-3.0.onnx";
+pub const DIARIZE_EMB_MODEL_FILE: &str = "wespeaker_en_voxceleb_CAM++.onnx";
+
 /// Map a chosen size + language to a whisper.cpp GGML model filename.
 ///
 /// Supported sizes (all served by the ggerganov/whisper.cpp HF mirror):
@@ -135,6 +140,30 @@ pub async fn ensure_vad_model() -> Result<PathBuf> {
     }
     download_model(&vad_model_url(VAD_MODEL_FILE), &dest).await?;
     Ok(dest)
+}
+
+/// Ensure the diarization models exist in [`models_dir`]; returns `(segmentation, embedding)`
+/// paths. Best-effort atomic downloads — a failure leaves the caller with the single "others"
+/// label (diarization is opt-in + non-fatal).
+pub async fn ensure_diarization_models() -> Result<(PathBuf, PathBuf)> {
+    let dir = models_dir()?;
+    let seg = dir.join(DIARIZE_SEG_MODEL_FILE);
+    if !seg.is_file() {
+        download_model(
+            "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx",
+            &seg,
+        )
+        .await?;
+    }
+    let emb = dir.join(DIARIZE_EMB_MODEL_FILE);
+    if !emb.is_file() {
+        download_model(
+            "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/wespeaker_en_voxceleb_CAM++.onnx",
+            &emb,
+        )
+        .await?;
+    }
+    Ok((seg, emb))
 }
 
 /// Download `url` to `dest` atomically (`dest.part` → rename). Overwrites any stale

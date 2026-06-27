@@ -29,6 +29,10 @@ rubato = "0.16"
 
 # ── Transcription ──
 whisper-rs = { version = "0.16", features = ["metal"] }
+# Offline speaker diarization (#8). Bundles a STATIC onnxruntime built for macOS 13.4+, which is
+# why minimumSystemVersion is 13.4. Linked in-process; the diarization path is opt-in + runs only
+# on the system ("others") stream.
+sherpa-onnx = "1.13"
 
 # ── HTTP (Anthropic + Ollama providers) ──
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

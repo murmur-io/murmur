@@ -39,6 +39,7 @@ export interface AppConfigDto {
   captureSystemAudio: boolean;
   vadEnabled: boolean;
   keepHiresMasters: boolean;
+  diarizeOthers: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;

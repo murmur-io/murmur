@@ -32,6 +32,9 @@ pub struct AppConfig {
     /// Keep faithful per-stream float32 MASTER archives (mic native + system 48k) alongside the
     /// 16 kHz playback mix. Default OFF — on, it roughly doubles audio disk use per recording.
     pub keep_hires_masters: bool,
+    /// Run N-way speaker diarization on the system ("others") stream to label remote speakers
+    /// (others-0/1/2). Default OFF; requires system-audio capture + downloads ~40 MB of models.
+    pub diarize_others: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
     /// "large-v3". Default "large-v3" (~3 GB, multilingual) — best transcription quality,
     /// notably for Polish; downloaded on demand via `download_model`.
@@ -75,6 +78,7 @@ impl Default for AppConfig {
             capture_system_audio: false,
             vad_enabled: true,
             keep_hires_masters: false,
+            diarize_others: false,
             model_size: "large-v3".to_string(),
             voice_trigger: false,
             onboarded: false,
@@ -102,6 +106,7 @@ const K_INPUT_DEVICE: &str = "input_device";
 const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 const K_VAD_ENABLED: &str = "vad_enabled";
 const K_KEEP_HIRES_MASTERS: &str = "keep_hires_masters";
+const K_DIARIZE_OTHERS: &str = "diarize_others";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
@@ -157,6 +162,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_KEEP_HIRES_MASTERS)? {
             cfg.keep_hires_masters = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_DIARIZE_OTHERS)? {
+            cfg.diarize_others = v == "true";
         }
         if let Some(v) = db.get_setting(K_MODEL_SIZE)? {
             if !v.is_empty() {
@@ -225,6 +233,10 @@ impl AppConfig {
         db.set_setting(
             K_KEEP_HIRES_MASTERS,
             if self.keep_hires_masters { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_DIARIZE_OTHERS,
+            if self.diarize_others { "true" } else { "false" },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         db.set_setting(
