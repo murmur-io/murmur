@@ -482,6 +482,21 @@ import type {
         </label>
       </div>
 
+      <!-- Echo cancellation (experimental) — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Cancel speaker echo (experimental)</span>
+            <span class="text-secondary toggle-sub">
+              When recording without headphones, apply system echo cancellation to
+              the microphone used for transcription. Experimental — headphones are
+              still the most reliable fix.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="aecEnabled" />
+        </label>
+      </div>
+
       <!-- Voice trigger — toggle row -->
       <div class="card">
         <label class="toggle-row">
@@ -1231,6 +1246,7 @@ export class SettingsComponent implements OnInit {
     vadEnabled: true,
     keepHiresMasters: false,
     diarizeOthers: false,
+    aecEnabled: false,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -1304,6 +1320,7 @@ export class SettingsComponent implements OnInit {
         vadEnabled: cfg.vadEnabled ?? true,
         keepHiresMasters: cfg.keepHiresMasters ?? false,
         diarizeOthers: cfg.diarizeOthers ?? false,
+        aecEnabled: cfg.aecEnabled ?? false,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
@@ -1348,6 +1365,7 @@ export class SettingsComponent implements OnInit {
       vadEnabled: v.vadEnabled,
       keepHiresMasters: v.keepHiresMasters,
       diarizeOthers: v.diarizeOthers,
+      aecEnabled: v.aecEnabled,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,

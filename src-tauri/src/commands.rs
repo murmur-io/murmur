@@ -73,6 +73,8 @@ pub struct AppConfigDto {
     pub keep_hires_masters: bool,
     #[serde(default)]
     pub diarize_others: bool,
+    #[serde(default)]
+    pub aec_enabled: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -192,6 +194,26 @@ pub async fn start_recording(
         }
     }
 
+    // Optionally capture an echo-cancelled (VPIO) mic in PARALLEL with cpal — the AEC'd WAV becomes
+    // the ASR mic feed; cpal stays the archive + fallback. Best-effort + opt-in (aec_enabled).
+    {
+        let enabled = state.config.lock().map(|c| c.aec_enabled).unwrap_or(false);
+        if enabled && crate::audio::aec::is_available(&app) {
+            let aec_wav = std::env::temp_dir().join(format!("meetnotes-aec-{meeting_id}.wav"));
+            match crate::audio::aec::AecRecorder::start(&app, aec_wav) {
+                Ok(rec) => {
+                    if let Ok(mut slot) = state.aec_recorder.lock() {
+                        *slot = Some(rec);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "audio", error = %e,
+                    "AEC capture unavailable; recording the raw mic only"
+                ),
+            }
+        }
+    }
+
     // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
     // during recording (see transcribe::live). Never affects the recording or final note.
     if let Some(cfg) = state.config.lock().ok().map(|c| c.clone()) {
@@ -267,6 +289,20 @@ pub async fn stop_recording(
         }
     };
 
+    // Stop the AEC mic helper (if any) and collect its WAV — used as the ASR mic feed; None falls
+    // back to the raw cpal mic.
+    let aec_mic_wav = {
+        let rec = state
+            .aec_recorder
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        match rec {
+            Some(r) => r.stop().unwrap_or(None),
+            None => None,
+        }
+    };
+
     // Duration from the persisted started_at, falling back to a sample-count estimate.
     let duration_s = compute_duration_s(&state, &meeting_id, samples.len(), src_rate);
 
@@ -278,6 +314,7 @@ pub async fn stop_recording(
         src_rate,
         duration_s,
         system_wav,
+        aec_mic_wav,
         mic_started_at,
         system_started_at,
     )
@@ -1287,6 +1324,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         vad_enabled: c.vad_enabled,
         keep_hires_masters: c.keep_hires_masters,
         diarize_others: c.diarize_others,
+        aec_enabled: c.aec_enabled,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -1317,6 +1355,7 @@ fn dto_to_config(d: AppConfigDto) -> AppConfig {
         vad_enabled: d.vad_enabled,
         keep_hires_masters: d.keep_hires_masters,
         diarize_others: d.diarize_others,
+        aec_enabled: d.aec_enabled,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a

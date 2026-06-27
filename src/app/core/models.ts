@@ -40,6 +40,7 @@ export interface AppConfigDto {
   vadEnabled: boolean;
   keepHiresMasters: boolean;
   diarizeOthers: boolean;
+  aecEnabled: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;

@@ -1259,6 +1259,7 @@ export class OnboardingComponent implements OnInit {
       vadEnabled: base?.vadEnabled ?? true,
       keepHiresMasters: base?.keepHiresMasters ?? false,
       diarizeOthers: base?.diarizeOthers ?? false,
+      aecEnabled: base?.aecEnabled ?? false,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
