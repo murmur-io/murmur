@@ -14,7 +14,10 @@ use crate::{audio, export};
 
 pub struct PipelineResult {
     pub note_markdown: String,
-    pub exported_path: PathBuf,
+    /// Path of the exported Obsidian `.md`, or `None` when no vault folder is configured.
+    /// The note is ALWAYS persisted to the canonical DB (`upsert_note`); the vault is
+    /// export-only, so a missing vault yields `None` here — not an error.
+    pub exported_path: Option<PathBuf>,
     pub meeting_id: String,
 }
 
@@ -451,9 +454,11 @@ async fn run_inner(
     .await
 }
 
-/// Summarize a transcript with the configured provider, persist the note, export it to
-/// the Obsidian vault, and update the meeting status/title. Shared by the full pipeline
-/// and `resummarize_existing`.
+/// Summarize a transcript with the configured provider, persist the note to the canonical
+/// DB, and — when a vault folder is configured — export it to the Obsidian vault and update
+/// the meeting status/title. When NO vault is configured the note is still fully saved
+/// (DB + title), `exported_path` is `None`, and the meeting finishes in `Summarized` (NOT
+/// `Error`): the vault is export-only. Shared by the full pipeline and `resummarize_existing`.
 #[allow(clippy::too_many_arguments)]
 async fn summarize_and_export(
     app: &AppHandle,
@@ -506,15 +511,34 @@ async fn summarize_and_export(
         exported_path: None,
     })?;
 
-    emit_status(app, "exporting", "Writing note to vault…", meeting_id);
+    // No vault configured → the note is ALREADY fully saved in Murmur's canonical DB above
+    // (upsert_note + status Summarized). The Obsidian vault is EXPORT-ONLY: skip the whole
+    // export / auto-organize / seal block, leave `exported_path = None`, and finish in the
+    // terminal `Summarized` state — NOT `Error`. Recording without a vault is fully supported.
+    let Some(vault_path) = config.vault_path.as_deref().filter(|p| !p.is_empty()) else {
+        // Title the meeting so the library/detail view shows it (same title we'd derive on export).
+        let title = finalize_note_without_vault(&state.db, meeting_id, &markdown, date_iso)?;
+        emit_status(
+            app,
+            "saved",
+            "Saved to Murmur — set a vault folder in Settings to export to Obsidian.",
+            meeting_id,
+        );
+        // Best-effort self-assembling graph: the encrypted DB (Sink A) is the canonical store and
+        // works without a vault; never fail the saved note on a graph hiccup.
+        if let Err(e) =
+            crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+        {
+            tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
+        }
+        return Ok(PipelineResult {
+            note_markdown: markdown,
+            exported_path: None,
+            meeting_id: meeting_id.to_string(),
+        });
+    };
 
-    let vault_path = config
-        .vault_path
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| {
-            AppError::Export("no vault folder configured — set one in Settings".into())
-        })?;
+    emit_status(app, "exporting", "Writing note to vault…", meeting_id);
 
     let title = derive_title(&markdown, date_iso);
     let subfolder =
@@ -576,9 +600,27 @@ async fn summarize_and_export(
 
     Ok(PipelineResult {
         note_markdown: markdown,
-        exported_path,
+        exported_path: Some(exported_path),
         meeting_id: meeting_id.to_string(),
     })
+}
+
+/// Finalize a summarized note when NO vault folder is configured. By this point the caller
+/// (`summarize_and_export`) has ALREADY upserted the note markdown to the canonical DB with
+/// `exported_path = None` and moved the meeting to `Summarized`; here we only title the meeting
+/// from the note so the library/detail view shows it. The Obsidian vault is EXPORT-ONLY, so the
+/// no-vault path is a SUCCESS — it NEVER builds an `Export` error. Returns the derived title (for
+/// the graph-entity step). DB-only (no `AppHandle`/provider) so the no-vault contract is
+/// unit-testable in isolation.
+fn finalize_note_without_vault(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    markdown: &str,
+    date_iso: &str,
+) -> Result<String> {
+    let title = derive_title(markdown, date_iso);
+    db.set_meeting_title(meeting_id, &title)?;
+    Ok(title)
 }
 
 /// Pick the vault subfolder for a note: AI thematic filing (nested under the configured
@@ -779,5 +821,85 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         drop(ScratchWav::new(Some(p))); // file doesn't exist — must not panic
+    }
+
+    /// Fixed SQLCipher key for the file-backed test DB (NOT a Keychain DEK).
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn temp_db_path(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-pipeline-test-{}-{}-{}.sqlite",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    /// The no-vault branch of `summarize_and_export`: with no vault configured the note is saved
+    /// to the canonical DB (markdown + `exported_path = None`) and the meeting finishes in the
+    /// terminal `Summarized` state — NOT `Error`. We exercise the real DB-only tail
+    /// (`finalize_note_without_vault`) plus the pre-branch writes `summarize_and_export` performs
+    /// before it (the provider call + `AppHandle` emit are not unit-testable, so they're excluded;
+    /// everything that determines success-vs-error and what lands in the DB is covered here).
+    #[test]
+    fn finalize_note_without_vault_saves_note_summarized_not_error() {
+        use crate::storage::models::Meeting;
+
+        let db = crate::storage::Db::open_with_key(&temp_db_path("no-vault"), TEST_DEK).unwrap();
+        let mid = "m-no-vault";
+
+        // A freshly recorded meeting, mid-pipeline (still Recording, untitled).
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: Some("2026-06-27T09:10:00Z".to_string()),
+            title: None,
+            duration_s: 600,
+            audio_path: Some("/audio/m-no-vault.wav".to_string()),
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+
+        // What `summarize_and_export` writes BEFORE the vault branch: status → Summarized and the
+        // note markdown upserted with NO exported path (the vault is export-only).
+        let markdown = "---\ntitle: Q3 Planning\n---\n# Q3 Planning\n\nBody.";
+        db.update_meeting_status(mid, MeetingStatus::Summarized)
+            .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: markdown.to_string(),
+            created_at: "2026-06-27T09:11:00Z".to_string(),
+            exported_path: None,
+        })
+        .unwrap();
+
+        // The no-vault tail: titles the meeting and returns Ok (never the Export error).
+        let title = finalize_note_without_vault(&db, mid, markdown, "2026-06-27").unwrap();
+        assert_eq!(title, "Q3 Planning");
+
+        // Note is saved to the canonical DB with NO export path.
+        let note = db.get_note(mid, "claude_code").unwrap().expect("note saved");
+        assert_eq!(note.markdown, markdown);
+        assert!(
+            note.exported_path.is_none(),
+            "no-vault note must have exported_path = None"
+        );
+
+        // Meeting is titled and terminal in Summarized — NOT Error.
+        let meeting = db.get_meeting(mid).unwrap().expect("meeting exists");
+        assert_eq!(meeting.title.as_deref(), Some("Q3 Planning"));
+        assert_eq!(
+            meeting.status,
+            MeetingStatus::Summarized,
+            "no-vault recording must finish Summarized, never Error"
+        );
+        assert_ne!(meeting.status, MeetingStatus::Error);
     }
 }
