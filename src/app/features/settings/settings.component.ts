@@ -10,7 +10,11 @@ import { FormBuilder, FormControl, ReactiveFormsModule } from "@angular/forms";
 import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
-import type { AppConfigDto, ProviderStatus } from "../../core/models";
+import type {
+  AppConfigDto,
+  InputDeviceInfo,
+  ProviderStatus,
+} from "../../core/models";
 
 @Component({
   selector: "app-settings",
@@ -401,6 +405,25 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
         </fieldset>
       </div>
 
+      <!-- Microphone input device -->
+      <div class="card">
+        <label class="field">
+          <span class="field-label">Microphone</span>
+          <select formControlName="inputDevice">
+            <option value="">System default</option>
+            @for (dev of inputDevices(); track dev.name) {
+              <option [value]="dev.name">
+                {{ dev.name }}{{ dev.isDefault ? " (default)" : "" }}
+              </option>
+            }
+          </select>
+          <span class="field-help text-muted">
+            Which microphone to record. “System default” follows your macOS input
+            selection; a chosen device falls back to the default if it’s unplugged.
+          </span>
+        </label>
+      </div>
+
       <!-- Capture system audio — toggle row -->
       <div class="card">
         <label class="toggle-row">
@@ -412,6 +435,65 @@ import type { AppConfigDto, ProviderStatus } from "../../core/models";
             </span>
           </span>
           <input type="checkbox" formControlName="captureSystemAudio" />
+        </label>
+      </div>
+
+      <!-- Smart transcription (VAD) — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Smart speech detection</span>
+            <span class="text-secondary toggle-sub">
+              Skips silence and resets context between pauses for cleaner, faster
+              transcripts (voice-activity detection). Recommended.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="vadEnabled" />
+        </label>
+      </div>
+
+      <!-- High-fidelity masters — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Keep high-fidelity masters</span>
+            <span class="text-secondary toggle-sub">
+              Archive faithful per-stream float32 recordings (mic + system)
+              alongside the standard mix. Best quality; roughly doubles audio disk
+              use per meeting.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="keepHiresMasters" />
+        </label>
+      </div>
+
+      <!-- Speaker diarization — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Identify remote speakers</span>
+            <span class="text-secondary toggle-sub">
+              Label individual people on the other side of the call (Speaker
+              1/2/3) instead of one “Others”. Needs system-audio capture;
+              downloads ~40 MB of models on first use.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="diarizeOthers" />
+        </label>
+      </div>
+
+      <!-- Echo cancellation (experimental) — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Cancel speaker echo (experimental)</span>
+            <span class="text-secondary toggle-sub">
+              When recording without headphones, apply system echo cancellation to
+              the microphone used for transcription. Experimental — headphones are
+              still the most reliable fix.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="aecEnabled" />
         </label>
       </div>
 
@@ -1224,7 +1306,12 @@ export class SettingsComponent implements OnInit {
     ollamaBaseUrl: "http://localhost:11434",
     ollamaModel: "llama3.1",
     claudeBinary: "claude",
+    inputDevice: "",
     captureSystemAudio: false,
+    vadEnabled: true,
+    keepHiresMasters: false,
+    diarizeOthers: false,
+    aecEnabled: false,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -1234,6 +1321,8 @@ export class SettingsComponent implements OnInit {
   readonly keyControl = new FormControl("", { nonNullable: true });
 
   readonly providers = signal<ProviderStatus[]>([]);
+  /** Available mic input devices for the picker (loaded best-effort in ngOnInit). */
+  readonly inputDevices = signal<InputDeviceInfo[]>([]);
   readonly hasKey = signal(false);
   readonly saved = signal(false);
   readonly loadError = signal<string | null>(null);
@@ -1313,7 +1402,12 @@ export class SettingsComponent implements OnInit {
         ollamaBaseUrl: cfg.ollamaBaseUrl,
         ollamaModel: cfg.ollamaModel,
         claudeBinary: cfg.claudeBinary,
+        inputDevice: cfg.inputDevice ?? "",
         captureSystemAudio: cfg.captureSystemAudio ?? false,
+        vadEnabled: cfg.vadEnabled ?? true,
+        keepHiresMasters: cfg.keepHiresMasters ?? false,
+        diarizeOthers: cfg.diarizeOthers ?? false,
+        aecEnabled: cfg.aecEnabled ?? false,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
@@ -1321,6 +1415,7 @@ export class SettingsComponent implements OnInit {
         noteLanguage: cfg.noteLanguage ?? "auto",
       });
       this.updateDownloadHint();
+      this.inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       this.hasKey.set(await this.ipc.hasAnthropicKey());
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
@@ -1352,7 +1447,12 @@ export class SettingsComponent implements OnInit {
       ollamaBaseUrl: v.ollamaBaseUrl,
       ollamaModel: v.ollamaModel,
       claudeBinary: v.claudeBinary,
+      inputDevice: v.inputDevice || null,
       captureSystemAudio: v.captureSystemAudio,
+      vadEnabled: v.vadEnabled,
+      keepHiresMasters: v.keepHiresMasters,
+      diarizeOthers: v.diarizeOthers,
+      aecEnabled: v.aecEnabled,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,

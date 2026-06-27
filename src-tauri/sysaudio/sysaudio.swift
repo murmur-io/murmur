@@ -45,8 +45,13 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
             FileHandle.standardError.write(Data("sysaudio: no display available\n".utf8))
             exit(3)
         }
+        // Global-minus-self: capture the whole display's audio EXCEPT Murmur's own output, so
+        // we never re-capture our own playback / notification sounds. com.meetnotes.app is the
+        // immutable bundle id of the main app.
+        let ownBundleID = "com.meetnotes.app"
+        let excluded = content.applications.filter { $0.bundleIdentifier == ownBundleID }
         let filter = SCContentFilter(
-            display: display, excludingApplications: [], exceptingWindows: [])
+            display: display, excludingApplications: excluded, exceptingWindows: [])
 
         let config = SCStreamConfiguration()
         config.capturesAudio = true

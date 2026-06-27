@@ -35,7 +35,12 @@ export interface AppConfigDto {
   ollamaBaseUrl: string;
   ollamaModel: string;
   claudeBinary: string;
+  inputDevice: string | null;
   captureSystemAudio: boolean;
+  vadEnabled: boolean;
+  keepHiresMasters: boolean;
+  diarizeOthers: boolean;
+  aecEnabled: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;
@@ -63,6 +68,12 @@ export interface AppConfigDto {
    * leaves the device for a cloud LLM until the user has consented once.
    */
   cloudEgressConsented: boolean;
+}
+
+/** A selectable microphone input device (from `list_input_devices`). */
+export interface InputDeviceInfo {
+  name: string;
+  isDefault: boolean;
 }
 
 export interface NoteDto {
