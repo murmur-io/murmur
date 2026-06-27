@@ -1,6 +1,6 @@
 [package]
 name = "murmur"
-version = "0.3.1"
+version = "0.3.2"
 description = "Murmur — local meeting capture, transcription, and AI notes for Obsidian"
 edition = "2021"
 rust-version = "1.77"
@@ -78,6 +78,21 @@ objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
 objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString"] }
+# v0.3.2 — BIOMETRIC-GATED master KEK. The KEK is stored as a generic-password Keychain item with a
+# kSecAttrAccessControl requiring user presence (Touch ID, device-passcode fallback). Reading it pops
+# the system Touch ID sheet directly (with our reason string) — that single sheet IS the unlock auth,
+# so no separate biometric prompt and no "app wants to use keychain, enter password" dialog. The
+# high-level `security-framework` ItemAddOptions has no access-control setter, so we drop to the raw
+# Security FFI (SecAccessControlCreateWithFlags + SecItemAdd/CopyMatching/Delete) via the -sys crate +
+# core-foundation. All three are already in the dependency graph transitively (reqwest/rustls) — this
+# only promotes them to direct deps, no new build cost. User-approved for v0.3.2.
+core-foundation = "0.10"
+# OSX_10_15 exposes `kSecUseDataProtectionKeychain` (propagated to security-framework-sys). That flag
+# is MANDATORY: kSecAttrAccessControl (the user-presence gate on the KEK item) is only supported by
+# the data-protection keychain — the legacy file-based keychain rejects it with errSecParam (-50), so
+# without targeting the data-protection keychain the biometric-gated KEK item could never be created.
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 
 [features]
 # default keeps Metal on for whisper; nothing else conditional in P0
