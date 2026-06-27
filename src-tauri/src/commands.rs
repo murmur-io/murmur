@@ -1101,10 +1101,14 @@ pub async fn ask_vault(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let (corpus, sources) = crate::summarize::vault_context::build_vault_context(
+    // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
+    // again, while sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let (corpus, sources) = crate::summarize::vault_context::build_vault_context_visible(
         &state.db,
         &question,
         &config.provider_id,
+        &unlocked,
     )?;
     if corpus.trim().is_empty() {
         return Ok(AskVaultResult {
@@ -1320,10 +1324,14 @@ pub async fn pre_meeting_brief(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let (corpus, sources) = crate::summarize::vault_context::build_vault_context(
+    // Pass the LIVE session unlock set (E9), same as ask_vault: session-unlocked folders included,
+    // sealed-and-not-unlocked excluded.
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let (corpus, sources) = crate::summarize::vault_context::build_vault_context_visible(
         &state.db,
         &subject,
         &config.provider_id,
+        &unlocked,
     )?;
     let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
     let (system, user) =
