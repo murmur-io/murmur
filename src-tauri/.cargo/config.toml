@@ -1,0 +1,5 @@
+# The bundled onnxruntime static lib in sherpa-onnx (offline speaker diarization) is built for
+# macOS 13.4+. Pin the binary's deployment target so its `minos` matches the shipped floor
+# (tauri.conf.json minimumSystemVersion = 13.4) instead of emitting a linker-version mismatch.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.4"
