@@ -160,11 +160,16 @@ async fn run_inner(
     // or ScreenCaptureKit permission denied → sidecar produced no WAV), we fall back to the
     // mic-only single pass (today's behaviour, everything attributed "me").
     let mut mic_16k = audio::resample_to_16k(&samples, src_rate)?;
+    // Native system audio (pre-resample) — kept ONLY for the optional hi-res master.
+    let mut sys_native: Option<(Vec<f32>, u32)> = None;
     let mut sys_16k: Option<Vec<f32>> = match &system_wav {
         Some(path) => match audio::read_wav_mono(path) {
             Ok((sys, sys_rate)) => {
                 let resampled = audio::resample_to_16k(&sys, sys_rate)?;
                 let _ = std::fs::remove_file(path); // transient sidecar output
+                if config.keep_hires_masters {
+                    sys_native = Some((sys, sys_rate));
+                }
                 Some(resampled)
             }
             Err(e) => {
@@ -192,6 +197,31 @@ async fn run_inner(
         duration_s,
         &wav_path.to_string_lossy(),
     )?;
+
+    // Rec #3: faithful per-stream MASTER archives (opt-in). Written from the PRE-resample,
+    // PRE-normalize buffers so they stay faithful; they live in the audio dir and are sealed at
+    // rest by the lock lifecycle exactly like audio_path. Best-effort: a write failure never fails
+    // the recording. NOT exposed to the FE — reachable only via the gated export commands.
+    if config.keep_hires_masters {
+        let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
+        if let Err(e) = audio::write_wav_f32(&mic_master, &samples, src_rate, 1) {
+            tracing::warn!(target: "audio", error = %e, "mic master write failed");
+        } else {
+            state
+                .db
+                .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))?;
+        }
+        if let Some((sys, sys_rate)) = &sys_native {
+            let sys_master = wav_dir.join(format!("{meeting_id}.sys.wav"));
+            if let Err(e) = audio::write_wav_f32(&sys_master, sys, *sys_rate, 1) {
+                tracing::warn!(target: "audio", error = %e, "system master write failed");
+            } else {
+                state
+                    .db
+                    .set_meeting_sys_master_path(meeting_id, Some(sys_master.to_string_lossy().as_ref()))?;
+            }
+        }
+    }
 
     // ── 2 + 3. Transcribe EACH stream separately, then MERGE by wall-clock ────
     emit_status(app, "transcribing", "Transcribing audio…", meeting_id);

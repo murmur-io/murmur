@@ -452,6 +452,21 @@ import type {
         </label>
       </div>
 
+      <!-- High-fidelity masters — toggle row -->
+      <div class="card">
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Keep high-fidelity masters</span>
+            <span class="text-secondary toggle-sub">
+              Archive faithful per-stream float32 recordings (mic + system)
+              alongside the standard mix. Best quality; roughly doubles audio disk
+              use per meeting.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="keepHiresMasters" />
+        </label>
+      </div>
+
       <!-- Voice trigger — toggle row -->
       <div class="card">
         <label class="toggle-row">
@@ -1199,6 +1214,7 @@ export class SettingsComponent implements OnInit {
     inputDevice: "",
     captureSystemAudio: false,
     vadEnabled: true,
+    keepHiresMasters: false,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -1270,6 +1286,7 @@ export class SettingsComponent implements OnInit {
         inputDevice: cfg.inputDevice ?? "",
         captureSystemAudio: cfg.captureSystemAudio ?? false,
         vadEnabled: cfg.vadEnabled ?? true,
+        keepHiresMasters: cfg.keepHiresMasters ?? false,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
@@ -1312,6 +1329,7 @@ export class SettingsComponent implements OnInit {
       inputDevice: v.inputDevice || null,
       captureSystemAudio: v.captureSystemAudio,
       vadEnabled: v.vadEnabled,
+      keepHiresMasters: v.keepHiresMasters,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,

@@ -66,6 +66,8 @@ pub fn run() {
             commands::rename_meeting,
             commands::chat_meeting,
             commands::export_audio,
+            commands::export_mic_master,
+            commands::export_sys_master,
             commands::export_note,
             commands::detect_meeting_app,
             commands::set_meeting_tags,

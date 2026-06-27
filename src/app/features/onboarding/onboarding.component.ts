@@ -1257,6 +1257,7 @@ export class OnboardingComponent implements OnInit {
       inputDevice: base?.inputDevice ?? null,
       captureSystemAudio: base?.captureSystemAudio ?? false,
       vadEnabled: base?.vadEnabled ?? true,
+      keepHiresMasters: base?.keepHiresMasters ?? false,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),

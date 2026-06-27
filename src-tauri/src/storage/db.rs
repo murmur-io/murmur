@@ -205,6 +205,13 @@ impl Db {
         // Guarded ALTER (idempotent); NULL for every row in an open folder.
         Self::add_column_if_missing(&conn, "segments", "text_blob", "BLOB")?;
         Self::add_column_if_missing(&conn, "timelines", "data_blob", "BLOB")?;
+        // Rec #3: faithful per-stream float32 MASTER archives (mic native + system 48k), opt-in.
+        // Each is sealed at rest exactly like `audio_path` (→ `<file>.enc`). NULL for every meeting
+        // recorded without `keep_hires_masters` → zero change for existing / non-opted users. These
+        // live OFF the `Meeting` struct (targeted reads only) so they can never leak through a
+        // masked DTO; they are export-only via gated commands.
+        Self::add_column_if_missing(&conn, "meetings", "mic_master_path", "TEXT")?;
+        Self::add_column_if_missing(&conn, "meetings", "sys_master_path", "TEXT")?;
         Ok(())
     }
 
@@ -1246,6 +1253,46 @@ impl Db {
         Ok(())
     }
 
+    /// Read a meeting's per-stream master paths `(mic_master_path, sys_master_path)`. A TARGETED
+    /// query so the masters never ride on the `Meeting` struct / its DTO — keeping them off
+    /// `Meeting` is what makes a masked-detail leak structurally impossible. NULL when not kept.
+    pub fn get_meeting_master_paths(
+        &self,
+        meeting_id: &str,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT mic_master_path, sys_master_path FROM meetings WHERE id = ?1",
+            rusqlite::params![meeting_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(map_err)?
+        .ok_or_else(|| AppError::Storage(format!("no meeting with id {meeting_id}")))
+    }
+
+    /// Set (or clear) a meeting's mic master path (the audio-at-rest seal lifecycle re-points it).
+    pub fn set_meeting_mic_master_path(&self, meeting_id: &str, path: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET mic_master_path = ?2 WHERE id = ?1",
+            rusqlite::params![meeting_id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Set (or clear) a meeting's system master path (the audio-at-rest seal lifecycle re-points it).
+    pub fn set_meeting_sys_master_path(&self, meeting_id: &str, path: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET sys_master_path = ?2 WHERE id = ?1",
+            rusqlite::params![meeting_id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     // ── exposure-aware reads (MCP visibility filter, Stage D) ──────────────────
     //
     // A note is visible iff its folder is NULL or open (`locked=0`) OR its folder id is in the
@@ -1992,6 +2039,32 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    #[test]
+    fn master_paths_round_trip() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        // Default: both NULL (legacy / non-opted meetings → nothing for the seal lifecycle to do).
+        assert_eq!(db.get_meeting_master_paths("m1").unwrap(), (None, None));
+        db.set_meeting_mic_master_path("m1", Some("/a/m1.mic.wav"))
+            .unwrap();
+        db.set_meeting_sys_master_path("m1", Some("/a/m1.sys.wav"))
+            .unwrap();
+        assert_eq!(
+            db.get_meeting_master_paths("m1").unwrap(),
+            (
+                Some("/a/m1.mic.wav".to_string()),
+                Some("/a/m1.sys.wav".to_string())
+            )
+        );
+        // Independent columns: clearing one leaves the other.
+        db.set_meeting_mic_master_path("m1", None).unwrap();
+        assert_eq!(
+            db.get_meeting_master_paths("m1").unwrap(),
+            (None, Some("/a/m1.sys.wav".to_string()))
+        );
     }
 
     #[test]
