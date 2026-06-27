@@ -77,17 +77,67 @@ export class FoldersService {
    * `Folder` row (no counts/children), so we reload the tree to fold it in with
    * the rest of the forest rather than splice a partial node. The created
    * `Folder` is returned so the caller can select/highlight it once it appears.
+   *
+   * BUGFIX (false "couldn't create" toast): the create + the follow-on tree
+   * refresh are SEPARATE outcomes. Once `createFolder` resolves the folder IS in
+   * the DB — a subsequent `load()` refresh failure must NEVER turn a real success
+   * into a thrown failure (the caller then shows a danger toast while the folder
+   * actually exists and appears after the next refresh). So `createFolder`'s
+   * error is the only one that rejects this method; a `load()` error is swallowed
+   * here (it already records `error` internally and a stale tree self-heals on the
+   * next `load()`). The created `Folder` is still returned so the caller can
+   * select + highlight it.
    */
   async create(name: string, parentId: string | null = null): Promise<Folder> {
     this._error.set(null);
+    // The CREATE is the operation whose failure means "couldn't create" — let it reject.
+    let folder: Folder;
     try {
-      const folder = await this.ipc.createFolder(name, parentId);
-      await this.load();
-      return folder;
+      folder = await this.ipc.createFolder(name, parentId);
     } catch (e) {
       this._error.set(String(e));
       throw e;
     }
+    // The folder now exists. The refresh is best-effort: a refresh error is logged into `error`
+    // (via load()) but must NOT be re-thrown — a successful create can never surface as a failure.
+    await this.load();
+    return folder;
+  }
+
+  /**
+   * Rename a folder (display name + on-disk vault subdir + governed paths). A LOCKED folder rename is
+   * metadata-only (never touches sealed content). Reloads the tree on success. Same split-outcome
+   * rule as {@link create}: the RENAME is the only failure that rejects; a follow-on refresh failure
+   * is swallowed (the rename already happened).
+   */
+  async rename(folderId: string, newName: string): Promise<Folder> {
+    this._error.set(null);
+    let folder: Folder;
+    try {
+      folder = await this.ipc.renameFolder(folderId, newName);
+    } catch (e) {
+      this._error.set(String(e));
+      throw e;
+    }
+    await this.load();
+    return folder;
+  }
+
+  /**
+   * Delete a folder. Its notes move to the vault root; the folder row + empty subdir are removed.
+   * Rejects when the folder is sealed-and-not-session-unlocked, or still has subfolders — the caller
+   * surfaces that as a friendly message. Reloads the tree on success (split-outcome: the DELETE is
+   * the only failure that rejects; a follow-on refresh failure is swallowed).
+   */
+  async delete(folderId: string): Promise<void> {
+    this._error.set(null);
+    try {
+      await this.ipc.deleteFolder(folderId);
+    } catch (e) {
+      this._error.set(String(e));
+      throw e;
+    }
+    await this.load();
   }
 
   /** Move a note into `folderId` (null = vault root); refreshes per-folder counts. */

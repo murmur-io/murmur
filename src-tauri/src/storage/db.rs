@@ -996,6 +996,58 @@ impl Db {
         .map(Option::flatten)
     }
 
+    /// Direct CHILD folders of `parent_id` (one level only — not transitive). Used by
+    /// `rename_folder`/`delete_folder` to walk the subtree so a rename can re-prefix descendant
+    /// paths and a delete can refuse a non-empty tree.
+    pub fn child_folders(&self, parent_id: &str) -> Result<Vec<Folder>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, path, parent_id, locked, created_at
+                   FROM folders WHERE parent_id = ?1 ORDER BY created_at, name",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![parent_id], row_to_folder)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Rename a folder's display `name` AND its vault-relative `path` in one statement. The new
+    /// `path` is composed by the caller (parent path + sanitized name), so this is a pure column
+    /// update — it does NOT touch the on-disk vault dir or any note's `exported_path` (those are the
+    /// caller's responsibility, sequenced so a crash can never lose content). Leaves `locked` /
+    /// `wrapped_key` untouched: a locked-folder rename is metadata-only and never reaches sealed
+    /// content.
+    pub fn rename_folder(&self, id: &str, new_name: &str, new_path: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE folders SET name = ?2, path = ?3 WHERE id = ?1",
+            rusqlite::params![id, new_name, new_path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete a folder ROW by id (the `folders` table only). The caller MUST have already moved /
+    /// unsealed its notes elsewhere — this does NOT reassign or delete any note, and a locked folder
+    /// with sealed content must never reach here (the command refuses unless the lock was removed
+    /// first). Returns the number of rows deleted (0 if the id was already gone — idempotent).
+    pub fn delete_folder(&self, id: &str) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM folders WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
     /// Count of notes assigned to each folder id (only folders with ≥1 note appear).
     pub fn count_notes_per_folder(&self) -> Result<std::collections::HashMap<String, usize>> {
         let conn = self.lock();
