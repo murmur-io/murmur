@@ -32,10 +32,15 @@ pub struct VadSegmenter {
 }
 
 impl VadSegmenter {
-    /// Load the Silero VAD model (GPU/Metal on when available).
+    /// Load the Silero VAD model on the CPU.
+    ///
+    /// CPU on purpose: the Silero model is tiny (~885 kB) so Metal buys nothing, and running a
+    /// SECOND ggml Metal context alongside the main whisper Metal context makes ggml's backend
+    /// scheduler `ggml_abort` during graph init (`whisper_vad_init_with_params` →
+    /// `ggml_backend_sched_alloc_graph`) — a hard C abort Rust can't catch, crashing the process.
     pub fn load(model_path: &Path) -> Result<Self> {
         let mut params = WhisperVadContextParams::default();
-        params.set_use_gpu(true);
+        params.set_use_gpu(false);
         let path = model_path
             .to_str()
             .ok_or_else(|| AppError::Transcribe("VAD model path is not valid UTF-8".into()))?;
