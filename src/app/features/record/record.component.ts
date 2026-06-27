@@ -54,6 +54,16 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
         </div>
       }
 
+      @if (headphonesHint() && !store.isRecording()) {
+        <div class="banner is-accent" role="note">
+          <span class="banner-icon" aria-hidden="true">🎧</span>
+          <span>
+            Capturing system audio — use <strong>headphones</strong> so the other
+            participants' voices don't echo back into your microphone.
+          </span>
+        </div>
+      }
+
       <!-- ── The morphing recording bar (the hero) ───────────────────────── -->
       <div class="stage" [class.live]="store.isRecording()">
         <!-- Meeting-app nudge: a subtle, dismissible suggestion to hit record. -->
@@ -890,6 +900,11 @@ export class RecordComponent implements OnInit {
 
   /** Latest settings snapshot, refreshed on entry — used for the readiness guard. */
   private readonly config = signal<AppConfigDto | null>(null);
+
+  /** Headphones hint: capturing system audio through speakers echoes into the mic (rec #5). */
+  readonly headphonesHint = computed(
+    () => this.config()?.captureSystemAudio ?? false,
+  );
 
   /** A vault folder is mandatory — export fails without it, so block recording. */
   readonly vaultMissing = computed(() => {
