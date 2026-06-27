@@ -1,0 +1,224 @@
+# Angular 18 Zoneless — Murmur `src/app` (binding ruleset)
+
+> The canonical FE ruleset for Murmur's Angular frontend. BINDING: every rule
+> here is enforced. The frontend is **zoneless** (`provideExperimentalZonelessChangeDetection()`
+> in `src/app/app.config.ts`) — there is no Zone.js, so change detection only runs
+> when a **signal** changes, a template event fires, or an explicit
+> `markForCheck`-equivalent happens. Plain mutable fields do not trigger renders.
+> If your view is stale, the cause is almost always state living in a field that
+> should be a `signal()`.
+>
+> Murmur talks to the Rust/Tauri core through `src/app/core/ipc.service.ts` —
+> **there is no NgRx, no facade layer, no HTTP data layer.** Every screen is a
+> standalone signal component that calls IPC methods and stores the result in
+> signals. Do not introduce NgRx, a "store" abstraction beyond the existing
+> `*.store.ts`/`*.service.ts` singletons, or `async` pipes.
+
+---
+
+## 1. Component shape (HARD)
+
+- **Standalone only.** No `NgModule`. `standalone: true` on every `@Component`.
+- **`OnPush` always.** `changeDetection: ChangeDetectionStrategy.OnPush`. Under
+  zoneless this is effectively mandatory; omitting it does not buy you anything.
+- **Inline `template` + inline `styles: [\`…\`]`.** No `templateUrl`, no
+  `styleUrl`/`styleUrls` — the whole tree is single-file components (see any
+  `src/app/features/**/*.component.ts`). The ESLint `processInlineTemplates`
+  processor lints the inline template, so template rules apply.
+- **`inject()` only.** No constructor injection. `private readonly ipc = inject(IpcService);`.
+- **Selectors are `app-` kebab-case** for components and **`app` camelCase** for
+  directives — enforced by `@angular-eslint/component-selector` /
+  `directive-selector` in `eslint.config.js` (e.g. `app-folder-tree`,
+  `appFolderDrop`).
+- **Keep the `Component` suffix on the class name** (`RecordComponent`,
+  `FolderTreeComponent`, `EntityDetailComponent`). Murmur uses it everywhere —
+  do NOT strip it. Stores/services use `Store`/`Service` suffixes
+  (`RecorderStore`, `FoldersService`).
+
+## 2. State = signals (HARD)
+
+- All component/store state is `signal()` / `computed()` / `effect()`. No plain
+  mutable fields for anything the template reads. Reference store:
+  `src/app/core/recorder.store.ts` (private writable `_stage` + public
+  `.asReadonly()` + `computed` derivations), and `src/app/services/folders.service.ts`.
+- Expose writable signals to the outside as **read-only**: keep a private
+  `_x = signal(...)` and publish `readonly x = this._x.asReadonly();`.
+- **Derive, don't recompute in the template.** Any value computed from other
+  signals is a `computed()`, never a method/getter called from the template
+  (a getter re-runs every CD pass; a `computed` is cached + dependency-tracked).
+- `input()` / `output()` / `viewChild()` signal APIs only — never the
+  `@Input`/`@Output`/`@ViewChild` decorators. Examples:
+  `MeetingTimelineComponent` (`input<MeetingTimelineData | null>(null)`,
+  `output<number>()`), `pre-meeting-brief.component.ts`
+  (`viewChild<ElementRef<HTMLInputElement>>("input")`).
+
+## 3. IPC: Promises and event streams — NEVER subscribe-for-state (HARD)
+
+`IpcService` is a thin wrapper over `@tauri-apps/api` `invoke`/`listen`. Two shapes:
+
+- **One-shot commands** return a `Promise` (`listMeetings()`, `getGraph()`,
+  `getMeetingDetail(id)`, `unlockMeeting(id)`, …). Consume them by `await`-ing
+  inside an `effect()` that tracks the inputs that should re-fetch, then writing
+  the result into signals — with a **stale-result guard** when an input can
+  change mid-flight. Canonical: `entity-detail.component.ts` `_load` effect
+  (re-fetch on `entityId()` change, drop late responses) and
+  `graph.component.ts` `_refetchOnLock` effect (re-fetch when
+  `folders.tree()` changes).
+- **Event streams** (`onStatus`, `onVoiceStart`, `onToggleRecord`,
+  `onLiveCaption`) return `Promise<UnlistenFn>`. Subscribe **once** in a store's
+  `init()`, push payloads into signals, and keep the `UnlistenFn` to release on
+  teardown. Canonical: `RecorderStore.init()`.
+- **`toSignal()` is for rxjs-bridged streams** (the polled `level` / `elapsed`
+  in `RecorderStore` wrap an rxjs `interval` via `toObservable` + `switchMap` +
+  `toSignal` so the subscription lifecycle is owned by the framework). Use this
+  shape — never a hand-rolled `setInterval`/`subscribe` that writes a field.
+- **BANNED: `.subscribe()` to populate state.** No
+  `this.ipc.x().then(v => this.field = v)` into a plain field, no `subscribe`
+  whose callback assigns a non-signal, no `async` pipe. The result of an IPC
+  call must land in a `signal`.
+- **One IPC method per Tauri command.** New backend command → add ONE typed
+  method to `ipc.service.ts` returning `Promise<T>` with `T` declared in
+  `src/app/core/models.ts`. Do not call `invoke(...)` directly from a component.
+
+## 4. Templates: built-in control flow only (HARD)
+
+- `@if` / `@for` / `@switch` / `@let` ONLY. The structural directives
+  `*ngIf` / `*ngFor` / `*ngSwitch` are BANNED.
+- `@for` MUST `track` a stable identity (`track item.id`, `track f.id`), never
+  `track $index` for keyed data.
+- Use `@empty {}` on `@for` for empty states (see `move-to-menu.component.ts`,
+  `folder-tree.component.ts`).
+- Bind to signals by calling them: `@if (loading()) { … }`, `{{ title() }}`.
+
+## 5. Side-effect timing — NEVER `setTimeout`/`rAF` in a component (HARD)
+
+- DOM-after-render work (focus, scroll-into-view, measure) uses
+  **`afterNextRender(fn)`** — a zoneless-safe one-shot, auto-torn-down on
+  destroy. Examples: `folder-tree.component.ts:457` (focus the new-folder
+  field), `detail.component.ts:1830` (focus the Unlock button),
+  `ask.component.ts:767` (scroll the transcript), `meeting-recipes.component.ts:611`.
+- When you register `afterNextRender` **outside** the constructor/field-init
+  injection context (e.g. inside a click handler), pass the injector:
+  `afterNextRender(fn, { injector: this.injector })` — Murmur injects
+  `private readonly injector = inject(Injector)` for exactly this (see
+  `folder-tree` / `detail`). Forgetting it throws "afterNextRender() can only be
+  used within an injection context".
+- **Service timers are the only sanctioned `setTimeout`.** A `providedIn:"root"`
+  service may use tracked `setTimeout` handles, stored in a `Map`, all cleared
+  in `DestroyRef.onDestroy(...)`. Reference: `src/app/services/toast.service.ts`.
+  A bare `setTimeout`/`requestAnimationFrame` in a component is BANNED.
+- DOM observers (`ResizeObserver`/`MutationObserver`/`IntersectionObserver`)
+  belong in a directive with `DestroyRef.onDestroy()` cleanup, never ad-hoc in a
+  component (Murmur's DOM-side concerns live in directives like
+  `folder-drop.directive.ts`).
+
+## 6. Styling — tokens, opaque overlays, budget (HARD)
+
+- **`var(--token)` for every color, radius, spacing, shadow, motion value.** The
+  full token set is `:root` in `src/styles.css` (`--surface-*`, `--accent*`,
+  `--live*`, `--text-*`, `--space-1..8`, `--radius-*`, `--shadow-*`,
+  `--transition*`). Never hardcode a hex color or a spacing/radius value a token
+  already names. (One-off structural pixel sizes — a `min-width` — are fine; the
+  rule is about the design language.)
+- **Overlays must be OPAQUE — not the frosted `.card`.** A popover / menu /
+  modal / dropdown that floats OVER other content uses
+  `background: var(--surface-overlay)` (opaque `#1b1b24`) with
+  `backdrop-filter: none`, `border: 1px solid var(--border-strong)`,
+  `box-shadow: var(--shadow-lg)`. The global `.card` is a **translucent**
+  frosted surface (`--surface-raised` + `backdrop-filter: blur(...)`); using it
+  for a floating popover bleeds the content behind it through (a broken-looking
+  modal). Reference + rationale comment: `move-to-menu.component.ts:140-148`.
+  `<select>` options likewise paint `var(--surface-overlay)`.
+- **16 kB per-component style budget** (`anyComponentStyle`: error 16 kB, warn
+  12 kB in `angular.json`). Inline `styles` over budget fail `ng build`. Lean on
+  the global primitives in `src/styles.css` (`.btn`, `.btn-primary`,
+  `.btn-ghost`, `.card`, `.pill`, `.banner`, `.count`, `.empty-state`,
+  `.state-card`) instead of re-declaring them per component.
+- **Icons are inline SVG** in the template (no icon-font, no icon package).
+- **`@media (prefers-reduced-motion: reduce)`** is honored globally — don't
+  fight it with `!important` animations.
+
+## 7. No new dependencies (HARD)
+
+- No new npm packages without explicit user approval. The FE runs on
+  `@angular/*`, `@tauri-apps/api`, and `rxjs` (used narrowly, only to bridge
+  event/interval streams into signals as in `recorder.store.ts`). Adding a UI
+  kit, icon library, state library, charting lib, etc. is forbidden.
+
+## Banned → replacement
+
+| Banned | Use instead |
+| --- | --- |
+| `*ngIf` / `*ngFor` / `*ngSwitch` | `@if` / `@for` / `@switch` |
+| `track $index` (keyed lists) | `track item.id` |
+| `@Input()` | `input()` |
+| `@Output() EventEmitter` | `output()` |
+| `@ViewChild()` | `viewChild()` |
+| Constructor injection | `inject()` |
+| Plain mutable field as state | `signal()` |
+| Getter / method called from template | `computed()` |
+| `markForCheck()` / `detectChanges()` | a `signal` write (delete the call) |
+| `BehaviorSubject` as component/store state | `signal()` |
+| `.subscribe()` to populate state | `effect()` + `await ipc.x()` → signal, or `toSignal()` |
+| `async` pipe | signal call `x()` in the template |
+| `setTimeout` / `requestAnimationFrame` in a component | `afterNextRender(fn, { injector })` |
+| Ad-hoc `ResizeObserver`/`MutationObserver` in a component | a directive with `DestroyRef.onDestroy()` |
+| `invoke('cmd', …)` from a component | a typed method on `IpcService` |
+| `templateUrl` / `styleUrl` | inline `template` + `styles: [\`…\`]` |
+| Hardcoded hex / spacing / radius / shadow | `var(--token)` from `src/styles.css` |
+| New npm package (FE) | ask the user; reuse `@angular/*` / `rxjs` / `@tauri-apps/api` |
+| `NgModule`, NgRx, a new facade/store abstraction | standalone component + `IpcService` + signals |
+
+## CRITICAL Murmur-specific traps
+
+### T1 — NG0600: signal write inside a tracked `effect()`
+Angular 18 throws **NG0600 ("Writing to signals is not allowed in a `computed`
+or an `effect` by default")** when an `effect()` writes a signal it could also
+read. The two real cases are IPC-on-input-change effects that set
+`loading`/`error` synchronously before `await`. Pass the flag:
+
+```ts
+private readonly _load = effect(
+  () => { const id = this.entityId(); this.loading.set(true); void this.fetch(id); },
+  { allowSignalWrites: true },   // REQUIRED in Angular 18
+);
+```
+
+Live examples: `entity-detail.component.ts:305-315`, `graph.component.ts:512-520`.
+Prefer **deriving with `computed()`** where possible; only reach for
+`allowSignalWrites` when the effect genuinely orchestrates an async IPC fetch.
+(Note: Murmur is pinned to Angular `^18.2.0` where this option exists; do not
+assume v19 semantics.)
+
+### T2 — mutually-recursive standalone components need `forwardRef`
+`FolderTreeComponent` ↔ `FolderRowComponent` render each other (a row renders
+its children through another tree), so their ES modules form an **import cycle**.
+A direct class reference in `imports:` is `undefined` at metadata-evaluation time
+and Angular then throws `getComponentDef(undefined)` (reading `'ɵcmp'`) the first
+time the `@for` instantiates the child — the infamous "view breaks after adding
+the first folder" bug. Defer the lookup:
+
+```ts
+imports: [FolderDropDirective, forwardRef(() => FolderRowComponent)],
+```
+
+Live mirrors: `folder-tree.component.ts:39-46`, `folder-row.component.ts:48-55`.
+Any new self-referential / mutually-recursive standalone pair MUST use
+`forwardRef(() => Other)` in both directions.
+
+### T3 — floating popovers/modals must be OPAQUE, not the frosted `.card`
+See §6. The frosted `.card` (`--surface-raised`, blurred) is for in-flow panels.
+Anything that floats OVER content (menus, the move-to-folder popover, dialogs,
+dropdowns, the lock gate's chrome) must use `var(--surface-overlay)` +
+`backdrop-filter: none` or the underlying list bleeds through. Rationale comment
+lives at `move-to-menu.component.ts:140-148`.
+
+---
+
+## Quality gate (a change is not done until these are green)
+
+- `npx ng lint` — clean (angular-eslint, inline-template rules included).
+- `npx ng build` — clean, including the 16 kB per-component style budget.
+- `bash scripts/ci.sh` — the full gate (Rust clippy/test/build, `ng lint`,
+  `ng build`, headless core E2E). Frontend-only changes still must keep
+  `ng lint` + `ng build` green within it.
