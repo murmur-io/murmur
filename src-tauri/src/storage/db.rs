@@ -532,6 +532,24 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// The most recent VISIBLE note across all meetings (BLK-2b backing for `get_last_note`): a note
+    /// whose folder is open/NULL or session-unlocked. A sealed-and-not-unlocked latest note is
+    /// skipped so the recorder bar never surfaces its blanked (or, defensively, sealed) content.
+    pub fn latest_note_visible(&self, unlocked: &HashSet<String>) -> Result<Option<NoteRecord>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path
+               FROM notes n
+               LEFT JOIN folders f ON f.id = n.folder_id
+              WHERE {visible}
+              ORDER BY n.created_at DESC LIMIT 1"
+        );
+        conn.query_row(&sql, [], row_to_note)
+            .optional()
+            .map_err(map_err)
+    }
+
     /// The most recent note for a meeting across providers (Detail view).
     pub fn get_latest_note_for_meeting(&self, meeting_id: &str) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
@@ -1011,6 +1029,35 @@ impl Db {
         Ok(out)
     }
 
+    /// Every provider row of ONE meeting's note (markdown, exported path, existing blob), regardless
+    /// of folder — the rows needed to seal a note moved INTO a locked folder (BLK-2). Mirrors
+    /// [`Db::notes_in_folder`] but scoped to a single meeting so a move seals ONLY that note.
+    pub fn sealable_notes_for_meeting(&self, meeting_id: &str) -> Result<Vec<SealableNote>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT meeting_id, provider_id, markdown, exported_path, content_blob
+                   FROM notes WHERE meeting_id = ?1",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                Ok(SealableNote {
+                    meeting_id: r.get(0)?,
+                    provider_id: r.get(1)?,
+                    markdown: r.get(2)?,
+                    exported_path: r.get(3)?,
+                    content_blob: r.get(4)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Seal ONE provider row of a note: store its AES-GCM `content_blob`, blank that row's
     /// plaintext `markdown`, and clear its `exported_path` (the `.md` leaves the vault).
     /// Targets `(meeting_id, provider_id)` so distinct per-provider markdown each gets its own
@@ -1080,6 +1127,60 @@ impl Db {
         }
         tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of EVERY `locked=1`
+    /// folder. In one transaction, re-blank the plaintext `markdown` / segment `text` / timeline
+    /// `data` of any row in a locked folder that still carries its AES-GCM blob (so a crash WHILE a
+    /// folder was session-unlocked — which leaves plaintext in those columns — cannot survive a
+    /// restart). Only rows WITH a blob are blanked (the blob is the recoverable source of truth); a
+    /// blob-less plaintext row is left untouched so we never destroy unsealed content.
+    ///
+    /// Returns the `(meeting_id, audio_path)` of every meeting in a locked folder so the caller can
+    /// re-seal stray plaintext WAVs (remove a plaintext WAV whose `.enc` already exists) on disk —
+    /// that filesystem step lives in `state::reconcile_locked_at_rest` (the DB layer stays pure-SQL).
+    pub fn reblank_locked_folders_at_rest(&self) -> Result<Vec<(String, String)>> {
+        const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
+             WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "UPDATE notes SET markdown = '' \
+               WHERE content_blob IS NOT NULL \
+                 AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
+            [],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("UPDATE segments SET text = '' WHERE text_blob IS NOT NULL AND meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("UPDATE timelines SET data = '' WHERE data_blob IS NOT NULL AND meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // Collect the audio paths of locked meetings for the caller's filesystem re-seal pass.
+        let mut audio = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT id, audio_path FROM meetings \
+                       WHERE audio_path IS NOT NULL AND id IN ({LOCKED_MEETINGS})"
+                ))
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_err)?;
+            for r in rows {
+                audio.push(r.map_err(map_err)?);
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(audio)
     }
 
     /// Folder ids that are sealed (`locked=1`) — used to re-blank every sealed note on relock-all.

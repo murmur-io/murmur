@@ -825,7 +825,7 @@ pub fn set_secret(account: &str, secret: &str) -> Result<()> {
         store.write_dp(secret)?;
         // Drop any legacy file-based copy so a future get_secret can't see the old value.
         let _ = store.delete_legacy();
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -839,7 +839,7 @@ pub fn get_secret(account: &str) -> Result<Option<String>> {
     #[cfg(target_os = "macos")]
     {
         let store = MacDpStore { account: leak_account(account) };
-        return migrate_or_read_dp(&store);
+        migrate_or_read_dp(&store)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -855,7 +855,7 @@ pub fn delete_secret(account: &str) -> Result<()> {
         let store = MacDpStore { account: leak_account(account) };
         store.delete_dp()?;
         let _ = store.delete_legacy();
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {

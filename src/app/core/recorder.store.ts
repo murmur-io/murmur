@@ -165,6 +165,30 @@ export class RecorderStore {
     }
   }
 
+  /**
+   * Re-run summarization + export for an already-recorded meeting. Used to retry
+   * after the user grants cloud-egress consent (the first attempt failed with
+   * "cloud egress not consented"). Mirrors stop()'s optimistic-then-reconcile flow.
+   */
+  async resummarize(meetingId: string): Promise<void> {
+    this._error.set(null);
+    this._stage.set("summarizing");
+    try {
+      const res = await this.ipc.resummarize(meetingId);
+      this._lastNote.set({
+        meetingId: res.meetingId,
+        providerId: "",
+        markdown: res.markdown,
+        exportedPath: res.exportedPath,
+      });
+      this._stage.set("done");
+      await this.refreshLastNote();
+    } catch (e) {
+      this._error.set(String(e));
+      this._stage.set("error");
+    }
+  }
+
   /** Tray toggle: stop if recording, else start (ignored while a recording is processing). */
   toggleRecord(): void {
     const s = this._stage();
