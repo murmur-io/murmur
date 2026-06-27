@@ -2,6 +2,10 @@
 /node_modules
 /dist
 .DS_Store
+# Local editor / tooling cruft — never tracked
+.idea/
+.playwright-mcp/
+/settings-audio-controls.png
 *.gguf
 *.wav
 *.mp4

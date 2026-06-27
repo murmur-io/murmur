@@ -1,17 +1,22 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
   computed,
   forwardRef,
   inject,
   input,
   output,
   signal,
+  viewChild,
 } from "@angular/core";
 import {
   FoldersService,
   type FolderExposure,
 } from "../../services/folders.service";
+import { ToastService } from "../../services/toast.service";
 import type { FolderNode } from "../../core/models";
 import { FolderTreeComponent } from "./folder-tree.component";
 import { FolderDropDirective } from "./folder-drop.directive";
@@ -91,29 +96,59 @@ import { FolderDropDirective } from "./folder-drop.directive";
       }
 
       <!-- The selectable folder button: glyph + name + count chip.
-           NO lock badge here — the single lock control (below) owns lock state. -->
-      <button
-        type="button"
-        class="folder"
-        [class.is-selected]="selectedId() === node().id"
-        [attr.aria-pressed]="selectedId() === node().id"
-        (click)="select.emit(node().id)"
-      >
-        <span class="folder-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
-            <path
-              d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
-              stroke="currentColor"
-              stroke-width="1.3"
-              stroke-linejoin="round"
-            />
-          </svg>
-        </span>
-        <span class="folder-name">{{ node().name }}</span>
-        @if (node().noteCount > 0) {
-          <span class="count folder-count">{{ node().noteCount }}</span>
-        }
-      </button>
+           NO lock badge here — the single lock control (below) owns lock state.
+           When renaming, the name is REPLACED by an inline edit field (Enter=save,
+           Esc=cancel; focused via afterNextRender). -->
+      @if (renaming()) {
+        <form class="rename-form" (submit)="confirmRename($event)">
+          <span class="folder-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
+              <path
+                d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </span>
+          <input
+            #renameInput
+            type="text"
+            class="rename-input"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Rename folder"
+            [value]="renameDraft()"
+            [disabled]="busy()"
+            (input)="onRenameInput($event)"
+            (keydown.escape)="cancelRename()"
+            (blur)="cancelRename()"
+          />
+        </form>
+      } @else {
+        <button
+          type="button"
+          class="folder"
+          [class.is-selected]="selectedId() === node().id"
+          [attr.aria-pressed]="selectedId() === node().id"
+          (click)="select.emit(node().id)"
+        >
+          <span class="folder-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
+              <path
+                d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </span>
+          <span class="folder-name">{{ node().name }}</span>
+          @if (node().noteCount > 0) {
+            <span class="count folder-count">{{ node().noteCount }}</span>
+          }
+        </button>
+      }
 
       <!-- ONE lock control. It is the state AND the action: a single padlock per
            row. Always visible while locked/session (so the privacy state always
@@ -229,6 +264,144 @@ import { FolderDropDirective } from "./folder-drop.directive";
             </button>
           }
         }
+
+        <!-- The ⋯ folder-actions menu: Rename · Make private/Unlock · Delete. -->
+        <div class="menu-wrap">
+          <button
+            type="button"
+            class="menu-trigger"
+            [class.is-open]="menuOpen()"
+            [disabled]="busy()"
+            [attr.aria-haspopup]="true"
+            [attr.aria-expanded]="menuOpen()"
+            [attr.aria-label]="'Folder actions for ' + node().name"
+            title="Folder actions"
+            (click)="toggleMenu()"
+          >
+            <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+              <circle cx="8" cy="3.2" r="1.35" fill="currentColor" />
+              <circle cx="8" cy="8" r="1.35" fill="currentColor" />
+              <circle cx="8" cy="12.8" r="1.35" fill="currentColor" />
+            </svg>
+          </button>
+
+          @if (menuOpen()) {
+            <div
+              class="menu"
+              role="menu"
+              [attr.aria-label]="node().name + ' actions'"
+            >
+              @if (confirmingDelete()) {
+                <!-- Load-bearing confirm: names the exact consequence (notes move, or unlock first). -->
+                <div class="confirm" role="alertdialog" aria-modal="true">
+                  <p class="confirm-body">{{ deleteConfirmText() }}</p>
+                  @if (actionError()) {
+                    <p class="confirm-error" role="alert">
+                      {{ actionError() }}
+                    </p>
+                  }
+                  <div class="confirm-actions">
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      [disabled]="busy()"
+                      (click)="cancelDelete()"
+                    >
+                      Cancel
+                    </button>
+                    @if (canDelete()) {
+                      <button
+                        type="button"
+                        class="btn btn-danger"
+                        [disabled]="busy()"
+                        (click)="onDelete()"
+                      >
+                        {{ busy() ? "Deleting…" : "Delete folder" }}
+                      </button>
+                    }
+                  </div>
+                </div>
+              } @else {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="startRename()"
+                >
+                  <span class="menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+                      <path
+                        d="M11.3 2.2 13.8 4.7 5.5 13H3v-2.5z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </span>
+                  Rename
+                </button>
+
+                <!-- "Make private" (lock) when open; "Unlock" via Touch ID when locked;
+                     "Re-seal now" when session-unlocked. Reuses the row's lock affordances. -->
+                @switch (exposure()) {
+                  @case ("open") {
+                    <button
+                      type="button"
+                      class="menu-item"
+                      role="menuitem"
+                      (click)="onLockFromMenu()"
+                    >
+                      <span class="menu-icon" aria-hidden="true">🔒</span>
+                      Make private
+                    </button>
+                  }
+                  @case ("locked") {
+                    <button
+                      type="button"
+                      class="menu-item"
+                      role="menuitem"
+                      (click)="onUnlockFromMenu()"
+                    >
+                      <span class="menu-icon" aria-hidden="true">🔑</span>
+                      Locked — unlock
+                    </button>
+                  }
+                  @case ("session") {
+                    <button
+                      type="button"
+                      class="menu-item"
+                      role="menuitem"
+                      (click)="onRelockFromMenu()"
+                    >
+                      <span class="menu-icon" aria-hidden="true">🔒</span>
+                      Re-seal now
+                    </button>
+                  }
+                }
+
+                <button
+                  type="button"
+                  class="menu-item is-danger"
+                  role="menuitem"
+                  (click)="startDelete()"
+                >
+                  <span class="menu-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
+                      <path
+                        d="M3.5 4.5h9M6.5 4.5V3.2c0-.4.3-.7.7-.7h1.6c.4 0 .7.3.7.7v1.3M5 4.5l.5 8c0 .4.3.7.7.7h3.6c.4 0 .7-.3.7-.7l.5-8"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </span>
+                  Delete folder
+                </button>
+              }
+            </div>
+          }
+        </div>
       </div>
     </div>
 
@@ -457,6 +630,175 @@ import { FolderDropDirective } from "./folder-drop.directive";
         }
       }
 
+      /* --- Inline rename field (replaces the folder name button) ---------- */
+      .rename-form {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: var(--space-2) var(--space-2);
+        border: 1px solid var(--accent);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .rename-input {
+        flex: 1 1 auto;
+        min-width: 0;
+        height: 22px;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 0.9rem;
+        font-weight: 550;
+        letter-spacing: -0.01em;
+      }
+      .rename-input:hover,
+      .rename-input:focus {
+        border: none;
+        background: transparent;
+        box-shadow: none;
+        outline: none;
+      }
+
+      /* --- ⋯ folder-actions menu ----------------------------------------- */
+      .menu-wrap {
+        position: relative;
+        display: inline-flex;
+      }
+      .menu-trigger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        /* Quiet until the row is hovered/focused (like the lock toggle). */
+        opacity: 0;
+        transition:
+          color var(--transition),
+          background var(--transition),
+          border-color var(--transition),
+          opacity var(--transition);
+      }
+      .row-line:hover .menu-trigger,
+      .row-line:focus-within .menu-trigger,
+      .menu-trigger.is-open {
+        opacity: 1;
+      }
+      .menu-trigger:hover:not(:disabled),
+      .menu-trigger.is-open {
+        color: var(--text-primary);
+        background: var(--surface-hover);
+        border-color: var(--border-strong);
+      }
+      .menu-trigger:focus-visible {
+        outline: none;
+        opacity: 1;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .menu-trigger:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
+      /* Floating popover OVER the tree → OPAQUE surface (never the frosted .card). */
+      .menu {
+        position: absolute;
+        top: calc(100% + 4px);
+        right: 0;
+        z-index: 30;
+        min-width: 196px;
+        padding: var(--space-1);
+        background: var(--surface-overlay);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-lg);
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
+      }
+      .menu-item {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        width: 100%;
+        padding: var(--space-2) var(--space-2);
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--text-secondary);
+        font-family: inherit;
+        font-size: 0.85rem;
+        font-weight: 550;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          color var(--transition),
+          background var(--transition);
+      }
+      .menu-item:hover {
+        color: var(--text-primary);
+        background: var(--surface-hover);
+      }
+      .menu-item:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .menu-item.is-danger {
+        color: var(--danger);
+      }
+      .menu-item.is-danger:hover {
+        color: var(--danger);
+        background: var(--danger-soft);
+      }
+      .menu-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 18px;
+        height: 18px;
+        font-size: 0.8rem;
+        color: var(--text-muted);
+      }
+      .menu-item.is-danger .menu-icon {
+        color: var(--danger);
+      }
+
+      /* Load-bearing delete confirm (names the consequence). */
+      .confirm {
+        padding: var(--space-2);
+      }
+      .confirm-body {
+        margin: 0 0 var(--space-2);
+        color: var(--text-secondary);
+        font-size: 0.8125rem;
+        line-height: 1.4;
+      }
+      .confirm-error {
+        margin: 0 0 var(--space-2);
+        color: var(--danger);
+        font-size: 0.78rem;
+      }
+      .confirm-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: var(--space-2);
+      }
+      .confirm-actions .btn {
+        height: 30px;
+        padding: 0 var(--space-3);
+        font-size: 0.8rem;
+      }
+
       .row-error {
         margin: var(--space-1) 0 var(--space-2);
         padding-left: calc(var(--depth, 0) * var(--space-4) + var(--space-5));
@@ -468,6 +810,8 @@ import { FolderDropDirective } from "./folder-drop.directive";
 })
 export class FolderRowComponent {
   private readonly folders = inject(FoldersService);
+  private readonly toast = inject(ToastService);
+  private readonly injector = inject(Injector);
 
   /** This row's folder node. */
   readonly node = input.required<FolderNode>();
@@ -484,15 +828,56 @@ export class FolderRowComponent {
 
   /** Whether this row's children subtree is shown. Roots start expanded. */
   readonly expanded = signal(true);
-  /** True while a lock op for THIS row is in flight (guards the affordance). */
+  /** True while a lock/rename/delete op for THIS row is in flight (guards the affordances). */
   readonly busy = signal(false);
-  /** Per-row lock error (cleared on the next attempt). */
+  /** Per-row lock/action error (cleared on the next attempt). */
   readonly lockError = signal<string | null>(null);
+
+  // --- ⋯ folder-actions menu + inline rename + delete confirm ---------------
+  /** Whether the ⋯ actions menu popover is open. */
+  readonly menuOpen = signal(false);
+  /** Whether the inline rename field is showing (replaces the name button). */
+  readonly renaming = signal(false);
+  /** Draft folder name bound to the rename field. */
+  readonly renameDraft = signal("");
+  /** Whether the delete-confirm step is showing inside the menu. */
+  readonly confirmingDelete = signal(false);
+  /** Error surfaced inside the delete confirm (e.g. a backend reject). */
+  readonly actionError = signal<string | null>(null);
+
+  /** The rename input — focused after it renders (afterNextRender; no setTimeout). */
+  private readonly renameInput =
+    viewChild<ElementRef<HTMLInputElement>>("renameInput");
 
   /** This folder's privacy exposure, derived from its lock flags. */
   readonly exposure = computed<FolderExposure>(() =>
     this.folders.exposureOf(this.node()),
   );
+
+  /**
+   * Whether DELETE may proceed right now. A sealed folder that is NOT session-unlocked cannot be
+   * deleted (its notes are encrypted and the backend refuses) — the confirm shows the "unlock first"
+   * message and hides the destructive button. An open or session-unlocked folder can delete.
+   */
+  readonly canDelete = computed(() => this.exposure() !== "locked");
+
+  /**
+   * The delete-confirm copy — names the exact consequence:
+   *  - sealed + not unlocked → "Unlock this folder first to delete it."
+   *  - otherwise             → "Delete 'X'? Its N notes move to All notes." (or no-notes variant).
+   */
+  readonly deleteConfirmText = computed(() => {
+    const f = this.node();
+    if (!this.canDelete()) {
+      return `“${f.name}” is locked. Unlock this folder first to delete it.`;
+    }
+    const n = f.noteCount;
+    if (n <= 0) {
+      return `Delete “${f.name}”? This empty folder will be removed.`;
+    }
+    const notes = n === 1 ? "note" : "notes";
+    return `Delete “${f.name}”? Its ${n} ${notes} move to All notes — nothing is lost.`;
+  });
 
   /**
    * This folder's children — always an array, even if the backend node omits
@@ -534,6 +919,141 @@ export class FolderRowComponent {
     } catch {
       // Leave the message visible until the next op (no component timer).
       this.lockError.set("Couldn’t change this folder’s lock. Try again.");
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  // --- ⋯ menu --------------------------------------------------------------
+  /** Open/close the actions menu. Closing resets any in-menu delete-confirm. */
+  toggleMenu(): void {
+    const next = !this.menuOpen();
+    this.menuOpen.set(next);
+    if (!next) {
+      this.confirmingDelete.set(false);
+      this.actionError.set(null);
+    }
+  }
+
+  /** Close the menu (and any confirm) — used after an action resolves. */
+  private closeMenu(): void {
+    this.menuOpen.set(false);
+    this.confirmingDelete.set(false);
+    this.actionError.set(null);
+  }
+
+  // --- Lock actions from the menu (reuse the existing run() lock affordances) ---
+  /** "Make private" — seal the whole folder. */
+  async onLockFromMenu(): Promise<void> {
+    this.closeMenu();
+    await this.onLock();
+  }
+
+  /** "Locked — unlock" — session-unlock via Touch ID. */
+  async onUnlockFromMenu(): Promise<void> {
+    this.closeMenu();
+    await this.onUnlock();
+  }
+
+  /** "Re-seal now" — re-lock a session-unlocked folder. */
+  async onRelockFromMenu(): Promise<void> {
+    this.closeMenu();
+    await this.onRelock();
+  }
+
+  // --- Inline rename -------------------------------------------------------
+  /** Open the inline rename field (seeded with the current name) + focus it once rendered. */
+  startRename(): void {
+    this.renameDraft.set(this.node().name);
+    this.renaming.set(true);
+    this.menuOpen.set(false);
+    afterNextRender(
+      () => {
+        const el = this.renameInput()?.nativeElement;
+        el?.focus();
+        el?.select();
+      },
+      { injector: this.injector },
+    );
+  }
+
+  onRenameInput(event: Event): void {
+    this.renameDraft.set((event.target as HTMLInputElement).value);
+  }
+
+  /** Close the rename field without saving. Ignored mid-save. */
+  cancelRename(): void {
+    if (this.busy()) {
+      return;
+    }
+    this.renaming.set(false);
+    this.renameDraft.set("");
+  }
+
+  /**
+   * Save the rename. A no-op when the name is unchanged/empty. On success the field closes and the
+   * tree reloads (the row re-renders with the new name). On failure we keep the field open (so the
+   * typed name isn't lost) and surface a single danger toast.
+   */
+  async confirmRename(event: Event): Promise<void> {
+    event.preventDefault();
+    const name = this.renameDraft().trim();
+    if (this.busy()) {
+      return;
+    }
+    if (!name || name === this.node().name) {
+      this.cancelRename();
+      return;
+    }
+    this.busy.set(true);
+    try {
+      await this.folders.rename(this.node().id, name);
+      this.renaming.set(false);
+      this.renameDraft.set("");
+    } catch {
+      this.toast.danger("Couldn’t rename that folder. Try another name.");
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  // --- Delete --------------------------------------------------------------
+  /** Switch the menu into its delete-confirm step. */
+  startDelete(): void {
+    this.actionError.set(null);
+    this.confirmingDelete.set(true);
+  }
+
+  /** Back out of the delete confirm (keeps the menu open on the action list). */
+  cancelDelete(): void {
+    if (this.busy()) {
+      return;
+    }
+    this.confirmingDelete.set(false);
+    this.actionError.set(null);
+  }
+
+  /**
+   * Delete the folder. Its notes move to the vault root (the backend never loses a note). On a
+   * backend reject (e.g. still has subfolders) we show the message inline in the confirm. The "unlock
+   * first" case is handled BEFORE this is reachable (the destructive button is hidden when locked).
+   */
+  async onDelete(): Promise<void> {
+    if (this.busy() || !this.canDelete()) {
+      return;
+    }
+    this.busy.set(true);
+    this.actionError.set(null);
+    try {
+      await this.folders.delete(this.node().id);
+      this.closeMenu();
+      this.toast.success("Folder deleted. Its notes are in All notes.");
+      // If this folder was selected, fall back to the vault root.
+      if (this.selectedId() === this.node().id) {
+        this.select.emit(null);
+      }
+    } catch {
+      this.actionError.set("Couldn’t delete this folder. Please try again.");
     } finally {
       this.busy.set(false);
     }
