@@ -167,9 +167,9 @@ pub async fn start_recording(
             .lock()
             .map(|c| c.capture_system_audio)
             .unwrap_or(false);
-        if enabled && crate::audio::system::is_available() {
+        if enabled && crate::audio::system::is_available(&app) {
             let sys_wav = std::env::temp_dir().join(format!("meetnotes-sys-{meeting_id}.wav"));
-            match crate::audio::system::SystemAudioRecorder::start(sys_wav) {
+            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav) {
                 Ok(rec) => {
                     if let Ok(mut slot) = state.system_recorder.lock() {
                         *slot = Some(rec);

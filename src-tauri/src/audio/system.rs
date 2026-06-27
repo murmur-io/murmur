@@ -8,19 +8,39 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+use tauri::{AppHandle, Manager};
+
 use crate::error::{AppError, Result};
 
-/// Path to the sidecar binary compiled by `build.rs`, if Swift compilation succeeded
-/// and the binary still exists.
-pub fn sidecar_path() -> Option<PathBuf> {
+/// Filename of the sidecar — both inside `Contents/Resources` of a shipped `.app` and at the
+/// dev `OUT_DIR`.
+const SIDECAR_NAME: &str = "meetnotes-sysaudio";
+
+/// Path to the system-audio sidecar binary. Resolution order:
+///
+/// 1. The bundled resource inside the distributed `.app`
+///    (`Contents/Resources/meetnotes-sysaudio`), resolved at RUNTIME via Tauri's resource dir
+///    — this is the ONLY path that exists in a shipped, notarized build.
+/// 2. The compile-time `SYSAUDIO_BIN` (an absolute `OUT_DIR` path baked in by `build.rs`) —
+///    a DEV-ONLY fallback; it does not exist on an end-user machine, which is exactly why (1)
+///    is required for production. (Shipping with only (2) was the latent mic-only regression.)
+pub fn sidecar_path(app: &AppHandle) -> Option<PathBuf> {
+    if let Ok(p) = app
+        .path()
+        .resolve(SIDECAR_NAME, tauri::path::BaseDirectory::Resource)
+    {
+        if p.exists() {
+            return Some(p);
+        }
+    }
     option_env!("SYSAUDIO_BIN")
         .map(PathBuf::from)
         .filter(|p| p.exists())
 }
 
-/// Whether this build has a usable system-audio sidecar.
-pub fn is_available() -> bool {
-    sidecar_path().is_some()
+/// Whether this build has a usable system-audio sidecar (bundled resource or dev fallback).
+pub fn is_available(app: &AppHandle) -> bool {
+    sidecar_path(app).is_some()
 }
 
 /// Spawns the sidecar to capture system audio into `wav_path`. Call [`stop`] to finalize.
@@ -37,8 +57,8 @@ pub struct SystemAudioRecorder {
 impl SystemAudioRecorder {
     /// Spawn the sidecar writing to `wav_path`. Errors only if the sidecar can't be
     /// spawned at all; a *capture* failure (no permission) surfaces later in [`stop`].
-    pub fn start(wav_path: PathBuf) -> Result<Self> {
-        let bin = sidecar_path()
+    pub fn start(app: &AppHandle, wav_path: PathBuf) -> Result<Self> {
+        let bin = sidecar_path(app)
             .ok_or_else(|| AppError::Audio("system-audio sidecar not built".into()))?;
         let child = Command::new(&bin)
             .arg(&wav_path)

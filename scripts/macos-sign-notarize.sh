@@ -50,8 +50,20 @@ echo "1) Building universal (.app, arm64 + x86_64)…"
 npx tauri build --target universal-apple-darwin --bundles app
 [ -d "$APP" ] || { echo "universal .app not found at $APP" >&2; exit 1; }
 
-echo "2) Codesigning (Developer ID + hardened runtime + entitlements + timestamp)…"
-codesign --force --deep --options runtime --timestamp \
+echo "2) Codesigning INSIDE-OUT (nested helpers first, app last — NO --deep)…"
+# --deep mis-signs nested Mach-Os and breaks notarization once a helper is bundled
+# (deprecated since macOS 13; reproduces Tauri #11992). Sign each embedded sidecar FIRST
+# with hardened runtime + timestamp, THEN seal the app bundle last.
+for HELPER in \
+  "$APP/Contents/Resources/meetnotes-sysaudio" \
+  "$APP/Contents/Resources/meetnotes-audiocap"; do
+  if [ -f "$HELPER" ]; then
+    echo "   • helper: $(basename "$HELPER")"
+    codesign --force --options runtime --timestamp \
+      --entitlements "$ENTITLEMENTS" --sign "$DEVELOPER_ID" "$HELPER"
+  fi
+done
+codesign --force --options runtime --timestamp \
   --entitlements "$ENTITLEMENTS" --sign "$DEVELOPER_ID" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
