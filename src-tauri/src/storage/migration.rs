@@ -1,7 +1,14 @@
 //! One-time, safety-first migration of an existing PLAINTEXT SQLite database to a SQLCipher
 //! encrypted one. The original file is never mutated until a fully-verified encrypted copy
-//! exists; the only mutating moment is the final atomic rename. A plaintext `.pre-encrypt.bak`
-//! snapshot is retained as a disaster-recovery path.
+//! exists; the only mutating moment is the final atomic rename.
+//!
+//! B4 (P0 live-leak fix): the recovery snapshot is NO LONGER a plaintext `.pre-encrypt.bak`. Writing
+//! the user's entire library to an UNENCRYPTED file next to the DB defeated the at-rest encryption
+//! we were in the middle of applying (anyone with file access could read it). The recovery copy is
+//! now a KEYED (SQLCipher-encrypted, same DEK) `.pre-encrypt.bak` produced via ATTACH + sqlcipher_-
+//! export into a keyed attached DB — encrypted at rest like the real target. A startup sweep in
+//! `state::init_at` additionally removes any stale plaintext `.pre-encrypt.bak` left by an older
+//! build.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,24 +51,46 @@ fn tmp_target(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Encrypt the plaintext DB at `path` in place: checkpoint WAL → plaintext backup → export into a
-/// fresh SQLCipher DB → verify (integrity + per-table row counts) → atomic swap. On any error
-/// before the swap, the original is left bit-for-bit intact and the temp target is removed.
+/// Encrypt the plaintext DB at `path` in place: checkpoint WAL → KEYED encrypted backup → export
+/// into a fresh SQLCipher DB → verify (integrity + per-table row counts) → atomic swap. On any error
+/// before the swap, the original is left bit-for-bit intact and the temp target is removed. The
+/// recovery backup is SQLCipher-encrypted with the same DEK (B4 — never a plaintext snapshot).
 pub fn encrypt_in_place(path: &Path, dek_hex: &str) -> Result<()> {
     let backup = backup_path(path);
     let tmp = tmp_target(path);
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&backup);
 
-    // 1–3: from the plaintext source — checkpoint WAL, snapshot backup, export to encrypted temp.
+    // Hold every `PRAGMA key` hex string in a Zeroizing buffer (C6) so the raw key is wiped from the
+    // stack as soon as the ATTACH runs.
+    let key_expr = zeroize::Zeroizing::new(format!("x'{dek_hex}'"));
+
+    // 1–3: from the plaintext source — checkpoint WAL, KEYED encrypted backup, export to encrypted
+    // temp. BOTH the backup and the temp target are SQLCipher-encrypted with the DEK.
     {
         let src = Connection::open(path).map_err(|e| mig_err("open source", e))?;
         let _ = src.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"); // best-effort fold WAL
-        src.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-            .map_err(|e| mig_err("backup VACUUM INTO", e))?;
+
+        // KEYED recovery backup (B4): export the source into an ATTACHed SQLCipher DB rather than a
+        // plaintext `VACUUM INTO`. Encrypted at rest with the same DEK.
+        src.execute(
+            "ATTACH DATABASE ?1 AS bak KEY ?2",
+            rusqlite::params![backup.to_string_lossy().as_ref(), key_expr.as_str()],
+        )
+        .map_err(|e| mig_err("attach keyed backup", e))?;
+        src.query_row("SELECT sqlcipher_export('bak')", [], |_| Ok(()))
+            .map_err(|e| mig_err("sqlcipher_export backup", e))?;
+        let uv_bak: i64 = src
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        let _ = src.execute_batch(&format!("PRAGMA bak.user_version = {uv_bak};"));
+        src.execute_batch("DETACH DATABASE bak;")
+            .map_err(|e| mig_err("detach backup", e))?;
+
+        // Encrypted migration target.
         src.execute(
             "ATTACH DATABASE ?1 AS enc KEY ?2",
-            rusqlite::params![tmp.to_string_lossy().as_ref(), format!("x'{dek_hex}'")],
+            rusqlite::params![tmp.to_string_lossy().as_ref(), key_expr.as_str()],
         )
         .map_err(|e| mig_err("attach encrypted target", e))?;
         src.query_row("SELECT sqlcipher_export('enc')", [], |_| Ok(()))
@@ -88,7 +117,7 @@ pub fn encrypt_in_place(path: &Path, dek_hex: &str) -> Result<()> {
         s.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(s));
     }
-    tracing::info!(target: "migration", "database encrypted; plaintext backup at {}", backup.display());
+    tracing::info!(target: "migration", "database encrypted; keyed recovery backup at {}", backup.display());
     Ok(())
 }
 
@@ -102,8 +131,11 @@ fn table_count(conn: &Connection, table: &str) -> i64 {
 fn verify_encrypted(source: &Path, encrypted: &Path, dek_hex: &str) -> Result<()> {
     let src = Connection::open(source).map_err(|e| mig_err("verify open source", e))?;
     let enc = Connection::open(encrypted).map_err(|e| mig_err("verify open encrypted", e))?;
-    enc.pragma_update(None, "key", format!("x'{dek_hex}'"))
+    // C6: wipe the formatted PRAGMA-key hex from the stack right after keying the verify handle.
+    let key_expr = zeroize::Zeroizing::new(format!("x'{dek_hex}'"));
+    enc.pragma_update(None, "key", key_expr.as_str())
         .map_err(|e| mig_err("verify key", e))?;
+    drop(key_expr);
 
     // Integrity: any returned row signals a problem.
     {
@@ -181,10 +213,30 @@ mod tests {
 
         encrypt_in_place(&p, KEY).unwrap();
 
-        // No longer plaintext; backup exists and IS plaintext.
+        // No longer plaintext; backup exists and is KEYED (encrypted), NOT plaintext (B4).
         assert!(!is_plaintext_sqlite(&p).unwrap(), "should be encrypted now");
         assert!(!needs_encryption(&p).unwrap(), "idempotent: encrypted file → no re-migration");
-        assert!(is_plaintext_sqlite(&backup_path(&p)).unwrap(), "backup is plaintext snapshot");
+        let bak = backup_path(&p);
+        assert!(bak.exists(), "a recovery backup is produced");
+        assert!(
+            !is_plaintext_sqlite(&bak).unwrap(),
+            "B4: the recovery backup MUST be encrypted at rest, never a plaintext snapshot"
+        );
+        // The keyed backup decrypts with the SAME DEK and holds the same rows.
+        let bak_conn = Connection::open(&bak).unwrap();
+        bak_conn.pragma_update(None, "key", format!("x'{KEY}'")).unwrap();
+        let bc: i64 = bak_conn
+            .query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bc, 2, "keyed backup holds the migrated rows");
+        // And the WRONG key cannot read the backup (proves it is genuinely encrypted).
+        let bad = Connection::open(&bak).unwrap();
+        bad.pragma_update(None, "key", "x'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'")
+            .unwrap();
+        assert!(
+            bad.query_row::<i64, _, _>("SELECT count(*) FROM meetings", [], |r| r.get(0)).is_err(),
+            "the keyed backup must not be readable without the DEK"
+        );
 
         // Reopen encrypted, verify byte-identical reads + carried user_version.
         let enc = Connection::open(&p).unwrap();

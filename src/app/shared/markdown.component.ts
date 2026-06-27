@@ -7,13 +7,22 @@ import {
   input,
 } from "@angular/core";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 
 /**
- * Renders LLM / markdown text as beautifully formatted, sanitized HTML.
+ * Renders LLM / markdown text (transcript text AND model output) as beautifully formatted,
+ * sanitized HTML.
  *
- * - `marked` parses the markdown; Angular's default `[innerHTML]` sanitizer strips anything
- *   unsafe (scripts, event handlers, javascript: URLs), so no `bypassSecurityTrust` is used.
- * - `[[Wikilinks]]` become accent chips.
+ * Defense in depth — the markdown source is UNTRUSTED (LLM-generated or speech-to-text of
+ * whatever was said), so the parsed HTML is treated as hostile:
+ *
+ * - `marked` parses the markdown into HTML.
+ * - `DOMPurify.sanitize(...)` strips scripts, event handlers, `javascript:`/`data:` script URLs,
+ *   `<iframe>`/`<object>`/`<embed>`, and any other XSS vector BEFORE the string ever reaches the
+ *   DOM. This is the primary sanitizer; we never call `bypassSecurityTrustHtml`, so Angular's
+ *   built-in `[innerHTML]` sanitizer also runs as a second, redundant pass.
+ * - `[[Wikilinks]]` become accent chips (the label is HTML-escaped first, then DOMPurify keeps
+ *   the `<span class="md-wikilink">` wrapper because `span`/`class` are on its default allow-list).
  * - A stray YAML front-matter block (some models leak one) is stripped defensively.
  *
  * Encapsulation is None with a `.md-body` scope so the styles reach the injected HTML.
@@ -204,7 +213,11 @@ export class MarkdownComponent {
       return `<span class="md-wikilink">${label}</span>`;
     });
     const out = marked.parse(text, { async: false, gfm: true, breaks: true });
-    return typeof out === "string" ? out : src;
+    const raw = typeof out === "string" ? out : src;
+    // Sanitize the parsed HTML before it is bound to [innerHTML]. The source is untrusted
+    // (LLM output / transcript), so DOMPurify is the authoritative XSS gate — no
+    // bypassSecurityTrustHtml is ever applied to this string.
+    return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
   }
 
   private stripFrontMatter(src: string): string {

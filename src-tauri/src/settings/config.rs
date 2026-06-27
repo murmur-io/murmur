@@ -37,9 +37,10 @@ pub struct AppConfig {
     pub auto_organize: bool,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
-    /// Require an `Authorization: Bearer <token>` on MCP `tools/call`. Default OFF so the
-    /// existing local Claude connection keeps working; discovery (initialize/tools/list/ping)
-    /// stays open regardless. Bind is always 127.0.0.1.
+    /// Require an `Authorization: Bearer <token>` on EVERY MCP method (E3) — including
+    /// initialize / tools/list / ping, not just tools/call. Default ON (fail-closed): an
+    /// unauthenticated localhost process must not be able to even enumerate the meeting tools.
+    /// Bind is always 127.0.0.1.
     pub mcp_require_token: bool,
     /// Require a passing biometric (Touch ID, falling back to device passcode) before unlocking a
     /// sealed folder. Default ON. Degrades to allow when no biometric/passcode policy is available
@@ -48,6 +49,15 @@ pub struct AppConfig {
     /// Auto-relock all session-unlocked folders (and zeroize the cached KEK) when screen
     /// capture/sharing STARTS. Default ON.
     pub relock_on_screenshare: bool,
+    /// E10 — one-time cloud-egress consent. The FIRST time the user would send meeting content
+    /// to a cloud LLM (claude_code / anthropic), the egress path refuses until this is flipped
+    /// `true` via the dedicated `consent_to_cloud_egress` command. Default OFF (fail-closed): no
+    /// content leaves the device until the user has explicitly acknowledged it once.
+    ///
+    /// SECURITY: this flag is intentionally NOT part of `AppConfigDto` / `save_config` — the FE
+    /// cannot set it as a side effect of a normal settings save. It is mutated ONLY by the
+    /// purpose-built consent command, so flipping it is an explicit, auditable user act.
+    pub cloud_egress_consented: bool,
 }
 
 impl Default for AppConfig {
@@ -69,9 +79,10 @@ impl Default for AppConfig {
             note_style: "standard".to_string(),
             auto_organize: false,
             note_language: "auto".to_string(),
-            mcp_require_token: false,
+            mcp_require_token: true,
             lock_require_biometric: true,
             relock_on_screenshare: true,
+            cloud_egress_consented: false,
         }
     }
 }
@@ -96,6 +107,7 @@ const K_NOTE_LANGUAGE: &str = "note_language";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
 const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
+const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -169,6 +181,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_RELOCK_ON_SCREENSHARE)? {
             cfg.relock_on_screenshare = v == "true";
         }
+        if let Some(v) = db.get_setting(K_CLOUD_EGRESS_CONSENTED)? {
+            cfg.cloud_egress_consented = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -219,7 +234,25 @@ impl AppConfig {
             K_RELOCK_ON_SCREENSHARE,
             if self.relock_on_screenshare { "true" } else { "false" },
         )?;
+        db.set_setting(
+            K_CLOUD_EGRESS_CONSENTED,
+            if self.cloud_egress_consented { "true" } else { "false" },
+        )?;
         Ok(())
+    }
+
+    /// E10 — record the user's one-time consent to send meeting content to a cloud LLM provider.
+    /// Flips the in-memory flag AND persists it. This is the ONLY supported way to grant consent;
+    /// it is deliberately separate from `save_config` so consent can never be granted as an
+    /// incidental side effect of a settings write.
+    ///
+    /// TODO(FE): wire a first-cloud-send confirmation prompt that calls the
+    /// `consent_to_cloud_egress` Tauri command before the first claude_code/anthropic run. Until
+    /// then the egress path returns `AppError::Unavailable("cloud egress not consented …")`, which
+    /// the FE can detect to surface the consent dialog.
+    pub fn grant_cloud_egress_consent(&mut self, db: &Db) -> Result<()> {
+        self.cloud_egress_consented = true;
+        db.set_setting(K_CLOUD_EGRESS_CONSENTED, "true")
     }
 }
 
@@ -262,6 +295,20 @@ mod tests {
         // Stage E security flags default ON.
         assert!(cfg.lock_require_biometric);
         assert!(cfg.relock_on_screenshare);
+        // E10 cloud-egress consent is fail-closed (OFF) until explicitly granted.
+        assert!(!cfg.cloud_egress_consented);
+    }
+
+    #[test]
+    fn cloud_egress_consent_grant_persists() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.cloud_egress_consented);
+        cfg.grant_cloud_egress_consent(&db).unwrap();
+        assert!(cfg.cloud_egress_consented);
+        // Survives a reload from the settings table.
+        let reloaded = AppConfig::load(&db).unwrap();
+        assert!(reloaded.cloud_egress_consented);
     }
 
     #[test]

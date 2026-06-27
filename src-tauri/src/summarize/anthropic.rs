@@ -32,11 +32,27 @@ impl AnthropicProvider {
             model
         };
         Self {
-            client: reqwest::Client::new(),
+            client: build_client(),
             model,
             api_key,
         }
     }
+}
+
+/// Build the reqwest client for cloud egress (E12): pin a TLS floor of 1.2 (refuse to negotiate
+/// the broken TLS 1.0/1.1) and set an overall request timeout so a stalled connection cannot wedge
+/// the pipeline. Falls back to `Client::new()` only if the builder somehow fails (it shouldn't with
+/// the rustls backend) so the provider is never un-constructible.
+///
+/// FOLLOW-UP: adopt `rustls-platform-verifier` for OS trust-store / policy-aware cert verification
+/// once it is an approved dependency (not added here — needs user sign-off).
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Minimal mirror of the `/v1/messages` success response — we only need the text blocks.

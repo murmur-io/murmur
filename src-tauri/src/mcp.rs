@@ -7,12 +7,46 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use tiny_http::{Header, Method, Response, Server};
 
 use crate::storage::Db;
 
 /// Fixed localhost port for the MCP server.
 pub const MCP_PORT: u16 = 8765;
+
+/// Max request body we will read (E5). The MCP JSON-RPC requests are tiny; cap hard so a
+/// malicious local client can't OOM us with an unbounded body.
+const MAX_BODY_BYTES: u64 = 1 << 20; // 1 MiB
+
+/// The only `Host` header values we accept (E2). A request whose Host is anything else — a DNS
+/// name resolving to 127.0.0.1, a `0.0.0.0` rebinding, an external host — is rejected, which
+/// blocks DNS-rebinding attacks against the localhost server.
+const ALLOWED_HOSTS: &[&str] = &["127.0.0.1:8765", "localhost:8765"];
+
+/// The only `Origin` header values we accept when one is present (E5). A browser page on another
+/// origin (or a `null` opaque origin) must not be able to script this server. Requests with NO
+/// Origin (native MCP clients like Claude Desktop/Code) are allowed through — Origin is a
+/// browser-set header. We never reflect the Origin back.
+fn origin_allowed(origin: &str) -> bool {
+    matches!(
+        origin,
+        "http://127.0.0.1:8765"
+            | "http://localhost:8765"
+            | "http://127.0.0.1"
+            | "http://localhost"
+    )
+}
+
+/// Case-insensitive fetch of a single request header value. Compares the header field name
+/// ASCII-case-insensitively against `name` (avoids `tiny_http::HeaderField::equiv`, which requires
+/// a `'static` argument).
+fn header_value(req: &tiny_http::Request, name: &str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+}
 
 /// Shared session unlock set: folder ids whose sealed notes are decrypted into the markdown
 /// column for this session (so MCP can read them as plaintext + the visibility filter lets them
@@ -42,8 +76,12 @@ fn run(db_path: PathBuf, unlocked: UnlockedSet, require_token: bool) {
         match crate::secrets::get_or_create_mcp_token() {
             Ok(t) => Some(t),
             Err(e) => {
-                tracing::warn!(target: "mcp", error = %e, "could not mint MCP token; disabling enforcement");
-                None
+                // FAIL CLOSED (E3): enforcement is required but the token could not be minted/read.
+                // Do NOT fall back to an unauthenticated server — that would serve the whole tool
+                // surface ungated. Refuse to start the MCP listener so the gate can never be
+                // bypassed by a transient Keychain failure.
+                tracing::error!(target: "mcp", error = %e, "MCP token required but unavailable — refusing to start the MCP server (fail closed)");
+                return;
             }
         }
     } else {
@@ -58,14 +96,38 @@ fn run(db_path: PathBuf, unlocked: UnlockedSet, require_token: bool) {
             );
             continue;
         }
+
+        // E2: reject any request whose Host header is not exactly one of our loopback hosts.
+        // A missing Host on HTTP/1.1 is non-conformant — reject it too (fail-closed).
+        match header_value(&req, "Host") {
+            Some(h) if ALLOWED_HOSTS.contains(&h.trim()) => {}
+            _ => {
+                let _ = req.respond(Response::from_string("forbidden host").with_status_code(403));
+                continue;
+            }
+        }
+
+        // E5: if an Origin header is present it must be on the loopback allow-list. We never
+        // reflect it; a cross-origin / null Origin is refused outright.
+        if let Some(origin) = header_value(&req, "Origin") {
+            if !origin_allowed(origin.trim()) {
+                let _ =
+                    req.respond(Response::from_string("forbidden origin").with_status_code(403));
+                continue;
+            }
+        }
+
         // Extract the bearer token (if any) from the Authorization header before consuming body.
-        let auth = req
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .map(|h| h.value.as_str().to_string());
+        let auth = header_value(&req, "Authorization");
+        // E5: cap the body so a local client cannot stream an unbounded payload. `Read::take`
+        // needs a `Sized` reader; `req.as_reader()` is `&mut dyn Read`, so take a `&mut` of it
+        // (which is `Sized` + `Read`) before `.take(..)`.
         let mut body = String::new();
-        let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+        {
+            use std::io::Read as _;
+            let reader = req.as_reader();
+            let _ = reader.take(MAX_BODY_BYTES).read_to_string(&mut body);
+        }
         match handle_rpc(&db_path, &body, &unlocked, expected_token.as_deref(), auth.as_deref()) {
             Some(resp) => {
                 let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
@@ -99,6 +161,16 @@ fn handle_rpc(
     // Notifications have no "id" → no response.
     let id = req.get("id")?.clone();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+
+    // E3: when enforcement is on, require a valid bearer token before ANY method — including
+    // initialize / tools/list / ping. Discovery is no longer open: an unauthenticated local
+    // process cannot even enumerate the tools. The check runs first, before any dispatch.
+    if let Some(expected) = expected_token {
+        if !bearer_ok(auth, expected) {
+            return Some(rpc_err(id, -32001, "unauthorized: bearer token required"));
+        }
+    }
+
     let result = match method {
         "initialize" => json!({
             "protocolVersion": "2024-11-05",
@@ -108,12 +180,6 @@ fn handle_rpc(
         "tools/list" => json!({ "tools": tools_spec() }),
         "ping" => json!({}),
         "tools/call" => {
-            // Bearer enforcement applies ONLY to tools/call; discovery stays open.
-            if let Some(expected) = expected_token {
-                if !bearer_ok(auth, expected) {
-                    return Some(rpc_err(id, -32001, "unauthorized: bearer token required"));
-                }
-            }
             return Some(handle_tool_call(db_path, id, req.get("params"), unlocked));
         }
         _ => return Some(rpc_err(id, -32601, "method not found")),
@@ -121,15 +187,26 @@ fn handle_rpc(
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-/// Constant-ish bearer-token check: the Authorization header must be `Bearer <expected>`.
+/// Bearer-token check in CONSTANT TIME (E5): the Authorization header must be `Bearer <expected>`
+/// and the token must equal `expected` byte-for-byte. The comparison uses `subtle::ConstantTimeEq`
+/// over fixed-length byte slices so a timing side-channel cannot be used to recover the token a
+/// prefix at a time. A length mismatch short-circuits to `false` WITHOUT a data-dependent compare
+/// (lengths are not secret; the bytes are), and a non-matching length never feeds `ct_eq` mismatched
+/// slices.
 fn bearer_ok(auth: Option<&str>, expected: &str) -> bool {
-    match auth {
-        Some(h) => {
-            let token = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer "));
-            token.map(|t| t.trim() == expected).unwrap_or(false)
-        }
-        None => false,
+    let Some(h) = auth else { return false };
+    let Some(token) = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    let token = token.trim().as_bytes();
+    let expected = expected.as_bytes();
+    if token.len() != expected.len() {
+        return false;
     }
+    token.ct_eq(expected).into()
 }
 
 fn rpc_err(id: Value, code: i64, msg: &str) -> Value {
@@ -309,42 +386,84 @@ mod tests {
 
     #[test]
     fn token_disabled_keeps_discovery_open() {
-        // Default (no enforcement): initialize/tools/list/ping all succeed without a token.
+        // With enforcement OFF (expected_token = None), discovery still works without a token —
+        // this preserves the no-token local connection when the user hasn't enabled the gate.
         assert!(rpc(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap()["result"].is_object());
         assert!(rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap()["result"]
             .is_object());
     }
 
     #[test]
-    fn token_required_gates_only_tools_call() {
-        // NOTE: every assertion here must STOP before `handle_tool_call` reaches `Db::open`,
-        // because `Db::open` fetches the SQLCipher DEK from the real Keychain (which can block on
-        // a freshly-signed test binary). The unauthorized branches return early in `handle_rpc`,
-        // so they never touch the DB — exactly the security-critical path we want to prove.
-        let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_recent_meetings","arguments":{}}}"#;
-        // No Authorization header → unauthorized error, returned BEFORE any DB access.
-        let unauth = rpc_auth(body, Some("sekret"), None).unwrap();
-        assert_eq!(unauth["error"]["code"], -32001);
-        // Wrong token → unauthorized, also before DB access.
-        let wrong = rpc_auth(body, Some("sekret"), Some("Bearer nope")).unwrap();
-        assert_eq!(wrong["error"]["code"], -32001);
-        // Discovery stays OPEN even with enforcement on (no token needed, no DB access).
-        let disc = rpc_auth(
+    fn token_required_gates_every_method() {
+        // E3: with enforcement ON, EVERY method (initialize / tools/list / ping / tools/call)
+        // requires a valid bearer token. NOTE: every assertion here STOPS before
+        // `handle_tool_call` reaches `Db::open` (real Keychain), because the unauthorized branch
+        // returns early in `handle_rpc` — exactly the security-critical path we want to prove.
+        for method in ["initialize", "tools/list", "ping", "tools/call"] {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"{method}","params":{{"name":"list_recent_meetings","arguments":{{}}}}}}"#
+            );
+            // No Authorization header → unauthorized, BEFORE any dispatch/DB access.
+            let unauth = rpc_auth(&body, Some("sekret"), None).unwrap();
+            assert_eq!(unauth["error"]["code"], -32001, "method {method} must be gated");
+            // Wrong token → unauthorized, also before dispatch.
+            let wrong = rpc_auth(&body, Some("sekret"), Some("Bearer nope")).unwrap();
+            assert_eq!(wrong["error"]["code"], -32001, "method {method} wrong-token must be gated");
+        }
+        // A CORRECT token lets discovery through (no DB access on initialize/tools/list/ping).
+        let ok = rpc_auth(
             r#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#,
             Some("sekret"),
-            None,
+            Some("Bearer sekret"),
         )
         .unwrap();
-        assert!(disc["result"]["tools"].is_array());
+        assert!(ok["result"]["tools"].is_array());
         // The "correct token reaches the DB" path is intentionally NOT asserted here: it would
         // call `Db::open` → real Keychain. `bearer_ok` (below) proves the matcher in isolation.
     }
 
     #[test]
-    fn bearer_ok_matches_case_insensitive_scheme() {
+    fn bearer_ok_constant_time_matches_scheme_and_value() {
         assert!(bearer_ok(Some("Bearer abc"), "abc"));
         assert!(bearer_ok(Some("bearer abc"), "abc"));
         assert!(!bearer_ok(Some("Basic abc"), "abc"));
+        assert!(!bearer_ok(Some("Bearer abc"), "abcd")); // length mismatch
+        assert!(!bearer_ok(Some("Bearer abd"), "abc")); // same length, different bytes
         assert!(!bearer_ok(None, "abc"));
+    }
+
+    #[test]
+    fn host_allow_list_is_loopback_only() {
+        // E2: only the two exact loopback authorities are accepted.
+        assert!(ALLOWED_HOSTS.contains(&"127.0.0.1:8765"));
+        assert!(ALLOWED_HOSTS.contains(&"localhost:8765"));
+        // Anything else (rebinding host, external name, bare host w/o port) is NOT in the list.
+        for bad in [
+            "evil.example.com:8765",
+            "0.0.0.0:8765",
+            "127.0.0.1",
+            "localhost",
+            "127.0.0.1:9999",
+        ] {
+            assert!(!ALLOWED_HOSTS.contains(&bad), "{bad} must not be allowed");
+        }
+    }
+
+    #[test]
+    fn origin_allow_list_rejects_cross_origin_and_null() {
+        // E5: loopback origins allowed; cross-origin and the opaque "null" origin rejected.
+        assert!(origin_allowed("http://127.0.0.1:8765"));
+        assert!(origin_allowed("http://localhost:8765"));
+        assert!(origin_allowed("http://127.0.0.1"));
+        assert!(origin_allowed("http://localhost"));
+        for bad in [
+            "null",
+            "https://evil.example.com",
+            "http://evil.example.com",
+            "https://127.0.0.1:8765", // wrong scheme
+            "http://127.0.0.1:9999",  // wrong port
+        ] {
+            assert!(!origin_allowed(bad), "{bad} must be rejected");
+        }
     }
 }
