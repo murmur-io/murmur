@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -29,6 +29,16 @@ struct Shared {
     /// stream "ready" signal) drops the thread-spawn + stream-build latency from the offset.
     /// Set exactly once; later callbacks leave it untouched.
     first_frame: OnceLock<std::time::Instant>,
+    /// Hard ceiling on `samples.len()` (source-rate mono frames). `0` means "uncapped" — it
+    /// stays 0 until [`build_and_play`] knows the device sample rate and sets it to
+    /// `MAX_RECORDING_SECONDS * source_sample_rate`. Once the buffer reaches it the data
+    /// callback drops further frames and flags `capped`, bounding RAM at ~MAX_RECORDING_SECONDS
+    /// (S2: a forgotten recording otherwise grows the f32 buffer ~0.7 GB/hr → OOM).
+    cap_samples: AtomicUsize,
+    /// Set `true` the moment the buffer first reaches `cap_samples`. The owning capture thread
+    /// polls it and tears the stream down (graceful self-stop); `Recorder::cap_reached` surfaces
+    /// it so the command layer can report "recording stopped: maximum length reached".
+    capped: AtomicBool,
 }
 
 impl Shared {
@@ -38,6 +48,8 @@ impl Shared {
             peak: AtomicU32::new(0),
             muted: AtomicBool::new(false),
             first_frame: OnceLock::new(),
+            cap_samples: AtomicUsize::new(0),
+            capped: AtomicBool::new(false),
         }
     }
 
@@ -56,7 +68,18 @@ impl Shared {
     fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
     }
+
+    fn is_capped(&self) -> bool {
+        self.capped.load(Ordering::Relaxed)
+    }
 }
+
+/// Hard ceiling on a single recording's wall-clock length. Beyond this the cpal mic buffer
+/// would keep growing unbounded (~0.7 GB/hr of f32 at 48 kHz), so a recording left running by
+/// mistake could exhaust RAM. At the cap we stop accumulating, tear the stream down, and flush
+/// what was captured normally on `stop()` (no data loss for the first `MAX_RECORDING_SECONDS`).
+/// 4 hours comfortably covers any real meeting while bounding worst-case memory.
+pub const MAX_RECORDING_SECONDS: u64 = 4 * 60 * 60;
 
 /// Message sent from the capture thread back to the owner once the stream is built.
 struct StartInfo {
@@ -74,13 +97,16 @@ struct StartInfo {
 /// channel. This keeps the `start`/`stop`/`level` API (PHASE0-PLAN §5.4) intact while
 /// making `Recorder` `Send + Sync`.
 ///
-/// Phase 0 is **mic-only mono**: the default input device is captured, any multi-channel
-/// input is down-mixed to mono, and samples are buffered at the device's native sample
-/// rate. Conversion to 16 kHz happens later in [`crate::audio::wav`].
+/// This `Recorder` captures the **mic track** only: the default (or configured) input device,
+/// any multi-channel input down-mixed to mono, buffered at the device's native sample rate
+/// (conversion to 16 kHz happens later in [`crate::audio::wav`]). The buffer is hard-capped at
+/// [`MAX_RECORDING_SECONDS`] so a forgotten recording can't grow it without bound.
 ///
-/// TODO(phase2): system-audio capture via ScreenCaptureKit lives alongside this mic path
-/// (separate Objective-C/Swift bridge producing a second mono track); `pipeline.rs` will
-/// mix the two before transcription. No system-audio hook is wired in Phase 0.
+/// System audio (the "other side" of a call) IS captured in parallel — by
+/// [`crate::audio::system`] (Core Audio process tap on macOS 14.4+, else the ScreenCaptureKit
+/// sidecar) into its own WAV, and optionally an echo-cancelled mic via [`crate::audio::aec`].
+/// `pipeline.rs` resamples and wall-clock-merges those tracks with this one before transcription.
+/// That dual-stream path is shipped; this struct owns only the cpal mic half.
 pub struct Recorder {
     shared: Arc<Shared>,
     source_sample_rate: u32,
@@ -194,6 +220,13 @@ impl Recorder {
         self.shared.is_muted()
     }
 
+    /// `true` once the recording hit its [`MAX_RECORDING_SECONDS`] hard cap and capture
+    /// self-stopped. Lock-free; intended for the status poll so the UI can surface a
+    /// "maximum recording length reached — recording stopped" notice and finalize the meeting.
+    pub fn cap_reached(&self) -> bool {
+        self.shared.is_capped()
+    }
+
     /// Clone up to the last `max_samples` captured mono samples WITHOUT draining — used by
     /// live transcription. Read-only; never disturbs capture or the final stop() buffer.
     pub fn snapshot_tail(&self, max_samples: usize) -> Vec<f32> {
@@ -230,8 +263,17 @@ fn capture_thread(
             if ready_tx.send(Ok(info)).is_err() {
                 return; // owner gone
             }
-            // Block until asked to stop (or the sender is dropped).
+            // Block until asked to stop (or the sender is dropped) — but also poll the hard cap
+            // so a recording that hits MAX_RECORDING_SECONDS tears the stream down on its own
+            // (graceful self-stop) instead of letting the data callback keep being invoked.
             loop {
+                if shared.is_capped() {
+                    tracing::warn!(
+                        target: "audio",
+                        "maximum recording length reached — stopping mic capture"
+                    );
+                    break;
+                }
                 match stop_rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -283,6 +325,12 @@ fn build_and_play(
     let source_sample_rate = supported.sample_rate().0;
     let channels = supported.channels();
     let config: StreamConfig = supported.into();
+
+    // S2: arm the hard cap now that the device rate is known. `usize::MAX` saturation keeps it a
+    // valid (effectively-unreachable) ceiling on any pathological rate instead of overflowing.
+    let cap_samples = (MAX_RECORDING_SECONDS.saturating_mul(source_sample_rate as u64))
+        .min(usize::MAX as u64) as usize;
+    shared.cap_samples.store(cap_samples, Ordering::Relaxed);
 
     // NOTE(privacy): never log captured audio or device names that could be PII;
     // ids/format only.
@@ -361,6 +409,22 @@ where
     if shared.first_frame.get().is_none() {
         let _ = shared.first_frame.set(std::time::Instant::now());
     }
+
+    // S2 hard cap: once the buffer reaches its ceiling, stop accumulating (both the live and the
+    // muted-silence paths grow it, so the check guards both) and flag `capped` so the capture
+    // thread tears the stream down. Frames arriving in the ≤1-callback window before that teardown
+    // are dropped — the recording is already at its maximum length. `cap == 0` ⇒ uncapped (the
+    // rate isn't known yet, or a direct unit-test call).
+    let cap = shared.cap_samples.load(Ordering::Relaxed);
+    if cap > 0 {
+        let len = shared.samples.lock().map(|b| b.len()).unwrap_or(usize::MAX);
+        if len >= cap {
+            shared.capped.store(true, Ordering::Relaxed);
+            shared.store_peak(0.0);
+            return;
+        }
+    }
+
     let channels = channels.max(1);
     let frame_count = data.len() / channels;
 
@@ -468,6 +532,53 @@ mod tests {
         accumulate_frames(&shared, &[0.5f32], 1);
         let buf = shared.samples.lock().unwrap();
         assert_eq!(&*buf, &[0.0f32, 0.5f32], "silence then real audio after unmute");
+    }
+
+    /// S2 hard cap: once the buffer reaches `cap_samples` the accumulator stops growing it and
+    /// flags `capped` — the OOM guard for a forgotten/very-long recording. Frames captured before
+    /// the cap are preserved (flushed on `stop()`); frames after are dropped.
+    #[test]
+    fn buffer_stops_growing_at_the_cap() {
+        let shared = Arc::new(Shared::new());
+        shared.cap_samples.store(3, Ordering::Relaxed); // tiny cap for the test
+        assert!(!shared.is_capped(), "uncapped before any frame");
+
+        // Fill exactly to the cap: cap check sees len 0 < 3, so all 3 frames are appended.
+        accumulate_frames(&shared, &[0.1f32, 0.2, 0.3], 1);
+        assert_eq!(shared.samples.lock().unwrap().len(), 3);
+        assert!(!shared.is_capped(), "at-cap but no over-cap callback yet");
+
+        // Next callback: len(3) >= cap(3) → drop the frames and latch `capped`.
+        accumulate_frames(&shared, &[0.4f32, 0.5, 0.6, 0.7], 1);
+        assert_eq!(
+            shared.samples.lock().unwrap().len(),
+            3,
+            "buffer must not grow past the cap"
+        );
+        assert!(shared.is_capped(), "cap-reached flag latched");
+        assert_eq!(shared.load_peak(), 0.0, "meter reads 0 once capped");
+
+        // A muted callback past the cap must also be dropped (no silent-frame growth either).
+        shared.set_muted(true);
+        accumulate_frames(&shared, &[0.0f32, 0.0], 1);
+        assert_eq!(
+            shared.samples.lock().unwrap().len(),
+            3,
+            "muted frames must not grow the buffer past the cap"
+        );
+    }
+
+    /// A zero `cap_samples` (the default until the device rate is known) means uncapped — direct
+    /// unit-test calls and the pre-`build_and_play` window keep today's behaviour.
+    #[test]
+    fn zero_cap_is_uncapped() {
+        let shared = Arc::new(Shared::new());
+        assert_eq!(shared.cap_samples.load(Ordering::Relaxed), 0);
+        for _ in 0..1000 {
+            accumulate_frames(&shared, &[0.5f32], 1);
+        }
+        assert_eq!(shared.samples.lock().unwrap().len(), 1000, "no cap applied at 0");
+        assert!(!shared.is_capped());
     }
 
     /// The capture-start anchor is taken from the FIRST frame callback and set exactly once —

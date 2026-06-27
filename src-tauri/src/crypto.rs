@@ -152,6 +152,38 @@ pub fn decrypt_file(
     Ok(())
 }
 
+/// Decrypt an encrypted-WAV file at `src` trying a LADDER of candidate AADs in priority order,
+/// writing the plaintext to `dest` on the first candidate that succeeds. Each candidate carries the
+/// same empty-AAD legacy fallback as [`decrypt_with_aad`].
+///
+/// This is the audio backward-compatibility ladder for the stream-role AAD hardening. The three
+/// per-meeting audio files (playback WAV + mic/sys masters) are now sealed with a ROLE-bound AAD so
+/// they can't be swapped for one another. But a master/playback `.enc` sealed BEFORE the role existed
+/// carries the role-LESS `aad_audio(meeting,folder)` — a NON-EMPTY AAD that a role-bound decrypt
+/// alone would miss AND the empty-AAD fallback would also miss → DATA LOSS. Passing the role-less AAD
+/// as a lower rung makes the migration lossless; the file re-binds to the role form on its next seal.
+/// A swapped file (mic ciphertext presented as sys) matches NEITHER rung and fails closed. Fails
+/// closed (`AppError::Locked`) only if NO candidate (and no empty fallback) matches.
+pub fn decrypt_file_multi(
+    key: &[u8; 32],
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    aads: &[&[u8]],
+) -> Result<()> {
+    let blob = std::fs::read(src)
+        .map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
+    for aad in aads {
+        if let Ok(pt) = decrypt(key, &blob, aad) {
+            std::fs::write(dest, &pt)
+                .map_err(|e| AppError::Storage(format!("write decrypted audio: {e}")))?;
+            return Ok(());
+        }
+    }
+    Err(AppError::Locked(
+        "audio decryption failed (wrong key, tampered data, or wrong storage context)".into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +324,59 @@ mod tests {
 
         let _ = std::fs::remove_file(&enc);
         let _ = std::fs::remove_file(&restored);
+    }
+
+    /// Stream-role AAD backward-compat ladder ([`decrypt_file_multi`]): a `.enc` sealed under ANY of
+    /// the three historical/new forms must still decrypt, while a swapped/wrong-context file fails
+    /// closed. The ladder is `[role-bound, role-less]` (each rung also tries empty-AAD internally):
+    ///   - a NEW role-bound master (`…|stream=mic`) decrypts on rung 1;
+    ///   - a LEGACY role-LESS master (`…folder=…`, NON-empty) decrypts on rung 2 (the migration that
+    ///     would otherwise be DATA LOSS);
+    ///   - a PRE-AAD master (empty AAD) decrypts via the empty fallback built into rung 1;
+    ///   - a mic file presented under the SYS ladder fails closed (no rung matches).
+    #[test]
+    fn audio_role_aad_ladder_reads_all_legacy_forms_and_rejects_swaps() {
+        let key = random_key().unwrap();
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+
+        let role_mic: &[u8] = b"murmur:audio:v1|meeting=m|folder=f|stream=mic";
+        let role_sys: &[u8] = b"murmur:audio:v1|meeting=m|folder=f|stream=sys";
+        let role_less: &[u8] = b"murmur:audio:v1|meeting=m|folder=f";
+        // The mic ladder a caller would use: role-bound first, then the role-less legacy form.
+        let mic_ladder: &[&[u8]] = &[role_mic, role_less];
+        let sys_ladder: &[&[u8]] = &[role_sys, role_less];
+
+        let src = temp_path("ladder-src.wav");
+        let enc = temp_path("ladder.wav.enc");
+        let out = temp_path("ladder-out.wav");
+        std::fs::write(&src, &payload).unwrap();
+
+        // (1) NEW role-bound mic master → decrypts on rung 1 of the mic ladder.
+        encrypt_file(&key, &src, &enc, role_mic).unwrap();
+        decrypt_file_multi(&key, &enc, &out, mic_ladder).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), payload, "role-bound master round-trips");
+        // …and a SYS ladder must NOT read a MIC file (swap rejected, fails closed).
+        assert!(
+            decrypt_file_multi(&key, &enc, &out, sys_ladder).is_err(),
+            "a mic master must not decrypt under the sys ladder (no swaps within a meeting)"
+        );
+
+        // (2) LEGACY role-LESS master (sealed before the stream role existed) → rung 2 reads it.
+        encrypt_file(&key, &src, &enc, role_less).unwrap();
+        decrypt_file_multi(&key, &enc, &out, mic_ladder).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), payload, "role-less legacy master still decrypts");
+
+        // (3) PRE-AAD master (empty AAD) → the empty fallback inside rung 1 reads it.
+        encrypt_file(&key, &src, &enc, b"").unwrap();
+        decrypt_file_multi(&key, &enc, &out, mic_ladder).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), payload, "pre-AAD master still decrypts");
+
+        // (4) Wrong KEY fails closed regardless of ladder.
+        assert!(decrypt_file_multi(&random_key().unwrap(), &enc, &out, mic_ladder).is_err());
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&enc);
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Naive subslice search for the leak assertion.
