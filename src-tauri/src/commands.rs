@@ -1794,10 +1794,19 @@ pub async fn unlock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    // Biometric gate (Stage E teeth): require a passing Touch ID / device-owner auth before we
-    // release the KEK and decrypt any sealed note. Gated by K_LOCK_REQUIRE_BIOMETRIC (default on)
-    // so it can be disabled. On hardware/policy unavailability the gate degrades to allow (see
-    // biometric::authenticate), so this never locks out a Mac without Touch ID.
+    // v0.3.2 — the master KEK is now a BIOMETRIC-GATED keychain item. Reading it makes macOS present
+    // the Touch ID / passcode sheet directly (with our reason string) and hand back the key — THAT
+    // single sheet IS the unlock auth. So we no longer call `biometric::authenticate` separately
+    // (that would double-prompt: Touch ID, then a keychain-password dialog). Result: exactly ONE
+    // Touch ID prompt, no "app wants to use keychain, enter password" dialog, no "Always Allow".
+    //
+    // lock_require_biometric (K_LOCK_REQUIRE_BIOMETRIC, default true): this preference is retained
+    // for forward-compat, but NOTE — the protection is now enforced by the keychain item's
+    // kSecAttrAccessControl (an OS-level gate), not by an app-side `if`. An app boolean cannot waive
+    // the OS access control: even with the flag false, reading the gated item still presents the
+    // system sheet. The flag therefore no longer suppresses the OS prompt; it is read only so a
+    // future build could choose to RE-LOCK more eagerly. The honest one-Touch-ID guarantee holds in
+    // the default (true) case, which is the shipped configuration.
     let require_biometric = {
         let cfg = state
             .config
@@ -1805,9 +1814,6 @@ pub async fn unlock_folder(
             .map_err(|_| AppError::Storage("config mutex poisoned".into()))?;
         cfg.lock_require_biometric
     };
-    if require_biometric && !crate::biometric::authenticate("Unlock this folder").await? {
-        return Err(AppError::Auth("biometric authentication failed".into()));
-    }
 
     let folder = state
         .db
@@ -1821,7 +1827,34 @@ pub async fn unlock_folder(
         .folder_wrapped_key(&folder_id)?
         .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
 
-    let kek = crate::secrets::get_or_create_master_kek()?;
+    // Reuse the KEK cached from an earlier unlock in this session so repeated unlocks do NOT
+    // re-prompt for Touch ID (the cache is zeroized on relock-all). Only fall through to the
+    // biometric-gated keychain read — the single Touch ID prompt — when nothing is cached. The
+    // `require_biometric` flag does not gate this read (see the note above); it is referenced so the
+    // value is intentionally consumed and so a future eager-relock path can branch on it.
+    let _ = require_biometric;
+    let kek = {
+        let cached = {
+            let g = state
+                .master_kek
+                .lock()
+                .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+            *g
+        };
+        match cached {
+            Some(k) => k,
+            None => {
+                // The biometric-gated keychain read BLOCKS while the Touch ID sheet is up, so run it
+                // on the blocking pool — never on an async-runtime worker thread (same discipline the
+                // old biometric::authenticate used). This is the single Touch ID prompt.
+                tokio::task::spawn_blocking(|| {
+                    crate::secrets::get_or_create_master_kek_with_reason("Unlock this folder")
+                })
+                .await
+                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))??
+            }
+        }
+    };
     let ck_bytes = crate::crypto::decrypt(&kek, &wrapped)?;
     let ck: [u8; 32] = ck_bytes
         .as_slice()
