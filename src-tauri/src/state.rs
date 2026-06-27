@@ -33,6 +33,16 @@ pub struct AppState {
     /// `Zeroizing` so the bytes are wiped from RAM whenever the cached copy is dropped/replaced (C4),
     /// in addition to the explicit `zeroize()` on relock-all.
     pub master_kek: Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
+    /// BLK-1 coarse LIFECYCLE lock. Serializes the folder-lock state machine
+    /// (`lock_folder` / `unlock_folder` / `relock_folder` / `relock_all_inner` / `remove_lock` /
+    /// the seal half of `move_note`) so two of them can NEVER interleave their multi-step
+    /// restore→clear / blank sequences. Without it, the off-thread `relock_all_inner` (screen-share
+    /// watcher, window-close, app-exit) could blank a note's `markdown` to `''` in the window
+    /// `remove_lock` opens between restoring plaintext (Step 1) and clearing `content_blob`
+    /// (Step 2) → `markdown='' + content_blob=NULL` = PERMANENT, IRREVERSIBLE content loss. It is a
+    /// `Mutex<()>` used purely as a critical-section guard: a poisoned `()` carries no invalid
+    /// state, so acquirers recover via `into_inner()` rather than bricking all future lock ops.
+    pub lifecycle: Mutex<()>,
 }
 
 impl AppState {
@@ -73,6 +83,14 @@ impl AppState {
         let db = Db::open_with_key(db_path, dek)?;
         let config = AppConfig::load(&db)?;
 
+        // SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of every locked
+        // folder. If the app crashed (or was force-quit) WHILE a folder was session-unlocked, the
+        // plaintext markdown/transcript/timeline + a decrypted WAV may still be on disk. Re-blank
+        // those columns (the blobs remain the source of truth) and re-seal any stray plaintext WAV
+        // whose `.enc` already exists, so plaintext never survives a crash into the next session.
+        // Best-effort: a reconciliation error is logged, never fatal to startup.
+        reconcile_locked_at_rest(&db);
+
         tracing::info!(target: "state", "app state initialized");
 
         Ok(Self {
@@ -84,6 +102,7 @@ impl AppState {
             current_meeting: Mutex::new(None),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
+            lifecycle: Mutex::new(()),
         })
     }
 
@@ -95,6 +114,39 @@ impl AppState {
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::Storage(format!("create app-data dir: {e}")))?;
         Ok(dir.join(DB_FILE))
+    }
+}
+
+/// SHOULD-FIX startup reconciliation (filesystem half of [`Db::reblank_locked_folders_at_rest`]).
+/// Re-blanks the locked folders' plaintext columns at the DB level, then re-seals stray plaintext
+/// WAVs on disk: for each locked meeting whose `audio_path` is a PLAINTEXT WAV (not `.enc`) but a
+/// sibling `<wav>.enc` exists, remove the plaintext WAV and re-point `audio_path` at the `.enc`. We
+/// only DROP a plaintext WAV when its encrypted twin is already present (never destroy the only
+/// copy, and never try to ENCRYPT here — there is no content key at startup). Best-effort and
+/// panic-free: every failure is logged, never fatal to launch.
+fn reconcile_locked_at_rest(db: &Db) {
+    let audio = match db.reblank_locked_folders_at_rest() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
+            return;
+        }
+    };
+    const ENC_SUFFIX: &str = ".enc";
+    for (meeting_id, path) in audio {
+        if path.ends_with(ENC_SUFFIX) {
+            continue; // already sealed at rest.
+        }
+        let enc_path = format!("{path}{ENC_SUFFIX}");
+        // Only drop the plaintext WAV if its encrypted twin already exists (the durable copy).
+        if std::path::Path::new(&enc_path).exists() {
+            let _ = std::fs::remove_file(&path);
+            if let Err(e) = db.set_meeting_audio_path(&meeting_id, Some(&enc_path)) {
+                tracing::warn!(target: "state", error = %e, "startup reconciliation: re-point audio_path to .enc failed");
+            } else {
+                tracing::warn!(target: "state", "startup reconciliation: re-sealed a stray plaintext WAV left by a crash while unlocked");
+            }
+        }
     }
 }
 

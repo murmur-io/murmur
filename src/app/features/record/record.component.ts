@@ -172,10 +172,36 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
       }
 
       @if (store.error(); as err) {
-        <div class="banner is-danger" role="alert">
-          <span class="banner-icon" aria-hidden="true">!</span>
-          <span>{{ err }}</span>
-        </div>
+        @if (needsCloudConsent()) {
+          <div class="banner is-accent cloud-consent" role="alert">
+            <span class="banner-icon" aria-hidden="true">☁</span>
+            <div class="cloud-consent-copy">
+              <strong>Cloud processing isn't enabled</strong>
+              <span>
+                {{ providerLabel() }} sends your (redacted) transcript to
+                Anthropic's cloud to write the summary — your data leaves this
+                Mac. Allow it once to finish this note, or switch to Ollama in
+                Settings to stay fully on-device.
+              </span>
+            </div>
+            <div class="cloud-consent-actions">
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="allowCloudAndRetry()"
+                [disabled]="consenting()"
+              >
+                {{ consenting() ? "Enabling…" : "Allow & finish note" }}
+              </button>
+              <a class="btn btn-ghost" routerLink="/settings">Settings</a>
+            </div>
+          </div>
+        } @else {
+          <div class="banner is-danger" role="alert">
+            <span class="banner-icon" aria-hidden="true">!</span>
+            <span>{{ err }}</span>
+          </div>
+        }
       }
 
       <!-- ── Minimal stats strip (home hero — links to full analytics) ────── -->
@@ -256,6 +282,34 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
         display: flex;
         flex-direction: column;
         gap: var(--space-2);
+      }
+
+      /* --- Cloud-egress consent prompt (shown instead of a silent failure) --- */
+      .cloud-consent {
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .cloud-consent-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+        flex: 1 1 14rem;
+        min-width: 0;
+      }
+      .cloud-consent-copy strong {
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+      .cloud-consent-copy span {
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+        line-height: 1.5;
+      }
+      .cloud-consent-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex: none;
       }
       .model-banner-title {
         margin: 0;
@@ -897,6 +951,32 @@ export class RecordComponent implements OnInit {
     return !c || !c.vaultPath || c.vaultPath.trim() === "";
   });
 
+  /**
+   * True when the last failure was the backend's cloud-egress consent gate. We
+   * detect the stable "cloud egress not consented" marker from `make_provider`
+   * and surface a friendly consent prompt instead of the raw error banner —
+   * never a silent failure.
+   */
+  readonly needsCloudConsent = computed(() => {
+    const e = this.store.error();
+    return !!e && /cloud egress not consented/i.test(e);
+  });
+
+  /** Human label for the configured provider (for the consent copy). */
+  readonly providerLabel = computed(() => {
+    switch (this.config()?.providerId) {
+      case "anthropic":
+        return "The Anthropic API";
+      case "claude_code":
+        return "Claude Code";
+      default:
+        return "This provider";
+    }
+  });
+
+  /** True while the one-time consent command + retry are in flight. */
+  readonly consenting = signal(false);
+
   /** Real Whisper-model presence (null = checking). */
   readonly modelPresent = signal<boolean | null>(null);
   readonly downloadingModel = signal(false);
@@ -1076,6 +1156,28 @@ export class RecordComponent implements OnInit {
   /** Summon the floating always-on-top bar (also bound to ⌘⇧R globally). */
   popOut(): void {
     void this.ipc.toggleBar();
+  }
+
+  /**
+   * Grant the one-time cloud-egress consent, then retry summarizing the meeting
+   * that just failed the gate. The transcript is already captured + on disk, so a
+   * `resummarize` finishes the note without re-recording. After consent we refresh
+   * the config snapshot so `providerLabel` / readiness reflect the new state.
+   */
+  async allowCloudAndRetry(): Promise<void> {
+    this.consenting.set(true);
+    try {
+      await this.ipc.consentToCloudEgress();
+      this.config.set(await this.ipc.getConfig());
+      const id = this.store.meetingId();
+      if (id) {
+        await this.store.resummarize(id);
+      }
+    } catch {
+      // The store surfaces a fresh error banner on a failed retry; nothing to do here.
+    } finally {
+      this.consenting.set(false);
+    }
   }
 
   /** Download the Whisper model, then re-check presence. */

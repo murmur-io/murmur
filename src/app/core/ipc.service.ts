@@ -102,6 +102,20 @@ export class IpcService {
     return invoke<void>("save_config", { config });
   }
 
+  /**
+   * E10 — grant the one-time cloud-egress consent. This is the ONLY supported way
+   * to flip `cloudEgressConsented` true: the backend persists the flag AND updates
+   * its in-memory config cache, so the next cloud summarize/chat/brief
+   * (claude_code / anthropic) is allowed to build. Idempotent.
+   *
+   * Until this is called, every cloud provider rejects with
+   * "cloud egress not consented …" — the FE surfaces that as a consent prompt
+   * rather than a silent failure.
+   */
+  consentToCloudEgress(): Promise<void> {
+    return invoke<void>("consent_to_cloud_egress");
+  }
+
   setAnthropicKey(key: string): Promise<void> {
     return invoke<void>("set_anthropic_key", { key });
   }
