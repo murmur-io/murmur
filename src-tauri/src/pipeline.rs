@@ -18,8 +18,9 @@ pub struct PipelineResult {
     pub meeting_id: String,
 }
 
-/// App-data folder + audio subdir for recorded WAVs.
-const APP_DIR: &str = "MeetNotes";
+/// Audio subdir (under the app-data folder) for recorded WAVs. The parent folder name comes from
+/// [`crate::state::app_dir_name`] so dev's recordings live under `MeetNotes-dev`, isolated from the
+/// installed release's `MeetNotes` — the same split as the DB dir.
 const AUDIO_SUBDIR: &str = "audio";
 
 /// RAII guard that deletes a transient sidecar scratch WAV (AEC mic / system-audio) when it
@@ -63,11 +64,11 @@ fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
     }
 }
 
-/// `<app-data>/MeetNotes/audio`, created if absent.
+/// `<app-data>/<app_dir_name()>/audio`, created if absent (`MeetNotes` release, `MeetNotes-dev` dev).
 fn audio_dir() -> Result<PathBuf> {
     let base = dirs::data_dir()
         .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
-    let dir = base.join(APP_DIR).join(AUDIO_SUBDIR);
+    let dir = base.join(crate::state::app_dir_name()).join(AUDIO_SUBDIR);
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Storage(format!("create audio dir: {e}")))?;
     Ok(dir)

@@ -136,8 +136,10 @@ pub fn run() {
             setup_tray(app.handle())?;
             // Localhost MCP server (read-only meeting tools for Claude Desktop/Code; no egress).
             // Share the session unlock set so sealed-and-not-unlocked notes stay invisible.
-            if let Some(db_path) =
-                dirs::data_dir().map(|b| b.join("MeetNotes").join("meetnotes.sqlite"))
+            // Must mirror `AppState::db_path` exactly (same dir + filename) so the MCP server opens
+            // the SAME DB the app did — `app_dir_name()` keeps the dev/release split consistent.
+            if let Some(db_path) = dirs::data_dir()
+                .map(|b| b.join(crate::state::app_dir_name()).join("meetnotes.sqlite"))
             {
                 let state = app.state::<AppState>();
                 let unlocked = state.unlocked_folders.clone();
