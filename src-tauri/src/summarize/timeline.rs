@@ -10,14 +10,18 @@ use crate::summarize::provider::SummarizerProvider;
 use crate::transcribe::types::Segment;
 
 const SYSTEM: &str = "You are an expert meeting analyst. You receive a meeting transcript \
-as timestamped lines `[start-end] text` (seconds). Output STRICT JSON ONLY — no prose, no \
-markdown, no code fences — with EXACTLY this shape:\n\
-{\"speakers\":[{\"speaker\":\"User 1\",\"startS\":0.0,\"endS\":12.5}],\
+as timestamped lines `[start-end] (speaker) text` (seconds). The `(speaker)` tag comes from \
+on-device diarization: `me` is the person recording the meeting; `others`, `others-0`, \
+`others-1`, … are the DISTINCT people on the other side of the call. Output STRICT JSON ONLY — \
+no prose, no markdown, no code fences — with EXACTLY this shape:\n\
+{\"speakers\":[{\"speaker\":\"Speaker 1\",\"startS\":0.0,\"endS\":12.5}],\
 \"topics\":[{\"label\":\"Budget\",\"startS\":0.0,\"endS\":60.0}]}\n\
 Rules:\n\
-- speakers: split the meeting into consecutive, non-overlapping speaker turns in time \
-order, inferred from the conversational flow. If a speaker's real name is clearly stated, \
-use it; otherwise label consistently \"User 1\", \"User 2\", etc. Cover the whole timeline.\n\
+- speakers: use the `(speaker)` TAGS as the source of truth for who is talking. Map `me` to \
+the recording user (their real name if clearly stated), and each distinct `others-N` to a \
+consistent label (a real name if clearly stated in the conversation, else \"Speaker 1\", \
+\"Speaker 2\", …). Build consecutive, non-overlapping turns in time order from the tags; do NOT \
+invent speaker changes the tags don't support. Cover the whole timeline.\n\
 - topics: segment the meeting into 3-8 main topics/threads, each a short 2-4 word label \
 with its start/end span; sequential spans covering the discussion.\n\
 - Use only timestamps from the transcript; the final endS should be near the meeting end.\n\
@@ -32,7 +36,12 @@ pub async fn generate(
 ) -> Result<MeetingTimeline> {
     let transcript: String = segments
         .iter()
-        .map(|s| format!("[{:.1}-{:.1}] {}", s.start_s, s.end_s, s.text.trim()))
+        .map(|s| {
+            // Feed the canonical diarization tag (me / others / others-N) so the LLM-derived
+            // timeline AGREES with the segment speaker labels instead of inventing its own.
+            let who = s.speaker.as_deref().unwrap_or("?");
+            format!("[{:.1}-{:.1}] ({}) {}", s.start_s, s.end_s, who, s.text.trim())
+        })
         .collect::<Vec<_>>()
         .join("\n");
 

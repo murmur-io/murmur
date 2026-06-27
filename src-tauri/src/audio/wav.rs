@@ -40,6 +40,29 @@ pub fn write_wav_16k_mono(path: &Path, samples: &[f32], src_rate: u32) -> Result
     Ok(())
 }
 
+/// Write f32 samples to a 32-bit FLOAT WAV at `sample_rate` WITHOUT resampling — the faithful
+/// per-stream MASTER archive (rec #3). `channels` is the interleave factor (1 = mono). Unlike
+/// `write_wav_16k_mono` this preserves the native rate AND full float precision (no i16 quantize).
+pub fn write_wav_f32(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) -> Result<()> {
+    let spec = WavSpec {
+        channels: channels.max(1),
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path, spec)
+        .map_err(|e| AppError::Audio(format!("failed to create master WAV: {e}")))?;
+    for &s in samples {
+        writer
+            .write_sample(s)
+            .map_err(|e| AppError::Audio(format!("failed to write master sample: {e}")))?;
+    }
+    writer
+        .finalize()
+        .map_err(|e| AppError::Audio(format!("failed to finalize master WAV: {e}")))?;
+    Ok(())
+}
+
 /// Resample mono f32 @ src_rate to 16 kHz mono f32 (in-memory, for Whisper input).
 ///
 /// Whisper expects 16 kHz mono `f32` in [-1.0, 1.0]. If the source is already 16 kHz
@@ -130,6 +153,27 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
+/// In-place loudness normalisation for the 16 kHz ASR FEED ONLY — never the archive master
+/// (rec #6). A single scalar peak gain toward `TARGET_PEAK`, capped at `MAX_GAIN` so a
+/// near-silent buffer isn't amplified into noise, then hard-clamped to [-1, 1]. It only ever
+/// AMPLIFIES quiet audio (never attenuates loud speech) and has no attack/release, so it can't
+/// introduce pumping artefacts that would confuse the decoder.
+pub fn normalize_for_asr(samples: &mut [f32]) {
+    const TARGET_PEAK: f32 = 0.95;
+    const MAX_GAIN: f32 = 8.0;
+    let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak <= 0.0 {
+        return;
+    }
+    let gain = (TARGET_PEAK / peak).min(MAX_GAIN);
+    if gain <= 1.0 {
+        return; // already at/above target — don't touch loud speech
+    }
+    for s in samples.iter_mut() {
+        *s = (*s * gain).clamp(-1.0, 1.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +194,44 @@ mod tests {
     #[test]
     fn zero_rate_is_error() {
         assert!(resample_to_16k(&[0.0], 0).is_err());
+    }
+
+    #[test]
+    fn master_wav_f32_round_trips() {
+        let p = std::env::temp_dir().join(format!("murmur-master-rt-{}.wav", std::process::id()));
+        let samples = vec![0.0f32, 0.5, -0.5, 0.123_456, -0.987_654, 1.0, -1.0];
+        write_wav_f32(&p, &samples, 48_000, 1).unwrap();
+        let (back, rate) = read_wav_mono(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(rate, 48_000);
+        assert_eq!(back.len(), samples.len());
+        for (a, b) in samples.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-6, "master float WAV not faithful: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn normalize_amplifies_quiet_audio_capped() {
+        let mut s = vec![0.1f32, -0.05, 0.1];
+        normalize_for_asr(&mut s);
+        // peak 0.1 → ideal gain 9.5, capped at MAX_GAIN 8.0 → 0.1*8 = 0.8.
+        assert!((s[0] - 0.8).abs() < 1e-5, "got {}", s[0]);
+        assert!((s[1] + 0.4).abs() < 1e-5, "got {}", s[1]);
+    }
+
+    #[test]
+    fn normalize_leaves_loud_audio_untouched() {
+        let mut s = vec![0.98f32, -0.97, 0.5];
+        let orig = s.clone();
+        normalize_for_asr(&mut s);
+        assert_eq!(s, orig, "peak >= target must not change the buffer");
+    }
+
+    #[test]
+    fn normalize_silence_is_noop() {
+        let mut s = vec![0.0f32; 8];
+        normalize_for_asr(&mut s);
+        assert!(s.iter().all(|&v| v == 0.0));
     }
 
     #[test]
