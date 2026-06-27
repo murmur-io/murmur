@@ -90,7 +90,9 @@ export interface StartResult {
 export interface StopResult {
   meetingId: string;
   markdown: string;
-  exportedPath: string;
+  /** Path of the exported Obsidian `.md`, or `null` when no vault is configured (the note is
+   *  still saved to Murmur — the vault is export-only). */
+  exportedPath: string | null;
 }
 
 export type MeetingStatus =

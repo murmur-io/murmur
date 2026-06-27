@@ -23,15 +23,7 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
   host: { "(document:keydown)": "onKey($event)" },
   template: `
     <section class="record">
-      @if (vaultMissing()) {
-        <div class="banner is-warning" role="alert">
-          <span class="banner-icon" aria-hidden="true">!</span>
-          <span>
-            Set your Obsidian <strong>vault folder</strong> in Settings before
-            recording — notes can't be saved without it.
-          </span>
-        </div>
-      } @else if (modelPresent() === false) {
+      @if (modelPresent() === false) {
         <div class="banner is-accent model-banner" role="alert">
           <span class="banner-icon" aria-hidden="true">↓</span>
           <div class="model-banner-body">
@@ -52,14 +44,35 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
             </button>
           </div>
         </div>
+      } @else if (showVaultNotice()) {
+        <!-- Calm, NON-blocking notice: notes are always saved in Murmur (the DB is the
+             canonical store). A vault is optional and export-only — never a recording blocker. -->
+        <div class="banner is-accent vault-notice" role="note">
+          <span class="banner-icon" aria-hidden="true">i</span>
+          <span class="vault-notice-body">
+            No Obsidian vault set — your notes are saved in
+            <strong>Murmur</strong>. Add a vault folder in Settings to also
+            export them as Markdown.
+          </span>
+          <span class="vault-notice-actions">
+            <a class="btn btn-ghost btn-sm" routerLink="/settings">Settings</a>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm"
+              (click)="dismissVaultNotice()"
+            >
+              Dismiss
+            </button>
+          </span>
+        </div>
       }
 
       @if (headphonesHint() && !store.isRecording()) {
         <div class="banner is-accent" role="note">
           <span class="banner-icon" aria-hidden="true">🎧</span>
           <span>
-            Capturing system audio — use <strong>headphones</strong> so the other
-            participants' voices don't echo back into your microphone.
+            Capturing system audio — use <strong>headphones</strong> so the
+            other participants' voices don't echo back into your microphone.
           </span>
         </div>
       }
@@ -292,6 +305,23 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
         display: flex;
         flex-direction: column;
         gap: var(--space-2);
+      }
+
+      /* --- Calm "no vault" info notice (non-blocking, dismissible) --- */
+      .vault-notice {
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .vault-notice-body {
+        flex: 1 1 14rem;
+        min-width: 0;
+      }
+      .vault-notice-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex: none;
+        margin-left: auto;
       }
 
       /* --- Cloud-egress consent prompt (shown instead of a silent failure) --- */
@@ -960,11 +990,26 @@ export class RecordComponent implements OnInit {
     () => this.config()?.captureSystemAudio ?? false,
   );
 
-  /** A vault folder is mandatory — export fails without it, so block recording. */
+  /**
+   * True when no Obsidian vault folder is configured. The vault is EXPORT-ONLY — every note
+   * is always saved to Murmur's canonical DB — so this NO LONGER blocks recording. It only
+   * drives the calm, dismissible "set a vault to also export" info notice + the "done" hint copy.
+   */
   readonly vaultMissing = computed(() => {
     const c = this.config();
     return !c || !c.vaultPath || c.vaultPath.trim() === "";
   });
+
+  /** Dismissed for this session — the no-vault info notice stays hidden once closed. */
+  private readonly vaultNoticeDismissed = signal(false);
+
+  /**
+   * Show the calm, non-blocking "no vault set" info notice: only when no vault is configured
+   * and the user hasn't dismissed it this session. It never gates recording.
+   */
+  readonly showVaultNotice = computed(
+    () => this.vaultMissing() && !this.vaultNoticeDismissed(),
+  );
 
   /**
    * True when the last failure was the backend's cloud-egress consent gate. We
@@ -1002,10 +1047,13 @@ export class RecordComponent implements OnInit {
     () => this.store.isBusy() && !this.store.isRecording(),
   );
 
-  /** Whether the Record action is allowed right now. */
+  /**
+   * Whether the Record action is allowed right now. A missing vault does NOT block recording
+   * (the note is always saved to Murmur; the vault is export-only) — only a missing/downloading
+   * model or an in-flight pipeline gates it.
+   */
   readonly canRecord = computed(
     () =>
-      !this.vaultMissing() &&
       this.modelPresent() !== false &&
       !this.downloadingModel() &&
       !this.store.isBusy(),
@@ -1063,10 +1111,11 @@ export class RecordComponent implements OnInit {
       return "Recording — press ⌘R or Stop when done.";
     }
     if (this.isProcessing()) return "Transcribing on-device, then summarizing…";
-    if (this.vaultMissing()) return "Set a vault folder in Settings to start.";
     if (this.modelPresent() === false) return "Download the model to start.";
     if (this.store.stage() === "done")
-      return "Saved ✓ — your note is in the vault.";
+      return this.vaultMissing()
+        ? "Saved ✓ — your note is in Murmur."
+        : "Saved ✓ — your note is in the vault.";
     return "On-device transcription · your audio never leaves this Mac.";
   });
 
@@ -1154,6 +1203,11 @@ export class RecordComponent implements OnInit {
   /** Prep-card dismiss — hide it for the rest of this session. */
   dismissBrief(): void {
     this.briefDismissed.set(true);
+  }
+
+  /** No-vault info-notice dismiss — hide it for the rest of this session. */
+  dismissVaultNotice(): void {
+    this.vaultNoticeDismissed.set(true);
   }
 
   /** ⌘R / Ctrl+R toggles recording. */

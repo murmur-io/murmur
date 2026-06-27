@@ -33,7 +33,9 @@ pub struct StartResult {
 pub struct StopResult {
     pub meeting_id: String,
     pub markdown: String,
-    pub exported_path: String,
+    /// Path of the exported Obsidian `.md`, or `None` when no vault is configured (the note
+    /// is still saved to the DB — the vault is export-only).
+    pub exported_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,7 +340,9 @@ pub async fn stop_recording(
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
-        exported_path: result.exported_path.to_string_lossy().to_string(),
+        exported_path: result
+            .exported_path
+            .map(|p| p.to_string_lossy().to_string()),
     })
 }
 
@@ -1576,7 +1580,9 @@ pub async fn resummarize(
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
-        exported_path: result.exported_path.to_string_lossy().to_string(),
+        exported_path: result
+            .exported_path
+            .map(|p| p.to_string_lossy().to_string()),
     })
 }
 
