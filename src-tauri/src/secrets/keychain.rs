@@ -20,6 +20,11 @@ pub const ACCOUNT_MASTER_KEK: &str = "murmur_master_kek";
 /// Keychain account holding the optional MCP bearer token.
 pub const ACCOUNT_MCP_TOKEN: &str = "murmur_mcp_token";
 
+/// Keychain account holding the Anthropic API key (mirrors `summarize::ANTHROPIC_KEY_ACCOUNT` and
+/// the `commands` constant). Named here so the data-protection routing recognizes it as a known
+/// fixed account (no per-call string leak in [`leak_account`]).
+pub const ACCOUNT_ANTHROPIC_KEY: &str = "anthropic_api_key";
+
 /// Default reason string shown on the Touch ID / passcode sheet when releasing the master KEK.
 /// Callers may override per call-site (e.g. "Unlock this folder").
 pub const KEK_DEFAULT_REASON: &str = "Unlock this folder";
@@ -46,8 +51,11 @@ pub fn get_or_create_db_dek() -> Result<String> {
     if let Some(dek) = get_secret(ACCOUNT_DB_DEK)? {
         return Ok(dek);
     }
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
+    // Mint a fresh DEK. Zeroize the raw byte buffer once the hex form is derived (the hex is the
+    // returned secret — the caller is responsible for its lifetime, e.g. wrapping in Zeroizing at
+    // the PRAGMA-key site in db.rs/migration.rs, C6).
+    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(&mut *bytes)
         .map_err(|e| AppError::Secrets(format!("RNG failed generating DEK: {e}")))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     set_secret(ACCOUNT_DB_DEK, &hex)?;
@@ -249,6 +257,11 @@ mod sec_consts {
     extern "C" {
         pub static kSecMatchLimitOne: CFStringRef;
         pub static kSecUseOperationPrompt: CFStringRef;
+        // The `kSecAttrAccessible` DICTIONARY KEY is not re-exported by security-framework-sys
+        // (only the value constants live in its `access_control` module). It is a stable Apple
+        // symbol — declare it here so the non-gated data-protection writes can pin accessibility to
+        // `WhenUnlockedThisDeviceOnly`.
+        pub static kSecAttrAccessible: CFStringRef;
     }
 
     // Stable Apple `OSStatus` codes the -sys crate (2.17) does not export. Values from
@@ -259,51 +272,56 @@ mod sec_consts {
     pub const ERR_SEC_INTERACTION_NOT_ALLOWED: OSStatus = -25308;
 }
 
+/// Build the base query dictionary identifying a data-protection-keychain generic-password item:
+/// `{ class: GenericPassword, service: SERVICE, account, kSecUseDataProtectionKeychain: true }`.
+/// Callers extend it with class-specific keys (return-data, access-control, value, …).
+///
+/// CRITICAL — `kSecUseDataProtectionKeychain = true` is MANDATORY on every SecItem call routed
+/// through here. For the KEK it is required because `kSecAttrAccessControl` (the user-presence gate)
+/// is supported ONLY by the macOS data-protection keychain; the legacy FILE-BASED keychain rejects
+/// it with `errSecParam` (-50). For the NON-gated secrets (DEK / MCP token / Anthropic key, A2/A3/A4/
+/// A9) it is what moves them OFF the legacy file-based keychain and onto the modern, non-syncable,
+/// `WhenUnlockedThisDeviceOnly` data-protection store (Apple DTS: "it talks to the data protection
+/// keychain if you supply kSecUseDataProtectionKeychain or kSecAttrSynchronizable; if not, it talks
+/// to the file-based keychain"). Pinning it keeps every op for an account consistently on the
+/// data-protection keychain. The legacy items read/deleted via the `keyring` crate live in the
+/// file-based keychain — a SEPARATE store — so there is no primary-key collision during migration.
+#[cfg(target_os = "macos")]
+fn dp_base_query(account: &str) -> core_foundation::dictionary::CFMutableDictionary {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFMutableDictionary;
+    use core_foundation::string::CFString;
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword,
+        kSecUseDataProtectionKeychain,
+    };
+
+    let service = CFString::new(SERVICE);
+    let account = CFString::new(account);
+    let mut q = CFMutableDictionary::new();
+    unsafe {
+        q.add(
+            &(kSecClass as *const _),
+            &(kSecClassGenericPassword as *const _),
+        );
+        q.add(&(kSecAttrService as *const _), &service.as_CFTypeRef());
+        q.add(&(kSecAttrAccount as *const _), &account.as_CFTypeRef());
+        // Target the data-protection keychain (required for kSecAttrAccessControl + to move the
+        // non-gated secrets off the file-based keychain, see above).
+        q.add(
+            &(kSecUseDataProtectionKeychain as *const _),
+            &CFBoolean::true_value().as_CFTypeRef(),
+        );
+    }
+    q
+}
+
 #[cfg(target_os = "macos")]
 impl MacKekStore {
-    /// Build the base query dictionary identifying the master-KEK item:
-    /// `{ class: GenericPassword, service: SERVICE, account: ACCOUNT_MASTER_KEK,
-    ///    kSecUseDataProtectionKeychain: true }`.
-    /// Callers extend it with class-specific keys (return-data, access-control, value, …).
-    ///
-    /// CRITICAL — `kSecUseDataProtectionKeychain = true` is MANDATORY on every SecItem call here.
-    /// `kSecAttrAccessControl` (the user-presence gate) is supported ONLY by the macOS data-
-    /// protection keychain; the legacy FILE-BASED keychain rejects it with `errSecParam` (-50).
-    /// Without this flag, `SecItemAdd` defaults to the file-based keychain (Apple DTS: "it talks to
-    /// the data protection keychain if you supply kSecUseDataProtectionKeychain or
-    /// kSecAttrSynchronizable; if not, it talks to the file-based keychain"), so `write_biometric`
-    /// would fail to ever create the gated item and `biometric_exists`/`read_biometric`/
-    /// `delete_biometric` would query the wrong store. Pinning it in `base_query` keeps all four ops
-    /// consistently on the data-protection keychain. (The legacy PLAIN item read/deleted via the
-    /// `keyring` crate lives in the file-based keychain — a SEPARATE store — so there is no
-    /// primary-key collision between the plain and gated items during migration.)
+    /// The master-KEK item's base query (data-protection keychain, account = [`ACCOUNT_MASTER_KEK`]).
     fn base_query(&self) -> core_foundation::dictionary::CFMutableDictionary {
-        use core_foundation::base::TCFType;
-        use core_foundation::boolean::CFBoolean;
-        use core_foundation::dictionary::CFMutableDictionary;
-        use core_foundation::string::CFString;
-        use security_framework_sys::item::{
-            kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword,
-            kSecUseDataProtectionKeychain,
-        };
-
-        let service = CFString::new(SERVICE);
-        let account = CFString::new(ACCOUNT_MASTER_KEK);
-        let mut q = CFMutableDictionary::new();
-        unsafe {
-            q.add(
-                &(kSecClass as *const _),
-                &(kSecClassGenericPassword as *const _),
-            );
-            q.add(&(kSecAttrService as *const _), &service.as_CFTypeRef());
-            q.add(&(kSecAttrAccount as *const _), &account.as_CFTypeRef());
-            // Target the data-protection keychain (required for kSecAttrAccessControl, see above).
-            q.add(
-                &(kSecUseDataProtectionKeychain as *const _),
-                &CFBoolean::true_value().as_CFTypeRef(),
-            );
-        }
-        q
+        dp_base_query(ACCOUNT_MASTER_KEK)
     }
 }
 
@@ -350,10 +368,12 @@ impl KekStore for MacKekStore {
         }
     }
 
-    /// Read the legacy PLAIN item via the `keyring` crate (the exact account the old code wrote).
-    /// Never prompts for biometry — it is a plain generic password. `Ok(None)` if absent.
+    /// Read the legacy PLAIN item via the `keyring` crate (the exact account+store the old code
+    /// wrote — the FILE-BASED keychain). MUST bypass the new data-protection routing in `get_secret`
+    /// (the legacy KEK lives in the file-based store, and the gated KEK is read via `read_biometric`,
+    /// never as a plain string). Never prompts. `Ok(None)` if absent.
     fn read_plain(&self) -> Result<Option<[u8; 32]>> {
-        match get_secret(ACCOUNT_MASTER_KEK)? {
+        match legacy_get_secret(ACCOUNT_MASTER_KEK)? {
             Some(hex) => match hex_to_key32(&hex) {
                 Some(k) => Ok(Some(k)),
                 None => Err(AppError::Secrets("legacy plain master KEK is malformed".into())),
@@ -490,9 +510,10 @@ impl KekStore for MacKekStore {
         Ok(k)
     }
 
-    /// Delete the legacy PLAIN item via the `keyring` crate (idempotent; absence is not an error).
+    /// Delete the legacy PLAIN item via the `keyring` crate (FILE-BASED store; idempotent; absence
+    /// is not an error). Bypasses the new DP routing for the same reason as `read_plain`.
     fn delete_plain(&self) -> Result<()> {
-        delete_secret(ACCOUNT_MASTER_KEK)
+        legacy_delete_secret(ACCOUNT_MASTER_KEK)
     }
 }
 
@@ -526,6 +547,215 @@ fn map_osstatus(ctx: &str, status: core_foundation::base::OSStatus) -> AppError 
     AppError::Secrets(format!("{ctx}: OSStatus {status}"))
 }
 
+// ───────────────────── shared data-protection store for NON-gated string secrets (A2/A3/A4/A9) ────
+//
+// The DEK, MCP token, and Anthropic key are STRING secrets that need NO biometric ACL (the DEK is
+// read on every cold start; gating it would prompt Touch ID at launch). They were previously stored
+// via the `keyring` crate, which lands them in the LEGACY FILE-BASED keychain. This moves them onto
+// the SAME data-protection keychain backend the KEK already uses — `SecItemAdd`/`CopyMatching`/
+// `Delete` with `kSecUseDataProtectionKeychain=true` + `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
+// (non-syncable, this-device-only) — but WITHOUT a `kSecAttrAccessControl` (so no prompt). A
+// one-time, value-preserving migration reads any legacy keyring item, re-stores the identical string
+// in the data-protection keychain, then deletes the legacy item. Delete-before-add on every write.
+
+/// Trait seam over the data-protection STRING ops so the value-preserving migration can be unit-
+/// tested against an in-memory fake (no live keychain). Mirrors the [`KekStore`] seam but for the
+/// non-gated string accounts and with no biometric read.
+#[allow(dead_code)] // some methods are exercised only on macOS / in tests.
+trait DpStringStore {
+    /// Read the data-protection item's string value (never prompts). `Ok(None)` if absent.
+    fn read_dp(&self) -> Result<Option<String>>;
+    /// Create/replace the data-protection item (delete-before-add).
+    fn write_dp(&self, secret: &str) -> Result<()>;
+    /// Delete the data-protection item (idempotent).
+    fn delete_dp(&self) -> Result<()>;
+    /// Read the legacy file-based (keyring) item's value (never prompts). `Ok(None)` if absent.
+    fn read_legacy(&self) -> Result<Option<String>>;
+    /// Delete the legacy file-based (keyring) item (idempotent).
+    fn delete_legacy(&self) -> Result<()>;
+}
+
+/// Resolve a string secret, migrating a legacy keyring item to the data-protection keychain ONCE,
+/// value-preservingly. Steady state (already in DP): a single `read_dp`. First run with a legacy
+/// item: read it, write the SAME string to DP, CONFIRM BY VALUE (read DP back, assert equal) BEFORE
+/// deleting the legacy item — so a crash mid-migration never loses the secret. Neither present ⇒
+/// `Ok(None)` (caller mints a fresh one and `set_secret`s it).
+fn migrate_or_read_dp<S: DpStringStore>(store: &S) -> Result<Option<String>> {
+    // Fast path: already on the data-protection keychain.
+    if let Some(v) = store.read_dp()? {
+        // Opportunistically drop a leftover legacy item ONLY when its value matches (crash between
+        // DP-write and legacy-delete on a prior run). Never a blind delete.
+        if let Some(legacy) = store.read_legacy()? {
+            if bool::from(ct_eq_str(&legacy, &v)) {
+                store.delete_legacy()?;
+            } else {
+                tracing::warn!(
+                    target: "secrets",
+                    "leftover legacy keychain item differs from the data-protection one — leaving it"
+                );
+            }
+        }
+        return Ok(Some(v));
+    }
+
+    // Not in DP yet — is there a legacy keyring item to migrate?
+    match store.read_legacy()? {
+        Some(legacy) => {
+            store.write_dp(&legacy)?;
+            // Confirm by value BEFORE deleting the legacy copy.
+            let confirm = store
+                .read_dp()?
+                .ok_or_else(|| AppError::Secrets("data-protection write did not persist".into()))?;
+            if !bool::from(ct_eq_str(&confirm, &legacy)) {
+                return Err(AppError::Secrets(
+                    "keychain migration value mismatch — keeping the legacy item, retry next launch"
+                        .into(),
+                ));
+            }
+            store.delete_legacy()?;
+            tracing::info!(
+                target: "secrets",
+                "migrated a secret to the data-protection keychain (value preserved)"
+            );
+            Ok(Some(confirm))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Constant-time string comparison for secret values (uses `subtle`). Equal-length required; a
+/// length difference short-circuits to "not equal" (lengths are not secret here).
+fn ct_eq_str(a: &str, b: &str) -> subtle::Choice {
+    use subtle::ConstantTimeEq;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return subtle::Choice::from(0u8);
+    }
+    a.ct_eq(b)
+}
+
+/// macOS data-protection backend for a single non-gated string account.
+#[cfg(target_os = "macos")]
+struct MacDpStore {
+    account: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+impl DpStringStore for MacDpStore {
+    fn read_dp(&self) -> Result<Option<String>> {
+        use core_foundation::base::{CFType, TCFType};
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::data::CFData;
+        use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
+        use security_framework_sys::item::{kSecMatchLimit, kSecReturnData};
+        use security_framework_sys::keychain_item::SecItemCopyMatching;
+
+        let mut q = dp_base_query(self.account);
+        unsafe {
+            q.add(
+                &(kSecReturnData as *const _),
+                &CFBoolean::true_value().as_CFTypeRef(),
+            );
+            q.add(
+                &(kSecMatchLimit as *const _),
+                &(sec_consts::kSecMatchLimitOne as *const _),
+            );
+        }
+        let dict = q.to_immutable();
+        let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out) };
+        if status == errSecItemNotFound {
+            if !out.is_null() {
+                unsafe { drop(CFType::wrap_under_create_rule(out)) };
+            }
+            return Ok(None);
+        }
+        if status != errSecSuccess {
+            if !out.is_null() {
+                unsafe { drop(CFType::wrap_under_create_rule(out)) };
+            }
+            return Err(map_osstatus("read data-protection secret", status));
+        }
+        if out.is_null() {
+            return Err(AppError::Secrets(
+                "data-protection read returned success but no data".into(),
+            ));
+        }
+        let data = unsafe { CFData::wrap_under_create_rule(out as *const _) };
+        let s = String::from_utf8(data.bytes().to_vec())
+            .map_err(|_| AppError::Secrets("data-protection secret is not valid UTF-8".into()))?;
+        Ok(Some(s))
+    }
+
+    fn write_dp(&self, secret: &str) -> Result<()> {
+        use core_foundation::base::TCFType;
+        use core_foundation::data::CFData;
+        use security_framework_sys::access_control::kSecAttrAccessibleWhenUnlockedThisDeviceOnly;
+        use security_framework_sys::base::{errSecDuplicateItem, errSecSuccess};
+        use security_framework_sys::item::kSecValueData;
+        use security_framework_sys::keychain_item::SecItemAdd;
+
+        // Delete-before-add so the value is always a clean replace (idempotent write).
+        self.delete_dp()?;
+
+        let data = CFData::from_buffer(secret.as_bytes());
+        let add = || -> i32 {
+            let mut q = dp_base_query(self.account);
+            unsafe {
+                // Accessibility: unlocked, THIS device only, non-syncable (no iCloud Keychain).
+                q.add(
+                    &(sec_consts::kSecAttrAccessible as *const _),
+                    &(kSecAttrAccessibleWhenUnlockedThisDeviceOnly as *const _),
+                );
+                q.add(&(kSecValueData as *const _), &data.as_CFTypeRef());
+            }
+            let dict = q.to_immutable();
+            let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+            let s = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), &mut out) };
+            if !out.is_null() {
+                unsafe { drop(core_foundation::base::CFType::wrap_under_create_rule(out)) };
+            }
+            s
+        };
+        let status = add();
+        if status == errSecSuccess {
+            return Ok(());
+        }
+        if status == errSecDuplicateItem {
+            // Lost a race with another writer — delete + retry once.
+            self.delete_dp()?;
+            let s2 = add();
+            if s2 == errSecSuccess {
+                return Ok(());
+            }
+            return Err(map_osstatus("add data-protection secret (after replace)", s2));
+        }
+        Err(map_osstatus("add data-protection secret", status))
+    }
+
+    fn delete_dp(&self) -> Result<()> {
+        use core_foundation::base::TCFType;
+        use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
+        use security_framework_sys::keychain_item::SecItemDelete;
+
+        let dict = dp_base_query(self.account).to_immutable();
+        let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
+        if status == errSecSuccess || status == errSecItemNotFound {
+            Ok(())
+        } else {
+            Err(map_osstatus("delete data-protection secret", status))
+        }
+    }
+
+    fn read_legacy(&self) -> Result<Option<String>> {
+        legacy_get_secret(self.account)
+    }
+
+    fn delete_legacy(&self) -> Result<()> {
+        legacy_delete_secret(self.account)
+    }
+}
+
 /// Return the MCP bearer token (a random 64-char hex string), minting + persisting it in the
 /// Keychain on first use. Used to gate MCP `tools/call` when `K_MCP_REQUIRE_TOKEN` is on.
 pub fn get_or_create_mcp_token() -> Result<String> {
@@ -534,8 +764,8 @@ pub fn get_or_create_mcp_token() -> Result<String> {
             return Ok(tok);
         }
     }
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
+    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(&mut *bytes)
         .map_err(|e| AppError::Secrets(format!("RNG failed generating MCP token: {e}")))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     set_secret(ACCOUNT_MCP_TOKEN, &hex)?;
@@ -577,15 +807,89 @@ fn classify(ctx: impl std::fmt::Display, e: KeyringError) -> AppError {
     }
 }
 
-/// Store/replace a secret in the macOS Keychain.
+// ─────────────────────────── public string-secret API (DP-backed on macOS) ───────────────────────
+//
+// A2/A3/A4/A9: on macOS the DEK / MCP token / Anthropic key now live in the SAME data-protection
+// keychain backend as the KEK (no biometric ACL). `get_secret` migrates any legacy keyring item to
+// the data-protection keychain on first read; `set_secret`/`delete_secret` write/delete the DP item
+// AND clear any legacy item so the two stores never diverge. Off macOS (CI/dev) the keyring crate is
+// the only backend.
+
+/// Store/replace a secret. On macOS: writes the data-protection keychain item (delete-before-add,
+/// `WhenUnlockedThisDeviceOnly`, non-syncable) and clears any legacy file-based item so reads can't
+/// resurrect a stale value. Off macOS: the keyring crate.
 pub fn set_secret(account: &str, secret: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let store = MacDpStore { account: leak_account(account) };
+        store.write_dp(secret)?;
+        // Drop any legacy file-based copy so a future get_secret can't see the old value.
+        let _ = store.delete_legacy();
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        legacy_set_secret(account, secret)
+    }
+}
+
+/// Read a secret. `Ok(None)` if absent. On macOS this also performs the one-time, value-preserving
+/// migration of a legacy keyring item into the data-protection keychain.
+pub fn get_secret(account: &str) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let store = MacDpStore { account: leak_account(account) };
+        return migrate_or_read_dp(&store);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        legacy_get_secret(account)
+    }
+}
+
+/// Delete a secret (idempotent). On macOS removes BOTH the data-protection item and any legacy
+/// file-based item.
+pub fn delete_secret(account: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let store = MacDpStore { account: leak_account(account) };
+        store.delete_dp()?;
+        let _ = store.delete_legacy();
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        legacy_delete_secret(account)
+    }
+}
+
+/// `MacDpStore` holds a `&'static str` account (so it is cheap to construct per call). All callers
+/// pass one of the fixed `ACCOUNT_*` constants or the Anthropic-key constant defined in `commands` /
+/// `summarize`, which are all `&'static`. To accept an arbitrary `&str` at the public boundary we
+/// match it to its known static; an unknown account is leaked once (bounded — accounts come from a
+/// small fixed set of string literals, never user input).
+#[cfg(target_os = "macos")]
+fn leak_account(account: &str) -> &'static str {
+    match account {
+        ACCOUNT_DB_DEK => ACCOUNT_DB_DEK,
+        ACCOUNT_MASTER_KEK => ACCOUNT_MASTER_KEK,
+        ACCOUNT_MCP_TOKEN => ACCOUNT_MCP_TOKEN,
+        ACCOUNT_ANTHROPIC_KEY => ACCOUNT_ANTHROPIC_KEY,
+        other => Box::leak(other.to_string().into_boxed_str()),
+    }
+}
+
+/// Store/replace a secret in the LEGACY file-based macOS Keychain (keyring crate). Only used on the
+/// non-macOS (CI/dev) path; on macOS writes go straight to the data-protection keychain.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn legacy_set_secret(account: &str, secret: &str) -> Result<()> {
     entry(account)?
         .set_password(secret)
         .map_err(|e| classify("set secret", e))
 }
 
-/// Read a secret from the Keychain. `Ok(None)` if no entry exists (not an error).
-pub fn get_secret(account: &str) -> Result<Option<String>> {
+/// Read a secret from the LEGACY file-based Keychain. `Ok(None)` if no entry exists.
+fn legacy_get_secret(account: &str) -> Result<Option<String>> {
     match entry(account)?.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(KeyringError::NoEntry) => Ok(None),
@@ -593,8 +897,8 @@ pub fn get_secret(account: &str) -> Result<Option<String>> {
     }
 }
 
-/// Delete a secret. `Ok(())` if it was already absent (idempotent).
-pub fn delete_secret(account: &str) -> Result<()> {
+/// Delete a LEGACY file-based secret. `Ok(())` if it was already absent (idempotent).
+fn legacy_delete_secret(account: &str) -> Result<()> {
     match entry(account)?.delete_credential() {
         Ok(()) => Ok(()),
         Err(KeyringError::NoEntry) => Ok(()),
@@ -839,16 +1143,16 @@ mod tests {
     /// plain KEK must still unwrap after migration, because the migrated KEK bytes are identical.
     #[test]
     fn wrapped_folder_ck_round_trips_with_preserved_kek() {
-        // 1. Pre-migration: a folder CK wrapped under the legacy plain KEK.
+        // 1. Pre-migration: a folder CK wrapped under the legacy plain KEK, bound to the folder id.
         let ck = crate::crypto::random_key().unwrap();
-        let wrapped = crate::crypto::encrypt(&KEK, &ck).unwrap();
+        let wrapped = crate::crypto::encrypt(&KEK, &ck, b"folder-123").unwrap();
 
         // 2. Migrate the plain KEK to the biometric item (value preserved).
         let store = FakeStore::new(Some(KEK), None);
         let migrated_kek = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
 
         // 3. Post-migration: unwrap the SAME wrapped key with the migrated KEK → original CK back.
-        let unwrapped = crate::crypto::decrypt(&migrated_kek, &wrapped).unwrap();
+        let unwrapped = crate::crypto::decrypt(&migrated_kek, &wrapped, b"folder-123").unwrap();
         assert_eq!(
             unwrapped.as_slice(),
             ck.as_slice(),
@@ -856,9 +1160,126 @@ mod tests {
         );
 
         // 4. And content encrypted under that CK still decrypts (full chain intact).
-        let blob = crate::crypto::encrypt(&ck, b"secret note markdown").unwrap();
+        let blob = crate::crypto::encrypt(&ck, b"secret note markdown", b"folder-123|m1").unwrap();
         let ck32: [u8; 32] = unwrapped.as_slice().try_into().unwrap();
-        let pt = crate::crypto::decrypt(&ck32, &blob).unwrap();
+        let pt = crate::crypto::decrypt(&ck32, &blob, b"folder-123|m1").unwrap();
         assert_eq!(pt, b"secret note markdown");
+    }
+
+    // ── A2/A3/A4/A9 data-protection STRING-secret migration value-preservation ───────────────────
+    //
+    // The DEK / MCP token / Anthropic key migration (`migrate_or_read_dp`) is exercised here against
+    // an in-memory fake (a live keychain can't run headlessly). We assert the SAME safety property
+    // as the KEK migration: the legacy value is re-stored in the data-protection store byte-for-byte
+    // and the legacy item is deleted ONLY AFTER a value-confirmed DP copy exists.
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum DpOp {
+        ReadDp,
+        WriteDp(String),
+        DeleteDp,
+        ReadLegacy,
+        DeleteLegacy,
+    }
+
+    struct FakeDp {
+        dp: RefCell<Option<String>>,
+        legacy: RefCell<Option<String>>,
+        log: RefCell<Vec<DpOp>>,
+    }
+    impl FakeDp {
+        fn new(dp: Option<&str>, legacy: Option<&str>) -> Self {
+            Self {
+                dp: RefCell::new(dp.map(str::to_string)),
+                legacy: RefCell::new(legacy.map(str::to_string)),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+        fn log(&self) -> Vec<DpOp> {
+            self.log.borrow().clone()
+        }
+    }
+    impl DpStringStore for FakeDp {
+        fn read_dp(&self) -> Result<Option<String>> {
+            self.log.borrow_mut().push(DpOp::ReadDp);
+            Ok(self.dp.borrow().clone())
+        }
+        fn write_dp(&self, secret: &str) -> Result<()> {
+            self.log.borrow_mut().push(DpOp::WriteDp(secret.to_string()));
+            *self.dp.borrow_mut() = Some(secret.to_string());
+            Ok(())
+        }
+        fn delete_dp(&self) -> Result<()> {
+            self.log.borrow_mut().push(DpOp::DeleteDp);
+            *self.dp.borrow_mut() = None;
+            Ok(())
+        }
+        fn read_legacy(&self) -> Result<Option<String>> {
+            self.log.borrow_mut().push(DpOp::ReadLegacy);
+            Ok(self.legacy.borrow().clone())
+        }
+        fn delete_legacy(&self) -> Result<()> {
+            self.log.borrow_mut().push(DpOp::DeleteLegacy);
+            *self.legacy.borrow_mut() = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dp_migration_preserves_value_and_deletes_legacy_only_after_confirm() {
+        let secret = "anthropic-sk-deadbeef-test-value";
+        let store = FakeDp::new(None, Some(secret));
+        let out = migrate_or_read_dp(&store).unwrap();
+
+        assert_eq!(out.as_deref(), Some(secret), "migrated value must be byte-identical");
+        assert_eq!(*store.dp.borrow(), Some(secret.to_string()), "DP item now holds the value");
+        assert_eq!(*store.legacy.borrow(), None, "legacy item removed after migration");
+
+        // Order proof: write DP → confirm-read DP → THEN delete legacy.
+        let log = store.log();
+        let wrote = log.iter().position(|o| matches!(o, DpOp::WriteDp(_))).unwrap();
+        let confirmed = log
+            .iter()
+            .enumerate()
+            .skip(wrote + 1)
+            .find(|(_, o)| **o == DpOp::ReadDp)
+            .map(|(i, _)| i)
+            .expect("a confirming DP read must follow the write");
+        let deleted = log.iter().position(|o| *o == DpOp::DeleteLegacy).unwrap();
+        assert!(wrote < confirmed && confirmed < deleted, "write→confirm→delete order (got {log:?})");
+        assert!(log.contains(&DpOp::WriteDp(secret.to_string())), "DP write uses the legacy bytes verbatim");
+    }
+
+    #[test]
+    fn dp_steady_state_is_a_single_read_and_keeps_no_legacy() {
+        // Already migrated: only a DP read; no legacy present.
+        let store = FakeDp::new(Some("mcp-token-xyz"), None);
+        let out = migrate_or_read_dp(&store).unwrap();
+        assert_eq!(out.as_deref(), Some("mcp-token-xyz"));
+        assert!(!store.log().contains(&DpOp::DeleteLegacy), "no legacy → no delete");
+        assert!(!store.log().iter().any(|o| matches!(o, DpOp::WriteDp(_))), "steady state writes nothing");
+    }
+
+    #[test]
+    fn dp_absent_everywhere_returns_none() {
+        let store = FakeDp::new(None, None);
+        assert_eq!(migrate_or_read_dp(&store).unwrap(), None, "no item anywhere → None (caller mints fresh)");
+    }
+
+    #[test]
+    fn dp_value_equal_legacy_leftover_is_cleaned_but_differing_is_kept() {
+        // Crash recovery: DP written, legacy not yet deleted, values equal → cleaned.
+        let store = FakeDp::new(Some("k"), Some("k"));
+        migrate_or_read_dp(&store).unwrap();
+        assert_eq!(*store.legacy.borrow(), None, "value-equal legacy leftover removed");
+
+        // Differing legacy is LEFT IN PLACE (never a blind destroy).
+        let store2 = FakeDp::new(Some("dp-value"), Some("legacy-DIFFERENT"));
+        migrate_or_read_dp(&store2).unwrap();
+        assert_eq!(
+            *store2.legacy.borrow(),
+            Some("legacy-DIFFERENT".to_string()),
+            "a differing legacy item is left untouched"
+        );
     }
 }
