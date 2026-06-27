@@ -56,7 +56,8 @@ echo "2) Codesigning INSIDE-OUT (nested helpers first, app last — NO --deep)�
 # with hardened runtime + timestamp, THEN seal the app bundle last.
 for HELPER in \
   "$APP/Contents/Resources/meetnotes-sysaudio" \
-  "$APP/Contents/Resources/meetnotes-audiocap"; do
+  "$APP/Contents/Resources/meetnotes-audiocap" \
+  "$APP/Contents/Resources/meetnotes-aeccap"; do
   if [ -f "$HELPER" ]; then
     echo "   • helper: $(basename "$HELPER")"
     codesign --force --options runtime --timestamp \

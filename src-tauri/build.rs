@@ -18,6 +18,14 @@ fn main() {
         "14.4",
         &["AVFoundation", "CoreAudio", "Foundation"],
     );
+    // VPIO AEC mic helper (echo cancellation; macOS 10.15+, app floor 13.4) — the AEC ASR feed.
+    build_swift_helper(
+        "aeccap/aeccap.swift",
+        "meetnotes-aeccap",
+        "AECCAP_BIN",
+        "13.4",
+        &["AVFoundation", "Foundation"],
+    );
     tauri_build::build();
 }
 

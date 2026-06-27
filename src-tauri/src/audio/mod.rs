@@ -1,3 +1,4 @@
+pub mod aec;
 pub mod listener;
 pub mod merge;
 pub mod mixer;

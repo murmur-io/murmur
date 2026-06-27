@@ -10,3 +10,4 @@
 # Build artifact: universal sidecar staged by build.rs for bundle.resources
 /src-tauri/binaries/meetnotes-sysaudio
 /src-tauri/binaries/meetnotes-audiocap
+/src-tauri/binaries/meetnotes-aeccap

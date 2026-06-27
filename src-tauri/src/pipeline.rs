@@ -61,6 +61,7 @@ pub async fn run_after_stop(
     src_rate: u32,
     duration_s: i64,
     system_wav: Option<PathBuf>,
+    aec_mic_wav: Option<PathBuf>,
     mic_started_at: std::time::Instant,
     system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
@@ -72,6 +73,7 @@ pub async fn run_after_stop(
         src_rate,
         duration_s,
         system_wav,
+        aec_mic_wav,
         mic_started_at,
         system_started_at,
     )
@@ -136,6 +138,7 @@ async fn run_inner(
     src_rate: u32,
     duration_s: i64,
     system_wav: Option<PathBuf>,
+    aec_mic_wav: Option<PathBuf>,
     mic_started_at: std::time::Instant,
     system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
@@ -160,6 +163,22 @@ async fn run_inner(
     // or ScreenCaptureKit permission denied → sidecar produced no WAV), we fall back to the
     // mic-only single pass (today's behaviour, everything attributed "me").
     let mut mic_16k = audio::resample_to_16k(&samples, src_rate)?;
+    // AEC'd mic for the ASR feed (rec #5): when the VPIO helper produced a WAV, transcribe THAT and
+    // keep the RAW cpal mic for the archive (`mic_16k_archive`); otherwise archive == ASR (today).
+    // `mem::replace` avoids cloning the (large) mic buffer in the common no-AEC path.
+    let mut mic_16k_archive: Option<Vec<f32>> = None;
+    if let Some(aec) = &aec_mic_wav {
+        match audio::read_wav_mono(aec) {
+            Ok((a, rate)) => {
+                let _ = std::fs::remove_file(aec); // transient helper output
+                let asr = audio::resample_to_16k(&a, rate)?;
+                mic_16k_archive = Some(std::mem::replace(&mut mic_16k, asr));
+            }
+            Err(e) => {
+                tracing::warn!(target: "audio", error = %e, "AEC mic unreadable; raw mic for ASR")
+            }
+        }
+    }
     // Native system audio (pre-resample) — kept ONLY for the optional hi-res master.
     let mut sys_native: Option<(Vec<f32>, u32)> = None;
     let mut sys_16k: Option<Vec<f32>> = match &system_wav {
@@ -181,12 +200,14 @@ async fn run_inner(
     };
 
     // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
+    // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed.
+    let archive_src = mic_16k_archive.as_ref().unwrap_or(&mic_16k);
     let archive_16k = match &sys_16k {
         Some(sys) => {
             tracing::info!(target: "audio", "archiving mixed mic + system-audio track");
-            audio::mix(&mic_16k, sys)
+            audio::mix(archive_src, sys)
         }
-        None => mic_16k.clone(),
+        None => archive_src.clone(),
     };
     let wav_dir = audio_dir()?;
     let wav_path = wav_dir.join(format!("{meeting_id}.wav"));
