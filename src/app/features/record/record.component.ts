@@ -14,12 +14,18 @@ import { IpcService } from "../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../core/models";
 import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
+import { AssistantActionsComponent } from "./assistant-actions.component";
 
 @Component({
   selector: "app-record",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, PreMeetingBriefComponent, MicMuteToggleComponent],
+  imports: [
+    RouterLink,
+    PreMeetingBriefComponent,
+    MicMuteToggleComponent,
+    AssistantActionsComponent,
+  ],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
     <section class="record">
@@ -192,6 +198,11 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
             }
           </p>
         </div>
+      }
+
+      <!-- ── In-meeting voice assistant — recent actions (Phase H) ────────── -->
+      @if (showAssistant()) {
+        <app-assistant-actions />
       }
 
       @if (store.error(); as err) {
@@ -989,6 +1000,17 @@ export class RecordComponent implements OnInit {
   readonly headphonesHint = computed(
     () => this.config()?.captureSystemAudio ?? false,
   );
+
+  /**
+   * Show the in-meeting voice-assistant card (Phase H): only when the user has
+   * enabled "realtime reactions" AND the brain backend isn't off. The card
+   * itself subscribes to the wake/result streams regardless of recording state
+   * (a wake can land any time the listener is active).
+   */
+  readonly showAssistant = computed(() => {
+    const c = this.config();
+    return !!c && c.realtimeReactions === true && c.brainBackend !== "off";
+  });
 
   /**
    * True when no Obsidian vault folder is configured. The vault is EXPORT-ONLY — every note
