@@ -98,6 +98,12 @@ impl VoiceActionResult {
 ///
 /// `unlocked` is the LIVE session unlock set (so Research/Recall see exactly what the session can
 /// see); `meeting_id` is the in-progress recording (for `NoteAside`).
+///
+/// `literal_command` is the user's OWN dictated words (the raw heard command), used ONLY for
+/// Research/Recall RETRIEVAL so the vault FTS keys off the user's actual language (e.g. Polish
+/// "pogoda"), NOT a brain-translated/normalized topic that the exact-term FTS would miss. The brain
+/// topic is still used for SYNTHESIS + as an additional retrieval leg; the literal terms are the
+/// must-have. Empty/whitespace falls back to the intent topic alone.
 pub fn handle_voice_action(
     intent: &VoiceIntent,
     reasoner: &dyn LocalReasoner,
@@ -105,13 +111,14 @@ pub fn handle_voice_action(
     unlocked: &HashSet<String>,
     config: &AppConfig,
     meeting_id: &str,
+    literal_command: &str,
 ) -> VoiceActionResult {
     match intent {
         VoiceIntent::Research { topic } => {
-            rag_answer("research", topic, reasoner, db, unlocked, config)
+            rag_answer("research", topic, literal_command, reasoner, db, unlocked, config)
         }
         VoiceIntent::Recall { entity } => {
-            rag_answer("recall", entity, reasoner, db, unlocked, config)
+            rag_answer("recall", entity, literal_command, reasoner, db, unlocked, config)
         }
         VoiceIntent::CreateReminder { text, due } => {
             let text = text.trim();
@@ -211,31 +218,80 @@ pub fn interpret_with_brain(reasoner: &dyn LocalReasoner, command: &str) -> Opti
     }
 }
 
+/// Build the set of RETRIEVAL queries for a Research/Recall, must-have-first:
+///
+/// 1. The user's LITERAL salient terms (`salient_query` over their raw dictated command) — the
+///    cross-lingual fix: the vault FTS is EXACT-TERM, so a Polish note ("pogoda") only matches when
+///    we search the user's ACTUAL Polish words, NOT a brain-translated English topic
+///    ("yesterday's weather"). This is the must-have leg.
+/// 2. The brain/parser `topic` (which may be normalized/translated) — kept as an ADDITIONAL leg so a
+///    well-formed topic still helps, but never at the expense of the literal terms.
+///
+/// De-duped, first-seen order (literal terms first). Both legs feed the SAME gated
+/// `execute_tool`/`search_visible` — no new read path. An empty result is dropped.
+fn retrieval_queries(topic: &str, literal_command: &str) -> Vec<String> {
+    let mut queries: Vec<String> = Vec::new();
+    let mut push = |q: String| {
+        let q = q.trim().to_string();
+        if !q.is_empty() && !queries.contains(&q) {
+            queries.push(q);
+        }
+    };
+    // MUST-HAVE: the user's literal salient terms (their own language/words).
+    push(crate::summarize::related_context::salient_query(None, literal_command));
+    // ADDITIONAL: the brain/parser topic verbatim, and its salient terms.
+    push(topic.to_string());
+    push(crate::summarize::related_context::salient_query(None, topic));
+    queries
+}
+
 /// Local-first RAG over the user's OWN gated vault (NOT a web search): run the gated read tools for
 /// the topic/entity, feed ONLY the gated results to the brain, return a brief cited answer.
+///
+/// RETRIEVAL keys off the user's LITERAL terms first (see [`retrieval_queries`]) so same-language
+/// recall works (Polish query ↔ Polish note); the brain `topic` is still used for the answer
+/// SYNTHESIS prompt.
 fn rag_answer(
     intent_kind: &str,
-    query: &str,
+    topic: &str,
+    literal_command: &str,
     reasoner: &dyn LocalReasoner,
     db: &Db,
     unlocked: &HashSet<String>,
     config: &AppConfig,
 ) -> VoiceActionResult {
-    let query = query.trim();
-    if query.is_empty() {
+    let topic = topic.trim();
+    if topic.is_empty() && literal_command.trim().is_empty() {
         return VoiceActionResult::new(intent_kind, "error", "No topic to look up.");
     }
+    // The queries we RETRIEVE with — literal user terms first, brain topic added. The `topic` is
+    // still what we hand the brain for SYNTHESIS below.
+    let queries = retrieval_queries(topic, literal_command);
+    // A coherent display query for the "couldn't find" / "found notes about" lines: prefer the brain
+    // topic (human-readable), else the first literal query.
+    let display_query = if !topic.is_empty() {
+        topic.to_string()
+    } else {
+        queries.first().cloned().unwrap_or_default()
+    };
 
     // GATE: every tool below routes through visibility_clause over the live `unlocked` set.
     // SemanticSearch is itself gated behind `config.semantic_search_enabled` inside `execute_tool`
     // (it returns a "disabled" string when off, never an ungated read). For `recall` we also pull
-    // the entity dossier; for `research` we add open commitments for grounding.
-    let mut tool_calls: Vec<ToolCall> = vec![
-        ToolCall::SearchMeetings { query: query.to_string() },
-        ToolCall::SearchSemantic { query: query.to_string() },
-    ];
+    // the entity dossier; for `research` we add open commitments for grounding. Each retrieval query
+    // (literal terms + brain topic) gets its own gated FTS + semantic leg; the gated results are
+    // UNIONED into the grounding below.
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    for q in &queries {
+        tool_calls.push(ToolCall::SearchMeetings { query: q.clone() });
+        tool_calls.push(ToolCall::SearchSemantic { query: q.clone() });
+    }
     if intent_kind == "recall" {
-        tool_calls.push(ToolCall::GetEntityDossier { entity: query.to_string() });
+        // The dossier resolves an ENTITY by name — use the literal terms first (most likely the
+        // user's actual entity word), then the brain topic.
+        for q in &queries {
+            tool_calls.push(ToolCall::GetEntityDossier { entity: q.clone() });
+        }
     }
 
     let mut grounding = String::new();
@@ -270,17 +326,22 @@ fn rag_answer(
             citations.push(c);
         }
     };
-    match db.search_visible(query, 8, unlocked) {
-        Ok(hits) => {
-            for h in &hits {
-                if let Some(t) = h.meeting.title.as_deref().map(str::trim).filter(|t| !t.is_empty())
-                {
-                    push_cite(format!("[[{t}]]"));
+    // Cite over EVERY retrieval query (literal terms + brain topic) so a hit found via the user's
+    // literal Polish terms is still cited even when the brain topic missed.
+    for q in &queries {
+        match db.search_visible(q, 8, unlocked) {
+            Ok(hits) => {
+                for h in &hits {
+                    if let Some(t) =
+                        h.meeting.title.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                    {
+                        push_cite(format!("[[{t}]]"));
+                    }
                 }
             }
-        }
-        Err(e) => {
-            tracing::debug!(target: "voice", error = %e, "voice-action citation search failed");
+            Err(e) => {
+                tracing::debug!(target: "voice", error = %e, "voice-action citation search failed");
+            }
         }
     }
     for c in extract_citations(grounding) {
@@ -292,7 +353,7 @@ fn rag_answer(
         return VoiceActionResult::new(
             intent_kind,
             "ok",
-            format!("I couldn't find anything in your vault about \"{query}\"."),
+            format!("I couldn't find anything in your vault about \"{display_query}\"."),
         );
     }
 
@@ -300,7 +361,7 @@ fn rag_answer(
                   sentences) using ONLY the provided notes from the user's own meeting vault. Cite \
                   the meetings you used by their [[Title]] wikilink. If the notes don't cover it, \
                   say so plainly. Do not invent facts.";
-    let user = format!("Request: {query}\n\nNotes from the vault:\n{grounding}");
+    let user = format!("Request: {display_query}\n\nNotes from the vault:\n{grounding}");
 
     // EGRESS SEAM: a Cloud reasoner routes through make_provider (consent gate + RedactingProvider).
     // A no-consent refusal comes back as AppError::Unavailable → graceful "needs consent", no leak.
@@ -308,7 +369,7 @@ fn rag_answer(
         Ok(answer) => {
             let answer = answer.trim();
             let summary = if answer.is_empty() {
-                format!("Found notes about \"{query}\" in your vault.")
+                format!("Found notes about \"{display_query}\" in your vault.")
             } else {
                 answer.to_string()
             };
@@ -583,6 +644,7 @@ mod tests {
             &empty_unlocked(),
             &cfg,
             "live-mtg",
+            "",
         );
 
         assert_eq!(res.intent_kind, "research");
@@ -620,6 +682,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live-mtg",
+            "",
         );
         assert_eq!(res.intent_kind, "recall");
         assert_eq!(res.status, "ok");
@@ -639,6 +702,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live-mtg",
+            "",
         );
         assert_eq!(res.status, "ok");
         assert!(res.summary.contains("couldn't find"));
@@ -669,6 +733,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live1",
+            "",
         );
         assert_eq!(res.intent_kind, "note_aside");
         assert_eq!(res.status, "ok");
@@ -690,6 +755,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "sealed1",
+            "",
         );
         assert_eq!(res.status, "error");
         assert!(db.list_note_asides("sealed1").unwrap().is_empty(), "no aside written to a sealed meeting");
@@ -706,6 +772,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live1",
+            "",
         );
         assert_eq!(res.intent_kind, "slack_search");
         assert_eq!(res.status, "unavailable");
@@ -722,6 +789,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live1",
+            "",
         );
         assert_eq!(res.status, "unrecognized");
         assert!(!res.summary.contains("secret-thing"), "raw command must not be echoed back");
@@ -740,6 +808,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live1",
+            "",
         );
         assert_eq!(res.status, "error");
         assert!(!res.summary.contains("boom internal detail"), "internal error detail must not leak");
@@ -759,6 +828,7 @@ mod tests {
             &empty_unlocked(),
             &AppConfig::default(),
             "live1",
+            "",
         );
         assert_eq!(res.status, "needs_consent");
         // Gated citations are still useful even when the brain can't run.
@@ -831,5 +901,111 @@ mod tests {
         let text = "- A ([id:1]) — x [[One]]\n- B — y [[Two]]\nagain [[One]]";
         let cites = extract_citations(text);
         assert_eq!(cites, vec!["[[One]]".to_string(), "[[Two]]".to_string()]);
+    }
+
+    // ── FIX 1: cross-lingual RETRIEVAL uses the user's LITERAL terms, not the brain topic ─────────
+
+    #[test]
+    fn retrieval_queries_uses_literal_terms_first() {
+        // The user's literal Polish words drive retrieval; the salient term "pogoda" survives (the
+        // stopword "jaka"/"byla" are dropped). The brain-translated English topic is an ADDITIONAL
+        // leg, never a replacement.
+        let qs = retrieval_queries("yesterday's weather", "jaka była pogoda");
+        let joined = qs.join(" | ");
+        assert!(
+            qs.iter().any(|q| q.contains("pogoda")),
+            "literal Polish term 'pogoda' MUST be a retrieval query; got: {joined}"
+        );
+        // The literal-terms leg comes FIRST (must-have).
+        assert!(
+            qs[0].contains("pogoda"),
+            "the literal salient terms must be the FIRST retrieval query; got: {joined}"
+        );
+        // The brain topic is still present as an additional leg.
+        assert!(
+            qs.iter().any(|q| q.contains("weather")),
+            "the brain topic should still be an additional retrieval leg; got: {joined}"
+        );
+    }
+
+    /// THE BUG, end-to-end: a Polish note ("pogoda") seeded into the vault, a Research dispatched
+    /// with the brain's ENGLISH-translated topic ("yesterday's weather") but the user's LITERAL
+    /// Polish command "jaka była pogoda". With the literal-terms retrieval the note is FOUND; with
+    /// ONLY the translated topic (literal command empty) it MISSES — proving the fix is load-bearing.
+    #[test]
+    fn research_uses_literal_polish_terms_not_translation() {
+        let db = tmp_db();
+        // A Polish weather note — exact-term FTS only matches the Polish word "pogoda".
+        db.insert_meeting(&Meeting {
+            id: "pl1".into(),
+            started_at: "2026-06-27T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Notatka o pogodzie".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "pl1".into(),
+            provider_id: "claude_code".into(),
+            markdown: "Dzisiaj pogoda była słoneczna i ciepła, bez deszczu.".into(),
+            created_at: "2026-06-27T09:05:00Z".into(),
+            exported_path: None,
+        })
+        .unwrap();
+
+        let reasoner = MockReasoner::new("Pogoda była słoneczna; zobacz [[Notatka o pogodzie]].");
+        let cfg = AppConfig::default();
+
+        // WITH the literal Polish command → the Polish note is FOUND, brain is called, cited.
+        let res = handle_voice_action(
+            &VoiceIntent::Research { topic: "yesterday's weather".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &cfg,
+            "live-mtg",
+            "jaka była pogoda",
+        );
+        assert_eq!(res.status, "ok");
+        assert!(
+            res.citations.contains(&"[[Notatka o pogodzie]]".to_string()),
+            "the Polish note must be cited when retrieval uses the literal Polish terms"
+        );
+        let grounding = reasoner
+            .last_user
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("brain MUST be called — the Polish note was found via the literal terms");
+        assert!(
+            grounding.contains("pogoda"),
+            "the found Polish note must be in the brain grounding"
+        );
+
+        // CONTROL: the SAME English-translated topic with NO literal command misses the Polish note
+        // entirely (the exact-term FTS can't match "weather" against "pogoda") → no grounding, no
+        // brain call. This is the bug the user hit.
+        let reasoner2 = MockReasoner::new("SHOULD-NOT-BE-CALLED");
+        let res2 = handle_voice_action(
+            &VoiceIntent::Research { topic: "yesterday's weather".into() },
+            &reasoner2,
+            &db,
+            &empty_unlocked(),
+            &cfg,
+            "live-mtg",
+            "",
+        );
+        assert_eq!(res2.status, "ok");
+        assert!(
+            res2.summary.contains("couldn't find"),
+            "the English-only topic must MISS the Polish note (the demonstrated bug)"
+        );
+        assert!(
+            reasoner2.last_user.lock().unwrap().is_none(),
+            "no grounding ⇒ no brain call on the translated-only path"
+        );
     }
 }
