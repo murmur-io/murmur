@@ -1208,6 +1208,42 @@ pub async fn ask_vault(
     Ok(AskVaultResult { answer, sources })
 }
 
+/// Entity DOSSIER (brain2 Phase 5b): synthesize the "state of [[entity]]" across all meetings —
+/// Overview · 🕑 Timeline of mentions · ⏳ Open commitments · 🧭 Last said / next step, every claim
+/// citing its [[Title]]. `entity` is an entity id (from `get_graph`) OR a name. The dossier data is
+/// assembled through the SAME visibility gate as Ask-My-Vault (sealed-not-unlocked meetings
+/// contribute nothing), then synthesized by the configured provider — so this is a CLOUD-egress
+/// path that goes through the redaction firewall + consent gate (E6/E7/E10) exactly like `ask_vault`.
+#[tauri::command]
+pub async fn entity_dossier(
+    state: State<'_, AppState>,
+    entity: String,
+) -> Result<String, AppError> {
+    if entity.trim().is_empty() {
+        return Err(AppError::InvalidArg("entity is empty".into()));
+    }
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
+    // again; sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let entity_id = crate::summarize::dossier::resolve_entity_id(&state.db, &entity, &unlocked)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching \"{entity}\"")))?;
+    let data = crate::summarize::dossier::build_dossier_data(&state.db, &entity_id, &unlocked)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching \"{entity}\"")))?;
+    // Build the provider (firewall + consent gate) BEFORE synthesizing — make_provider refuses a
+    // cloud provider until the user has consented to egress.
+    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let system = crate::summarize::dossier::dossier_system_prompt(&config.note_language);
+    let user = crate::summarize::dossier::render_dossier_user(&data, &config.provider_id);
+    provider.complete(&system, &user).await
+}
+
 /// Generate a Weekly Vault Digest synthesizing meetings from the last `days` days; writes it
 /// into the vault's Digests/ folder and returns the markdown + path.
 #[tauri::command]
