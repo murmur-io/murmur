@@ -65,6 +65,16 @@ pub struct AppConfigDto {
     pub whisper_model_path: Option<String>,
     pub language: Option<String>,
     pub anthropic_model: String,
+    /// Brain/AI MODEL override for the active cloud provider. Settable from the DTO (the Settings
+    /// UI owns the picker), like `anthropic_model` — a plain string, NOT preserve-only. Empty `""`
+    /// = provider default. An omitted key deserializes to `""` (`#[serde(default)]`).
+    #[serde(default)]
+    pub provider_model: String,
+    /// Brain/AI reasoning EFFORT (`""`/`low`/`medium`/`high`). Settable from the DTO. Honored ONLY
+    /// by the direct `anthropic` provider (adaptive thinking); the `claude_code` CLI ignores it.
+    /// An omitted key deserializes to `""` (`#[serde(default)]`).
+    #[serde(default)]
+    pub provider_effort: String,
     pub ollama_base_url: String,
     pub ollama_model: String,
     pub claude_binary: String,
@@ -1813,6 +1823,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         whisper_model_path: c.whisper_model_path.clone(),
         language: c.language.clone(),
         anthropic_model: c.anthropic_model.clone(),
+        provider_model: c.provider_model.clone(),
+        provider_effort: c.provider_effort.clone(),
         ollama_base_url: c.ollama_base_url.clone(),
         ollama_model: c.ollama_model.clone(),
         claude_binary: c.claude_binary.clone(),
@@ -1858,6 +1870,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         whisper_model_path: norm(d.whisper_model_path),
         language: norm(d.language),
         anthropic_model: d.anthropic_model,
+        // Brain/AI model + effort ARE settable from the DTO (the Settings UI owns the pickers),
+        // exactly like `anthropic_model` — plain strings, NOT preserve-only. `""` = provider default.
+        provider_model: d.provider_model,
+        provider_effort: d.provider_effort,
         ollama_base_url: d.ollama_base_url,
         ollama_model: d.ollama_model,
         claude_binary: d.claude_binary,
@@ -5045,6 +5061,49 @@ mod lifecycle_tests {
             !dto_to_config(dto_off, &current_on).semantic_search_enabled,
             "semantic_search_enabled MUST be settable from the DTO (turn off)"
         );
+    }
+
+    /// Brain/AI picker: `provider_model` + `provider_effort` round-trip through the settings DTO
+    /// BOTH ways. OUT: `config_to_dto` carries the live values so the FE pickers reflect them. IN:
+    /// `dto_to_config` TAKES them from the DTO (settable — like `anthropic_model`, NOT preserve-only),
+    /// proven by starting from a different `current` so the merged value can only have come from the DTO.
+    #[test]
+    fn dto_round_trips_provider_model_and_effort_both_ways() {
+        // OUT.
+        let cfg = AppConfig {
+            provider_model: "claude-sonnet-4-6".to_string(),
+            provider_effort: "high".to_string(),
+            ..AppConfig::default()
+        };
+        let dto = config_to_dto(&cfg);
+        assert_eq!(dto.provider_model, "claude-sonnet-4-6");
+        assert_eq!(dto.provider_effort, "high");
+
+        // IN (set): DTO values over a DIFFERENT current ⇒ merged values come from the DTO.
+        let mut dto_in = config_to_dto(&AppConfig::default());
+        dto_in.provider_model = "claude-haiku-4-5".to_string();
+        dto_in.provider_effort = "low".to_string();
+        let current = AppConfig {
+            provider_model: "claude-opus-4-8".to_string(),
+            provider_effort: "medium".to_string(),
+            ..AppConfig::default()
+        };
+        let merged = dto_to_config(dto_in, &current);
+        assert_eq!(merged.provider_model, "claude-haiku-4-5");
+        assert_eq!(merged.provider_effort, "low");
+
+        // IN (clear to provider default): DTO="" over current set ⇒ merged "" (settable both ways).
+        let mut dto_clear = config_to_dto(&AppConfig::default());
+        dto_clear.provider_model = String::new();
+        dto_clear.provider_effort = String::new();
+        let current2 = AppConfig {
+            provider_model: "claude-opus-4-8".to_string(),
+            provider_effort: "high".to_string(),
+            ..AppConfig::default()
+        };
+        let merged2 = dto_to_config(dto_clear, &current2);
+        assert_eq!(merged2.provider_model, "");
+        assert_eq!(merged2.provider_effort, "");
     }
 
     /// Phase H graceful degradation: a DTO carrying an UNKNOWN `brain_model_id` must NOT be stored —
