@@ -238,8 +238,48 @@ fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
                 status = %result.status,
                 "voice action dispatched"
             );
+            // PERSIST the interaction against the CURRENT recording (best-effort + panic-free): the
+            // wake-path command lives in the intent's literal words. A persist failure NEVER disrupts
+            // the dispatch — it is logged (non-PII) and dropped.
+            persist_interaction(&state, &meeting_id, &literal, &result);
             let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
         });
+}
+
+/// Persist one dispatched voice interaction against the CURRENT recording meeting — best-effort +
+/// PANIC-FREE so a persist failure can NEVER disrupt recording/dispatch. Skips when there is no
+/// active recording (`meeting_id` empty). `command` is the user's own dictated words (the heard
+/// command for the manual path, the intent's literal words for the wake path). The `summary`/
+/// `citations`/`status`/`intent_kind` come straight off the dispatch result. Derived convenience
+/// data: it is PURGED on seal (it mirrors sealed content), never surfaced for a sealed meeting.
+fn persist_interaction(
+    state: &AppState,
+    meeting_id: &str,
+    command: &str,
+    result: &crate::voice_action::VoiceActionResult,
+) {
+    if meeting_id.is_empty() {
+        return; // no active recording → nothing to attach the interaction to.
+    }
+    let created_at = chrono::Utc::now().to_rfc3339();
+    match state.db.insert_assistant_interaction(
+        meeting_id,
+        command,
+        &result.summary,
+        &result.citations,
+        &result.status,
+        Some(result.intent_kind.as_str()),
+        &created_at,
+    ) {
+        Ok(_) => {}
+        // PII rule: log only that a persist failed + the coarse status — never the command/answer.
+        Err(e) => tracing::debug!(
+            target: "voice",
+            error = %e,
+            status = %result.status,
+            "persisting assistant interaction failed; continuing"
+        ),
+    }
 }
 
 /// Resolve a NON-EMPTY heard `command` to an intent (keyword → brain → fallback) and dispatch it
@@ -291,6 +331,10 @@ fn spawn_command_dispatch(app: AppHandle, command: String) {
                 status = %result.status,
                 "manual voice command dispatched"
             );
+            // PERSIST the interaction against the CURRENT recording (best-effort + panic-free): the
+            // manual-path command is the user's HEARD dictation. A persist failure NEVER disrupts the
+            // dispatch — it is logged (non-PII) and dropped.
+            persist_interaction(&state, &meeting_id, &command, &result);
             let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
         });
 }

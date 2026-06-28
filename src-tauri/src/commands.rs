@@ -172,6 +172,11 @@ pub struct MeetingDetailDto {
     pub meeting: Meeting,
     pub note: Option<NoteDto>,
     pub segments: Vec<Segment>,
+    /// In-meeting voice-assistant interactions (the persisted Q&A: the user's spoken command + the
+    /// assistant's answer + citations). EMPTY when the meeting is locked-and-not-session-unlocked
+    /// (gated by `meeting_is_unlocked`, exactly like `note`/`segments`) — and also empty for a sealed
+    /// meeting at rest because the rows were PURGED on seal (purge-on-seal, like the correction-log).
+    pub assistant_interactions: Vec<crate::storage::models::AssistantInteraction>,
     /// Phase 0.5 — `true` when the meeting's folder is sealed AND not session-unlocked. The FE
     /// renders a locked state (Touch-ID-to-unlock) instead of content; `note`/`segments` are
     /// empty in that case (the content is encrypted at rest, decrypted only on session-unlock).
@@ -2103,10 +2108,22 @@ pub fn get_meeting_detail(
             exported_path: n.exported_path,
         });
     let segments = state.db.get_segments(&meeting_id)?;
+    // GATED read: only past the `meeting_is_unlocked` gate above do we surface the persisted
+    // assistant Q&A. The DB read is ALSO `visibility_clause`-gated (it returns empty for a sealed-
+    // not-unlocked meeting) — defense-in-depth, double-gated exactly like the rest of the DTO.
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let assistant_interactions = state
+        .db
+        .list_assistant_interactions_visible(&meeting_id, &unlocked)?;
     Ok(Some(MeetingDetailDto {
         meeting,
         note,
         segments,
+        assistant_interactions,
         locked: false,
     }))
 }
@@ -2127,6 +2144,9 @@ fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
         },
         note: None,
         segments: Vec::new(),
+        // The Q&A log is masked too — a sealed-not-unlocked meeting surfaces NOTHING here (and at
+        // rest the rows were purged on seal anyway).
+        assistant_interactions: Vec::new(),
         locked: true,
     }
 }
