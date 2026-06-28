@@ -279,6 +279,12 @@ impl Db {
         // pattern) — NULL for legacy rows transcribed before dual-stream, which read back as
         // `speaker: None` (unattributed). NOT per-remote-person diarization; see types::Segment.
         Self::add_column_if_missing(&conn, "segments", "speaker", "TEXT")?;
+        // Phase F0 LOCK-SAFETY: link each correction-log example to the meeting it derived from, so
+        // the gated reader can join meetings→folders for a visibility check and the seal/delete paths
+        // can purge a sealed meeting's rows. Guarded ALTER (idempotent); NULL for legacy/unattributed
+        // rows, which the gated `list_corrections` treats as NOT visible (fail-closed). `folder_id` is
+        // DERIVED via the meetings/notes join, never stored.
+        Self::add_column_if_missing(&conn, "correction_log", "meeting_id", "TEXT")?;
         // Phase 0.5 — full per-folder lock (defense-in-depth beyond SQLCipher-at-rest):
         // sealed-folder transcripts + timelines carry an AES-GCM blob under the folder CK while
         // sealed; the plaintext `text`/`data` column is blanked. Reversed on session-unlock.
@@ -497,8 +503,8 @@ impl Db {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO correction_log
-               (kind, input, model_output, final_output, accepted, owner_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (kind, input, model_output, final_output, accepted, owner_id, created_at, meeting_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 rec.kind,
                 rec.input,
@@ -507,24 +513,43 @@ impl Db {
                 rec.accepted as i64,
                 rec.owner_id,
                 rec.created_at,
+                rec.meeting_id,
             ],
         )
         .map_err(map_err)?;
         Ok(conn.last_insert_rowid())
     }
 
-    /// Read back the most-recent `limit` correction examples of `kind`, newest first.
-    pub fn list_corrections(&self, kind: &str, limit: i64) -> Result<Vec<CorrectionRecord>> {
+    /// GATED read-back of the most-recent `limit` correction examples of `kind`, newest first. This
+    /// is an EXPORT-SHAPED reader over sealed-content-derived data, so it is visibility-gated exactly
+    /// like `search_visible`: a row is returned ONLY when its `meeting_id` is non-NULL AND that
+    /// meeting has at least one VISIBLE note (folder open/NULL OR session-unlocked, via
+    /// `visibility_clause`). A correction for a sealed-and-not-unlocked meeting — and any row with a
+    /// NULL `meeting_id` (legacy/unattributed) — is EXCLUDED (fail-closed). The seal/delete paths also
+    /// purge a meeting's rows, so this is defense-in-depth on top of that.
+    pub fn list_corrections(
+        &self,
+        kind: &str,
+        limit: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<CorrectionRecord>> {
         let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, kind, input, model_output, final_output, accepted, owner_id, created_at
-                   FROM correction_log
-                  WHERE kind = ?1
-                  ORDER BY created_at DESC, id DESC
-                  LIMIT ?2",
-            )
-            .map_err(map_err)?;
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT cl.id, cl.kind, cl.input, cl.model_output, cl.final_output, cl.accepted,
+                    cl.owner_id, cl.created_at, cl.meeting_id
+               FROM correction_log cl
+              WHERE cl.kind = ?1
+                AND cl.meeting_id IS NOT NULL
+                AND EXISTS (
+                      SELECT 1 FROM notes n
+                       LEFT JOIN folders f ON f.id = n.folder_id
+                       WHERE n.meeting_id = cl.meeting_id AND {visible}
+                    )
+              ORDER BY cl.created_at DESC, cl.id DESC
+              LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![kind, limit], |row| {
                 Ok(CorrectionRecord {
@@ -536,6 +561,7 @@ impl Db {
                     accepted: row.get::<_, i64>(5)? != 0,
                     owner_id: row.get(6)?,
                     created_at: row.get(7)?,
+                    meeting_id: row.get(8)?,
                 })
             })
             .map_err(map_err)?;
@@ -616,6 +642,9 @@ impl Db {
         // `vec_chunks` — without this the deleted meeting's (invertible) embeddings would persist
         // orphaned at rest, and a future rowid reuse could PK-conflict on the stale chunk_id.
         Self::purge_chunks_tx(&tx, &[id.to_string()])?;
+        // Phase F0: drop this meeting's correction-log rows too (same tx) — a deleted meeting leaves
+        // no plaintext-derived training data behind.
+        Self::purge_corrections_tx(&tx, &[id.to_string()])?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
@@ -828,6 +857,9 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_chunks_tx(&tx, meeting_ids)?;
+        // Phase F0: the seal-into-locked callers (lock_folder, move-into-locked) also drop the
+        // sealed meetings' correction-log rows in the SAME tx — a sealed meeting feeds no flywheel.
+        Self::purge_corrections_tx(&tx, meeting_ids)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -846,6 +878,25 @@ impl Db {
             .map_err(map_err)?;
             tx.execute(
                 "DELETE FROM note_chunks WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Phase F0 LOCK-SAFETY: delete every `correction_log` row for `meeting_ids` within an EXISTING
+    /// transaction, so the purge lands in the SAME atomic unit as the plaintext blanking on a seal
+    /// (and on `delete_meeting`). The flywheel is plaintext-derived training data; a sealed meeting
+    /// must contribute NOTHING to it. This is INTENTIONAL and privacy-first: sealed meetings are
+    /// simply not used for fine-tuning, and the data is not recoverable from the blob (it was never
+    /// keyed) — so we delete rather than seal. Note: this is deliberately NOT folded into
+    /// `purge_chunks_tx`, because that helper also runs on the (non-seal) re-index "clean replace"
+    /// path where corrections must survive.
+    fn purge_corrections_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM correction_log WHERE meeting_id = ?1",
                 rusqlite::params![mid],
             )
             .map_err(map_err)?;
@@ -1767,6 +1818,10 @@ impl Db {
             }
             drop(mids);
             Self::purge_chunks_tx(&tx, &meeting_ids)?;
+            // Phase F0 LOCK-SAFETY: purge the correction-log rows of every meeting in these (now
+            // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
+            // nothing to the flywheel.
+            Self::purge_corrections_tx(&tx, &meeting_ids)?;
         }
         tx.commit().map_err(map_err)?;
         Ok(())
@@ -1823,6 +1878,14 @@ impl Db {
         .map_err(map_err)?;
         tx.execute(
             &format!("DELETE FROM note_chunks WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // Phase F0 LOCK-SAFETY: purge correction-log rows for every meeting in a locked folder, in
+        // this same reconciliation transaction — so a crash-while-unlocked (which may have logged a
+        // correction) cannot leave sealed-content-derived training data at rest after a restart.
+        tx.execute(
+            &format!("DELETE FROM correction_log WHERE meeting_id IN ({LOCKED_MEETINGS})"),
             [],
         )
         .map_err(map_err)?;
@@ -3100,56 +3163,180 @@ mod tests {
         db.migrate().unwrap();
     }
 
+    /// Test-only builder for a correction example tied to a meeting.
+    fn corr_rec(
+        kind: &str,
+        input: &str,
+        model_output: &str,
+        fin: Option<&str>,
+        accepted: bool,
+        at: &str,
+        meeting_id: Option<&str>,
+    ) -> crate::storage::models::CorrectionRecord {
+        crate::storage::models::CorrectionRecord {
+            id: 0,
+            kind: kind.to_string(),
+            input: input.to_string(),
+            model_output: model_output.to_string(),
+            final_output: fin.map(str::to_string),
+            accepted,
+            owner_id: "local".to_string(),
+            created_at: at.to_string(),
+            meeting_id: meeting_id.map(str::to_string),
+        }
+    }
+
     #[test]
     fn correction_log_round_trips_and_filters_by_kind() {
-        use crate::storage::models::CorrectionRecord;
         let db = mem_db();
-        let rec = |kind: &str, input: &str, model_output: &str, fin: Option<&str>, accepted: bool, at: &str| {
-            CorrectionRecord {
-                id: 0,
-                kind: kind.to_string(),
-                input: input.to_string(),
-                model_output: model_output.to_string(),
-                final_output: fin.map(str::to_string),
-                accepted,
-                owner_id: "local".to_string(),
-                created_at: at.to_string(),
-            }
-        };
+        // Two visible meetings in an OPEN folder so their corrections are returned by the gate.
+        seed_folder(&db, "f-open", "Open");
+        for id in ["m1", "m2", "m3"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z"))
+                .unwrap();
+            note_for(&db, id, "claude_code", "note");
+            db.set_note_folder(id, Some("f-open")).unwrap();
+        }
+        let nothing = std::collections::HashSet::new();
+
         // Insert two NER examples (one accepted-as-is, one edited) and one of another kind.
         let id1 = db
-            .log_correction(&rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z"))
+            .log_correction(&corr_rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z", Some("m1")))
             .unwrap();
         let id2 = db
-            .log_correction(&rec(
+            .log_correction(&corr_rec(
                 "ner",
                 "in-2",
                 "out-2",
                 Some("fixed-2"),
                 false,
                 "2026-06-28T10:01:00Z",
+                Some("m2"),
             ))
             .unwrap();
-        db.log_correction(&rec("timeline", "in-3", "out-3", None, true, "2026-06-28T10:02:00Z"))
+        db.log_correction(&corr_rec("timeline", "in-3", "out-3", None, true, "2026-06-28T10:02:00Z", Some("m3")))
             .unwrap();
         assert!(id2 > id1);
 
         // Only the matching kind comes back, newest first.
-        let ner = db.list_corrections("ner", 10).unwrap();
+        let ner = db.list_corrections("ner", 10, &nothing).unwrap();
         assert_eq!(ner.len(), 2);
         assert_eq!(ner[0].id, id2);
         assert_eq!(ner[0].input, "in-2");
         assert_eq!(ner[0].final_output.as_deref(), Some("fixed-2"));
         assert!(!ner[0].accepted);
+        assert_eq!(ner[0].meeting_id.as_deref(), Some("m2"));
         assert_eq!(ner[1].id, id1);
         assert!(ner[1].accepted);
         assert_eq!(ner[1].final_output, None);
         assert_eq!(ner[1].owner_id, "local");
 
         // Limit is honoured.
-        assert_eq!(db.list_corrections("ner", 1).unwrap().len(), 1);
+        assert_eq!(db.list_corrections("ner", 1, &nothing).unwrap().len(), 1);
         // A kind with no rows yields empty (not an error).
-        assert!(db.list_corrections("does-not-exist", 10).unwrap().is_empty());
+        assert!(db.list_corrections("does-not-exist", 10, &nothing).unwrap().is_empty());
+    }
+
+    /// GATE: a correction row for a sealed-and-not-unlocked meeting is EXCLUDED; the same kind's row
+    /// for a visible meeting is INCLUDED. Session-unlocking the sealed folder makes it reappear.
+    /// (RED before the gate: the un-gated reader returned both rows regardless of seal state.)
+    #[test]
+    fn list_corrections_excludes_sealed_meeting() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped")).unwrap();
+        // Visible meeting in the open folder.
+        db.insert_meeting(&sample_meeting("m-open", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m-open", "claude_code", "note");
+        db.set_note_folder("m-open", Some("f-open")).unwrap();
+        // Sealed meeting in the locked folder.
+        db.insert_meeting(&sample_meeting("m-sealed", "2026-06-24T11:00:00Z")).unwrap();
+        note_for(&db, "m-sealed", "claude_code", "note");
+        db.set_note_folder("m-sealed", Some("f-locked")).unwrap();
+
+        db.log_correction(&corr_rec("ner", "in-o", "out-o", None, true, "2026-06-28T10:00:00Z", Some("m-open")))
+            .unwrap();
+        db.log_correction(&corr_rec("ner", "in-s", "out-s", None, true, "2026-06-28T10:01:00Z", Some("m-sealed")))
+            .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let visible = db.list_corrections("ner", 10, &nothing).unwrap();
+        assert_eq!(visible.len(), 1, "sealed meeting's correction leaked through the gate");
+        assert_eq!(visible[0].meeting_id.as_deref(), Some("m-open"));
+
+        // Session-unlock the locked folder → its correction reappears.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let both = db.list_corrections("ner", 10, &unlocked).unwrap();
+        assert_eq!(both.len(), 2, "session-unlocked meeting's correction must reappear");
+    }
+
+    /// FAIL-CLOSED: a correction row with a NULL `meeting_id` (legacy/unattributed) is never returned
+    /// by the gated reader, even with nothing locked.
+    #[test]
+    fn list_corrections_excludes_null_meeting_id() {
+        let db = mem_db();
+        db.log_correction(&corr_rec("ner", "in-x", "out-x", None, true, "2026-06-28T10:00:00Z", None))
+            .unwrap();
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.list_corrections("ner", 10, &nothing).unwrap().is_empty(),
+            "NULL-meeting_id correction must be excluded (fail-closed)"
+        );
+    }
+
+    /// PURGE-ON-SEAL: a correction row tied to a meeting in a folder is GONE after the folder is
+    /// sealed (relock blanker). (RED before the purge: the row survived at rest.)
+    #[test]
+    fn correction_log_purged_on_lock() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.log_correction(&corr_rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z", Some("m1")))
+            .unwrap();
+        assert_eq!(correction_count(&db, "m1"), 1, "expected a correction row before seal");
+
+        // Seal: blank the note (content_blob present so blank_sealed_notes_in_folders acts), then run
+        // the relock blanker for the folder.
+        db.seal_note("m1", "claude_code", b"ciphertext").unwrap();
+        let mut folders = std::collections::HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        assert_eq!(
+            correction_count(&db, "m1"),
+            0,
+            "correction_log row must be purged on seal (no flywheel data for sealed meetings)"
+        );
+    }
+
+    /// PURGE-ON-DELETE: deleting a meeting also removes its correction-log rows.
+    #[test]
+    fn correction_log_purged_on_delete_meeting() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.log_correction(&corr_rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z", Some("m1")))
+            .unwrap();
+        assert_eq!(correction_count(&db, "m1"), 1);
+        db.delete_meeting("m1").unwrap();
+        assert_eq!(
+            correction_count(&db, "m1"),
+            0,
+            "delete_meeting must purge the meeting's correction_log rows"
+        );
+    }
+
+    fn correction_count(db: &Db, meeting_id: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM correction_log WHERE meeting_id = ?1",
+                rusqlite::params![meeting_id],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
