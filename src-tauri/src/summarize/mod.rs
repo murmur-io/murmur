@@ -19,6 +19,7 @@ pub mod organize;
 pub mod provider;
 pub mod recipes;
 pub mod redact;
+pub mod related_context;
 pub mod template;
 pub mod threads;
 pub mod timeline;
