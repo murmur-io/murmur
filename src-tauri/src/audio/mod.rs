@@ -5,6 +5,7 @@ pub mod mixer;
 pub mod recorder;
 pub mod system;
 pub mod tap;
+pub mod wake;
 pub mod wav;
 
 pub use merge::*;
