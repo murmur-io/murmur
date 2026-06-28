@@ -9,6 +9,6 @@
     <key>NSRemindersUsageDescription</key>
     <string>Murmur can add your meeting action items to Apple Reminders.</string>
     <key>NSCalendarsUsageDescription</key>
-    <string>Murmur reads your upcoming events to prepare pre-meeting briefs from your notes.</string>
+    <string>Murmur reads your upcoming events — title, attendees, and agenda — to prepare pre-meeting context and briefs, all on your device.</string>
   </dict>
 </plist>
