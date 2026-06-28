@@ -50,6 +50,22 @@ pub struct VoiceCommandListeningPayload {
     pub active: bool,
 }
 
+/// Emitted when a MANUAL voice-command capture has STOPPED listening and the accumulated utterance is
+/// being DISPATCHED (the gated `handle_voice_action` round-trip — RAG + brain — can take seconds).
+/// `active: true` lets the FE show a "thinking…" state in the gap between capture-end and the answer
+/// (the user's complaint: "you don't know what it's doing"). It is cleared (`active: false` is
+/// implied) by the arrival of [`EVENT_VOICE_ACTION_RESULT`] — the FE clears "processing" when the
+/// result lands. Carries NO transcript — just the boolean.
+pub const EVENT_VOICE_COMMAND_PROCESSING: &str = "murmur://voice-command-processing";
+
+/// Payload for [`EVENT_VOICE_COMMAND_PROCESSING`]. Boolean only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCommandProcessingPayload {
+    /// True while the dispatch is in flight (between capture-stop and the result event).
+    pub active: bool,
+}
+
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
 pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
 
