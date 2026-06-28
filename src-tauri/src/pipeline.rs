@@ -505,13 +505,20 @@ async fn summarize_and_export(
         .ok()
         .flatten()
         .and_then(|m| m.title);
-    let related_context = build_grounding_context(
+    // Phase B step 3 (Flow A) — the local brain DECIDES what context to fetch. With no real model
+    // (the StubReasoner, the default build) `orchestrate_context` falls through to the EXACT
+    // deterministic `build_grounding_context` path below (byte-identical, zero behavior change). With
+    // a real reasoner it runs a gated pre-analysis → retrieval plan, but the deterministic
+    // salient-query path stays the FALLBACK FLOOR. The reasoner call is synchronous, so this keeps
+    // the existing inline shape (no extra await). Best-effort + GATED: same egress/consent envelope.
+    let related_context = crate::orchestrate::orchestrate_context(
+        &*state.reasoner,
         &state.db,
-        &unlocked,
         meeting_id,
         related_title.as_deref(),
         transcript_text,
-        &config.provider_id,
+        &unlocked,
+        config,
     );
 
     let request = SummarizeRequest {
