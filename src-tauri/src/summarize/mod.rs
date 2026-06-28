@@ -12,6 +12,7 @@ pub mod brief;
 pub mod chat;
 pub mod claude_code;
 pub mod digest;
+pub mod dossier;
 pub mod graph;
 pub mod ollama;
 pub mod organize;
