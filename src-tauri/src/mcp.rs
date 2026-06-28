@@ -293,178 +293,56 @@ fn handle_tool_call(
     }
 }
 
-/// Dispatch a `tools/call` against an OPEN `Db`. Every read here is visibility-gated against
-/// `unlocked_set` (`search_visible` / `meeting_is_visible` / `get_note_if_visible` /
-/// `list_meetings_visible` / `search_hybrid_visible`), so a sealed-and-not-unlocked meeting is
-/// invisible to all of them. Returns the tool's text payload or a `(code, message)` error.
+/// Dispatch a `tools/call` against an OPEN `Db`. THIN MAPPER: parse the JSON-RPC tool name + args
+/// into a transport-agnostic [`crate::tools::ToolCall`], then run it through the single gated
+/// [`crate::tools::execute_tool`] seam (shared with the future local brain). Every read there is
+/// visibility-gated against `unlocked_set` (`search_visible` / `meeting_is_visible` /
+/// `get_note_if_visible` / `list_meetings_visible` / `search_hybrid_visible` / `build_dossier_data`),
+/// so a sealed-and-not-unlocked meeting is invisible to all of them. JSON-RPC error codes for the
+/// transport concerns (unknown tool, missing required arg) are produced HERE; runtime tool failures
+/// map to `-32000` exactly as before. Returns the tool's text payload or a `(code, message)` error.
 fn dispatch_tool(
     db: &Db,
     name: &str,
     args: &Value,
     unlocked_set: &HashSet<String>,
 ) -> std::result::Result<String, ToolError> {
-    match name {
-        "search_meetings" => {
-            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
-            match db.search_visible(q, 20, unlocked_set) {
-                Ok(hits) if hits.is_empty() => Ok(format!("No meetings match \"{q}\".")),
-                Ok(hits) => Ok(format_hits(&hits)),
-                Err(e) => Err((-32000, format!("search failed: {e}"))),
-            }
-        }
-        "search_semantic" => {
-            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
-            // GATE: the master flag lives in the (whole-DB-encrypted) settings table, so the MCP
-            // reader thread reads it from the same DB. When OFF, return an explicit "disabled" result
-            // — do NOT silently fall back to an ungated read. No `vec_chunks` row is ever touched.
-            let enabled = crate::settings::AppConfig::load(db)
-                .map(|c| c.semantic_search_enabled)
-                .unwrap_or(false);
-            if !enabled {
-                return Ok(
-                    "Semantic search is disabled. Enable it in Murmur settings to use this tool."
-                        .to_string(),
-                );
-            }
-            // Embed the query with the SAME active embedder used to index, then HYBRID-search through
-            // the SAME visibility gate as `search_meetings` (both FTS + vector legs are gated).
-            let embedder = crate::embed::active_embedder();
-            let query_vec = match embedder.embed(std::slice::from_ref(&q.to_string())) {
-                Ok(v) => v.into_iter().next().unwrap_or_default(),
-                Err(e) => return Err((-32000, format!("embed failed: {e}"))),
-            };
-            match db.search_hybrid_visible(q, &query_vec, 20, unlocked_set) {
-                Ok(hits) if hits.is_empty() => Ok(format!("No meetings match \"{q}\".")),
-                Ok(hits) => Ok(format_hits(&hits)),
-                Err(e) => Err((-32000, format!("semantic search failed: {e}"))),
-            }
-        }
-        "get_meeting" => {
-            let mid = args.get("meetingId").and_then(Value::as_str).unwrap_or("");
-            // A sealed-and-not-unlocked meeting is invisible — including its transcript.
-            match db.meeting_is_visible(mid, unlocked_set) {
-                Ok(false) => Ok(format!("No data for meeting {mid}.")),
-                Err(e) => Err((-32000, format!("visibility check failed: {e}"))),
-                Ok(true) => {
-                    let note = db.get_note_if_visible(mid, unlocked_set).ok().flatten();
-                    let segs = db.get_segments(mid).unwrap_or_default();
-                    let transcript = segs
-                        .iter()
-                        .map(|s| s.text.trim())
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    match note {
-                        Some(n) => Ok(format!("NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}", n.markdown)),
-                        None if !transcript.is_empty() => Ok(format!("TRANSCRIPT:\n{transcript}")),
-                        None => Ok(format!("No data for meeting {mid}.")),
-                    }
-                }
-            }
-        }
-        "list_recent_meetings" => {
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_i64)
-                .unwrap_or(20)
-                .clamp(1, 100);
-            match db.list_meetings_visible(limit, unlocked_set) {
-                Ok(ms) => Ok(ms
-                    .iter()
-                    .map(|m| {
-                        format!(
-                            "- {} · {} · {:?} · id:{}",
-                            m.title.clone().unwrap_or_else(|| "(untitled)".into()),
-                            m.started_at,
-                            m.status,
-                            m.id
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")),
-                Err(e) => Err((-32000, format!("list failed: {e}"))),
-            }
-        }
-        "get_open_commitments" => {
-            // GATE: routes through `list_open_commitments`, which double-gates on the same
-            // `unlocked_set` (`list_meetings_visible` + `get_note_if_visible`) — a sealed-and-not-
-            // unlocked meeting's commitments are never read here, so they can never surface.
-            let owner = args
+    use crate::tools::ToolCall;
+    let call = match name {
+        "search_meetings" => ToolCall::SearchMeetings {
+            query: args.get("query").and_then(Value::as_str).unwrap_or("").to_string(),
+        },
+        "search_semantic" => ToolCall::SearchSemantic {
+            query: args.get("query").and_then(Value::as_str).unwrap_or("").to_string(),
+        },
+        "get_meeting" => ToolCall::GetMeeting {
+            meeting_id: args.get("meetingId").and_then(Value::as_str).unwrap_or("").to_string(),
+        },
+        "list_recent_meetings" => ToolCall::ListRecentMeetings {
+            limit: args.get("limit").and_then(Value::as_i64).unwrap_or(20).clamp(1, 100),
+        },
+        "get_open_commitments" => ToolCall::GetOpenCommitments {
+            owner: args
                 .get("owner")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|o| !o.is_empty());
-            match db.list_open_commitments(unlocked_set, owner) {
-                Ok(items) if items.is_empty() => Ok(match owner {
-                    Some(o) => format!("No open commitments for \"{o}\"."),
-                    None => "No open commitments.".to_string(),
-                }),
-                Ok(items) => Ok(format_commitments(&items)),
-                Err(e) => Err((-32000, format!("commitments rollup failed: {e}"))),
-            }
-        }
+                .filter(|o| !o.is_empty())
+                .map(str::to_string),
+        },
         "get_entity_dossier" => {
-            // EGRESS-FREE: the MCP server NEVER makes a cloud LLM call. It returns the GATED
-            // STRUCTURED DATA (overview + timeline + open commitments + neighbours + the
-            // citation-tagged note corpus) for the CLIENT (Claude Desktop) to synthesize. Every
-            // read inside `build_dossier_data` is visibility-gated against `unlocked_set`
-            // (entity_is_visible / entity_mentions_visible / get_note_if_visible /
-            // list_open_commitments / entity_neighbors_visible), so a sealed-and-not-unlocked
-            // meeting contributes nothing. No `make_provider` / `complete` is ever constructed here.
             let entity = args.get("entity").and_then(Value::as_str).unwrap_or("");
             if entity.trim().is_empty() {
                 return Err((-32602, "missing required argument: entity".to_string()));
             }
-            let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked_set) {
-                Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
-                Err(e) => return Err((-32000, format!("entity resolve failed: {e}"))),
-            };
-            match crate::summarize::dossier::build_dossier_data(db, &id, unlocked_set) {
-                Ok(Some(data)) => Ok(crate::summarize::dossier::format_dossier_client(&data)),
-                Ok(None) => Ok(format!("No visible entity matching \"{entity}\".")),
-                Err(e) => Err((-32000, format!("dossier build failed: {e}"))),
-            }
+            ToolCall::GetEntityDossier { entity: entity.to_string() }
         }
-        other => Err((-32602, format!("unknown tool: {other}"))),
-    }
-}
-
-/// Render the open-commitments rollup into the MCP text payload — one line per item:
-/// `- owner · due · "text" · [[Title]]` (owner/due omitted when absent).
-fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
-    items
-        .iter()
-        .map(|c| {
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(o) = c.owner.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
-                parts.push(o.to_string());
-            }
-            if let Some(d) = c.due_date.as_deref().filter(|d| !d.is_empty()) {
-                parts.push(format!("due {d}"));
-            }
-            parts.push(format!("\"{}\"", c.text.trim()));
-            parts.push(format!("[[{}]]", c.meeting_title));
-            format!("- {}", parts.join(" · "))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Render a list of search hits (FTS or hybrid) into the MCP text payload — one line per meeting.
-fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
-    hits.iter()
-        .map(|h| {
-            format!(
-                "- {} ({}) [id:{}] — {}",
-                h.meeting.title.clone().unwrap_or_else(|| "(untitled)".into()),
-                h.meeting.started_at,
-                h.meeting.id,
-                h.snippet
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        other => return Err((-32602, format!("unknown tool: {other}"))),
+    };
+    // The `semantic_search_enabled` flag lives in the whole-DB-encrypted settings table; load it from
+    // the SAME DB the MCP reader opened. A load failure degrades to the default (flag OFF), matching
+    // the pre-refactor `unwrap_or(false)` behaviour.
+    let config = crate::settings::AppConfig::load(db).unwrap_or_default();
+    crate::tools::execute_tool(&call, db, unlocked_set, &config).map_err(|e| (-32000, e.to_string()))
 }
 
 #[cfg(test)]

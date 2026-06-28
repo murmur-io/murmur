@@ -94,10 +94,74 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                     .trim()
                     .to_string();
                 if !text.is_empty() {
+                    // In-meeting voice trigger (Phase A: DETECT + SURFACE only — NO action dispatch;
+                    // that needs the local brain in a later phase). Best-effort + panic-free: the
+                    // detection is a pure function and the emit error is ignored, so a wake miss/hit
+                    // can NEVER disrupt the caption or the authoritative record/transcribe flow.
+                    if let Some(payload) = wake_event_for(&text) {
+                        // PII rule (§8): NEVER log the spoken command text — only the
+                        // non-PII wake token and a coarse intent KIND (variant
+                        // discriminant, no content). The full payload goes to the FE
+                        // event, not the log.
+                        let intent_kind = match &payload.intent {
+                            crate::audio::wake::VoiceIntent::Research { .. } => "research",
+                            crate::audio::wake::VoiceIntent::SlackSearch { .. } => "slack_search",
+                            crate::audio::wake::VoiceIntent::Recall { .. } => "recall",
+                            crate::audio::wake::VoiceIntent::CreateReminder { .. } => "create_reminder",
+                            crate::audio::wake::VoiceIntent::NoteAside { .. } => "note_aside",
+                            crate::audio::wake::VoiceIntent::Unknown { .. } => "unknown",
+                        };
+                        tracing::info!(
+                            target: "voice",
+                            matched = %payload.matched_phrase,
+                            intent = intent_kind,
+                            "wake word detected in live caption (surfaced, not dispatched)"
+                        );
+                        let _ = app.emit(crate::events::EVENT_WAKE_DETECTED, payload);
+                    }
                     let _ = app.emit(crate::events::EVENT_LIVE_CAPTION, LiveCaption { text });
                 }
             }
             Err(e) => tracing::debug!(target: "live", error = %e, "live transcribe tick failed"),
         }
+    }
+}
+
+/// Pure, headless-testable core of the wake wiring: detect a wake utterance at the head of a
+/// transcript `tail` and, on a hit, build the typed [`crate::events::WakeDetectedPayload`] (matched
+/// wake token + command tail + deterministically-parsed intent). Returns `None` when nothing fires.
+///
+/// No I/O, no FFI, no egress — just `detect_wake` + `parse_voice_intent`. The live mic loop above
+/// calls this and emits the payload; the real-mic precision is the Mac step (`cargo test` is not
+/// proof for acoustic behaviour — see `crate::audio::wake`).
+fn wake_event_for(tail: &str) -> Option<crate::events::WakeDetectedPayload> {
+    let hit = crate::audio::wake::detect_wake(tail)?;
+    let intent = crate::audio::wake::parse_voice_intent(&hit.command);
+    Some(crate::events::WakeDetectedPayload {
+        matched_phrase: hit.matched_phrase,
+        command: hit.command,
+        intent,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::wake::VoiceIntent;
+
+    #[test]
+    fn wake_event_for_builds_payload_with_parsed_intent_on_hit() {
+        let p = wake_event_for("klodku zrób research o konkurencji")
+            .expect("vocative wake must fire");
+        assert_eq!(p.matched_phrase, "klodku");
+        assert_eq!(p.command, "zrób research o konkurencji");
+        assert_eq!(p.intent, VoiceIntent::Research { topic: "konkurencji".into() });
+    }
+
+    #[test]
+    fn wake_event_for_is_silent_on_ordinary_speech_and_empty() {
+        assert!(wake_event_for("let's talk about the budget for friday").is_none());
+        assert!(wake_event_for("cloud computing is the future").is_none());
+        assert!(wake_event_for("").is_none());
     }
 }
