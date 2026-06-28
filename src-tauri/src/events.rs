@@ -27,6 +27,13 @@ pub struct WakeDetectedPayload {
     pub intent: crate::audio::wake::VoiceIntent,
 }
 
+/// Emitted when an in-meeting VOICE ACTION ("Claudku, zrób research o X") has been DISPATCHED and a
+/// result is ready (Phase E, Flow B). Only fires when `realtime_reactions` is ON — when OFF the
+/// wake is surfaced via [`EVENT_WAKE_DETECTED`] and nothing is dispatched. The payload is a
+/// [`crate::voice_action::VoiceActionResult`] (intent kind + status + summary + `[[Title]]`
+/// citations over VISIBLE meetings only). The rich result card is Phase H.
+pub const EVENT_VOICE_ACTION_RESULT: &str = "murmur://voice-action-result";
+
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
 pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
 

@@ -1,0 +1,688 @@
+//! In-meeting VOICE ACTION DISPATCH — the BACKEND ENGINE (Phase E, Flow B).
+//!
+//! When the user addresses the assistant mid-meeting ("Claudku, zrób research o X"), the live loop
+//! ([`crate::transcribe::live`]) has already DETECTED the wake + parsed a [`VoiceIntent`] (Phase A).
+//! This module EXECUTES that intent — best-effort, gated, panic-free — and returns a
+//! [`VoiceActionResult`] the live loop emits as a live event for the UI (the rich card is Phase H).
+//!
+//! ## Lock / egress invariants (load-bearing)
+//! - **Every content read is GATED.** Research / Recall route through [`crate::tools::execute_tool`]
+//!   over the LIVE session `unlocked` set, so every DB read is `visibility_clause`-gated — a
+//!   sealed-and-not-session-unlocked meeting contributes NOTHING. There is no ungated read here.
+//! - **Brain egress is consent-gated.** The reasoner is [`crate::reason::active_reasoner`], honoring
+//!   the user's backend choice. With `BrainBackend::Cloud` the call routes through the SAME
+//!   `make_provider` consent gate + RedactingProvider as the note summary; with no consent it fails
+//!   closed → this returns a graceful "needs cloud consent" result, never a leak and never a panic.
+//! - **NoteAside is additive + gated.** It records the aside in the `notes_asides` store ONLY when
+//!   the current meeting is visible to the live unlocked set; it never blanks/clobbers sealed note
+//!   content.
+//!
+//! ## Best-effort, never panic
+//! Any tool/brain/IO error becomes a `VoiceActionResult { status: "error", .. }` with a NON-PII
+//! message — the live loop spawns this off the transcription tick, so a dispatch failure can never
+//! disrupt the recording or the caption.
+//!
+//! ## NOT verified headless
+//! The real-mic wake precision and the live cloud round-trip LATENCY are the Mac step — `cargo test`
+//! exercises the dispatch/gating/parse logic with a MOCK reasoner + seeded gated data only.
+
+use std::collections::HashSet;
+
+use serde::Serialize;
+
+use crate::audio::wake::VoiceIntent;
+use crate::error::AppError;
+use crate::reason::LocalReasoner;
+use crate::settings::AppConfig;
+use crate::storage::Db;
+use crate::tools::{execute_tool, ToolCall};
+
+/// The outcome of dispatching one [`VoiceIntent`], emitted to the FE as a live event. Carries NO raw
+/// transcript beyond the user's own dictated command — `summary` is the brain's answer (research/
+/// recall) or a short status line; `citations` are the `[[Title]]` wikilinks the answer was grounded
+/// on, extracted from the GATED tool output (so they only ever name VISIBLE meetings).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceActionResult {
+    /// Coarse intent discriminant: `research` | `recall` | `create_reminder` | `note_aside` |
+    /// `slack_search` | `unknown`. Lets the FE pick the card style without re-parsing.
+    pub intent_kind: String,
+    /// `ok` (action completed) | `unavailable` (a deferred capability, e.g. Slack) | `unrecognized`
+    /// (nothing actionable) | `needs_consent` (cloud brain refused, fail-closed) | `error`
+    /// (best-effort failure — message is non-PII).
+    pub status: String,
+    /// The brain answer (research/recall) or a short, non-sensitive status line.
+    pub summary: String,
+    /// `[[Title]]` wikilink citations the answer was grounded on (VISIBLE meetings only). Empty for
+    /// non-RAG intents.
+    pub citations: Vec<String>,
+}
+
+impl VoiceActionResult {
+    fn new(intent_kind: &str, status: &str, summary: impl Into<String>) -> Self {
+        Self {
+            intent_kind: intent_kind.to_string(),
+            status: status.to_string(),
+            summary: summary.into(),
+            citations: Vec::new(),
+        }
+    }
+}
+
+/// Dispatch one parsed [`VoiceIntent`] over the GATED vault + consent-gated brain. Synchronous (the
+/// live loop spawns it off-thread) and PANIC-FREE: every fallible step degrades to a graceful
+/// `VoiceActionResult`.
+///
+/// `unlocked` is the LIVE session unlock set (so Research/Recall see exactly what the session can
+/// see); `meeting_id` is the in-progress recording (for `NoteAside`).
+pub fn handle_voice_action(
+    intent: &VoiceIntent,
+    reasoner: &dyn LocalReasoner,
+    db: &Db,
+    unlocked: &HashSet<String>,
+    config: &AppConfig,
+    meeting_id: &str,
+) -> VoiceActionResult {
+    match intent {
+        VoiceIntent::Research { topic } => {
+            rag_answer("research", topic, reasoner, db, unlocked, config)
+        }
+        VoiceIntent::Recall { entity } => {
+            rag_answer("recall", entity, reasoner, db, unlocked, config)
+        }
+        VoiceIntent::CreateReminder { text, due } => {
+            let text = text.trim();
+            if text.is_empty() {
+                return VoiceActionResult::new(
+                    "create_reminder",
+                    "error",
+                    "Nothing to remind about.",
+                );
+            }
+            match crate::commands::add_reminder_blocking(text, due.as_deref()) {
+                Ok(()) => VoiceActionResult::new(
+                    "create_reminder",
+                    "ok",
+                    "Added a reminder.",
+                ),
+                Err(e) => VoiceActionResult::new("create_reminder", "error", non_pii_error(&e)),
+            }
+        }
+        VoiceIntent::NoteAside { text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                return VoiceActionResult::new("note_aside", "error", "Nothing to note.");
+            }
+            note_aside(text, db, unlocked, meeting_id)
+        }
+        VoiceIntent::SlackSearch { .. } => VoiceActionResult::new(
+            "slack_search",
+            "unavailable",
+            "Slack search isn't available yet.",
+        ),
+        VoiceIntent::Unknown { .. } => VoiceActionResult::new(
+            "unknown",
+            "unrecognized",
+            "Sorry, I didn't catch an action I can run.",
+        ),
+    }
+}
+
+/// Local-first RAG over the user's OWN gated vault (NOT a web search): run the gated read tools for
+/// the topic/entity, feed ONLY the gated results to the brain, return a brief cited answer.
+fn rag_answer(
+    intent_kind: &str,
+    query: &str,
+    reasoner: &dyn LocalReasoner,
+    db: &Db,
+    unlocked: &HashSet<String>,
+    config: &AppConfig,
+) -> VoiceActionResult {
+    let query = query.trim();
+    if query.is_empty() {
+        return VoiceActionResult::new(intent_kind, "error", "No topic to look up.");
+    }
+
+    // GATE: every tool below routes through visibility_clause over the live `unlocked` set.
+    // SemanticSearch is itself gated behind `config.semantic_search_enabled` inside `execute_tool`
+    // (it returns a "disabled" string when off, never an ungated read). For `recall` we also pull
+    // the entity dossier; for `research` we add open commitments for grounding.
+    let mut tool_calls: Vec<ToolCall> = vec![
+        ToolCall::SearchMeetings { query: query.to_string() },
+        ToolCall::SearchSemantic { query: query.to_string() },
+    ];
+    if intent_kind == "recall" {
+        tool_calls.push(ToolCall::GetEntityDossier { entity: query.to_string() });
+    }
+
+    let mut grounding = String::new();
+    for call in &tool_calls {
+        match execute_tool(call, db, unlocked, config) {
+            Ok(text) => {
+                let text = text.trim();
+                // Skip a tool's "nothing"/"disabled" placeholder so it doesn't pollute grounding
+                // (a non-empty placeholder would otherwise count as real grounding).
+                if !text.is_empty() && !is_empty_tool_result(text) {
+                    grounding.push_str(text);
+                    grounding.push_str("\n\n");
+                }
+            }
+            // A single tool error is non-fatal — drop it and keep whatever the others returned.
+            Err(e) => tracing::debug!(
+                target: "voice",
+                error = %e,
+                "voice-action tool call failed; continuing with partial grounding"
+            ),
+        }
+    }
+    let grounding = grounding.trim();
+
+    // CITATIONS: derived from a GATED `search_visible` over the SAME live unlocked set — every hit
+    // names a VISIBLE meeting (a sealed-not-unlocked meeting is filtered out by visibility_clause),
+    // rendered as `[[Title]]`. Plus any `[[Title]]` wikilinks the tool grounding already carried
+    // (commitments / dossier emit them). De-duped, first-seen order.
+    let mut citations: Vec<String> = Vec::new();
+    let mut push_cite = |c: String| {
+        if !c.is_empty() && !citations.contains(&c) {
+            citations.push(c);
+        }
+    };
+    match db.search_visible(query, 8, unlocked) {
+        Ok(hits) => {
+            for h in &hits {
+                if let Some(t) = h.meeting.title.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                {
+                    push_cite(format!("[[{t}]]"));
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(target: "voice", error = %e, "voice-action citation search failed");
+        }
+    }
+    for c in extract_citations(grounding) {
+        push_cite(c);
+    }
+
+    // No grounding at all → don't burn a brain call; return a clean "nothing found".
+    if grounding.is_empty() {
+        return VoiceActionResult::new(
+            intent_kind,
+            "ok",
+            format!("I couldn't find anything in your vault about \"{query}\"."),
+        );
+    }
+
+    let system = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
+                  sentences) using ONLY the provided notes from the user's own meeting vault. Cite \
+                  the meetings you used by their [[Title]] wikilink. If the notes don't cover it, \
+                  say so plainly. Do not invent facts.";
+    let user = format!("Request: {query}\n\nNotes from the vault:\n{grounding}");
+
+    // EGRESS SEAM: a Cloud reasoner routes through make_provider (consent gate + RedactingProvider).
+    // A no-consent refusal comes back as AppError::Unavailable → graceful "needs consent", no leak.
+    match reasoner.reason(system, &user) {
+        Ok(answer) => {
+            let answer = answer.trim();
+            let summary = if answer.is_empty() {
+                format!("Found notes about \"{query}\" in your vault.")
+            } else {
+                answer.to_string()
+            };
+            VoiceActionResult {
+                intent_kind: intent_kind.to_string(),
+                status: "ok".to_string(),
+                summary,
+                citations,
+            }
+        }
+        Err(AppError::Unavailable(_)) => VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "needs_consent".to_string(),
+            // Surface the gated citations even when the brain can't run, so the card is still useful.
+            summary: "The cloud brain needs your one-time consent to answer (Settings ▸ Privacy). \
+                      I found related meetings in your vault."
+                .to_string(),
+            citations,
+        },
+        Err(e) => VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "error".to_string(),
+            summary: non_pii_error(&e),
+            citations,
+        },
+    }
+}
+
+/// Record a spoken aside against the CURRENT meeting — additive + gated. The aside lands only when
+/// the meeting is visible to the live unlocked set (the in-progress recording is foldered/sealed
+/// later, so it is trivially visible now); a sealed-not-unlocked meeting is refused, never written.
+fn note_aside(
+    text: &str,
+    db: &Db,
+    unlocked: &HashSet<String>,
+    meeting_id: &str,
+) -> VoiceActionResult {
+    // GATE: never write an aside against a meeting the session can't see.
+    match db.meeting_is_visible(meeting_id, unlocked) {
+        Ok(true) => {}
+        Ok(false) => {
+            return VoiceActionResult::new(
+                "note_aside",
+                "error",
+                "This meeting is locked — unlock it to add a note.",
+            );
+        }
+        Err(e) => return VoiceActionResult::new("note_aside", "error", non_pii_error(&e)),
+    }
+    let created_at = chrono::Utc::now().to_rfc3339();
+    match db.insert_note_aside(meeting_id, text, &created_at) {
+        Ok(_) => VoiceActionResult::new("note_aside", "ok", "Noted."),
+        Err(e) => VoiceActionResult::new("note_aside", "error", non_pii_error(&e)),
+    }
+}
+
+/// Whether a tool result is a "nothing found" / "disabled" placeholder rather than real content,
+/// so it can be excluded from the brain grounding (an included placeholder would falsely count as
+/// grounding and trigger a brain call on an empty vault). Matches the deterministic prefixes
+/// `execute_tool` emits (`No meetings match`, `No data`, `No open commitments`, `No visible
+/// entity`, and the `Semantic search is disabled` notice).
+fn is_empty_tool_result(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("No meetings match")
+        || t.starts_with("No data")
+        || t.starts_with("No open commitments")
+        || t.starts_with("No visible entity")
+        || t.starts_with("Semantic search is disabled")
+}
+
+/// Pull distinct `[[Title]]` wikilinks out of the gated tool grounding text, in first-seen order.
+/// Deterministic, no regex. Only the tool output is scanned, so a citation can only ever name a
+/// VISIBLE meeting (the tools never emit a sealed-not-unlocked title).
+fn extract_citations(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(rel_end) = text[i + 2..].find("]]") {
+                let inner = text[i + 2..i + 2 + rel_end].trim();
+                if !inner.is_empty() {
+                    let cite = format!("[[{inner}]]");
+                    if !out.contains(&cite) {
+                        out.push(cite);
+                    }
+                }
+                i = i + 2 + rel_end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A short, NON-PII summary string for an error result. Uses the AppError VARIANT name only — never
+/// the inner message (which could carry a path/title) — per the PII-in-logs rule applied to the FE
+/// event too. The exact technical detail still goes to the debug log via the caller.
+fn non_pii_error(e: &AppError) -> String {
+    let kind = match e {
+        AppError::Unavailable(_) => "the action is unavailable right now",
+        AppError::Locked(_) => "the content is locked",
+        AppError::InvalidArg(_) => "the request was incomplete",
+        AppError::Storage(_) | AppError::Migration(_) => "a storage error occurred",
+        AppError::Summarize(_) => "the brain couldn't complete the request",
+        _ => "the action couldn't be completed",
+    };
+    format!("Sorry — {kind}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reason::LocalReasoner;
+    use crate::storage::{Folder, Meeting, MeetingStatus, NoteRecord};
+    use serde_json::Value;
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tmp_db() -> Db {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-voiceaction-{}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_file(&p);
+        Db::open_with_key(&p, KEY).unwrap()
+    }
+
+    /// A reasoner that echoes a fixed answer and records the grounding it was handed, so we can
+    /// assert the brain saw ONLY gated content. No network, no model.
+    struct MockReasoner {
+        answer: String,
+        last_user: std::sync::Mutex<Option<String>>,
+    }
+    impl MockReasoner {
+        fn new(answer: &str) -> Self {
+            Self {
+                answer: answer.to_string(),
+                last_user: std::sync::Mutex::new(None),
+            }
+        }
+    }
+    impl LocalReasoner for MockReasoner {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        fn reason(&self, _system: &str, user: &str) -> crate::error::Result<String> {
+            *self.last_user.lock().unwrap() = Some(user.to_string());
+            Ok(self.answer.clone())
+        }
+        fn structured(
+            &self,
+            _system: &str,
+            _user: &str,
+            _schema: &Value,
+        ) -> crate::error::Result<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    /// A reasoner that always errors — proves the dispatch degrades to a graceful "error" result
+    /// (no panic), and an `Unavailable` error maps to the fail-closed "needs_consent" status.
+    struct ErrReasoner(AppError);
+    impl LocalReasoner for ErrReasoner {
+        fn id(&self) -> &str {
+            "err"
+        }
+        fn reason(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
+            Err(clone_err(&self.0))
+        }
+        fn structured(
+            &self,
+            _system: &str,
+            _user: &str,
+            _schema: &Value,
+        ) -> crate::error::Result<Value> {
+            Err(clone_err(&self.0))
+        }
+    }
+    fn clone_err(e: &AppError) -> AppError {
+        match e {
+            AppError::Unavailable(m) => AppError::Unavailable(m.clone()),
+            AppError::Summarize(m) => AppError::Summarize(m.clone()),
+            _ => AppError::Other(anyhow::anyhow!("err")),
+        }
+    }
+
+    /// Seed a visible meeting (no folder) with a note, plus a SEALED meeting in a locked folder
+    /// whose note plaintext is blanked (sealed-not-unlocked). Returns the db.
+    fn seed_visible_and_sealed(db: &Db) {
+        // Visible meeting: open folder (None), note mentions "Atlas".
+        db.insert_meeting(&Meeting {
+            id: "open1".into(),
+            started_at: "2026-06-01T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Atlas Kickoff".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "open1".into(),
+            provider_id: "claude_code".into(),
+            markdown: "We discussed the Atlas migration plan and pricing.".into(),
+            created_at: "2026-06-01T09:05:00Z".into(),
+            exported_path: None,
+        })
+        .unwrap();
+
+        // Sealed meeting: locked folder, note plaintext BLANKED (the sealed-at-rest shape).
+        db.insert_folder(&Folder {
+            id: "fsec".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_meeting(&Meeting {
+            id: "sealed1".into(),
+            started_at: "2026-06-02T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Atlas Secret Terms".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        // Blanked plaintext + a non-null content_blob marks it sealed-not-unlocked for the gate.
+        db.upsert_note(&NoteRecord {
+            meeting_id: "sealed1".into(),
+            provider_id: "claude_code".into(),
+            markdown: String::new(),
+            created_at: "2026-06-02T09:05:00Z".into(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_note_folder("sealed1", Some("fsec")).unwrap();
+    }
+
+    fn empty_unlocked() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn research_returns_cited_summary_built_only_from_visible_content() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let reasoner = MockReasoner::new("Atlas is migrating; see [[Atlas Kickoff]].");
+        let cfg = AppConfig::default();
+
+        let res = handle_voice_action(
+            &VoiceIntent::Research { topic: "Atlas".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &cfg,
+            "live-mtg",
+        );
+
+        assert_eq!(res.intent_kind, "research");
+        assert_eq!(res.status, "ok");
+        assert!(res.summary.contains("Atlas"));
+        // Citation is the VISIBLE meeting, extracted from gated tool output.
+        assert!(res.citations.contains(&"[[Atlas Kickoff]]".to_string()));
+
+        // THE GATE: the sealed meeting's title must NEVER reach the brain grounding nor the
+        // citations, even though it also matches "Atlas".
+        let grounding = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            grounding.contains("Atlas Kickoff"),
+            "visible meeting must be in grounding"
+        );
+        assert!(
+            !grounding.contains("Atlas Secret Terms"),
+            "SEALED meeting must NOT leak into the brain grounding"
+        );
+        assert!(
+            !res.citations.iter().any(|c| c.contains("Secret")),
+            "SEALED meeting must NOT be cited"
+        );
+    }
+
+    #[test]
+    fn recall_returns_ok_and_excludes_sealed() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let reasoner = MockReasoner::new("Recall: [[Atlas Kickoff]] covered the plan.");
+        let res = handle_voice_action(
+            &VoiceIntent::Recall { entity: "Atlas".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+        );
+        assert_eq!(res.intent_kind, "recall");
+        assert_eq!(res.status, "ok");
+        let grounding = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(!grounding.contains("Atlas Secret Terms"), "sealed excluded from recall too");
+    }
+
+    #[test]
+    fn research_with_no_vault_match_is_ok_without_brain_call() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let reasoner = MockReasoner::new("SHOULD-NOT-BE-CALLED");
+        let res = handle_voice_action(
+            &VoiceIntent::Research { topic: "nonexistent-topic-zzz".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+        );
+        assert_eq!(res.status, "ok");
+        assert!(res.summary.contains("couldn't find"));
+        // No grounding ⇒ no brain call (so the mock never recorded a user prompt).
+        assert!(reasoner.last_user.lock().unwrap().is_none(), "brain must not be called with empty grounding");
+    }
+
+    #[test]
+    fn note_aside_records_against_visible_meeting() {
+        let db = tmp_db();
+        // A live, un-foldered (visible) meeting.
+        db.insert_meeting(&Meeting {
+            id: "live1".into(),
+            started_at: "2026-06-03T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Live".into()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        let reasoner = MockReasoner::new("");
+        let res = handle_voice_action(
+            &VoiceIntent::NoteAside { text: "deadline is friday".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live1",
+        );
+        assert_eq!(res.intent_kind, "note_aside");
+        assert_eq!(res.status, "ok");
+        let asides = db.list_note_asides("live1").unwrap();
+        assert_eq!(asides.len(), 1);
+        assert_eq!(asides[0].0, "deadline is friday");
+    }
+
+    #[test]
+    fn note_aside_refused_for_sealed_meeting() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let reasoner = MockReasoner::new("");
+        // sealed1 is in a locked folder, not in the unlocked set ⇒ not visible ⇒ refuse the write.
+        let res = handle_voice_action(
+            &VoiceIntent::NoteAside { text: "secret aside".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "sealed1",
+        );
+        assert_eq!(res.status, "error");
+        assert!(db.list_note_asides("sealed1").unwrap().is_empty(), "no aside written to a sealed meeting");
+    }
+
+    #[test]
+    fn slack_search_is_unavailable() {
+        let db = tmp_db();
+        let reasoner = MockReasoner::new("");
+        let res = handle_voice_action(
+            &VoiceIntent::SlackSearch { query: "raport".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live1",
+        );
+        assert_eq!(res.intent_kind, "slack_search");
+        assert_eq!(res.status, "unavailable");
+    }
+
+    #[test]
+    fn unknown_is_unrecognized_and_echoes_nothing_sensitive() {
+        let db = tmp_db();
+        let reasoner = MockReasoner::new("");
+        let res = handle_voice_action(
+            &VoiceIntent::Unknown { raw: "qwer asdf secret-thing".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live1",
+        );
+        assert_eq!(res.status, "unrecognized");
+        assert!(!res.summary.contains("secret-thing"), "raw command must not be echoed back");
+    }
+
+    #[test]
+    fn reasoner_error_degrades_gracefully_without_panic() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        // A generic Summarize error → status "error", non-PII message, citations still surfaced.
+        let reasoner = ErrReasoner(AppError::Summarize("boom internal detail".into()));
+        let res = handle_voice_action(
+            &VoiceIntent::Research { topic: "Atlas".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live1",
+        );
+        assert_eq!(res.status, "error");
+        assert!(!res.summary.contains("boom internal detail"), "internal error detail must not leak");
+        assert!(res.citations.contains(&"[[Atlas Kickoff]]".to_string()));
+    }
+
+    #[test]
+    fn cloud_no_consent_maps_to_needs_consent_failclosed() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        // The make_provider consent gate returns AppError::Unavailable when consent is OFF.
+        let reasoner = ErrReasoner(AppError::Unavailable("cloud egress not consented".into()));
+        let res = handle_voice_action(
+            &VoiceIntent::Research { topic: "Atlas".into() },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live1",
+        );
+        assert_eq!(res.status, "needs_consent");
+        // Gated citations are still useful even when the brain can't run.
+        assert!(res.citations.contains(&"[[Atlas Kickoff]]".to_string()));
+    }
+
+    #[test]
+    fn extract_citations_dedups_in_first_seen_order() {
+        let text = "- A ([id:1]) — x [[One]]\n- B — y [[Two]]\nagain [[One]]";
+        let cites = extract_citations(text);
+        assert_eq!(cites, vec!["[[One]]".to_string(), "[[Two]]".to_string()]);
+    }
+}
