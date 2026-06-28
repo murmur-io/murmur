@@ -1634,10 +1634,6 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // Phase 2b: the semantic-search master flag is not (yet) carried on the settings DTO, so a
         // settings save can neither set nor clobber it — preserve the live value (default OFF).
         semantic_search_enabled: current.semantic_search_enabled,
-        // Phase 4: the retrieval-augmented-notes master flag is not (yet) carried on the settings
-        // DTO, so a settings save can neither set nor clobber it — preserve the live value
-        // (default OFF). Dormant in prod until an FE setter is added.
-        augment_notes_with_context: current.augment_notes_with_context,
     }
 }
 
