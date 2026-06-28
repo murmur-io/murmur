@@ -1279,6 +1279,8 @@ export class OnboardingComponent implements OnInit {
       brainBackend: base?.brainBackend ?? "cloud",
       realtimeReactions: base?.realtimeReactions ?? false,
       brainModelId: base?.brainModelId ?? null,
+      // brain2 RAG — semantic-search master flag; round-trip the snapshot, default off.
+      semanticSearchEnabled: base?.semanticSearchEnabled ?? false,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.
