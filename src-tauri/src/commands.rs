@@ -123,6 +123,12 @@ pub struct AppConfigDto {
     /// bogus model id. `select_brain_model` remains the other supported mutator.
     #[serde(default)]
     pub brain_model_id: Option<String>,
+    /// brain2 RAG — the SEMANTIC SEARCH master flag. Settable from the DTO (the Settings UI owns the
+    /// toggle), unlike `cloud_egress_consented` which is preserved-only. Plain bool; an omitted value
+    /// deserializes to `false` (`#[serde(default)]`), so a partial/older save can never silently
+    /// enable it. Flipping it on does NOT auto-index — the user runs `reindex_embeddings` to backfill.
+    #[serde(default)]
+    pub semantic_search_enabled: bool,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -1745,6 +1751,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         brain_backend: c.brain_backend,
         realtime_reactions: c.realtime_reactions,
         brain_model_id: c.brain_model_id.clone(),
+        semantic_search_enabled: c.semantic_search_enabled,
     }
 }
 
@@ -1799,9 +1806,11 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
         // `consent_to_cloud_egress` command may flip it. This makes an omitting/zeroed save inert.
         cloud_egress_consented: current.cloud_egress_consented,
-        // Phase 2b: the semantic-search master flag is not (yet) carried on the settings DTO, so a
-        // settings save can neither set nor clobber it — preserve the live value (default OFF).
-        semantic_search_enabled: current.semantic_search_enabled,
+        // brain2 RAG: the semantic-search master flag IS carried on the settings DTO (the Settings
+        // UI owns the toggle). Plain bool; an omitted value already defaulted to OFF on the DTO
+        // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
+        // `cloud_egress_consented` (preserved-only), this one is settable.
+        semantic_search_enabled: d.semantic_search_enabled,
         // Phase B: the brain model path is not carried on the settings DTO (it is resolved from the
         // shared models dir by default), so a settings save preserves the live value (default None).
         brain_model_path: current.brain_model_path.clone(),
@@ -2287,6 +2296,125 @@ pub async fn download_embed_model(app: AppHandle) -> Result<String, AppError> {
         },
     );
     Ok(dir.to_string_lossy().to_string())
+}
+
+/// Result of [`reindex_embeddings`]. `status` is `"model_missing"` when the real e5 model is absent
+/// (no indexing was attempted — re-indexing with the deterministic STUB embedder would poison the
+/// index with garbage vectors, worse than nothing), else `"indexed"`. On `"indexed"`, `indexed` is
+/// the count of VISIBLE meetings whose chunks were (re)built. NO PII — counts + a status string only.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReindexResult {
+    pub status: String,
+    pub indexed: usize,
+    pub total: usize,
+}
+
+/// brain2 RAG — BACKFILL the semantic vector index for ALL VISIBLE meetings (the one-shot the user
+/// runs after turning `semantic_search_enabled` on, or after installing the e5 model so the old
+/// STUB-embedded chunks get replaced by real e5 vectors).
+///
+/// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked)` — a sealed-and-not-
+/// session-unlocked meeting is NEVER returned, so its plaintext is never chunked/embedded, and its
+/// chunks STAY purged (the seal already purged them; we don't touch them). For each visible meeting
+/// we re-fetch its note through `get_note_if_visible(unlocked)` (defense-in-depth: skip if the note
+/// is not visible) and call `index_meeting_chunks`, which PURGES-then-reinserts — so any stale stub
+/// vectors are replaced with e5 ones. No new read path: every read routes through `visibility_clause`.
+///
+/// MODEL GUARD: if the real e5 model is absent (`!embed_model_present()` ⇒ `active_embedder` is the
+/// stub), we DO NOTHING and return `{ status: "model_missing" }`. Re-indexing with garbage stub
+/// vectors is strictly worse than leaving the (old, possibly-stub) chunks alone — the FE prompts the
+/// user to download e5 first via `download_embed_model`.
+///
+/// Emits [`crate::events::EVENT_REINDEX`] `{ done, total }` progress (counts only, NO PII).
+/// EMBED_DIM stays 384 (e5 == stub width) ⇒ NO `vec_chunks` schema migration.
+#[tauri::command]
+pub async fn reindex_embeddings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ReindexResult, AppError> {
+    // Snapshot the LIVE session unlock set — visibility is evaluated against exactly this set, so a
+    // sealed-not-unlocked folder's meetings are invisible and never indexed.
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    reindex_embeddings_inner(
+        &state.db,
+        &unlocked,
+        crate::embed::embed_model_present(),
+        crate::embed::active_embedder().as_ref(),
+        |done, total| {
+            let _ = app.emit(
+                crate::events::EVENT_REINDEX,
+                crate::events::ReindexPayload { done, total },
+            );
+        },
+    )
+}
+
+/// Pure, AppHandle-free core of [`reindex_embeddings`] so the model-missing guard + the
+/// visibility-gated loop are unit-testable headless. Takes the `Db`, the live `unlocked` session set,
+/// whether the REAL e5 model is present (`model_present`), the active embedder, and a progress sink.
+///
+/// MODEL GUARD: `model_present == false` ⇒ return `{ status: "model_missing" }` and index NOTHING
+/// (re-indexing with the deterministic STUB embedder would poison the index with garbage vectors —
+/// strictly worse than leaving the old chunks alone).
+///
+/// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked)` — a sealed-and-not-
+/// session-unlocked meeting is NEVER returned, so its plaintext is never chunked/embedded and its
+/// chunks STAY purged. Each meeting's note is re-checked through `get_note_if_visible(unlocked)`
+/// before `index_meeting_chunks` (PURGE-then-reinsert, so stale stub vectors are replaced).
+pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
+    db: &crate::storage::Db,
+    unlocked: &std::collections::HashSet<String>,
+    model_present: bool,
+    embedder: &dyn crate::embed::Embedder,
+    mut on_progress: F,
+) -> Result<ReindexResult, AppError> {
+    if !model_present {
+        tracing::info!(target: "rag", "reindex_embeddings: e5 model missing; skipping (no stub indexing)");
+        return Ok(ReindexResult {
+            status: "model_missing".to_string(),
+            indexed: 0,
+            total: 0,
+        });
+    }
+
+    // The corpus is the visibility-gated meeting list. `list_meetings_visible` already excludes
+    // sealed-and-not-session-unlocked meetings (their notes are not visible under `visibility_clause`).
+    let meetings = db.list_meetings_visible(100_000, unlocked)?;
+    let total = meetings.len();
+
+    let mut indexed = 0usize;
+    for m in &meetings {
+        // Defense-in-depth: only index a meeting whose latest note is currently visible.
+        match db.get_note_if_visible(&m.id, unlocked) {
+            Ok(Some(_note)) => {
+                if let Err(e) = db.index_meeting_chunks(&m.id, embedder) {
+                    // Never abort the whole backfill on one bad note — log (no PII) and continue.
+                    tracing::warn!(target: "rag", error = %e, "reindex: indexing one meeting failed (skipped)");
+                }
+            }
+            Ok(None) => {
+                // No visible note (sealed sibling, or no note yet) — skip; do NOT index.
+            }
+            Err(e) => {
+                tracing::warn!(target: "rag", error = %e, "reindex: visibility check failed (skipped)");
+            }
+        }
+        indexed += 1;
+        on_progress(indexed, total);
+    }
+
+    tracing::info!(target: "rag", indexed, total, "reindex_embeddings complete");
+    Ok(ReindexResult {
+        status: "indexed".to_string(),
+        indexed,
+        total,
+    })
 }
 
 /// True iff the on-device PERSON-name NER model (Phase D) is present on disk. Pure existence probe;
@@ -4680,6 +4808,38 @@ mod lifecycle_tests {
         }
     }
 
+    /// brain2 RAG: `semantic_search_enabled` round-trips BOTH ways through the settings DTO. OUT:
+    /// `config_to_dto` carries the live value so the FE toggle reflects it. IN: `dto_to_config` TAKES
+    /// it from the DTO (settable — unlike `cloud_egress_consented`), proven by starting from a
+    /// different `current` so the merged value can only have come from the DTO.
+    #[test]
+    fn dto_round_trips_semantic_search_enabled_both_ways() {
+        // OUT: true and false both surface on the DTO.
+        let cfg_on = AppConfig { semantic_search_enabled: true, ..AppConfig::default() };
+        assert!(config_to_dto(&cfg_on).semantic_search_enabled);
+        let cfg_off = AppConfig { semantic_search_enabled: false, ..AppConfig::default() };
+        assert!(!config_to_dto(&cfg_off).semantic_search_enabled);
+
+        // IN (set true): DTO=true over current=false ⇒ merged true (the DTO is authoritative).
+        let mut dto_on = config_to_dto(&AppConfig::default());
+        dto_on.semantic_search_enabled = true;
+        let current_off = AppConfig { semantic_search_enabled: false, ..AppConfig::default() };
+        assert!(
+            dto_to_config(dto_on, &current_off).semantic_search_enabled,
+            "semantic_search_enabled MUST be settable from the DTO (turn on)"
+        );
+
+        // IN (clear): DTO=false over current=true ⇒ merged false (settable both directions — NOT
+        // preserve-only like cloud_egress_consented).
+        let mut dto_off = config_to_dto(&AppConfig::default());
+        dto_off.semantic_search_enabled = false;
+        let current_on = AppConfig { semantic_search_enabled: true, ..AppConfig::default() };
+        assert!(
+            !dto_to_config(dto_off, &current_on).semantic_search_enabled,
+            "semantic_search_enabled MUST be settable from the DTO (turn off)"
+        );
+    }
+
     /// Phase H graceful degradation: a DTO carrying an UNKNOWN `brain_model_id` must NOT be stored —
     /// the live selection is preserved (no error, no bogus id) — while an unknown/omitted
     /// `brain_backend` deserializes to the default `Cloud` rather than crashing the save.
@@ -5014,6 +5174,81 @@ mod lifecycle_tests {
         assert!(matches!(res, Err(AppError::InvalidArg(_))), "must refuse, got {res:?}");
         assert!(state.db.folder_by_id("parent").unwrap().is_some(), "parent NOT deleted");
         assert!(state.db.folder_by_id("child").unwrap().is_some(), "child NOT orphaned");
+    }
+
+    // ── reindex_embeddings (semantic backfill) ──────────────────────────────────────────────────
+
+    /// True iff `mid` surfaces in the GATED semantic read for `text` under `unlocked` — i.e. it has
+    /// vec0 chunks AND is visible. Uses the stub embedder (this test asserts WHICH meetings are
+    /// indexed, not retrieval QUALITY, so the deterministic stub is sufficient plumbing).
+    fn reindex_semantic_finds(db: &Db, mid: &str, text: &str, unlocked: &HashSet<String>) -> bool {
+        use crate::embed::Embedder;
+        let emb = crate::embed::StubEmbedder;
+        let qv = emb.embed(std::slice::from_ref(&text.to_string())).unwrap();
+        let qvec = qv.into_iter().next().unwrap_or_default();
+        db.search_semantic_visible(&qvec, 50, unlocked)
+            .unwrap()
+            .iter()
+            .any(|h| h.meeting.id == mid)
+    }
+
+    /// GATING: `reindex_embeddings_inner` over a corpus of two OPEN (visible) meetings + one SEALED
+    /// (locked, not-session-unlocked) meeting indexes ONLY the two visible ones. The sealed meeting
+    /// is never returned by `list_meetings_visible`, its plaintext is never chunked/embedded, and its
+    /// chunks STAY purged (the seal already removed them) — RED if the gate were dropped.
+    #[test]
+    fn reindex_indexes_only_visible_meetings_skips_sealed() {
+        let state = build_state("reindex-gate");
+        make_open_folder(&state.db, "f-lock", "Confidential");
+
+        // Two open meetings (no folder ⇒ always visible) + one in a folder we will SEAL.
+        seed_meeting(&state.db, "m-open-1", "Quarterly budget planning and hiring runway.", None);
+        seed_meeting(&state.db, "m-open-2", "Roadmap review for the next sprint.", None);
+        seed_meeting(&state.db, "m-sealed", "Secret acquisition numbers and the term sheet.", Some("f-lock"));
+
+        // Seal the folder (verify-before-destroy seal + chunk purge) — m-sealed is now invisible.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let nothing = HashSet::new();
+        let stub = crate::embed::StubEmbedder;
+        // model_present = true so the guard passes (we deliberately use the stub here for plumbing).
+        let res = reindex_embeddings_inner(&state.db, &nothing, true, &stub, |_, _| {}).unwrap();
+        assert_eq!(res.status, "indexed");
+        // Only the two VISIBLE meetings were processed (the sealed one is absent from the corpus).
+        assert_eq!(res.total, 2, "sealed meeting must NOT be in the reindex corpus");
+        assert_eq!(res.indexed, 2);
+
+        // The two open meetings are now semantically findable; the sealed one is NOT — even under the
+        // same empty unlock set (it has no chunks, and is gated out).
+        assert!(reindex_semantic_finds(&state.db, "m-open-1", "budget planning hiring", &nothing));
+        assert!(reindex_semantic_finds(&state.db, "m-open-2", "roadmap sprint review", &nothing));
+        assert!(
+            !reindex_semantic_finds(&state.db, "m-sealed", "secret acquisition term sheet", &nothing),
+            "a sealed-not-unlocked meeting must never be indexed by reindex (gate violation)"
+        );
+    }
+
+    /// MODEL GUARD: with the real e5 model ABSENT (`model_present = false`), `reindex_embeddings_inner`
+    /// returns `{ status: "model_missing" }` and indexes NOTHING — it must NOT poison the index with
+    /// the deterministic STUB embedder. RED if the guard were dropped (the open meeting would gain
+    /// stub chunks).
+    #[test]
+    fn reindex_model_missing_indexes_nothing() {
+        let state = build_state("reindex-nomodel");
+        seed_meeting(&state.db, "m-open", "Quarterly budget planning.", None);
+
+        let nothing = HashSet::new();
+        let stub = crate::embed::StubEmbedder;
+        // model_present = false → the guard short-circuits BEFORE any indexing.
+        let res = reindex_embeddings_inner(&state.db, &nothing, false, &stub, |_, _| {}).unwrap();
+        assert_eq!(res.status, "model_missing");
+        assert_eq!(res.indexed, 0);
+        assert_eq!(res.total, 0);
+        // No chunks were written — the meeting is NOT semantically findable.
+        assert!(
+            !reindex_semantic_finds(&state.db, "m-open", "budget planning", &nothing),
+            "model_missing guard must index NOTHING (no stub poisoning)"
+        );
     }
 }
 
