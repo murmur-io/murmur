@@ -15,6 +15,7 @@ import type { Analytics, AppConfigDto } from "../../core/models";
 import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 import { AssistantActionsComponent } from "./assistant-actions.component";
+import { AssistantStore } from "../../core/assistant.store";
 
 @Component({
   selector: "app-record",
@@ -969,6 +970,9 @@ import { AssistantActionsComponent } from "./assistant-actions.component";
 })
 export class RecordComponent implements OnInit {
   readonly store = inject(RecorderStore);
+  /** The in-meeting voice-assistant store. Injected + init()'d here (not only from the
+   * card) so it subscribes to the wake/result streams even before the card is shown. */
+  readonly assistant = inject(AssistantStore);
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
 
@@ -1009,7 +1013,11 @@ export class RecordComponent implements OnInit {
    */
   readonly showAssistant = computed(() => {
     const c = this.config();
-    return !!c && c.realtimeReactions === true && c.brainBackend !== "off";
+    const enabled = !!c && c.realtimeReactions === true && c.brainBackend !== "off";
+    // Also surface the card the instant an interaction lands — covers a stale config
+    // snapshot (realtime toggled on in Settings after this screen mounted). The store is
+    // init()'d in ngOnInit, so it subscribes even when the card was never shown.
+    return enabled || this.assistant.hasAny();
   });
 
   /**
@@ -1171,6 +1179,10 @@ export class RecordComponent implements OnInit {
 
   async ngOnInit(): Promise<void> {
     await this.store.init();
+    // Subscribe the voice-assistant store to the wake/result streams now, regardless of
+    // whether the card is visible yet — otherwise events fired before the card renders
+    // (or while the config snapshot is stale) would be dropped.
+    void this.assistant.init();
     this.config.set(await this.ipc.getConfig());
     this.modelPresent.set(await this.ipc.modelPresent());
     // Stats are secondary — never let a failure here block the record screen.
