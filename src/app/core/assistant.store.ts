@@ -5,8 +5,17 @@ import type {
   VoiceActionResultPayload,
   VoiceActionStatus,
   VoiceCommandListeningPayload,
+  VoiceCommandProcessingPayload,
   WakeDetectedPayload,
 } from "./models";
+
+/**
+ * The 4-state visual model of the assistant orb (industry-convergent
+ * idle → listening → processing → answer). Pure presentation: derived from the
+ * store's listening/processing/in-flight signals + the newest interaction
+ * status by {@link AssistantStore.orbState}, never set directly.
+ */
+export type OrbState = "idle" | "listening" | "processing" | "answer";
 
 /**
  * Phase H — one recent in-meeting voice-assistant interaction. A wake creates a
@@ -105,12 +114,40 @@ export class AssistantStore {
   private readonly _manualAskInFlight = signal(false);
   readonly manualAskInFlight = this._manualAskInFlight.asReadonly();
 
+  /**
+   * True while a dispatched command is being processed (between the listener
+   * stopping and the answer landing) — the EVENT_VOICE_COMMAND_PROCESSING
+   * `{active}` boolean. Drives the orb's PROCESSING state + the "🧠 Przetwarzam…"
+   * shimmer label. Cleared by the result (or by the end-ask error path).
+   */
+  private readonly _processing = signal(false);
+  readonly processing = this._processing.asReadonly();
+
+  /**
+   * The 4-state orb model collapsed from the existing signals — a PURE
+   * `computed` (no signal writes → no NG0600 / trap T1):
+   *   processing → "processing" (highest priority: a dispatch is in flight)
+   *   listening  → "listening"  (the mic is open)
+   *   manual ask in flight (begin clicked, listener not yet open) → "listening"
+   *   newest interaction resolved → "answer" (a result is on screen)
+   *   otherwise → "idle".
+   * Bound on the orb as `[state]="orbState()"`.
+   */
+  readonly orbState = computed<OrbState>(() => {
+    if (this._processing()) return "processing";
+    if (this._listening() || this._manualAskInFlight()) return "listening";
+    const top = this._interactions()[0];
+    if (top && top.status !== "pending") return "answer";
+    return "idle";
+  });
+
   /** Monotonic id source for interaction rows (stable `@for` keys). */
   private nextId = 1;
 
   private unlistenWake: UnlistenFn | null = null;
   private unlistenResult: UnlistenFn | null = null;
   private unlistenListening: UnlistenFn | null = null;
+  private unlistenProcessing: UnlistenFn | null = null;
   /** Synchronous re-entrancy guard so two concurrent init() calls (e.g. the record
    * screen + the card both initialising) can't double-subscribe before the first
    * `await` resolves. */
@@ -127,6 +164,9 @@ export class AssistantStore {
     this.unlistenListening = await this.ipc.onVoiceCommandListening((p) =>
       this.onListening(p),
     );
+    this.unlistenProcessing = await this.ipc.onVoiceCommandProcessing((p) =>
+      this.onProcessing(p),
+    );
   }
 
   /** Release the event subscriptions (e.g. on app teardown). */
@@ -134,9 +174,11 @@ export class AssistantStore {
     this.unlistenWake?.();
     this.unlistenResult?.();
     this.unlistenListening?.();
+    this.unlistenProcessing?.();
     this.unlistenWake = null;
     this.unlistenResult = null;
     this.unlistenListening = null;
+    this.unlistenProcessing = null;
   }
 
   /**
@@ -152,6 +194,28 @@ export class AssistantStore {
     } catch (e) {
       this._manualAskInFlight.set(false);
       this._listening.set(false);
+      throw e;
+    }
+  }
+
+  /**
+   * CLICK-TO-STOP: stop the open listener so the FULL accumulated utterance is
+   * dispatched. Optimistically flip `listening` off + `processing` on so the orb
+   * morphs to PROCESSING the instant the user clicks (the backend's
+   * `{active:false}` listening + `{active:true}` processing events reconcile it
+   * shortly after); the answer clears processing via {@link onResult}. The manual
+   * ask stays in flight so the card keeps the answer's home. A no-op backend
+   * (nothing armed) is fine — `endVoiceCommand` is a graceful no-op there.
+   */
+  async endAsk(): Promise<void> {
+    this._listening.set(false);
+    this._processing.set(true);
+    try {
+      await this.ipc.endVoiceCommand();
+    } catch (e) {
+      // The stop call itself failed — don't leave the orb stuck "processing".
+      this._processing.set(false);
+      this._manualAskInFlight.set(false);
       throw e;
     }
   }
@@ -173,11 +237,18 @@ export class AssistantStore {
     this._listening.set(p.active);
   }
 
+  private onProcessing(p: VoiceCommandProcessingPayload): void {
+    this._processing.set(p.active);
+    // The backend stops the listener implicitly when it begins dispatching.
+    if (p.active) this._listening.set(false);
+  }
+
   private onResult(p: VoiceActionResultPayload): void {
-    // The answer landed — the manual ask (if any) is no longer in flight, and
-    // the listener is closed.
+    // The answer landed — the manual ask (if any) is no longer in flight, the
+    // listener is closed, and the dispatch is no longer processing.
     this._manualAskInFlight.set(false);
     this._listening.set(false);
+    this._processing.set(false);
     this._interactions.update((rows) => {
       // Resolve the most recent still-pending row; if none (a result without a
       // wake we observed), prepend a fresh resolved row so nothing is lost.

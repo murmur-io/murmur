@@ -40,41 +40,50 @@ pub fn app_dir_name() -> &'static str {
 /// Live state of a MANUAL voice-command capture (the button trigger). Held in
 /// `AppState::voice_command_capture` while the user is "asking the assistant".
 ///
-/// The capture isolates the POST-CLICK utterance: at arm time it latches the recorder's current
-/// total-sample offset (`start_sample`), and each live tick transcribes ONLY the audio captured
-/// SINCE that offset (a growing window) — so the command is exactly what the user said after the
-/// click, never the rolling tail of prior speech. `budget` is a countdown of live ticks (each ≈3s,
-/// see `transcribe::live::TICK`): it is decremented every tick that hears NOTHING (silence), and
-/// when it reaches 0 with nothing heard the capture is cleared gracefully ("nothing_heard"). An
-/// EMPTY window is NEVER dispatched.
+/// CLICK-TO-STOP: the user controls when they are done. At arm time we latch the recorder's current
+/// total-sample offset (`start_sample`); each live tick transcribes ONLY the audio captured SINCE
+/// that offset (a GROWING window) — the whole post-click utterance, never the rolling tail of prior
+/// speech — but we do NOT auto-dispatch on hearing speech. We keep listening (accumulating) until
+/// the user clicks "stop" (`end_voice_command` flips `ended` to true → dispatch the FULL accumulated
+/// utterance). `budget` is now a generous BACKSTOP cap (a countdown of live ticks, each ≈3s, see
+/// `transcribe::live::TICK`): the primary end is the user's click; the cap only prevents listening
+/// forever if no stop ever arrives. An all-silent / garbage-only capture is NEVER dispatched — it
+/// ends gracefully as "nothing_heard".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureState {
-    /// Remaining live ticks of SILENCE before we give up waiting for the user to speak and clear the
-    /// capture with a graceful "nothing_heard". Armed to a small budget by `begin_voice_command`.
+    /// Remaining live ticks of BACKSTOP before we auto-stop a capture the user never explicitly ended
+    /// (so it can't listen forever). Decremented EVERY tick. Armed to [`Self::DEFAULT_BUDGET`] by
+    /// `begin_voice_command`. The PRIMARY end is the user's `end_voice_command` click; this is just
+    /// the safety cap.
     pub budget: u32,
     /// The recorder's total-sample offset latched at arm time. Each tick transcribes the audio
     /// captured since this offset (`Recorder::snapshot_from`), so the command = what was said AFTER
     /// the click. `None` only in degenerate paths (no recorder / poisoned lock at arm time), in which
     /// case the loop falls back to the rolling-tail window so the capture still functions.
     pub start_sample: Option<usize>,
+    /// Set true by `end_voice_command` (the user's "stop" click). On the next tick the live loop
+    /// dispatches the FULL accumulated post-click utterance (or surfaces "nothing_heard" if silent).
+    pub ended: bool,
 }
 
 impl CaptureState {
-    /// How many live ticks (≈3s each) of SILENCE a single manual capture tolerates before giving up.
-    /// ~5 ticks ≈ 15s gives the user a comfortable window to click and then speak one command.
-    pub const DEFAULT_BUDGET: u32 = 5;
+    /// BACKSTOP cap: how many live ticks (≈3s each) a manual capture may listen with NO explicit stop
+    /// before it auto-stops + dispatches so it can never listen forever. ~20 ticks ≈ 60s is generous —
+    /// the user's `end_voice_command` click is the primary end; this is only the safety backstop and
+    /// must not feel like a cutoff for a normal-length question.
+    pub const DEFAULT_BUDGET: u32 = 20;
 
-    /// A freshly-armed capture with the default tick budget and no latched offset (the offset is set
+    /// A freshly-armed capture with the default backstop and no latched offset (the offset is set
     /// by `armed_from` at the call site that has the recorder). Kept for the headless tests that
     /// don't have a recorder; the live loop falls back to the rolling tail when `start_sample` is None.
     pub fn armed() -> Self {
-        Self { budget: Self::DEFAULT_BUDGET, start_sample: None }
+        Self { budget: Self::DEFAULT_BUDGET, start_sample: None, ended: false }
     }
 
     /// A freshly-armed capture that latches the recorder's total-sample `offset` at arm time, so the
     /// live loop transcribes only the POST-CLICK utterance.
     pub fn armed_from(offset: usize) -> Self {
-        Self { budget: Self::DEFAULT_BUDGET, start_sample: Some(offset) }
+        Self { budget: Self::DEFAULT_BUDGET, start_sample: Some(offset), ended: false }
     }
 }
 
