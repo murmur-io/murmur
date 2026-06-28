@@ -6,6 +6,7 @@
 //! NER (not in this stack) and are therefore NOT redacted here — surfaced in the Settings copy.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -13,6 +14,159 @@ use regex::Regex;
 
 use crate::error::Result;
 use crate::summarize::provider::{Availability, SummarizeRequest, SummarizerProvider};
+
+// ── Phase D model plumbing (shared by the feature-gated redactor + the download command) ──────────
+// The real DebertaNameRedactor lives in the sibling `crate::summarize::ner_deberta` module (declared
+// in `summarize/mod.rs`, `#[cfg(feature = "local-ner")]`); this file holds only the model resolver,
+// the active-redactor factory, and the inbound-only downloader.
+
+/// The stable `⟪NAME_` token prefix the [`NameRedactor`] family emits (closed by the index + `⟫`).
+/// Centralized so the real redactor and the fixtures/tests agree byte-for-byte. The sole runtime
+/// consumer (`ner_deberta`) is feature-gated behind `local-ner`, so the default build sees it as
+/// "unused" outside of `#[cfg(test)]` — allow that rather than feature-gate the constant itself.
+#[allow(dead_code)]
+pub(crate) const NER_NAME_TOKEN_PREFIX: &str = "\u{27ea}NAME_";
+
+/// Sub-directory under the shared models dir holding the multilingual DeBERTa NER files
+/// (`model.safetensors` + `tokenizer.json` + `config.json`, the `config.json` carrying an `id2label`
+/// with `B-PER`/`I-PER`).
+pub const NER_MODEL_SUBDIR: &str = "ner-mdeberta-v3-multilingual";
+
+/// The three Hugging Face files the real NER redactor needs, fetched INBOUND-ONLY by
+/// [`download_ner_model`]. Each is downloaded into [`NER_MODEL_SUBDIR`].
+pub const NER_MODEL_FILES: &[&str] = &["model.safetensors", "tokenizer.json", "config.json"];
+
+/// Hugging Face `resolve/main` base for the chosen multilingual mDeBERTa-v3 token-classification NER.
+/// INBOUND ONLY — fetched, never sent meeting content.
+///
+/// MODEL CHOICE (documented): a multilingual mDeBERTa-v3 NER that ships `model.safetensors` +
+/// `tokenizer.json` + a `config.json` whose `id2label` uses CoNLL-style `B-PER`/`I-PER`. candle's
+/// `DebertaV2NERModel` is fully driven by that `id2label`, so the decode is model-agnostic; only this
+/// URL names the repo. Polish PERSON recall against this specific checkpoint is a @Mac eval (see the
+/// module header of `ner_deberta.rs`). Swap this base + re-download to evaluate an alternative
+/// loadable DeBERTa-v2 PER checkpoint with zero code change.
+pub const NER_MODEL_HF_BASE: &str =
+    "https://huggingface.co/Davlan/mdeberta-v3-base-ner-hrl/resolve/main";
+
+/// Resolve the on-disk dir the real NER redactor loads from: `<models_dir>/ner-mdeberta-v3-multilingual/`.
+/// Creating the models dir can fail (returns `Err`); the dir itself may not yet exist (that is fine —
+/// the caller checks [`ner_model_present`]). NEVER panics.
+pub fn ner_model_dir() -> Result<PathBuf> {
+    Ok(crate::transcribe::models_dir()?.join(NER_MODEL_SUBDIR))
+}
+
+/// `true` when all three NER model files exist in [`ner_model_dir`]. Pure existence probe; a
+/// models-dir resolution error is treated as "not present" (graceful — falls back to the no-op),
+/// never propagated as a hard error.
+pub fn ner_model_present() -> bool {
+    match ner_model_dir() {
+        Ok(dir) => NER_MODEL_FILES.iter().all(|f| dir.join(f).is_file()),
+        Err(_) => false,
+    }
+}
+
+/// The single active name-redactor used by [`RedactingProvider`] (mirrors
+/// [`crate::embed::active_embedder`]). Graceful degradation, in priority order:
+/// - the `local-ner` feature is ON **and** the NER model dir is present at [`ner_model_dir`]
+///   ([`ner_model_present`]) → the real [`ner_deberta::DebertaNameRedactor`] (lazy: the model loads on
+///   first `redact_names`, not here, so this never blocks startup and never panics);
+/// - otherwise (feature off, no model, or a construction error) → the dependency-free
+///   [`NoopNameRedactor`]. Egress is then byte-identical to before this seam existed (ZERO regression).
+///
+/// NEVER panics and NEVER blocks. A NER miss leaks no more than the no-op (the redactor only ever
+/// REMOVES content), so the worst case == today's behaviour.
+pub fn active_name_redactor() -> Arc<dyn NameRedactor> {
+    #[cfg(feature = "local-ner")]
+    {
+        if ner_model_present() {
+            match ner_model_dir().and_then(crate::summarize::ner_deberta::DebertaNameRedactor::new) {
+                Ok(r) => {
+                    tracing::info!(target: "ner", "local NER name-redactor ready (lazy load)");
+                    return Arc::new(r);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "ner", error = %e, "local NER init failed; using no-op name redactor");
+                }
+            }
+        } else {
+            tracing::info!(target: "ner", "no local NER model present; using no-op name redactor");
+        }
+    }
+    Arc::new(NoopNameRedactor)
+}
+
+/// Download the three NER model files into [`ner_model_dir`], INBOUND-ONLY, with progress.
+///
+/// Mirrors [`crate::embed::download_embed_model`]: each file streams to `<file>.part` then renames
+/// atomically; `on_progress(file_index, downloaded, total)` fires as bytes arrive (`total` is `None`
+/// when the server omits `Content-Length`). A file already present on disk is SKIPPED. INBOUND ONLY:
+/// fetches model files and sends NO request body / NO meeting content (no egress). NO PII logged —
+/// filenames + byte counts only.
+pub async fn download_ner_model<F>(mut on_progress: F) -> Result<PathBuf>
+where
+    F: FnMut(usize, u64, Option<u64>),
+{
+    use crate::error::AppError;
+    use tokio::io::AsyncWriteExt;
+
+    let dir = ner_model_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Storage(format!("create ner model dir: {e}")))?;
+
+    for (idx, file) in NER_MODEL_FILES.iter().enumerate() {
+        let dest = dir.join(file);
+        if dest.is_file() {
+            continue;
+        }
+        let url = format!("{NER_MODEL_HF_BASE}/{file}");
+        tracing::info!(target: "ner", file = %file, "downloading ner model file");
+
+        let mut resp = reqwest::get(&url)
+            .await
+            .map_err(|e| AppError::Storage(format!("ner model download request failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(AppError::Storage(format!(
+                "ner model download HTTP {} for {file}",
+                resp.status()
+            )));
+        }
+        let total = resp.content_length();
+
+        let part = dest.with_extension("part");
+        let mut out = tokio::fs::File::create(&part)
+            .await
+            .map_err(|e| AppError::Storage(format!("create ner model temp file: {e}")))?;
+        let mut downloaded: u64 = 0;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| AppError::Storage(format!("ner model download body failed: {e}")))?
+        {
+            out.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Storage(format!("write ner model chunk: {e}")))?;
+            downloaded += chunk.len() as u64;
+            on_progress(idx, downloaded, total);
+        }
+        out.flush()
+            .await
+            .map_err(|e| AppError::Storage(format!("flush ner model file: {e}")))?;
+        drop(out);
+
+        if downloaded == 0 {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(AppError::Storage(format!(
+                "ner model download returned empty body for {file}"
+            )));
+        }
+        tokio::fs::rename(&part, &dest)
+            .await
+            .map_err(|e| AppError::Storage(format!("rename ner model file: {e}")))?;
+        tracing::info!(target: "ner", file = %file, bytes = downloaded, "ner model file ready");
+    }
+
+    Ok(dir)
+}
 
 fn email_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
@@ -390,6 +544,81 @@ mod tests {
         assert!(sent.contains("\u{27ea}NAME_1\u{27eb}"));
         // ...but the caller still gets the real names back.
         assert!(out.contains("Anna Kowalska") && out.contains("Bob Smith"));
+    }
+
+    // ── Phase D model plumbing + active factory ──────────────────────────────
+
+    #[test]
+    fn ner_model_dir_is_under_models_dir() {
+        let dir = ner_model_dir().unwrap();
+        assert!(dir.ends_with(NER_MODEL_SUBDIR));
+        assert_eq!(
+            NER_MODEL_FILES,
+            &["model.safetensors", "tokenizer.json", "config.json"]
+        );
+        assert!(NER_MODEL_HF_BASE.contains("mdeberta"));
+        // The token prefix the redactor emits matches the ⟪NAME_ tokens the tests assert on.
+        assert_eq!(NER_NAME_TOKEN_PREFIX, "\u{27ea}NAME_");
+    }
+
+    #[test]
+    fn ner_model_present_false_when_any_file_missing() {
+        // On a clean machine the NER dir is absent ⇒ not present.
+        let dir = ner_model_dir().unwrap();
+        if !dir.is_dir() {
+            assert!(!ner_model_present(), "absent NER dir must report not-present");
+        }
+    }
+
+    #[test]
+    fn active_name_redactor_falls_back_to_noop_without_model() {
+        // The graceful-degradation contract: with NO NER model present, `active_name_redactor`
+        // returns a redactor that leaves text byte-identical (the no-op). With `local-ner` OFF this
+        // is unconditional; with it ON it still holds whenever the model dir is absent.
+        if !ner_model_present() {
+            let r = active_name_redactor();
+            let text = "Anna Kowalska met Bob Smith on Friday.";
+            let (out, pairs) = r.redact_names(text);
+            assert_eq!(out, text, "no-op fallback must be byte-identical");
+            assert!(pairs.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_make_provider_egress_byte_identical_with_active_redactor() {
+        // End-to-end through the PRODUCTION seam: `RedactingProvider::with_name_redactor(inner,
+        // active_name_redactor())` (what `make_provider` now wires). On a clean machine the active
+        // redactor is the no-op, so a names-only transcript reaches the inner provider verbatim —
+        // proving the wire change is zero-regression when no model is installed.
+        if !ner_model_present() {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+            struct CaptureProvider(std::sync::Arc<std::sync::Mutex<String>>);
+            #[async_trait]
+            impl SummarizerProvider for CaptureProvider {
+                fn id(&self) -> &str {
+                    "capture"
+                }
+                async fn availability(&self) -> Availability {
+                    Availability::Available
+                }
+                async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+                    *self.0.lock().unwrap() = req.transcript.clone();
+                    Ok("done".to_string())
+                }
+                async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                    Ok(String::new())
+                }
+            }
+
+            let prov = RedactingProvider::with_name_redactor(
+                Arc::new(CaptureProvider(captured.clone())),
+                active_name_redactor(),
+            );
+            let transcript = "Anna Kowalska met Bob Smith on Friday to plan Atlas.";
+            block_on(prov.summarize(&sample_req(transcript))).unwrap();
+            assert_eq!(*captured.lock().unwrap(), transcript);
+        }
     }
 
     #[test]
