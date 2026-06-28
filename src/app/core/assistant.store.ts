@@ -50,10 +50,15 @@ export class AssistantStore {
 
   private unlistenWake: UnlistenFn | null = null;
   private unlistenResult: UnlistenFn | null = null;
+  /** Synchronous re-entrancy guard so two concurrent init() calls (e.g. the record
+   * screen + the card both initialising) can't double-subscribe before the first
+   * `await` resolves. */
+  private initializing = false;
 
-  /** Subscribe once to the wake + result streams. Idempotent. */
+  /** Subscribe once to the wake + result streams. Idempotent + concurrency-safe. */
   async init(): Promise<void> {
-    if (this.unlistenWake) return;
+    if (this.unlistenWake || this.initializing) return;
+    this.initializing = true;
     this.unlistenWake = await this.ipc.onWakeDetected((p) => this.onWake(p));
     this.unlistenResult = await this.ipc.onVoiceActionResult((p) =>
       this.onResult(p),
