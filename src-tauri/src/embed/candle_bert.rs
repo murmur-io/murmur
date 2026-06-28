@@ -1,6 +1,6 @@
 //! Real on-device embedding model (Phase C) — an [`Embedder`] backed by candle-transformers 0.10.2
-//! BERT inference (Metal). Compiled ONLY under `--features local-embed`; the default build ships the
-//! dependency-free `StubEmbedder` instead.
+//! BERT inference (Metal). ALWAYS compiled; [`crate::embed::active_embedder`] selects it at runtime
+//! when the multilingual-e5-small model dir is present, else ships the dependency-free `StubEmbedder`.
 //!
 //! ## Honest scope (READ THIS)
 //!
@@ -13,9 +13,9 @@
 //! - **Polish** recall;
 //! - **Metal** performance + correctness (load time, throughput, the Metal-vs-CPU fallback).
 //!
-//! `cargo test --lib` NEVER runs a forward pass here. Treat a green `--features local-embed` build as
-//! proof the impl typechecks/links against candle 0.10.2 — NOT as proof embedding works. The real
-//! quality/Metal/Polish-recall bake-off is @Mac.
+//! `cargo test --lib` NEVER runs a forward pass here (the smoke test is `#[ignore]`d). Treat a green
+//! build as proof the impl typechecks/links against candle 0.10.2 — NOT as proof embedding works. The
+//! real quality/Metal/Polish-recall bake-off is @Mac.
 //!
 //! ## Graceful + crash-safe
 //!
@@ -242,15 +242,15 @@ fn l2_normalize(x: &Tensor) -> candle_core::Result<Tensor> {
 /// on disk + Metal), so it never runs in the normal `cargo test` loop. Run:
 ///
 /// ```text
-/// cargo test --features local-embed embed::candle_bert::smoke -- --ignored --nocapture
+/// cargo test embed::candle_bert::smoke -- --ignored --nocapture
 /// ```
-#[cfg(all(test, feature = "local-embed"))]
+#[cfg(test)]
 mod smoke {
     use super::CandleBertEmbedder;
     use crate::embed::{embed_model_dir, Embedder, EMBED_DIM};
 
     #[test]
-    #[ignore = "needs the e5 model on disk + Metal; run manually with --features local-embed"]
+    #[ignore = "needs the e5 model on disk + Metal; run manually on a Mac"]
     fn e5_loads_and_embeds() {
         let dir = embed_model_dir().expect("embed_model_dir");
         assert!(

@@ -1,6 +1,7 @@
 //! Real on-device PERSON-name redaction (Phase D) — a [`NameRedactor`](crate::summarize::redact::NameRedactor)
-//! backed by candle-transformers 0.10.2 token-classification NER (DeBERTa-v2, Metal). Compiled ONLY
-//! under `--features local-ner`; the default build ships the dependency-free
+//! backed by candle-transformers 0.10.2 token-classification NER (DeBERTa-v2, Metal). ALWAYS compiled;
+//! [`active_name_redactor`](crate::summarize::redact::active_name_redactor) selects it at runtime when
+//! the NER model dir is present, else ships the dependency-free
 //! [`NoopNameRedactor`](crate::summarize::redact::NoopNameRedactor) instead.
 //!
 //! ## What this does (and why it is SAFE-BY-DESIGN)
@@ -31,8 +32,8 @@
 //!
 //! ## Honest scope (READ THIS)
 //!
-//! Everything here is **COMPILE-proven only** in the headless CI loop (`cargo build --features
-//! local-ner --lib`). What can ONLY be verified on a signed/dev build on a real Mac, with the NER
+//! Everything here is **COMPILE-proven only** in the headless CI loop (`cargo build --lib`). What can
+//! ONLY be verified on a signed/dev build on a real Mac, with the NER
 //! files actually present, is: real NER quality, **Polish PERSON recall**, the BIO decode against the
 //! real tokenizer's subword offsets, and **Metal** correctness/perf (Metal-vs-CPU fallback). The pure
 //! BIO→span decode + distinct-name→token mapping IS unit-tested headless via injected logits — that
@@ -398,8 +399,8 @@ mod tests {
     /// Build (label_ids, offsets, special) for a sequence of (token_text, label_id) over a source
     /// string, prepending a CLS and appending a SEP special token (offsets (0,0), special=1) like a
     /// real DeBERTa encoding. Token offsets are located by scanning the source left-to-right.
-    fn fixture<'a>(
-        src: &'a str,
+    fn fixture(
+        src: &str,
         toks: &[(&str, u32)],
     ) -> (Vec<u32>, Vec<(usize, usize)>, Vec<u32>) {
         let mut labels = vec![0u32]; // CLS
@@ -511,15 +512,15 @@ mod tests {
 /// normal `cargo test` loop. Run:
 ///
 /// ```text
-/// cargo test --features local-ner summarize::ner_deberta::smoke -- --ignored --nocapture
+/// cargo test summarize::ner_deberta::smoke -- --ignored --nocapture
 /// ```
-#[cfg(all(test, feature = "local-ner"))]
+#[cfg(test)]
 mod smoke {
     use super::DebertaNameRedactor;
     use crate::summarize::redact::{ner_model_dir, NameRedactor};
 
     #[test]
-    #[ignore = "needs the NER model on disk + Metal; run manually with --features local-ner"]
+    #[ignore = "needs the NER model on disk + Metal; run manually on a Mac"]
     fn deberta_masks_polish_person() {
         let dir = ner_model_dir().expect("ner_model_dir");
         assert!(

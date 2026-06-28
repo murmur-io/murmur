@@ -124,6 +124,12 @@ at launch ("Rust cannot catch foreign exceptions"). See the header doc in
 
 - Inner dev/verify loop: `cargo test --lib` (the ~128 unit tests live in `src-tauri/src/**`).
   Run it from `src-tauri/` (or `source ~/.cargo/env` first).
+- The on-device brain (mistralrs) + embedder/NER (candle/tokenizers) are now ALWAYS compiled (the
+  feature gates were removed so the real impls ship by default, selected at runtime on model
+  presence). So `cargo test --lib` now DOES compile the heavy ML tree: the FIRST build after a clean
+  checkout (or a deps bump) is slow (hundreds of MB), but the incremental loop stays fast once warm —
+  let a slow first build finish, don't bail. `MISTRALRS_METAL_PRECOMPILE=0` is baked into
+  `src-tauri/.cargo/config.toml [env]` (CLT-only Mac defers Metal-shader compile to first run).
 - Do NOT run `cargo clippy --all-targets` in the iterative loop — it thrashes the
   openssl/sqlcipher build profile and times out. The full gate `scripts/ci.sh` (which DOES run
   clippy `-D warnings` + tests + `ng lint` + `ng build` + headless E2E) is the FINAL check, run
