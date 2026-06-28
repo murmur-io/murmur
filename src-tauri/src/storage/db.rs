@@ -8,9 +8,9 @@ use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
 use crate::storage::models::{
-    Analytics, CorrectionRecord, DayCount, EntityDetail, EntityKind, EntityNeighbor, Folder,
-    GraphData, GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord,
-    SearchHit, StatusCount, VaultSource,
+    Analytics, Commitment, CorrectionRecord, DayCount, EntityDetail, EntityKind, EntityNeighbor,
+    Folder, GraphData, GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord,
+    RecipeRecord, SearchHit, StatusCount, VaultSource,
 };
 use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
@@ -2252,6 +2252,57 @@ impl Db {
         Ok(!has_notes || has_visible)
     }
 
+    /// OPEN-COMMITMENTS rollup (deterministic, no model): every OPEN (`- [ ]`) action item across
+    /// the VISIBLE meetings, with its meeting context. DOUBLE-GATED — the meeting list is filtered
+    /// by `list_meetings_visible(unlocked)` and each note is re-fetched through
+    /// `get_note_if_visible(unlocked)`, so a sealed-and-not-session-unlocked meeting contributes
+    /// NOTHING (its note markdown is never read here). Checked-off (`- [x]`) items are dropped.
+    /// `owner`, when Some, filters case-insensitively. Sorted by due date (None last), then recency.
+    pub fn list_open_commitments(
+        &self,
+        unlocked: &HashSet<String>,
+        owner: Option<&str>,
+    ) -> Result<Vec<Commitment>> {
+        let owner_lc = owner
+            .map(|o| o.trim().to_lowercase())
+            .filter(|o| !o.is_empty());
+        let mut out: Vec<Commitment> = Vec::new();
+        // GATE 1: only VISIBLE meetings. GATE 2: only the VISIBLE note (None for sealed-not-unlocked).
+        for m in self.list_meetings_visible(1000, unlocked)? {
+            let Some(note) = self.get_note_if_visible(&m.id, unlocked)? else {
+                continue;
+            };
+            let title = m.title.clone().unwrap_or_else(|| "(untitled)".to_string());
+            for item in crate::summarize::action_items::parse_action_items(&note.markdown) {
+                if item.done {
+                    continue; // `- [x]` — already done, not an open commitment.
+                }
+                if let Some(want) = owner_lc.as_deref() {
+                    match item.owner.as_deref() {
+                        Some(o) if o.trim().to_lowercase() == want => {}
+                        _ => continue,
+                    }
+                }
+                out.push(Commitment {
+                    meeting_id: m.id.clone(),
+                    meeting_title: title.clone(),
+                    started_at: m.started_at.clone(),
+                    owner: item.owner,
+                    due_date: item.due_date,
+                    text: item.text,
+                });
+            }
+        }
+        // Due date ascending (soonest first), items with no date last; ties broken by recency.
+        out.sort_by(|a, b| match (a.due_date.as_deref(), b.due_date.as_deref()) {
+            (Some(x), Some(y)) => x.cmp(y).then_with(|| b.started_at.cmp(&a.started_at)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b.started_at.cmp(&a.started_at),
+        });
+        Ok(out)
+    }
+
     // ── self-assembling graph (entities + mentions) ───────────────────────────
     //
     // Sink A of the dual-sink: the encrypted DB is the source of truth for the in-app
@@ -4124,6 +4175,57 @@ mod lock_tests {
             db.restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn list_open_commitments_aggregates_attaches_context_and_gates() {
+        let db = file_db("commitments");
+        seed_folder(&db, "f-lock", "Secret");
+        // open1: one open item w/ owner+due, one DONE item, one loose open item (no owner/date).
+        seed_note(
+            &db,
+            "open1",
+            "## Action items\n- [ ] Anna — ship the deck 2026-07-01\n- [x] Bob — done thing\n- [ ] just a loose task\n",
+            None,
+        );
+        // open2: one open item, an earlier due date (sorts first).
+        seed_note(&db, "open2", "- [ ] Carol — review 2026-06-15\n", None);
+        // sealed: in a folder we lock → must contribute NOTHING until session-unlocked.
+        seed_note(&db, "sealed", "- [ ] Dave — secret task 2026-07-02\n", Some("f-lock"));
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        // GATED: folder locked, not session-unlocked → sealed meeting excluded; DONE item excluded.
+        let open = db.list_open_commitments(&HashSet::new(), None).unwrap();
+        assert!(
+            open.iter().all(|c| c.meeting_id != "sealed"),
+            "sealed-not-unlocked meeting leaked into the rollup (gate violation)"
+        );
+        assert!(open.iter().all(|c| !c.text.contains("done thing")), "checked `- [x]` item must be excluded");
+        assert_eq!(open.len(), 3, "two open meetings → 3 open items (Carol, Anna, loose)");
+
+        // Sort: due dates ascending, then None last.
+        assert_eq!(open[0].due_date.as_deref(), Some("2026-06-15"));
+        assert_eq!(open[0].owner.as_deref(), Some("Carol"));
+        assert_eq!(open[0].meeting_title, "title-open2", "meeting context attached");
+        assert_eq!(open[1].due_date.as_deref(), Some("2026-07-01"));
+        assert_eq!(open[1].owner.as_deref(), Some("Anna"));
+        assert_eq!(open[2].due_date, None, "the dateless loose task sorts last");
+        assert_eq!(open[2].owner, None);
+
+        // Session-unlock → the sealed meeting's open commitment reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let all = db.list_open_commitments(&unlocked, None).unwrap();
+        assert!(
+            all.iter().any(|c| c.meeting_id == "sealed" && c.text.contains("secret task")),
+            "unlocked folder's commitment must reappear"
+        );
+
+        // Owner filter (case-insensitive) keeps only Anna's item.
+        let anna = db.list_open_commitments(&unlocked, Some("ANNA")).unwrap();
+        assert_eq!(anna.len(), 1);
+        assert!(anna[0].text.contains("ship the deck"));
+        assert_eq!(anna[0].meeting_title, "title-open1");
     }
 
     #[test]
