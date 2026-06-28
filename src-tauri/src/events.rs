@@ -34,6 +34,22 @@ pub struct WakeDetectedPayload {
 /// citations over VISIBLE meetings only). The rich result card is Phase H.
 pub const EVENT_VOICE_ACTION_RESULT: &str = "murmur://voice-action-result";
 
+/// Emitted when the MANUAL voice-command capture (the button trigger) changes state: `active: true`
+/// when the user clicks "ask the assistant" and the live loop starts collecting the next spoken
+/// utterance as a command (NO wake word), `active: false` once it has been dispatched, given up at
+/// budget, or armed while not recording. Lets the FE show/clear the "listening…" affordance. The
+/// resulting answer still arrives via [`EVENT_VOICE_ACTION_RESULT`] (same gated dispatch path as the
+/// wake trigger). Carries NO transcript — just the boolean.
+pub const EVENT_VOICE_COMMAND_LISTENING: &str = "murmur://voice-command-listening";
+
+/// Payload for [`EVENT_VOICE_COMMAND_LISTENING`]. Boolean only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCommandListeningPayload {
+    /// True while the manual capture is armed/listening; false once it ends.
+    pub active: bool,
+}
+
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
 pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
 

@@ -34,6 +34,7 @@ import type {
   StopResult,
   TopicThread,
   VoiceActionResultPayload,
+  VoiceCommandListeningPayload,
   WakeDetectedPayload,
 } from "./models";
 
@@ -44,6 +45,7 @@ export const EVENT_LIVE_CAPTION = "murmur://live-caption";
 // Phase H — the brain / in-meeting voice assistant event stream.
 export const EVENT_WAKE_DETECTED = "murmur://wake-detected";
 export const EVENT_VOICE_ACTION_RESULT = "murmur://voice-action-result";
+export const EVENT_VOICE_COMMAND_LISTENING = "murmur://voice-command-listening";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 
 /**
@@ -420,6 +422,18 @@ export class IpcService {
     return invoke<void>("toggle_bar");
   }
 
+  /**
+   * Phase H — manually trigger the in-meeting voice assistant to listen for a
+   * spoken command (the "Ask AI" button in the recording bar), bypassing the
+   * wake phrase. The backend emits `EVENT_VOICE_COMMAND_LISTENING {active:true}`
+   * while the mic is open, then `{active:false}` once it captures the utterance;
+   * the answer arrives via `EVENT_VOICE_ACTION_RESULT`. The promise resolves once
+   * listening has STARTED (not when the answer is ready).
+   */
+  beginVoiceCommand(): Promise<void> {
+    return invoke<void>("begin_voice_command");
+  }
+
   // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
 
   /** The folder tree (roots → children) with per-folder note counts + session lock state. */
@@ -520,6 +534,20 @@ export class IpcService {
   ): Promise<UnlistenFn> {
     return listen<VoiceActionResultPayload>(EVENT_VOICE_ACTION_RESULT, (e) =>
       cb(e.payload),
+    );
+  }
+
+  /**
+   * Fires when the manual "Ask AI" voice-command listener opens (`active:true`)
+   * and closes (`active:false`). Drives the inline "🎙 Słucham…" listening
+   * indicator + the pulsing Ask-AI button in the recording bar.
+   */
+  onVoiceCommandListening(
+    cb: (p: VoiceCommandListeningPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<VoiceCommandListeningPayload>(
+      EVENT_VOICE_COMMAND_LISTENING,
+      (e) => cb(e.payload),
     );
   }
 

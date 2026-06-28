@@ -37,6 +37,29 @@ pub fn app_dir_name() -> &'static str {
     }
 }
 
+/// Live state of a MANUAL voice-command capture (the button trigger). Held in
+/// `AppState::voice_command_capture` while the user is "asking the assistant". The `budget` is a
+/// countdown of live ticks (each ≈3s, see `transcribe::live::TICK`): it is decremented every tick
+/// the capture survives, and when it reaches 0 the captured tail is dispatched as-is (even if its
+/// intent is `Unknown`, yielding a graceful "unrecognized" result) so the capture can never hang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureState {
+    /// Remaining live ticks before we give up waiting for a recognized intent and dispatch the
+    /// last-heard tail. Armed to a small budget (e.g. 3 ticks ≈ 9s) by `begin_voice_command`.
+    pub budget: u32,
+}
+
+impl CaptureState {
+    /// How many live ticks (≈3s each) a single manual capture stays armed. ~3 ticks ≈ 9s gives the
+    /// user time to finish one spoken command after clicking.
+    pub const DEFAULT_BUDGET: u32 = 3;
+
+    /// A freshly-armed capture with the default tick budget.
+    pub fn armed() -> Self {
+        Self { budget: Self::DEFAULT_BUDGET }
+    }
+}
+
 pub struct AppState {
     /// Some while recording.
     pub recorder: Mutex<Option<Recorder>>,
@@ -46,6 +69,15 @@ pub struct AppState {
     pub aec_recorder: Mutex<Option<crate::audio::aec::AecRecorder>>,
     /// Some while the voice-trigger listener is running.
     pub voice_listener: Mutex<Option<VoiceListener>>,
+    /// MANUAL voice-command capture (the button trigger): `Some` while the user has clicked
+    /// "ask the assistant" and the live loop is collecting the next spoken utterance as a command —
+    /// NO wake word required. Armed by [`crate::commands::begin_voice_command`], consumed + cleared
+    /// by the live loop (`transcribe::live`). The budget is a small N-tick countdown rather than a
+    /// wall-clock deadline (this codebase has no `Instant` capture pattern): each live tick decrements
+    /// it, and on a recognized intent OR budget exhaustion the captured tail is dispatched over the
+    /// SAME gated `handle_voice_action` path as the wake trigger. Opt-in PER CLICK — independent of
+    /// the `realtime_reactions` toggle.
+    pub voice_command_capture: Mutex<Option<CaptureState>>,
     /// Db is internally Send+Sync (Mutex<Connection>).
     pub db: Db,
     /// In-memory cache of the settings table.
@@ -135,6 +167,7 @@ impl AppState {
             system_recorder: Mutex::new(None),
             aec_recorder: Mutex::new(None),
             voice_listener: Mutex::new(None),
+            voice_command_capture: Mutex::new(None),
             db,
             config: Mutex::new(config),
             reasoner,
