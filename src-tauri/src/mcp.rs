@@ -243,6 +243,11 @@ fn tools_spec() -> Value {
             "name": "get_open_commitments",
             "description": "Roll up every OPEN action item ('- [ ]', still open / not done) across your meetings, with each item's owner, due date and source meeting. Answers 'what did I promise / what is still open'. Optionally filter by owner (case-insensitive). Sealed-and-locked meetings are excluded.",
             "inputSchema": { "type": "object", "properties": { "owner": { "type": "string" } } }
+        },
+        {
+            "name": "get_entity_dossier",
+            "description": "Assemble a DOSSIER on one person or project across all your meetings: a timeline of mentions, the entity's open commitments, and co-occurring people/projects — each citing its source meeting [[Title]]. Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id. Returns the gated source material for YOU to synthesize the 'state of [[entity]]' (Overview, Timeline, Open commitments, Last said / next step). Sealed-and-locked meetings are excluded.",
+            "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" } }, "required": ["entity"] }
         }
     ])
 }
@@ -388,6 +393,29 @@ fn dispatch_tool(
                 Err(e) => Err((-32000, format!("commitments rollup failed: {e}"))),
             }
         }
+        "get_entity_dossier" => {
+            // EGRESS-FREE: the MCP server NEVER makes a cloud LLM call. It returns the GATED
+            // STRUCTURED DATA (overview + timeline + open commitments + neighbours + the
+            // citation-tagged note corpus) for the CLIENT (Claude Desktop) to synthesize. Every
+            // read inside `build_dossier_data` is visibility-gated against `unlocked_set`
+            // (entity_is_visible / entity_mentions_visible / get_note_if_visible /
+            // list_open_commitments / entity_neighbors_visible), so a sealed-and-not-unlocked
+            // meeting contributes nothing. No `make_provider` / `complete` is ever constructed here.
+            let entity = args.get("entity").and_then(Value::as_str).unwrap_or("");
+            if entity.trim().is_empty() {
+                return Err((-32602, "missing required argument: entity".to_string()));
+            }
+            let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked_set) {
+                Ok(Some(id)) => id,
+                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Err(e) => return Err((-32000, format!("entity resolve failed: {e}"))),
+            };
+            match crate::summarize::dossier::build_dossier_data(db, &id, unlocked_set) {
+                Ok(Some(data)) => Ok(crate::summarize::dossier::format_dossier_client(&data)),
+                Ok(None) => Ok(format!("No visible entity matching \"{entity}\".")),
+                Err(e) => Err((-32000, format!("dossier build failed: {e}"))),
+            }
+        }
         other => Err((-32602, format!("unknown tool: {other}"))),
     }
 }
@@ -455,14 +483,16 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_five_tools() {
+    fn tools_list_has_six_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "get_open_commitments"));
+        // The Phase 5b entity-dossier tool is advertised.
+        assert!(tools.iter().any(|t| t["name"] == "get_entity_dossier"));
     }
 
     #[test]
@@ -733,6 +763,75 @@ mod tests {
             !out3.contains("sign the contract"),
             "owner filter must drop Carol's item"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Phase 5b: `get_entity_dossier` is visibility-gated AND egress-free. A sealed-and-not-unlocked
+    /// mentioning meeting contributes nothing to the dossier payload (no title, no note body), and
+    /// reappears once the folder is session-unlocked. The dispatch builds GATED STRUCTURED DATA only
+    /// — it never constructs a provider or makes a cloud call (the whole `dispatch_tool` path has no
+    /// `make_provider`/`complete`), so the MCP server stays read-only + egress-free.
+    #[test]
+    fn get_entity_dossier_is_visibility_gated_and_egress_free() {
+        use crate::storage::models::{EntityKind, Folder};
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed(
+            &db,
+            "open",
+            "Kickoff",
+            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            None,
+        );
+        seed(
+            &db,
+            "sealed",
+            "Secret Atlas Review",
+            "LOCKED Atlas acquisition price\n## Action items\n- [ ] Carol — sign 2026-07-09\n",
+            Some("f-lock"),
+        );
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "open").unwrap();
+        db.add_mention(&atlas, "sealed").unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        // Not unlocked → the dossier resolves Atlas by NAME, includes the open meeting [[Title]]
+        // and its commitment, and EXCLUDES the sealed meeting's title, note body, and commitment.
+        let args = json!({ "entity": "Atlas" });
+        let out = dispatch_tool(&db, "get_entity_dossier", &args, &HashSet::new()).unwrap();
+        assert!(out.contains("DOSSIER for [[Atlas]]"), "overview header must render");
+        assert!(out.contains("[[Kickoff]]"), "visible meeting must be cited");
+        assert!(out.contains("draft Atlas spec"), "visible open commitment must surface");
+        assert!(
+            !out.contains("Secret Atlas Review") && !out.contains("LOCKED Atlas acquisition"),
+            "sealed-not-unlocked meeting leaked into the dossier (gate violation)"
+        );
+        assert!(!out.contains("sign"), "sealed commitment leaked into the dossier");
+
+        // Session-unlock → the sealed meeting + its content reappear.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = dispatch_tool(&db, "get_entity_dossier", &args, &unlocked).unwrap();
+        assert!(out2.contains("[[Secret Atlas Review]]"), "unlocked meeting must reappear");
+        assert!(out2.contains("LOCKED Atlas acquisition"), "unlocked content must reappear");
+
+        // Unknown entity → a friendly, non-leaking message (never an error).
+        let none = dispatch_tool(
+            &db,
+            "get_entity_dossier",
+            &json!({ "entity": "Nonexistent" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(none.contains("No visible entity"), "unknown entity → friendly message");
         let _ = std::fs::remove_file(&p);
     }
 

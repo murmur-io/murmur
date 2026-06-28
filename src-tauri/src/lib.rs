@@ -90,6 +90,7 @@ pub fn run() {
             commands::get_graph,
             commands::get_entity_detail,
             commands::ask_vault,
+            commands::entity_dossier,
             commands::generate_digest,
             commands::topic_threads,
             commands::export_canvas,
