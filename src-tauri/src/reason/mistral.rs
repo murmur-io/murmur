@@ -33,9 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mistralrs::{
-    Constraint, GgufModelBuilder, Model, RequestBuilder, TextMessageRole, TextMessages,
-};
+use mistralrs::{GgufModelBuilder, Model, TextMessageRole, TextMessages};
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
@@ -132,19 +130,17 @@ impl LocalReasoner for MistralReasoner {
     }
 
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value> {
-        let model = self.model()?;
-        // Prefer mistralrs' JSON-schema-CONSTRAINED decode: the sampler is restricted to tokens that
-        // keep the output conformant, so generation cannot drift off-schema. (Constraint correctness
-        // is a Mac-eval item — see the module header.)
-        let request = RequestBuilder::new()
-            .add_message(TextMessageRole::System, system)
-            .add_message(TextMessageRole::User, user)
-            .set_constraint(Constraint::JsonSchema(json_schema.clone()));
-        let resp = block_on(&self.rt, model.send_chat_request(request))?
-            .map_err(|e| AppError::Summarize(format!("brain structured generation failed: {e}")))?;
-        let content = Self::first_content(resp)?;
-        // Constrained decoding SHOULD yield pure JSON, but route through the robust extractor anyway
-        // (mirrors `StubReasoner`) so a model that still wraps prose/fences around it parses cleanly.
+        // mistralrs' `Constraint::JsonSchema` overflowed the model context on Bielik-11B
+        // (a `narrow … start: 32768` model error at the 32K context boundary), so instead we
+        // INSTRUCT JSON in the prompt and recover it with the robust extractor — the SAME
+        // approach `CloudReasoner` uses. `reason()` (unconstrained generation) is proven to work
+        // (the on-Mac smoke test produced sane Polish); `parse_first_json` tolerates any prose or
+        // markdown fence the model wraps around the object.
+        let sys = format!(
+            "{system}\n\nRespond with ONLY a single JSON object conforming to this schema: \
+             {json_schema}. No prose, no markdown fences."
+        );
+        let content = self.reason(&sys, user)?;
         parse_first_json(&content)
     }
 }
