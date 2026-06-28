@@ -7,9 +7,10 @@
 //!    French/English proper noun inside Polish speech ("Klałd", "Cloud", "Klałdku", "Klod",
 //!    "Claud", "klołdku", …). It NORMALIZES (lowercase → strip Polish diacritics → collapse the
 //!    systematic au/ał/ou/oł→o and cl→kl confusions → squeeze repeats), then matches the name
-//!    token by a hand-rolled Levenshtein against a small wake-lexicon, ANCHORED at an utterance
-//!    boundary (absolute start, or right after a short interjection like "hej"/"ok"). Precision is
-//!    favoured over recall — a false fire mid-meeting is the failure mode to avoid.
+//!    token by its VOCATIVE SHAPE ("kl…" + vowel/`d` nucleus + "-ku"/"-ko"), ANCHORED at an
+//!    utterance boundary (absolute start, or right after a short interjection like "hej"/"ok").
+//!    RECALL is favoured (the wake must always catch, incl. the d-less "Klauku"), with precision
+//!    held by the shape-gate + the boundary anchor so ordinary speech stays silent.
 //! 2. [`parse_voice_intent`] — map the recognized command tail to a structured [`VoiceIntent`]
 //!    with a deterministic PL+EN keyword/pattern parser. Structured so a future
 //!    `LocalReasoner`-backed parser ([`crate::reason`]) is a drop-in replacement.
@@ -29,22 +30,6 @@ pub struct WakeHit {
     pub command: String,
 }
 
-/// The ONLY firing wake-lexicon: the distinctive Polish vocative diminutive of the assistant's
-/// name ("Claudku"/"Klaudku"/"Klałdku" → "klodku", "kladku"). PRECISION-FIRST anchor.
-///
-/// The bare French/English name forms "klod"/"klode" (cloud/claude) were DELIBERATELY DROPPED from
-/// the firing set: they sit within edit-distance 1 of ubiquitous meeting words ("loud"→"lod",
-/// "cloud"→"klod", "close"→"klose"), so firing on them is hopelessly imprecise. We anchor instead
-/// on the 3-syllable vocative the user actually says — a long (len 6), `'d'`-skeletoned token that
-/// ENDS IN the vocative `'u'`. See [`detect_wake`]'s recall trade-off note.
-const WAKE_LEXICON: [&str; 2] = ["klodku", "kladku"];
-
-/// Tight edit-distance threshold — normalization already absorbs the systematic confusions, so
-/// only minor residual error is allowed on top. Safe ONLY because the lexicon words are long
-/// (len 6) + distinctive, so their 1-edit neighbourhood is small. Bigger = more recall, more
-/// false fires.
-const WAKE_THRESHOLD: usize = 1;
-
 /// Short interjections that may precede the wake name ("hej claude"). NOT a wake anchor on their
 /// own ("hej"/"ok" alone are far too common).
 const INTERJECTIONS: [&str; 11] = [
@@ -53,22 +38,26 @@ const INTERJECTIONS: [&str; 11] = [
 
 /// Detect the assistant wake name at the head of `text` and split off the command tail.
 ///
-/// Returns `Some(WakeHit)` only when a [`WAKE_LEXICON`] (vocative "Claudku") match sits at an
-/// utterance boundary:
+/// Returns `Some(WakeHit)` only when a [`matches_wake`] vocative ("Claudku"/"Klauku") match sits at
+/// an utterance boundary:
 /// - at token index 0 (absolute start of an utterance), or
 /// - at token index 1 IF token 0 is an [`INTERJECTIONS`] member ("hej"/"ok"/"okej" …).
 ///
-/// Pure + deterministic. PRECISION-FIRST.
+/// Pure + deterministic. RECALL-FIRST (the user's requirement: the wake MUST always catch),
+/// precision held by the shape-gate in [`matches_wake`] + the boundary anchor here.
 ///
-/// ## Recall trade-off (DOCUMENTED, by design)
-/// The firing anchor is ONLY the distinctive Polish vocative "Claudku" — the form the user
-/// actually utters when addressing the assistant. Consequently the bare French/English name
-/// mis-transcriptions "Cloud"/"Claude" NO LONGER fire, even after an interjection ("hej Cloud",
-/// "ok Claude" are silent). That is the correct trade for a meeting context: those bare forms are
-/// within edit-distance 1 of "loud"/"cloud"/"close" and firing on them produced real false fires
-/// ("ok loud and clear", "no loud and clear", "cloud computing"). We accept losing the bare-form
-/// recall to win the precision. The vocative is killed for the Polish padlock noun "kłódka"/"kłódkę"
-/// (→"klodka"/"klodke") by the `'u'`-ending guard in [`matches_wake`].
+/// ## Recall + the d-LESS vocative (the real fix)
+/// The firing anchor is the distinctive Polish vocative the user actually utters — including the
+/// d-LESS pronunciation "Klauku"/"Klołku" (Whisper drops the `'d'`), which is the user's natural
+/// form and was the demonstrated MISS. [`matches_wake`] accepts it by matching the vocative SHAPE
+/// ("kl…" + vowel/`d` nucleus + "-ku"/"-ko") rather than an edit-distance ball, so "kloku" fires
+/// but its 1-edit neighbours "kroku" (a *step*) and "klocku" (a *block*) do not.
+///
+/// The bare French/English name mis-transcriptions "Cloud"/"Claude"/"Klaud" (→"klod"/"klode")
+/// remain silent by design — even after an interjection — because they collide exactly with
+/// "loud"/"cloud"/"close" and produced real false fires ("ok loud and clear", "cloud computing").
+/// We keep the long, vocative-ended forms only. The padlock noun "kłódka"/"kłódkę"
+/// (→"klodka"/"klodke") stays silent via the vocative-ending guard (ends `a`/`e`, not `ku`/`ko`).
 ///
 /// ## Residual false-fire risk (real-mic only, NOT covered by unit tests)
 /// On real audio the live tail is a multi-second window, not a clean single utterance; the
@@ -109,21 +98,56 @@ fn make_hit(words: &[&str], idx: usize) -> WakeHit {
     WakeHit { matched_phrase: words[idx].to_string(), command }
 }
 
-/// Whether `cand` (already name-normalized) matches the vocative [`WAKE_LEXICON`] within
-/// [`WAKE_THRESHOLD`]. THREE precision guards, all of which every real "Claudku" form satisfies:
+/// Whether `cand` (already name-normalized) matches the distinctive Polish vocative of the
+/// assistant's name ("Claudku"/"Klauku"/"Klołdku" → "klodku"/"kloku"/"klodko"). RECALL-FIRST but
+/// SHAPE-GATED: instead of an edit-distance ball around a lexicon (whose 1-edit neighbourhood now
+/// overlaps real Polish words — "kroku", "klocku", "kłódka" all sit ≤1 edit from the d-less
+/// vocative "kloku"), we match the literal STRUCTURE the vocative always has and ordinary words
+/// don't:
 ///
-/// 1. **`'u'` ending** — the vocative case-ending. This is the load-bearing guard: it kills the
-///    Polish padlock noun "kłódka"→"klodka" (ends `'a'`) and "kłódkę"→"klodke" (ends `'e'`) while
-///    keeping "Claudku"/"Klałdku"→"klodku" (ends `'u'`). It also rejects "loud"→"lod" and
-///    "cloud"→"klod" (end `'d'`), which are additionally ≥2 edits away anyway.
-/// 2. **`'d'` skeleton** — carries the "Cla**ud**ku" `'d'`; rejects "close"→"klose", "klocku" …
-/// 3. **length ≥ 5** — the distinctive long vocative; a 1-edit neighbourhood of a len-6 token is
-///    small and distinctive (unlike the len-4 bare "klod", which we dropped entirely).
+/// 1. **starts `kl`** (literal) — the load-bearing separator from "kroku"/"do kroku" (krok, a
+///    *step*), which starts `kr`. "Klau-" carries an `'l'`; "kro-" an `'r'`. This is exactly how
+///    "klauku" is kept apart from its 1-edit neighbour "kroku".
+/// 2. **ends in the vocative `-ku` or `-ko`** (`…k` + `u`|`o`) — the case-ending the user utters
+///    when ADDRESSING the assistant. Kills the padlock noun "kłódka"→"klodka" (ends `a`),
+///    "kłódkę"→"klodke" (ends `e`), "Claudia"/"Klaudia"→"klodia" (ends `a`), "cloud"/"Claud"→"klod"
+///    (ends `d`), "loud"→"lod", "close"→"klose".
+/// 3. **the core between `kl…` and `…k(u|o)` is ONLY vowels + at most one `'d'`** — the "Cla(u)(d)"
+///    nucleus. This is what makes the `'d'` requirement SOFT: "klodku" (with d) and the d-LESS
+///    "kloku" (Klauku, the user's natural pronunciation) BOTH pass, while "klocku" (klocek, a
+///    *block* — has a `'c'`) and any word with a stray consonant in the nucleus are rejected.
+/// 4. **length ≥ 5** — the distinctive long vocative; rejects the bare "klod"/"klode" forms that
+///    collide with "cloud"/"loud" and were never a reliable anchor.
+///
+/// Net effect vs the old matcher: the d-LESS "kloku"/"klołku" and the `-ko` ending "klodko" now
+/// FIRE (the real misses), without re-opening any of the demonstrated false fires.
 fn matches_wake(cand: &str) -> bool {
-    if cand.chars().count() < 5 || !cand.ends_with('u') || !cand.contains('d') {
+    let ch: Vec<char> = cand.chars().collect();
+    let n = ch.len();
+    // length ≥ 5 (guard 4) and starts "kl" (guard 1).
+    if n < 5 || ch[0] != 'k' || ch[1] != 'l' {
         return false;
     }
-    WAKE_LEXICON.iter().any(|w| levenshtein(cand, w) <= WAKE_THRESHOLD)
+    // ends in the vocative "…k" + ('u' | 'o') (guard 2).
+    let last = ch[n - 1];
+    if (last != 'u' && last != 'o') || ch[n - 2] != 'k' {
+        return false;
+    }
+    // core = the nucleus between the leading "kl" and the trailing "k(u|o)": vowels + ≤1 'd'
+    // only — no stray consonant ('c' of "klocku", etc.) (guard 3).
+    let core = &ch[2..n - 2];
+    if core.is_empty() {
+        return false;
+    }
+    let mut d_count = 0usize;
+    for &c in core {
+        match c {
+            'a' | 'e' | 'i' | 'o' | 'u' | 'y' => {}
+            'd' => d_count += 1,
+            _ => return false,
+        }
+    }
+    d_count <= 1
 }
 
 /// Whether `word` (raw) is a leading interjection that may precede the wake name.
@@ -199,29 +223,6 @@ fn squeeze_repeats(s: &str) -> String {
         }
     }
     out
-}
-
-/// Classic two-row Levenshtein edit distance (no crate). Operates on `char`s so it is UTF-8-safe.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    if a.is_empty() {
-        return b.len();
-    }
-    if b.is_empty() {
-        return a.len();
-    }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr: Vec<usize> = vec![0; b.len() + 1];
-    for (i, &ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b.len()]
 }
 
 // ───────────────────────────── intent parser ─────────────────────────────
@@ -410,11 +411,38 @@ mod tests {
     }
 
     #[test]
-    fn levenshtein_basics() {
-        assert_eq!(levenshtein("klod", "klod"), 0);
-        assert_eq!(levenshtein("klod", "klode"), 1);
-        assert_eq!(levenshtein("klodia", "klodku"), 2);
-        assert_eq!(levenshtein("klose", "klode"), 1);
+    fn normalizer_dless_and_ko_vocative_variants() {
+        // The d-LESS pronunciation (Whisper drops the 'd') and the '-ko' vocative ending.
+        assert_eq!(normalize_name("klauku"), "kloku");
+        assert_eq!(normalize_name("Klołku"), "kloku");
+        assert_eq!(normalize_name("klaudko"), "klodko");
+        assert_eq!(normalize_name("Klołdko"), "klodko");
+        // Hard near-collisions land OFF the vocative shape.
+        assert_eq!(normalize_name("kroku"), "kroku"); // krok / step — starts 'kr'
+        assert_eq!(normalize_name("klocku"), "klocku"); // klocek / block — 'c' in the nucleus
+    }
+
+    // ── matches_wake shape-gate: the precision/recall boundary ──────────────
+
+    #[test]
+    fn matches_wake_accepts_vocative_family_rejects_near_collisions() {
+        // The full vocative family the user produces (already normalized) FIRES…
+        for good in ["klodku", "kladku", "kloku", "klodko"] {
+            assert!(matches_wake(good), "vocative {good:?} should match");
+        }
+        // …including the d-LESS "kloku" — but its 1-edit neighbours and the padlock noun do NOT.
+        for bad in [
+            "kroku",  // krok / "do kroku" (step) — starts 'kr', the 'l' vs 'r' separator
+            "klocku", // klocek / "do klocka" (block) — 'c' in the nucleus
+            "klodka", // kłódka (padlock) — ends 'a'
+            "klodke", // kłódkę (padlock) — ends 'e'
+            "klodia", // claudia/klaudia — ends 'a'
+            "klod",   // cloud/claud — too short, ends 'd'
+            "klose",  // close — ends 'e', 's' in nucleus
+            "lod",    // loud — no 'kl'
+        ] {
+            assert!(!matches_wake(bad), "near-collision {bad:?} must NOT match");
+        }
     }
 
     // ── RECALL: detect_wake fires on mangled wake utterances ────────────────
@@ -435,6 +463,13 @@ mod tests {
             ("hej klałdku wyszukaj w slacku raport", "wyszukaj w slacku raport"),
             ("okej klaudku note that we shipped", "note that we shipped"),
             ("ok klodku przypomnij mi", "przypomnij mi"),
+            // ── THE REAL ON-MIC VARIANTS (the missed d-less + -ko forms) ──
+            ("klaudku zrób research o cenach", "zrób research o cenach"),
+            ("klauku zrób research", "zrób research"), // d-LESS — was MISSED
+            ("klołku co wiemy o atlasie", "co wiemy o atlasie"), // d-less, oł→o
+            ("klołdku przypomnij mi", "przypomnij mi"),
+            ("hej klauku wyszukaj", "wyszukaj"), // interjection + d-less
+            ("ok klołku zapisz to", "zapisz to"), // interjection + d-less
         ];
         for (input, want_cmd) in cases {
             let hit = detect_wake(input).unwrap_or_else(|| panic!("expected wake fire on {input:?}"));
@@ -449,7 +484,12 @@ mod tests {
         // The load-bearing test: ZERO false fires. Includes every demonstrated false fire the
         // adversarial verifier reproduced, plus the hard near-collisions.
         let negatives: &[&str] = &[
-            // ── demonstrated false fires that MUST now be silent ──
+            // ── NEW precision risk from accepting the d-less "kloku" vocative ──
+            "do kroku",            // krok/step → "kroku"; 1 edit from "kloku" — 'l' vs 'r' separates
+            "kroku",               // bare step word
+            "klocku",              // klocek/block → "klocku"; 'c' in nucleus kills it
+            "do klocka",           // block in a sentence → "klocka"
+            // ── demonstrated false fires that MUST stay silent ──
             "ok loud and clear",   // "loud"→"lod" used to match bare "klod"
             "no loud and clear",   // "loud"→"lod" used to match bare "klod"
             "kłódka",              // padlock → "klodka" (ends 'a', not the vocative 'u')
