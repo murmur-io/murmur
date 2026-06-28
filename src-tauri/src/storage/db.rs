@@ -8,9 +8,9 @@ use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
 use crate::storage::models::{
-    Analytics, DayCount, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData, GraphEdge,
-    GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
-    StatusCount, VaultSource,
+    Analytics, CorrectionRecord, DayCount, EntityDetail, EntityKind, EntityNeighbor, Folder,
+    GraphData, GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord,
+    SearchHit, StatusCount, VaultSource,
 };
 use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
@@ -255,7 +255,19 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_entity_mentions_meeting ON entity_mentions(meeting_id);
              CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
-             CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);",
+             CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);
+             CREATE TABLE IF NOT EXISTS correction_log (
+               id INTEGER PRIMARY KEY,
+               kind TEXT NOT NULL,
+               input TEXT NOT NULL,
+               model_output TEXT NOT NULL,
+               final_output TEXT,
+               accepted INTEGER NOT NULL DEFAULT 0,
+               owner_id TEXT NOT NULL DEFAULT 'local',
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_correction_log_kind_created
+               ON correction_log(kind, created_at);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -473,6 +485,65 @@ impl Db {
         let conn = self.lock();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(map_err)
+    }
+
+    // ── correction-log flywheel ──────────────────────────────────────────────
+
+    /// Append one model-output→correction example to the local `correction_log` (the dataset
+    /// substrate for later on-device LoRA fine-tuning). Returns the new row id (the passed `rec.id`
+    /// is ignored — SQLite assigns the autoincrement key). Entirely local + SQLCipher-encrypted;
+    /// nothing here egresses.
+    pub fn log_correction(&self, rec: &CorrectionRecord) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO correction_log
+               (kind, input, model_output, final_output, accepted, owner_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                rec.kind,
+                rec.input,
+                rec.model_output,
+                rec.final_output,
+                rec.accepted as i64,
+                rec.owner_id,
+                rec.created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read back the most-recent `limit` correction examples of `kind`, newest first.
+    pub fn list_corrections(&self, kind: &str, limit: i64) -> Result<Vec<CorrectionRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, input, model_output, final_output, accepted, owner_id, created_at
+                   FROM correction_log
+                  WHERE kind = ?1
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?2",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![kind, limit], |row| {
+                Ok(CorrectionRecord {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    input: row.get(2)?,
+                    model_output: row.get(3)?,
+                    final_output: row.get(4)?,
+                    accepted: row.get::<_, i64>(5)? != 0,
+                    owner_id: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
     }
 
     // ── meetings ────────────────────────────────────────────────────────────
@@ -2976,6 +3047,58 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    #[test]
+    fn correction_log_round_trips_and_filters_by_kind() {
+        use crate::storage::models::CorrectionRecord;
+        let db = mem_db();
+        let rec = |kind: &str, input: &str, model_output: &str, fin: Option<&str>, accepted: bool, at: &str| {
+            CorrectionRecord {
+                id: 0,
+                kind: kind.to_string(),
+                input: input.to_string(),
+                model_output: model_output.to_string(),
+                final_output: fin.map(str::to_string),
+                accepted,
+                owner_id: "local".to_string(),
+                created_at: at.to_string(),
+            }
+        };
+        // Insert two NER examples (one accepted-as-is, one edited) and one of another kind.
+        let id1 = db
+            .log_correction(&rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z"))
+            .unwrap();
+        let id2 = db
+            .log_correction(&rec(
+                "ner",
+                "in-2",
+                "out-2",
+                Some("fixed-2"),
+                false,
+                "2026-06-28T10:01:00Z",
+            ))
+            .unwrap();
+        db.log_correction(&rec("timeline", "in-3", "out-3", None, true, "2026-06-28T10:02:00Z"))
+            .unwrap();
+        assert!(id2 > id1);
+
+        // Only the matching kind comes back, newest first.
+        let ner = db.list_corrections("ner", 10).unwrap();
+        assert_eq!(ner.len(), 2);
+        assert_eq!(ner[0].id, id2);
+        assert_eq!(ner[0].input, "in-2");
+        assert_eq!(ner[0].final_output.as_deref(), Some("fixed-2"));
+        assert!(!ner[0].accepted);
+        assert_eq!(ner[1].id, id1);
+        assert!(ner[1].accepted);
+        assert_eq!(ner[1].final_output, None);
+        assert_eq!(ner[1].owner_id, "local");
+
+        // Limit is honoured.
+        assert_eq!(db.list_corrections("ner", 1).unwrap().len(), 1);
+        // A kind with no rows yields empty (not an error).
+        assert!(db.list_corrections("does-not-exist", 10).unwrap().is_empty());
     }
 
     #[test]
