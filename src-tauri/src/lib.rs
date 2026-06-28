@@ -6,6 +6,7 @@ pub mod error;
 pub mod events;
 pub mod export;
 pub mod mcp;
+pub mod orchestrate;
 pub mod pipeline;
 pub mod reason;
 pub mod screenshare;
