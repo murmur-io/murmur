@@ -199,9 +199,82 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
         }
     }
 
+    // brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION. When `related_context` is present
+    // (the flag is ON and the gated retrieval found visible prior notes), prepend it as a clearly
+    // labelled, read-only block BEFORE the transcript so the model can reference prior decisions /
+    // owed items and cite them as `[[Title]]`. When `None` (the default + flag-OFF case) this whole
+    // block is skipped, so the output is BYTE-IDENTICAL to before this field existed — no regression.
+    if let Some(ctx) = &req.related_context {
+        if !ctx.trim().is_empty() {
+            out.push_str(
+                "\n## Related prior notes (context only — do not copy, cite as [[Title]])\n",
+            );
+            out.push_str(ctx);
+            out.push('\n');
+        }
+    }
+
     out.push_str("\nTRANSCRIPT\n");
     out.push_str(&req.transcript);
     out.push('\n');
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::summarize::provider::{MeetingMeta, SummarizeRequest};
+
+    fn req(related: Option<String>) -> SummarizeRequest {
+        SummarizeRequest {
+            transcript: "We shipped v2 and agreed Anna owns the rollout.".to_string(),
+            meta: MeetingMeta {
+                date_iso: "2026-06-28".to_string(),
+                title_hint: None,
+                duration_s: 1800,
+                language: Some("en".to_string()),
+            },
+            template: "TEMPLATE".to_string(),
+            vault_titles: vec!["Roadmap".to_string()],
+            related_context: related,
+        }
+    }
+
+    /// No-regression proof: with `related_context = None` (the default + flag-OFF case) the rendered
+    /// user content is byte-identical to the pre-Phase-4 rendering — no Related-prior-notes block,
+    /// nothing before TRANSCRIPT changed.
+    #[test]
+    fn render_user_content_none_is_unchanged() {
+        let out = render_user_content(&req(None));
+        // The transcript section follows the vault-titles section directly, with no extra block.
+        assert!(out.contains("\nTRANSCRIPT\nWe shipped v2"));
+        assert!(!out.contains("Related prior notes"));
+        // Reconstruct the exact expected string to pin byte-identity.
+        let expected = "MEETING METADATA\n- date: 2026-06-28\n- duration_minutes: 30\n- language: en\n\nEXISTING NOTE TITLES (valid [[wikilink]] targets — link only these):\n- Roadmap\n\nTRANSCRIPT\nWe shipped v2 and agreed Anna owns the rollout.\n";
+        assert_eq!(out, expected);
+    }
+
+    /// Flag ON: a `Some(context)` prepends the labelled, read-only block BEFORE the transcript.
+    #[test]
+    fn render_user_content_some_prepends_block() {
+        let ctx = "\n\n### [[Q2 Planning]] · 2026-04-01 · id:m-prev\nWe decided to delay launch.";
+        let out = render_user_content(&req(Some(ctx.to_string())));
+        let block_at = out
+            .find("## Related prior notes (context only — do not copy, cite as [[Title]])")
+            .expect("related block present");
+        let transcript_at = out.find("\nTRANSCRIPT\n").expect("transcript present");
+        assert!(block_at < transcript_at, "related block must precede the transcript");
+        assert!(out.contains("Q2 Planning"));
+        assert!(out.contains("We decided to delay launch."));
+    }
+
+    /// An empty/whitespace context is treated as None (no block, byte-identical to the None path).
+    #[test]
+    fn render_user_content_empty_context_is_skipped() {
+        assert_eq!(
+            render_user_content(&req(Some("   \n".to_string()))),
+            render_user_content(&req(None))
+        );
+    }
 }
