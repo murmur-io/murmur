@@ -148,6 +148,33 @@ export class IpcService {
     return invoke<boolean>("has_anthropic_key");
   }
 
+  /**
+   * brain2 connectors — grant the one-time consent for WEB-SEARCH egress. This is
+   * the ONLY supported way to flip `webSearchConsented` true: the backend persists
+   * the flag AND updates its in-memory config cache, so the next brain/Ask answer
+   * may expose the web connector (provided web search is enabled AND a key is
+   * stored). Idempotent. Until granted, the redacted query never leaves the device.
+   * Mirrors {@link consentToCloudEgress}.
+   */
+  consentToWebSearch(): Promise<void> {
+    return invoke<void>("consent_to_web_search");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO web-search (Brave) API key in the
+   * Keychain. An empty string clears it. The key is NEVER logged and NEVER returned
+   * to the FE — only {@link hasWebSearchKey} reports presence. Mirrors
+   * {@link setAnthropicKey}.
+   */
+  setWebSearchApiKey(key: string): Promise<void> {
+    return invoke<void>("set_web_search_api_key", { key });
+  }
+
+  /** Whether a web-search (Brave) API key is currently stored. Never the value. */
+  hasWebSearchKey(): Promise<boolean> {
+    return invoke<boolean>("has_web_search_key");
+  }
+
   providerStatuses(): Promise<ProviderStatus[]> {
     return invoke<ProviderStatus[]>("provider_statuses");
   }

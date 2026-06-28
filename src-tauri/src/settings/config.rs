@@ -159,6 +159,23 @@ pub struct AppConfig {
     /// live loop behaves EXACTLY as before (wake detected + surfaced, NO dispatch).
     #[serde(default)]
     pub realtime_reactions: bool,
+    /// brain2 connector framework (Phase F) — master toggle for the WEB SEARCH connector. Default
+    /// OFF (`#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`).
+    /// When OFF the web connector is ABSENT from the brain's tool registry (no web tool offered), so
+    /// shipping this changes NOTHING vs today. Settable from the settings DTO (the Settings UI owns
+    /// the toggle). Even when ON, the connector is exposed only once `web_search_consented` is granted
+    /// AND a Brave API key is stored — see `connectors::web::WebConnector::from_config_if_available`.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    /// brain2 connector framework — one-time WEB SEARCH egress consent. The web connector reaches an
+    /// EXTERNAL service (a NEW EGRESS CLASS): the outgoing (redacted) query leaves the device. Default
+    /// OFF (fail-closed): no query egresses until the user explicitly consents once via the dedicated
+    /// `consent_to_web_search` command. Like `cloud_egress_consented`, this is PRESERVE-ONLY on the
+    /// settings DTO — `dto_to_config` ignores the incoming value and keeps the stored one, so a normal
+    /// settings save can neither grant nor clear it. `#[serde(default)]` ⇒ pre-existing configs load
+    /// as `false`.
+    #[serde(default)]
+    pub web_search_consented: bool,
 }
 
 impl Default for AppConfig {
@@ -194,6 +211,8 @@ impl Default for AppConfig {
             brain_model_id: None,
             brain_backend: BrainBackend::default(),
             realtime_reactions: false,
+            web_search_enabled: false,
+            web_search_consented: false,
         }
     }
 }
@@ -229,6 +248,8 @@ const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
 const K_BRAIN_BACKEND: &str = "brain_backend";
 const K_REALTIME_REACTIONS: &str = "realtime_reactions";
+const K_WEB_SEARCH_ENABLED: &str = "web_search_enabled";
+const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -331,6 +352,12 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_REALTIME_REACTIONS)? {
             cfg.realtime_reactions = v == "true";
         }
+        if let Some(v) = db.get_setting(K_WEB_SEARCH_ENABLED)? {
+            cfg.web_search_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_WEB_SEARCH_CONSENTED)? {
+            cfg.web_search_consented = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -419,6 +446,14 @@ impl AppConfig {
             K_REALTIME_REACTIONS,
             if self.realtime_reactions { "true" } else { "false" },
         )?;
+        db.set_setting(
+            K_WEB_SEARCH_ENABLED,
+            if self.web_search_enabled { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_WEB_SEARCH_CONSENTED,
+            if self.web_search_consented { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -434,6 +469,16 @@ impl AppConfig {
     pub fn grant_cloud_egress_consent(&mut self, db: &Db) -> Result<()> {
         self.cloud_egress_consented = true;
         db.set_setting(K_CLOUD_EGRESS_CONSENTED, "true")
+    }
+
+    /// brain2 connector framework — record the user's one-time consent to send the (redacted) web
+    /// search query to an EXTERNAL search service. Mirrors [`grant_cloud_egress_consent`]: flips the
+    /// in-memory flag AND persists it. This is the ONLY supported mutator (deliberately separate from
+    /// `save_config`), so web-search egress consent can never be granted as an incidental side effect
+    /// of a settings write. Until granted, the web connector is absent from the brain's tool registry.
+    pub fn grant_web_search_consent(&mut self, db: &Db) -> Result<()> {
+        self.web_search_consented = true;
+        db.set_setting(K_WEB_SEARCH_CONSENTED, "true")
     }
 }
 
@@ -587,6 +632,37 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().realtime_reactions);
+    }
+
+    #[test]
+    fn web_search_flags_default_off_and_round_trip() {
+        let db = temp_db();
+        // Fail-closed defaults: both OFF until explicitly set/granted.
+        let cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.web_search_enabled, "web search master toggle defaults OFF");
+        assert!(!cfg.web_search_consented, "web search egress consent fail-closed OFF");
+
+        // `web_search_enabled` is a settable flag; consent is granted via its dedicated method.
+        let cfg = AppConfig {
+            web_search_enabled: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert!(loaded.web_search_enabled);
+        // Consent was NOT granted by a plain save.
+        assert!(!loaded.web_search_consented);
+    }
+
+    #[test]
+    fn web_search_consent_grant_persists() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.web_search_consented);
+        cfg.grant_web_search_consent(&db).unwrap();
+        assert!(cfg.web_search_consented);
+        // Survives a reload from the settings table.
+        assert!(AppConfig::load(&db).unwrap().web_search_consented);
     }
 
     #[test]

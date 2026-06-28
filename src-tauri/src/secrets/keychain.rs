@@ -25,6 +25,11 @@ pub const ACCOUNT_MCP_TOKEN: &str = "murmur_mcp_token";
 /// fixed account (no per-call string leak in [`leak_account`]).
 pub const ACCOUNT_ANTHROPIC_KEY: &str = "anthropic_api_key";
 
+/// Keychain account holding the BYO web-search API key (Brave). Mirrors
+/// [`crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT`]. Named here so the data-protection routing
+/// recognizes it as a known fixed account (no per-call string leak in [`leak_account`]).
+pub const ACCOUNT_WEB_SEARCH_KEY: &str = "web_search_api_key";
+
 /// Default reason string shown on the Touch ID / passcode sheet when releasing the master KEK.
 /// Callers may override per call-site (e.g. "Unlock this folder").
 pub const KEK_DEFAULT_REASON: &str = "Unlock this folder";
@@ -875,6 +880,7 @@ fn leak_account(account: &str) -> &'static str {
         ACCOUNT_MASTER_KEK => ACCOUNT_MASTER_KEK,
         ACCOUNT_MCP_TOKEN => ACCOUNT_MCP_TOKEN,
         ACCOUNT_ANTHROPIC_KEY => ACCOUNT_ANTHROPIC_KEY,
+        ACCOUNT_WEB_SEARCH_KEY => ACCOUNT_WEB_SEARCH_KEY,
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }

@@ -12,7 +12,9 @@ import type { AssistantInteraction } from "../../core/assistant.store";
  * (once, via AssistantStore.init()) to the in-meeting voice assistant's wake +
  * result event streams and renders a newest-first list of recent interactions:
  * a pending "🎙 usłyszano: {command}" row on a wake, resolved to {summary} +
- * [[Title]] citation chips with a status pill when the result arrives.
+ * citation chips with a status pill when the result arrives. Vault sources render
+ * as `[[Title]]` chips; web sources (when the web-search connector contributed)
+ * render as a distinct "via web" link to the URL — the off-device origin is loud.
  *
  * The card is in-flow on the record page (not a floating overlay), so it uses
  * the frosted `.card` like the other record-surface panels. If it were ever
@@ -73,8 +75,22 @@ import type { AssistantInteraction } from "../../core/assistant.store";
                 }
                 @if (a.citations.length > 0) {
                   <div class="action-cites" aria-label="Sources">
-                    @for (c of a.citations; track c) {
-                      <span class="cite-chip">[[{{ c }}]]</span>
+                    @for (c of a.citations; track $index) {
+                      @if (c.kind === "web") {
+                        <a
+                          class="cite-chip is-web"
+                          [href]="c.url ?? null"
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          [title]="c.url ?? c.label"
+                        >
+                          <span class="cite-web-mark" aria-hidden="true">⊕</span>
+                          <span class="cite-web-label">{{ c.label }}</span>
+                          <span class="cite-web-via">via web</span>
+                        </a>
+                      } @else {
+                        <span class="cite-chip">[[{{ c.label }}]]</span>
+                      }
                     }
                   </div>
                 }
@@ -220,6 +236,43 @@ import type { AssistantInteraction } from "../../core/assistant.store";
         font-family: var(--font-mono);
         font-size: 0.78rem;
         letter-spacing: -0.01em;
+      }
+      /* A web source — visibly distinct from the [[vault]] chips: a link, not a
+         monospace wikilink, with an "via web" tag so the off-device origin is loud. */
+      a.cite-chip.is-web {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        background: var(--surface-input);
+        border: 1px solid var(--border-subtle);
+        color: var(--text-secondary);
+        font-family: inherit;
+        text-decoration: none;
+        max-width: 100%;
+      }
+      a.cite-chip.is-web:hover {
+        border-color: var(--accent-soft);
+        color: var(--text-primary);
+      }
+      .cite-web-mark {
+        color: var(--accent);
+        line-height: 1;
+      }
+      .cite-web-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 220px;
+      }
+      .cite-web-via {
+        padding: 0 var(--space-1);
+        border-radius: var(--radius-sm);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
       }
 
       @media (prefers-reduced-motion: reduce) {
