@@ -486,22 +486,26 @@ pub fn begin_voice_command(
 pub(crate) fn begin_voice_command_inner(
     state: &AppState,
 ) -> Result<VoiceCommandArmResult, AppError> {
-    let recording = state
+    // Latch the recorder's current total-sample offset AT CLICK TIME so the live loop transcribes
+    // only the POST-CLICK utterance (the command the user is about to speak), cleanly isolated from
+    // any prior speech in the rolling buffer. `None` (no recorder) ⇒ not recording ⇒ arm nothing.
+    let start_sample = state
         .recorder
         .lock()
         .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?
-        .is_some();
-    if !recording {
+        .as_ref()
+        .map(|r| r.total_samples());
+    let Some(offset) = start_sample else {
         return Ok(VoiceCommandArmResult {
             listening: false,
             reason: Some("not recording".into()),
         });
-    }
+    };
     let mut guard = state
         .voice_command_capture
         .lock()
         .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
-    *guard = Some(crate::state::CaptureState::armed());
+    *guard = Some(crate::state::CaptureState::armed_from(offset));
     Ok(VoiceCommandArmResult { listening: true, reason: None })
 }
 
@@ -4356,10 +4360,10 @@ mod lifecycle_tests {
             let mut g = state.voice_command_capture.lock().unwrap();
             *g = Some(CaptureState::armed());
         }
-        let armed = state.voice_command_capture.lock().unwrap().clone();
+        let armed = *state.voice_command_capture.lock().unwrap();
         assert_eq!(
             armed,
-            Some(CaptureState { budget: CaptureState::DEFAULT_BUDGET }),
+            Some(CaptureState { budget: CaptureState::DEFAULT_BUDGET, start_sample: None }),
             "arming must store a fresh full-budget capture the live loop can consume"
         );
     }

@@ -101,13 +101,29 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 // + panic-free: a poisoned lock or empty tail simply leaves the capture armed; the
                 // dispatch runs off-thread exactly like the wake path. NOTE: an EMPTY tail still
                 // counts down the budget so a silent capture can't hang forever.
-                if let Some(decision) = step_manual_capture(&app, &text) {
+                if let Some(decision) =
+                    step_manual_capture(&app, &transcriber, lang.as_deref(), &text)
+                {
                     match decision {
-                        ManualCaptureDecision::Dispatch(intent) => {
-                            spawn_dispatch(app.clone(), intent);
+                        ManualCaptureDecision::Dispatch { command } => {
+                            // Resolve (keyword → brain → fallback) + dispatch OFF the tick, with the
+                            // heard command surfaced onto the result for the FE card.
+                            spawn_command_dispatch(app.clone(), command);
                             let _ = app.emit(
                                 crate::events::EVENT_VOICE_COMMAND_LISTENING,
                                 crate::events::VoiceCommandListeningPayload { active: false },
+                            );
+                        }
+                        ManualCaptureDecision::NothingHeard => {
+                            // Budget expired with nothing heard → graceful, NOT a confusing
+                            // "didn't catch an action". Clear the listening affordance + surface it.
+                            let _ = app.emit(
+                                crate::events::EVENT_VOICE_COMMAND_LISTENING,
+                                crate::events::VoiceCommandListeningPayload { active: false },
+                            );
+                            let _ = app.emit(
+                                crate::events::EVENT_VOICE_ACTION_RESULT,
+                                crate::voice_action::VoiceActionResult::nothing_heard(),
                             );
                         }
                         ManualCaptureDecision::KeepListening => {}
@@ -222,70 +238,209 @@ fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
         });
 }
 
+/// Resolve a NON-EMPTY heard `command` to an intent (keyword → brain → fallback) and dispatch it
+/// over the SAME gated `handle_voice_action` path as the wake trigger, with the HEARD command
+/// surfaced onto the result so the FE card can show "usłyszano: {command}". Runs entirely OFF the
+/// transcription tick on its own detached OS thread — the brain interpret + the dispatch can each
+/// take seconds and MUST NOT block the live loop. Best-effort + panic-free, exactly like
+/// [`spawn_dispatch`]; a poisoned lock simply aborts the thread.
+fn spawn_command_dispatch(app: AppHandle, command: String) {
+    let _ = std::thread::Builder::new()
+        .name("murmur-voice-command".into())
+        .spawn(move || {
+            let state = app.state::<AppState>();
+            let config = match state.config.lock() {
+                Ok(c) => c.clone(),
+                Err(_) => return,
+            };
+            let unlocked = match state.unlocked_folders.lock() {
+                Ok(u) => u.clone(),
+                Err(_) => return,
+            };
+            let meeting_id = state
+                .current_meeting
+                .lock()
+                .ok()
+                .and_then(|m| m.map(|id| id.to_string()))
+                .unwrap_or_default();
+
+            // Keyword fast-path → BRAIN interpret (consent-gated, same reasoner) → keyword fallback.
+            let intent = resolve_command_intent(&*state.reasoner, &command);
+            let result = crate::voice_action::handle_voice_action(
+                &intent,
+                &*state.reasoner,
+                &state.db,
+                &unlocked,
+                &config,
+                &meeting_id,
+            )
+            // Surface the user's OWN dictated command onto the result for the FE card.
+            .with_command(&command);
+
+            // PII rule: log only the coarse intent kind + status, never the command/summary text.
+            tracing::info!(
+                target: "voice",
+                intent = %result.intent_kind,
+                status = %result.status,
+                "manual voice command dispatched"
+            );
+            let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
+        });
+}
+
 /// What the live loop should do with the MANUAL voice-command capture on this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManualCaptureDecision {
-    /// Dispatch this parsed intent now (a recognized command, OR the budget ran out so we dispatch
-    /// the last-heard tail — which may be `Unknown` → a graceful "unrecognized" result).
-    Dispatch(crate::audio::wake::VoiceIntent),
-    /// Keep the capture armed and wait for the next tick (nothing actionable yet, budget remains).
+    /// A NON-EMPTY command was captured (real speech heard since the click) → resolve + dispatch it
+    /// (keyword fast-path, else brain interpret, else keyword fallback) and clear the capture.
+    Dispatch { command: String },
+    /// Nothing heard yet but budget remains → keep the capture armed and wait for the next tick.
     KeepListening,
+    /// The whole budget expired with NOTHING heard (the user never spoke) → clear the capture and
+    /// surface a graceful "nothing_heard". NEVER dispatches an empty command.
+    NothingHeard,
 }
 
-/// Advance the MANUAL voice-command capture by one live tick using the freshly-transcribed `tail`.
+/// Advance the MANUAL voice-command capture by one live tick. Snapshots ONLY the audio captured
+/// SINCE the click (`Recorder::snapshot_from(start_sample)`) — the POST-CLICK utterance — and
+/// transcribes it in isolation, so the command is exactly what the user said after clicking, not the
+/// rolling 14s tail. Falls back to the rolling-tail `caption` text only when no offset was latched
+/// (degenerate arm path). Returns `None` when no manual capture is armed (the common case).
 ///
-/// Returns `None` when no manual capture is armed (the common case — zero cost beyond a lock).
-/// When a capture IS armed, it mutates the budget in place and returns the [`ManualCaptureDecision`],
-/// CLEARING the capture state whenever it decides to dispatch (so exactly one dispatch fires per
-/// click). Best-effort + panic-free: a poisoned lock is treated as "no capture" (`None`).
+/// When a capture IS armed it mutates the budget in place and returns the [`ManualCaptureDecision`],
+/// CLEARING the capture state on dispatch / nothing-heard (so exactly one outcome fires per click).
+/// Best-effort + panic-free: a poisoned lock is treated as "no capture" (`None`).
 ///
-/// The actual dispatch + the `EVENT_VOICE_COMMAND_LISTENING{active:false}` emit are done by the
-/// caller (off the tick); the decision itself is computed by the pure [`decide_manual_capture`].
-fn step_manual_capture(app: &AppHandle, tail: &str) -> Option<ManualCaptureDecision> {
+/// The transcription of the post-click window + the dispatch/emit are the caller's job (off the
+/// tick); the budget arithmetic + the no-empty guard are the pure [`decide_manual_capture`].
+fn step_manual_capture(
+    app: &AppHandle,
+    transcriber: &Transcriber,
+    lang: Option<&str>,
+    caption: &str,
+) -> Option<ManualCaptureDecision> {
     let state = app.state::<AppState>();
-    let mut guard = state.voice_command_capture.lock().ok()?;
-    let current = (*guard)?; // None ⇒ not armed ⇒ nothing to do.
-    let (decision, next) = decide_manual_capture(current, tail);
-    *guard = next; // clear on dispatch, or store the decremented budget on keep-listening.
+    // Read the armed capture (and release the lock before any transcription work).
+    let current = { (*state.voice_command_capture.lock().ok()?)? };
+
+    // Transcribe ONLY the post-click window when an offset was latched; otherwise fall back to the
+    // rolling-tail caption the live loop already produced (degenerate arm path with no recorder).
+    let command = match current.start_sample {
+        Some(offset) => transcribe_since(app, transcriber, lang, offset).unwrap_or_default(),
+        None => caption.trim().to_string(),
+    };
+
+    let (decision, next) = decide_manual_capture(current, &command);
+    // Re-acquire to store the next state (clear on terminal outcomes, decrement on keep-listening).
+    *state.voice_command_capture.lock().ok()? = next;
     Some(decision)
 }
 
+/// Transcribe the growing window of audio captured SINCE `offset` (the click) into a single trimmed
+/// command string. Reads `Recorder::snapshot_from` (read-only, never drains), resamples to 16k, and
+/// runs the Fast profile — exactly like the caption tick, but on the ISOLATED post-click window.
+/// Returns `None` when the recorder is gone or there is < ~0.4s of audio yet (too little to bother).
+fn transcribe_since(
+    app: &AppHandle,
+    transcriber: &Transcriber,
+    lang: Option<&str>,
+    offset: usize,
+) -> Option<String> {
+    let (window, rate) = {
+        let state = app.state::<AppState>();
+        let guard = state.recorder.lock().ok()?;
+        let r = guard.as_ref()?;
+        (r.snapshot_from(offset), r.source_sample_rate())
+    };
+    // Need a little audio before transcribing — < ~0.4s is just the click latency / silence.
+    if rate == 0 || window.len() < (rate as usize) * 2 / 5 {
+        return Some(String::new());
+    }
+    let samples_16k = match crate::audio::resample_to_16k(&window, rate) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(target: "live", error = %e, "manual-capture resample failed");
+            return Some(String::new());
+        }
+    };
+    match transcriber.transcribe(&samples_16k, lang) {
+        Ok(t) => Some(
+            t.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string(),
+        ),
+        Err(e) => {
+            tracing::debug!(target: "live", error = %e, "manual-capture transcribe failed");
+            Some(String::new())
+        }
+    }
+}
+
 /// PURE, headless-testable core of the manual-capture step. Given the armed [`CaptureState`] and the
-/// freshly-heard `tail`, decide whether to DISPATCH now or KEEP LISTENING, and return the NEXT capture
-/// state (`None` = cleared once we dispatch, `Some(decremented)` while we keep listening).
+/// `command` heard SINCE the click (the post-click window's transcript), decide the outcome and the
+/// NEXT capture state (`None` = cleared on a terminal outcome, `Some(decremented)` while listening).
 ///
-/// Rules (no wake word, no word-order requirement — the WHOLE tail is the command):
-/// 1. If `parse_voice_intent(tail)` is a RECOGNIZED intent (anything but `Unknown`) → dispatch it
-///    now and clear the capture. The user's spoken command was understood.
-/// 2. Else, decrement the tick budget:
-///    - budget still > 0 → KEEP LISTENING (the user may not have finished speaking yet).
-///    - budget now == 0 → give up waiting and DISPATCH the parsed (likely `Unknown`) tail, which
-///      yields a graceful "unrecognized" `VoiceActionResult`. This guarantees the capture always
-///      terminates — it can never hang.
+/// Rules (no wake word — the WHOLE post-click utterance is the command; NEVER dispatch empty):
+/// 1. If the command is NON-EMPTY (real speech heard) → `Dispatch{command}` now and clear the
+///    capture. The caller resolves it (keyword → brain → keyword fallback) and dispatches it with the
+///    heard command surfaced.
+/// 2. Else (silence this tick) → spend one tick of budget:
+///    - budget still > 0 → KEEP LISTENING (give the user time to start/finish speaking).
+///    - budget now == 0 → `NothingHeard`: clear the capture and surface a graceful "nothing_heard".
+///      The capture can never hang AND it never dispatches an empty/Unknown command.
 ///
-/// No I/O, no FFI, no egress — just `parse_voice_intent` + arithmetic.
+/// No I/O, no FFI, no egress — just emptiness check + arithmetic.
 fn decide_manual_capture(
     capture: crate::state::CaptureState,
-    tail: &str,
+    command: &str,
 ) -> (ManualCaptureDecision, Option<crate::state::CaptureState>) {
-    let intent = crate::audio::wake::parse_voice_intent(tail);
-    let recognized = !matches!(intent, crate::audio::wake::VoiceIntent::Unknown { .. });
-    if recognized {
-        // Understood the command → dispatch immediately, clear the capture.
-        return (ManualCaptureDecision::Dispatch(intent), None);
+    let command = command.trim();
+    if !command.is_empty() {
+        // Real speech heard since the click → dispatch it, clear the capture.
+        return (
+            ManualCaptureDecision::Dispatch { command: command.to_string() },
+            None,
+        );
     }
-    // Not (yet) recognized: spend one tick of budget.
+    // Silence this tick: spend one tick of budget.
     let remaining = capture.budget.saturating_sub(1);
     if remaining == 0 {
-        // Budget exhausted → dispatch the last-heard (Unknown) tail; the dispatch maps it to a
-        // graceful "unrecognized" result. Clear the capture so it can't fire again.
-        (ManualCaptureDecision::Dispatch(intent), None)
+        // Budget exhausted with nothing ever heard → graceful give-up, clear the capture.
+        (ManualCaptureDecision::NothingHeard, None)
     } else {
         (
             ManualCaptureDecision::KeepListening,
-            Some(crate::state::CaptureState { budget: remaining }),
+            Some(crate::state::CaptureState { budget: remaining, ..capture }),
         )
     }
+}
+
+/// Resolve a NON-EMPTY heard `command` to a [`crate::audio::wake::VoiceIntent`] using the
+/// keyword fast-path, then the BRAIN, then a keyword fallback. PURE w.r.t. the reasoner (the only
+/// effect is the reasoner call, which the caller runs off-thread):
+/// 1. `parse_voice_intent` — deterministic PL+EN keyword parser. A RECOGNIZED intent wins immediately.
+/// 2. Else ask the brain ([`crate::voice_action::interpret_with_brain`]) to map any phrasing/order to
+///    a known action — so "poszukaj mi info o X", "zrób research o wakacjach", etc. all work.
+/// 3. Else (brain unavailable / no-consent / no mapping) fall back to **Research over the literal
+///    command** — a sensible default for a non-empty command, never an empty/Unknown dispatch.
+fn resolve_command_intent(
+    reasoner: &dyn crate::reason::LocalReasoner,
+    command: &str,
+) -> crate::audio::wake::VoiceIntent {
+    let keyword = crate::audio::wake::parse_voice_intent(command);
+    if !matches!(keyword, crate::audio::wake::VoiceIntent::Unknown { .. }) {
+        return keyword; // keyword fast-path understood it.
+    }
+    // Keyword said Unknown but the command is non-empty → ask the brain (best-effort).
+    if let Some(intent) = crate::voice_action::interpret_with_brain(reasoner, command) {
+        return intent;
+    }
+    // Brain unavailable / no mapping → Research over the literal command is a fine default.
+    crate::audio::wake::VoiceIntent::Research { topic: command.trim().to_string() }
 }
 
 /// Pure, headless-testable core of the wake wiring: detect a wake utterance at the head of a
@@ -348,70 +503,126 @@ mod tests {
     }
 
     // ── MANUAL voice-command capture (the button trigger) ───────────────────
+    use crate::reason::LocalReasoner;
     use crate::state::CaptureState;
+    use serde_json::Value;
+
+    fn armed(budget: u32) -> CaptureState {
+        CaptureState { budget, start_sample: Some(0) }
+    }
 
     #[test]
-    fn manual_capture_recognized_intent_dispatches_immediately_and_clears() {
-        // A recognized command (no wake word) → dispatch now, clear the capture, budget irrelevant.
-        let cap = CaptureState::armed();
-        let (decision, next) =
-            decide_manual_capture(cap, "zrób research o konkurencji");
+    fn manual_capture_nonempty_command_dispatches_with_the_heard_command_and_clears() {
+        // ANY non-empty post-click utterance is dispatched, carrying the heard command verbatim.
+        let cap = armed(5);
+        let (decision, next) = decide_manual_capture(cap, "  zrób research o konkurencji  ");
         assert_eq!(
             decision,
-            ManualCaptureDecision::Dispatch(VoiceIntent::Research { topic: "konkurencji".into() }),
-            "recognized intent must dispatch the parsed command immediately"
+            ManualCaptureDecision::Dispatch { command: "zrób research o konkurencji".into() },
+            "a non-empty command must dispatch with the heard (trimmed) command"
         );
         assert!(next.is_none(), "capture must be cleared after a dispatch");
     }
 
     #[test]
-    fn manual_capture_unknown_with_budget_left_keeps_listening_and_decrements() {
-        // Unrecognized tail but budget remains → keep listening, budget ticks down by 1.
-        let cap = CaptureState { budget: 3 };
-        let (decision, next) = decide_manual_capture(cap, "umm let me think");
+    fn manual_capture_silent_tick_with_budget_left_keeps_listening_and_decrements() {
+        // An EMPTY post-click window (no speech yet) but budget remains → keep listening, budget −1.
+        let cap = armed(3);
+        let (decision, next) = decide_manual_capture(cap, "   ");
         assert_eq!(decision, ManualCaptureDecision::KeepListening);
         assert_eq!(
             next,
-            Some(CaptureState { budget: 2 }),
-            "an unrecognized tick must decrement the budget and keep the capture armed"
+            Some(CaptureState { budget: 2, start_sample: Some(0) }),
+            "a silent tick must decrement the budget and keep the SAME latched offset"
         );
     }
 
     #[test]
-    fn manual_capture_unknown_at_budget_zero_dispatches_unrecognized_and_clears() {
-        // Last tick of budget, still unrecognized → give up + dispatch the Unknown tail (→ graceful
-        // "unrecognized" result), and clear the capture so it can never hang.
-        let cap = CaptureState { budget: 1 };
-        let (decision, next) = decide_manual_capture(cap, "qwer asdf zxcv");
-        assert_eq!(
-            decision,
-            ManualCaptureDecision::Dispatch(VoiceIntent::Unknown { raw: "qwer asdf zxcv".into() }),
-            "budget exhaustion must dispatch the last-heard (Unknown) tail"
-        );
-        assert!(next.is_none(), "capture must be cleared when the budget runs out");
-    }
-
-    #[test]
-    fn manual_capture_empty_tail_counts_down_so_silence_cannot_hang() {
-        // A SILENT tick (empty tail → Unknown) still spends budget; once it hits 0 it dispatches.
-        let (d1, n1) = decide_manual_capture(CaptureState { budget: 2 }, "");
+    fn manual_capture_budget_exhausted_silent_is_nothing_heard_not_empty_dispatch() {
+        // The NO-EMPTY-DISPATCH guarantee: a fully-silent capture ends in NothingHeard (graceful),
+        // NEVER an empty Unknown dispatch.
+        let (d1, n1) = decide_manual_capture(armed(2), "");
         assert_eq!(d1, ManualCaptureDecision::KeepListening);
-        assert_eq!(n1, Some(CaptureState { budget: 1 }));
+        assert_eq!(n1, Some(CaptureState { budget: 1, start_sample: Some(0) }));
         let (d2, n2) = decide_manual_capture(n1.unwrap(), "");
         assert_eq!(
             d2,
-            ManualCaptureDecision::Dispatch(VoiceIntent::Unknown { raw: String::new() }),
-            "a fully-silent capture must terminate at budget 0"
+            ManualCaptureDecision::NothingHeard,
+            "a fully-silent capture must terminate as NothingHeard, never an empty dispatch"
         );
-        assert!(n2.is_none());
+        assert!(n2.is_none(), "capture must be cleared once it gives up");
     }
 
     #[test]
-    fn manual_capture_default_budget_is_a_few_ticks() {
-        // The default arms ~3 ticks (≈9s at the 3s TICK) — long enough for one spoken command.
+    fn nothing_heard_result_is_graceful_with_empty_command() {
+        let r = crate::voice_action::VoiceActionResult::nothing_heard();
+        assert_eq!(r.status, "nothing_heard");
+        assert!(r.command.is_empty(), "nothing was heard ⇒ no command surfaced");
+        assert!(r.summary.contains("Nie usłyszałem"), "friendly PL nudge, not 'didn't catch an action'");
+    }
+
+    #[test]
+    fn manual_capture_default_budget_gives_a_reasonable_window() {
+        // The default arms ~5 ticks (≈15s at the 3s TICK) — comfortable to click then speak.
         assert!(
-            (2..=5).contains(&CaptureState::DEFAULT_BUDGET),
-            "default capture budget should be a small handful of live ticks"
+            (3..=8).contains(&CaptureState::DEFAULT_BUDGET),
+            "default capture budget should give the user a reasonable window to speak"
+        );
+    }
+
+    // ── resolve_command_intent: keyword fast-path → brain → fallback ─────────
+
+    /// Maps "research" for any non-empty command via `structured`, so we can prove the brain path.
+    struct BrainResearch;
+    impl LocalReasoner for BrainResearch {
+        fn id(&self) -> &str {
+            "brain-research"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+        fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> crate::error::Result<Value> {
+            Ok(serde_json::json!({ "action": "research", "argument": "wakacjach" }))
+        }
+    }
+
+    /// A reasoner that always errors — proves the keyword FALLBACK kicks in when the brain is down.
+    struct DeadBrain;
+    impl LocalReasoner for DeadBrain {
+        fn id(&self) -> &str {
+            "dead"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            Err(crate::error::AppError::Unavailable("no consent".into()))
+        }
+        fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> crate::error::Result<Value> {
+            Err(crate::error::AppError::Unavailable("no consent".into()))
+        }
+    }
+
+    #[test]
+    fn resolve_keyword_fast_path_wins_without_touching_the_brain() {
+        // A keyword-recognized command never calls the brain (DeadBrain would error if it did).
+        let intent = resolve_command_intent(&DeadBrain, "zrób research o konkurencji");
+        assert_eq!(intent, VoiceIntent::Research { topic: "konkurencji".into() });
+    }
+
+    #[test]
+    fn resolve_unknown_command_uses_the_brain_mapping() {
+        // Keyword Unknown ("poszukaj mi info o…") → brain maps it to Research over its argument.
+        let intent = resolve_command_intent(&BrainResearch, "poszukaj mi info o wakacjach");
+        assert_eq!(intent, VoiceIntent::Research { topic: "wakacjach".into() });
+    }
+
+    #[test]
+    fn resolve_unknown_command_falls_back_to_research_when_brain_unavailable() {
+        // Keyword Unknown + brain unavailable (no consent) → Research over the LITERAL command, a
+        // sensible non-empty default; never an empty/Unknown dispatch.
+        let intent = resolve_command_intent(&DeadBrain, "find me the latest on widgets");
+        assert_eq!(
+            intent,
+            VoiceIntent::Research { topic: "find me the latest on widgets".into() },
+            "a non-empty command with no brain must default to Research over the literal text"
         );
     }
 }
