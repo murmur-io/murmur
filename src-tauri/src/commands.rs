@@ -2259,8 +2259,8 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
 
 /// Whether a usable on-device brain (reasoning GGUF) is present at the resolved path — the
 /// configured custom `brain_model_path`, else the selected `brain_model_id`'s file in the shared
-/// models dir. Lets the UI offer a download. Independent of the `local-brain` feature: this only
-/// checks the file on disk.
+/// models dir. Lets the UI offer a download. Purely a file-on-disk check (mistralrs is always
+/// compiled; the real brain activates on model presence).
 #[tauri::command]
 pub fn brain_model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
     let (configured, selected) = {
@@ -2393,8 +2393,8 @@ pub async fn download_brain_model(
 }
 
 /// `true` when all three multilingual-e5-small files are present in the shared models dir's embed
-/// sub-dir — i.e. the REAL embedder (under `--features local-embed`) would load. Cheap existence
-/// probe; NEVER errors on a missing models dir (treats it as "not present").
+/// sub-dir — i.e. the REAL embedder would load (candle is always compiled; it activates on model
+/// presence). Cheap existence probe; NEVER errors on a missing models dir (treats it as "not present").
 #[tauri::command]
 pub fn embed_model_present() -> Result<bool, AppError> {
     Ok(crate::embed::embed_model_present())
@@ -2403,7 +2403,7 @@ pub fn embed_model_present() -> Result<bool, AppError> {
 /// Download the multilingual-e5-small model (3 HF files) into the shared models dir, INBOUND-ONLY,
 /// emitting [`crate::events::EVENT_EMBED_DOWNLOAD`] progress (throttled per file). Sends NO meeting
 /// content (no egress). The downloaded model is NOT loaded here — it is picked up lazily by
-/// `embed::active_embedder` on the next embed (feature-gated by `local-embed`). Returns the model dir.
+/// `embed::active_embedder` on the next embed (selected on model presence). Returns the model dir.
 #[tauri::command]
 pub async fn download_embed_model(app: AppHandle) -> Result<String, AppError> {
     let file_count = crate::embed::EMBED_MODEL_FILES.len();
@@ -2563,8 +2563,9 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
 }
 
 /// True iff the on-device PERSON-name NER model (Phase D) is present on disk. Pure existence probe;
-/// NEVER errors on a missing models dir (treats it as "not present"). When false (or the `local-ner`
-/// feature is off), the redaction firewall uses the byte-identical NoopNameRedactor.
+/// NEVER errors on a missing models dir (treats it as "not present"). When false, the redaction
+/// firewall uses the byte-identical NoopNameRedactor (candle NER is always compiled; it activates on
+/// model presence).
 #[tauri::command]
 pub fn ner_model_present() -> Result<bool, AppError> {
     Ok(crate::summarize::redact::ner_model_present())
@@ -2573,8 +2574,8 @@ pub fn ner_model_present() -> Result<bool, AppError> {
 /// Download the multilingual mDeBERTa-v3 NER model (3 HF files) into the shared models dir,
 /// INBOUND-ONLY, emitting [`crate::events::EVENT_NER_DOWNLOAD`] progress (throttled per file). Sends
 /// NO meeting content (no egress). The downloaded model is NOT loaded here — it is picked up lazily by
-/// `summarize::redact::active_name_redactor` on the next cloud summarization (feature-gated by
-/// `local-ner`). Returns the model dir.
+/// `summarize::redact::active_name_redactor` on the next cloud summarization (selected on model
+/// presence). Returns the model dir.
 #[tauri::command]
 pub async fn download_ner_model(app: AppHandle) -> Result<String, AppError> {
     let file_count = crate::summarize::redact::NER_MODEL_FILES.len();

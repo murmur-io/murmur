@@ -27,14 +27,17 @@ Every change shipped via build → adversarial-verify → (lock-security-review 
 
 ---
 
-## ⚠️ THE BUILD DECISION (same as 0.6.0)
+## THE BUILD (no feature decision — the full product IS the default build)
 
-Local models are opt-in cargo features (`local-brain`, `local-embed`, `local-ner`). For the full product you built, use **Option C**:
+The local-model cargo features were REMOVED: mistralrs (brain) + candle/tokenizers (embedder + NER)
+are now ALWAYS compiled and the real impls activate at runtime on model-presence. So the full product
+is just the plain default build — no `--features` needed. `MISTRALRS_METAL_PRECOMPILE=0` is baked into
+`src-tauri/.cargo/config.toml [env]`, but keep it on the command line too as a belt-and-braces guard
+(this Mac has only the Command Line Tools, not full Xcode → defer Metal-shader compile to first run):
 
 ```bash
-MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app -- --features local-brain,local-embed,local-ner
+MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app
 ```
-(Option B = `--features local-embed,local-ner` — semantic + NER + Claude brain, no Xcode/metal step. Option A = default, Claude-only.)
 
 ## Release steps (your Mac — sign/notarize/publish need your auth)
 
@@ -42,8 +45,8 @@ MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --b
 # clean tree on murmur @ 0.7.0:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 pkill -x Murmur ; pkill -f 'tauri dev' || true            # free the cargo target lock
-# build (Option C example):
-MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app -- --features local-brain,local-embed,local-ner
+# build (full product = the default build; no --features):
+MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app
 # sign INSIDE-OUT by identity HASH — FOUR bundled helpers (3 audio + meetnotes-calendar):
 bash scripts/macos-sign-notarize.sh        # signs each nested helper FIRST, then the .app (NO --deep), then the DMG
 # notarize + staple + verify + publish (notarytool keychain profile "murmur"):

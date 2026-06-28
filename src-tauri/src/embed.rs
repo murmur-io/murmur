@@ -1,9 +1,11 @@
 //! Embedding seam + pure retrieval helpers for the Phase 2a vector layer.
 //!
-//! Everything here is RUNTIME-AGNOSTIC and dependency-light: the real embedding model (BGE-M3,
-//! bundled, multilingual incl. Polish) is a deliberate LATER swap. Until it lands, [`StubEmbedder`]
-//! — a deterministic hash-bag embedder — backs the [`Embedder`] trait so the whole index/search/
-//! fusion pipeline is exercisable headless (`cargo test --lib`) with byte-stable vectors.
+//! Everything here is RUNTIME-AGNOSTIC and dependency-light: the real embedding model
+//! (multilingual-e5-small, 384-dim, multilingual incl. Polish — downloaded on first use, NOT bundled)
+//! is selected at runtime by [`active_embedder`] when its model dir is present. Until the model is
+//! downloaded, [`StubEmbedder`] — a deterministic hash-bag embedder — backs the [`Embedder`] trait so
+//! the whole index/search/fusion pipeline is exercisable headless (`cargo test --lib`) with
+//! byte-stable vectors.
 //!
 //! The DB-side wiring (the `vec0` virtual table, indexing, the GATED semantic search, purge-on-
 //! lock) lives in `storage/db.rs` because it needs `Db`'s private connection. This module holds
@@ -17,14 +19,14 @@ use crate::error::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// The REAL on-device embedder (Phase C), compiled ONLY under `--features local-embed`. The default
-/// build never pulls candle, keeping the fast `cargo test --lib` loop intact.
-#[cfg(feature = "local-embed")]
+/// The REAL on-device embedder (multilingual-e5-small via candle). ALWAYS compiled; the real impl is
+/// selected at runtime by [`active_embedder`] when the e5 model dir is present, else the stub.
 pub mod candle_bert;
 
 /// Embedding dimensionality of the vector layer. The `vec0` column is declared `float[EMBED_DIM]`,
-/// so this MUST match the real model's output width when it lands (BGE-M3 = 1024; the stub uses a
-/// smaller 384 so test vectors stay cheap). Changing it is a schema change (new `vec0` table).
+/// so this MUST match the real model's output width. multilingual-e5-small = 384, and the stub also
+/// emits 384, so the real model swaps in with ZERO vec0 schema migration. Changing it is a schema
+/// change (new `vec0` table).
 pub const EMBED_DIM: usize = 384;
 
 /// Target character size for one note chunk (paragraphs are merged up to roughly this width).
@@ -35,8 +37,8 @@ const CHUNK_CHAR_TARGET: usize = 800;
 pub const RRF_K: f64 = 60.0;
 
 /// The swappable embedding backend. Pure + synchronous: `embed` maps a batch of texts to a batch
-/// of `dim()`-length vectors. The real model implements this over BGE-M3; tests + the current
-/// default use [`StubEmbedder`].
+/// of `dim()`-length vectors. The real model implements this over multilingual-e5-small; tests +
+/// the no-model floor use [`StubEmbedder`].
 pub trait Embedder {
     /// Output vector width. MUST equal [`EMBED_DIM`] for vectors destined for the `vec0` table.
     fn dim(&self) -> usize;
@@ -127,12 +129,12 @@ impl Embedder for StubEmbedder {
 /// the model a swappable seam.
 ///
 /// Graceful degradation (mirrors [`crate::reason::active_reasoner`]), in priority order:
-/// - the `local-embed` feature is ON **and** the e5 model dir is present at [`embed_model_dir`]
-///   ([`embed_model_present`]) → the real [`candle_bert::CandleBertEmbedder`] (lazy: the model loads
-///   on first `embed`, not here, so this never blocks startup and never panics);
-/// - otherwise (feature off, no model, or a construction error) → the dependency-free
-///   [`StubEmbedder`]. The app works either way; semantic, WHEN enabled, just uses real vectors once
-///   the model is present.
+/// - the e5 model dir is present at [`embed_model_dir`] ([`embed_model_present`]) → the real
+///   [`candle_bert::CandleBertEmbedder`] (lazy: the model loads on first `embed`, not here, so this
+///   never blocks startup and never panics);
+/// - otherwise (no model, or a construction error) → the dependency-free [`StubEmbedder`]. The app
+///   works either way; semantic, WHEN enabled, just uses real vectors once the model is present.
+///   Selection keys ONLY on model presence — the candle backend is always compiled (no cargo feature).
 ///
 /// NEVER panics and NEVER blocks. Target model = multilingual-e5-small (384-dim), so the real model's
 /// width EQUALS [`EMBED_DIM`] — ZERO `vec_chunks` schema migration. (A future model whose dimension
@@ -142,21 +144,18 @@ impl Embedder for StubEmbedder {
 /// so callers build one per operation. NEVER invoked when `semantic_search_enabled` is off (the gate
 /// short-circuits before this is called) — building the real embedder does NOT flip that flag.
 pub fn active_embedder() -> Box<dyn Embedder> {
-    #[cfg(feature = "local-embed")]
-    {
-        if embed_model_present() {
-            match embed_model_dir().and_then(candle_bert::CandleBertEmbedder::new) {
-                Ok(e) => {
-                    tracing::info!(target: "embed", "local embed model ready (lazy load)");
-                    return Box::new(e);
-                }
-                Err(e) => {
-                    tracing::warn!(target: "embed", error = %e, "local embed init failed; using stub embedder");
-                }
+    if embed_model_present() {
+        match embed_model_dir().and_then(candle_bert::CandleBertEmbedder::new) {
+            Ok(e) => {
+                tracing::info!(target: "embed", "local embed model ready (lazy load)");
+                return Box::new(e);
             }
-        } else {
-            tracing::info!(target: "embed", "no local embed model present; using stub embedder");
+            Err(e) => {
+                tracing::warn!(target: "embed", error = %e, "local embed init failed; using stub embedder");
+            }
         }
+    } else {
+        tracing::info!(target: "embed", "no local embed model present; using stub embedder");
     }
     Box::new(StubEmbedder)
 }
@@ -436,14 +435,14 @@ mod tests {
     }
 
     /// The embedder factory's graceful-degradation contract: with NO e5 model dir present,
-    /// `active_embedder` returns the deterministic StubEmbedder (dim == EMBED_DIM, byte-stable). With
-    /// the `local-embed` feature OFF this is unconditional; with it ON it still holds whenever the
-    /// model dir is absent. Headless proof of the swap wiring's fallback (mirrors
+    /// `active_embedder` returns the deterministic StubEmbedder (dim == EMBED_DIM, byte-stable). The
+    /// candle backend is always compiled now, so selection keys ONLY on model presence — absent model
+    /// ⇒ stub. Headless proof of the swap wiring's fallback (mirrors
     /// `active_reasoner_falls_back_to_stub_without_model`).
     #[test]
     fn active_embedder_falls_back_to_stub_without_model() {
         // Only meaningful as a fallback assertion when no real model is installed; on a clean
-        // machine/CI the e5 dir is absent, so a feature-on build also yields the stub.
+        // machine/CI the e5 dir is absent, so the always-compiled candle backend still yields the stub.
         if !embed_model_present() {
             let e = active_embedder();
             assert_eq!(e.dim(), EMBED_DIM);
