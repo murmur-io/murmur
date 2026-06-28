@@ -138,6 +138,39 @@ import { AssistantStore } from "../../core/assistant.store";
                  Compact (icon-only) so the pill stays uncrowded; the descriptive
                  "still capturing others" copy rides the stage hint below. -->
             <app-mic-mute-toggle [compact]="true" #micToggle />
+            <!-- Ask AI — manually open the voice-command listener (no wake phrase
+                 needed). Pulses + glows while the assistant is listening. The
+                 spoken answer lands in the assistant-actions card below. -->
+            <button
+              type="button"
+              class="ask-btn"
+              [class.is-listening]="assistant.listening()"
+              (click)="askAi()"
+              [attr.aria-pressed]="assistant.listening()"
+              [attr.aria-label]="
+                assistant.listening()
+                  ? 'Listening — say your request'
+                  : 'Ask the AI assistant'
+              "
+            >
+              <svg
+                class="ask-ico"
+                viewBox="0 0 24 24"
+                width="20"
+                height="20"
+                aria-hidden="true"
+              >
+                <path
+                  d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+                  fill="currentColor"
+                />
+                <path
+                  d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+                  fill="currentColor"
+                  opacity="0.85"
+                />
+              </svg>
+            </button>
             <button
               type="button"
               class="stop-btn"
@@ -147,6 +180,15 @@ import { AssistantStore } from "../../core/assistant.store";
               <span class="stop-ico" aria-hidden="true"></span>
             </button>
           </div>
+
+          <!-- Rich "listening" state — appears the instant the manual Ask-AI
+               listener opens; clear copy so it's obvious the app is hearing you. -->
+          @if (assistant.listening()) {
+            <div class="listening" role="status" aria-live="polite">
+              <span class="listening-orb" aria-hidden="true"></span>
+              <span class="listening-text">🎙 Słucham — powiedz polecenie…</span>
+            </div>
+          }
         } @else if (isProcessing()) {
           <div class="rec-bar is-processing" role="status">
             <span class="orb proc" aria-hidden="true"></span>
@@ -628,6 +670,92 @@ import { AssistantStore } from "../../core/assistant.store";
         background: #fff;
       }
 
+      /* Ask AI — sparkle button beside Stop. Calm accent at idle, pulsing glow
+         while the assistant is listening so it's unmistakable. */
+      .ask-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        height: 44px;
+        min-width: 44px;
+        border: 1px solid var(--accent-ring);
+        border-radius: 50%;
+        color: var(--accent-hover);
+        background: var(--accent-soft);
+        cursor: pointer;
+        transition:
+          transform var(--transition-fast),
+          background var(--transition),
+          box-shadow var(--transition),
+          color var(--transition);
+      }
+      .ask-btn:hover {
+        background: var(--accent);
+        color: #fff;
+        transform: scale(1.05);
+      }
+      .ask-btn:active {
+        transform: scale(0.96);
+      }
+      .ask-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .ask-btn.is-listening {
+        background: var(--accent-gradient);
+        color: #fff;
+        border-color: transparent;
+        animation: ask-pulse 1.5s ease-in-out infinite;
+      }
+      .ask-ico {
+        display: block;
+      }
+      @keyframes ask-pulse {
+        0%,
+        100% {
+          box-shadow: 0 0 0 0 var(--accent-ring);
+        }
+        50% {
+          box-shadow: 0 0 0 8px rgba(110, 118, 255, 0);
+        }
+      }
+
+      /* Inline "listening" indicator under the pill while the mic is open. */
+      .listening {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        margin-top: var(--space-3);
+        padding: var(--space-2) var(--space-3);
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-ring);
+        color: var(--accent-hover);
+        font-size: 0.9rem;
+        font-weight: 550;
+        animation: rise 220ms var(--transition) both;
+      }
+      .listening-orb {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 0 0 var(--accent-ring);
+        animation: ask-pulse 1.5s ease-in-out infinite;
+      }
+      .listening-text {
+        line-height: 1.3;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .ask-btn.is-listening,
+        .listening-orb,
+        .listening {
+          animation: none;
+        }
+      }
+
       /* Processing — cool, calm, working. */
       .rec-bar.is-processing {
         width: 420px;
@@ -1016,8 +1144,14 @@ export class RecordComponent implements OnInit {
     const enabled = !!c && c.realtimeReactions === true && c.brainBackend !== "off";
     // Also surface the card the instant an interaction lands — covers a stale config
     // snapshot (realtime toggled on in Settings after this screen mounted). The store is
-    // init()'d in ngOnInit, so it subscribes even when the card was never shown.
-    return enabled || this.assistant.hasAny();
+    // init()'d in ngOnInit, so it subscribes even when the card was never shown. A manual
+    // "Ask AI" (listening or in-flight) ALWAYS shows the card so the answer has a home.
+    return (
+      enabled ||
+      this.assistant.hasAny() ||
+      this.assistant.listening() ||
+      this.assistant.manualAskInFlight()
+    );
   });
 
   /**
@@ -1259,6 +1393,20 @@ export class RecordComponent implements OnInit {
   /** Summon the floating always-on-top bar (also bound to ⌘⇧R globally). */
   popOut(): void {
     void this.ipc.toggleBar();
+  }
+
+  /**
+   * Manually trigger the voice assistant to listen for a spoken command (the
+   * "Ask AI" button) — no wake phrase needed. The store sets the in-flight flag
+   * (so the answer card stays visible) and the backend streams the listening
+   * state over EVENT_VOICE_COMMAND_LISTENING; the answer lands in the
+   * assistant-actions card. Swallow rejections (e.g. brain backend off) — the
+   * store already resets its pulsing state on error.
+   */
+  askAi(): void {
+    void this.assistant.askNow().catch(() => {
+      /* listener unavailable — store resets the in-flight/listening state */
+    });
   }
 
   /**
