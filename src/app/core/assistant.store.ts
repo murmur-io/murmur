@@ -4,6 +4,7 @@ import { IpcService } from "./ipc.service";
 import type {
   VoiceActionResultPayload,
   VoiceActionStatus,
+  VoiceCommandListeningPayload,
   WakeDetectedPayload,
 } from "./models";
 
@@ -45,11 +46,29 @@ export class AssistantStore {
   /** Whether any interaction has ever been observed (drives empty-state copy). */
   readonly hasAny = computed(() => this._interactions().length > 0);
 
+  /**
+   * True while the manual "Ask AI" listener has the mic open (between the
+   * `{active:true}` and `{active:false}` EVENT_VOICE_COMMAND_LISTENING events).
+   * Drives the pulsing button + "🎙 Słucham…" inline indicator.
+   */
+  private readonly _listening = signal(false);
+  readonly listening = this._listening.asReadonly();
+
+  /**
+   * True from the instant a manual ask is fired until its answer lands — keeps
+   * the assistant-actions card visible across the whole round-trip even when the
+   * realtime-reactions config toggle is off. Set by {@link askStarted}, cleared
+   * when a result resolves a pending row.
+   */
+  private readonly _manualAskInFlight = signal(false);
+  readonly manualAskInFlight = this._manualAskInFlight.asReadonly();
+
   /** Monotonic id source for interaction rows (stable `@for` keys). */
   private nextId = 1;
 
   private unlistenWake: UnlistenFn | null = null;
   private unlistenResult: UnlistenFn | null = null;
+  private unlistenListening: UnlistenFn | null = null;
   /** Synchronous re-entrancy guard so two concurrent init() calls (e.g. the record
    * screen + the card both initialising) can't double-subscribe before the first
    * `await` resolves. */
@@ -63,14 +82,36 @@ export class AssistantStore {
     this.unlistenResult = await this.ipc.onVoiceActionResult((p) =>
       this.onResult(p),
     );
+    this.unlistenListening = await this.ipc.onVoiceCommandListening((p) =>
+      this.onListening(p),
+    );
   }
 
   /** Release the event subscriptions (e.g. on app teardown). */
   dispose(): void {
     this.unlistenWake?.();
     this.unlistenResult?.();
+    this.unlistenListening?.();
     this.unlistenWake = null;
     this.unlistenResult = null;
+    this.unlistenListening = null;
+  }
+
+  /**
+   * Fire the manual "Ask AI" trigger: open the listener AND mark a manual ask in
+   * flight so the assistant card stays visible for the whole round-trip. Errors
+   * (backend rejects / listener unavailable) clear the in-flight flag so the UI
+   * doesn't get stuck pulsing.
+   */
+  async askNow(): Promise<void> {
+    this._manualAskInFlight.set(true);
+    try {
+      await this.ipc.beginVoiceCommand();
+    } catch (e) {
+      this._manualAskInFlight.set(false);
+      this._listening.set(false);
+      throw e;
+    }
   }
 
   private onWake(p: WakeDetectedPayload): void {
@@ -86,7 +127,15 @@ export class AssistantStore {
     );
   }
 
+  private onListening(p: VoiceCommandListeningPayload): void {
+    this._listening.set(p.active);
+  }
+
   private onResult(p: VoiceActionResultPayload): void {
+    // The answer landed — the manual ask (if any) is no longer in flight, and
+    // the listener is closed.
+    this._manualAskInFlight.set(false);
+    this._listening.set(false);
     this._interactions.update((rows) => {
       // Resolve the most recent still-pending row; if none (a result without a
       // wake we observed), prepend a fresh resolved row so nothing is lost.
