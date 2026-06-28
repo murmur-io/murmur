@@ -141,9 +141,12 @@ export class AssistantStore {
       // wake we observed), prepend a fresh resolved row so nothing is lost.
       const idx = rows.findIndex((r) => r.status === "pending");
       if (idx === -1) {
+        // A manual ("Ask AI") result has NO preceding wake row — surface the
+        // HEARD command straight from the payload so the card shows what the
+        // user actually said (not an empty "usłyszano: …").
         const row: AssistantInteraction = {
           id: this.nextId++,
-          command: "",
+          command: p.command,
           status: p.status,
           summary: p.summary,
           citations: p.citations,
@@ -153,6 +156,9 @@ export class AssistantStore {
       const next = rows.slice();
       next[idx] = {
         ...next[idx],
+        // Keep the wake-detected command, but fall back to the payload's heard
+        // command if the pending row never captured one.
+        command: next[idx].command || p.command,
         status: p.status,
         summary: p.summary,
         citations: p.citations,
