@@ -129,6 +129,19 @@ pub struct AppConfigDto {
     /// enable it. Flipping it on does NOT auto-index — the user runs `reindex_embeddings` to backfill.
     #[serde(default)]
     pub semantic_search_enabled: bool,
+    /// brain2 connector framework — the WEB SEARCH master toggle. Settable from the DTO (the Settings
+    /// UI owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`), so a
+    /// partial/older save can never silently enable it. Even ON, the web connector is exposed only
+    /// once `web_search_consented` is granted AND a key is stored.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    /// brain2 connector framework — one-time WEB SEARCH egress consent. PRESERVE-ONLY on this DTO,
+    /// exactly like `cloud_egress_consented`: `get_config` carries the current value OUT (so the FE can
+    /// show consent status), but `dto_to_config` IGNORES the incoming value and PRESERVES the stored
+    /// one. The ONLY mutator is the dedicated `consent_to_web_search` command, so a settings save can
+    /// neither grant nor clear web-search egress consent. `#[serde(default)]` = false (fail-closed).
+    #[serde(default)]
+    pub web_search_consented: bool,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -1721,6 +1734,22 @@ pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppErro
     Ok(())
 }
 
+/// brain2 connectors — grant the one-time WEB SEARCH egress consent. The web connector reaches an
+/// EXTERNAL service (a NEW EGRESS CLASS): the redacted query leaves the device. This is the ONLY
+/// supported way to flip `web_search_consented` true; it persists the flag AND updates the in-memory
+/// config cache, so the next `ConnectorRegistry::build` exposes the web tool (provided web search is
+/// also enabled and a key is stored). Idempotent. Until granted, the web connector is absent from the
+/// brain's tool registry and the redacted query never leaves the device.
+#[tauri::command]
+pub fn consent_to_web_search(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_web_search_consent(&state.db)?;
+    Ok(())
+}
+
 fn config_to_dto(c: &AppConfig) -> AppConfigDto {
     AppConfigDto {
         provider_id: c.provider_id.clone(),
@@ -1752,6 +1781,10 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         realtime_reactions: c.realtime_reactions,
         brain_model_id: c.brain_model_id.clone(),
         semantic_search_enabled: c.semantic_search_enabled,
+        web_search_enabled: c.web_search_enabled,
+        // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
+        // in `dto_to_config`).
+        web_search_consented: c.web_search_consented,
     }
 }
 
@@ -1830,6 +1863,13 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // Settings UI owns the toggle). Plain bool; an omitted value already defaulted to OFF on the
         // DTO (`#[serde(default)]`), so the opt-in can never be silently enabled by a partial save.
         realtime_reactions: d.realtime_reactions,
+        // brain2 connectors: the web-search master toggle IS settable from the DTO (Settings owns it).
+        // An omitted value already defaulted to OFF on the DTO, so a partial save can't enable it.
+        web_search_enabled: d.web_search_enabled,
+        // brain2 connectors (NEW EGRESS CLASS): consent is NEVER set from the DTO — preserved from the
+        // live value (BLK-4 mirror). Only `consent_to_web_search` may flip it, so a settings save can
+        // neither grant nor clear web-search egress consent.
+        web_search_consented: current.web_search_consented,
     }
 }
 
@@ -1853,6 +1893,25 @@ pub fn set_anthropic_key(key: String) -> Result<(), AppError> {
 #[tauri::command]
 pub fn has_anthropic_key() -> Result<bool, AppError> {
     Ok(secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?.is_some())
+}
+
+/// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
+/// An empty input clears it. The key is NEVER logged and NEVER returned to the FE — only `has_*`
+/// reports presence. Mirrors `set_anthropic_key`.
+#[tauri::command]
+pub fn set_web_search_api_key(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return secrets::delete_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT);
+    }
+    secrets::set_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT, key.trim())
+}
+
+/// Whether a web-search API key is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_web_search_key() -> Result<bool, AppError> {
+    Ok(secrets::get_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT)?
+        .filter(|k| !k.trim().is_empty())
+        .is_some())
 }
 
 /// availability() fan-out across all three providers for the Settings UI.
@@ -4773,6 +4832,49 @@ mod lifecycle_tests {
             !dto_to_config(dto2, &current2).cloud_egress_consented,
             "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
         );
+    }
+
+    /// brain2 connectors (NEW EGRESS CLASS): `web_search_consented` is PRESERVE-ONLY on the settings
+    /// DTO exactly like `cloud_egress_consented` — an omitting/false save can't clear an existing
+    /// grant, and a save carrying `true` can't grant it. Only `consent_to_web_search` may flip it.
+    #[test]
+    fn save_config_merge_never_clobbers_or_grants_web_search_consent() {
+        // (a) preserve an existing grant even when the DTO carries false.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.web_search_consented = false;
+        let current = AppConfig { web_search_consented: true, ..AppConfig::default() };
+        assert!(
+            dto_to_config(dto, &current).web_search_consented,
+            "an omitting/false save must NOT clobber an existing web-search consent"
+        );
+
+        // (b) a save carrying true cannot GRANT consent (default-off stays off).
+        let mut dto2 = config_to_dto(&AppConfig::default());
+        dto2.web_search_consented = true;
+        let current2 = AppConfig::default(); // consent off
+        assert!(
+            !dto_to_config(dto2, &current2).web_search_consented,
+            "a settings save must NEVER grant web-search consent — only the dedicated command may"
+        );
+    }
+
+    /// `web_search_enabled` IS settable from the DTO (unlike the consent flag): config_to_dto carries
+    /// it out, dto_to_config takes it in (proven by starting from a different `current`).
+    #[test]
+    fn dto_takes_web_search_enabled_from_payload() {
+        let dto_on = {
+            let mut d = config_to_dto(&AppConfig::default());
+            d.web_search_enabled = true;
+            d
+        };
+        let current_off = AppConfig::default(); // enabled off
+        assert!(
+            dto_to_config(dto_on, &current_off).web_search_enabled,
+            "web_search_enabled is settable from the DTO"
+        );
+        // And OUT: config_to_dto reflects the live value.
+        let cfg = AppConfig { web_search_enabled: true, ..AppConfig::default() };
+        assert!(config_to_dto(&cfg).web_search_enabled);
     }
 
     /// Phase H: the three brain toggles round-trip through the settings DTO. `config_to_dto` carries
