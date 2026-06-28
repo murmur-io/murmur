@@ -236,3 +236,53 @@ fn l2_normalize(x: &Tensor) -> candle_core::Result<Tensor> {
     let norm = norm.clamp(1e-12f32, f32::INFINITY)?;
     x.broadcast_div(&norm)
 }
+
+/// On-Mac smoke test — does the e5 safetensors actually LOAD via candle + produce a sane,
+/// L2-normalized, dimension-correct, semantically-ordered embedding? `#[ignore]`d (needs the model
+/// on disk + Metal), so it never runs in the normal `cargo test` loop. Run:
+///
+/// ```text
+/// cargo test --features local-embed embed::candle_bert::smoke -- --ignored --nocapture
+/// ```
+#[cfg(all(test, feature = "local-embed"))]
+mod smoke {
+    use super::CandleBertEmbedder;
+    use crate::embed::{embed_model_dir, Embedder, EMBED_DIM};
+
+    #[test]
+    #[ignore = "needs the e5 model on disk + Metal; run manually with --features local-embed"]
+    fn e5_loads_and_embeds() {
+        let dir = embed_model_dir().expect("embed_model_dir");
+        assert!(
+            dir.join("model.safetensors").is_file(),
+            "e5 model not found at {dir:?}"
+        );
+        let e = CandleBertEmbedder::new(dir).expect("construct CandleBertEmbedder");
+
+        let passages = vec![
+            "Notatki ze spotkania o projekcie Atlas i terminie integracji API.".to_string(),
+            "The quarterly budget review is scheduled for next Friday.".to_string(),
+        ];
+        let pv = e.embed_passage(&passages).expect("embed_passage failed");
+        assert_eq!(pv.len(), 2);
+        assert_eq!(pv[0].len(), EMBED_DIM, "wrong embedding dim");
+
+        let norm: f32 = pv[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        println!("dim={} L2-norm={norm:.4} first5={:?}", pv[0].len(), &pv[0][..5]);
+        assert!((norm - 1.0).abs() < 0.05, "not L2-normalized: {norm}");
+
+        // Semantic sanity: a Polish query about the meeting should be closer to the Polish
+        // meeting passage than to the unrelated English budget passage.
+        let q = e
+            .embed_query(&["o czym było spotkanie projektu Atlas".to_string()])
+            .expect("embed_query failed");
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let sim_related = cos(&q[0], &pv[0]);
+        let sim_unrelated = cos(&q[0], &pv[1]);
+        println!("cos(query, PL-meeting)={sim_related:.4}  cos(query, EN-budget)={sim_unrelated:.4}");
+        assert!(
+            sim_related > sim_unrelated,
+            "PL query should rank the PL meeting passage above the unrelated EN passage"
+        );
+    }
+}
