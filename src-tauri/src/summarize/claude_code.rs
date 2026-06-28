@@ -171,6 +171,10 @@ extern "C" {
 pub struct ClaudeCodeProvider {
     binary: String,
     system_prompt: String,
+    /// Optional model OVERRIDE passed to the CLI as `--model <id>`. Empty `""` (the default) means
+    /// "let the `claude` CLI pick its own default model" — no `--model` flag is added in that case.
+    /// (The CLI has no reasoning-effort flag, so `provider_effort` is intentionally NOT wired here.)
+    model: String,
 }
 
 impl ClaudeCodeProvider {
@@ -178,6 +182,7 @@ impl ClaudeCodeProvider {
         Self {
             binary: DEFAULT_BINARY.to_string(),
             system_prompt: template::default_template(),
+            model: String::new(),
         }
     }
 
@@ -190,7 +195,14 @@ impl ClaudeCodeProvider {
         Self {
             binary,
             system_prompt: template::default_template(),
+            model: String::new(),
         }
+    }
+
+    /// Set the model override (builder-style). Empty/blank ⇒ no `--model` flag (CLI default).
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = model;
+        self
     }
 }
 
@@ -259,6 +271,9 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true); // F6: a dropped future (cancel/panic) reaps the child.
+        // Brain/AI model override: only add `--model` when the user picked a specific model;
+        // an empty value lets the CLI use its own default.
+        cmd.args(model_args(&self.model));
         harden_env(&mut cmd); // F2: env_clear + minimal PATH.
         let mut child = cmd
             .spawn()
@@ -337,6 +352,8 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true); // F6
+        // Brain/AI model override (mirrors `summarize`): add `--model` only when set.
+        cmd.args(model_args(&self.model));
         harden_env(&mut cmd); // F2
         let mut child = cmd
             .spawn()
@@ -387,6 +404,17 @@ impl SummarizerProvider for ClaudeCodeProvider {
     }
 }
 
+/// The `--model <id>` argument pair to append for a given model override, or `&[]` when the
+/// override is empty/blank (let the CLI use its default). Pure + unit-testable — the exact
+/// branch used at both call sites in `summarize`/`complete` (`if !self.model.trim().is_empty()`).
+fn model_args(model: &str) -> Vec<String> {
+    if model.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec!["--model".to_string(), model.to_string()]
+    }
+}
+
 /// True iff `text`'s first non-empty line is exactly a three-dash YAML fence (allowing
 /// trailing whitespace on the line).
 fn starts_with_frontmatter(text: &str) -> bool {
@@ -399,6 +427,32 @@ fn starts_with_frontmatter(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_args_adds_flag_only_when_set() {
+        // Empty/blank ⇒ no flag (CLI default).
+        assert!(model_args("").is_empty());
+        assert!(model_args("   ").is_empty());
+        // A real id ⇒ the `--model <id>` pair.
+        assert_eq!(
+            model_args("claude-opus-4-8"),
+            vec!["--model".to_string(), "claude-opus-4-8".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_model_threads_the_override() {
+        // The builder stores the override; the empty default leaves it unset (no flag).
+        let p = ClaudeCodeProvider::with_binary("claude".to_string());
+        assert!(p.model.is_empty());
+        let p = ClaudeCodeProvider::with_binary("claude".to_string())
+            .with_model("claude-sonnet-4-6".to_string());
+        assert_eq!(p.model, "claude-sonnet-4-6");
+        assert_eq!(
+            model_args(&p.model),
+            vec!["--model".to_string(), "claude-sonnet-4-6".to_string()]
+        );
+    }
 
     #[test]
     fn frontmatter_detection() {

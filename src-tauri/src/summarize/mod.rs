@@ -76,13 +76,27 @@ pub fn make_provider(
     }
 
     let inner: Arc<dyn SummarizerProvider> = match id {
-        PROVIDER_CLAUDE_CODE => Arc::new(ClaudeCodeProvider::with_binary(
-            config.claude_binary.clone(),
-        )),
+        PROVIDER_CLAUDE_CODE => Arc::new(
+            ClaudeCodeProvider::with_binary(config.claude_binary.clone())
+                // Brain/AI model picker: a chosen model is passed as `--model`; an empty value
+                // (the default) lets the CLI use its own default. Effort is N/A for the CLI.
+                .with_model(config.provider_model.clone()),
+        ),
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
             let api_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?;
-            Arc::new(AnthropicProvider::new(api_key, config.anthropic_model.clone()))
+            // Brain/AI model picker takes precedence over the legacy `anthropic_model`; effort is
+            // the adaptive-thinking tier (provider default when empty).
+            let model = if config.provider_model.trim().is_empty() {
+                config.anthropic_model.clone()
+            } else {
+                config.provider_model.clone()
+            };
+            Arc::new(AnthropicProvider::with_effort(
+                api_key,
+                model,
+                config.provider_effort.clone(),
+            ))
         }
         PROVIDER_OLLAMA => {
             return Ok(Arc::new(OllamaProvider::new(
@@ -125,11 +139,20 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
         .ok()
         .flatten();
 
+    let anthropic_model = if config.provider_model.trim().is_empty() {
+        config.anthropic_model.clone()
+    } else {
+        config.provider_model.clone()
+    };
     vec![
-        Arc::new(ClaudeCodeProvider::with_binary(config.claude_binary.clone())),
-        Arc::new(AnthropicProvider::new(
+        Arc::new(
+            ClaudeCodeProvider::with_binary(config.claude_binary.clone())
+                .with_model(config.provider_model.clone()),
+        ),
+        Arc::new(AnthropicProvider::with_effort(
             anthropic_key,
-            config.anthropic_model.clone(),
+            anthropic_model,
+            config.provider_effort.clone(),
         )),
         Arc::new(OllamaProvider::new(
             config.ollama_base_url.clone(),

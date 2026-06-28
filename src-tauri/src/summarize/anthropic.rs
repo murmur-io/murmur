@@ -20,12 +20,22 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     model: String,
     api_key: Option<String>,
+    /// Reasoning EFFORT: `""`/`"default"` (provider default — no thinking config sent), or
+    /// `"low"`/`"medium"`/`"high"`. When set, ADAPTIVE thinking + an output effort tier is added to
+    /// the request body. Opus 4.8 requires `thinking.type = "adaptive"`; sending the older
+    /// `thinking.enabled`/`budget_tokens` shape would 400, so we deliberately never do that.
+    effort: String,
 }
 
 impl AnthropicProvider {
     /// `api_key` already resolved from Keychain by the factory. `model` defaults to
-    /// `claude-opus-4-8` when empty.
+    /// `claude-opus-4-8` when empty. Effort defaults to provider-default (`""`).
     pub fn new(api_key: Option<String>, model: String) -> Self {
+        Self::with_effort(api_key, model, String::new())
+    }
+
+    /// Like [`new`], plus an explicit reasoning-effort tier (`""`/`"default"` = provider default).
+    pub fn with_effort(api_key: Option<String>, model: String, effort: String) -> Self {
         let model = if model.trim().is_empty() {
             DEFAULT_MODEL.to_string()
         } else {
@@ -35,7 +45,29 @@ impl AnthropicProvider {
             client: build_client(),
             model,
             api_key,
+            effort,
         }
+    }
+}
+
+/// Inject ADAPTIVE thinking + an output-effort tier into a `/v1/messages` request `body` when
+/// `effort` is a real tier. Empty `""` or `"default"` ⇒ the body is left UNTOUCHED (provider
+/// default — no thinking config sent at all). An UNKNOWN tier is also left untouched (fail-safe:
+/// never send a malformed effort that would 400). `body` must be a JSON object.
+///
+/// Shape (Opus 4.8): `"thinking": {"type": "adaptive"}` + `"output_config": {"effort": <tier>}`.
+/// NEVER `thinking.enabled`/`budget_tokens` — that legacy shape 400s on the 4.x adaptive models.
+fn apply_effort(body: &mut serde_json::Value, effort: &str) {
+    let tier = effort.trim();
+    if tier.is_empty() || tier.eq_ignore_ascii_case("default") {
+        return;
+    }
+    if !matches!(tier, "low" | "medium" | "high") {
+        return;
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("thinking".to_string(), json!({ "type": "adaptive" }));
+        obj.insert("output_config".to_string(), json!({ "effort": tier }));
     }
 }
 
@@ -102,7 +134,7 @@ impl SummarizerProvider for AnthropicProvider {
         };
         let user_content = template::render_user_content(req);
 
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "system": system_prompt,
@@ -110,6 +142,7 @@ impl SummarizerProvider for AnthropicProvider {
                 { "role": "user", "content": user_content }
             ],
         });
+        apply_effort(&mut body, &self.effort);
 
         let resp = self
             .client
@@ -170,12 +203,13 @@ impl SummarizerProvider for AnthropicProvider {
             .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| AppError::Unavailable("Anthropic API key is not set".to_string()))?;
 
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "system": system,
             "messages": [ { "role": "user", "content": user } ],
         });
+        apply_effort(&mut body, &self.effort);
 
         let resp = self
             .client
@@ -217,4 +251,69 @@ impl SummarizerProvider for AnthropicProvider {
 fn extract_api_error(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     v.get("error")?.get("message")?.as_str().map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_body() -> serde_json::Value {
+        json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": MAX_TOKENS,
+            "system": "sys",
+            "messages": [ { "role": "user", "content": "u" } ],
+        })
+    }
+
+    #[test]
+    fn effort_set_injects_adaptive_thinking_and_output_effort() {
+        for tier in ["low", "medium", "high"] {
+            let mut body = base_body();
+            apply_effort(&mut body, tier);
+            // Adaptive thinking (the ONLY shape Opus 4.8 accepts) — never enabled/budget_tokens.
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert!(body["thinking"].get("enabled").is_none());
+            assert!(body["thinking"].get("budget_tokens").is_none());
+            // Output effort tier carried through verbatim.
+            assert_eq!(body["output_config"]["effort"], tier);
+        }
+    }
+
+    #[test]
+    fn effort_empty_or_default_omits_thinking_and_effort() {
+        for tier in ["", "   ", "default", "Default"] {
+            let mut body = base_body();
+            apply_effort(&mut body, tier);
+            assert!(
+                body.get("thinking").is_none(),
+                "effort {tier:?} must NOT add thinking (provider default)"
+            );
+            assert!(
+                body.get("output_config").is_none(),
+                "effort {tier:?} must NOT add output_config"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_unknown_tier_is_inert() {
+        // A garbage tier must never produce a malformed body that would 400 — leave it untouched.
+        let mut body = base_body();
+        apply_effort(&mut body, "ultra");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn with_effort_threads_model_and_effort() {
+        let p = AnthropicProvider::with_effort(None, String::new(), "high".to_string());
+        // Empty model falls back to the default; effort is retained.
+        assert_eq!(p.model, DEFAULT_MODEL);
+        assert_eq!(p.effort, "high");
+        // The plain constructor defaults effort to provider-default (empty).
+        let p = AnthropicProvider::new(None, "claude-haiku-4-5".to_string());
+        assert_eq!(p.model, "claude-haiku-4-5");
+        assert_eq!(p.effort, "");
+    }
 }
