@@ -6,6 +6,7 @@ import {
 } from "@angular/core";
 import { AssistantStore } from "../../core/assistant.store";
 import type { AssistantInteraction } from "../../core/assistant.store";
+import { AiOrbComponent } from "./ai-orb.component";
 
 /**
  * Phase H — the live "assistant actions" card on the record surface. Subscribes
@@ -25,10 +26,11 @@ import type { AssistantInteraction } from "../../core/assistant.store";
   selector: "app-assistant-actions",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [AiOrbComponent],
   template: `
     <div class="card assistant" role="group" aria-label="Voice assistant">
       <div class="assistant-head">
-        <span class="assistant-mark" aria-hidden="true">🎙</span>
+        <app-ai-orb class="head-orb" [state]="store.orbState()" />
         <span class="assistant-title">Voice assistant</span>
         <span class="pill is-live assistant-live" aria-hidden="true">
           <span class="pill-dot"></span>
@@ -118,9 +120,8 @@ import type { AssistantInteraction } from "../../core/assistant.store";
         align-items: center;
         gap: var(--space-2);
       }
-      .assistant-mark {
-        font-size: 1.05rem;
-        line-height: 1;
+      .head-orb {
+        --orb-size: 22px;
       }
       .assistant-title {
         color: var(--text-primary);

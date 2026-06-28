@@ -244,6 +244,18 @@ export interface VoiceCommandListeningPayload {
   active: boolean;
 }
 
+/**
+ * Fired when a MANUAL voice-command capture has STOPPED listening and the
+ * accumulated utterance is being DISPATCHED (`EVENT_VOICE_COMMAND_PROCESSING`).
+ * `active` flips true the instant the backend stops capturing and the gated
+ * `handle_voice_action` round-trip (RAG + brain) begins, and is cleared (false
+ * is implied) when the answer lands via `EVENT_VOICE_ACTION_RESULT`. Drives the
+ * "🧠 Przetwarzam…" processing state in the gap between stop and answer.
+ */
+export interface VoiceCommandProcessingPayload {
+  active: boolean;
+}
+
 /** A selectable microphone input device (from `list_input_devices`). */
 export interface InputDeviceInfo {
   name: string;

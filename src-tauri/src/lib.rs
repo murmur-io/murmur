@@ -75,6 +75,7 @@ pub fn run() {
             commands::set_mic_muted,
             commands::is_mic_muted,
             commands::begin_voice_command,
+            commands::end_voice_command,
             commands::list_input_devices,
             commands::get_last_note,
             commands::update_note,
