@@ -82,6 +82,7 @@ pub fn run() {
             commands::delete_recipe,
             commands::run_recipe,
             commands::get_action_items,
+            commands::list_open_commitments,
             commands::patch_note_tasks,
             commands::add_reminder,
             commands::pin_moment,

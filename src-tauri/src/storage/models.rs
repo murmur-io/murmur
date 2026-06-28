@@ -275,6 +275,22 @@ pub struct ActionItem {
     pub due_date: Option<String>,
 }
 
+/// One OPEN action item ("commitment") rolled up across the whole library, carrying its meeting
+/// context. Produced by the deterministic `Db::list_open_commitments` aggregation: only OPEN
+/// (`- [ ]`, not `- [x]`) items from VISIBLE meetings contribute — a sealed-and-not-unlocked
+/// meeting yields nothing (excluded by both `list_meetings_visible` and `get_note_if_visible`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Commitment {
+    pub meeting_id: String,
+    pub meeting_title: String,
+    /// ISO 8601 meeting start (used for recency ordering + the [[Title]] context).
+    pub started_at: String,
+    pub owner: Option<String>,
+    pub due_date: Option<String>,
+    pub text: String,
+}
+
 /// Result of pinning a meeting moment: the ^block-ref id + an obsidian:// deep link.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

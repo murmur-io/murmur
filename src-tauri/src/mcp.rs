@@ -238,6 +238,11 @@ fn tools_spec() -> Value {
             "name": "search_semantic",
             "description": "Semantic (meaning-based) search across your meeting notes, fused with full-text search. Finds relevant meetings even when they don't share the exact words. Requires semantic search to be enabled in Murmur settings.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
+        },
+        {
+            "name": "get_open_commitments",
+            "description": "Roll up every OPEN action item ('- [ ]', still open / not done) across your meetings, with each item's owner, due date and source meeting. Answers 'what did I promise / what is still open'. Optionally filter by owner (case-insensitive). Sealed-and-locked meetings are excluded.",
+            "inputSchema": { "type": "object", "properties": { "owner": { "type": "string" } } }
         }
     ])
 }
@@ -365,8 +370,47 @@ fn dispatch_tool(
                 Err(e) => Err((-32000, format!("list failed: {e}"))),
             }
         }
+        "get_open_commitments" => {
+            // GATE: routes through `list_open_commitments`, which double-gates on the same
+            // `unlocked_set` (`list_meetings_visible` + `get_note_if_visible`) — a sealed-and-not-
+            // unlocked meeting's commitments are never read here, so they can never surface.
+            let owner = args
+                .get("owner")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|o| !o.is_empty());
+            match db.list_open_commitments(unlocked_set, owner) {
+                Ok(items) if items.is_empty() => Ok(match owner {
+                    Some(o) => format!("No open commitments for \"{o}\"."),
+                    None => "No open commitments.".to_string(),
+                }),
+                Ok(items) => Ok(format_commitments(&items)),
+                Err(e) => Err((-32000, format!("commitments rollup failed: {e}"))),
+            }
+        }
         other => Err((-32602, format!("unknown tool: {other}"))),
     }
+}
+
+/// Render the open-commitments rollup into the MCP text payload — one line per item:
+/// `- owner · due · "text" · [[Title]]` (owner/due omitted when absent).
+fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
+    items
+        .iter()
+        .map(|c| {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(o) = c.owner.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+                parts.push(o.to_string());
+            }
+            if let Some(d) = c.due_date.as_deref().filter(|d| !d.is_empty()) {
+                parts.push(format!("due {d}"));
+            }
+            parts.push(format!("\"{}\"", c.text.trim()));
+            parts.push(format!("[[{}]]", c.meeting_title));
+            format!("- {}", parts.join(" · "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render a list of search hits (FTS or hybrid) into the MCP text payload — one line per meeting.
@@ -411,14 +455,14 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_four_tools() {
+    fn tools_list_has_five_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         // The Phase 2b semantic tool is advertised.
-        assert!(tools
-            .iter()
-            .any(|t| t["name"] == "search_semantic"));
+        assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
+        // The Phase 5a open-commitments rollup tool is advertised.
+        assert!(tools.iter().any(|t| t["name"] == "get_open_commitments"));
     }
 
     #[test]
@@ -620,6 +664,75 @@ mod tests {
         unlocked.insert("f-lock".to_string());
         let out2 = dispatch_tool(&db, "search_semantic", &args, &unlocked).unwrap();
         assert!(out2.contains("id:sealed"), "unlocked meeting must reappear in semantic results");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Phase 5a: `get_open_commitments` is visibility-gated exactly like the other tools. A sealed-
+    /// and-not-unlocked meeting's open action items NEVER appear; they reappear once the folder is
+    /// session-unlocked. The payload renders owner · due · "text" · [[Title]].
+    #[test]
+    fn get_open_commitments_is_visibility_gated() {
+        use crate::storage::models::Folder;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed(
+            &db,
+            "open",
+            "Open Sync",
+            "## Action items\n- [ ] Anna — ship the deck 2026-07-01\n- [x] Bob — already done\n",
+            None,
+        );
+        seed(
+            &db,
+            "sealed",
+            "Secret Sync",
+            "## Action items\n- [ ] Carol — sign the contract 2026-07-05\n",
+            Some("f-lock"),
+        );
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        // Not unlocked → only the open meeting's open item; sealed item invisible; done item dropped.
+        let out = dispatch_tool(&db, "get_open_commitments", &json!({}), &HashSet::new()).unwrap();
+        assert!(out.contains("ship the deck"), "open commitment must surface");
+        assert!(out.contains("[[Open Sync]]"), "source title must render");
+        assert!(out.contains("due 2026-07-01"), "due date must render");
+        assert!(out.contains("Anna"), "owner must render");
+        assert!(
+            !out.contains("already done"),
+            "checked-off item must not be a commitment"
+        );
+        assert!(
+            !out.contains("sign the contract") && !out.contains("Secret Sync"),
+            "sealed-not-unlocked meeting's commitments leaked (gate violation)"
+        );
+
+        // Session-unlock → the sealed meeting's commitment reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = dispatch_tool(&db, "get_open_commitments", &json!({}), &unlocked).unwrap();
+        assert!(out2.contains("sign the contract"), "unlocked commitment must reappear");
+
+        // Owner filter (case-insensitive).
+        let out3 = dispatch_tool(
+            &db,
+            "get_open_commitments",
+            &json!({ "owner": "anna" }),
+            &unlocked,
+        )
+        .unwrap();
+        assert!(out3.contains("ship the deck"), "owner filter must keep Anna's item");
+        assert!(
+            !out3.contains("sign the contract"),
+            "owner filter must drop Carol's item"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
