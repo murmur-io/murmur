@@ -300,6 +300,52 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
           <input type="checkbox" formControlName="realtimeReactions" />
         </label>
 
+        <!--
+          Proactive cloud-egress consent (issue 20). The in-meeting assistant
+          dispatches voice actions through the active provider. With a cloud
+          provider (claude_code or anthropic, mirroring the backend is_cloud
+          gate) it uploads mid-meeting context, and the dispatch is fail-closed
+          behind cloud_egress_consented. Surface the requirement at enable time.
+          Condition: realtime on, cloud provider, brain not off, not consented.
+          Reuses the existing consent flow (allowCloudProcessing). In-flow
+          warning, so the frosted banner is correct (no opaque overlay needed).
+        -->
+        @if (
+          form.controls.realtimeReactions.value &&
+          form.controls.brainBackend.value === "cloud" &&
+          (form.controls.providerId.value === "claude_code" ||
+            form.controls.providerId.value === "anthropic") &&
+          !cloudConsented()
+        ) {
+          <div class="banner is-warning realtime-consent">
+            <span class="realtime-consent-copy">
+              ⚠ Asystent w spotkaniu wysyła kontekst do chmury — zezwól na
+              przetwarzanie w chmurze, inaczej odpowiedzi na żywo nie zadziałają.
+            </span>
+            <div class="cloud-consent-row">
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="allowCloudProcessing()"
+                [disabled]="consenting()"
+              >
+                @if (consenting()) {
+                  <span class="spin-ring" aria-hidden="true"></span>
+                  Enabling…
+                } @else {
+                  Allow
+                }
+              </button>
+              <span class="text-muted cloud-consent-hint">
+                One-time, redacted first. Same consent as cloud summaries.
+              </span>
+            </div>
+            @if (consentError(); as cerr) {
+              <p class="text-danger privacy-note">{{ cerr }}</p>
+            }
+          </div>
+        }
+
         <!-- Model + reasoning-effort overrides for the active cloud provider. -->
         <div class="brain-tuning">
           <label class="field">
@@ -1354,6 +1400,14 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         display: flex;
         flex-direction: column;
         gap: var(--space-4);
+      }
+      /* #20 — proactive cloud-egress consent warning under the assistant toggle. */
+      .realtime-consent {
+        flex-direction: column;
+        gap: var(--space-3);
+      }
+      .realtime-consent-copy {
+        line-height: 1.55;
       }
       .brain-models {
         display: flex;
