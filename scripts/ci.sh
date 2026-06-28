@@ -8,6 +8,12 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# mistralrs/metal is ALWAYS compiled (the local brain ships by default). Its build script precompiles
+# Metal shaders via `xcrun metal`, which needs the FULL Xcode toolchain — this machine has only the
+# Command Line Tools, so we defer shader compile to first runtime use. Without this the cargo steps
+# below fail at link time. Safe to always set (it only changes WHEN shaders compile, not whether).
+export MISTRALRS_METAL_PRECOMPILE=0
+
 echo "── swiftc: system-audio sidecar typecheck ──"
 if command -v swiftc >/dev/null 2>&1; then
   swiftc -typecheck src-tauri/sysaudio/sysaudio.swift \

@@ -1,6 +1,7 @@
 //! Real on-device reasoning brain (Phase B) — a [`LocalReasoner`] backed by mistralrs 0.8.1 GGUF
-//! inference (Metal). Compiled ONLY under `--features local-brain`; the default build ships the
-//! dependency-free `StubReasoner` instead.
+//! inference (Metal). ALWAYS compiled; [`crate::reason::active_reasoner`] (BrainBackend::Local)
+//! selects it at runtime when a GGUF is present on disk, else ships the dependency-free
+//! `StubReasoner` instead.
 //!
 //! ## Honest scope (READ THIS)
 //!
@@ -12,8 +13,8 @@
 //! - Polish-language quality;
 //! - Metal performance (load time, tokens/sec, memory).
 //!
-//! `cargo test --lib` NEVER runs a forward pass here. Treat a green `--features local-brain` build as
-//! proof the impl typechecks/links against mistralrs 0.8.1 — NOT as proof inference works.
+//! `cargo test --lib` NEVER runs a forward pass here. Treat a green build as proof the impl
+//! typechecks/links against mistralrs 0.8.1 — NOT as proof inference works.
 //!
 //! ## Graceful + crash-safe
 //!

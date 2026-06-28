@@ -14,10 +14,9 @@ pub mod claude_code;
 pub mod digest;
 pub mod dossier;
 pub mod graph;
-/// The REAL on-device PERSON-name NER redactor (Phase D), compiled ONLY under `--features local-ner`.
-/// The default build never pulls candle, keeping the fast `cargo test --lib` loop intact and name
-/// egress byte-identical to today (the no-op). Wired via `redact::active_name_redactor`.
-#[cfg(feature = "local-ner")]
+/// The REAL on-device PERSON-name NER redactor (Phase D). ALWAYS compiled; the real impl is selected
+/// at runtime by `redact::active_name_redactor` when the NER model dir is present, else the
+/// byte-identical `NoopNameRedactor` (so a no-model build's name egress is unchanged).
 pub mod ner_deberta;
 pub mod ollama;
 pub mod organize;
@@ -116,11 +115,11 @@ pub fn make_provider(
     // CLI, but that CLI uploads to Anthropic's cloud, so it needs the firewall exactly as the
     // direct HTTP `anthropic` provider does. ollama (local) already returned above, unwrapped.
     //
-    // Phase D — the name layer is now the ACTIVE on-device redactor: with `--features local-ner`
-    // ON and the NER model present, `active_name_redactor()` returns the real DebertaNameRedactor
-    // (PERSON names → ⟪NAME_n⟫ before egress, restored in the reply); otherwise it is the
-    // byte-identical NoopNameRedactor, so default-build egress is unchanged. The redactor only ever
-    // REMOVES content (a NER miss leaks no more than the no-op).
+    // Phase D — the name layer is now the ACTIVE on-device redactor: when the NER model is present,
+    // `active_name_redactor()` returns the real DebertaNameRedactor (PERSON names → ⟪NAME_n⟫ before
+    // egress, restored in the reply); otherwise it is the byte-identical NoopNameRedactor, so a
+    // no-model build's egress is unchanged. The redactor only ever REMOVES content (a NER miss leaks
+    // no more than the no-op).
     Ok(Arc::new(
         crate::summarize::redact::RedactingProvider::with_name_redactor(
             inner,

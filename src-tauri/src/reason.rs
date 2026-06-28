@@ -21,9 +21,8 @@ use crate::error::{AppError, Result};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::summarize::provider::SummarizerProvider;
 
-/// The REAL on-device reasoner (Phase B), compiled ONLY under `--features local-brain`. The default
-/// build never pulls mistralrs, keeping the fast `cargo test --lib` loop intact.
-#[cfg(feature = "local-brain")]
+/// The REAL on-device reasoner (mistral.rs / GGUF). ALWAYS compiled; the real impl is selected at
+/// runtime by [`local_reasoner`] when a GGUF resolves on disk, else the dependency-free stub.
 pub mod mistral;
 
 /// A curated, mistral.rs-arch-SAFE on-device reasoning model the user can pick from. The app must
@@ -240,11 +239,11 @@ where
 /// The single active reasoning backend, used wherever the app needs local on-device reasoning.
 ///
 /// Graceful degradation, in priority order:
-/// - the `local-brain` feature is ON **and** a GGUF is present at the resolved [`resolve_brain_model`]
-///   → the real [`mistral::MistralReasoner`] (lazy: the model loads on first use, not here, so this
-///   never blocks startup and never panics);
-/// - otherwise (feature off, no model, or a path-resolution error) → the dependency-free
-///   [`StubReasoner`]. The app works either way — just less smart without the model.
+/// - a GGUF is present at the resolved [`resolve_brain_model`] → the real
+///   [`mistral::MistralReasoner`] (lazy: the model loads on first use, not here, so this never blocks
+///   startup and never panics);
+/// - otherwise (no model, or a path-resolution error) → the dependency-free [`StubReasoner`]. The app
+///   works either way — just less smart without the model.
 ///
 /// NEVER panics and NEVER blocks: a missing/failed model is logged (no PII) and falls back to stub.
 ///
@@ -252,8 +251,8 @@ where
 /// - **`Cloud`** → [`CloudReasoner`] — the cloud LLM via the SAME `make_provider` egress envelope
 ///   as the note summary. Construction is cheap + infallible; the consent gate fires at CALL time
 ///   (a no-consent / no-CLI / offline failure degrades to the deterministic floor in `orchestrate.rs`).
-/// - **`Local`** → the real `MistralReasoner` when the `local-brain` feature is on AND a GGUF is
-///   present ([`local_reasoner`]), else the dependency-free `StubReasoner`.
+/// - **`Local`** → the real `MistralReasoner` when a GGUF is present on disk ([`local_reasoner`]),
+///   else the dependency-free `StubReasoner`.
 /// - **`Off`** → `StubReasoner` (the deterministic floor).
 pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
     match config.brain_backend {
@@ -271,35 +270,28 @@ pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
     }
 }
 
-/// Resolve the LOCAL on-device reasoner: the real [`mistral::MistralReasoner`] when the
-/// `local-brain` feature is compiled in AND a GGUF resolves on disk (lazy load — never blocks or
-/// panics at startup), otherwise the dependency-free [`StubReasoner`]. Used only for
-/// [`BrainBackend::Local`]; the default build (feature off) always yields the stub.
+/// Resolve the LOCAL on-device reasoner: the real [`mistral::MistralReasoner`] when a GGUF resolves
+/// on disk (lazy load — never blocks or panics at startup), otherwise the dependency-free
+/// [`StubReasoner`]. Used only for [`BrainBackend::Local`]; with no model present it always yields
+/// the stub (selection keys ONLY on model presence — mistralrs is always compiled).
 fn local_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
-    #[cfg(feature = "local-brain")]
-    {
-        let configured = config.brain_model_path.as_deref().map(Path::new);
-        match resolve_brain_model(configured, config.brain_model_id.as_deref()) {
-            Ok(Some(path)) => match mistral::MistralReasoner::new(path) {
-                Ok(r) => {
-                    tracing::info!(target: "reason", id = r.id(), "local brain ready (lazy model load)");
-                    return Box::new(r);
-                }
-                Err(e) => {
-                    tracing::warn!(target: "reason", error = %e, "local brain init failed; using stub reasoner");
-                }
-            },
-            Ok(None) => {
-                tracing::info!(target: "reason", "no local brain model present; using stub reasoner");
+    let configured = config.brain_model_path.as_deref().map(Path::new);
+    match resolve_brain_model(configured, config.brain_model_id.as_deref()) {
+        Ok(Some(path)) => match mistral::MistralReasoner::new(path) {
+            Ok(r) => {
+                tracing::info!(target: "reason", id = r.id(), "local brain ready (lazy model load)");
+                return Box::new(r);
             }
             Err(e) => {
-                tracing::warn!(target: "reason", error = %e, "local brain path resolution failed; using stub reasoner");
+                tracing::warn!(target: "reason", error = %e, "local brain init failed; using stub reasoner");
             }
+        },
+        Ok(None) => {
+            tracing::info!(target: "reason", "no local brain model present; using stub reasoner");
         }
-    }
-    #[cfg(not(feature = "local-brain"))]
-    {
-        let _ = config; // model path is only consulted when the feature is compiled in.
+        Err(e) => {
+            tracing::warn!(target: "reason", error = %e, "local brain path resolution failed; using stub reasoner");
+        }
     }
     Box::new(StubReasoner)
 }
@@ -740,14 +732,14 @@ mod tests {
 
     /// The LOCAL backend's graceful-degradation contract: with NO usable model (a configured path
     /// that doesn't exist, and — on a clean machine — no default model) `active_reasoner` returns the
-    /// StubReasoner. With the `local-brain` feature OFF this is unconditional; with it ON it still
-    /// holds as long as no GGUF is present. (`brain_backend` is pinned to `Local` here — the default
-    /// is now `Cloud`.) This is the headless proof of the swap wiring's fallback.
+    /// StubReasoner. mistralrs is always compiled now, so selection keys ONLY on model presence —
+    /// no GGUF ⇒ stub. (`brain_backend` is pinned to `Local` here — the default is now `Cloud`.) This
+    /// is the headless proof of the swap wiring's fallback.
     #[test]
     fn active_reasoner_falls_back_to_stub_without_model() {
         // No custom path (a non-existent one) AND no selected brain_model_id ⇒ nothing resolves, so
-        // even a feature-on build returns the stub. With no selection there is no registry file to
-        // probe, so this holds regardless of what GGUFs happen to live in the shared models dir.
+        // the always-compiled mistralrs backend returns the stub. With no selection there is no
+        // registry file to probe, so this holds regardless of what GGUFs live in the shared models dir.
         let cfg = AppConfig {
             brain_backend: BrainBackend::Local,
             brain_model_path: Some(
@@ -909,8 +901,7 @@ mod tests {
     #[test]
     fn active_reasoner_local_backend_without_model_yields_stub() {
         // Local backend with a configured path that does not exist AND no selected model id ⇒
-        // nothing resolves, so even a `local-brain` build returns the stub (and the default build
-        // unconditionally does).
+        // nothing resolves, so the always-compiled mistralrs backend returns the stub.
         let cfg = AppConfig {
             brain_backend: BrainBackend::Local,
             brain_model_path: Some(
