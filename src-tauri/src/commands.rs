@@ -1640,6 +1640,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // Phase B (registry): the selected brain model id is set ONLY via `select_brain_model`, never
         // through a settings save — preserve the live value so a save can't clobber the selection.
         brain_model_id: current.brain_model_id.clone(),
+        // Phase B (brain backend): which reasoner powers the brain (cloud/local/off). Not carried on
+        // the settings DTO yet — preserve the live value (default Cloud) so a settings save can
+        // neither change nor clobber the backend selection.
+        brain_backend: current.brain_backend,
     }
 }
 

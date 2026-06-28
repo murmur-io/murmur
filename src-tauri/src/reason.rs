@@ -12,12 +12,14 @@
 //! recover-JSON-from-noisy-text path is exercised and testable.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
-use crate::settings::AppConfig;
+use crate::settings::{AppConfig, BrainBackend};
+use crate::summarize::provider::SummarizerProvider;
 
 /// The REAL on-device reasoner (Phase B), compiled ONLY under `--features local-brain`. The default
 /// build never pulls mistralrs, keeping the fast `cargo test --lib` loop intact.
@@ -245,7 +247,35 @@ where
 ///   [`StubReasoner`]. The app works either way — just less smart without the model.
 ///
 /// NEVER panics and NEVER blocks: a missing/failed model is logged (no PII) and falls back to stub.
+///
+/// Dispatch is on [`AppConfig::brain_backend`] (default `Cloud`, the user's choice):
+/// - **`Cloud`** → [`CloudReasoner`] — the cloud LLM via the SAME `make_provider` egress envelope
+///   as the note summary. Construction is cheap + infallible; the consent gate fires at CALL time
+///   (a no-consent / no-CLI / offline failure degrades to the deterministic floor in `orchestrate.rs`).
+/// - **`Local`** → the real `MistralReasoner` when the `local-brain` feature is on AND a GGUF is
+///   present ([`local_reasoner`]), else the dependency-free `StubReasoner`.
+/// - **`Off`** → `StubReasoner` (the deterministic floor).
 pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
+    match config.brain_backend {
+        BrainBackend::Cloud => {
+            // Cheap: just clones the config; the provider (+ consent gate + RedactingProvider) is
+            // built per-call inside CloudReasoner via the same `make_provider` the summary uses.
+            tracing::info!(target: "reason", "brain backend = cloud; reasoning via the summarizer-provider seam");
+            Box::new(CloudReasoner::new(config.clone()))
+        }
+        BrainBackend::Local => local_reasoner(config),
+        BrainBackend::Off => {
+            tracing::info!(target: "reason", "brain backend = off; using stub reasoner");
+            Box::new(StubReasoner)
+        }
+    }
+}
+
+/// Resolve the LOCAL on-device reasoner: the real [`mistral::MistralReasoner`] when the
+/// `local-brain` feature is compiled in AND a GGUF resolves on disk (lazy load — never blocks or
+/// panics at startup), otherwise the dependency-free [`StubReasoner`]. Used only for
+/// [`BrainBackend::Local`]; the default build (feature off) always yields the stub.
+fn local_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
     #[cfg(feature = "local-brain")]
     {
         let configured = config.brain_model_path.as_deref().map(Path::new);
@@ -375,6 +405,128 @@ impl LocalReasoner for StubReasoner {
         });
         let noisy = format!("Sure, here is the JSON:\n```json\n{obj}\n```\nHope that helps!");
         parse_first_json(&noisy)
+    }
+}
+
+/// The CLOUD brain — the smartest reasoner, with NO local model. It implements [`LocalReasoner`]
+/// (the "local" in the trait name is historical — it is the on-device *seam*, not a no-egress
+/// promise) by delegating to the cloud LLM through the EXACT same provider factory the note summary
+/// uses.
+///
+/// ## PRIVACY INVARIANT (load-bearing — audited by the lock-security reviewer)
+/// `CloudReasoner` opens NO new egress class. Every call routes through
+/// [`crate::summarize::make_provider`], so it inherits — byte-for-byte — the summary's egress
+/// posture:
+/// - the **fail-closed `cloud_egress_consented` gate** (`make_provider` returns
+///   `AppError::Unavailable` for a cloud provider until the user has consented once);
+/// - the **[`RedactingProvider`](crate::summarize::redact::RedactingProvider) firewall** (PII is
+///   scrubbed before any content leaves the device, restored in the reply).
+///
+/// It holds NO `reqwest`/HTTP client and makes NO direct network call — it cannot bypass the gate
+/// or the redactor. The brain input (a ≤2k-char transcript excerpt, per `orchestrate.rs`) is a
+/// SUBSET of what the summary already sends (the full transcript + grounding corpus), so the brain
+/// never widens egress. With consent OFF (the default) `reason`/`structured` return `Err` and
+/// `orchestrate.rs` falls back to the deterministic floor — no content leaves.
+///
+/// GRACEFUL: any failure (no consent, no `claude` CLI, offline) is returned as `Err`, never a panic;
+/// the caller already treats `Err` as "use the deterministic floor".
+pub struct CloudReasoner {
+    /// Stable id, e.g. `cloud:claude_code` — computed once so [`LocalReasoner::id`] can return a
+    /// borrow.
+    id: String,
+    /// A snapshot of the config used to build the provider per call (provider id + the
+    /// consent-relevant bits). Clone is cheap (a handful of strings/bools).
+    config: AppConfig,
+    /// TEST-ONLY injected provider. When `Some`, `build_provider` returns it instead of calling
+    /// `make_provider`, so the wiring/parse can be exercised with a mock — NO real Claude/network.
+    /// `None` in every production path (the only constructor reachable in release is [`new`]).
+    provider_override: Option<Arc<dyn SummarizerProvider>>,
+}
+
+impl CloudReasoner {
+    /// Build the cloud brain from a config snapshot. Cheap + infallible: the provider (and thus the
+    /// consent gate) is constructed lazily, per call.
+    pub fn new(config: AppConfig) -> Self {
+        Self {
+            id: format!("cloud:{}", config.provider_id),
+            config,
+            provider_override: None,
+        }
+    }
+
+    /// TEST-ONLY: build a CloudReasoner that delegates to an injected provider instead of the real
+    /// `make_provider`, so `reason`/`structured` can be asserted without a network/CLI call. NOT
+    /// compiled in non-test builds, so production can never inject a provider that skips the gate.
+    #[cfg(test)]
+    fn with_provider(config: AppConfig, provider: Arc<dyn SummarizerProvider>) -> Self {
+        Self {
+            id: format!("cloud:{}", config.provider_id),
+            config,
+            provider_override: Some(provider),
+        }
+    }
+
+    /// Resolve the provider for this call. THE egress seam: in production this is ALWAYS
+    /// `make_provider` (consent gate + RedactingProvider). A test override short-circuits only under
+    /// `#[cfg(test)]`.
+    fn build_provider(&self) -> Result<Arc<dyn SummarizerProvider>> {
+        if let Some(p) = &self.provider_override {
+            return Ok(p.clone());
+        }
+        crate::summarize::make_provider(&self.config.provider_id, &self.config)
+    }
+}
+
+/// Drive an `async` `complete` to completion from a SYNCHRONOUS trait method without panicking,
+/// regardless of caller context. The reasoner is called synchronously from WITHIN the async note
+/// pipeline (`pipeline.rs` → `orchestrate.rs`), so a plain `Handle::block_on`/new-runtime-`block_on`
+/// here would panic ("Cannot start a runtime from within a runtime"). We instead run the provider
+/// call on a DEDICATED scoped OS thread with its own current-thread runtime (`enable_all` covers the
+/// IO + time drivers the `claude_code` process / `anthropic` reqwest paths need). The future never
+/// crosses a thread boundary, only the `Result<String>` does.
+fn block_on_complete(
+    provider: &Arc<dyn SummarizerProvider>,
+    system: &str,
+    user: &str,
+) -> Result<String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        AppError::Summarize(format!("cloud reasoner: runtime build failed: {e}"))
+                    })?;
+                rt.block_on(provider.complete(system, user))
+            })
+            .join()
+            .map_err(|_| AppError::Summarize("cloud reasoner: worker thread panicked".into()))?
+    })
+}
+
+impl LocalReasoner for CloudReasoner {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn reason(&self, system: &str, user: &str) -> Result<String> {
+        // EGRESS SEAM: provider built via `make_provider` → consent gate + RedactingProvider.
+        let provider = self.build_provider()?;
+        block_on_complete(&provider, system, user)
+    }
+
+    fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value> {
+        // Cloud providers have no native constrained decode — embed the schema as an instruction and
+        // recover the object from the (possibly fenced/prose-wrapped) reply via the robust extractor.
+        let schema = serde_json::to_string(json_schema)
+            .map_err(|e| AppError::Summarize(format!("cloud reasoner: schema serialize: {e}")))?;
+        let augmented_system = format!(
+            "{system}\n\nRespond with ONLY a JSON object conforming to this schema: {schema}. \
+             No prose, no fences."
+        );
+        let text = self.reason(&augmented_system, user)?;
+        parse_first_json(&text)
     }
 }
 
@@ -586,16 +738,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The factory's graceful-degradation contract: with NO usable model (a configured path that
-    /// doesn't exist, and — on a clean machine — no default model) `active_reasoner` returns the
+    /// The LOCAL backend's graceful-degradation contract: with NO usable model (a configured path
+    /// that doesn't exist, and — on a clean machine — no default model) `active_reasoner` returns the
     /// StubReasoner. With the `local-brain` feature OFF this is unconditional; with it ON it still
-    /// holds as long as no GGUF is present. This is the headless proof of the swap wiring's fallback.
+    /// holds as long as no GGUF is present. (`brain_backend` is pinned to `Local` here — the default
+    /// is now `Cloud`.) This is the headless proof of the swap wiring's fallback.
     #[test]
     fn active_reasoner_falls_back_to_stub_without_model() {
         // No custom path (a non-existent one) AND no selected brain_model_id ⇒ nothing resolves, so
         // even a feature-on build returns the stub. With no selection there is no registry file to
         // probe, so this holds regardless of what GGUFs happen to live in the shared models dir.
         let cfg = AppConfig {
+            brain_backend: BrainBackend::Local,
             brain_model_path: Some(
                 std::env::temp_dir()
                     .join("murmur-brain-absent-model-xyz.gguf")
@@ -606,5 +760,175 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(active_reasoner(&cfg).id(), "stub");
+    }
+
+    // ---- CloudReasoner (the cloud brain) ----------------------------------------------------
+
+    /// A mock `SummarizerProvider` that records the `complete` system prompt and returns a canned
+    /// reply — so the CloudReasoner wiring/parse is exercised WITHOUT any real Claude/network call.
+    struct MockProvider {
+        reply: String,
+        last_system: std::sync::Mutex<Option<String>>,
+    }
+    impl MockProvider {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                last_system: std::sync::Mutex::new(None),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl SummarizerProvider for MockProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+        async fn summarize(
+            &self,
+            _req: &crate::summarize::provider::SummarizeRequest,
+        ) -> Result<String> {
+            Ok(self.reply.clone())
+        }
+        async fn complete(&self, system: &str, _user: &str) -> Result<String> {
+            *self.last_system.lock().unwrap() = Some(system.to_string());
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[test]
+    fn cloud_reasoner_id_is_namespaced_by_provider() {
+        let cfg = AppConfig {
+            provider_id: "claude_code".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(CloudReasoner::new(cfg).id(), "cloud:claude_code");
+    }
+
+    #[test]
+    fn cloud_reasoner_reason_returns_provider_text_via_injected_provider() {
+        // The injected mock stands in for `make_provider`'s output — proving `reason` returns the
+        // provider's `complete` text verbatim (the sync→async bridge works, no network).
+        let provider = Arc::new(MockProvider::new("the cloud answer"));
+        let r = CloudReasoner::with_provider(AppConfig::default(), provider);
+        assert_eq!(r.reason("sys", "user").unwrap(), "the cloud answer");
+    }
+
+    #[test]
+    fn cloud_reasoner_structured_builds_json_instruction_and_parses_reply() {
+        // The provider replies with a FENCED, prose-wrapped JSON object (what a real cloud model
+        // emits); `structured` must (a) embed the schema as an instruction and (b) recover the
+        // object via `parse_first_json`.
+        let reply = "Sure! Here you go:\n```json\n{\"entities\":[\"Atlas\"],\"n\":2}\n```\nDone.";
+        let provider = Arc::new(MockProvider::new(reply));
+        let r = CloudReasoner::with_provider(AppConfig::default(), provider.clone());
+
+        let schema = serde_json::json!({ "type": "object", "properties": { "n": { "type": "number" } } });
+        let v = r.structured("plan retrieval", "transcript excerpt", &schema).unwrap();
+
+        // (b) parsed JSON value from the noisy reply.
+        assert_eq!(v["entities"], serde_json::json!(["Atlas"]));
+        assert_eq!(v["n"], serde_json::json!(2));
+
+        // (a) the system prompt actually carried the schema-as-instruction.
+        let sent = provider.last_system.lock().unwrap().clone().unwrap();
+        assert!(sent.contains("conforming to this schema"), "schema instruction embedded: {sent}");
+        assert!(sent.contains("\"properties\""), "the JSON schema itself is embedded: {sent}");
+        assert!(sent.contains("No prose, no fences"));
+    }
+
+    #[test]
+    fn cloud_reasoner_propagates_provider_error_as_err() {
+        // A provider whose `complete` errors must surface as Err (orchestrate.rs then floors).
+        struct ErrProvider;
+        #[async_trait::async_trait]
+        impl SummarizerProvider for ErrProvider {
+            fn id(&self) -> &str {
+                "err"
+            }
+            async fn availability(&self) -> crate::summarize::provider::Availability {
+                crate::summarize::provider::Availability::Available
+            }
+            async fn summarize(
+                &self,
+                _req: &crate::summarize::provider::SummarizeRequest,
+            ) -> Result<String> {
+                Err(AppError::Summarize("boom".into()))
+            }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Err(AppError::Summarize("boom".into()))
+            }
+        }
+        let r = CloudReasoner::with_provider(AppConfig::default(), Arc::new(ErrProvider));
+        assert!(r.reason("s", "u").is_err());
+        assert!(r.structured("s", "u", &serde_json::json!({})).is_err());
+    }
+
+    /// EGRESS POSTURE (by construction): the production `reason`/`structured` path builds its
+    /// provider through `make_provider`, which is fail-closed on `cloud_egress_consented`. A
+    /// CloudReasoner with NO injected provider + consent OFF (the default) therefore returns the
+    /// SAME `AppError::Unavailable` the summary would — proving it routes through the consent gate
+    /// and opens no side channel.
+    #[test]
+    fn cloud_reasoner_without_consent_is_refused_by_the_same_gate() {
+        let cfg = AppConfig {
+            provider_id: "claude_code".to_string(),
+            cloud_egress_consented: false,
+            ..Default::default()
+        };
+        let r = CloudReasoner::new(cfg);
+        match r.reason("s", "u") {
+            Err(AppError::Unavailable(_)) => {}
+            other => panic!("expected the make_provider consent gate to refuse, got {other:?}"),
+        }
+    }
+
+    // ---- active_reasoner backend selection --------------------------------------------------
+
+    #[test]
+    fn active_reasoner_cloud_backend_yields_cloud_reasoner() {
+        let cfg = AppConfig {
+            brain_backend: BrainBackend::Cloud,
+            provider_id: "claude_code".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(active_reasoner(&cfg).id(), "cloud:claude_code");
+    }
+
+    #[test]
+    fn active_reasoner_off_backend_yields_stub() {
+        let cfg = AppConfig {
+            brain_backend: BrainBackend::Off,
+            ..Default::default()
+        };
+        assert_eq!(active_reasoner(&cfg).id(), "stub");
+    }
+
+    #[test]
+    fn active_reasoner_local_backend_without_model_yields_stub() {
+        // Local backend with a configured path that does not exist AND no selected model id ⇒
+        // nothing resolves, so even a `local-brain` build returns the stub (and the default build
+        // unconditionally does).
+        let cfg = AppConfig {
+            brain_backend: BrainBackend::Local,
+            brain_model_path: Some(
+                std::env::temp_dir()
+                    .join("murmur-cloud-absent-model-xyz.gguf")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            brain_model_id: None,
+            ..Default::default()
+        };
+        assert_eq!(active_reasoner(&cfg).id(), "stub");
+    }
+
+    /// Default config (the user's choice) selects the Cloud brain.
+    #[test]
+    fn active_reasoner_default_is_cloud() {
+        let id = active_reasoner(&AppConfig::default()).id().to_string();
+        assert!(id.starts_with("cloud:"), "default brain must be cloud, got {id}");
     }
 }
