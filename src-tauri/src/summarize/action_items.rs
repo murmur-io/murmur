@@ -5,11 +5,21 @@
 use crate::storage::models::ActionItem;
 
 /// Parse all action-item checklist lines from a note's markdown.
+///
+/// DEFENSE-IN-DEPTH against the assistant-command leak: a checklist line whose text is ADDRESSED TO
+/// THE ASSISTANT ("Klaudku, sprawdź pogodę") is DROPPED — it is a voice command the user gave the
+/// in-meeting assistant, not a real task. The primary fix excludes these lines from the summarizer
+/// input (so they never become action items), but a model could still echo one; this guarantees the
+/// owner-less "(właściciel nieokreślony) — Sprawdzić pogodę" item never survives into the task list.
 pub fn parse_action_items(markdown: &str) -> Vec<ActionItem> {
     let mut out = Vec::new();
     let mut idx = 0usize;
     for line in markdown.lines() {
         if let Some((done, text)) = parse_item_line(line) {
+            // Drop a task that is really an assistant command (vocative wake form).
+            if crate::audio::wake::is_assistant_directed(&text) {
+                continue;
+            }
             let owner = extract_owner(&text);
             let due_date = find_date(&text);
             out.push(ActionItem {
@@ -126,5 +136,19 @@ mod tests {
     fn no_date_no_change() {
         let md = "- [ ] just a task\n";
         assert_eq!(patch_tasks_markdown(md), md);
+    }
+
+    /// The assistant-command leak: a checklist line addressed to the assistant ("Klaudku, …") must be
+    /// DROPPED, while a real action item ("Janek wyśle raport w piątek") is KEPT. This is the
+    /// owner-less "(właściciel nieokreślony) — Sprawdzić pogodę" item the user reported.
+    #[test]
+    fn drops_assistant_directed_item_keeps_real_task() {
+        let md = "## Action items\n\
+                  - [ ] Klaudku, sprawdź jaka była pogoda\n\
+                  - [ ] Janek wyśle raport w piątek\n\
+                  - [ ] klaudku, jakie masz informacje w moich notatkach\n";
+        let items = parse_action_items(md);
+        assert_eq!(items.len(), 1, "only the real task survives; assistant commands are dropped");
+        assert_eq!(items[0].text, "Janek wyśle raport w piątek");
     }
 }

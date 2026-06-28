@@ -140,6 +140,29 @@ pub struct NoteRecord {
     pub exported_path: Option<String>,
 }
 
+/// One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken command, the
+/// assistant's answer, the grounding citations, and the dispatch status. PERSISTED so the meeting
+/// note can surface the assistant exchange that was previously ephemeral (only the live card). It is
+/// DERIVED convenience data — purged (not sealed) when the meeting's folder is sealed, exactly like
+/// `correction_log` / `note_chunks`; the underlying transcript is still sealed + restorable.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantInteraction {
+    /// The HEARD command — the user's own dictated words ("Klaudku, sprawdź pogodę").
+    pub command: String,
+    /// The assistant's answer (the dispatch `summary`): research/recall result or a status line.
+    pub answer: String,
+    /// `[[Title]]` wikilink / "(web)" citations the answer was grounded on (VISIBLE meetings only).
+    pub citations: Vec<String>,
+    /// Dispatch status: `ok` | `unavailable` | `unrecognized` | `needs_consent` | `error` |
+    /// `nothing_heard`.
+    pub status: String,
+    /// Coarse source label for the FE card style (the intent kind), e.g. `research` / `recall`.
+    pub source_label: Option<String>,
+    /// RFC3339 timestamp the interaction was recorded.
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusCount {
