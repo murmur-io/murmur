@@ -93,6 +93,27 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                     .join(" ")
                     .trim()
                     .to_string();
+                // MANUAL voice-command capture (the button trigger) — checked EVERY tick,
+                // independent of the wake path and independent of `realtime_reactions`. When the
+                // user has clicked "ask the assistant" the freshly-transcribed tail IS the command:
+                // no wake word, no word-order requirement. We decide per tick whether to dispatch
+                // now (a recognized intent OR the tick budget is spent) or keep listening. Best-effort
+                // + panic-free: a poisoned lock or empty tail simply leaves the capture armed; the
+                // dispatch runs off-thread exactly like the wake path. NOTE: an EMPTY tail still
+                // counts down the budget so a silent capture can't hang forever.
+                if let Some(decision) = step_manual_capture(&app, &text) {
+                    match decision {
+                        ManualCaptureDecision::Dispatch(intent) => {
+                            spawn_dispatch(app.clone(), intent);
+                            let _ = app.emit(
+                                crate::events::EVENT_VOICE_COMMAND_LISTENING,
+                                crate::events::VoiceCommandListeningPayload { active: false },
+                            );
+                        }
+                        ManualCaptureDecision::KeepListening => {}
+                    }
+                }
+
                 if !text.is_empty() {
                     // In-meeting voice trigger (Phase A: DETECT + SURFACE only — NO action dispatch;
                     // that needs the local brain in a later phase). Best-effort + panic-free: the
@@ -201,6 +222,72 @@ fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
         });
 }
 
+/// What the live loop should do with the MANUAL voice-command capture on this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualCaptureDecision {
+    /// Dispatch this parsed intent now (a recognized command, OR the budget ran out so we dispatch
+    /// the last-heard tail — which may be `Unknown` → a graceful "unrecognized" result).
+    Dispatch(crate::audio::wake::VoiceIntent),
+    /// Keep the capture armed and wait for the next tick (nothing actionable yet, budget remains).
+    KeepListening,
+}
+
+/// Advance the MANUAL voice-command capture by one live tick using the freshly-transcribed `tail`.
+///
+/// Returns `None` when no manual capture is armed (the common case — zero cost beyond a lock).
+/// When a capture IS armed, it mutates the budget in place and returns the [`ManualCaptureDecision`],
+/// CLEARING the capture state whenever it decides to dispatch (so exactly one dispatch fires per
+/// click). Best-effort + panic-free: a poisoned lock is treated as "no capture" (`None`).
+///
+/// The actual dispatch + the `EVENT_VOICE_COMMAND_LISTENING{active:false}` emit are done by the
+/// caller (off the tick); the decision itself is computed by the pure [`decide_manual_capture`].
+fn step_manual_capture(app: &AppHandle, tail: &str) -> Option<ManualCaptureDecision> {
+    let state = app.state::<AppState>();
+    let mut guard = state.voice_command_capture.lock().ok()?;
+    let current = (*guard)?; // None ⇒ not armed ⇒ nothing to do.
+    let (decision, next) = decide_manual_capture(current, tail);
+    *guard = next; // clear on dispatch, or store the decremented budget on keep-listening.
+    Some(decision)
+}
+
+/// PURE, headless-testable core of the manual-capture step. Given the armed [`CaptureState`] and the
+/// freshly-heard `tail`, decide whether to DISPATCH now or KEEP LISTENING, and return the NEXT capture
+/// state (`None` = cleared once we dispatch, `Some(decremented)` while we keep listening).
+///
+/// Rules (no wake word, no word-order requirement — the WHOLE tail is the command):
+/// 1. If `parse_voice_intent(tail)` is a RECOGNIZED intent (anything but `Unknown`) → dispatch it
+///    now and clear the capture. The user's spoken command was understood.
+/// 2. Else, decrement the tick budget:
+///    - budget still > 0 → KEEP LISTENING (the user may not have finished speaking yet).
+///    - budget now == 0 → give up waiting and DISPATCH the parsed (likely `Unknown`) tail, which
+///      yields a graceful "unrecognized" `VoiceActionResult`. This guarantees the capture always
+///      terminates — it can never hang.
+///
+/// No I/O, no FFI, no egress — just `parse_voice_intent` + arithmetic.
+fn decide_manual_capture(
+    capture: crate::state::CaptureState,
+    tail: &str,
+) -> (ManualCaptureDecision, Option<crate::state::CaptureState>) {
+    let intent = crate::audio::wake::parse_voice_intent(tail);
+    let recognized = !matches!(intent, crate::audio::wake::VoiceIntent::Unknown { .. });
+    if recognized {
+        // Understood the command → dispatch immediately, clear the capture.
+        return (ManualCaptureDecision::Dispatch(intent), None);
+    }
+    // Not (yet) recognized: spend one tick of budget.
+    let remaining = capture.budget.saturating_sub(1);
+    if remaining == 0 {
+        // Budget exhausted → dispatch the last-heard (Unknown) tail; the dispatch maps it to a
+        // graceful "unrecognized" result. Clear the capture so it can't fire again.
+        (ManualCaptureDecision::Dispatch(intent), None)
+    } else {
+        (
+            ManualCaptureDecision::KeepListening,
+            Some(crate::state::CaptureState { budget: remaining }),
+        )
+    }
+}
+
 /// Pure, headless-testable core of the wake wiring: detect a wake utterance at the head of a
 /// transcript `tail` and, on a hit, build the typed [`crate::events::WakeDetectedPayload`] (matched
 /// wake token + command tail + deterministically-parsed intent). Returns `None` when nothing fires.
@@ -258,5 +345,73 @@ mod tests {
             ..Default::default()
         };
         assert!(should_dispatch(&cfg), "ON must dispatch a voice action");
+    }
+
+    // ── MANUAL voice-command capture (the button trigger) ───────────────────
+    use crate::state::CaptureState;
+
+    #[test]
+    fn manual_capture_recognized_intent_dispatches_immediately_and_clears() {
+        // A recognized command (no wake word) → dispatch now, clear the capture, budget irrelevant.
+        let cap = CaptureState::armed();
+        let (decision, next) =
+            decide_manual_capture(cap, "zrób research o konkurencji");
+        assert_eq!(
+            decision,
+            ManualCaptureDecision::Dispatch(VoiceIntent::Research { topic: "konkurencji".into() }),
+            "recognized intent must dispatch the parsed command immediately"
+        );
+        assert!(next.is_none(), "capture must be cleared after a dispatch");
+    }
+
+    #[test]
+    fn manual_capture_unknown_with_budget_left_keeps_listening_and_decrements() {
+        // Unrecognized tail but budget remains → keep listening, budget ticks down by 1.
+        let cap = CaptureState { budget: 3 };
+        let (decision, next) = decide_manual_capture(cap, "umm let me think");
+        assert_eq!(decision, ManualCaptureDecision::KeepListening);
+        assert_eq!(
+            next,
+            Some(CaptureState { budget: 2 }),
+            "an unrecognized tick must decrement the budget and keep the capture armed"
+        );
+    }
+
+    #[test]
+    fn manual_capture_unknown_at_budget_zero_dispatches_unrecognized_and_clears() {
+        // Last tick of budget, still unrecognized → give up + dispatch the Unknown tail (→ graceful
+        // "unrecognized" result), and clear the capture so it can never hang.
+        let cap = CaptureState { budget: 1 };
+        let (decision, next) = decide_manual_capture(cap, "qwer asdf zxcv");
+        assert_eq!(
+            decision,
+            ManualCaptureDecision::Dispatch(VoiceIntent::Unknown { raw: "qwer asdf zxcv".into() }),
+            "budget exhaustion must dispatch the last-heard (Unknown) tail"
+        );
+        assert!(next.is_none(), "capture must be cleared when the budget runs out");
+    }
+
+    #[test]
+    fn manual_capture_empty_tail_counts_down_so_silence_cannot_hang() {
+        // A SILENT tick (empty tail → Unknown) still spends budget; once it hits 0 it dispatches.
+        let (d1, n1) = decide_manual_capture(CaptureState { budget: 2 }, "");
+        assert_eq!(d1, ManualCaptureDecision::KeepListening);
+        assert_eq!(n1, Some(CaptureState { budget: 1 }));
+        let (d2, n2) = decide_manual_capture(n1.unwrap(), "");
+        assert_eq!(
+            d2,
+            ManualCaptureDecision::Dispatch(VoiceIntent::Unknown { raw: String::new() }),
+            "a fully-silent capture must terminate at budget 0"
+        );
+        assert!(n2.is_none());
+    }
+
+    #[test]
+    fn manual_capture_default_budget_is_a_few_ticks() {
+        // The default arms ~3 ticks (≈9s at the 3s TICK) — long enough for one spoken command.
+        assert!(
+            (2..=5).contains(&CaptureState::DEFAULT_BUDGET),
+            "default capture budget should be a small handful of live ticks"
+        );
     }
 }

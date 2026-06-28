@@ -155,6 +155,17 @@ export interface VoiceActionResultPayload {
   citations: string[];
 }
 
+/**
+ * Phase H — fired when the manual "Ask AI" voice-command trigger toggles the
+ * assistant listener (`EVENT_VOICE_COMMAND_LISTENING`). `active` flips true the
+ * moment the backend opens the mic for a spoken command and false once it has
+ * captured the utterance and dispatched it (the answer then arrives via
+ * `EVENT_VOICE_ACTION_RESULT`). Drives the inline "🎙 Słucham…" indicator.
+ */
+export interface VoiceCommandListeningPayload {
+  active: boolean;
+}
+
 /** A selectable microphone input device (from `list_input_devices`). */
 export interface InputDeviceInfo {
   name: string;
