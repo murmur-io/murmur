@@ -300,6 +300,39 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
           <input type="checkbox" formControlName="realtimeReactions" />
         </label>
 
+        <!-- Model + reasoning-effort overrides for the active cloud provider. -->
+        <div class="brain-tuning">
+          <label class="field">
+            <span class="field-label">Model</span>
+            <select formControlName="providerModel">
+              <option value="">Default (provider's pick)</option>
+              <option value="claude-opus-4-8">Opus 4.8</option>
+              <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+              <option value="claude-haiku-4-5">Haiku 4.5</option>
+            </select>
+            <span class="field-help text-muted">
+              Overrides the model used for grounded answers — leave on Default to
+              let the provider choose.
+            </span>
+          </label>
+
+          @if (form.controls.providerId.value === "anthropic") {
+            <label class="field">
+              <span class="field-label">Reasoning effort</span>
+              <select formControlName="providerEffort">
+                <option value="">Default</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+              <span class="field-help text-muted">
+                Applies to the Anthropic provider — higher effort spends more
+                thinking on harder questions.
+              </span>
+            </label>
+          }
+        </div>
+
         <!-- Local model picker — only meaningful for the local backend. -->
         @if (form.controls.brainBackend.value === "local") {
           <div class="brain-models">
@@ -1317,6 +1350,11 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         font-size: 0.875rem;
         line-height: 1.55;
       }
+      .brain-tuning {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
       .brain-models {
         display: flex;
         flex-direction: column;
@@ -1915,6 +1953,10 @@ export class SettingsComponent implements OnInit {
     whisperModelPath: "",
     language: "",
     anthropicModel: "claude-opus-4-8",
+    // Brain/AI model + reasoning-effort overrides ("" = provider default). Effort is
+    // honored only by the anthropic provider; the picker is gated on providerId below.
+    providerModel: "",
+    providerEffort: "",
     ollamaBaseUrl: "http://localhost:11434",
     ollamaModel: "llama3.1",
     claudeBinary: "claude",
@@ -2094,6 +2136,8 @@ export class SettingsComponent implements OnInit {
         whisperModelPath: cfg.whisperModelPath ?? "",
         language: cfg.language ?? "",
         anthropicModel: cfg.anthropicModel,
+        providerModel: cfg.providerModel ?? "",
+        providerEffort: cfg.providerEffort ?? "",
         ollamaBaseUrl: cfg.ollamaBaseUrl,
         ollamaModel: cfg.ollamaModel,
         claudeBinary: cfg.claudeBinary,
@@ -2294,6 +2338,8 @@ export class SettingsComponent implements OnInit {
       whisperModelPath: v.whisperModelPath || null,
       language: v.language || null,
       anthropicModel: v.anthropicModel,
+      providerModel: v.providerModel,
+      providerEffort: v.providerEffort,
       ollamaBaseUrl: v.ollamaBaseUrl,
       ollamaModel: v.ollamaModel,
       claudeBinary: v.claudeBinary,
