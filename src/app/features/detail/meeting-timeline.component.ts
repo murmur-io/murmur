@@ -46,6 +46,12 @@ interface TopicBlock {
   width: number;
   hue: number;
   order: number;
+  /**
+   * Block is too narrow to carry a readable label → render colour-only (the
+   * chapter chip row above + the hover tooltip still name it). Guards the dense
+   * case so short/adjacent topics don't show overlapping truncated text.
+   */
+  narrow: boolean;
 }
 
 /** An axis tick: position (0–100) + its mono label. */
@@ -338,9 +344,12 @@ interface AxisTick {
                   [attr.aria-label]="
                     top.label + ', ' + range(top.startS, top.endS)
                   "
+                  [attr.title]="top.label"
                   (click)="onBlock($event, top.startS)"
                 >
-                  <span class="tl-topic-label">{{ top.label }}</span>
+                  @if (!top.narrow) {
+                    <span class="tl-topic-label">{{ top.label }}</span>
+                  }
                   <span class="tl-tip" aria-hidden="true">
                     <span class="tl-tip-name">{{ top.label }}</span>
                     <span class="tl-tip-time">{{
@@ -641,7 +650,9 @@ interface AxisTick {
         position: absolute;
         top: 4px;
         bottom: 4px;
-        min-width: 6px;
+        /* Floor short/adjacent chapters so they never collapse to an
+           unreadable sliver (label is hidden below the width threshold). */
+        min-width: 14px;
         display: flex;
         align-items: center;
         padding: 0 var(--space-2);
@@ -1123,21 +1134,51 @@ export class MeetingTimelineComponent {
     { left: 64, width: 35 },
   ];
 
-  /** Effective denominator: prefer the meeting length, else span of the data. */
-  private readonly span = computed(() => {
-    const t = this.total();
-    if (t > 0) {
-      return t;
-    }
+  /**
+   * Largest *meaningful* content time across every speaker turn + topic span
+   * (seconds); 0 when there is no data. This — not the full recording length —
+   * is what the geometry scales to, so a meeting with speech only in its first
+   * stretch isn't bunched into a sliver of the track while a silent tail eats
+   * the rest of the width.
+   */
+  private readonly contentEnd = computed(() => {
     const tl = this.timeline();
     let max = 0;
     for (const s of tl?.speakers ?? []) {
       max = Math.max(max, s.endS);
     }
-    for (const t2 of tl?.topics ?? []) {
-      max = Math.max(max, t2.endS);
+    for (const t of tl?.topics ?? []) {
+      max = Math.max(max, t.endS);
     }
     return max;
+  });
+
+  /**
+   * Effective denominator for ALL geometry (blocks, topics, ticks, playhead,
+   * scrub). Scales to the content end + a little head-room (×1.06) so the
+   * meaningful content spreads across the full width — but NEVER exceeds the
+   * real recording length (`total`), and falls back to `total` unchanged when
+   * the content already (nearly) fills the recording (content ≥ 0.9×total, i.e.
+   * the tail isn't mostly silent). With no recording length known it scales to
+   * the raw content; with no content at all it is `total` (or 0).
+   */
+  private readonly span = computed(() => {
+    const total = this.total();
+    const content = this.contentEnd();
+    if (content <= 0) {
+      // No speakers/topics → nothing to scale to; use the recording length.
+      return total;
+    }
+    if (total <= 0) {
+      // Recording length unknown → scale to content with head-room.
+      return content * 1.06;
+    }
+    if (content >= total * 0.9) {
+      // Content fills (almost) the whole recording → keep the true duration.
+      return total;
+    }
+    // Silent tail: scale to content + head-room, capped at the real duration.
+    return Math.min(total, content * 1.06);
   });
 
   /** Stable colour index for each distinct name (order of first appearance). */
@@ -1195,14 +1236,17 @@ export class MeetingTimelineComponent {
     return spans.map((s, i) => {
       const start = clamp(s.startS, 0, total);
       const end = clamp(s.endS, start, total);
+      const width = Math.max(1, ((end - start) / total) * 100);
       return {
         label: s.label,
         startS: s.startS,
         endS: s.endS,
         left: (start / total) * 100,
-        width: Math.max(1, ((end - start) / total) * 100),
+        width,
         hue: hues.get(s.label) ?? 0,
         order: i,
+        // < ~8% of the track can't fit readable text → show colour only.
+        narrow: width < 8,
       };
     });
   });
