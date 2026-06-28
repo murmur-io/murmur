@@ -241,6 +241,29 @@ pub struct RecipeRecord {
     pub created_at: String,
 }
 
+/// One row of the local correction-log "flywheel" (`correction_log`): a single
+/// model-output→human-correction example captured for later on-device fine-tuning (LoRA). Local +
+/// SQLCipher-encrypted like the rest of the DB; never egresses. `final_output` is `None` until the
+/// user edits the model output; `accepted` records whether the model output was kept as-is.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CorrectionRecord {
+    pub id: i64,
+    /// Task discriminator, e.g. "ner" | "timeline" | "summary" — groups examples per model head.
+    pub kind: String,
+    /// The model's input (prompt / source text).
+    pub input: String,
+    /// What the model produced.
+    pub model_output: String,
+    /// The human-corrected output, if the user edited it (else `None`).
+    pub final_output: Option<String>,
+    /// True iff the model output was accepted unchanged.
+    pub accepted: bool,
+    /// Owner scope; "local" for the single-user on-device dataset.
+    pub owner_id: String,
+    pub created_at: String,
+}
+
 /// One parsed action-item checklist line from a note's "## Action items" section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
