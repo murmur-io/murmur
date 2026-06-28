@@ -8,9 +8,9 @@ use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
 use crate::storage::models::{
-    Analytics, Commitment, CorrectionRecord, DayCount, EntityDetail, EntityKind, EntityNeighbor,
-    Folder, GraphData, GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord,
-    RecipeRecord, SearchHit, StatusCount, VaultSource,
+    Analytics, AssistantInteraction, Commitment, CorrectionRecord, DayCount, EntityDetail,
+    EntityKind, EntityNeighbor, Folder, GraphData, GraphEdge, GraphEntity, GraphNode, Meeting,
+    MeetingStatus, NoteRecord, RecipeRecord, SearchHit, StatusCount, VaultSource,
 };
 use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
@@ -275,7 +275,20 @@ impl Db {
                created_at TEXT NOT NULL,
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );
-             CREATE INDEX IF NOT EXISTS idx_notes_asides_meeting ON notes_asides(meeting_id);",
+             CREATE INDEX IF NOT EXISTS idx_notes_asides_meeting ON notes_asides(meeting_id);
+             CREATE TABLE IF NOT EXISTS assistant_interactions (
+               id INTEGER PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               command TEXT NOT NULL,
+               answer TEXT NOT NULL,
+               citations TEXT NOT NULL DEFAULT '[]',
+               status TEXT NOT NULL,
+               source_label TEXT,
+               created_at TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_assistant_interactions_meeting
+               ON assistant_interactions(meeting_id);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -870,6 +883,9 @@ impl Db {
         // Phase F0: the seal-into-locked callers (lock_folder, move-into-locked) also drop the
         // sealed meetings' correction-log rows in the SAME tx — a sealed meeting feeds no flywheel.
         Self::purge_corrections_tx(&tx, meeting_ids)?;
+        // Voice-assistant Q&A log is plaintext-derived convenience data mirroring sealed content —
+        // drop it in the SAME seal tx (purge-on-seal, like corrections). Dropped by design.
+        Self::purge_assistant_interactions_tx(&tx, meeting_ids)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -1899,6 +1915,15 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
+        // LOCK-SAFETY: purge the voice-assistant Q&A log for every meeting in a locked folder, in
+        // this same reconciliation transaction — so a crash-while-unlocked (which may have persisted
+        // an interaction against a since-sealed meeting) cannot leave the plaintext Q&A at rest after
+        // a restart. Same purge-on-seal contract as the correction-log above.
+        tx.execute(
+            &format!("DELETE FROM assistant_interactions WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
         // Collect the at-rest audio columns of locked meetings for the caller's filesystem re-seal
         // pass — the playback WAV AND both hi-res masters (B1). A meeting is surfaced if ANY of the
         // three columns is set; each path is reconciled independently by the caller.
@@ -2361,6 +2386,118 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok(out)
+    }
+
+    /// Persist one in-meeting voice-assistant interaction (the Q&A) against `meeting_id`. PURELY
+    /// ADDITIVE: it never touches note/transcript/timeline plaintext or blobs, so it can never blank
+    /// or clobber sealed content. `citations` is stored as a JSON array string. The CALLER is the
+    /// off-thread voice dispatch, which is best-effort + panic-free — a persist failure there is
+    /// logged (non-PII) and never disrupts recording/dispatch. Derived convenience data: it is PURGED
+    /// (not sealed) when the meeting's folder is sealed (see `purge_assistant_interactions_tx`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_assistant_interaction(
+        &self,
+        meeting_id: &str,
+        command: &str,
+        answer: &str,
+        citations: &[String],
+        status: &str,
+        source_label: Option<&str>,
+        created_at: &str,
+    ) -> Result<i64> {
+        let citations_json = serde_json::to_string(citations)
+            .map_err(|e| AppError::Storage(format!("serialize interaction citations: {e}")))?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO assistant_interactions
+                (meeting_id, command, answer, citations, status, source_label, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                meeting_id,
+                command,
+                answer,
+                citations_json,
+                status,
+                source_label,
+                created_at
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read every persisted assistant interaction for `meeting_id`, oldest first, ONLY when the
+    /// meeting is VISIBLE to the session `unlocked` set (a sealed-and-not-session-unlocked meeting
+    /// returns an EMPTY list — never its rows). This is the gated read the detail DTO uses; it mirrors
+    /// the `meeting_is_visible` predicate so the interaction log is gated exactly like the note /
+    /// segments / timeline. Note: on seal the rows are PURGED (see `purge_assistant_interactions_tx`),
+    /// so a sealed meeting has no rows to read anyway — the gate is defense-in-depth.
+    pub fn list_assistant_interactions_visible(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<AssistantInteraction>> {
+        if !self.meeting_is_visible(meeting_id, unlocked)? {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT command, answer, citations, status, source_label, created_at
+                   FROM assistant_interactions
+                  WHERE meeting_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                let citations_json: String = r.get(2)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    citations_json,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (command, answer, citations_json, status, source_label, created_at) =
+                r.map_err(map_err)?;
+            // A malformed citations blob must never break the read — fall back to an empty list.
+            let citations: Vec<String> = serde_json::from_str(&citations_json).unwrap_or_default();
+            out.push(AssistantInteraction {
+                command,
+                answer,
+                citations,
+                status,
+                source_label,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// LOCK-SAFETY: delete every `assistant_interactions` row for `meeting_ids` within an EXISTING
+    /// transaction, so the purge lands in the SAME atomic unit as the plaintext blanking on a seal
+    /// (and on the startup reconcile). The Q&A log is plaintext-derived convenience data that mirrors
+    /// content of a sealed meeting (the user's spoken question + the answer grounded on the vault); a
+    /// sealed meeting must surface NOTHING, so — exactly like `correction_log` / `note_chunks` — we
+    /// DELETE rather than seal. This is INTENTIONAL: the Q&A log is dropped on seal by design and is
+    /// not recoverable (it was never keyed); the underlying transcript is still sealed + restorable.
+    fn purge_assistant_interactions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM assistant_interactions WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
     }
 
     /// OPEN-COMMITMENTS rollup (deterministic, no model): every OPEN (`- [ ]`) action item across
@@ -3385,6 +3522,131 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    fn interaction_count(db: &Db, meeting_id: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM assistant_interactions WHERE meeting_id = ?1",
+                rusqlite::params![meeting_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// PERSIST → READ round-trips a voice-assistant interaction (command + answer + citations +
+    /// status + source_label) for a VISIBLE (unfoldered) meeting.
+    #[test]
+    fn assistant_interaction_round_trips_for_visible_meeting() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_assistant_interaction(
+            "m1",
+            "Klaudku, sprawdź jaka była pogoda",
+            "Wczoraj było słonecznie. Zobacz [[Notatka o pogodzie]].",
+            &["[[Notatka o pogodzie]]".to_string(), "(web) Weather — http://x".to_string()],
+            "ok",
+            Some("research"),
+            "2026-06-24T10:05:00Z",
+        )
+        .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let got = db.list_assistant_interactions_visible("m1", &nothing).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].command, "Klaudku, sprawdź jaka była pogoda");
+        assert!(got[0].answer.contains("słonecznie"));
+        assert_eq!(
+            got[0].citations,
+            vec![
+                "[[Notatka o pogodzie]]".to_string(),
+                "(web) Weather — http://x".to_string()
+            ]
+        );
+        assert_eq!(got[0].status, "ok");
+        assert_eq!(got[0].source_label.as_deref(), Some("research"));
+        assert_eq!(got[0].created_at, "2026-06-24T10:05:00Z");
+    }
+
+    /// GATE: a sealed-and-NOT-session-unlocked meeting's interactions are NEVER returned by the gated
+    /// read (empty), even if a row exists at rest. RED-able: drop the `meeting_is_visible` guard in
+    /// `list_assistant_interactions_visible` and this fails (the row leaks through the read).
+    #[test]
+    fn assistant_interactions_gated_for_sealed_meeting() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "note"); // gives the meeting a note in the folder
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.insert_assistant_interaction(
+            "m1",
+            "secret command",
+            "secret answer",
+            &[],
+            "ok",
+            Some("research"),
+            "2026-06-24T10:05:00Z",
+        )
+        .unwrap();
+        // Seal the folder (visibility_clause keys off folders.locked); session-unlock set is empty.
+        db.set_folder_locked("f-locked", true, Some(b"wrapped")).unwrap();
+
+        let empty = std::collections::HashSet::new();
+        assert!(
+            db.list_assistant_interactions_visible("m1", &empty).unwrap().is_empty(),
+            "a sealed-not-unlocked meeting must surface NO interactions through the gated read"
+        );
+        // …and once the folder is session-unlocked, the row is visible again.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        assert_eq!(
+            db.list_assistant_interactions_visible("m1", &unlocked).unwrap().len(),
+            1,
+            "a session-unlocked folder's interactions ARE visible"
+        );
+    }
+
+    /// PURGE-ON-SEAL: the interactions of a meeting in a folder are GONE after the seal purge tx
+    /// (`purge_chunks_for_meetings`, which lock_folder runs). RED-able: drop the
+    /// `purge_assistant_interactions_tx` call and the row survives at rest in a locked folder.
+    #[test]
+    fn assistant_interactions_purged_on_seal() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.insert_assistant_interaction(
+            "m1", "cmd", "answer", &[], "ok", Some("research"), "2026-06-24T10:05:00Z",
+        )
+        .unwrap();
+        assert_eq!(interaction_count(&db, "m1"), 1, "row present before seal");
+
+        // The seal purge runs in the SAME tx that drops chunks + corrections for the sealed meetings.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert_eq!(
+            interaction_count(&db, "m1"),
+            0,
+            "assistant_interactions must be purged on seal (Q&A log dropped on seal by design)"
+        );
+    }
+
+    /// PURGE-ON-DELETE: deleting a meeting also removes its interactions (FK ON DELETE CASCADE).
+    #[test]
+    fn assistant_interactions_purged_on_delete_meeting() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_assistant_interaction(
+            "m1", "cmd", "answer", &[], "ok", Some("research"), "2026-06-24T10:05:00Z",
+        )
+        .unwrap();
+        assert_eq!(interaction_count(&db, "m1"), 1);
+        db.delete_meeting("m1").unwrap();
+        assert_eq!(
+            interaction_count(&db, "m1"),
+            0,
+            "delete_meeting must purge the meeting's assistant_interactions rows"
+        );
     }
 
     #[test]

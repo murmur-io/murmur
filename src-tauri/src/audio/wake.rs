@@ -225,6 +225,29 @@ fn squeeze_repeats(s: &str) -> String {
     out
 }
 
+/// Whether a transcript `line` is ADDRESSED TO THE ASSISTANT — i.e. it opens with the "Klaud/
+/// Klaudku/Claude" vocative wake form ("Klaudku, sprawdź pogodę"). Reuses [`detect_wake`] (the
+/// same recall-first, shape-gated vocative matcher the live loop uses), so the SUMMARIZER recognizes
+/// exactly the utterances the in-meeting assistant treats as commands. Deterministic + pure.
+///
+/// WHY: the user's spoken assistant commands land verbatim in the transcript. Fed to the summarizer
+/// they get MANGLED into owner-less action items ("(właściciel nieokreślony) — Sprawdzić pogodę").
+/// Excluding these lines from the summarization input keeps them OUT of the note's action items; the
+/// assistant's ANSWER is carried by the persisted Q&A log instead.
+pub fn is_assistant_directed(line: &str) -> bool {
+    detect_wake(line).is_some()
+}
+
+/// Filter a list of transcript LINES, dropping every one [`is_assistant_directed`] flags (a line the
+/// user spoke TO the assistant). Returns the kept lines in order. Pure + deterministic. Used to build
+/// the summarization input so assistant-directed utterances never reach the action-items extraction.
+pub fn strip_assistant_directed_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    lines
+        .into_iter()
+        .filter(|l| !is_assistant_directed(l))
+        .collect()
+}
+
 // ───────────────────────────── intent parser ─────────────────────────────
 
 /// A structured, deterministic interpretation of a wake command tail. The dispatch/execution of
@@ -654,6 +677,46 @@ mod tests {
             VoiceIntent::Unknown { raw: "asdf qwer zxcv".into() }
         );
         assert_eq!(parse_voice_intent("   "), VoiceIntent::Unknown { raw: String::new() });
+    }
+
+    // ── SUMMARIZER EXCLUSION: assistant-directed line detection ──────────────
+
+    #[test]
+    fn is_assistant_directed_flags_vocative_lines_only() {
+        // Lines the user spoke TO the assistant (vocative wake form) → directed.
+        for directed in [
+            "Klaudku, sprawdź jaka była pogoda",
+            "klaudku jakie masz informacje w moich notatkach",
+            "klauku zrób research o cenach", // d-less vocative
+            "hej klałdku wyszukaj raport",
+        ] {
+            assert!(is_assistant_directed(directed), "{directed:?} must be assistant-directed");
+        }
+        // Ordinary meeting speech → NOT directed (must reach the summarizer).
+        for ordinary in [
+            "Janek wyśle raport w piątek",
+            "let's talk about the budget for friday",
+            "klaudia z działu hr dołączy do nas", // name, not the vocative
+            "cloud computing is the future",
+            "",
+        ] {
+            assert!(!is_assistant_directed(ordinary), "{ordinary:?} must NOT be assistant-directed");
+        }
+    }
+
+    #[test]
+    fn strip_assistant_directed_lines_keeps_meeting_content() {
+        let lines = [
+            "Janek wyśle raport w piątek",
+            "Klaudku, sprawdź jaka była pogoda",
+            "Ustaliliśmy termin na poniedziałek",
+        ];
+        let kept = strip_assistant_directed_lines(lines.iter().copied());
+        assert_eq!(
+            kept,
+            vec!["Janek wyśle raport w piątek", "Ustaliliśmy termin na poniedziałek"],
+            "assistant commands dropped; real meeting content kept in order"
+        );
     }
 
     #[test]
