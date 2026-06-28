@@ -62,6 +62,19 @@ mistralrs = { version = "0.8.1", features = ["metal"], optional = true }
 # model is a deliberate later swap (the `Embedder` seam ships with a deterministic StubEmbedder).
 sqlite-vec = "0.1.9"
 
+# ── Local embedding model (Phase C — OPTIONAL: compiled ONLY under `--features local-embed`) ──
+# In-process BERT embedding (candle-transformers, Metal) for the REAL multilingual-e5-small encoder
+# behind `embed::active_embedder`. A build-proof PROVED candle 0.10.2 (BERT) links cleanly in-process
+# with ZERO second onnxruntime — it SHARES candle with the `local-brain` graph, and sherpa stays the
+# only ORT. `optional` so the DEFAULT build (and the fast `cargo test --lib` loop) NEVER compiles
+# candle; `embed::active_embedder` returns the dependency-free `StubEmbedder` unless this feature is
+# on AND the e5 model dir is present. The `metal`/`accelerate` features mirror the candle already in
+# the brain graph. Build: `cargo build --features local-embed`.
+candle-core = { version = "0.10.2", features = ["metal", "accelerate"], optional = true }
+candle-nn = { version = "0.10.2", features = ["metal", "accelerate"], optional = true }
+candle-transformers = { version = "0.10.2", features = ["metal", "accelerate"], optional = true }
+tokenizers = { version = "0.21", optional = true }
+
 # ── Serde ──
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -130,3 +143,9 @@ default = []
 # present at the resolved path, `reason::active_reasoner` returns the real MistralReasoner; otherwise it
 # gracefully degrades to the StubReasoner. Build: `MISTRALRS_METAL_PRECOMPILE=0 cargo build --features local-brain`.
 local-brain = ["dep:mistralrs"]
+# Phase C — the REAL on-device embedding model (CandleBertEmbedder, `embed/candle_bert.rs`). OFF by
+# default so the fast `cargo test --lib` loop never compiles candle. With it ON *and* the e5 model dir
+# present at the resolved path, `embed::active_embedder` returns the real CandleBertEmbedder; otherwise
+# it gracefully degrades to the StubEmbedder. Target model = multilingual-e5-small (384-dim ⇒ EMBED_DIM
+# is unchanged, ZERO vec0 schema migration). Build: `cargo build --features local-embed`.
+local-embed = ["dep:candle-transformers", "dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
