@@ -45,14 +45,15 @@ async-trait = "0.1"
 # bundled-sqlcipher-vendored-openssl: whole-DB at-rest encryption, no system OpenSSL dependency
 # (universal-capable). Fallback if the universal build breaks: "bundled-sqlcipher".
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
-# ── Local reasoning brain (Phase B — OPTIONAL: compiled ONLY under `--features local-brain`) ──
+# ── Local reasoning brain (always compiled; the real impl activates at runtime when the model is present) ──
 # In-process GGUF inference (Metal). A build-proof PROVED this links cleanly alongside whisper.cpp +
-# sherpa's static onnxruntime + bundled SQLCipher (zero ORT/ggml/openssl conflict). It is `optional`
-# so the DEFAULT build (and the fast `cargo test --lib` loop) NEVER compiles the heavy mistralrs tree;
-# `reason::active_reasoner` returns the dependency-free `StubReasoner` unless this feature is on AND a
-# GGUF model is present. The `metal` feature precompiles shaders via xcrun (needs full Xcode, or env
-# `MISTRALRS_METAL_PRECOMPILE=0` to defer). NOT wired into any pipeline path yet (Phase B step 3).
-mistralrs = { version = "0.8.1", features = ["metal"], optional = true }
+# sherpa's static onnxruntime + bundled SQLCipher (zero ORT/ggml/openssl conflict). Always compiled:
+# `reason::active_reasoner` (BrainBackend::Local) returns the real `MistralReasoner` when a GGUF model
+# is present on disk, else gracefully degrades to the dependency-free `StubReasoner` (model presence is
+# the ONLY switch — no cargo feature). The `metal` feature precompiles shaders via xcrun (needs full
+# Xcode, or env `MISTRALRS_METAL_PRECOMPILE=0` to defer shader compile to first run — REQUIRED on a
+# Mac with only the Command Line Tools).
+mistralrs = { version = "0.8.1", features = ["metal"] }
 
 # ── Vector retrieval (Phase 2a) ──
 # sqlite-vec `vec0` virtual table for on-device KNN, registered into the SAME bundled SQLCipher
@@ -62,18 +63,20 @@ mistralrs = { version = "0.8.1", features = ["metal"], optional = true }
 # model is a deliberate later swap (the `Embedder` seam ships with a deterministic StubEmbedder).
 sqlite-vec = "0.1.9"
 
-# ── Local embedding model (Phase C — OPTIONAL: compiled ONLY under `--features local-embed`) ──
+# ── Local embedding model + NER (always compiled; the real impls activate at runtime when the model is present) ──
 # In-process BERT embedding (candle-transformers, Metal) for the REAL multilingual-e5-small encoder
-# behind `embed::active_embedder`. A build-proof PROVED candle 0.10.2 (BERT) links cleanly in-process
-# with ZERO second onnxruntime — it SHARES candle with the `local-brain` graph, and sherpa stays the
-# only ORT. `optional` so the DEFAULT build (and the fast `cargo test --lib` loop) NEVER compiles
-# candle; `embed::active_embedder` returns the dependency-free `StubEmbedder` unless this feature is
-# on AND the e5 model dir is present. The `metal`/`accelerate` features mirror the candle already in
-# the brain graph. Build: `cargo build --features local-embed`.
-candle-core = { version = "0.10.2", features = ["metal", "accelerate"], optional = true }
-candle-nn = { version = "0.10.2", features = ["metal", "accelerate"], optional = true }
-candle-transformers = { version = "0.10.2", features = ["metal", "accelerate"], optional = true }
-tokenizers = { version = "0.21", optional = true }
+# behind `embed::active_embedder`, AND the mDeBERTa-v3 PERSON-name NER behind
+# `summarize::redact::active_name_redactor`. A build-proof PROVED candle 0.10.2 links cleanly
+# in-process with ZERO second onnxruntime — it SHARES candle with the mistralrs brain graph, and
+# sherpa stays the only ORT. Always compiled: `embed::active_embedder` returns the real
+# `CandleBertEmbedder` when the e5 model dir is present on disk, else the dependency-free
+# `StubEmbedder`; likewise `active_name_redactor` returns the real `DebertaNameRedactor` when the NER
+# model dir is present, else the byte-identical `NoopNameRedactor` (model presence is the ONLY switch —
+# no cargo feature). The `metal`/`accelerate` features mirror the candle in the brain graph.
+candle-core = { version = "0.10.2", features = ["metal", "accelerate"] }
+candle-nn = { version = "0.10.2", features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.10.2", features = ["metal", "accelerate"] }
+tokenizers = { version = "0.21" }
 
 # ── Serde ──
 serde = { version = "1", features = ["derive"] }
@@ -136,25 +139,9 @@ security-framework = { version = "3.7", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 
 [features]
-# default keeps Metal on for whisper; nothing else conditional in P0
+# default keeps Metal on for whisper; nothing else conditional. The on-device brain (mistralrs),
+# embedder + NER (candle/tokenizers) are ALWAYS compiled — the real impls activate at runtime on
+# model-presence (see `reason::active_reasoner`, `embed::active_embedder`,
+# `summarize::redact::active_name_redactor`), so there is no longer a cargo feature to flip; a fresh
+# install with no downloaded model still boots and runs on the stub/no-op floor.
 default = []
-# Phase B — the REAL on-device reasoning brain (MistralReasoner, `reason/mistral.rs`). OFF by default
-# so the fast `cargo test --lib` loop never compiles the heavy mistralrs tree. With it ON *and* a GGUF
-# present at the resolved path, `reason::active_reasoner` returns the real MistralReasoner; otherwise it
-# gracefully degrades to the StubReasoner. Build: `MISTRALRS_METAL_PRECOMPILE=0 cargo build --features local-brain`.
-local-brain = ["dep:mistralrs"]
-# Phase C — the REAL on-device embedding model (CandleBertEmbedder, `embed/candle_bert.rs`). OFF by
-# default so the fast `cargo test --lib` loop never compiles candle. With it ON *and* the e5 model dir
-# present at the resolved path, `embed::active_embedder` returns the real CandleBertEmbedder; otherwise
-# it gracefully degrades to the StubEmbedder. Target model = multilingual-e5-small (384-dim ⇒ EMBED_DIM
-# is unchanged, ZERO vec0 schema migration). Build: `cargo build --features local-embed`.
-local-embed = ["dep:candle-transformers", "dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
-# Phase D — the REAL on-device name-redaction NER (DebertaNameRedactor, `summarize/ner_deberta.rs`).
-# OFF by default so the fast `cargo test --lib` loop never compiles candle. REUSES the SAME optional
-# candle/tokenizers deps `local-embed` added (candle-transformers 0.10.2 ships a built-in
-# `models::debertav2::DebertaV2NERModel` that links with ZERO second onnxruntime — sherpa stays the
-# only ORT). With it ON *and* the NER model dir present, `summarize::redact::active_name_redactor`
-# returns the real DebertaNameRedactor (PERSON spans → ⟪NAME_n⟫ tokens before cloud egress);
-# otherwise it gracefully degrades to the byte-identical NoopNameRedactor. Build:
-# `cargo build --features local-ner --lib`.
-local-ner = ["dep:candle-transformers", "dep:candle-core", "dep:candle-nn", "dep:tokenizers"]

@@ -110,10 +110,9 @@ pub struct AppState {
     /// In-memory cache of the settings table.
     pub config: Mutex<AppConfig>,
     /// The active on-device reasoning backend (Phase B). Resolved ONCE at startup by
-    /// [`crate::reason::active_reasoner`]: the real `MistralReasoner` when the `local-brain` feature
-    /// is on AND a GGUF is present, else the dependency-free `StubReasoner`. The trait is `Send +
-    /// Sync` and all methods take `&self`, so no `Mutex` is needed. NOT yet called from any pipeline
-    /// path (wired but inert until Phase B step 3 / orchestrate.rs).
+    /// [`crate::reason::active_reasoner`]: the real `MistralReasoner` when a GGUF is present on disk
+    /// (mistralrs is always compiled), else the dependency-free `StubReasoner`. The trait is `Send +
+    /// Sync` and all methods take `&self`, so no `Mutex` is needed.
     pub reasoner: Box<dyn crate::reason::LocalReasoner>,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +

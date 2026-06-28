@@ -136,9 +136,15 @@ pkill -f 'tauri dev' ; pkill -x Murmur ; pkill -f 'target/debug/Murmur' || true
 
 ## Stage 7 — Universal build
 
+The full product IS the default build — the local-model cargo features were removed, so the
+on-device brain (mistralrs) + embedder/NER (candle) are always compiled and activate at runtime on
+model-presence. NO `--features` flag. `MISTRALRS_METAL_PRECOMPILE=0` is baked into
+`src-tauri/.cargo/config.toml [env]` (CLT-only Mac → defer Metal-shader compile to first run); keep
+it on the command line too as a guard.
+
 ```bash
 source "$HOME/.cargo/env"
-npx tauri build --target universal-apple-darwin --bundles app
+MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app
 APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
 lipo -archs "$APP/Contents/MacOS/Murmur"     # MUST print: x86_64 arm64
 ```
