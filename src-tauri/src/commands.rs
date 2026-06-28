@@ -1637,6 +1637,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // Phase B: the brain model path is not carried on the settings DTO (it is resolved from the
         // shared models dir by default), so a settings save preserves the live value (default None).
         brain_model_path: current.brain_model_path.clone(),
+        // Phase B (registry): the selected brain model id is set ONLY via `select_brain_model`, never
+        // through a settings save — preserve the live value so a save can't clobber the selection.
+        brain_model_id: current.brain_model_id.clone(),
     }
 }
 
@@ -1920,50 +1923,115 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
 }
 
 /// Whether a usable on-device brain (reasoning GGUF) is present at the resolved path — the
-/// configured `brain_model_path`, else the default model in the shared models dir. Lets the UI offer
-/// a download. Independent of the `local-brain` feature: this only checks the file on disk.
+/// configured custom `brain_model_path`, else the selected `brain_model_id`'s file in the shared
+/// models dir. Lets the UI offer a download. Independent of the `local-brain` feature: this only
+/// checks the file on disk.
 #[tauri::command]
 pub fn brain_model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
-    let configured = {
+    let (configured, selected) = {
         let c = state
             .config
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.brain_model_path.clone()
+        (c.brain_model_path.clone(), c.brain_model_id.clone())
     };
     let p = configured.as_deref().map(std::path::Path::new);
-    Ok(crate::reason::brain_model_path(p)?.is_some())
+    Ok(crate::reason::resolve_brain_model(p, selected.as_deref())?.is_some())
 }
 
-/// Download the on-device brain (reasoning GGUF) into the shared models dir if missing; returns its
-/// path. No-op (returns the existing path) when already present. INBOUND ONLY — fetches a model file
-/// and sends NO meeting content (no egress). Emits [`crate::events::EVENT_BRAIN_DOWNLOAD`] progress
-/// events (throttled). The downloaded file is NOT loaded here — wiring the brain is Phase B step 3.
+/// macOS total physical RAM in whole GB via `sysctl -n hw.memsize` (no new FFI/crate). Returns
+/// `None` on any error — the caller then treats every model as fitting rather than HIDING it behind
+/// a failed probe.
+fn total_ram_gb() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.memsize")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let bytes: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
+    Some(bytes / (1024 * 1024 * 1024))
+}
+
+/// The curated on-device brain model registry, each row carrying the picker flags `downloaded`
+/// (file present in the shared models dir), `fits_ram` (min RAM within the machine's total RAM —
+/// `true` when total RAM can't be read), and `selected` (the persisted `brain_model_id`). Feeds the
+/// Phase-H model picker. No content read / no egress — static metadata + on-disk existence only.
+#[tauri::command]
+pub fn list_brain_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::reason::BrainModelDto>, AppError> {
+    let selected = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.brain_model_id.clone()
+    };
+    let dir = crate::transcribe::models_dir()?;
+    Ok(crate::reason::brain_model_dtos(
+        &dir,
+        total_ram_gb(),
+        selected.as_deref(),
+    ))
+}
+
+/// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
+/// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the next `active_reasoner` build
+/// resolves this model when its GGUF is present. Does NOT download — the FE calls
+/// `download_brain_model(model_id)` for that.
+#[tauri::command]
+pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Result<(), AppError> {
+    select_brain_model_inner(&state, model_id)
+}
+
+/// Testable core of [`select_brain_model`]: validate the id against the registry, persist it.
+fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), AppError> {
+    if crate::reason::brain_model_by_id(&model_id).is_none() {
+        return Err(AppError::InvalidArg(format!(
+            "unknown brain model id: {model_id}"
+        )));
+    }
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    c.brain_model_id = Some(model_id);
+    c.save(&state.db)?;
+    Ok(())
+}
+
+/// Download the on-device brain model identified by `model_id` (from the curated registry) into the
+/// shared models dir if missing; returns its path. No-op (returns the existing path) when already
+/// present. Unknown id ⇒ `AppError::InvalidArg`. INBOUND ONLY — fetches a model file and sends NO
+/// meeting content (no egress). Emits [`crate::events::EVENT_BRAIN_DOWNLOAD`] progress events
+/// (throttled). The downloaded file is NOT loaded here — wiring the brain is a later step.
+/// Resolve a registry `model_id` to its `(download url, on-disk dest)`. Unknown id ⇒
+/// `AppError::InvalidArg` (the rejection [`download_brain_model`] enforces). Testable sync core.
+fn brain_download_target(model_id: &str) -> Result<(&'static str, std::path::PathBuf), AppError> {
+    let model = crate::reason::brain_model_by_id(model_id).ok_or_else(|| {
+        AppError::InvalidArg(format!("unknown brain model id: {model_id}"))
+    })?;
+    Ok((model.url, crate::transcribe::models_dir()?.join(model.filename)))
+}
+
 #[tauri::command]
 pub async fn download_brain_model(
     app: AppHandle,
-    state: State<'_, AppState>,
+    model_id: String,
 ) -> Result<String, AppError> {
-    let configured = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.brain_model_path.clone()
-    };
-    let p = configured.as_deref().map(std::path::Path::new);
-    if let Some(found) = crate::reason::brain_model_path(p)? {
-        return Ok(found.to_string_lossy().to_string());
-    }
+    let (url, dest) = brain_download_target(&model_id)?;
 
-    let dest =
-        crate::transcribe::models_dir()?.join(crate::reason::DEFAULT_BRAIN_MODEL_FILE);
-    let url = crate::reason::default_brain_model_url();
+    if dest.is_file() {
+        return Ok(dest.to_string_lossy().to_string());
+    }
 
     // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
     const EMIT_EVERY: u64 = 8 * 1024 * 1024;
     let mut last_emit: u64 = 0;
-    crate::reason::download_brain_model(&url, &dest, |downloaded, total| {
+    crate::reason::download_brain_model(url, &dest, |downloaded, total| {
         if downloaded - last_emit >= EMIT_EVERY {
             last_emit = downloaded;
             let _ = app.emit(
@@ -4256,6 +4324,52 @@ mod lifecycle_tests {
             !dto_to_config(dto2, &current2).cloud_egress_consented,
             "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
         );
+    }
+
+    // ── brain model registry: select + download-target resolution ───────────────────────────────
+
+    /// `select_brain_model` validates the id against the registry and PERSISTS it; reloading config
+    /// from the DB returns the chosen id. An unknown id is rejected with `InvalidArg` and leaves the
+    /// stored selection untouched.
+    #[test]
+    fn select_brain_model_persists_valid_and_rejects_unknown() {
+        let state = build_state("brain-select");
+
+        select_brain_model_inner(&state, "bielik-11b-v3".to_string()).unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().brain_model_id.as_deref(),
+            Some("bielik-11b-v3")
+        );
+        // Survives a reload from the settings table.
+        assert_eq!(
+            AppConfig::load(&state.db).unwrap().brain_model_id.as_deref(),
+            Some("bielik-11b-v3")
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged.
+        let err = select_brain_model_inner(&state, "not-a-real-model".to_string()).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)));
+        assert_eq!(
+            state.config.lock().unwrap().brain_model_id.as_deref(),
+            Some("bielik-11b-v3")
+        );
+    }
+
+    /// The download-target resolver rejects an unknown id (the exact guard `download_brain_model`
+    /// enforces before any network I/O) and resolves a known id to its registry URL + a path inside
+    /// the shared models dir.
+    #[test]
+    fn brain_download_target_rejects_unknown_and_resolves_known() {
+        assert!(matches!(
+            brain_download_target("bogus-id"),
+            Err(AppError::InvalidArg(_))
+        ));
+        let (url, dest) = brain_download_target("qwen2.5-3b").unwrap();
+        assert_eq!(
+            url,
+            "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+        );
+        assert!(dest.ends_with("Qwen2.5-3B-Instruct-Q4_K_M.gguf"));
     }
 
     // ── rename_folder / delete_folder (folder lifecycle) ────────────────────────────────────────

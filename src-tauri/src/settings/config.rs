@@ -91,6 +91,13 @@ pub struct AppConfig {
     /// this field existed loads as `None`.
     #[serde(default)]
     pub brain_model_path: Option<String>,
+    /// Phase B (model registry) — the SELECTED on-device brain model id (from `reason::BRAIN_MODELS`,
+    /// e.g. `bielik-11b-v3` / `qwen3-14b` / `qwen2.5-3b`). `None` (the default) means no model is
+    /// chosen ⇒ the resolver falls back to the `StubReasoner`. Set via the `select_brain_model`
+    /// command. Consulted only when the `local-brain` feature is compiled in. `#[serde(default)]` ⇒
+    /// a config persisted before this field existed loads as `None`.
+    #[serde(default)]
+    pub brain_model_id: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -123,6 +130,7 @@ impl Default for AppConfig {
             cloud_egress_consented: false,
             semantic_search_enabled: false,
             brain_model_path: None,
+            brain_model_id: None,
         }
     }
 }
@@ -155,6 +163,7 @@ const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
+const K_BRAIN_MODEL_ID: &str = "brain_model_id";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -248,6 +257,7 @@ impl AppConfig {
             cfg.semantic_search_enabled = v == "true";
         }
         cfg.brain_model_path = opt(db.get_setting(K_BRAIN_MODEL_PATH)?);
+        cfg.brain_model_id = opt(db.get_setting(K_BRAIN_MODEL_ID)?);
 
         Ok(cfg)
     }
@@ -326,6 +336,10 @@ impl AppConfig {
         db.set_setting(
             K_BRAIN_MODEL_PATH,
             self.brain_model_path.as_deref().unwrap_or(""),
+        )?;
+        db.set_setting(
+            K_BRAIN_MODEL_ID,
+            self.brain_model_id.as_deref().unwrap_or(""),
         )?;
         Ok(())
     }
@@ -413,6 +427,22 @@ mod tests {
         // Settings-table path: an empty DB (no key written) loads false.
         let db = temp_db();
         assert!(!AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    #[test]
+    fn brain_model_id_round_trips_and_defaults_none() {
+        let db = temp_db();
+        // Absent key ⇒ None (prod-safe default for existing installs).
+        assert!(AppConfig::load(&db).unwrap().brain_model_id.is_none());
+        let cfg = AppConfig {
+            brain_model_id: Some("bielik-11b-v3".to_string()),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert_eq!(
+            AppConfig::load(&db).unwrap().brain_model_id.as_deref(),
+            Some("bielik-11b-v3")
+        );
     }
 
     #[test]
