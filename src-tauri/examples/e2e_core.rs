@@ -65,6 +65,7 @@ async fn main() {
         },
         template: String::new(),
         vault_titles,
+        related_context: None,
     };
 
     let provider = ClaudeCodeProvider::new();
