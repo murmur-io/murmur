@@ -483,52 +483,36 @@ async fn summarize_and_export(
         _ => Vec::new(),
     };
 
-    // brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION. When `augment_notes_with_context`
-    // is ON, ground the new note in related PRIOR notes so notes compound. GATED twofold:
-    //   1. the master flag (default OFF ⇒ `related_context = None` ⇒ `render_user_content` is
-    //      BYTE-IDENTICAL to today — zero prod regression);
-    //   2. the LIVE session unlock set — the retrieval routes through `search_visible` +
-    //      `get_note_if_visible`, so a sealed-and-not-session-unlocked prior note contributes
-    //      NOTHING. This matters because the corpus EGRESSES to the cloud provider in the prompt
-    //      (lock-model invariant).
-    // Best-effort: a retrieval error logs (target rag, no PII) and proceeds with NO context — it
-    // NEVER fails the pipeline.
-    let related_context: Option<String> = if config.augment_notes_with_context {
-        let unlocked = state
-            .unlocked_folders
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        let title = state
-            .db
-            .get_meeting(meeting_id)
-            .ok()
-            .flatten()
-            .and_then(|m| m.title);
-        let query = crate::summarize::related_context::salient_query(
-            title.as_deref(),
-            transcript_text,
-        );
-        match crate::summarize::related_context::build_related_context(
-            &state.db,
-            meeting_id,
-            &query,
-            &unlocked,
-            &config.provider_id,
-        ) {
-            Ok((corpus, sources)) if !corpus.trim().is_empty() => {
-                tracing::info!(target: "rag", related = sources.len(), "grounding note in related prior notes");
-                Some(corpus)
-            }
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(target: "rag", error = %e, "related-context retrieval failed (note unaffected)");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION (ALWAYS ON). Ground the new note in
+    // related PRIOR notes so notes compound ("last time you decided X"). GATED by the LIVE session
+    // unlock set: the retrieval routes through `search_visible` + `get_note_if_visible` (inside
+    // `build_grounding_context` → `build_related_context`), so a sealed-and-not-session-unlocked
+    // prior note contributes NOTHING. This matters because the corpus EGRESSES to the provider in
+    // the prompt — but it is the SAME provider call (`make_provider` → RedactingProvider +
+    // fail-closed `cloud_egress_consented` gate) the summary already makes, so always-on adds NO
+    // new egress class and does NOT bypass consent (local provider stays local; no consent → the
+    // summary already fails closed). Best-effort: a retrieval error logs (target rag, no PII) and
+    // proceeds with NO context, and an empty corpus yields `None` (byte-identical to no-context) —
+    // it NEVER fails the pipeline.
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let related_title = state
+        .db
+        .get_meeting(meeting_id)
+        .ok()
+        .flatten()
+        .and_then(|m| m.title);
+    let related_context = build_grounding_context(
+        &state.db,
+        &unlocked,
+        meeting_id,
+        related_title.as_deref(),
+        transcript_text,
+        &config.provider_id,
+    );
 
     let request = SummarizeRequest {
         transcript: transcript_text.to_string(),
@@ -713,6 +697,49 @@ pub(crate) fn index_meeting_if_enabled(
         return Ok(()); // sealed-not-unlocked: never index its plaintext.
     }
     db.index_meeting_chunks(meeting_id, embedder)
+}
+
+/// brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION (ALWAYS ON). Build the GATED corpus of
+/// related PRIOR notes used to ground a new note. AppState-free (takes only the `Db`, the live
+/// `unlocked` session set, the meeting id/title/transcript, and the provider id) so the always-on
+/// path + its gate are unit-testable in isolation.
+///
+/// LOCK INVARIANT (load-bearing): the returned corpus is injected into the summarization prompt and
+/// therefore EGRESSES to the provider. The retrieval routes through `search_visible` +
+/// `get_note_if_visible` on the LIVE `unlocked` set (inside `build_related_context`), and the
+/// meeting being summarized is self-excluded — a sealed-and-not-session-unlocked prior note
+/// contributes NOTHING. Egress is the SAME provider call the summary already makes (no new egress
+/// class, no consent bypass).
+///
+/// BEST-EFFORT: a retrieval `Err` logs (target `rag`, no PII) and yields `None`; an empty corpus
+/// (fresh vault / no related notes / all-stopword transcript) also yields `None`, so
+/// `render_user_content` stays byte-identical to the no-context path. It NEVER fails the pipeline.
+pub(crate) fn build_grounding_context(
+    db: &crate::storage::Db,
+    unlocked: &std::collections::HashSet<String>,
+    meeting_id: &str,
+    title: Option<&str>,
+    transcript: &str,
+    provider_id: &str,
+) -> Option<String> {
+    let query = crate::summarize::related_context::salient_query(title, transcript);
+    match crate::summarize::related_context::build_related_context(
+        db,
+        meeting_id,
+        &query,
+        unlocked,
+        provider_id,
+    ) {
+        Ok((corpus, sources)) if !corpus.trim().is_empty() => {
+            tracing::info!(target: "rag", related = sources.len(), "grounding note in related prior notes");
+            Some(corpus)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(target: "rag", error = %e, "related-context retrieval failed (note unaffected)");
+            None
+        }
+    }
 }
 
 /// Pick the vault subfolder for a note: AI thematic filing (nested under the configured
@@ -1040,6 +1067,104 @@ mod tests {
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == mid)
+    }
+
+    /// ALWAYS-ON (no flag): the pipeline path now builds a related-context corpus for a meeting that
+    /// has a VISIBLE related prior note — there is no `augment_notes_with_context` gate anymore.
+    #[test]
+    fn grounding_context_built_without_flag_for_visible_related_note() {
+        let db = crate::storage::Db::open_with_key(&temp_db_path("rag-on"), TEST_DEK).unwrap();
+        // The meeting being summarized and a genuinely related, open (visible) prior note.
+        seed_meeting_note(&db, "m-self", None);
+        seed_meeting_note(&db, "m-prior", None);
+
+        let nothing = HashSet::new();
+        let ctx = build_grounding_context(
+            &db,
+            &nothing,
+            "m-self",
+            Some("Budget Planning"),
+            "Budget planning for the next quarter and hiring runway.",
+            "anthropic",
+        );
+
+        let corpus = ctx.expect("a visible related prior note must ground the new note (no flag)");
+        assert!(corpus.contains("id:m-prior"), "related prior note must be cited: {corpus}");
+        // Self-exclusion: the meeting being summarized is never grounded in itself.
+        assert!(!corpus.contains("id:m-self"), "a note must never be grounded in itself");
+    }
+
+    /// ALWAYS-ON graceful no-op: a fresh vault (no related prior notes) yields `related_context =
+    /// None`, so the rendered prompt stays byte-identical to the no-context path — never a panic,
+    /// never a failure.
+    #[test]
+    fn grounding_context_none_for_fresh_vault() {
+        let db = crate::storage::Db::open_with_key(&temp_db_path("rag-empty"), TEST_DEK).unwrap();
+        // Only the meeting being summarized exists — no prior notes to ground in.
+        seed_meeting_note(&db, "m-self", None);
+
+        let nothing = HashSet::new();
+        let ctx = build_grounding_context(
+            &db,
+            &nothing,
+            "m-self",
+            Some("Budget Planning"),
+            "Budget planning for the next quarter and hiring runway.",
+            "anthropic",
+        );
+        assert!(ctx.is_none(), "no related notes ⇒ related_context = None (graceful no-op)");
+    }
+
+    /// LOCK INVARIANT under always-on: a sealed-and-NOT-session-unlocked related meeting must
+    /// contribute NOTHING to the cloud-bound corpus, and must reappear once its folder is
+    /// session-unlocked. The always-on path keeps the visibility gate (`build_related_context`
+    /// routes through `search_visible` + `get_note_if_visible`).
+    #[test]
+    fn grounding_context_excludes_sealed_until_unlocked() {
+        let db = crate::storage::Db::open_with_key(&temp_db_path("rag-sealed"), TEST_DEK).unwrap();
+        seed_meeting_note(&db, "m-self", None);
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed_meeting_note(&db, "m-sealed", Some("f-lock"));
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let nothing = HashSet::new();
+        let sealed_ctx = build_grounding_context(
+            &db,
+            &nothing,
+            "m-self",
+            Some("Budget Planning"),
+            "Budget planning for the next quarter and hiring runway.",
+            "anthropic",
+        );
+        // Sealed + not unlocked → the related note is absent from the cloud-bound corpus.
+        assert!(
+            sealed_ctx.map(|c| !c.contains("id:m-sealed")).unwrap_or(true),
+            "sealed-not-unlocked related content leaked into the cloud grounding corpus (gate violation)"
+        );
+
+        // Session-unlock the folder → the related note is now legitimately available + cited.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let unlocked_ctx = build_grounding_context(
+            &db,
+            &unlocked,
+            "m-self",
+            Some("Budget Planning"),
+            "Budget planning for the next quarter and hiring runway.",
+            "anthropic",
+        );
+        assert!(
+            unlocked_ctx.map(|c| c.contains("id:m-sealed")).unwrap_or(false),
+            "unlocked related content must reappear in the grounding corpus"
+        );
     }
 
     /// Flag OFF (the prod-safe default): `index_meeting_if_enabled` must write NOTHING — a
