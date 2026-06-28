@@ -103,6 +103,8 @@ pub fn run() {
             commands::rename_speaker,
             commands::model_present,
             commands::download_model,
+            commands::brain_model_present,
+            commands::download_brain_model,
             commands::toggle_bar,
             commands::list_folders,
             commands::create_folder,

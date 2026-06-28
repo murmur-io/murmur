@@ -27,6 +27,21 @@ pub struct WakeDetectedPayload {
     pub intent: crate::audio::wake::VoiceIntent,
 }
 
+/// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
+pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
+
+/// Payload for [`EVENT_BRAIN_DOWNLOAD`]. `total` is `None` when the server omits `Content-Length`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrainDownloadPayload {
+    /// Bytes written so far.
+    pub downloaded: u64,
+    /// Total bytes expected, when known.
+    pub total: Option<u64>,
+    /// True on the final event once the file is fully written + renamed into place.
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusPayload {

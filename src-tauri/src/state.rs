@@ -50,6 +50,12 @@ pub struct AppState {
     pub db: Db,
     /// In-memory cache of the settings table.
     pub config: Mutex<AppConfig>,
+    /// The active on-device reasoning backend (Phase B). Resolved ONCE at startup by
+    /// [`crate::reason::active_reasoner`]: the real `MistralReasoner` when the `local-brain` feature
+    /// is on AND a GGUF is present, else the dependency-free `StubReasoner`. The trait is `Send +
+    /// Sync` and all methods take `&self`, so no `Mutex` is needed. NOT yet called from any pipeline
+    /// path (wired but inert until Phase B step 3 / orchestrate.rs).
+    pub reasoner: Box<dyn crate::reason::LocalReasoner>,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
@@ -109,6 +115,11 @@ impl AppState {
         let db = Db::open_with_key(db_path, dek)?;
         let config = AppConfig::load(&db)?;
 
+        // Phase B: resolve the on-device reasoning backend once. Cheap + panic-free: the real brain
+        // (if the feature is on AND a model is present) loads its GGUF LAZILY on first use, so this
+        // never blocks or aborts startup — a missing/failed model degrades to the StubReasoner.
+        let reasoner = crate::reason::active_reasoner(&config);
+
         // SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of every locked
         // folder. If the app crashed (or was force-quit) WHILE a folder was session-unlocked, the
         // plaintext markdown/transcript/timeline + a decrypted WAV may still be on disk. Re-blank
@@ -126,6 +137,7 @@ impl AppState {
             voice_listener: Mutex::new(None),
             db,
             config: Mutex::new(config),
+            reasoner,
             current_meeting: Mutex::new(None),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
