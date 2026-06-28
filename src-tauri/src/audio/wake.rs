@@ -30,21 +30,28 @@ pub struct WakeHit {
     pub command: String,
 }
 
-/// Short interjections that may precede the wake name ("hej claude"). NOT a wake anchor on their
-/// own ("hej"/"ok" alone are far too common).
-const INTERJECTIONS: [&str; 11] = [
-    "hej", "ej", "ok", "okej", "okay", "hey", "hi", "halo", "sluchaj", "dobra", "no",
-];
-
-/// Detect the assistant wake name at the head of `text` and split off the command tail.
+/// Detect the assistant wake name ANYWHERE in `text` and split off the command tail.
 ///
-/// Returns `Some(WakeHit)` only when a [`matches_wake`] vocative ("Claudku"/"Klauku") match sits at
-/// an utterance boundary:
-/// - at token index 0 (absolute start of an utterance), or
-/// - at token index 1 IF token 0 is an [`INTERJECTIONS`] member ("hej"/"ok"/"okej" …).
+/// Returns `Some(WakeHit)` at the FIRST token position whose [`matches_wake`] vocative
+/// ("Claudku"/"Klauku") fires — regardless of where it sits in the tail:
+/// - at token index 0 (absolute start of an utterance),
+/// - after an interjection ("hej"/"ok"/"okej" …), OR
+/// - MID-tail (anywhere else in a multi-second rolling window).
+///
+/// ## Why fire anywhere (the #23 recall fix)
+/// The live caption loop feeds a rolling ~14s window. The old anchor only fired at index 0 / right
+/// after an interjection, so on a SECOND "Klaudku" spoken later in the same recording the vocative
+/// landed MID-tail and was MISSED (the demonstrated bug: two asks, one wake hit). The distinctive
+/// "Klaudku/Klauku" SHAPE-GATE in [`matches_wake`] (starts `kl`, vowel/`d`-only nucleus, ends `-ku`/
+/// `-ko`, length ≥ 5) is precise enough to carry firing on its own — the boundary anchor is no
+/// longer load-bearing for precision, so we drop it for recall. Ordinary words ("kroku"/"klocku"/
+/// "kłódka"/…) still fail the shape-gate at EVERY position, so widening the search window does not
+/// re-open any demonstrated false fire. The command tail = everything after the matched vocative.
+/// Overlapping-tail RE-FIRES of the same spoken wake are de-duplicated by the STATEFUL caller
+/// ([`crate::transcribe::live`]), not here — `detect_wake` stays pure.
 ///
 /// Pure + deterministic. RECALL-FIRST (the user's requirement: the wake MUST always catch),
-/// precision held by the shape-gate in [`matches_wake`] + the boundary anchor here.
+/// precision held entirely by the shape-gate in [`matches_wake`].
 ///
 /// ## Recall + the d-LESS vocative (the real fix)
 /// The firing anchor is the distinctive Polish vocative the user actually utters — including the
@@ -60,27 +67,24 @@ const INTERJECTIONS: [&str; 11] = [
 /// (→"klodka"/"klodke") stays silent via the vocative-ending guard (ends `a`/`e`, not `ku`/`ko`).
 ///
 /// ## Residual false-fire risk (real-mic only, NOT covered by unit tests)
-/// On real audio the live tail is a multi-second window, not a clean single utterance; the
-/// integration must feed the trailing sentence so the boundary anchor holds. This fix eliminates
-/// the demonstrated TEXT-level false fires only — real-mic acoustic precision still needs tuning
-/// of `WAKE_THRESHOLD` / the lexicon on a real Mac.
+/// On real audio the live tail is a multi-second window, not a clean single utterance. Firing
+/// anywhere widens recall (the user's "to ma zawsze łapać"); the shape-gate keeps ordinary speech
+/// silent, but real-mic acoustic precision still needs tuning of `WAKE_THRESHOLD` / the lexicon on a
+/// real Mac. This fix eliminates the demonstrated TEXT-level MISS (a 2nd, mid-tail "Klaudku").
 pub fn detect_wake(text: &str) -> Option<WakeHit> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return None;
     }
 
-    // Index 0: the distinctive vocative at the absolute start of an utterance.
-    let n0 = normalize_name(words[0]);
-    if matches_wake(&n0) {
-        return Some(make_hit(&words, 0));
-    }
-
-    // Index 1: the same vocative, after an interjection that clearly addresses the assistant.
-    if words.len() >= 2 && is_interjection(words[0]) {
-        let n1 = normalize_name(words[1]);
-        if matches_wake(&n1) {
-            return Some(make_hit(&words, 1));
+    // RECALL-FIRST: fire at the FIRST token (any position) whose normalized form matches the
+    // distinctive vocative shape. The shape-gate in `matches_wake` is the only precision guard —
+    // the old index-0 / after-interjection anchor is dropped so a vocative MID-tail (the rolling
+    // ~14s window's 2nd ask) still catches. The interjection list now only matters as ordinary
+    // words that never match the shape-gate.
+    for (idx, word) in words.iter().enumerate() {
+        if matches_wake(&normalize_name(word)) {
+            return Some(make_hit(&words, idx));
         }
     }
 
@@ -148,13 +152,6 @@ fn matches_wake(cand: &str) -> bool {
         }
     }
     d_count <= 1
-}
-
-/// Whether `word` (raw) is a leading interjection that may precede the wake name.
-fn is_interjection(word: &str) -> bool {
-    let w = strip_diacritics(&word.to_lowercase());
-    let w = w.trim_matches(|c: char| !c.is_alphanumeric());
-    INTERJECTIONS.contains(&w)
 }
 
 /// PHONETIC normalizer for a single candidate NAME token. Lowercases, keeps only letters, collapses
@@ -497,6 +494,47 @@ mod tests {
         for (input, want_cmd) in cases {
             let hit = detect_wake(input).unwrap_or_else(|| panic!("expected wake fire on {input:?}"));
             assert_eq!(hit.command, *want_cmd, "wrong command tail for {input:?}");
+        }
+    }
+
+    // ── #23 RECALL: detect_wake fires on a vocative NOT at index 0 (mid-tail) ─
+
+    #[test]
+    fn recall_fires_on_vocative_mid_tail_not_only_at_index_0() {
+        // The #23 bug: the live caption loop feeds a rolling ~14s window, so a SECOND "Klaudku"
+        // spoken later in the same recording lands MID-tail (not at index 0, not after an
+        // interjection) and was MISSED by the old boundary anchor. It MUST now fire, with the
+        // command tail = everything after the vocative. (RED on the old index-0/interjection anchor.)
+        let cases: &[(&str, &str)] = &[
+            ("ok więc tak, klaudku zrób research", "zrób research"),
+            ("no dobra to teraz klołku co wiemy o atlasie", "co wiemy o atlasie"),
+            ("a jeszcze jedno klałdku przypomnij mi o spotkaniu", "przypomnij mi o spotkaniu"),
+            // the demonstrated 2nd-ask shape: prior sentence + a fresh vocative deep in the tail.
+            (
+                "zrobiłem już research o cenach klauku zrób research o konkurencji",
+                "zrób research o konkurencji",
+            ),
+        ];
+        for (input, want_cmd) in cases {
+            let hit =
+                detect_wake(input).unwrap_or_else(|| panic!("expected mid-tail wake fire on {input:?}"));
+            assert_eq!(hit.command, *want_cmd, "wrong command tail for mid-tail wake {input:?}");
+        }
+    }
+
+    #[test]
+    fn precision_near_collisions_stay_silent_even_mid_tail() {
+        // Firing ANYWHERE must NOT re-open the near-collision false fires when they sit mid-sentence
+        // (the shape-gate, not the position anchor, is what holds precision). All None.
+        for n in [
+            "przejdźmy do kroku drugiego",              // "kroku" mid-sentence (step)
+            "wróćmy do klocka na stole",                // "klocka" mid-sentence (block)
+            "ok zamknij teraz tę kłódkę proszę",        // "kłódkę" mid-sentence (padlock)
+            "myślę że klaudia z hr to ogarnie",         // "klaudia" mid-sentence (name)
+            "everything is moving to the cloud this year", // "cloud" mid-sentence
+            "i think we should close this deal today",  // "close" mid-sentence
+        ] {
+            assert!(detect_wake(n).is_none(), "FALSE FIRE on mid-tail near-collision: {n:?}");
         }
     }
 
