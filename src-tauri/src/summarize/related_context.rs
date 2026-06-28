@@ -34,7 +34,7 @@ const MAX_QUERY_TERMS: usize = 8;
 /// Char budget for the grounding corpus, by provider. Smaller than the Ask-My-Vault budget on
 /// purpose — this rides ON TOP of the full transcript in the same prompt, so it must stay lean.
 /// Local quantized models (Ollama) have tiny context windows → cap much tighter.
-fn budget_for(provider_id: &str) -> usize {
+pub(crate) fn budget_for(provider_id: &str) -> usize {
     if provider_id == "ollama" {
         3_000
     } else {
