@@ -219,6 +219,9 @@ fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
                 .and_then(|m| m.map(|id| id.to_string()))
                 .unwrap_or_default();
 
+            // The wake parser does NOT translate — the intent's own topic/entity IS the user's
+            // literal words, so retrieval already keys off them. Pass them as the literal command.
+            let literal = literal_command_of(&intent);
             let result = crate::voice_action::handle_voice_action(
                 &intent,
                 &*state.reasoner,
@@ -226,6 +229,7 @@ fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
                 &unlocked,
                 &config,
                 &meeting_id,
+                &literal,
             );
             // PII rule: log only the coarse intent kind + status, never the summary/citations.
             tracing::info!(
@@ -266,6 +270,8 @@ fn spawn_command_dispatch(app: AppHandle, command: String) {
 
             // Keyword fast-path → BRAIN interpret (consent-gated, same reasoner) → keyword fallback.
             let intent = resolve_command_intent(&*state.reasoner, &command);
+            // RETRIEVAL keys off the user's LITERAL dictated `command` (their own language/words),
+            // NOT the brain-interpreted topic — so a Polish note matches a Polish question.
             let result = crate::voice_action::handle_voice_action(
                 &intent,
                 &*state.reasoner,
@@ -273,6 +279,7 @@ fn spawn_command_dispatch(app: AppHandle, command: String) {
                 &unlocked,
                 &config,
                 &meeting_id,
+                &command,
             )
             // Surface the user's OWN dictated command onto the result for the FE card.
             .with_command(&command);
@@ -323,10 +330,18 @@ fn step_manual_capture(
     // Read the armed capture (and release the lock before any transcription work).
     let current = { (*state.voice_command_capture.lock().ok()?)? };
 
+    // FORCE the command-clip language. A ~3s clip is far too short for Whisper to reliably
+    // auto-detect — it routinely mis-detects a short Polish command as Russian/Slovak, which then
+    // mangles the transcript. Resolve the forced language from `config.language` (the user's
+    // setting), which is the SAME language the meeting transcription uses this session. When it is
+    // unset/auto we keep `None` (whisper auto-detects) — the user can fix that in Settings ▸ Language.
+    let clip_lang = resolve_clip_lang(lang, &state);
+    let clip_lang_ref = clip_lang.as_deref();
+
     // Transcribe ONLY the post-click window when an offset was latched; otherwise fall back to the
     // rolling-tail caption the live loop already produced (degenerate arm path with no recorder).
     let command = match current.start_sample {
-        Some(offset) => transcribe_since(app, transcriber, lang, offset).unwrap_or_default(),
+        Some(offset) => transcribe_since(app, transcriber, clip_lang_ref, offset).unwrap_or_default(),
         None => caption.trim().to_string(),
     };
 
@@ -380,6 +395,91 @@ fn transcribe_since(
     }
 }
 
+/// Resolve the forced language for a manual-capture command clip from the live-loop `lang` (which is
+/// `config.language` at spawn time) and the CURRENT config (re-read from `state` in case the user
+/// changed it mid-recording). Side-effecting only in that it reads the config lock; the decision is
+/// the pure [`resolve_clip_lang_core`].
+fn resolve_clip_lang(loop_lang: Option<&str>, state: &AppState) -> Option<String> {
+    let cfg_lang = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|c| c.language.clone());
+    resolve_clip_lang_core(loop_lang, cfg_lang.as_deref())
+}
+
+/// PURE, headless-testable core: pick the forced clip language. Prefer the freshest configured
+/// language (the user may have set/changed it after the recording started), else the loop's spawn-
+/// time language. A blank/whitespace value (`Some("")`) counts as UNSET → `None` (auto-detect). The
+/// returned `Some(lang)` is what gets passed to Whisper for the short clip so it does NOT free-
+/// auto-detect a 3s utterance into the wrong Slavic language.
+fn resolve_clip_lang_core(loop_lang: Option<&str>, config_lang: Option<&str>) -> Option<String> {
+    let norm = |s: Option<&str>| -> Option<String> {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+            .map(str::to_string)
+    };
+    norm(config_lang).or_else(|| norm(loop_lang))
+}
+
+/// Standalone filler/backchannel utterances Whisper emits for a near-silent / noise-only clip, in
+/// EN + PL. Normalized (lowercased, diacritics stripped, inner non-alphanumerics removed) before the
+/// lookup, so "Uh," / "Eee…" / "Yyy" all collapse onto a member. A command consisting ONLY of these
+/// (after splitting on whitespace) is NOT a real command.
+const FILLERS: &[&str] = &[
+    // English
+    "uh", "uhh", "uhm", "um", "umm", "er", "err", "erm", "hmm", "hm", "hmmm", "ah", "aha", "ahh",
+    "oh", "ohh", "eh", "ehh", "mm", "mmm", "mhm", "huh", "yeah", "ok", "okay",
+    // Polish fillers / backchannels
+    "eee", "ee", "yyy", "yy", "yhy", "ehe",
+];
+
+/// Whether a normalized token is a pure filler/backchannel (after stripping inner punctuation).
+fn is_filler_token(tok: &str) -> bool {
+    let t: String = tok
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'ą' => 'a',
+            'ć' => 'c',
+            'ę' => 'e',
+            'ł' => 'l',
+            'ń' => 'n',
+            'ó' => 'o',
+            'ś' => 's',
+            'ź' | 'ż' => 'z',
+            other => other,
+        })
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    t.is_empty() || FILLERS.contains(&t.as_str())
+}
+
+/// Whether the heard `command` is a MEANINGFUL command worth dispatching, vs garbage/filler. PURE +
+/// headless-testable. A command is garbage when, after trimming, EITHER:
+/// - it has fewer than 2 tokens that are not pure filler, OR
+/// - its non-filler alphanumeric content is shorter than ~8 chars (a single short word like "Uh").
+///
+/// So "Uh," / "eee" / "." / "a" / "ok" → NOT meaningful (keep listening); but real commands like
+/// "zrób research o pogodzie" / "co wiemy o atlasie" → meaningful (dispatch). Conservative on the
+/// short side so we never DROP a real one-word command that carries enough signal (≥8 non-filler
+/// chars, e.g. "pogoda?" is 6 → borderline; we require it ride with a verb in practice — the manual
+/// path's whole utterance is the command, which is virtually always ≥2 words).
+fn is_meaningful_command(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let non_filler: Vec<&str> = tokens.iter().copied().filter(|t| !is_filler_token(t)).collect();
+    // Count of meaningful (non-filler) tokens.
+    let meaningful_tokens = non_filler.len();
+    // Total non-filler alphanumeric chars (diacritic-insensitive count via char count of the kept
+    // alphanumerics — we don't need the normalized form, just the length signal).
+    let non_filler_chars: usize = non_filler
+        .iter()
+        .flat_map(|t| t.chars())
+        .filter(|c| c.is_alphanumeric())
+        .count();
+    meaningful_tokens >= 2 || non_filler_chars >= 8
+}
+
 /// PURE, headless-testable core of the manual-capture step. Given the armed [`CaptureState`] and the
 /// `command` heard SINCE the click (the post-click window's transcript), decide the outcome and the
 /// NEXT capture state (`None` = cleared on a terminal outcome, `Some(decremented)` while listening).
@@ -399,14 +499,18 @@ fn decide_manual_capture(
     command: &str,
 ) -> (ManualCaptureDecision, Option<crate::state::CaptureState>) {
     let command = command.trim();
-    if !command.is_empty() {
+    // GARBAGE FILTER: a too-short / pure-filler clip ("Uh,", "eee", "hmm", a lone char or
+    // punctuation) is NOT a real command — Whisper emits these for a ~3s silent/noise clip. Treat
+    // it exactly like a silent tick (KEEP LISTENING / NOTHING_HEARD at budget end) rather than
+    // dispatching a Research on "Uh,". The user gets a clean "nothing_heard", never a garbage card.
+    if !command.is_empty() && is_meaningful_command(command) {
         // Real speech heard since the click → dispatch it, clear the capture.
         return (
             ManualCaptureDecision::Dispatch { command: command.to_string() },
             None,
         );
     }
-    // Silence this tick: spend one tick of budget.
+    // Silence OR garbage/filler this tick: spend one tick of budget.
     let remaining = capture.budget.saturating_sub(1);
     if remaining == 0 {
         // Budget exhausted with nothing ever heard → graceful give-up, clear the capture.
@@ -441,6 +545,22 @@ fn resolve_command_intent(
     }
     // Brain unavailable / no mapping → Research over the literal command is a fine default.
     crate::audio::wake::VoiceIntent::Research { topic: command.trim().to_string() }
+}
+
+/// The user's LITERAL words carried by an intent, for use as the retrieval-side literal command on
+/// the WAKE path (where the deterministic parser already kept the user's own language — it never
+/// translates). For non-RAG intents this is the payload text; the Research/Recall topics ARE the
+/// literal command tail. Empty `String` for `Unknown` (nothing actionable).
+fn literal_command_of(intent: &crate::audio::wake::VoiceIntent) -> String {
+    use crate::audio::wake::VoiceIntent as VI;
+    match intent {
+        VI::Research { topic } => topic.clone(),
+        VI::Recall { entity } => entity.clone(),
+        VI::SlackSearch { query } => query.clone(),
+        VI::CreateReminder { text, .. } => text.clone(),
+        VI::NoteAside { text } => text.clone(),
+        VI::Unknown { .. } => String::new(),
+    }
 }
 
 /// Pure, headless-testable core of the wake wiring: detect a wake utterance at the head of a
@@ -624,5 +744,82 @@ mod tests {
             VoiceIntent::Research { topic: "find me the latest on widgets".into() },
             "a non-empty command with no brain must default to Research over the literal text"
         );
+    }
+
+    // ── FIX 3: GARBAGE / FILLER filter — "Uh," / "eee" / single char must NOT dispatch ───────────
+
+    #[test]
+    fn is_meaningful_command_rejects_filler_and_too_short() {
+        // Pure fillers / single short tokens / punctuation → NOT meaningful.
+        for junk in ["Uh,", "uh", "eee", "Hmm", "yyy", "aha", "ok", ".", ",", "a", "—", "  uh  ", "eh"] {
+            assert!(
+                !is_meaningful_command(junk),
+                "garbage/filler {junk:?} must NOT be a meaningful command"
+            );
+        }
+        // Real commands → meaningful.
+        for good in [
+            "zrób research o pogodzie",
+            "co wiemy o atlasie",
+            "jaka była pogoda",
+            "do research on pricing",
+            "przypomnij mi o spotkaniu",
+        ] {
+            assert!(is_meaningful_command(good), "real command {good:?} must be meaningful");
+        }
+    }
+
+    #[test]
+    fn decide_manual_capture_drops_garbage_keeps_listening_then_nothing_heard() {
+        // "Uh," is garbage → treat like a silent tick: KEEP LISTENING (budget −1), NOT a dispatch.
+        let (d1, n1) = decide_manual_capture(armed(2), "Uh,");
+        assert_eq!(d1, ManualCaptureDecision::KeepListening, "garbage must not dispatch");
+        assert_eq!(n1, Some(CaptureState { budget: 1, start_sample: Some(0) }));
+        // A second garbage tick exhausts the budget → NothingHeard (graceful), never a dispatch.
+        let (d2, n2) = decide_manual_capture(n1.unwrap(), "eee");
+        assert_eq!(
+            d2,
+            ManualCaptureDecision::NothingHeard,
+            "a fully-garbage capture ends as NothingHeard, never a garbage dispatch"
+        );
+        assert!(n2.is_none(), "capture cleared once it gives up");
+    }
+
+    #[test]
+    fn decide_manual_capture_dispatches_a_real_command() {
+        // A genuine command dispatches with the heard (trimmed) command verbatim.
+        let (d, n) = decide_manual_capture(armed(5), "  zrób research o pogodzie  ");
+        assert_eq!(
+            d,
+            ManualCaptureDecision::Dispatch { command: "zrób research o pogodzie".into() },
+            "a real command must dispatch"
+        );
+        assert!(n.is_none(), "capture cleared on dispatch");
+    }
+
+    // ── FIX 2: forced clip language threading (config.language reaches the clip) ──────────────────
+
+    #[test]
+    fn resolve_clip_lang_core_forces_configured_language() {
+        // A configured language is forced for the short command clip (the param that reaches
+        // `transcribe_since` → Whisper), so a 3s Polish clip is NOT free-auto-detected as Russian.
+        assert_eq!(
+            resolve_clip_lang_core(None, Some("pl")).as_deref(),
+            Some("pl"),
+            "config.language must force the clip language even when the loop lang was None"
+        );
+        // The freshest config language wins over the spawn-time loop language.
+        assert_eq!(
+            resolve_clip_lang_core(Some("en"), Some("pl")).as_deref(),
+            Some("pl"),
+            "the freshest configured language must win"
+        );
+        // Loop lang is used when config is unset.
+        assert_eq!(resolve_clip_lang_core(Some("de"), None).as_deref(), Some("de"));
+        // Blank / "auto" / both-unset → None (whisper auto-detects; user can set it in Settings).
+        assert_eq!(resolve_clip_lang_core(None, Some("")), None);
+        assert_eq!(resolve_clip_lang_core(None, Some("auto")), None);
+        assert_eq!(resolve_clip_lang_core(Some("  "), Some("  ")), None);
+        assert_eq!(resolve_clip_lang_core(None, None), None);
     }
 }

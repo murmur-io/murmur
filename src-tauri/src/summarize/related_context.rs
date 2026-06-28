@@ -60,6 +60,12 @@ fn is_stopword(t: &str) -> bool {
         "jako", "który", "ktory", "która", "ktora", "które", "ktore", "tutaj", "teraz", "wtedy",
         "bardzo", "trochę", "troche", "może", "moze", "żeby", "zeby", "przez", "przy", "pod", "nad",
         "tu", "to", "co", "na", "we", "do", "od", "po", "za", "ze", "oraz", "więc", "wiec",
+        // Polish question words + the "być" copula's inflected forms — high-frequency function words
+        // that over-constrain an exact-term FTS query for a spoken question ("jaka była pogoda" must
+        // key off "pogoda", not the auxiliary "jaka"/"była"). Diacritic-stripped forms too.
+        "jaka", "jaki", "jakie", "jacy", "jakas", "jakaś", "kto", "kogo", "kim", "gdzie", "kiedy",
+        "ile", "dlaczego", "czyj", "czyja", "był", "byl", "była", "byla", "było", "bylo", "były",
+        "byly", "byłem", "bylem", "byłam", "bylam", "jestem", "jesteś", "jestes", "będzie", "bedzie",
     ];
     STOP.contains(&t)
 }
