@@ -105,6 +105,20 @@ pub struct NerDownloadPayload {
     pub done: bool,
 }
 
+/// Progress for the semantic-search backfill (`reindex_embeddings`) over all visible meetings.
+/// Carries COUNTS ONLY — no meeting ids, titles, or content (NO PII).
+pub const EVENT_REINDEX: &str = "murmur://reindex-embeddings";
+
+/// Payload for [`EVENT_REINDEX`]. Counts only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReindexPayload {
+    /// Visible meetings indexed so far.
+    pub done: usize,
+    /// Total visible meetings to index this run.
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusPayload {

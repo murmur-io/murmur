@@ -87,6 +87,14 @@ export interface AppConfigDto {
    * `brainBackend === "local"`. Null = none selected yet.
    */
   brainModelId: string | null;
+  /**
+   * brain2 RAG — the semantic-search master flag. When on, Ask-My-Vault retrieves
+   * candidates by HYBRID (FTS ∪ vector-KNN) retrieval over the on-device embedding
+   * model; off falls back to lexical-only. Flipping it on does NOT auto-index — the
+   * user runs `reindexEmbeddings()` to backfill. Round-tripped on every `save_config`
+   * like the other flags. Default false. Mirrors Rust `AppConfigDto.semantic_search_enabled`.
+   */
+  semanticSearchEnabled: boolean;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
@@ -128,6 +136,43 @@ export interface BrainDownloadProgress {
   downloaded: number;
   total: number | null;
   done: boolean;
+}
+
+/**
+ * brain2 RAG — progress for the on-device embedding-model (multilingual-e5-small)
+ * download (`EVENT_EMBED_DOWNLOAD`). Mirrors the backend `EmbedDownloadPayload`:
+ * the e5 model is 3 small files, so progress is reported per-file (`fileIndex` /
+ * `fileCount`). `total` is null when the server omits Content-Length; `done` fires
+ * once all files are written + renamed into place.
+ */
+export interface EmbedDownloadProgress {
+  fileIndex: number;
+  fileCount: number;
+  downloaded: number;
+  total: number | null;
+  done: boolean;
+}
+
+/**
+ * brain2 RAG — progress for the semantic-search backfill (`EVENT_REINDEX`). Counts
+ * only, NO PII. Mirrors the backend `ReindexPayload`: visible meetings indexed so
+ * far (`done`) out of the run total (`total`).
+ */
+export interface ReindexProgress {
+  done: number;
+  total: number;
+}
+
+/**
+ * brain2 RAG — result of `reindexEmbeddings()`. Mirrors the backend `ReindexResult`
+ * (camelCase). `status` is `"model_missing"` when the real e5 model is absent (no
+ * indexing was attempted — the FE nudges the user to download it first), else
+ * `"indexed"`; `indexed` is the count of VISIBLE meetings whose chunks were rebuilt.
+ */
+export interface ReindexResult {
+  status: string;
+  indexed: number;
+  total: number;
 }
 
 /**
