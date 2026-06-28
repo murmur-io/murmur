@@ -86,6 +86,18 @@ impl Transcriber {
             AppError::Transcribe("whisper model path is not valid UTF-8".into())
         })?;
 
+        // Disable ggml-metal residency sets BEFORE the Metal device is created (read live in
+        // `ggml_metal_device_init`). On macOS 15+/Apple-silicon the residency-set teardown asserts
+        // `[rsets->data count] == 0` at device free (`ggml_metal_rsets_free`, GGML_ASSERT — NOT
+        // NDEBUG-gated, so it aborts in release too) and `ggml_abort`s the process at whisper's
+        // per-transcription Metal free. Setting `GGML_METAL_NO_RESIDENCY` makes ggml skip the
+        // residency-set collection entirely (`dev->rsets = nil`), bypassing the assert with no
+        // effect on transcription output (residency sets are a pure GPU-memory residency hint).
+        // Idempotent mirror of the process-entry guard in `lib::run` — also covers test/bench and
+        // any non-`run()` caller that loads a model. Set before `new_with_params` creates the
+        // WhisperContext (and thus the Metal device).
+        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+
         let ctx = WhisperContext::new_with_params(path_str, WhisperContextParameters::default())
             .map_err(|e| AppError::Transcribe(format!("failed to load whisper model: {e}")))?;
 
