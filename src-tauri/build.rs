@@ -26,6 +26,17 @@ fn main() {
         "13.4",
         &["AVFoundation", "Foundation"],
     );
+    // EventKit Calendar context helper (app floor 13.4; uses the macOS 14+ full-access API at
+    // runtime, guarded). Surfaces local meeting context — title, attendees, agenda — zero-OAuth,
+    // on-device. Crash-safe SEPARATE process: a missing permission / no events → a graceful JSON
+    // envelope, never an app crash.
+    build_swift_helper(
+        "calendar/calendar.swift",
+        "meetnotes-calendar",
+        "CALENDAR_BIN",
+        "13.4",
+        &["EventKit", "Foundation"],
+    );
     tauri_build::build();
 }
 

@@ -23,5 +23,12 @@
          NSMicrophoneUsageDescription TCC prompt). Harmless if redundant. -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
+
+    <!-- Local Calendar read via the bundled meetnotes-calendar EventKit helper
+         (works with the NSCalendarsUsageDescription TCC prompt). On-device only;
+         no network egress — the calendar context never leaves the Mac unless it
+         rides the existing redacted-transcript firewall + consent. -->
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
   </dict>
 </plist>

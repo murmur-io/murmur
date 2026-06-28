@@ -44,7 +44,8 @@
     "resources": {
       "binaries/meetnotes-sysaudio": "meetnotes-sysaudio",
       "binaries/meetnotes-audiocap": "meetnotes-audiocap",
-      "binaries/meetnotes-aeccap": "meetnotes-aeccap"
+      "binaries/meetnotes-aeccap": "meetnotes-aeccap",
+      "binaries/meetnotes-calendar": "meetnotes-calendar"
     },
     "icon": [
       "icons/32x32.png",
