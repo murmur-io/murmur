@@ -28,6 +28,8 @@ import {
   type FolderExposure,
 } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
+import { MarkdownComponent } from "../../shared/markdown.component";
+import { AssistantSourcesComponent } from "../../shared/assistant-sources.component";
 import { LockBadgeComponent } from "../folders/lock-badge.component";
 import { MoveToMenuComponent } from "../folders/move-to-menu.component";
 import { MeetingActionsComponent } from "./meeting-actions.component";
@@ -102,6 +104,8 @@ interface ParsedNote {
     MeetingRecipesComponent,
     LockBadgeComponent,
     MoveToMenuComponent,
+    MarkdownComponent,
+    AssistantSourcesComponent,
   ],
   template: `
     <section class="detail">
@@ -814,45 +818,15 @@ interface ParsedNote {
                     </div>
 
                     @if (q.answer) {
-                      <p class="qa-answer">{{ q.answer }}</p>
+                      <app-markdown
+                        class="qa-answer"
+                        [markdown]="q.answer"
+                        compact
+                      />
                     }
 
                     @if (q.citations.length) {
-                      <div class="qa-cites" aria-label="Źródła">
-                        @for (c of q.citations; track $index) {
-                          @if (c.kind === "web") {
-                            @if (c.url) {
-                              <a
-                                class="cite-chip is-web"
-                                [href]="c.url"
-                                target="_blank"
-                                rel="noreferrer noopener"
-                                [title]="c.url"
-                              >
-                                <span class="cite-web-mark" aria-hidden="true"
-                                  >⊕</span
-                                >
-                                <span class="cite-web-label">{{
-                                  c.label
-                                }}</span>
-                                <span class="cite-web-via">via web</span>
-                              </a>
-                            } @else {
-                              <span class="cite-chip is-web">
-                                <span class="cite-web-mark" aria-hidden="true"
-                                  >⊕</span
-                                >
-                                <span class="cite-web-label">{{
-                                  c.label
-                                }}</span>
-                                <span class="cite-web-via">via web</span>
-                              </span>
-                            }
-                          } @else {
-                            <span class="cite-chip">[[{{ c.label }}]]</span>
-                          }
-                        }
-                      </div>
+                      <app-assistant-sources [citations]="q.citations" />
                     }
 
                     @if (q.sourceLabel) {
@@ -1517,8 +1491,7 @@ interface ParsedNote {
         padding: var(--space-3) var(--space-4);
         animation: rise 360ms var(--transition) both;
       }
-      .qa-heard,
-      .qa-cites {
+      .qa-heard {
         display: flex;
         align-items: center;
         flex-wrap: wrap;
@@ -1535,61 +1508,15 @@ interface ParsedNote {
       .qa-heard .pill {
         margin-left: auto;
       }
+      /* The answer is now rendered by app-markdown; just give the block room. */
       .qa-answer {
-        margin: 0;
-        color: var(--text-primary);
+        display: block;
         font-size: 0.9rem;
-        line-height: 1.55;
-        white-space: pre-wrap;
       }
       .qa-source {
         font-size: 0.72rem;
         text-transform: uppercase;
         letter-spacing: 0.03em;
-      }
-      .cite-chip {
-        padding: 2px var(--space-2);
-        border-radius: var(--radius-sm);
-        background: var(--accent-soft);
-        color: var(--accent-hover);
-        font-family: var(--font-mono);
-        font-size: 0.78rem;
-      }
-      /* A web source — visibly distinct from the [[vault]] chips, with a loud
-         "via web" tag for the off-device origin (mirrors assistant-actions). */
-      .cite-chip.is-web {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-1);
-        max-width: 100%;
-        background: var(--surface-input);
-        border: 1px solid var(--border-subtle);
-        color: var(--text-secondary);
-        font-family: inherit;
-        text-decoration: none;
-      }
-      a.cite-chip.is-web:hover {
-        border-color: var(--accent-soft);
-        color: var(--text-primary);
-      }
-      .cite-web-mark {
-        color: var(--accent);
-        line-height: 1;
-      }
-      .cite-web-label {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        max-width: 220px;
-      }
-      .cite-web-via {
-        padding: 0 var(--space-1);
-        border-radius: var(--radius-sm);
-        background: var(--accent-soft);
-        color: var(--accent-hover);
-        font-size: 0.7rem;
-        font-weight: 600;
-        text-transform: uppercase;
       }
       @media (prefers-reduced-motion: reduce) {
         .qa-row {
