@@ -909,7 +909,7 @@ fn parse_iso_ymd(s: &str) -> Option<(i32, u32, u32)> {
 /// `escape_applescript`-escaped so its text can never break out of the string literal. The date is
 /// built by setting `day` to 1 FIRST (so a year/month change can't overflow the current day-of-month),
 /// then year, then month, then the real day.
-fn build_reminder_script(name: &str, due_date: Option<&str>) -> String {
+pub(crate) fn build_reminder_script(name: &str, due_date: Option<&str>) -> String {
     let esc = escape_applescript(name);
     match due_date.and_then(parse_iso_ymd) {
         Some((y, m, d)) => format!(
@@ -949,6 +949,32 @@ pub async fn add_reminder(text: String, due_date: Option<String>) -> Result<(), 
     .await
     .map_err(|e| AppError::Unavailable(format!("reminder task failed: {e}")))?
     .map_err(|e| AppError::Unavailable(format!("osascript failed: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::Unavailable(format!(
+            "Could not add to Reminders — grant access in System Settings ▸ Privacy & Security ▸ Reminders. ({})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+/// SYNCHRONOUS reminder creation for the off-thread voice-action dispatch (Flow B). Mirrors the
+/// `add_reminder` command's osascript path, but blocking (it already runs on a detached task, so it
+/// must not require an async runtime). Returns `Ok(())` on success, a typed `AppError` otherwise —
+/// NEVER panics. NO PII logged by the caller; the reminder text is the user's own dictated note.
+pub(crate) fn add_reminder_blocking(text: &str, due_date: Option<&str>) -> Result<(), AppError> {
+    let name = text.trim();
+    if name.is_empty() {
+        return Err(AppError::InvalidArg("empty reminder".into()));
+    }
+    let due = due_date.filter(|d| !d.is_empty());
+    let script = build_reminder_script(name, due);
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| AppError::Unavailable(format!("osascript failed: {e}")))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -1644,6 +1670,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // the settings DTO yet — preserve the live value (default Cloud) so a settings save can
         // neither change nor clobber the backend selection.
         brain_backend: current.brain_backend,
+        // Phase E (Flow B): the in-meeting voice-action dispatch gate is not carried on the settings
+        // DTO yet — preserve the live value (default OFF) so a normal settings save can neither
+        // enable nor clobber the opt-in.
+        realtime_reactions: current.realtime_reactions,
     }
 }
 
