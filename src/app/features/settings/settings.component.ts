@@ -526,6 +526,125 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         </div>
       </div>
 
+      <!-- Connectors — web search (NEW CLOUD EGRESS, surfaced loudly) -->
+      <div class="card connectors-card">
+        <div class="brain-copy">
+          <h3>Connectors</h3>
+          <p class="text-secondary brain-sub">
+            Let the brain reach beyond your notes. Connectors are
+            <strong>off by default</strong> — each one that leaves this Mac asks
+            for an explicit, one-time consent first.
+          </p>
+        </div>
+
+        <!-- Web search (Brave) connector -->
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">Web search</span>
+            <span class="text-secondary toggle-sub">
+              When enabled (and allowed below, with a key), the assistant can
+              look facts up on the web and cite them. Answers stay grounded in
+              your notes first; web results are added as “via web” sources.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="webSearchEnabled" />
+        </label>
+
+        @if (form.controls.webSearchEnabled.value) {
+          <!-- Egress banner — make the new off-device path impossible to miss. -->
+          <p class="banner is-warning connector-egress" role="note">
+            <strong>This sends data off your Mac.</strong> When the brain runs a
+            web search, your (redacted) query leaves the device and goes to the
+            search provider (Brave). Only the query is sent — never your notes or
+            transcript. Disable this, or skip the consent below, to keep
+            everything local.
+          </p>
+
+          <!-- BYO API key (Brave) -->
+          <fieldset class="connector-fieldset">
+            <legend>Brave Search API key</legend>
+            <div class="key-status">
+              <span class="text-secondary">Status</span>
+              @if (hasWebKey()) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Key set ✓
+                </span>
+              } @else {
+                <span class="pill">
+                  <span class="pill-dot"></span>
+                  Not set
+                </span>
+              }
+            </div>
+            <span class="row">
+              <input
+                type="password"
+                [formControl]="webKeyControl"
+                placeholder="Brave Search API key"
+                autocomplete="off"
+              />
+              <button
+                type="button"
+                class="btn"
+                (click)="saveWebKey()"
+                [disabled]="savingWebKey()"
+              >
+                {{ savingWebKey() ? "Saving…" : "Save key" }}
+              </button>
+            </span>
+            <span class="field-help text-muted">
+              Bring your own key — it's stored in your macOS Keychain, never
+              logged, and never leaves with your notes.
+            </span>
+            @if (webKeyError(); as wkerr) {
+              <p class="text-danger brain-error">{{ wkerr }}</p>
+            }
+          </fieldset>
+
+          <!-- One-time egress consent (mirrors the Cloud-processing UX) -->
+          <div class="privacy-section connector-consent">
+            <span class="privacy-section-label text-muted"
+              >Allow web search</span
+            >
+            <p class="text-secondary privacy-note">
+              Your search query leaves this device for the search provider
+              (redacted first). Until you allow this once, web search stays off
+              and no query is ever sent.
+            </p>
+            @if (webConsented()) {
+              <span class="pill is-success cloud-consent-pill">
+                <span class="pill-dot"></span>
+                Web search allowed
+              </span>
+            } @else {
+              <div class="cloud-consent-row">
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  (click)="allowWebSearch()"
+                  [disabled]="webConsenting()"
+                >
+                  @if (webConsenting()) {
+                    <span class="spin-ring" aria-hidden="true"></span>
+                    Enabling…
+                  } @else {
+                    Allow web search
+                  }
+                </button>
+                <span class="text-muted cloud-consent-hint">
+                  One-time. The brain works fully offline on your notes without
+                  it.
+                </span>
+              </div>
+            }
+            @if (webConsentError(); as wcerr) {
+              <p class="text-danger privacy-note">{{ wcerr }}</p>
+            }
+          </div>
+        }
+      </div>
+
       <!-- Works with Obsidian — optional vault companion -->
       <div class="card obsidian-card">
         <div class="obsidian-head">
@@ -1609,6 +1728,26 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         font-size: 0.8125rem;
       }
 
+      /* --- Connectors card (web search — NEW EGRESS) --- */
+      .connectors-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .connector-egress {
+        margin: 0;
+        font-size: 0.875rem;
+        line-height: 1.55;
+      }
+      .connector-fieldset {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+      }
+      .connector-consent {
+        margin-top: var(--space-1);
+      }
+
       /* --- Privacy & integrations card --- */
       .privacy-card {
         display: flex;
@@ -1797,8 +1936,12 @@ export class SettingsComponent implements OnInit {
     brainModelId: "",
     // brain2 RAG — semantic-search master flag (round-tripped on save).
     semanticSearchEnabled: false,
+    // brain2 connectors — web-search master toggle (NEW EGRESS; round-tripped).
+    webSearchEnabled: false,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
+  /** BYO Brave Search API key input (web-search connector). Cleared after save. */
+  readonly webKeyControl = new FormControl("", { nonNullable: true });
 
   readonly providers = signal<ProviderStatus[]>([]);
   /** Available mic input devices for the picker (loaded best-effort in ngOnInit). */
@@ -1860,6 +2003,21 @@ export class SettingsComponent implements OnInit {
   readonly consenting = signal(false);
   /** Surfaced if granting consent rejects. */
   readonly consentError = signal<string | null>(null);
+
+  // ── brain2 connectors — web search (NEW EGRESS) ────────────────────────
+
+  /** Web-search egress consent state — drives the "Allow web search" section; round-tripped on save. */
+  readonly webConsented = signal(false);
+  /** True while the one-time web-search consent command is in flight. */
+  readonly webConsenting = signal(false);
+  /** Surfaced if granting web-search consent rejects. */
+  readonly webConsentError = signal<string | null>(null);
+  /** Whether a Brave Search API key is stored (has-key check; never the value). */
+  readonly hasWebKey = signal(false);
+  /** True while the BYO key is being saved. */
+  readonly savingWebKey = signal(false);
+  /** Surfaced if storing the web-search key rejects. */
+  readonly webKeyError = signal<string | null>(null);
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
 
@@ -1926,6 +2084,9 @@ export class SettingsComponent implements OnInit {
       this.loadedLockRequireBiometric = cfg.lockRequireBiometric ?? true;
       this.loadedRelockOnScreenshare = cfg.relockOnScreenshare ?? true;
       this.cloudConsented.set(cfg.cloudEgressConsented ?? false);
+      // brain2 connectors — web-search consent is preserve-only (granted only via
+      // consent_to_web_search); snapshot it so save() round-trips it unchanged.
+      this.webConsented.set(cfg.webSearchConsented ?? false);
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -1951,10 +2112,12 @@ export class SettingsComponent implements OnInit {
         realtimeReactions: cfg.realtimeReactions ?? false,
         brainModelId: cfg.brainModelId ?? "",
         semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
+        webSearchEnabled: cfg.webSearchEnabled ?? false,
       });
       this.updateDownloadHint();
       this.inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       this.hasKey.set(await this.ipc.hasAnthropicKey());
+      this.hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
       // Phase H — brain model registry + download-progress stream (best-effort).
@@ -2152,6 +2315,11 @@ export class SettingsComponent implements OnInit {
       brainModelId: v.brainModelId || null,
       // brain2 RAG — semantic-search master flag (round-tripped so a save preserves it).
       semanticSearchEnabled: v.semanticSearchEnabled,
+      // brain2 connectors — web-search toggle is settable from the form; its consent
+      // is PRESERVE-ONLY (granted via allowWebSearch's dedicated command), so a save
+      // just carries the current value back instead of letting the backend default it.
+      webSearchEnabled: v.webSearchEnabled,
+      webSearchConsented: this.webConsented(),
       // Round-trip the Stage E security flags so a settings save never silently
       // resets them. Cloud-egress consent is GRANTED only via the dedicated
       // command (allowCloudProcessing) — here we just carry the current value back.
@@ -2203,6 +2371,48 @@ export class SettingsComponent implements OnInit {
       this.consentError.set(String(e));
     } finally {
       this.consenting.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Brave Search API key in the
+   * Keychain, then re-probe presence so the "Key set ✓" pill flips. The value is
+   * cleared from the input after saving (it's never shown back). Mirrors saveKey().
+   */
+  async saveWebKey(): Promise<void> {
+    const key = this.webKeyControl.value;
+    if (!key.trim()) return;
+    this.webKeyError.set(null);
+    this.savingWebKey.set(true);
+    try {
+      await this.ipc.setWebSearchApiKey(key);
+      this.webKeyControl.setValue("");
+      this.hasWebKey.set(await this.ipc.hasWebSearchKey());
+    } catch (e) {
+      this.webKeyError.set(String(e));
+    } finally {
+      this.savingWebKey.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — grant the one-time web-search egress consent via the
+   * dedicated command (an explicit, auditable user act — NOT a side effect of a
+   * normal settings save). After it resolves the brain may expose the web
+   * connector (when web search is enabled AND a key is stored). There is no FE
+   * "revoke": save() simply carries the current value back so it isn't cleared.
+   * Mirrors allowCloudProcessing().
+   */
+  async allowWebSearch(): Promise<void> {
+    this.webConsentError.set(null);
+    this.webConsenting.set(true);
+    try {
+      await this.ipc.consentToWebSearch();
+      this.webConsented.set(true);
+    } catch (e) {
+      this.webConsentError.set(String(e));
+    } finally {
+      this.webConsenting.set(false);
     }
   }
 
