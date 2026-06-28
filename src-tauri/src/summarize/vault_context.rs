@@ -33,12 +33,10 @@ fn budget_for(provider_id: &str) -> usize {
 /// Backward-compatible entry point (original 3-arg signature). Delegates to the
 /// visibility-aware [`build_vault_context_visible`] with an EMPTY unlock set, i.e. it is
 /// **fail-closed**: every sealed folder is treated as not-unlocked, so no sealed content can
-/// reach the cloud prompt (E9) even from a caller that hasn't yet been migrated.
-///
-/// TODO(owner of commands.rs): migrate `ask_vault` / `pre_meeting_brief` to call
-/// [`build_vault_context_visible`] with the live `state.unlocked_folders` snapshot, so a folder
-/// the user has *session-unlocked* is included again. Until then those flows simply omit
-/// session-unlocked folders from Ask-My-Vault — the safe (no-leak) direction.
+/// reach the cloud prompt (E9). The live callers (`ask_vault` / `pre_meeting_brief`) now call
+/// [`build_vault_context_visible`] directly with the live `state.unlocked_folders` snapshot, so
+/// session-unlocked folders ARE included; this empty-set shim remains only as a fail-closed
+/// default for any caller that does not have an unlock set to pass.
 pub fn build_vault_context(
     db: &Db,
     query: &str,

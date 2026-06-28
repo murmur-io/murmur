@@ -57,9 +57,12 @@ impl Embedder for StubEmbedder {
 /// The single active embedding backend used by BOTH the index path (chunking a note on creation)
 /// and the query path (Ask-My-Vault / MCP `search_semantic`). Returning a boxed trait object keeps
 /// the model a swappable seam: today it is the deterministic [`StubEmbedder`]; Phase 2c swaps in the
-/// real BGE-M3 model here and NOTHING else changes. Cheap to construct (the stub is zero-sized), so
-/// callers build one per operation rather than caching. NEVER invoked when `semantic_search_enabled`
-/// is off (the gate short-circuits before this is called).
+/// real BGE-M3 model here. NOTE: if the real model's output dimension differs from [`EMBED_DIM`],
+/// that is a `vec_chunks float[N]` SCHEMA change — an additive migration to a new-width vec0 table
+/// plus a full re-index of every meeting, NOT a code one-liner. A mismatched-width insert fails
+/// loud (dimension error), never silently. Cheap to construct (the stub is zero-sized), so callers
+/// build one per operation rather than caching. NEVER invoked when `semantic_search_enabled` is off
+/// (the gate short-circuits before this is called).
 pub fn active_embedder() -> Box<dyn Embedder> {
     Box::new(StubEmbedder)
 }
