@@ -84,6 +84,13 @@ pub struct AppConfig {
     /// (Phase 2c) replaces the stub; until then the only embedder is the deterministic `StubEmbedder`.
     #[serde(default)]
     pub semantic_search_enabled: bool,
+    /// Phase B — optional explicit path to a local reasoning GGUF for the on-device brain
+    /// (`MistralReasoner`). `None` (the default) means the resolver falls back to the default model
+    /// filename inside the shared models dir. Consulted ONLY when the `local-brain` feature is
+    /// compiled in; the default build never loads it. `#[serde(default)]` ⇒ a config persisted before
+    /// this field existed loads as `None`.
+    #[serde(default)]
+    pub brain_model_path: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -115,6 +122,7 @@ impl Default for AppConfig {
             relock_on_screenshare: true,
             cloud_egress_consented: false,
             semantic_search_enabled: false,
+            brain_model_path: None,
         }
     }
 }
@@ -146,6 +154,7 @@ const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
+const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -238,6 +247,7 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
             cfg.semantic_search_enabled = v == "true";
         }
+        cfg.brain_model_path = opt(db.get_setting(K_BRAIN_MODEL_PATH)?);
 
         Ok(cfg)
     }
@@ -312,6 +322,10 @@ impl AppConfig {
         db.set_setting(
             K_SEMANTIC_SEARCH_ENABLED,
             if self.semantic_search_enabled { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_BRAIN_MODEL_PATH,
+            self.brain_model_path.as_deref().unwrap_or(""),
         )?;
         Ok(())
     }

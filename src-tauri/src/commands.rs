@@ -1634,6 +1634,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // Phase 2b: the semantic-search master flag is not (yet) carried on the settings DTO, so a
         // settings save can neither set nor clobber it — preserve the live value (default OFF).
         semantic_search_enabled: current.semantic_search_enabled,
+        // Phase B: the brain model path is not carried on the settings DTO (it is resolved from the
+        // shared models dir by default), so a settings save preserves the live value (default None).
+        brain_model_path: current.brain_model_path.clone(),
     }
 }
 
@@ -1914,6 +1917,76 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
     let p = configured.as_deref().map(std::path::Path::new);
     let path = crate::transcribe::ensure_model(p, &size, &language).await?;
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Whether a usable on-device brain (reasoning GGUF) is present at the resolved path — the
+/// configured `brain_model_path`, else the default model in the shared models dir. Lets the UI offer
+/// a download. Independent of the `local-brain` feature: this only checks the file on disk.
+#[tauri::command]
+pub fn brain_model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let configured = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.brain_model_path.clone()
+    };
+    let p = configured.as_deref().map(std::path::Path::new);
+    Ok(crate::reason::brain_model_path(p)?.is_some())
+}
+
+/// Download the on-device brain (reasoning GGUF) into the shared models dir if missing; returns its
+/// path. No-op (returns the existing path) when already present. INBOUND ONLY — fetches a model file
+/// and sends NO meeting content (no egress). Emits [`crate::events::EVENT_BRAIN_DOWNLOAD`] progress
+/// events (throttled). The downloaded file is NOT loaded here — wiring the brain is Phase B step 3.
+#[tauri::command]
+pub async fn download_brain_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, AppError> {
+    let configured = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.brain_model_path.clone()
+    };
+    let p = configured.as_deref().map(std::path::Path::new);
+    if let Some(found) = crate::reason::brain_model_path(p)? {
+        return Ok(found.to_string_lossy().to_string());
+    }
+
+    let dest =
+        crate::transcribe::models_dir()?.join(crate::reason::DEFAULT_BRAIN_MODEL_FILE);
+    let url = crate::reason::default_brain_model_url();
+
+    // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
+    const EMIT_EVERY: u64 = 8 * 1024 * 1024;
+    let mut last_emit: u64 = 0;
+    crate::reason::download_brain_model(&url, &dest, |downloaded, total| {
+        if downloaded - last_emit >= EMIT_EVERY {
+            last_emit = downloaded;
+            let _ = app.emit(
+                crate::events::EVENT_BRAIN_DOWNLOAD,
+                crate::events::BrainDownloadPayload {
+                    downloaded,
+                    total,
+                    done: false,
+                },
+            );
+        }
+    })
+    .await?;
+
+    let _ = app.emit(
+        crate::events::EVENT_BRAIN_DOWNLOAD,
+        crate::events::BrainDownloadPayload {
+            downloaded: 0,
+            total: None,
+            done: true,
+        },
+    );
+    Ok(dest.to_string_lossy().to_string())
 }
 
 /// Show/hide the floating recorder bar window (also bound to the global ⌘⇧R shortcut).
@@ -3898,6 +3971,7 @@ mod lifecycle_tests {
             voice_listener: Mutex::new(None),
             db,
             config: Mutex::new(AppConfig::default()),
+            reasoner: Box::new(crate::reason::StubReasoner),
             current_meeting: Mutex::new(None),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),

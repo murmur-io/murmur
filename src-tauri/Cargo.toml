@@ -45,6 +45,15 @@ async-trait = "0.1"
 # bundled-sqlcipher-vendored-openssl: whole-DB at-rest encryption, no system OpenSSL dependency
 # (universal-capable). Fallback if the universal build breaks: "bundled-sqlcipher".
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+# ── Local reasoning brain (Phase B — OPTIONAL: compiled ONLY under `--features local-brain`) ──
+# In-process GGUF inference (Metal). A build-proof PROVED this links cleanly alongside whisper.cpp +
+# sherpa's static onnxruntime + bundled SQLCipher (zero ORT/ggml/openssl conflict). It is `optional`
+# so the DEFAULT build (and the fast `cargo test --lib` loop) NEVER compiles the heavy mistralrs tree;
+# `reason::active_reasoner` returns the dependency-free `StubReasoner` unless this feature is on AND a
+# GGUF model is present. The `metal` feature precompiles shaders via xcrun (needs full Xcode, or env
+# `MISTRALRS_METAL_PRECOMPILE=0` to defer). NOT wired into any pipeline path yet (Phase B step 3).
+mistralrs = { version = "0.8.1", features = ["metal"], optional = true }
+
 # ── Vector retrieval (Phase 2a) ──
 # sqlite-vec `vec0` virtual table for on-device KNN, registered into the SAME bundled SQLCipher
 # handle via SQLite's auto-extension hook (db::register_vec_extension). Build-proven (de-risking
@@ -116,3 +125,8 @@ security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 [features]
 # default keeps Metal on for whisper; nothing else conditional in P0
 default = []
+# Phase B — the REAL on-device reasoning brain (MistralReasoner, `reason/mistral.rs`). OFF by default
+# so the fast `cargo test --lib` loop never compiles the heavy mistralrs tree. With it ON *and* a GGUF
+# present at the resolved path, `reason::active_reasoner` returns the real MistralReasoner; otherwise it
+# gracefully degrades to the StubReasoner. Build: `MISTRALRS_METAL_PRECOMPILE=0 cargo build --features local-brain`.
+local-brain = ["dep:mistralrs"]
