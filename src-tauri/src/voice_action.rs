@@ -53,6 +53,10 @@ pub struct VoiceActionResult {
     pub status: String,
     /// The brain answer (research/recall) or a short, non-sensitive status line.
     pub summary: String,
+    /// The HEARD command — exactly what the user dictated (their OWN spoken words, no other
+    /// transcript), so the FE card can show "usłyszano: {command}". Empty when nothing was heard.
+    /// This is the user's own dictation, not meeting content, so it carries no other party's speech.
+    pub command: String,
     /// `[[Title]]` wikilink citations the answer was grounded on (VISIBLE meetings only). Empty for
     /// non-RAG intents.
     pub citations: Vec<String>,
@@ -64,8 +68,27 @@ impl VoiceActionResult {
             intent_kind: intent_kind.to_string(),
             status: status.to_string(),
             summary: summary.into(),
+            command: String::new(),
             citations: Vec::new(),
         }
+    }
+
+    /// Thread the HEARD command through onto a result (builder-style), so every dispatch path can
+    /// surface what the user actually said without re-plumbing each constructor.
+    pub fn with_command(mut self, command: &str) -> Self {
+        self.command = command.to_string();
+        self
+    }
+
+    /// The graceful outcome when a MANUAL voice-command capture's budget expired with NOTHING heard
+    /// (the user never spoke after clicking). NOT a confusing "didn't catch an action" — a friendly
+    /// Polish nudge to click + speak again. Empty `command` (nothing was heard) and no citations.
+    pub fn nothing_heard() -> Self {
+        VoiceActionResult::new(
+            "unknown",
+            "nothing_heard",
+            "Nie usłyszałem polecenia — kliknij i powiedz jeszcze raz.",
+        )
     }
 }
 
@@ -125,6 +148,66 @@ pub fn handle_voice_action(
             "unrecognized",
             "Sorry, I didn't catch an action I can run.",
         ),
+    }
+}
+
+/// Map a FREE-FORM, keyword-unrecognized command to a known [`VoiceIntent`] using the BRAIN (natural
+/// language), best-effort. Called ONLY when `parse_voice_intent` returned `Unknown` for a NON-EMPTY
+/// command — so any phrasing/order works ("zrób research o wakacjach", "poszukaj mi info o X").
+///
+/// EGRESS: rides the SAME consent-gated reasoner as every other voice action — `structured` over the
+/// reasoner the caller passes (a Cloud reasoner routes through `make_provider`'s consent gate +
+/// RedactingProvider; no new egress class). The command is the user's OWN dictation (≤ one short
+/// utterance), a strict subset of what the summary already sends.
+///
+/// Returns the brain-mapped intent, or — if the brain is unavailable / no-consent / returns garbage
+/// (`Ok(None)` or `Err`) — `None`, so the caller falls back to the keyword result (Research over the
+/// literal command is a fine default for a non-empty command). NEVER panics: every failure is a
+/// graceful `None`.
+pub fn interpret_with_brain(reasoner: &dyn LocalReasoner, command: &str) -> Option<VoiceIntent> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let system = "You map a short spoken assistant command to ONE structured action. The actions \
+                  are: \"research\" (look something up / investigate a topic), \"recall\" (what do we \
+                  know about an entity), \"reminder\" (remind me to do something), \"note\" (jot a \
+                  quick aside). Pick the single best action and extract its argument (the topic / \
+                  entity / reminder text / note text) from the command. If none fits, use action \
+                  \"unknown\".";
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": ["research", "recall", "reminder", "note", "unknown"] },
+            "argument": { "type": "string" }
+        },
+        "required": ["action", "argument"]
+    });
+    let user = format!("Command: {command}");
+
+    let value = match reasoner.structured(system, &user, &schema) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(target: "voice", error = %e, "brain intent-interpret failed; falling back to keyword result");
+            return None;
+        }
+    };
+    let action = value.get("action").and_then(|a| a.as_str())?.trim().to_lowercase();
+    // The argument the brain extracted; fall back to the whole command when it omits/empties it.
+    let argument = value
+        .get("argument")
+        .and_then(|a| a.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(command)
+        .to_string();
+    match action.as_str() {
+        "research" => Some(VoiceIntent::Research { topic: argument }),
+        "recall" => Some(VoiceIntent::Recall { entity: argument }),
+        "reminder" => Some(VoiceIntent::CreateReminder { text: argument, due: None }),
+        "note" => Some(VoiceIntent::NoteAside { text: argument }),
+        // "unknown" or any unexpected label ⇒ no mapping; caller uses the keyword fallback.
+        _ => None,
     }
 }
 
@@ -233,6 +316,7 @@ fn rag_answer(
                 intent_kind: intent_kind.to_string(),
                 status: "ok".to_string(),
                 summary,
+                command: String::new(),
                 citations,
             }
         }
@@ -243,12 +327,14 @@ fn rag_answer(
             summary: "The cloud brain needs your one-time consent to answer (Settings ▸ Privacy). \
                       I found related meetings in your vault."
                 .to_string(),
+            command: String::new(),
             citations,
         },
         Err(e) => VoiceActionResult {
             intent_kind: intent_kind.to_string(),
             status: "error".to_string(),
             summary: non_pii_error(&e),
+            command: String::new(),
             citations,
         },
     }
@@ -677,6 +763,67 @@ mod tests {
         assert_eq!(res.status, "needs_consent");
         // Gated citations are still useful even when the brain can't run.
         assert!(res.citations.contains(&"[[Atlas Kickoff]]".to_string()));
+    }
+
+    /// A reasoner whose `structured` returns a fixed brain mapping, to prove `interpret_with_brain`
+    /// maps free-form text to the right intent + argument.
+    struct MapReasoner(Value);
+    impl LocalReasoner for MapReasoner {
+        fn id(&self) -> &str {
+            "map"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+        fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> crate::error::Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn interpret_with_brain_maps_each_action() {
+        let cases = [
+            (serde_json::json!({"action":"research","argument":"wakacjach"}),
+             VoiceIntent::Research { topic: "wakacjach".into() }),
+            (serde_json::json!({"action":"recall","argument":"atlas"}),
+             VoiceIntent::Recall { entity: "atlas".into() }),
+            (serde_json::json!({"action":"reminder","argument":"call bob"}),
+             VoiceIntent::CreateReminder { text: "call bob".into(), due: None }),
+            (serde_json::json!({"action":"note","argument":"deadline friday"}),
+             VoiceIntent::NoteAside { text: "deadline friday".into() }),
+        ];
+        for (map, want) in cases {
+            let got = interpret_with_brain(&MapReasoner(map), "some free-form command").unwrap();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn interpret_with_brain_empty_argument_falls_back_to_whole_command() {
+        // When the brain omits/empties the argument, the whole command is used as the argument.
+        let r = MapReasoner(serde_json::json!({ "action": "research", "argument": "" }));
+        let got = interpret_with_brain(&r, "look into the pricing model").unwrap();
+        assert_eq!(got, VoiceIntent::Research { topic: "look into the pricing model".into() });
+    }
+
+    #[test]
+    fn interpret_with_brain_unknown_or_error_returns_none() {
+        // action="unknown" ⇒ None (caller uses the keyword fallback).
+        let unknown = MapReasoner(serde_json::json!({ "action": "unknown", "argument": "x" }));
+        assert!(interpret_with_brain(&unknown, "gibberish").is_none());
+        // An erroring/unavailable brain ⇒ None, never a panic.
+        let err = ErrReasoner(AppError::Unavailable("no consent".into()));
+        assert!(interpret_with_brain(&err, "gibberish").is_none());
+        // An empty command never calls the brain ⇒ None.
+        assert!(interpret_with_brain(&unknown, "   ").is_none());
+    }
+
+    #[test]
+    fn with_command_surfaces_the_heard_command_on_a_result() {
+        let r = VoiceActionResult::new("research", "ok", "answer").with_command("zrób research o X");
+        assert_eq!(r.command, "zrób research o X");
+        // nothing_heard carries an empty command (nothing was heard).
+        assert!(VoiceActionResult::nothing_heard().command.is_empty());
     }
 
     #[test]
