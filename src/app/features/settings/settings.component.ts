@@ -17,6 +17,7 @@ import type {
   BrainModelDto,
   InputDeviceInfo,
   ProviderStatus,
+  ReindexResult,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
@@ -413,6 +414,116 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
             }
           </div>
         }
+
+        <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
+        <div class="semantic">
+          <label class="toggle-row">
+            <span class="toggle-copy">
+              <span class="toggle-title">Semantic search (multilingual)</span>
+              <span class="text-secondary toggle-sub">
+                Finds notes by meaning + across languages — needs the embedding
+                model.
+              </span>
+            </span>
+            <input type="checkbox" formControlName="semanticSearchEnabled" />
+          </label>
+
+          <!-- Embedding model: present pill, or a download control with progress -->
+          <div class="semantic-model-row">
+            @if (embedModelPresent() === true) {
+              <span class="pill is-success">
+                <span class="pill-dot"></span>
+                Embedding model ready ✓
+              </span>
+              <span class="text-muted semantic-note">
+                Stored on this Mac — used to index + search your notes.
+              </span>
+            } @else if (embedModelPresent() === false) {
+              @if (downloadingEmbedModel()) {
+                <div class="semantic-progress" role="status">
+                  <div class="semantic-progress-track" aria-hidden="true">
+                    <div
+                      class="semantic-progress-fill"
+                      [style.width.%]="embedDownloadFrac() * 100"
+                    ></div>
+                  </div>
+                  <span class="semantic-progress-label text-muted">
+                    Downloading embedding model… {{ embedPct() }}
+                  </span>
+                </div>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                  (click)="downloadEmbedModel()"
+                >
+                  Download embedding model (~120 MB)
+                </button>
+                <span class="text-muted semantic-note">
+                  One time, on-device — required before semantic search can index.
+                </span>
+              }
+            } @else {
+              <span class="pill">
+                <span class="pill-dot"></span>
+                Checking…
+              </span>
+            }
+          </div>
+          @if (embedDownloadError(); as eerr) {
+            <p class="text-danger brain-error">{{ eerr }}</p>
+          }
+
+          <!-- Re-index notes: backfill the semantic vector index over all notes -->
+          <div class="semantic-reindex">
+            <button
+              type="button"
+              class="btn btn-sm"
+              (click)="reindexEmbeddings()"
+              [disabled]="reindexing()"
+            >
+              @if (reindexing()) {
+                <span class="spin-ring" aria-hidden="true"></span>
+                Re-indexing…
+              } @else {
+                Re-index notes
+              }
+            </button>
+            <span class="text-muted semantic-note">
+              Builds the semantic index over your notes — run it after turning
+              this on, or after downloading the model.
+            </span>
+          </div>
+          @if (reindexing()) {
+            <div class="semantic-progress" role="status">
+              <div class="semantic-progress-track" aria-hidden="true">
+                <div
+                  class="semantic-progress-fill"
+                  [style.width.%]="reindexFrac() * 100"
+                ></div>
+              </div>
+              <span class="semantic-progress-label text-muted">
+                Indexing notes… {{ reindexPct() }}
+              </span>
+            </div>
+          }
+          @if (reindexResult(); as rr) {
+            @if (rr.status === "model_missing") {
+              <p class="semantic-nudge text-secondary">
+                Download the embedding model above first — semantic search can't
+                index without it.
+              </p>
+            } @else {
+              <span class="pill is-success semantic-done-pill">
+                <span class="pill-dot"></span>
+                Indexed {{ rr.indexed }} of {{ rr.total }} notes
+              </span>
+            }
+          }
+          @if (reindexError(); as rerr) {
+            <p class="text-danger brain-error">{{ rerr }}</p>
+          }
+        </div>
       </div>
 
       <!-- Works with Obsidian — optional vault companion -->
@@ -1206,6 +1317,63 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         font-size: 0.8125rem;
       }
 
+      /* --- brain2 RAG — semantic-search subsection --- */
+      .semantic {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+        padding: var(--space-4);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        border: 1px solid var(--border-subtle);
+      }
+      .semantic-model-row,
+      .semantic-reindex {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+        min-height: 36px;
+      }
+      .semantic-reindex .btn,
+      .semantic-model-row .btn {
+        flex: none;
+      }
+      .semantic-note {
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
+      .semantic-progress {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        min-width: 180px;
+        flex: 1 1 auto;
+      }
+      .semantic-progress-track {
+        height: 6px;
+        border-radius: 3px;
+        background: var(--surface-raised);
+        overflow: hidden;
+      }
+      .semantic-progress-fill {
+        height: 100%;
+        background: var(--accent);
+        border-radius: 3px;
+        transition: width var(--transition);
+      }
+      .semantic-progress-label {
+        font-size: 0.75rem;
+      }
+      .semantic-nudge {
+        margin: 0;
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+      .semantic-done-pill {
+        align-self: flex-start;
+      }
+
       /* --- Works-with-Obsidian card --- */
       .obsidian-card {
         display: flex;
@@ -1627,6 +1795,8 @@ export class SettingsComponent implements OnInit {
     realtimeReactions: false,
     /** Custom GGUF model path (or registry id). Empty → null on save. */
     brainModelId: "",
+    // brain2 RAG — semantic-search master flag (round-tripped on save).
+    semanticSearchEnabled: false,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -1710,6 +1880,41 @@ export class SettingsComponent implements OnInit {
   /** Release handle for the EVENT_BRAIN_DOWNLOAD subscription. */
   private unlistenBrainDownload: UnlistenFn | null = null;
 
+  // ── brain2 RAG — semantic search (embedding model + reindex) ────────────
+
+  /**
+   * Whether the on-device embedding model is present.
+   * `null` = not yet checked, `true`/`false` = detected via ipc.embedModelPresent().
+   */
+  readonly embedModelPresent = signal<boolean | null>(null);
+  /** True while the embedding model is downloading — disables its button. */
+  readonly downloadingEmbedModel = signal(false);
+  /** 0..1 download progress for the in-flight embed-model download. */
+  readonly embedDownloadFrac = signal(0);
+  /** Whole-percent label for the in-flight embed-model download. */
+  readonly embedPct = computed(
+    () => Math.round(this.embedDownloadFrac() * 100) + "%",
+  );
+  /** Surfaced if ipc.downloadEmbedModel() rejects. */
+  readonly embedDownloadError = signal<string | null>(null);
+
+  /** True while a reindex backfill is running — disables the button + shows progress. */
+  readonly reindexing = signal(false);
+  /** 0..1 progress for the in-flight reindex backfill. */
+  readonly reindexFrac = signal(0);
+  /** Whole-percent label for the in-flight reindex backfill. */
+  readonly reindexPct = computed(
+    () => Math.round(this.reindexFrac() * 100) + "%",
+  );
+  /** Last reindex outcome — drives the "model_missing" nudge / "indexed" confirmation. */
+  readonly reindexResult = signal<ReindexResult | null>(null);
+  /** Surfaced if ipc.reindexEmbeddings() rejects. */
+  readonly reindexError = signal<string | null>(null);
+
+  /** Release handles for the embed-download + reindex event streams. */
+  private unlistenEmbedDownload: UnlistenFn | null = null;
+  private unlistenReindex: UnlistenFn | null = null;
+
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
@@ -1745,6 +1950,7 @@ export class SettingsComponent implements OnInit {
         brainBackend: cfg.brainBackend ?? "cloud",
         realtimeReactions: cfg.realtimeReactions ?? false,
         brainModelId: cfg.brainModelId ?? "",
+        semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
       });
       this.updateDownloadHint();
       this.inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
@@ -1754,6 +1960,11 @@ export class SettingsComponent implements OnInit {
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
       await this.refreshBrainModels();
+      // brain2 RAG — embedding-model presence + reindex/download progress streams.
+      await this.subscribeSemanticStreams();
+      this.embedModelPresent.set(
+        await this.ipc.embedModelPresent().catch(() => false),
+      );
     } catch (e) {
       this.loadError.set(String(e));
     }
@@ -1829,6 +2040,77 @@ export class SettingsComponent implements OnInit {
     }
   }
 
+  // ── brain2 RAG — semantic search (embedding model + reindex backfill) ───
+
+  /**
+   * Subscribe ONCE to the embed-download + reindex progress streams and store the
+   * unlisten handles so DestroyRef can release them (no leaked listeners).
+   * Best-effort: a missing backend stream just leaves the relevant bar inert.
+   */
+  private async subscribeSemanticStreams(): Promise<void> {
+    try {
+      this.unlistenEmbedDownload = await this.ipc.onEmbedDownload((p) => {
+        // Per-file progress: blend the completed files + the current file's fraction
+        // across the whole set so the single bar advances smoothly.
+        if (p.fileCount > 0) {
+          const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
+          this.embedDownloadFrac.set(
+            Math.min(1, (p.fileIndex + cur) / p.fileCount),
+          );
+        }
+        if (p.done) this.embedDownloadFrac.set(1);
+      });
+      this.unlistenReindex = await this.ipc.onReindex((p) => {
+        if (p.total > 0) {
+          this.reindexFrac.set(Math.min(1, p.done / p.total));
+        }
+      });
+      this.destroyRef.onDestroy(() => {
+        this.unlistenEmbedDownload?.();
+        this.unlistenReindex?.();
+      });
+    } catch {
+      // No stream available — progress bars stay inert; commands still resolve.
+    }
+  }
+
+  /** Download the on-device embedding model, then re-check presence. */
+  async downloadEmbedModel(): Promise<void> {
+    this.embedDownloadError.set(null);
+    this.embedDownloadFrac.set(0);
+    this.downloadingEmbedModel.set(true);
+    try {
+      await this.ipc.downloadEmbedModel();
+      this.embedModelPresent.set(await this.ipc.embedModelPresent());
+    } catch (e) {
+      this.embedDownloadError.set(String(e));
+    } finally {
+      this.downloadingEmbedModel.set(false);
+    }
+  }
+
+  /**
+   * Backfill the semantic vector index over all visible meetings. A
+   * `"model_missing"` result means the e5 model isn't installed yet — surfaced as
+   * a nudge to download it first (no indexing was attempted).
+   */
+  async reindexEmbeddings(): Promise<void> {
+    this.reindexError.set(null);
+    this.reindexResult.set(null);
+    this.reindexFrac.set(0);
+    this.reindexing.set(true);
+    try {
+      const res = await this.ipc.reindexEmbeddings();
+      this.reindexResult.set(res);
+      // The model could have been (un)installed between the presence probe and now.
+      if (res.status === "model_missing") this.embedModelPresent.set(false);
+    } catch (e) {
+      this.reindexError.set(String(e));
+    } finally {
+      this.reindexing.set(false);
+    }
+  }
+
   async pickVault(): Promise<void> {
     const dir = await open({ directory: true, multiple: false });
     if (typeof dir === "string") this.form.patchValue({ vaultPath: dir });
@@ -1868,6 +2150,8 @@ export class SettingsComponent implements OnInit {
       brainBackend: v.brainBackend,
       realtimeReactions: v.realtimeReactions,
       brainModelId: v.brainModelId || null,
+      // brain2 RAG — semantic-search master flag (round-tripped so a save preserves it).
+      semanticSearchEnabled: v.semanticSearchEnabled,
       // Round-trip the Stage E security flags so a settings save never silently
       // resets them. Cloud-egress consent is GRANTED only via the dedicated
       // command (allowCloudProcessing) — here we just carry the current value back.

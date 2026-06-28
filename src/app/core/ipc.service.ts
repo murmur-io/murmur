@@ -7,6 +7,9 @@ import type {
   AppConfigDto,
   BrainDownloadProgress,
   BrainModelDto,
+  EmbedDownloadProgress,
+  ReindexProgress,
+  ReindexResult,
   InputDeviceInfo,
   AskVaultResult,
   BriefResult,
@@ -47,6 +50,9 @@ export const EVENT_WAKE_DETECTED = "murmur://wake-detected";
 export const EVENT_VOICE_ACTION_RESULT = "murmur://voice-action-result";
 export const EVENT_VOICE_COMMAND_LISTENING = "murmur://voice-command-listening";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
+// brain2 RAG — semantic-search model download + reindex backfill event streams.
+export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
+export const EVENT_REINDEX = "murmur://reindex-embeddings";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -417,6 +423,39 @@ export class IpcService {
     return invoke<void>("download_brain_model", { modelId });
   }
 
+  // ── brain2 RAG — semantic search (embedding model + reindex backfill) ───
+
+  /**
+   * Whether the on-device embedding model (multilingual-e5-small) is present —
+   * i.e. the REAL embedder would load. Cheap existence check; semantic search /
+   * reindex are no-ops (stub) without it.
+   */
+  embedModelPresent(): Promise<boolean> {
+    return invoke<boolean>("embed_model_present");
+  }
+
+  /**
+   * Download the on-device embedding model (multilingual-e5-small, 3 small files).
+   * Progress streams over {@link onEmbedDownload} (EVENT_EMBED_DOWNLOAD); the
+   * promise resolves with the model dir when the download finishes. Sends NO
+   * meeting content (inbound-only, no egress).
+   */
+  downloadEmbedModel(): Promise<string> {
+    return invoke<string>("download_embed_model");
+  }
+
+  /**
+   * brain2 RAG — backfill the semantic vector index for ALL VISIBLE meetings (the
+   * one-shot run after turning semantic search on, or after installing the e5
+   * model). Progress streams over {@link onReindex} (EVENT_REINDEX). Resolves with
+   * a {@link ReindexResult}: `status: "model_missing"` when the e5 model is absent
+   * (nothing indexed → the FE nudges the user to download it first), else
+   * `"indexed"`. Sealed-not-unlocked meetings are never indexed (gated).
+   */
+  reindexEmbeddings(): Promise<ReindexResult> {
+    return invoke<ReindexResult>("reindex_embeddings");
+  }
+
   /** Show/hide the floating always-on-top recorder bar window. */
   toggleBar(): Promise<void> {
     return invoke<void>("toggle_bar");
@@ -558,5 +597,19 @@ export class IpcService {
     return listen<BrainDownloadProgress>(EVENT_BRAIN_DOWNLOAD, (e) =>
       cb(e.payload),
     );
+  }
+
+  /** Fires with per-file progress for the in-flight embedding-model download. */
+  onEmbedDownload(
+    cb: (p: EmbedDownloadProgress) => void,
+  ): Promise<UnlistenFn> {
+    return listen<EmbedDownloadProgress>(EVENT_EMBED_DOWNLOAD, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /** Fires with COUNT-only progress for the in-flight semantic reindex backfill. */
+  onReindex(cb: (p: ReindexProgress) => void): Promise<UnlistenFn> {
+    return listen<ReindexProgress>(EVENT_REINDEX, (e) => cb(e.payload));
   }
 }
