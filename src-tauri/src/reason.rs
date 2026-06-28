@@ -11,9 +11,149 @@
 //! the stub fakes it but still routes its output through [`extract_first_json`] so the
 //! recover-JSON-from-noisy-text path is exercised and testable.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
+use crate::settings::AppConfig;
+
+/// The REAL on-device reasoner (Phase B), compiled ONLY under `--features local-brain`. The default
+/// build never pulls mistralrs, keeping the fast `cargo test --lib` loop intact.
+#[cfg(feature = "local-brain")]
+pub mod mistral;
+
+/// Default brain model filename (a small instruct GGUF) placed under the shared models dir. The
+/// actual model choice + download is the user's on-device step; only the path resolution + download
+/// plumbing is exercised headless here. Mirrors `transcribe::model`'s filename convention.
+pub const DEFAULT_BRAIN_MODEL_FILE: &str = "Qwen2.5-3B-Instruct-Q4_K_M.gguf";
+
+/// Hugging Face mirror serving the default brain GGUF (raw file via `resolve/main`). INBOUND ONLY —
+/// the brain download fetches a model; it NEVER sends meeting content anywhere (no egress).
+pub fn default_brain_model_url() -> String {
+    format!(
+        "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/{DEFAULT_BRAIN_MODEL_FILE}"
+    )
+}
+
+/// Resolve the GGUF the local brain should load, or `Ok(None)` when none is present.
+///
+/// Resolution order (mirrors [`crate::transcribe::resolve_model_path`]):
+/// 1. `configured` — an explicit path from settings (`brain_model_path`); used verbatim if it
+///    points at an existing file.
+/// 2. [`DEFAULT_BRAIN_MODEL_FILE`] inside the shared models dir, if it already exists on disk.
+///
+/// Creating the models dir can fail (returns `Err`); a missing model is `Ok(None)`, NOT an error —
+/// the app runs fine without the brain (it falls back to the stub). NEVER panics.
+pub fn brain_model_path(configured: Option<&Path>) -> Result<Option<PathBuf>> {
+    if let Some(p) = configured {
+        if p.is_file() {
+            return Ok(Some(p.to_path_buf()));
+        }
+    }
+    let derived = crate::transcribe::models_dir()?.join(DEFAULT_BRAIN_MODEL_FILE);
+    if derived.is_file() {
+        return Ok(Some(derived));
+    }
+    Ok(None)
+}
+
+/// Download `url` to `dest` atomically (`dest.part` → rename), invoking `on_progress(downloaded,
+/// total)` as bytes arrive (total is `None` when the server omits `Content-Length`). INBOUND ONLY:
+/// this fetches a model file and sends NO request body / NO meeting content (no egress). Streams via
+/// `Response::chunk` (no extra stream-combinator dep). NO PII logged — model id / byte counts only.
+pub async fn download_brain_model<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    use tokio::io::AsyncWriteExt;
+
+    tracing::info!(target: "reason", file = %dest.display(), "downloading brain model");
+
+    let mut resp = reqwest::get(url)
+        .await
+        .map_err(|e| AppError::Summarize(format!("brain model download request failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(AppError::Summarize(format!(
+            "brain model download HTTP {}",
+            resp.status()
+        )));
+    }
+    let total = resp.content_length();
+
+    let part = dest.with_extension("part");
+    let mut file = tokio::fs::File::create(&part)
+        .await
+        .map_err(|e| AppError::Summarize(format!("create brain model temp file: {e}")))?;
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AppError::Summarize(format!("brain model download body failed: {e}")))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| AppError::Summarize(format!("write brain model chunk: {e}")))?;
+        downloaded += chunk.len() as u64;
+        on_progress(downloaded, total);
+    }
+    file.flush()
+        .await
+        .map_err(|e| AppError::Summarize(format!("flush brain model file: {e}")))?;
+    drop(file);
+
+    if downloaded == 0 {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(AppError::Summarize(
+            "brain model download returned empty body".into(),
+        ));
+    }
+    tokio::fs::rename(&part, dest)
+        .await
+        .map_err(|e| AppError::Summarize(format!("rename brain model file: {e}")))?;
+
+    tracing::info!(target: "reason", file = %dest.display(), bytes = downloaded, "brain model ready");
+    Ok(())
+}
+
+/// The single active reasoning backend, used wherever the app needs local on-device reasoning.
+///
+/// Graceful degradation, in priority order:
+/// - the `local-brain` feature is ON **and** a GGUF is present at the resolved [`brain_model_path`]
+///   → the real [`mistral::MistralReasoner`] (lazy: the model loads on first use, not here, so this
+///   never blocks startup and never panics);
+/// - otherwise (feature off, no model, or a path-resolution error) → the dependency-free
+///   [`StubReasoner`]. The app works either way — just less smart without the model.
+///
+/// NEVER panics and NEVER blocks: a missing/failed model is logged (no PII) and falls back to stub.
+pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
+    #[cfg(feature = "local-brain")]
+    {
+        let configured = config.brain_model_path.as_deref().map(Path::new);
+        match brain_model_path(configured) {
+            Ok(Some(path)) => match mistral::MistralReasoner::new(path) {
+                Ok(r) => {
+                    tracing::info!(target: "reason", id = r.id(), "local brain ready (lazy model load)");
+                    return Box::new(r);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "reason", error = %e, "local brain init failed; using stub reasoner");
+                }
+            },
+            Ok(None) => {
+                tracing::info!(target: "reason", "no local brain model present; using stub reasoner");
+            }
+            Err(e) => {
+                tracing::warn!(target: "reason", error = %e, "local brain path resolution failed; using stub reasoner");
+            }
+        }
+    }
+    #[cfg(not(feature = "local-brain"))]
+    {
+        let _ = config; // model path is only consulted when the feature is compiled in.
+    }
+    Box::new(StubReasoner)
+}
 
 /// A local (on-device, no-egress) reasoning model. Synchronous: the real impl runs a local model
 /// to completion on a worker thread; the stub is pure. All methods are deterministic for a given
@@ -199,5 +339,76 @@ mod tests {
         let schema = serde_json::json!({});
         let v = r.structured("sys", "json like {a:1} please", &schema).unwrap();
         assert_eq!(v["echo"], serde_json::json!("json like {a:1} please"));
+    }
+
+    fn tmp_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-brain-{tag}-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[test]
+    fn brain_model_path_prefers_existing_configured_file() {
+        let f = tmp_file("configured", b"GGUF");
+        let got = brain_model_path(Some(&f)).unwrap();
+        assert_eq!(got.as_deref(), Some(f.as_path()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn brain_model_path_none_when_configured_missing_and_no_default() {
+        // A configured path that does not exist must NOT be returned; with no default model present
+        // in the (test) models dir the resolver reports None — the graceful "use the stub" signal.
+        let missing = std::env::temp_dir().join("murmur-brain-does-not-exist-xyz.gguf");
+        let _ = std::fs::remove_file(&missing);
+        // Only assert the configured-missing branch is skipped; the derived-default branch depends on
+        // the shared models dir, which a dev machine may legitimately have populated.
+        if !crate::transcribe::models_dir()
+            .map(|d| d.join(DEFAULT_BRAIN_MODEL_FILE).is_file())
+            .unwrap_or(false)
+        {
+            assert!(brain_model_path(Some(&missing)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn default_brain_url_points_at_hf_mirror() {
+        assert_eq!(
+            default_brain_model_url(),
+            "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+        );
+    }
+
+    /// The factory's graceful-degradation contract: with NO usable model (a configured path that
+    /// doesn't exist, and — on a clean machine — no default model) `active_reasoner` returns the
+    /// StubReasoner. With the `local-brain` feature OFF this is unconditional; with it ON it still
+    /// holds as long as no GGUF is present. This is the headless proof of the swap wiring's fallback.
+    #[test]
+    fn active_reasoner_falls_back_to_stub_without_model() {
+        let cfg = AppConfig {
+            brain_model_path: Some(
+                std::env::temp_dir()
+                    .join("murmur-brain-absent-model-xyz.gguf")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        // Skip the assertion only if a real default model happens to be installed on this machine
+        // (then the feature-on build would legitimately return the real reasoner).
+        let default_present = crate::transcribe::models_dir()
+            .map(|d| d.join(DEFAULT_BRAIN_MODEL_FILE).is_file())
+            .unwrap_or(false);
+        if cfg!(not(feature = "local-brain")) || !default_present {
+            assert_eq!(active_reasoner(&cfg).id(), "stub");
+        }
     }
 }
