@@ -24,9 +24,75 @@ const TICK: Duration = Duration::from_millis(3000);
 /// How many trailing seconds of audio to transcribe each tick (overlapping window).
 const WINDOW_SECS: usize = 14;
 
+/// How many consecutive ticks the SAME spoken wake stays de-duplicated. Consecutive ~14s tails
+/// OVERLAP heavily (a `TICK` of 3s into a `WINDOW_SECS` of 14s ⇒ the same vocative is visible for
+/// ~4-5 ticks), so without dedup one spoken "Klaudku" would re-fire every tick. A window of 5 ticks
+/// (≈ 15s ≈ one full tail) collapses the overlapping re-detections of ONE utterance into a single
+/// dispatch, while a fresh "Klaudku" later — or the same command after the window lapses — DOES
+/// fire again. Recall is preserved (a NEW ask always catches); only the duplicate echo is dropped.
+const WAKE_DEDUP_TICKS: u32 = 5;
+
 #[derive(serde::Serialize, Clone)]
 struct LiveCaption {
     text: String,
+}
+
+/// DEDUP state for the in-meeting wake trigger (the #23 fix). [`detect_wake`] now fires ANYWHERE in
+/// the rolling, OVERLAPPING ~14s tail, so the SAME spoken "Klaudku zrób research" would otherwise
+/// re-fire on every tick it remains visible. This collapses the overlapping re-detections of ONE
+/// utterance into a SINGLE dispatch: it remembers the last fired wake (its normalized command text)
+/// and a tick countdown, skipping a detection that matches the remembered one while the countdown is
+/// live. A DIFFERENT command, or the SAME command after the window lapses, fires again — so one
+/// spoken wake = one dispatch, but a fresh ask later in the same recording still catches.
+///
+/// Pure + stateful — held by the live loop, advanced once per tick via [`Self::tick`] and consulted
+/// per wake hit via [`Self::should_fire`]. No I/O. Headless-testable.
+#[derive(Default)]
+struct WakeDedup {
+    /// The normalized command of the last FIRED wake, while it is still suppressing repeats.
+    last: Option<String>,
+    /// Ticks remaining before `last` stops suppressing a matching repeat (0 = no active suppression).
+    cooldown: u32,
+}
+
+impl WakeDedup {
+    /// Advance one live tick: age out an expired suppression window. Call once per loop iteration,
+    /// BEFORE the wake check, so the countdown reflects ticks elapsed since the last fire.
+    fn tick(&mut self) {
+        if self.cooldown > 0 {
+            self.cooldown -= 1;
+            if self.cooldown == 0 {
+                self.last = None;
+            }
+        }
+    }
+
+    /// Decide whether a wake hit with normalized command `cmd` should FIRE (dispatch+emit) on this
+    /// tick. Fires when it is a NEW/different command, or the suppression window for the same command
+    /// has lapsed. On a fire it arms the suppression window ([`WAKE_DEDUP_TICKS`]); on a suppressed
+    /// repeat it leaves the window untouched (so the cooldown counts from the FIRST fire, not the
+    /// last echo — the overlap of one utterance can't extend the window indefinitely).
+    fn should_fire(&mut self, cmd: &str) -> bool {
+        let key = normalize_command(cmd);
+        if self.cooldown > 0 && self.last.as_deref() == Some(key.as_str()) {
+            return false; // overlapping re-detection of the same just-fired wake → skip.
+        }
+        self.last = Some(key);
+        self.cooldown = WAKE_DEDUP_TICKS;
+        true
+    }
+}
+
+/// Normalize a wake command for dedup comparison: lowercase, collapse whitespace, drop surrounding
+/// punctuation. So the SAME utterance transcribed with slightly different trailing punctuation /
+/// spacing / casing across overlapping tails still compares equal and is de-duplicated.
+fn normalize_command(cmd: &str) -> String {
+    cmd.to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Spawn the live-caption loop for the current recording. Returns immediately; the loop
@@ -46,8 +112,14 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         }
     };
 
+    // DEDUP state for the wake trigger (#23): detect_wake now fires ANYWHERE in the overlapping tail,
+    // so without this the same spoken wake re-fires every tick it stays visible. Lives across ticks.
+    let mut wake_dedup = WakeDedup::default();
+
     loop {
         std::thread::sleep(TICK);
+        // Age out an expired wake-suppression window once per tick (before this tick's wake check).
+        wake_dedup.tick();
 
         // Snapshot the recent tail; stop as soon as the recording is gone.
         let snapshot = {
@@ -141,7 +213,15 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                     // that needs the local brain in a later phase). Best-effort + panic-free: the
                     // detection is a pure function and the emit error is ignored, so a wake miss/hit
                     // can NEVER disrupt the caption or the authoritative record/transcribe flow.
-                    if let Some(payload) = wake_event_for(&text) {
+                    // DEDUP (#23): the rolling tail OVERLAPS, so a single spoken "Klaudku …" is
+                    // visible for several ticks and `detect_wake` (now firing anywhere) would re-hit
+                    // it each tick. `should_fire` collapses those overlapping re-detections of the
+                    // SAME command into ONE dispatch, while a DIFFERENT command — or the same one
+                    // after the suppression window lapses — still fires. Skipped repeats produce
+                    // neither a dispatch nor an `EVENT_WAKE_DETECTED`, but the caption still emits.
+                    if let Some(payload) =
+                        wake_event_for(&text).filter(|p| wake_dedup.should_fire(&p.command))
+                    {
                         // PII rule (§8): NEVER log the spoken command text — only the
                         // non-PII wake token and a coarse intent KIND (variant
                         // discriminant, no content). The full payload goes to the FE
@@ -658,6 +738,82 @@ mod tests {
         assert_eq!(p.matched_phrase, "klodku");
         assert_eq!(p.command, "zrób research o konkurencji");
         assert_eq!(p.intent, VoiceIntent::Research { topic: "konkurencji".into() });
+    }
+
+    // ── #23 DEDUP: one spoken wake = one dispatch; a fresh wake later DOES fire ───────────────────
+
+    #[test]
+    fn wake_dedup_collapses_overlapping_repeats_of_the_same_wake() {
+        // The #23 echo: the same "Klaudku zrób research" stays visible across several overlapping
+        // ~14s tails. The FIRST tick fires; the next ticks (within the window) are SKIPPED.
+        let mut d = WakeDedup::default();
+        assert!(d.should_fire("zrób research o konkurencji"), "first detection must fire");
+        for _ in 0..WAKE_DEDUP_TICKS - 1 {
+            d.tick();
+            assert!(
+                !d.should_fire("zrób research o konkurencji"),
+                "an overlapping re-detection of the SAME command within the window must be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_dedup_normalizes_punctuation_and_case_across_tails() {
+        // The same utterance re-transcribed with different trailing punctuation / casing across
+        // overlapping tails still compares equal and is de-duplicated.
+        let mut d = WakeDedup::default();
+        assert!(d.should_fire("zrób research o konkurencji"));
+        d.tick();
+        assert!(
+            !d.should_fire("Zrób research o konkurencji."),
+            "case/punctuation-only differences must still dedup as the same command"
+        );
+    }
+
+    #[test]
+    fn wake_dedup_allows_a_different_command_immediately() {
+        // RECALL: a DIFFERENT wake command in the same recording must fire right away, even while the
+        // previous one's suppression window is still live (the user's "to ma zawsze łapać").
+        let mut d = WakeDedup::default();
+        assert!(d.should_fire("zrób research o konkurencji"), "first command fires");
+        d.tick();
+        assert!(
+            d.should_fire("co wiemy o atlasie"),
+            "a fresh, different command must fire even within the prior window"
+        );
+    }
+
+    #[test]
+    fn wake_dedup_allows_the_same_command_again_after_the_window_lapses() {
+        // The user genuinely asks the SAME thing again, later. Once the suppression window has fully
+        // aged out, the same command fires again — dedup suppresses the echo, not a real re-ask.
+        let mut d = WakeDedup::default();
+        assert!(d.should_fire("zrób research o konkurencji"), "first ask fires");
+        for _ in 0..WAKE_DEDUP_TICKS {
+            d.tick();
+        }
+        assert!(
+            d.should_fire("zrób research o konkurencji"),
+            "after the window lapses the same command must be allowed to fire again"
+        );
+    }
+
+    #[test]
+    fn wake_dedup_window_counts_from_the_first_fire_not_the_last_echo() {
+        // A suppressed echo must NOT re-arm the window, else a long overlap would suppress forever.
+        let mut d = WakeDedup::default();
+        assert!(d.should_fire("zrób research"), "first fire arms the window");
+        // Echo once mid-window: suppressed, and must not extend the cooldown.
+        d.tick();
+        assert!(!d.should_fire("zrób research"), "echo suppressed");
+        // Age out the REMAINDER of the window counted from the FIRST fire.
+        for _ in 0..WAKE_DEDUP_TICKS - 1 {
+            d.tick();
+        }
+        assert!(
+            d.should_fire("zrób research"),
+            "the window must expire on schedule from the first fire, not be extended by echoes"
+        );
     }
 
     #[test]
