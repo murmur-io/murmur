@@ -17,6 +17,7 @@ pub mod storage;
 pub mod summarize;
 pub mod tools;
 pub mod transcribe;
+pub mod voice_action;
 
 use tauri::window::{Effect, EffectsBuilder};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};

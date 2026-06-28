@@ -150,6 +150,15 @@ pub struct AppConfig {
     /// existed loads as `Cloud`. See [`BrainBackend`].
     #[serde(default)]
     pub brain_backend: BrainBackend,
+    /// Phase E (Flow B) — the in-meeting VOICE ACTION DISPATCH master gate. When ON, a wake-word
+    /// hit in a live caption ("Claudku, zrób research o X") DISPATCHES the parsed action against the
+    /// gated vault (research/recall/reminder/note) and emits a live result. OPT-IN, default OFF
+    /// (`#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`):
+    /// the always-on in-meeting assistant is a privacy + surprise-egress decision — a wake
+    /// false-fire must never silently trigger a cloud call or a mid-meeting action. With it OFF the
+    /// live loop behaves EXACTLY as before (wake detected + surfaced, NO dispatch).
+    #[serde(default)]
+    pub realtime_reactions: bool,
 }
 
 impl Default for AppConfig {
@@ -184,6 +193,7 @@ impl Default for AppConfig {
             brain_model_path: None,
             brain_model_id: None,
             brain_backend: BrainBackend::default(),
+            realtime_reactions: false,
         }
     }
 }
@@ -218,6 +228,7 @@ const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
 const K_BRAIN_BACKEND: &str = "brain_backend";
+const K_REALTIME_REACTIONS: &str = "realtime_reactions";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -317,6 +328,9 @@ impl AppConfig {
                 cfg.brain_backend = BrainBackend::from_str_or_default(&v);
             }
         }
+        if let Some(v) = db.get_setting(K_REALTIME_REACTIONS)? {
+            cfg.realtime_reactions = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -401,6 +415,10 @@ impl AppConfig {
             self.brain_model_id.as_deref().unwrap_or(""),
         )?;
         db.set_setting(K_BRAIN_BACKEND, self.brain_backend.as_str())?;
+        db.set_setting(
+            K_REALTIME_REACTIONS,
+            if self.realtime_reactions { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -556,6 +574,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dto.brain_backend, BrainBackend::Off);
+    }
+
+    #[test]
+    fn realtime_reactions_defaults_off_and_round_trips() {
+        let db = temp_db();
+        // Absent key ⇒ OFF (opt-in; the always-on in-meeting assistant must never default on).
+        assert!(!AppConfig::load(&db).unwrap().realtime_reactions);
+        let cfg = AppConfig {
+            realtime_reactions: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(AppConfig::load(&db).unwrap().realtime_reactions);
     }
 
     #[test]
