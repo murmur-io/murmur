@@ -104,6 +104,7 @@ impl VoiceActionResult {
 /// "pogoda"), NOT a brain-translated/normalized topic that the exact-term FTS would miss. The brain
 /// topic is still used for SYNTHESIS + as an additional retrieval leg; the literal terms are the
 /// must-have. Empty/whitespace falls back to the intent topic alone.
+#[allow(clippy::too_many_arguments)] // cohesive dispatch surface: intent + gated state + the AppHandle.
 pub fn handle_voice_action(
     intent: &VoiceIntent,
     reasoner: &dyn LocalReasoner,
@@ -112,13 +113,14 @@ pub fn handle_voice_action(
     config: &AppConfig,
     meeting_id: &str,
     literal_command: &str,
+    app: Option<&tauri::AppHandle>,
 ) -> VoiceActionResult {
     match intent {
         VoiceIntent::Research { topic } => {
-            rag_answer("research", topic, literal_command, reasoner, db, unlocked, config)
+            rag_answer("research", topic, literal_command, reasoner, db, unlocked, config, app)
         }
         VoiceIntent::Recall { entity } => {
-            rag_answer("recall", entity, literal_command, reasoner, db, unlocked, config)
+            rag_answer("recall", entity, literal_command, reasoner, db, unlocked, config, app)
         }
         VoiceIntent::CreateReminder { text, due } => {
             let text = text.trim();
@@ -251,6 +253,7 @@ fn retrieval_queries(topic: &str, literal_command: &str) -> Vec<String> {
 /// RETRIEVAL keys off the user's LITERAL terms first (see [`retrieval_queries`]) so same-language
 /// recall works (Polish query ↔ Polish note); the brain `topic` is still used for the answer
 /// SYNTHESIS prompt.
+#[allow(clippy::too_many_arguments)] // cohesive RAG surface: topic/literal + gated state + AppHandle.
 fn rag_answer(
     intent_kind: &str,
     topic: &str,
@@ -259,6 +262,7 @@ fn rag_answer(
     db: &Db,
     unlocked: &HashSet<String>,
     config: &AppConfig,
+    app: Option<&tauri::AppHandle>,
 ) -> VoiceActionResult {
     let topic = topic.trim();
     if topic.is_empty() && literal_command.trim().is_empty() {
@@ -355,6 +359,48 @@ fn rag_answer(
             }
         }
     }
+    // CALENDAR LEG (LOCAL, on-device — NO egress, NEVER consent-gated): when the request reads like a
+    // calendar/meeting question ("who's in my next meeting", "what's on my agenda"), ALSO pull the
+    // user's local calendar context and fold its LOUD, source-labelled hits into the grounding. It is
+    // INTENT-GATED (not fired on every research) so a plain "what's the weather" doesn't drag in
+    // calendar noise. Requires an `AppHandle` to drive the bundled EventKit sidecar; when none is in
+    // scope (headless tests) the leg is simply skipped. `fetch_events` degrades to empty on ANY
+    // failure (denied Calendars permission, missing sidecar), so the deterministic vault floor stays
+    // intact and the brain call is unaffected when calendar is empty/unavailable.
+    let mut calendar_lines: Vec<String> = Vec::new();
+    if let Some(app) = app {
+        let cal_query = if !topic.is_empty() {
+            topic.to_string()
+        } else {
+            literal_command.trim().to_string()
+        };
+        if wants_calendar(&cal_query, literal_command) {
+            match calendar_search_blocking(&cal_query, app) {
+                Ok(text) => {
+                    let text = text.trim();
+                    if !text.is_empty() && !is_empty_tool_result(text) {
+                        // Capture the loud "[calendar] …" lines for citations, and add to grounding.
+                        for line in text.lines() {
+                            if line.trim_start().starts_with("[calendar]") {
+                                calendar_lines.push(line.to_string());
+                            }
+                        }
+                        if !grounding.is_empty() {
+                            grounding.push_str("\n\n");
+                        }
+                        grounding.push_str(text);
+                        grounding.push_str("\n\n");
+                    }
+                }
+                // A calendar failure is non-fatal — the vault (+ web) grounding still answers.
+                Err(e) => tracing::debug!(
+                    target: "voice",
+                    error = %e,
+                    "voice-action calendar lookup failed; continuing with vault grounding"
+                ),
+            }
+        }
+    }
     let grounding = grounding.trim();
 
     // CITATIONS: derived from a GATED `search_visible` over the SAME live unlocked set — every hit
@@ -393,6 +439,14 @@ fn rag_answer(
     // `[[Title]]` vault wikilinks.
     for line in &web_lines {
         if let Some(c) = web_citation_from_line(line) {
+            push_cite(c);
+        }
+    }
+    // CALENDAR citations: each loud "[calendar] Title — …" line becomes a "(calendar) Title"
+    // citation, so the card visibly attributes the calendar-sourced context (LOUD). Kept distinct
+    // from the `[[Title]]` vault wikilinks and the "(web) …" web citations.
+    for line in &calendar_lines {
+        if let Some(c) = calendar_citation_from_line(line) {
             push_cite(c);
         }
     }
@@ -502,6 +556,61 @@ fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<
     })
 }
 
+/// INTENT GATE for the calendar leg: does this request read like a calendar/meeting question? We
+/// fire the local calendar lookup ONLY for these — so a plain "what's the weather" research never
+/// drags in calendar noise, while "who's in my next meeting" / "what's on my agenda" / "kto jest na
+/// spotkaniu" do. Case-insensitive substring match over a small bilingual (EN/PL) keyword set,
+/// checked against BOTH the brain topic and the user's literal command. Deterministic, no regex.
+fn wants_calendar(topic: &str, literal_command: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        // English
+        "calendar", "meeting", "meetings", "agenda", "next meeting", "who's in", "who is in",
+        "attendee", "attendees", "schedule", "scheduled", "appointment", "invite",
+        // Polish
+        "kalendarz", "spotkanie", "spotkania", "spotkaniu", "agenda", "kto jest", "uczestnik",
+        "uczestnicy", "harmonogram", "termin",
+    ];
+    let hay = format!("{} {}", topic.to_lowercase(), literal_command.to_lowercase());
+    KEYWORDS.iter().any(|k| hay.contains(k))
+}
+
+/// Run the async LOCAL-CALENDAR connector to completion from this SYNCHRONOUS dispatch (the live loop
+/// spawns `handle_voice_action` off-thread). Mirrors [`web_search_blocking`]: a dedicated scoped OS
+/// thread with its own current-thread runtime, so we never "start a runtime within a runtime" and the
+/// future never crosses a thread boundary (only the `Result<String>` does). NO egress — the calendar
+/// read is on-device — and `fetch_events` degrades to empty on every failure inside
+/// `execute_calendar_search`.
+fn calendar_search_blocking(
+    query: &str,
+    app: &tauri::AppHandle,
+) -> crate::error::Result<String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Summarize(format!("calendar runtime build: {e}")))?;
+                rt.block_on(crate::tools::execute_calendar_search(query, app))
+            })
+            .join()
+            .map_err(|_| AppError::Summarize("calendar worker thread panicked".into()))?
+    })
+}
+
+/// Turn a loud calendar grounding line `[calendar] Title — <context block>` into a compact citation
+/// `(calendar) Title`. Returns `None` for a non-calendar line. Deterministic, no regex.
+fn calendar_citation_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let rest = line.strip_prefix("[calendar]")?.trim();
+    // Title is everything up to the first " — " (the context-block separator).
+    let title = rest.split(" — ").next().unwrap_or(rest).trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(format!("(calendar) {title}"))
+}
+
 /// Turn a loud web grounding line `- [web · Brave] Title — snippet (https://…)` into a compact
 /// citation `(web) Title — https://…`. Returns `None` for a non-web line. Deterministic, no regex.
 fn web_citation_from_line(line: &str) -> Option<String> {
@@ -544,6 +653,7 @@ fn is_empty_tool_result(text: &str) -> bool {
         || t.starts_with("Semantic search is disabled")
         || t.starts_with("No web results")
         || t.starts_with("Web search is not available")
+        || t.starts_with("No calendar events")
 }
 
 /// Pull distinct `[[Title]]` wikilinks out of the gated tool grounding text, in first-seen order.
@@ -748,6 +858,7 @@ mod tests {
             &cfg,
             "live-mtg",
             "",
+            None,
         );
 
         assert_eq!(res.intent_kind, "research");
@@ -786,6 +897,7 @@ mod tests {
             &AppConfig::default(),
             "live-mtg",
             "",
+            None,
         );
         assert_eq!(res.intent_kind, "recall");
         assert_eq!(res.status, "ok");
@@ -806,6 +918,7 @@ mod tests {
             &AppConfig::default(),
             "live-mtg",
             "",
+            None,
         );
         assert_eq!(res.status, "ok");
         assert!(res.summary.contains("couldn't find"));
@@ -837,6 +950,7 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            None,
         );
         assert_eq!(res.intent_kind, "note_aside");
         assert_eq!(res.status, "ok");
@@ -859,6 +973,7 @@ mod tests {
             &AppConfig::default(),
             "sealed1",
             "",
+            None,
         );
         assert_eq!(res.status, "error");
         assert!(db.list_note_asides("sealed1").unwrap().is_empty(), "no aside written to a sealed meeting");
@@ -876,6 +991,7 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            None,
         );
         assert_eq!(res.intent_kind, "slack_search");
         assert_eq!(res.status, "unavailable");
@@ -893,6 +1009,7 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            None,
         );
         assert_eq!(res.status, "unrecognized");
         assert!(!res.summary.contains("secret-thing"), "raw command must not be echoed back");
@@ -912,6 +1029,7 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            None,
         );
         assert_eq!(res.status, "error");
         assert!(!res.summary.contains("boom internal detail"), "internal error detail must not leak");
@@ -932,6 +1050,7 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            None,
         );
         assert_eq!(res.status, "needs_consent");
         // Gated citations are still useful even when the brain can't run.
@@ -1006,6 +1125,45 @@ mod tests {
         assert_eq!(cites, vec!["[[One]]".to_string(), "[[Two]]".to_string()]);
     }
 
+    // ── CALENDAR connector leg: intent gate + loud citation extraction (headless, NO EventKit) ─────
+
+    #[test]
+    fn wants_calendar_fires_only_on_calendar_meeting_intent() {
+        // EN + PL calendar/meeting phrasings fire the leg.
+        assert!(wants_calendar("who's in my next meeting", "who's in my next meeting"));
+        assert!(wants_calendar("what's on my agenda", ""));
+        assert!(wants_calendar("", "kto jest na spotkaniu"));
+        assert!(wants_calendar("kalendarz na dziś", ""));
+        // A plain research question does NOT fire it (no calendar noise on "weather").
+        assert!(!wants_calendar("what's the weather in Kraków", "jaka jest pogoda"));
+        assert!(!wants_calendar("research the Atlas pricing model", ""));
+    }
+
+    #[test]
+    fn calendar_citation_from_line_extracts_title_and_skips_non_calendar() {
+        // A loud "[calendar] Title — <context>" line → "(calendar) Title".
+        let c = calendar_citation_from_line(
+            "[calendar] Sprint Planning — Meeting: Sprint Planning\nAttendees: Alice",
+        );
+        assert_eq!(c, Some("(calendar) Sprint Planning".to_string()));
+        // A title with no context separator still yields a citation.
+        assert_eq!(
+            calendar_citation_from_line("[calendar] 1:1"),
+            Some("(calendar) 1:1".to_string())
+        );
+        // A non-calendar line is ignored.
+        assert!(calendar_citation_from_line("- [web · Brave] Weather — Sunny").is_none());
+    }
+
+    #[test]
+    fn is_empty_tool_result_matches_calendar_sentinel() {
+        // The calendar "nothing found" sentinels are filtered out of the grounding.
+        assert!(is_empty_tool_result("No calendar events match \"standup\"."));
+        assert!(is_empty_tool_result("No calendar events in the window."));
+        // A real calendar block is NOT a sentinel.
+        assert!(!is_empty_tool_result("[calendar] Sprint Planning — Meeting: Sprint Planning"));
+    }
+
     // ── FIX 1: cross-lingual RETRIEVAL uses the user's LITERAL terms, not the brain topic ─────────
 
     #[test]
@@ -1071,6 +1229,7 @@ mod tests {
             &cfg,
             "live-mtg",
             "jaka była pogoda",
+            None,
         );
         assert_eq!(res.status, "ok");
         assert!(
@@ -1100,6 +1259,7 @@ mod tests {
             &cfg,
             "live-mtg",
             "",
+            None,
         );
         assert_eq!(res2.status, "ok");
         assert!(
