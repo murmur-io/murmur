@@ -812,10 +812,12 @@ impl Db {
         // Always purge this meeting's prior rows first (clean replace), then insert the fresh set in
         // ONE transaction. A meeting with a now-empty note simply ends up with zero chunks.
         let provider_id = note.provider_id.clone();
+        // DOCUMENT side: chunks are passages → use the e5 `passage:` prefix convention. The stub
+        // ignores the prefix; the real CandleBertEmbedder needs it for retrieval recall.
         let vectors = if chunks.is_empty() {
             Vec::new()
         } else {
-            embedder.embed(&chunks)?
+            embedder.embed_passage(&chunks)?
         };
 
         let this_meeting = [meeting_id.to_string()];
