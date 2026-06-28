@@ -1251,6 +1251,10 @@ export class OnboardingComponent implements OnInit {
       whisperModelPath: base?.whisperModelPath ?? null,
       language: this.language() || null,
       anthropicModel: base?.anthropicModel ?? "claude-opus-4-8",
+      // Brain/AI model + effort overrides — preserve-only here (the Settings panel owns
+      // the pickers); send the snapshot back unchanged so onboarding never clobbers them.
+      providerModel: base?.providerModel ?? "",
+      providerEffort: base?.providerEffort ?? "",
       ollamaBaseUrl: base?.ollamaBaseUrl ?? "http://localhost:11434",
       ollamaModel: base?.ollamaModel ?? "llama3.1",
       claudeBinary: base?.claudeBinary ?? "claude",
