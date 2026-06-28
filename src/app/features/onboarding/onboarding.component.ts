@@ -1281,6 +1281,10 @@ export class OnboardingComponent implements OnInit {
       brainModelId: base?.brainModelId ?? null,
       // brain2 RAG — semantic-search master flag; round-trip the snapshot, default off.
       semanticSearchEnabled: base?.semanticSearchEnabled ?? false,
+      // brain2 connectors — web-search toggle + its preserve-only consent; round-trip
+      // the snapshot so onboarding never resets them, both default off (no egress).
+      webSearchEnabled: base?.webSearchEnabled ?? false,
+      webSearchConsented: base?.webSearchConsented ?? false,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.
