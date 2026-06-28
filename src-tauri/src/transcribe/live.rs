@@ -93,26 +93,32 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                     .join(" ")
                     .trim()
                     .to_string();
-                // MANUAL voice-command capture (the button trigger) — checked EVERY tick,
-                // independent of the wake path and independent of `realtime_reactions`. When the
-                // user has clicked "ask the assistant" the freshly-transcribed tail IS the command:
-                // no wake word, no word-order requirement. We decide per tick whether to dispatch
-                // now (a recognized intent OR the tick budget is spent) or keep listening. Best-effort
-                // + panic-free: a poisoned lock or empty tail simply leaves the capture armed; the
-                // dispatch runs off-thread exactly like the wake path. NOTE: an EMPTY tail still
-                // counts down the budget so a silent capture can't hang forever.
+                // MANUAL voice-command capture (the button trigger) — CLICK-TO-STOP, checked EVERY
+                // tick, independent of the wake path and independent of `realtime_reactions`. When the
+                // user has clicked "ask the assistant" the growing post-click window IS the command:
+                // no wake word, no word-order requirement. We ACCUMULATE it tick by tick and keep
+                // listening until the user clicks "stop" (`end_voice_command` → dispatch the FULL
+                // utterance) — only a generous backstop cap forces an end so it can't listen forever.
+                // Best-effort + panic-free: a poisoned lock or empty tail simply leaves the capture
+                // armed; the dispatch runs off-thread exactly like the wake path.
                 if let Some(decision) =
                     step_manual_capture(&app, &transcriber, lang.as_deref(), &text)
                 {
                     match decision {
                         ManualCaptureDecision::Dispatch { command } => {
-                            // Resolve (keyword → brain → fallback) + dispatch OFF the tick, with the
-                            // heard command surfaced onto the result for the FE card.
-                            spawn_command_dispatch(app.clone(), command);
+                            // Capture ENDED (user stop click OR the backstop cap) with a real
+                            // utterance → stop "listening", show "thinking…", then resolve (keyword →
+                            // brain → fallback) + dispatch the FULL accumulated command OFF the tick.
+                            // PROCESSING is cleared by EVENT_VOICE_ACTION_RESULT when the answer lands.
                             let _ = app.emit(
                                 crate::events::EVENT_VOICE_COMMAND_LISTENING,
                                 crate::events::VoiceCommandListeningPayload { active: false },
                             );
+                            let _ = app.emit(
+                                crate::events::EVENT_VOICE_COMMAND_PROCESSING,
+                                crate::events::VoiceCommandProcessingPayload { active: true },
+                            );
+                            spawn_command_dispatch(app.clone(), command);
                         }
                         ManualCaptureDecision::NothingHeard => {
                             // Budget expired with nothing heard → graceful, NOT a confusing
@@ -342,13 +348,18 @@ fn spawn_command_dispatch(app: AppHandle, command: String) {
 /// What the live loop should do with the MANUAL voice-command capture on this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManualCaptureDecision {
-    /// A NON-EMPTY command was captured (real speech heard since the click) → resolve + dispatch it
-    /// (keyword fast-path, else brain interpret, else keyword fallback) and clear the capture.
+    /// The capture is DONE (the user clicked stop, OR the backstop cap was reached) AND the
+    /// accumulated post-click utterance is a real (non-empty, meaningful) command → resolve +
+    /// dispatch it (keyword fast-path, else brain interpret, else keyword fallback) and clear the
+    /// capture. Carries the FULL accumulated utterance, not a per-tick fragment.
     Dispatch { command: String },
-    /// Nothing heard yet but budget remains → keep the capture armed and wait for the next tick.
+    /// Still listening (the user has not stopped and the backstop cap is not yet reached) → keep the
+    /// capture armed, ACCUMULATING the growing post-click window, and wait for the next tick / the
+    /// user's stop click. Does NOT dispatch on hearing speech (CLICK-TO-STOP).
     KeepListening,
-    /// The whole budget expired with NOTHING heard (the user never spoke) → clear the capture and
-    /// surface a graceful "nothing_heard". NEVER dispatches an empty command.
+    /// The capture ended (user stop OR backstop) with NOTHING meaningful heard (the user never spoke,
+    /// or only silence/filler) → clear the capture and surface a graceful "nothing_heard". NEVER
+    /// dispatches an empty command.
     NothingHeard,
 }
 
@@ -358,12 +369,14 @@ enum ManualCaptureDecision {
 /// rolling 14s tail. Falls back to the rolling-tail `caption` text only when no offset was latched
 /// (degenerate arm path). Returns `None` when no manual capture is armed (the common case).
 ///
-/// When a capture IS armed it mutates the budget in place and returns the [`ManualCaptureDecision`],
-/// CLEARING the capture state on dispatch / nothing-heard (so exactly one outcome fires per click).
+/// When a capture IS armed it decrements the backstop budget in place and returns the
+/// [`ManualCaptureDecision`], CLEARING the capture state on dispatch / nothing-heard (so exactly one
+/// outcome fires per capture). CLICK-TO-STOP: it returns `Dispatch` only when the user has ended the
+/// capture (`ended`) or the backstop cap was reached — never merely on hearing speech.
 /// Best-effort + panic-free: a poisoned lock is treated as "no capture" (`None`).
 ///
-/// The transcription of the post-click window + the dispatch/emit are the caller's job (off the
-/// tick); the budget arithmetic + the no-empty guard are the pure [`decide_manual_capture`].
+/// The transcription of the GROWING post-click window + the dispatch/emit are the caller's job (off
+/// the tick); the backstop arithmetic + the no-empty guard are the pure [`decide_manual_capture`].
 fn step_manual_capture(
     app: &AppHandle,
     transcriber: &Transcriber,
@@ -524,42 +537,49 @@ fn is_meaningful_command(command: &str) -> bool {
     meaningful_tokens >= 2 || non_filler_chars >= 8
 }
 
-/// PURE, headless-testable core of the manual-capture step. Given the armed [`CaptureState`] and the
-/// `command` heard SINCE the click (the post-click window's transcript), decide the outcome and the
-/// NEXT capture state (`None` = cleared on a terminal outcome, `Some(decremented)` while listening).
+/// PURE, headless-testable core of the manual-capture step (CLICK-TO-STOP). Given the armed
+/// [`CaptureState`] and the FULL `command` accumulated SINCE the click (the growing post-click
+/// window's transcript), decide the outcome and the NEXT capture state (`None` = cleared on a
+/// terminal outcome, `Some(decremented)` while still listening).
 ///
-/// Rules (no wake word — the WHOLE post-click utterance is the command; NEVER dispatch empty):
-/// 1. If the command is NON-EMPTY (real speech heard) → `Dispatch{command}` now and clear the
-///    capture. The caller resolves it (keyword → brain → keyword fallback) and dispatches it with the
-///    heard command surfaced.
-/// 2. Else (silence this tick) → spend one tick of budget:
-///    - budget still > 0 → KEEP LISTENING (give the user time to start/finish speaking).
-///    - budget now == 0 → `NothingHeard`: clear the capture and surface a graceful "nothing_heard".
-///      The capture can never hang AND it never dispatches an empty/Unknown command.
+/// The capture ENDS only when the user clicked stop (`capture.ended == true`) OR the backstop cap is
+/// reached (`budget` hits 0) — NOT on merely hearing speech. Until then we KEEP LISTENING so the user
+/// can finish their whole question without being cut off mid-sentence. Rules (no wake word — the WHOLE
+/// post-click utterance is the command; NEVER dispatch empty):
+/// 1. The capture is DONE (`ended` set by the user's stop click, OR `budget` exhausted = backstop):
+///    - accumulated command is meaningful → `Dispatch{command}` with the FULL utterance, clear.
+///    - else (silent / pure filler) → `NothingHeard`, clear (graceful, never an empty dispatch).
+/// 2. Still going (not ended, backstop not reached) → spend one tick of the backstop budget and
+///    `KeepListening` (keep accumulating). On a non-`ended` capture this is the common path even when
+///    real speech is heard — we wait for the user's stop click, only the backstop forces an end.
 ///
-/// No I/O, no FFI, no egress — just emptiness check + arithmetic.
+/// No I/O, no FFI, no egress — just the meaningfulness check + arithmetic.
 fn decide_manual_capture(
     capture: crate::state::CaptureState,
     command: &str,
 ) -> (ManualCaptureDecision, Option<crate::state::CaptureState>) {
     let command = command.trim();
-    // GARBAGE FILTER: a too-short / pure-filler clip ("Uh,", "eee", "hmm", a lone char or
-    // punctuation) is NOT a real command — Whisper emits these for a ~3s silent/noise clip. Treat
-    // it exactly like a silent tick (KEEP LISTENING / NOTHING_HEARD at budget end) rather than
-    // dispatching a Research on "Uh,". The user gets a clean "nothing_heard", never a garbage card.
-    if !command.is_empty() && is_meaningful_command(command) {
-        // Real speech heard since the click → dispatch it, clear the capture.
-        return (
-            ManualCaptureDecision::Dispatch { command: command.to_string() },
-            None,
-        );
-    }
-    // Silence OR garbage/filler this tick: spend one tick of budget.
+    // Spend one tick of the backstop budget; 0 means the safety cap is now reached this tick.
     let remaining = capture.budget.saturating_sub(1);
-    if remaining == 0 {
-        // Budget exhausted with nothing ever heard → graceful give-up, clear the capture.
-        (ManualCaptureDecision::NothingHeard, None)
+    let backstop_reached = remaining == 0;
+
+    // The capture is DONE when the user clicked stop OR the backstop cap is reached.
+    if capture.ended || backstop_reached {
+        // GARBAGE FILTER: a too-short / pure-filler accumulation ("Uh,", "eee", "hmm", a lone char or
+        // punctuation) is NOT a real command — Whisper emits these for a silent/noise clip. Treat it
+        // as nothing heard rather than dispatching a Research on "Uh,". The user gets a clean
+        // "nothing_heard", never a garbage card.
+        if !command.is_empty() && is_meaningful_command(command) {
+            (
+                ManualCaptureDecision::Dispatch { command: command.to_string() },
+                None,
+            )
+        } else {
+            (ManualCaptureDecision::NothingHeard, None)
+        }
     } else {
+        // Still listening — accumulate the growing window, decrement the backstop, wait for the
+        // user's stop click. We do NOT dispatch on hearing speech (CLICK-TO-STOP).
         (
             ManualCaptureDecision::KeepListening,
             Some(crate::state::CaptureState { budget: remaining, ..capture }),
@@ -672,49 +692,99 @@ mod tests {
     use serde_json::Value;
 
     fn armed(budget: u32) -> CaptureState {
-        CaptureState { budget, start_sample: Some(0) }
+        CaptureState { budget, start_sample: Some(0), ended: false }
+    }
+
+    /// An armed capture the user has CLICKED STOP on (`end_voice_command` flipped `ended`).
+    fn ended(budget: u32) -> CaptureState {
+        CaptureState { budget, start_sample: Some(0), ended: true }
     }
 
     #[test]
-    fn manual_capture_nonempty_command_dispatches_with_the_heard_command_and_clears() {
-        // ANY non-empty post-click utterance is dispatched, carrying the heard command verbatim.
-        let cap = armed(5);
-        let (decision, next) = decide_manual_capture(cap, "  zrób research o konkurencji  ");
+    fn manual_capture_still_listening_does_not_dispatch_on_hearing_speech() {
+        // CLICK-TO-STOP: hearing a real, meaningful utterance while NOT ended (and under the backstop)
+        // must KEEP LISTENING — the user controls when they're done, not a per-tick auto-dispatch.
+        let cap = armed(20);
+        let (decision, next) = decide_manual_capture(cap, "Więc tak, zrób web");
         assert_eq!(
             decision,
-            ManualCaptureDecision::Dispatch { command: "zrób research o konkurencji".into() },
-            "a non-empty command must dispatch with the heard (trimmed) command"
+            ManualCaptureDecision::KeepListening,
+            "a non-ended capture must keep accumulating, not cut the user off mid-question"
+        );
+        assert_eq!(
+            next,
+            Some(CaptureState { budget: 19, start_sample: Some(0), ended: false }),
+            "a listening tick decrements the backstop and keeps the latched offset + ended flag"
+        );
+    }
+
+    #[test]
+    fn manual_capture_end_click_dispatches_full_accumulated_utterance_and_clears() {
+        // The user clicked STOP (`ended`) with a full accumulated utterance → dispatch the WHOLE
+        // trimmed command, clear the capture. This is the primary end of a CLICK-TO-STOP capture.
+        let cap = ended(15);
+        let (decision, next) =
+            decide_manual_capture(cap, "  Więc tak, zrób web research o konkurencji  ");
+        assert_eq!(
+            decision,
+            ManualCaptureDecision::Dispatch {
+                command: "Więc tak, zrób web research o konkurencji".into()
+            },
+            "the user's stop click must dispatch the FULL accumulated (trimmed) utterance"
         );
         assert!(next.is_none(), "capture must be cleared after a dispatch");
     }
 
     #[test]
+    fn manual_capture_backstop_cap_dispatches_a_real_utterance_as_a_backstop() {
+        // No stop click, but the backstop cap is reached (budget hits 0 this tick) with a real
+        // utterance accumulated → auto-stop + dispatch so the capture can't listen forever.
+        let cap = armed(1); // this tick takes budget 1 → 0 = backstop reached
+        let (decision, next) = decide_manual_capture(cap, "zrób research o konkurencji");
+        assert_eq!(
+            decision,
+            ManualCaptureDecision::Dispatch { command: "zrób research o konkurencji".into() },
+            "reaching the backstop cap with a real utterance must dispatch it (backstop)"
+        );
+        assert!(next.is_none(), "capture cleared at the backstop");
+    }
+
+    #[test]
+    fn manual_capture_end_click_on_silent_capture_is_nothing_heard_not_empty_dispatch() {
+        // The NO-EMPTY-DISPATCH guarantee: the user clicked stop but nothing was ever heard → graceful
+        // NothingHeard, NEVER an empty Unknown dispatch.
+        let (d, n) = decide_manual_capture(ended(15), "");
+        assert_eq!(
+            d,
+            ManualCaptureDecision::NothingHeard,
+            "an ended-but-silent capture must terminate as NothingHeard, never an empty dispatch"
+        );
+        assert!(n.is_none(), "capture must be cleared once it gives up");
+    }
+
+    #[test]
+    fn manual_capture_backstop_with_nothing_heard_is_nothing_heard() {
+        // No stop click, backstop reached, nothing ever heard → NothingHeard (graceful), never empty.
+        let (d, n) = decide_manual_capture(armed(1), "   ");
+        assert_eq!(
+            d,
+            ManualCaptureDecision::NothingHeard,
+            "the backstop with a fully-silent capture must give up gracefully"
+        );
+        assert!(n.is_none(), "capture cleared at the backstop");
+    }
+
+    #[test]
     fn manual_capture_silent_tick_with_budget_left_keeps_listening_and_decrements() {
-        // An EMPTY post-click window (no speech yet) but budget remains → keep listening, budget −1.
+        // An EMPTY post-click window (no speech yet) but backstop remains → keep listening, budget −1.
         let cap = armed(3);
         let (decision, next) = decide_manual_capture(cap, "   ");
         assert_eq!(decision, ManualCaptureDecision::KeepListening);
         assert_eq!(
             next,
-            Some(CaptureState { budget: 2, start_sample: Some(0) }),
-            "a silent tick must decrement the budget and keep the SAME latched offset"
+            Some(CaptureState { budget: 2, start_sample: Some(0), ended: false }),
+            "a silent tick must decrement the backstop and keep the SAME latched offset + flag"
         );
-    }
-
-    #[test]
-    fn manual_capture_budget_exhausted_silent_is_nothing_heard_not_empty_dispatch() {
-        // The NO-EMPTY-DISPATCH guarantee: a fully-silent capture ends in NothingHeard (graceful),
-        // NEVER an empty Unknown dispatch.
-        let (d1, n1) = decide_manual_capture(armed(2), "");
-        assert_eq!(d1, ManualCaptureDecision::KeepListening);
-        assert_eq!(n1, Some(CaptureState { budget: 1, start_sample: Some(0) }));
-        let (d2, n2) = decide_manual_capture(n1.unwrap(), "");
-        assert_eq!(
-            d2,
-            ManualCaptureDecision::NothingHeard,
-            "a fully-silent capture must terminate as NothingHeard, never an empty dispatch"
-        );
-        assert!(n2.is_none(), "capture must be cleared once it gives up");
     }
 
     #[test]
@@ -726,11 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn manual_capture_default_budget_gives_a_reasonable_window() {
-        // The default arms ~5 ticks (≈15s at the 3s TICK) — comfortable to click then speak.
+    fn manual_capture_default_backstop_is_generous_not_a_felt_cutoff() {
+        // CLICK-TO-STOP: the default backstop must be GENEROUS (~20 ticks ≈ 60s at the 3s TICK) so a
+        // normal-length question never feels cut off — the user's stop click is the primary end, this
+        // is only the can't-listen-forever safety cap.
         assert!(
-            (3..=8).contains(&CaptureState::DEFAULT_BUDGET),
-            "default capture budget should give the user a reasonable window to speak"
+            (15..=30).contains(&CaptureState::DEFAULT_BUDGET),
+            "the backstop cap must be generous (~60s) so it never feels like a cutoff mid-question"
         );
     }
 
@@ -814,29 +886,26 @@ mod tests {
     }
 
     #[test]
-    fn decide_manual_capture_drops_garbage_keeps_listening_then_nothing_heard() {
-        // "Uh," is garbage → treat like a silent tick: KEEP LISTENING (budget −1), NOT a dispatch.
-        let (d1, n1) = decide_manual_capture(armed(2), "Uh,");
-        assert_eq!(d1, ManualCaptureDecision::KeepListening, "garbage must not dispatch");
-        assert_eq!(n1, Some(CaptureState { budget: 1, start_sample: Some(0) }));
-        // A second garbage tick exhausts the budget → NothingHeard (graceful), never a dispatch.
-        let (d2, n2) = decide_manual_capture(n1.unwrap(), "eee");
+    fn decide_manual_capture_end_click_on_garbage_only_is_nothing_heard() {
+        // The user clicked stop but only garbage/filler ("eee") was accumulated → NothingHeard
+        // (graceful), never a garbage Research dispatch.
+        let (d, n) = decide_manual_capture(ended(10), "eee");
         assert_eq!(
-            d2,
+            d,
             ManualCaptureDecision::NothingHeard,
-            "a fully-garbage capture ends as NothingHeard, never a garbage dispatch"
+            "an ended garbage-only capture ends as NothingHeard, never a garbage dispatch"
         );
-        assert!(n2.is_none(), "capture cleared once it gives up");
+        assert!(n.is_none(), "capture cleared once it gives up");
     }
 
     #[test]
-    fn decide_manual_capture_dispatches_a_real_command() {
-        // A genuine command dispatches with the heard (trimmed) command verbatim.
-        let (d, n) = decide_manual_capture(armed(5), "  zrób research o pogodzie  ");
+    fn decide_manual_capture_end_click_dispatches_a_real_command() {
+        // The user clicked stop with a genuine command → dispatch the (trimmed) command verbatim.
+        let (d, n) = decide_manual_capture(ended(15), "  zrób research o pogodzie  ");
         assert_eq!(
             d,
             ManualCaptureDecision::Dispatch { command: "zrób research o pogodzie".into() },
-            "a real command must dispatch"
+            "an ended real command must dispatch"
         );
         assert!(n.is_none(), "capture cleared on dispatch");
     }
