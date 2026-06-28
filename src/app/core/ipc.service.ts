@@ -12,6 +12,8 @@ import type {
   BriefResult,
   BuiltinRecipe,
   CalendarEvent,
+  CalendarEventFull,
+  CalendarContext,
   ChatTurn,
   DigestResult,
   EntityDetail,
@@ -270,6 +272,19 @@ export class IpcService {
   /** Best-effort next macOS Calendar event (title) in the next hour, or null. */
   nextCalendarEvent(): Promise<CalendarEvent | null> {
     return invoke<CalendarEvent | null>("next_calendar_event");
+  }
+
+  /**
+   * Local Calendar events (title + attendees + agenda) in a window around now, via the on-device
+   * EventKit sidecar. Empty array if Calendar access is denied or nothing's scheduled — never throws.
+   */
+  listCalendarEvents(): Promise<CalendarEventFull[]> {
+    return invoke<CalendarEventFull[]>("list_calendar_events");
+  }
+
+  /** Compact calendar context (title + attendees + agenda) for one event, or null if not found. */
+  calendarContextFor(eventId: string): Promise<CalendarContext | null> {
+    return invoke<CalendarContext | null>("calendar_context_for", { eventId });
   }
 
   /** Copy a meeting's recording (WAV) to a chosen path. */

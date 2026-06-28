@@ -428,6 +428,24 @@ export interface CalendarEvent {
   start: string | null;
 }
 
+/** A full local Calendar event from the EventKit sidecar — title + attendees + agenda. */
+export interface CalendarEventFull {
+  id: string;
+  title: string;
+  start: string | null;
+  end: string | null;
+  attendees: string[];
+  notes: string;
+}
+
+/** A compact calendar-context block (title + attendees + agenda) for a meeting. */
+export interface CalendarContext {
+  eventId: string;
+  title: string;
+  attendees: string[];
+  text: string;
+}
+
 export interface BriefResult {
   markdown: string;
   sources: VaultSource[];

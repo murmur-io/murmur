@@ -8,9 +8,10 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarEvent, ChatTurn,
-    Commitment, DigestResult, EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus,
-    MeetingTimeline, NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
+    ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarContext,
+    CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, EntityDetail, Folder,
+    FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, PinResult,
+    RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -1557,6 +1558,40 @@ return out"#;
         .find(|l| !l.is_empty())
         .map(str::to_string);
     Ok(title.map(|title| CalendarEvent { title, start: None }))
+}
+
+/// CALENDAR source (local, zero-OAuth, on-device): list the user's events in a window around now
+/// via the bundled `meetnotes-calendar` EventKit sidecar — title, attendees, agenda. GRACEFUL on
+/// every failure: sidecar missing / Calendar permission denied / timeout / malformed output →
+/// an empty list, never an error, never a block. No network egress: reading the local calendar
+/// stays on device.
+#[tauri::command]
+pub async fn list_calendar_events(app: AppHandle) -> Result<Vec<CalendarEventFull>, AppError> {
+    // Default window: now-1h .. now+12h (60 back, 720 forward minutes).
+    Ok(crate::calendar::fetch_events(&app, 60, 720).await)
+}
+
+/// Build a compact [`CalendarContext`] (title + attendees + agenda) for one event so the existing
+/// pre-meeting brief / note pre-analysis can consume it (the brain already takes context). Looks
+/// the event up by id in the same window the sidecar surfaces. Returns `None` if the event isn't
+/// found (expired from the window, or Calendar access denied) — never an error.
+///
+/// IMPORTANT: the returned text is on-device context. If it is later fed to a CLOUD provider it
+/// MUST ride the existing `make_provider` redaction firewall + consent (the same path the
+/// transcript takes) — this command opens NO new egress path.
+#[tauri::command]
+pub async fn calendar_context_for(
+    app: AppHandle,
+    event_id: String,
+) -> Result<Option<CalendarContext>, AppError> {
+    if event_id.trim().is_empty() {
+        return Err(AppError::InvalidArg("event_id is empty".into()));
+    }
+    let events = crate::calendar::fetch_events(&app, 60, 720).await;
+    Ok(events
+        .iter()
+        .find(|e| e.id == event_id)
+        .map(CalendarContext::from_event))
 }
 
 /// Read current config (settings table), without secrets.
