@@ -1,7 +1,7 @@
 //! Self-assembling knowledge graph: ask the provider to resolve the people and projects in a
 //! meeting note, so each can get a [[Person]] / [[Project]] page in the vault with a backlink.
 
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::summarize::provider::SummarizerProvider;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -33,16 +33,10 @@ pub async fn extract_entities(
 }
 
 fn parse(reply: &str) -> Result<GraphPayload> {
-    let json = match (reply.find('{'), reply.rfind('}')) {
-        (Some(s), Some(e)) if e > s => &reply[s..=e],
-        _ => {
-            return Err(AppError::Summarize(
-                "graph: model did not return JSON".into(),
-            ))
-        }
-    };
-    let mut p: GraphPayload = serde_json::from_str(json)
-        .map_err(|e| AppError::Summarize(format!("graph: invalid JSON ({e})")))?;
+    // Recover the FIRST balanced top-level JSON object via the string/escape-aware extractor in
+    // `reason.rs` instead of the brittle `find('{')..=rfind('}')` slice — the old slice swept up a
+    // stray `}` in trailing prose (or a second object) and then failed to parse a valid reply.
+    let mut p: GraphPayload = crate::reason::parse_first_json(reply)?;
     p.people = clean(p.people);
     p.projects = clean(p.projects);
     Ok(p)
@@ -78,5 +72,17 @@ mod tests {
     #[test]
     fn errors_without_json() {
         assert!(parse("no json").is_err());
+    }
+
+    /// RED-before-GREEN: the OLD `find('{')..=rfind('}')` slice swept up the stray `}` in the
+    /// trailing prose, producing `{…} note: close the }` which `serde_json::from_str` rejected as
+    /// trailing garbage. `parse_first_json` stops at the first balanced object and parses cleanly.
+    /// (Verified RED: reverting `parse` to the rfind slice makes this `unwrap()` panic.)
+    #[test]
+    fn parses_despite_trailing_prose_with_stray_brace() {
+        let r = r#"{"people":["Anna Kowalska"],"projects":["Atlas"]} note: close the } bracket"#;
+        let p = parse(r).unwrap();
+        assert_eq!(p.people, vec!["Anna Kowalska"]);
+        assert_eq!(p.projects, vec!["Atlas"]);
     }
 }
