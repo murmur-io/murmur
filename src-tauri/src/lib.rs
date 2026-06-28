@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod calendar;
 pub mod commands;
+pub mod connectors;
 pub mod crypto;
 pub mod embed;
 pub mod error;
@@ -80,8 +81,11 @@ pub fn run() {
             commands::get_config,
             commands::save_config,
             commands::consent_to_cloud_egress,
+            commands::consent_to_web_search,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
+            commands::set_web_search_api_key,
+            commands::has_web_search_key,
             commands::provider_statuses,
             commands::resummarize,
             commands::list_meetings,

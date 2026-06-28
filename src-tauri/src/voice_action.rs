@@ -314,6 +314,47 @@ fn rag_answer(
             ),
         }
     }
+    // WEB LEG (research about the WORLD): for a `research` intent, if the web connector is exposed
+    // (enabled + consented + keyed), ALSO run a live web search and fold its LOUD, source-labelled
+    // hits into the grounding. This is the brain CHOOSING web vs vault — the vault legs above always
+    // run (so "what do we know about project X" still works); the web leg adds "what's the weather /
+    // who won Y" coverage when the vault has nothing to say. When the connector is not exposed the
+    // call returns a graceful sentinel (no egress) that is filtered out below, so behavior is
+    // unchanged from before for users without web search. Recall (entity dossier) stays vault-only.
+    let mut web_lines: Vec<String> = Vec::new();
+    if intent_kind == "research" {
+        let web_query = if !topic.is_empty() {
+            topic.to_string()
+        } else {
+            literal_command.trim().to_string()
+        };
+        if !web_query.is_empty() {
+            match web_search_blocking(&web_query, config) {
+                Ok(text) => {
+                    let text = text.trim();
+                    if !text.is_empty() && !is_empty_tool_result(text) {
+                        // Capture the loud "[web · …]" lines for citations, and add to grounding.
+                        for line in text.lines() {
+                            if line.trim_start().starts_with("- [") {
+                                web_lines.push(line.to_string());
+                            }
+                        }
+                        if !grounding.is_empty() {
+                            grounding.push_str("\n\n");
+                        }
+                        grounding.push_str(text);
+                        grounding.push_str("\n\n");
+                    }
+                }
+                // A web failure is non-fatal — the vault grounding still answers.
+                Err(e) => tracing::debug!(
+                    target: "voice",
+                    error = %e,
+                    "voice-action web search failed; continuing with vault grounding"
+                ),
+            }
+        }
+    }
     let grounding = grounding.trim();
 
     // CITATIONS: derived from a GATED `search_visible` over the SAME live unlocked set — every hit
@@ -347,6 +388,14 @@ fn rag_answer(
     for c in extract_citations(grounding) {
         push_cite(c);
     }
+    // WEB citations: each loud "- [web · …] Title — … (url)" line becomes a "(web) Title — url"
+    // citation, so the card visibly attributes the web-sourced facts (LOUD). Kept distinct from the
+    // `[[Title]]` vault wikilinks.
+    for line in &web_lines {
+        if let Some(c) = web_citation_from_line(line) {
+            push_cite(c);
+        }
+    }
 
     // No grounding at all → don't burn a brain call; return a clean "nothing found".
     if grounding.is_empty() {
@@ -357,10 +406,14 @@ fn rag_answer(
         );
     }
 
+    // The brain may now ground its answer on BOTH the user's vault notes AND any web results. The
+    // prompt allows web facts (attributed) so a "what's the weather" question the vault can't answer
+    // is still answered from the web leg, while vault-answerable questions stay vault-grounded.
     let system = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
-                  sentences) using ONLY the provided notes from the user's own meeting vault. Cite \
-                  the meetings you used by their [[Title]] wikilink. If the notes don't cover it, \
-                  say so plainly. Do not invent facts.";
+                  sentences) using ONLY the provided context: the user's own meeting notes AND any \
+                  WEB results (lines beginning \"[web\"). Cite vault meetings by their [[Title]] \
+                  wikilink and attribute web facts as \"(via web)\". If the context doesn't cover \
+                  it, say so plainly. Do not invent facts.";
     let user = format!("Request: {display_query}\n\nNotes from the vault:\n{grounding}");
 
     // EGRESS SEAM: a Cloud reasoner routes through make_provider (consent gate + RedactingProvider).
@@ -429,6 +482,54 @@ fn note_aside(
     }
 }
 
+/// Run the async web-search connector to completion from this SYNCHRONOUS dispatch (the live loop
+/// spawns `handle_voice_action` off-thread). Mirrors `reason::block_on_complete`: a dedicated scoped
+/// OS thread with its own current-thread runtime, so we never "start a runtime within a runtime" and
+/// the future never crosses a thread boundary (only the `Result<String>` does). The egress/consent/
+/// redaction discipline all lives inside `execute_web_search` → the connector registry.
+fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Summarize(format!("web search runtime build: {e}")))?;
+                rt.block_on(crate::tools::execute_web_search(query, config))
+            })
+            .join()
+            .map_err(|_| AppError::Summarize("web search worker thread panicked".into()))?
+    })
+}
+
+/// Turn a loud web grounding line `- [web · Brave] Title — snippet (https://…)` into a compact
+/// citation `(web) Title — https://…`. Returns `None` for a non-web line. Deterministic, no regex.
+fn web_citation_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let after_label = line.strip_prefix("- [")?;
+    let close = after_label.find(']')?;
+    let rest = after_label[close + 1..].trim();
+    // Title is everything up to the first " — " (snippet sep) or " (" (url); whichever comes first.
+    let title_end = [rest.find(" — "), rest.find(" (")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(rest.len());
+    let title = rest[..title_end].trim();
+    if title.is_empty() {
+        return None;
+    }
+    // Extract a trailing "(url)" if present.
+    let url = rest
+        .rfind('(')
+        .and_then(|i| rest[i + 1..].strip_suffix(')').map(str::trim))
+        .filter(|u| u.starts_with("http"));
+    Some(match url {
+        Some(u) => format!("(web) {title} — {u}"),
+        None => format!("(web) {title}"),
+    })
+}
+
 /// Whether a tool result is a "nothing found" / "disabled" placeholder rather than real content,
 /// so it can be excluded from the brain grounding (an included placeholder would falsely count as
 /// grounding and trigger a brain call on an empty vault). Matches the deterministic prefixes
@@ -441,6 +542,8 @@ fn is_empty_tool_result(text: &str) -> bool {
         || t.starts_with("No open commitments")
         || t.starts_with("No visible entity")
         || t.starts_with("Semantic search is disabled")
+        || t.starts_with("No web results")
+        || t.starts_with("Web search is not available")
 }
 
 /// Pull distinct `[[Title]]` wikilinks out of the gated tool grounding text, in first-seen order.

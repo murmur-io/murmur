@@ -221,6 +221,7 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::GetOpenCommitments { .. } => "Open commitments",
         ToolCall::GetMeeting { .. } => "Meeting",
         ToolCall::ListRecentMeetings { .. } => "Recent meetings",
+        ToolCall::WebSearch { .. } => "Web search",
     }
 }
 
