@@ -267,7 +267,15 @@ impl Db {
                created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_correction_log_kind_created
-               ON correction_log(kind, created_at);",
+               ON correction_log(kind, created_at);
+             CREATE TABLE IF NOT EXISTS notes_asides (
+               id INTEGER PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               text TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_notes_asides_meeting ON notes_asides(meeting_id);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -2313,6 +2321,44 @@ impl Db {
             })
             .map_err(map_err)?;
         Ok(!has_notes || has_visible)
+    }
+
+    /// Phase E (Flow B, `NoteAside`) — record a spoken aside against a meeting in the additive
+    /// `notes_asides` store. PURELY ADDITIVE: it never touches the note `markdown`/`content_blob`,
+    /// so it can never blank or clobber sealed content. The CALLER gates on the live unlocked set
+    /// (`meeting_is_visible`) before calling, so an aside is only ever recorded for a meeting the
+    /// session can see — the in-progress recording is foldered/sealed only later, so the live
+    /// meeting is trivially visible. `text` is stored verbatim (it is the user's own dictated note).
+    pub fn insert_note_aside(&self, meeting_id: &str, text: &str, created_at: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO notes_asides (meeting_id, text, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![meeting_id, text, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read every aside recorded for `meeting_id`, oldest first. Used by the detail view / note
+    /// finalization to surface the asides captured live. Returns `(text, created_at)` tuples.
+    pub fn list_note_asides(&self, meeting_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT text, created_at FROM notes_asides
+                  WHERE meeting_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
     }
 
     /// OPEN-COMMITMENTS rollup (deterministic, no model): every OPEN (`- [ ]`) action item across
