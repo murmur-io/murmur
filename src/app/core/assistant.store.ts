@@ -13,6 +13,21 @@ import type {
  * `pending` row ("heard: {command}"); the matching result resolves it with a
  * summary + citation chips + a status pill. Newest-first.
  */
+/**
+ * One parsed grounding citation. The backend sends a flat `string[]` mixing two
+ * shapes (`voice_action.rs`): a VAULT meeting wikilink `[[Title]]`, and a WEB hit
+ * `(web) Title — https://…` (the loud "via web" attribution). We parse each into
+ * this discriminated shape so the card renders vault chips and "via web" links
+ * distinctly — a web source is visibly off-device, never a `[[vault]]` chip.
+ */
+export interface AssistantCitation {
+  kind: "vault" | "web";
+  /** Display label: the bare title (brackets stripped for vault). */
+  label: string;
+  /** The destination URL for a web source (absent for vault). */
+  url?: string;
+}
+
 export interface AssistantInteraction {
   /** Stable id for `@for` tracking (we never key on $index). */
   id: number;
@@ -22,8 +37,35 @@ export interface AssistantInteraction {
   status: "pending" | VoiceActionStatus;
   /** The assistant's answer (empty while pending). */
   summary: string;
-  /** Grounding citations → rendered as [[Title]] chips. */
-  citations: string[];
+  /** Parsed grounding citations → vault `[[Title]]` chips + "via web" links. */
+  citations: AssistantCitation[];
+}
+
+/**
+ * Parse the backend's flat citation strings into typed vault/web citations.
+ * A web hit is `(web) Title — https://…` (or `(web) Title` with no URL); anything
+ * else is a vault meeting, whose `[[…]]` brackets we strip for display.
+ */
+export function parseCitations(raw: string[]): AssistantCitation[] {
+  return raw.map((c) => {
+    const s = c.trim();
+    if (s.startsWith("(web)")) {
+      const body = s.slice("(web)".length).trim();
+      // Split a trailing " — https://…" off the title; the URL is the last
+      // " — "-separated chunk when it looks like a link.
+      const sep = body.lastIndexOf(" — ");
+      if (sep !== -1) {
+        const tail = body.slice(sep + 3).trim();
+        if (/^https?:\/\//i.test(tail)) {
+          return { kind: "web", label: body.slice(0, sep).trim(), url: tail };
+        }
+      }
+      return { kind: "web", label: body };
+    }
+    // Vault wikilink — strip surrounding [[ ]] for the chip label.
+    const label = s.replace(/^\[\[/, "").replace(/\]\]$/, "");
+    return { kind: "vault", label };
+  });
 }
 
 /**
@@ -149,7 +191,7 @@ export class AssistantStore {
           command: p.command,
           status: p.status,
           summary: p.summary,
-          citations: p.citations,
+          citations: parseCitations(p.citations),
         };
         return [row, ...rows].slice(0, AssistantStore.MAX);
       }
@@ -161,7 +203,7 @@ export class AssistantStore {
         command: next[idx].command || p.command,
         status: p.status,
         summary: p.summary,
-        citations: p.citations,
+        citations: parseCitations(p.citations),
       };
       return next;
     });
