@@ -483,6 +483,53 @@ async fn summarize_and_export(
         _ => Vec::new(),
     };
 
+    // brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION. When `augment_notes_with_context`
+    // is ON, ground the new note in related PRIOR notes so notes compound. GATED twofold:
+    //   1. the master flag (default OFF ⇒ `related_context = None` ⇒ `render_user_content` is
+    //      BYTE-IDENTICAL to today — zero prod regression);
+    //   2. the LIVE session unlock set — the retrieval routes through `search_visible` +
+    //      `get_note_if_visible`, so a sealed-and-not-session-unlocked prior note contributes
+    //      NOTHING. This matters because the corpus EGRESSES to the cloud provider in the prompt
+    //      (lock-model invariant).
+    // Best-effort: a retrieval error logs (target rag, no PII) and proceeds with NO context — it
+    // NEVER fails the pipeline.
+    let related_context: Option<String> = if config.augment_notes_with_context {
+        let unlocked = state
+            .unlocked_folders
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let title = state
+            .db
+            .get_meeting(meeting_id)
+            .ok()
+            .flatten()
+            .and_then(|m| m.title);
+        let query = crate::summarize::related_context::salient_query(
+            title.as_deref(),
+            transcript_text,
+        );
+        match crate::summarize::related_context::build_related_context(
+            &state.db,
+            meeting_id,
+            &query,
+            &unlocked,
+            &config.provider_id,
+        ) {
+            Ok((corpus, sources)) if !corpus.trim().is_empty() => {
+                tracing::info!(target: "rag", related = sources.len(), "grounding note in related prior notes");
+                Some(corpus)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(target: "rag", error = %e, "related-context retrieval failed (note unaffected)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let request = SummarizeRequest {
         transcript: transcript_text.to_string(),
         meta: MeetingMeta {
@@ -493,6 +540,7 @@ async fn summarize_and_export(
         },
         template: template::build_template(&config.note_style, &config.note_language),
         vault_titles,
+        related_context,
     };
 
     let provider = make_provider(&config.provider_id, config)?;

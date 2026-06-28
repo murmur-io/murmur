@@ -163,11 +163,29 @@ impl SummarizerProvider for RedactingProvider {
     }
 
     async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
-        let (red, map) = redact(&req.transcript);
-        // Name layer (default no-op → `red` unchanged, `name_pairs` empty → byte-identical egress).
-        let (red, name_pairs) = self.names.redact_names(&red);
+        // Shared regex map across the transcript AND the Phase-4 `related_context` so a value
+        // redacted in either restores consistently in the reply. With `related_context = None`
+        // (the default + flag-OFF case) the map is built from the transcript alone, exactly as the
+        // old `redact(&req.transcript)` did — egress stays byte-identical.
+        let mut map = HashMap::new();
+        let mut rev = HashMap::new();
+        let red_transcript = redact_into(&req.transcript, &mut map, &mut rev);
+        // The related-context corpus EGRESSES to the provider in the prompt — scrub it through the
+        // SAME firewall as the transcript so emails/cards/phones never leave un-redacted.
+        let red_related = req
+            .related_context
+            .as_ref()
+            .map(|c| redact_into(c, &mut map, &mut rev));
+        // Name layer (default no-op → text unchanged, `name_pairs` empty → byte-identical egress).
+        let (red_transcript, mut name_pairs) = self.names.redact_names(&red_transcript);
+        let red_related = red_related.map(|c| {
+            let (c2, more) = self.names.redact_names(&c);
+            name_pairs.extend(more);
+            c2
+        });
         let mut r = req.clone();
-        r.transcript = red;
+        r.transcript = red_transcript;
+        r.related_context = red_related;
         let out = self.inner.summarize(&r).await?;
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
@@ -277,6 +295,7 @@ mod tests {
             },
             template: String::new(),
             vault_titles: Vec::new(),
+            related_context: None,
         }
     }
 
