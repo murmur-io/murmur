@@ -329,10 +329,42 @@ export interface Segment {
   speaker?: "me" | "others" | string | null;
 }
 
+/**
+ * One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken
+ * command, the assistant's answer, the grounding citations, and the dispatch
+ * status. Surfaced in the meeting detail's "Asystent — Q&A" section. EMPTY when
+ * the meeting is locked-and-not-session-unlocked (gated, like note/segments) and
+ * also empty for a sealed meeting at rest (the rows are PURGED on seal). Mirrors
+ * the Rust `AssistantInteraction` (serde camelCase).
+ */
+export interface AssistantInteraction {
+  /** The HEARD command — the user's own dictated words. */
+  command: string;
+  /** The assistant's answer (research/recall result or a status line). */
+  answer: string;
+  /** `[[Title]]` wikilink / "(web)" citations the answer was grounded on. */
+  citations: string[];
+  /**
+   * Dispatch status: `ok` | `unavailable` | `unrecognized` | `needs_consent` |
+   * `error` | `nothing_heard`.
+   */
+  status: string;
+  /** Coarse source label / intent kind, e.g. `research` / `recall`. */
+  sourceLabel: string | null;
+  /** RFC3339 timestamp the interaction was recorded. */
+  createdAt: string;
+}
+
 export interface MeetingDetail {
   meeting: Meeting;
   note: NoteDto | null;
   segments: Segment[];
+  /**
+   * Persisted in-meeting assistant Q&A for this meeting. Present (gated) only
+   * when the meeting is unlocked; empty otherwise. The FE renders these in the
+   * "🎙 Asystent — Q&A" detail section.
+   */
+  assistantInteractions: AssistantInteraction[];
   /**
    * True when this meeting lives in a sealed-and-NOT-session-unlocked folder.
    * The backend MASKS the payload in that case (title "🔒 Locked", note null,
