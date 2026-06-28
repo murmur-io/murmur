@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod calendar;
 pub mod commands;
 pub mod crypto;
 pub mod embed;
@@ -99,6 +100,8 @@ pub fn run() {
             commands::export_canvas,
             commands::pre_meeting_brief,
             commands::next_calendar_event,
+            commands::list_calendar_events,
+            commands::calendar_context_for,
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,
