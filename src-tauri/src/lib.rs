@@ -111,6 +111,8 @@ pub fn run() {
             commands::download_brain_model,
             commands::embed_model_present,
             commands::download_embed_model,
+            commands::ner_model_present,
+            commands::download_ner_model,
             commands::toggle_bar,
             commands::list_folders,
             commands::create_folder,

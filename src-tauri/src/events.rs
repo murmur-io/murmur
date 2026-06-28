@@ -69,6 +69,26 @@ pub struct EmbedDownloadPayload {
     pub done: bool,
 }
 
+/// Progress for the on-device NER name-redaction model (multilingual mDeBERTa-v3) download. Carries
+/// byte/file counts only — NO PII. The model is three files, so progress is reported per-file.
+pub const EVENT_NER_DOWNLOAD: &str = "murmur://ner-download";
+
+/// Payload for [`EVENT_NER_DOWNLOAD`]. `total` is `None` when the server omits `Content-Length`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NerDownloadPayload {
+    /// Index of the file currently downloading (0-based, into the 3-file NER set).
+    pub file_index: usize,
+    /// Total number of files in the set (3).
+    pub file_count: usize,
+    /// Bytes written so far for the CURRENT file.
+    pub downloaded: u64,
+    /// Total bytes expected for the current file, when known.
+    pub total: Option<u64>,
+    /// True on the final event once all three files are written + renamed into place.
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusPayload {
