@@ -81,7 +81,8 @@ pub fn execute_tool(
             // Embed the query with the SAME active embedder used to index, then HYBRID-search through
             // the SAME visibility gate as `search_meetings` (both FTS + vector legs are gated).
             let embedder = crate::embed::active_embedder();
-            let query_vec = match embedder.embed(std::slice::from_ref(&q.to_string())) {
+            // QUERY side: e5 `query:` prefix (asymmetric with the `passage:` index side).
+            let query_vec = match embedder.embed_query(std::slice::from_ref(&q.to_string())) {
                 Ok(v) => v.into_iter().next().unwrap_or_default(),
                 Err(e) => return Err(AppError::Summarize(format!("embed failed: {e}"))),
             };
