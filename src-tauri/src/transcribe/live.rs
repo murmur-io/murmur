@@ -236,6 +236,7 @@ fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
                 &config,
                 &meeting_id,
                 &literal,
+                Some(&app),
             );
             // PII rule: log only the coarse intent kind + status, never the summary/citations.
             tracing::info!(
@@ -326,6 +327,7 @@ fn spawn_command_dispatch(app: AppHandle, command: String) {
                 &config,
                 &meeting_id,
                 &command,
+                Some(&app),
             )
             // Surface the user's OWN dictated command onto the result for the FE card.
             .with_command(&command);
