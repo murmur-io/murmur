@@ -332,11 +332,100 @@ pub struct DigestResult {
 }
 
 /// An upcoming Calendar event (best-effort; absent if Calendar access is denied).
+/// Minimal shape used by the legacy AppleScript `next_calendar_event` probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarEvent {
     pub title: String,
     pub start: Option<String>,
+}
+
+/// A full Calendar event surfaced by the bundled EventKit sidecar (`meetnotes-calendar`):
+/// title + attendees + agenda/notes, so the brain / pre-meeting brief can use "who's in this
+/// meeting + the agenda". On-device only — reading the local calendar adds no network egress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarEventFull {
+    /// EventKit `eventIdentifier` — stable handle to fetch this event again (`calendar_context_for`).
+    pub id: String,
+    pub title: String,
+    /// ISO-8601 start, or `None` if EventKit had no start date.
+    pub start: Option<String>,
+    /// ISO-8601 end, or `None`.
+    pub end: Option<String>,
+    /// Attendee display names (or email when there's no name). May be empty.
+    pub attendees: Vec<String>,
+    /// The event's agenda / notes body. May be empty.
+    pub notes: String,
+}
+
+/// The envelope the `meetnotes-calendar` sidecar prints on stdout. `status` is always one of
+/// `ok` / `denied` / `empty` / `error`; `events` is empty for everything but `ok`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CalendarSidecarEnvelope {
+    pub status: String,
+    #[serde(default)]
+    pub events: Vec<CalendarEventFull>,
+}
+
+/// A compact calendar-context block attachable to a meeting so the existing pre-meeting brief /
+/// note pre-analysis can consume it (the brain already takes context). Plain text + the source
+/// event id; if this text reaches a cloud provider it MUST ride the existing make_provider
+/// redaction firewall + consent — it is NEVER a new egress path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarContext {
+    /// Source EventKit event id (empty if assembled from a non-EventKit event).
+    pub event_id: String,
+    pub title: String,
+    pub attendees: Vec<String>,
+    /// A short, human-readable context block: title + attendees + agenda. This is what the brain
+    /// consumes; keep it bounded.
+    pub text: String,
+}
+
+impl CalendarContext {
+    /// Assemble a bounded context block from a full calendar event. Pure + deterministic so it's
+    /// unit-testable headless (no EventKit needed).
+    pub fn from_event(e: &CalendarEventFull) -> Self {
+        let mut text = String::new();
+        text.push_str("Meeting: ");
+        text.push_str(if e.title.is_empty() {
+            "(untitled)"
+        } else {
+            &e.title
+        });
+        if let Some(start) = &e.start {
+            text.push_str("\nWhen: ");
+            text.push_str(start);
+            if let Some(end) = &e.end {
+                text.push_str(" – ");
+                text.push_str(end);
+            }
+        }
+        if !e.attendees.is_empty() {
+            text.push_str("\nAttendees: ");
+            text.push_str(&e.attendees.join(", "));
+        }
+        let agenda = e.notes.trim();
+        if !agenda.is_empty() {
+            // Bound the agenda so a giant notes field can't bloat the prompt / leak surface.
+            const MAX_AGENDA: usize = 2000;
+            text.push_str("\nAgenda:\n");
+            if agenda.len() > MAX_AGENDA {
+                text.push_str(&agenda.chars().take(MAX_AGENDA).collect::<String>());
+                text.push('…');
+            } else {
+                text.push_str(agenda);
+            }
+        }
+        CalendarContext {
+            event_id: e.id.clone(),
+            title: e.title.clone(),
+            attendees: e.attendees.clone(),
+            text,
+        }
+    }
 }
 
 /// A pre-meeting brief: grounded markdown + the source meetings used.
@@ -365,4 +454,70 @@ pub struct TopicThread {
     pub label: String,
     pub count: usize,
     pub mentions: Vec<TopicMention>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn full_event() -> CalendarEventFull {
+        CalendarEventFull {
+            id: "E1".into(),
+            title: "Sprint Planning".into(),
+            start: Some("2026-06-28T10:00:00Z".into()),
+            end: Some("2026-06-28T11:00:00Z".into()),
+            attendees: vec!["Alice".into(), "bob@example.com".into()],
+            notes: "Agenda:\n- velocity\n- scope".into(),
+        }
+    }
+
+    #[test]
+    fn calendar_context_assembles_full_block() {
+        let ctx = CalendarContext::from_event(&full_event());
+        assert_eq!(ctx.event_id, "E1");
+        assert_eq!(ctx.title, "Sprint Planning");
+        assert_eq!(ctx.attendees, vec!["Alice", "bob@example.com"]);
+        assert!(ctx.text.contains("Meeting: Sprint Planning"));
+        assert!(ctx.text.contains("When: 2026-06-28T10:00:00Z – 2026-06-28T11:00:00Z"));
+        assert!(ctx.text.contains("Attendees: Alice, bob@example.com"));
+        assert!(ctx.text.contains("Agenda:"));
+        assert!(ctx.text.contains("velocity"));
+    }
+
+    #[test]
+    fn calendar_context_handles_sparse_event() {
+        let e = CalendarEventFull {
+            id: String::new(),
+            title: String::new(),
+            start: None,
+            end: None,
+            attendees: vec![],
+            notes: String::new(),
+        };
+        let ctx = CalendarContext::from_event(&e);
+        // No panic; untitled placeholder; no When/Attendees/Agenda sections.
+        assert!(ctx.text.contains("Meeting: (untitled)"));
+        assert!(!ctx.text.contains("When:"));
+        assert!(!ctx.text.contains("Attendees:"));
+        assert!(!ctx.text.contains("Agenda:"));
+    }
+
+    #[test]
+    fn calendar_context_bounds_giant_agenda() {
+        let mut e = full_event();
+        e.notes = "x".repeat(5000);
+        let ctx = CalendarContext::from_event(&e);
+        // Bounded to MAX_AGENDA (2000) + an ellipsis marker; never the full 5000.
+        assert!(ctx.text.contains('…'));
+        assert!(ctx.text.len() < 2200);
+    }
+
+    #[test]
+    fn calendar_context_start_without_end() {
+        let mut e = full_event();
+        e.end = None;
+        let ctx = CalendarContext::from_event(&e);
+        assert!(ctx.text.contains("When: 2026-06-28T10:00:00Z"));
+        assert!(!ctx.text.contains(" – "));
+    }
 }
