@@ -31,6 +31,23 @@ const SUMMON_SHORTCUT: &str = "CmdOrCtrl+Shift+R";
 
 /// Builds the tauri::Builder, manages AppState, registers commands + the floating bar, runs.
 pub fn run() {
+    // ── Whisper/ggml-metal residency-set abort guard (macOS 15+ / Apple-silicon) ──
+    // whisper.cpp 1.8.3's ggml-metal "residency sets" path (compiled only on macOS >= 15.0)
+    // asserts `[rsets->data count] == 0` when the Metal device is freed
+    // (ggml-metal-device.m `ggml_metal_rsets_free` → GGML_ASSERT). The teardown ordering on
+    // Apple-silicon frees the device while a buffer's residency set is still registered, so the
+    // assert fires and `ggml_abort` ABORTS the process at whisper's per-transcription Metal free.
+    // GGML_ASSERT (ggml.h:288) is NOT NDEBUG-gated, so this aborts in RELEASE too — it is not a
+    // debug-only crash. The upstream-sanctioned switch is the `GGML_METAL_NO_RESIDENCY` env var,
+    // read live inside `ggml_metal_device_init` (ggml-metal-device.m:768): when set, the device's
+    // residency-set collection is never created (`dev->rsets = nil`), so `ggml_metal_rsets_free`
+    // returns early and the assert can never fire. Residency sets are only a GPU-memory residency
+    // *hint* (keep buffers wired to avoid OS reclamation); disabling them does not change
+    // transcription output — it only forgoes a minor perf optimization. Set here at process entry,
+    // strictly before any ggml-Metal device can be initialized. SAFETY: single-threaded at
+    // startup, before any thread that could read the env. (Mirror guard in `Transcriber::load`.)
+    std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
