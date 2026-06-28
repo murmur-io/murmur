@@ -3,6 +3,52 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::storage::Db;
 
+/// Which reasoning backend powers the on-device "brain" pre-analysis step (Flow A,
+/// `orchestrate.rs`). The brain is a SEAM — see [`crate::reason::active_reasoner`]:
+///
+/// - **`Cloud`** (the DEFAULT, the user's choice): the SMARTEST option — the cloud LLM
+///   ([`crate::reason::CloudReasoner`]) reasons via the SAME `make_provider` factory the note
+///   summary uses, so the egress posture is IDENTICAL (RedactingProvider + fail-closed
+///   `cloud_egress_consented` gate). No local model required.
+/// - **`Local`**: the on-device GGUF (`MistralReasoner`, e.g. Bielik) when the `local-brain`
+///   feature is compiled in AND the selected model file is present; otherwise the `StubReasoner`.
+/// - **`Off`**: the dependency-free `StubReasoner` (the deterministic floor — zero brain).
+///
+/// `#[serde(default)]` on the field ⇒ a config persisted before this field existed loads as
+/// `Cloud` (the chosen default). NEVER changes the egress envelope: a Cloud brain that lacks
+/// consent simply falls back to the deterministic floor at call time (best-effort).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BrainBackend {
+    /// Cloud LLM via the summarizer-provider seam — the default brain.
+    #[default]
+    Cloud,
+    /// On-device GGUF when present, else the stub.
+    Local,
+    /// No brain — the deterministic floor.
+    Off,
+}
+
+impl BrainBackend {
+    /// Stable lowercase token persisted in the settings table (`cloud` | `local` | `off`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrainBackend::Cloud => "cloud",
+            BrainBackend::Local => "local",
+            BrainBackend::Off => "off",
+        }
+    }
+
+    /// Parse the persisted token; an unknown/empty value falls back to the default (`Cloud`).
+    pub fn from_str_or_default(s: &str) -> Self {
+        match s {
+            "local" => BrainBackend::Local,
+            "off" => BrainBackend::Off,
+            _ => BrainBackend::Cloud,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -98,6 +144,12 @@ pub struct AppConfig {
     /// a config persisted before this field existed loads as `None`.
     #[serde(default)]
     pub brain_model_id: Option<String>,
+    /// Which reasoning backend powers the brain pre-analysis (Flow A). Default `Cloud` — the
+    /// cloud LLM is the smartest reasoner and routes through the SAME `make_provider` egress
+    /// envelope as the note summary. `#[serde(default)]` ⇒ a config persisted before this field
+    /// existed loads as `Cloud`. See [`BrainBackend`].
+    #[serde(default)]
+    pub brain_backend: BrainBackend,
 }
 
 impl Default for AppConfig {
@@ -131,6 +183,7 @@ impl Default for AppConfig {
             semantic_search_enabled: false,
             brain_model_path: None,
             brain_model_id: None,
+            brain_backend: BrainBackend::default(),
         }
     }
 }
@@ -164,6 +217,7 @@ const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
+const K_BRAIN_BACKEND: &str = "brain_backend";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -258,6 +312,11 @@ impl AppConfig {
         }
         cfg.brain_model_path = opt(db.get_setting(K_BRAIN_MODEL_PATH)?);
         cfg.brain_model_id = opt(db.get_setting(K_BRAIN_MODEL_ID)?);
+        if let Some(v) = db.get_setting(K_BRAIN_BACKEND)? {
+            if !v.is_empty() {
+                cfg.brain_backend = BrainBackend::from_str_or_default(&v);
+            }
+        }
 
         Ok(cfg)
     }
@@ -341,6 +400,7 @@ impl AppConfig {
             K_BRAIN_MODEL_ID,
             self.brain_model_id.as_deref().unwrap_or(""),
         )?;
+        db.set_setting(K_BRAIN_BACKEND, self.brain_backend.as_str())?;
         Ok(())
     }
 
@@ -443,6 +503,59 @@ mod tests {
             AppConfig::load(&db).unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
+    }
+
+    #[test]
+    fn brain_backend_defaults_cloud_and_round_trips() {
+        let db = temp_db();
+        // Absent key ⇒ Cloud (the chosen default for fresh + pre-existing installs).
+        assert_eq!(AppConfig::load(&db).unwrap().brain_backend, BrainBackend::Cloud);
+
+        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            let cfg = AppConfig {
+                brain_backend: backend,
+                ..Default::default()
+            };
+            cfg.save(&db).unwrap();
+            assert_eq!(AppConfig::load(&db).unwrap().brain_backend, backend);
+        }
+    }
+
+    #[test]
+    fn brain_backend_serde_round_trips_and_defaults() {
+        // Token form persisted to the settings table.
+        assert_eq!(BrainBackend::Cloud.as_str(), "cloud");
+        assert_eq!(BrainBackend::Local.as_str(), "local");
+        assert_eq!(BrainBackend::Off.as_str(), "off");
+        assert_eq!(BrainBackend::from_str_or_default("local"), BrainBackend::Local);
+        assert_eq!(BrainBackend::from_str_or_default("off"), BrainBackend::Off);
+        // Unknown / empty falls back to the default brain.
+        assert_eq!(BrainBackend::from_str_or_default("bogus"), BrainBackend::Cloud);
+        assert_eq!(BrainBackend::from_str_or_default(""), BrainBackend::Cloud);
+
+        // JSON DTO: a payload omitting brainBackend loads as Cloud (#[serde(default)]).
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.brain_backend, BrainBackend::Cloud);
+        // And an explicit value round-trips through serde with the lowercase rename.
+        let dto: AppConfig = serde_json::from_str(
+            &serde_json::to_string(&AppConfig {
+                brain_backend: BrainBackend::Off,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dto.brain_backend, BrainBackend::Off);
     }
 
     #[test]
