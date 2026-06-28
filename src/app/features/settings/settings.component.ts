@@ -3,6 +3,7 @@ import {
   Component,
   DestroyRef,
   OnInit,
+  computed,
   inject,
   signal,
 } from "@angular/core";
@@ -12,9 +13,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type {
   AppConfigDto,
+  BrainBackend,
+  BrainModelDto,
   InputDeviceInfo,
   ProviderStatus,
 } from "../../core/models";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 
 @Component({
   selector: "app-settings",
@@ -246,6 +250,169 @@ import type {
           </span>
           <input type="checkbox" formControlName="autoOrganize" />
         </label>
+      </div>
+
+      <!-- Brain / AI — the assistant backend + in-meeting voice assistant (Phase H) -->
+      <div class="card brain-card">
+        <div class="brain-copy">
+          <h3>Brain / AI</h3>
+          <p class="text-secondary brain-sub">
+            Powers grounded answers across your notes and the optional in-meeting
+            voice assistant. Claude (cloud) is fastest for live use; local models
+            keep everything on-device but are slower in real time.
+          </p>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Assistant backend</span>
+          <select formControlName="brainBackend">
+            <option value="cloud">Claude (cloud) — recommended for live</option>
+            <option value="local">Local model — fully on-device</option>
+            <option value="off">Off</option>
+          </select>
+          <span class="field-help text-muted">
+            @switch (form.controls.brainBackend.value) {
+              @case ("local") {
+                Runs a local GGUF model on this Mac — private, but large models
+                are slow for realtime. Pick a model below.
+              }
+              @case ("off") {
+                The brain and the in-meeting voice assistant are disabled.
+              }
+              @default {
+                Sends your (redacted) text to Anthropic's cloud — lowest latency,
+                best for the live voice assistant.
+              }
+            }
+          </span>
+        </label>
+
+        <label class="toggle-row">
+          <span class="toggle-copy">
+            <span class="toggle-title">In-meeting voice assistant</span>
+            <span class="text-secondary toggle-sub">
+              Listen for your wake phrase during a recording and answer grounded
+              questions live, with sources. Off by default — it adds listening
+              and (for cloud) sends audio-derived text mid-meeting.
+            </span>
+          </span>
+          <input type="checkbox" formControlName="realtimeReactions" />
+        </label>
+
+        <!-- Local model picker — only meaningful for the local backend. -->
+        @if (form.controls.brainBackend.value === "local") {
+          <div class="brain-models">
+            <div class="brain-models-head">
+              <span class="brain-models-label text-muted">Local models</span>
+              <button
+                type="button"
+                class="btn btn-sm"
+                (click)="refreshBrainModels()"
+                [disabled]="brainModelsLoading()"
+              >
+                {{ brainModelsLoading() ? "Loading…" : "Refresh" }}
+              </button>
+            </div>
+
+            <p class="brain-note text-muted">
+              Big local models are slow for the realtime voice assistant —
+              Claude (cloud) is recommended for live answers. Local is best for
+              private, non-time-critical analysis.
+            </p>
+
+            @if (brainModels(); as models) {
+              @if (models.length === 0 && !brainModelsLoading()) {
+                <p class="brain-empty text-muted">
+                  No local models available.
+                </p>
+              } @else {
+                <ul class="brain-model-list">
+                  @for (m of models; track m.id) {
+                    <li
+                      class="brain-model-row"
+                      [class.is-unfit]="!m.fitsRam"
+                      [class.is-selected]="m.selected"
+                    >
+                      <div class="brain-model-info">
+                        <span class="brain-model-name">
+                          {{ m.name }}
+                          @if (m.selected) {
+                            <span class="pill is-success brain-inline-pill">
+                              <span class="pill-dot"></span>
+                              In use
+                            </span>
+                          }
+                        </span>
+                        <span class="brain-model-meta text-muted">
+                          {{ m.sizeLabel }} · needs ≥{{ m.minRamGb }} GB RAM
+                          @if (m.languages.length > 0) {
+                            · {{ m.languages.join("/") }}
+                          }
+                        </span>
+                        @if (!m.fitsRam) {
+                          <span class="pill is-warning brain-fit-pill">
+                            <span class="pill-dot"></span>
+                            May not fit this Mac's RAM
+                          </span>
+                        }
+                      </div>
+
+                      <div class="brain-model-actions">
+                        @if (brainDownloadingId() === m.id) {
+                          <div class="brain-progress" role="status">
+                            <div class="brain-progress-track" aria-hidden="true">
+                              <div
+                                class="brain-progress-fill"
+                                [style.width.%]="brainDownloadFrac() * 100"
+                              ></div>
+                            </div>
+                            <span class="brain-progress-label text-muted">
+                              Downloading… {{ brainPct() }}
+                            </span>
+                          </div>
+                        } @else if (m.downloaded) {
+                          <button
+                            type="button"
+                            class="btn btn-sm"
+                            (click)="useBrainModel(m.id)"
+                            [disabled]="m.selected"
+                          >
+                            {{ m.selected ? "Selected" : "Use" }}
+                          </button>
+                        } @else {
+                          <button
+                            type="button"
+                            class="btn btn-primary btn-sm"
+                            (click)="downloadBrainModel(m.id)"
+                            [disabled]="brainDownloadingId() !== null"
+                          >
+                            Download
+                          </button>
+                        }
+                      </div>
+                    </li>
+                  }
+                </ul>
+              }
+            }
+
+            <label class="field brain-custom">
+              <span class="field-label">Custom GGUF model</span>
+              <input
+                formControlName="brainModelId"
+                placeholder="/path/to/model.gguf or a registry id"
+              />
+              <span class="field-help text-muted">
+                Advanced: point at your own GGUF file (or a registry id). Saved
+                with your settings.
+              </span>
+            </label>
+
+            @if (brainError(); as berr) {
+              <p class="text-danger brain-error">{{ berr }}</p>
+            }
+          </div>
+        }
       </div>
 
       <!-- Works with Obsidian — optional vault companion -->
@@ -901,6 +1068,144 @@ import type {
         line-height: 1.5;
       }
 
+      /* --- Brain / AI card (Phase H) --- */
+      .brain-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .brain-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .brain-copy h3 {
+        margin: 0;
+      }
+      .brain-sub {
+        margin: 0;
+        font-size: 0.875rem;
+        line-height: 1.55;
+      }
+      .brain-models {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+        padding: var(--space-4);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        border: 1px solid var(--border-subtle);
+      }
+      .brain-models-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+      }
+      .brain-models-label {
+        font-size: 0.8125rem;
+        font-weight: 550;
+        letter-spacing: 0.01em;
+        text-transform: uppercase;
+      }
+      .brain-note {
+        margin: 0;
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
+      .brain-empty {
+        margin: 0;
+        font-size: 0.875rem;
+      }
+      .brain-model-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+      }
+      .brain-model-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+        padding: var(--space-3);
+        border-radius: var(--radius-md);
+        background: var(--surface-raised);
+        border: 1px solid var(--glass-border);
+      }
+      .brain-model-row.is-selected {
+        border-color: var(--accent-hover);
+      }
+      .brain-model-row.is-unfit {
+        opacity: 0.78;
+      }
+      .brain-model-info {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        min-width: 0;
+      }
+      .brain-model-name {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        color: var(--text-primary);
+        font-weight: 550;
+        font-size: 0.9rem;
+        flex-wrap: wrap;
+      }
+      .brain-model-meta {
+        font-size: 0.8125rem;
+      }
+      .brain-inline-pill,
+      .brain-fit-pill {
+        align-self: flex-start;
+      }
+      .brain-fit-pill {
+        margin-top: 2px;
+      }
+      .brain-model-actions {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+      }
+      .brain-progress {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        min-width: 120px;
+      }
+      .brain-progress-track {
+        height: 6px;
+        border-radius: 3px;
+        background: var(--surface-input);
+        overflow: hidden;
+      }
+      .brain-progress-fill {
+        height: 100%;
+        background: var(--accent);
+        border-radius: 3px;
+        transition: width var(--transition);
+      }
+      .brain-progress-label {
+        font-size: 0.75rem;
+      }
+      .brain-custom {
+        margin-top: var(--space-1);
+      }
+      .brain-error {
+        margin: 0;
+        font-size: 0.85rem;
+      }
+      .brain-card .btn-sm {
+        height: 32px;
+        padding: 0 var(--space-3);
+        font-size: 0.8125rem;
+      }
+
       /* --- Works-with-Obsidian card --- */
       .obsidian-card {
         display: flex;
@@ -1317,6 +1622,11 @@ export class SettingsComponent implements OnInit {
     noteStyle: "standard",
     autoOrganize: false,
     noteLanguage: "auto",
+    // Phase H — brain / in-meeting voice assistant.
+    brainBackend: "cloud" as BrainBackend,
+    realtimeReactions: false,
+    /** Custom GGUF model path (or registry id). Empty → null on save. */
+    brainModelId: "",
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
 
@@ -1381,6 +1691,25 @@ export class SettingsComponent implements OnInit {
   /** Surfaced if granting consent rejects. */
   readonly consentError = signal<string | null>(null);
 
+  // ── Phase H — brain (AI assistant) model registry ──────────────────────
+
+  /** The selectable local brain models (from list_brain_models). */
+  readonly brainModels = signal<BrainModelDto[]>([]);
+  /** True while the model list is loading (best-effort). */
+  readonly brainModelsLoading = signal(false);
+  /** Surfaced if loading / selecting / downloading a brain model rejects. */
+  readonly brainError = signal<string | null>(null);
+  /** Model id currently downloading, or null. Drives the per-row progress UI. */
+  readonly brainDownloadingId = signal<string | null>(null);
+  /** 0..1 download progress for the in-flight model (best-effort from events). */
+  readonly brainDownloadFrac = signal(0);
+  /** Whole-percent label for the in-flight brain-model download. */
+  readonly brainPct = computed(
+    () => Math.round(this.brainDownloadFrac() * 100) + "%",
+  );
+  /** Release handle for the EVENT_BRAIN_DOWNLOAD subscription. */
+  private unlistenBrainDownload: UnlistenFn | null = null;
+
   async ngOnInit(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
@@ -1413,14 +1742,90 @@ export class SettingsComponent implements OnInit {
         noteStyle: cfg.noteStyle ?? "standard",
         autoOrganize: cfg.autoOrganize ?? false,
         noteLanguage: cfg.noteLanguage ?? "auto",
+        brainBackend: cfg.brainBackend ?? "cloud",
+        realtimeReactions: cfg.realtimeReactions ?? false,
+        brainModelId: cfg.brainModelId ?? "",
       });
       this.updateDownloadHint();
       this.inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       this.hasKey.set(await this.ipc.hasAnthropicKey());
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
+      // Phase H — brain model registry + download-progress stream (best-effort).
+      await this.subscribeBrainDownload();
+      await this.refreshBrainModels();
     } catch (e) {
       this.loadError.set(String(e));
+    }
+  }
+
+  /**
+   * Subscribe ONCE to the brain-download progress stream and store the unlisten
+   * so DestroyRef can release it (no leaked listener). Best-effort: a missing
+   * backend command just leaves the progress bar inert.
+   */
+  private async subscribeBrainDownload(): Promise<void> {
+    try {
+      this.unlistenBrainDownload = await this.ipc.onBrainDownload((p) => {
+        // The backend emits one download at a time and the component already
+        // tracks which model it started (brainDownloadingId), so every progress
+        // event applies to it. (Download errors surface via the command promise.)
+        if (this.brainDownloadingId() === null) return;
+        if (p.total && p.total > 0) {
+          this.brainDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+        }
+        if (p.done) {
+          this.brainDownloadingId.set(null);
+          void this.refreshBrainModels();
+        }
+      });
+      this.destroyRef.onDestroy(() => this.unlistenBrainDownload?.());
+    } catch {
+      // No brain-download stream available — progress stays inert; downloads
+      // still resolve via the command promise.
+    }
+  }
+
+  /** Reload the brain model registry (downloaded / fits-RAM / selected state). */
+  async refreshBrainModels(): Promise<void> {
+    this.brainModelsLoading.set(true);
+    this.brainError.set(null);
+    try {
+      this.brainModels.set(await this.ipc.listBrainModels());
+    } catch (e) {
+      this.brainError.set(String(e));
+    } finally {
+      this.brainModelsLoading.set(false);
+    }
+  }
+
+  /** Make a registry model the active local brain model, then refresh the list. */
+  async useBrainModel(id: string): Promise<void> {
+    this.brainError.set(null);
+    try {
+      await this.ipc.selectBrainModel(id);
+      this.form.patchValue({ brainModelId: id });
+      await this.refreshBrainModels();
+    } catch (e) {
+      this.brainError.set(String(e));
+    }
+  }
+
+  /**
+   * Download a registry model. The promise resolves on completion; live
+   * progress (when available) rides the EVENT_BRAIN_DOWNLOAD stream.
+   */
+  async downloadBrainModel(id: string): Promise<void> {
+    this.brainError.set(null);
+    this.brainDownloadFrac.set(0);
+    this.brainDownloadingId.set(id);
+    try {
+      await this.ipc.downloadBrainModel(id);
+      await this.refreshBrainModels();
+    } catch (e) {
+      this.brainError.set(String(e));
+    } finally {
+      this.brainDownloadingId.set(null);
     }
   }
 
@@ -1459,6 +1864,10 @@ export class SettingsComponent implements OnInit {
       noteStyle: v.noteStyle,
       autoOrganize: v.autoOrganize,
       noteLanguage: v.noteLanguage,
+      // Phase H — brain / in-meeting voice assistant.
+      brainBackend: v.brainBackend,
+      realtimeReactions: v.realtimeReactions,
+      brainModelId: v.brainModelId || null,
       // Round-trip the Stage E security flags so a settings save never silently
       // resets them. Cloud-egress consent is GRANTED only via the dedicated
       // command (allowCloudProcessing) — here we just carry the current value back.
