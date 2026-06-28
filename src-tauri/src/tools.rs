@@ -44,6 +44,13 @@ pub enum ToolCall {
     GetOpenCommitments { owner: Option<String> },
     /// Assemble the gated structured dossier for one entity (caller must pass a non-empty name/id).
     GetEntityDossier { entity: String },
+    /// CONNECTOR — live WEB SEARCH ("research about the world"). This is the ONE [`ToolCall`] that can
+    /// EGRESS: it reaches an external search service through the consent-gated, redacting connector
+    /// framework ([`crate::connectors`]). It is NOT runnable through the synchronous [`execute_tool`]
+    /// (which is egress-free, and is the MCP surface's only entry) — it is dispatched ONLY via the
+    /// async [`execute_web_search`], and ONLY when the web connector is exposed (enabled + consented +
+    /// keyed). The brain decides web-vs-vault; see `orchestrate.rs` / `voice_action.rs`.
+    WebSearch { query: String },
 }
 
 /// Execute a read-only tool against an OPEN `Db`, gated on the live session `unlocked` set.
@@ -163,7 +170,77 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!("dossier build failed: {e}"))),
             }
         }
+        ToolCall::WebSearch { .. } => {
+            // EGRESS GUARD: the synchronous, egress-free `execute_tool` is the MCP surface's only
+            // entry, so it MUST NOT run a connector (which reaches off-device). Web search is
+            // dispatched exclusively via the async `execute_web_search`. Reaching here is a
+            // programming error in a caller, never a leak — refuse loudly, egress nothing.
+            Err(AppError::InvalidArg(
+                "WebSearch is an egress connector and cannot run through the egress-free tool path; \
+                 use execute_web_search"
+                    .to_string(),
+            ))
+        }
     }
+}
+
+/// CONNECTOR DISPATCH — run a live WEB SEARCH through the consent-gated, redacting connector
+/// framework, returning the same text-payload shape the vault tools return (so the brain treats web
+/// hits and vault hits identically). ASYNC + egress-bearing, kept OUT of [`execute_tool`] so the
+/// synchronous MCP surface can never reach it.
+///
+/// EGRESS DISCIPLINE (all three enforced before anything leaves the device):
+/// - **Consent-gated, fail-closed:** the registry exposes the web connector ONLY when
+///   `web_search_enabled && web_search_consented && a key is present`. When it is not exposed this
+///   returns the explicit `"Web search is not available …"` sentinel and EGRESSES NOTHING (the
+///   underlying [`crate::connectors::ConnectorError::NeedsConsent`]).
+/// - **Redacted:** [`crate::connectors::ConnectorRegistry::search`] scrubs the query through the
+///   redaction firewall BEFORE the provider call.
+/// - **Loud:** every line carries the hit's `source_label` (e.g. "web · Brave") so the answer is
+///   attributed to the web.
+///
+/// Returns a `"No web results …"` / `"Web search is not available …"` sentinel (matched by the
+/// brain's `is_empty_result`) when nothing usable comes back, so an unavailable/empty web tool never
+/// pollutes the grounding. A real network failure surfaces as `Err`.
+pub async fn execute_web_search(query: &str, config: &AppConfig) -> Result<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok("No web results for an empty query.".to_string());
+    }
+    let registry = crate::connectors::ConnectorRegistry::build(config);
+    match registry.search("web", q).await {
+        Ok(hits) if hits.is_empty() => Ok(format!("No web results for \"{q}\".")),
+        Ok(hits) => Ok(format_web_hits(&hits)),
+        // Fail-closed / not-exposed → a graceful sentinel (NOT an error), so the brain just skips it.
+        Err(crate::connectors::ConnectorError::NeedsConsent) => {
+            Ok("Web search is not available (not enabled, not consented, or no API key set).".to_string())
+        }
+        Err(crate::connectors::ConnectorError::Unconfigured(_)) => {
+            Ok("Web search is not available (not configured).".to_string())
+        }
+        // A real external failure (network/HTTP/parse) is surfaced; the caller logs + skips it.
+        Err(e @ crate::connectors::ConnectorError::Failed(_)) => Err(e.into()),
+    }
+}
+
+/// Render web connector hits into the tool text payload — one line per result, each LOUD with its
+/// source label + URL: `- [web · Brave] Title — snippet (url)`.
+fn format_web_hits(hits: &[crate::connectors::ConnectorHit]) -> String {
+    hits.iter()
+        .map(|h| {
+            let mut line = format!("- [{}] {}", h.source_label, h.title.trim());
+            let snippet = h.snippet.trim();
+            if !snippet.is_empty() {
+                line.push_str(&format!(" — {snippet}"));
+            }
+            let url = h.url.trim();
+            if !url.is_empty() {
+                line.push_str(&format!(" ({url})"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render the open-commitments rollup into the tool text payload — one line per item:
@@ -201,4 +278,97 @@ fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::AppConfig;
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tmp_db() -> Db {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-tools-web-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Db::open_with_key(&p, TEST_DEK).unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// EGRESS GUARD: the synchronous, egress-free `execute_tool` (the MCP surface's only entry) MUST
+    /// refuse a `WebSearch` call — it can never run a connector that reaches off-device.
+    #[test]
+    fn sync_execute_tool_refuses_websearch() {
+        let db = tmp_db();
+        let nothing = HashSet::new();
+        let cfg = AppConfig::default();
+        let res = execute_tool(
+            &ToolCall::WebSearch { query: "weather".into() },
+            &db,
+            &nothing,
+            &cfg,
+        );
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "the egress-free tool path must refuse WebSearch (no connector through MCP)"
+        );
+    }
+
+    /// FAIL-CLOSED: with the default config (web search disabled + unconsented), `execute_web_search`
+    /// returns the graceful "not available" sentinel and EGRESSES NOTHING — no key, no network.
+    #[test]
+    fn web_search_fail_closed_returns_sentinel_no_egress() {
+        let cfg = AppConfig::default(); // web_search_enabled = false, consented = false
+        let out = block_on(execute_web_search("what's the weather in Kraków", &cfg)).unwrap();
+        assert!(
+            out.starts_with("Web search is not available"),
+            "unexposed web search must return the not-available sentinel: {out}"
+        );
+    }
+
+    /// An empty query never builds the registry / reaches a connector.
+    #[test]
+    fn web_search_empty_query_is_inert() {
+        let cfg = AppConfig::default();
+        let out = block_on(execute_web_search("   ", &cfg)).unwrap();
+        assert!(out.starts_with("No web results"));
+    }
+
+    /// LOUD: web hits render with their source label + URL, so the answer is attributed "via web".
+    #[test]
+    fn format_web_hits_is_loud_with_source_and_url() {
+        let hits = vec![
+            crate::connectors::ConnectorHit {
+                title: "Kraków weather".into(),
+                snippet: "Sunny, 22°C".into(),
+                url: "https://w.example/krakow".into(),
+                source_label: "web · Brave".into(),
+            },
+            crate::connectors::ConnectorHit {
+                title: "No URL result".into(),
+                snippet: String::new(),
+                url: String::new(),
+                source_label: "web · Brave".into(),
+            },
+        ];
+        let out = format_web_hits(&hits);
+        assert!(out.contains("[web · Brave] Kraków weather"), "loud source label: {out}");
+        assert!(out.contains("Sunny, 22°C"), "snippet present: {out}");
+        assert!(out.contains("(https://w.example/krakow)"), "url present: {out}");
+        // A hit with no snippet/url still renders its labelled title.
+        assert!(out.contains("[web · Brave] No URL result"), "labelled even without url: {out}");
+    }
 }

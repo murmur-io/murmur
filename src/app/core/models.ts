@@ -95,6 +95,23 @@ export interface AppConfigDto {
    * like the other flags. Default false. Mirrors Rust `AppConfigDto.semantic_search_enabled`.
    */
   semanticSearchEnabled: boolean;
+  /**
+   * brain2 connectors — the web-search connector MASTER toggle. NEW CLOUD EGRESS:
+   * when on (AND `webSearchConsented` AND a Brave key is stored), the brain/Ask
+   * answer may send a REDACTED query off-device to the search provider. A settable
+   * flag: round-tripped on every `save_config` like the other flags. Default false.
+   * Mirrors Rust `AppConfigDto.web_search_enabled`.
+   */
+  webSearchEnabled: boolean;
+  /**
+   * brain2 connectors — one-time consent for the web-search egress. Like
+   * `cloudEgressConsented`, this is PRESERVE-ONLY on `save_config` (a normal save
+   * carries the current value back, never flips it) and is granted SOLELY by the
+   * dedicated `consent_to_web_search` command. Default false (fail-closed): no
+   * query leaves the device until the user has consented once. Mirrors Rust
+   * `AppConfigDto.web_search_consented`.
+   */
+  webSearchConsented: boolean;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
