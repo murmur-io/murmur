@@ -84,6 +84,17 @@ pub struct AppConfig {
     /// (Phase 2c) replaces the stub; until then the only embedder is the deterministic `StubEmbedder`.
     #[serde(default)]
     pub semantic_search_enabled: bool,
+    /// brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION. When ON, each new meeting note is
+    /// grounded in a small, GATED corpus of related PRIOR notes (built from the LIVE FTS retrieval
+    /// plus the existing provider, no local model) so notes compound ("last time you decided X").
+    /// Default OFF via `#[serde(default)]`, so a config persisted before this field existed loads
+    /// as `false`. When OFF, the summarization request carries `related_context = None` and the
+    /// rendered prompt is BYTE-IDENTICAL to today — shipping it changes NOTHING in prod. The related
+    /// context EGRESSES to the cloud provider, so the retrieval is gated by the live session unlock
+    /// set through `search_visible` and `get_note_if_visible`: a sealed-not-unlocked prior note can
+    /// never reach the prompt.
+    #[serde(default)]
+    pub augment_notes_with_context: bool,
 }
 
 impl Default for AppConfig {
@@ -115,6 +126,7 @@ impl Default for AppConfig {
             relock_on_screenshare: true,
             cloud_egress_consented: false,
             semantic_search_enabled: false,
+            augment_notes_with_context: false,
         }
     }
 }
@@ -146,6 +158,7 @@ const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
+const K_AUGMENT_NOTES_WITH_CONTEXT: &str = "augment_notes_with_context";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -238,6 +251,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
             cfg.semantic_search_enabled = v == "true";
         }
+        if let Some(v) = db.get_setting(K_AUGMENT_NOTES_WITH_CONTEXT)? {
+            cfg.augment_notes_with_context = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -313,6 +329,10 @@ impl AppConfig {
             K_SEMANTIC_SEARCH_ENABLED,
             if self.semantic_search_enabled { "true" } else { "false" },
         )?;
+        db.set_setting(
+            K_AUGMENT_NOTES_WITH_CONTEXT,
+            if self.augment_notes_with_context { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -374,6 +394,28 @@ mod tests {
         assert!(!cfg.cloud_egress_consented);
         // Phase 2b semantic search is OFF by default — shipping it changes nothing.
         assert!(!cfg.semantic_search_enabled);
+        // Phase 4 retrieval-augmented notes is OFF by default — shipping it changes nothing.
+        assert!(!cfg.augment_notes_with_context);
+    }
+
+    /// Phase 4: a config persisted before `augment_notes_with_context` existed (key absent from the
+    /// settings table) must load with the flag defaulting to `false` — the prod-safe default for
+    /// existing installs.
+    #[test]
+    fn missing_augment_flag_defaults_off() {
+        let db = temp_db();
+        assert!(!AppConfig::load(&db).unwrap().augment_notes_with_context);
+    }
+
+    #[test]
+    fn augment_notes_flag_round_trips() {
+        let db = temp_db();
+        let cfg = AppConfig {
+            augment_notes_with_context: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(AppConfig::load(&db).unwrap().augment_notes_with_context);
     }
 
     /// A config persisted before `semantic_search_enabled` existed (key absent from both the JSON

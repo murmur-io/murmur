@@ -21,6 +21,14 @@ pub struct SummarizeRequest {
     pub template: String,
     /// existing note titles → [[link]] targets
     pub vault_titles: Vec<String>,
+    /// brain2 RAG Phase 4 — a small, GATED corpus of related PRIOR notes (each headed by a
+    /// `### [[Title]] · date · id:` citation) so the model can ground the new note in past
+    /// decisions/owed items. `None` (the default + flag-OFF case) ⇒ `render_user_content` is
+    /// byte-identical to before this field existed. SECURITY: this string EGRESSES to the cloud
+    /// provider in the summarization prompt, so it MUST be assembled only from VISIBLE
+    /// (not sealed-not-unlocked) prior notes — see `summarize::related_context::build_related_context`.
+    /// It is redacted by `RedactingProvider` alongside the transcript before egress.
+    pub related_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
