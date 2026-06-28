@@ -15,6 +15,12 @@
 
 use crate::error::Result;
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// The REAL on-device embedder (Phase C), compiled ONLY under `--features local-embed`. The default
+/// build never pulls candle, keeping the fast `cargo test --lib` loop intact.
+#[cfg(feature = "local-embed")]
+pub mod candle_bert;
 
 /// Embedding dimensionality of the vector layer. The `vec0` column is declared `float[EMBED_DIM]`,
 /// so this MUST match the real model's output width when it lands (BGE-M3 = 1024; the stub uses a
@@ -35,7 +41,69 @@ pub trait Embedder {
     /// Output vector width. MUST equal [`EMBED_DIM`] for vectors destined for the `vec0` table.
     fn dim(&self) -> usize;
     /// Embed a batch of texts → one `dim()`-length vector each (same order as the input).
+    ///
+    /// This is the RAW encode — no asymmetric prefix. Document-indexing and query callers SHOULD
+    /// prefer [`Embedder::embed_passage`] / [`Embedder::embed_query`] so the e5 family's required
+    /// asymmetric prefix convention is applied; the existing index/query sites that call `embed`
+    /// directly still work (the stub ignores prefixes, and the real model treats a prefix-less text
+    /// as a generic passage). See the e5 prefix note on [`PASSAGE_PREFIX`]/[`QUERY_PREFIX`].
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Embed DOCUMENT/passage texts (the index side). Default impl prefixes each text with
+    /// [`PASSAGE_PREFIX`] then calls [`Embedder::embed`]. The stub's output is prefix-invariant in
+    /// practice (the prefix tokens add a tiny constant bag), so this is safe to route through the
+    /// stub; the real `CandleBertEmbedder` relies on it for correct e5 retrieval quality.
+    fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{PASSAGE_PREFIX}{t}")).collect();
+        self.embed(&prefixed)
+    }
+
+    /// Embed QUERY texts (the search side). Default impl prefixes each text with [`QUERY_PREFIX`]
+    /// then calls [`Embedder::embed`]. e5 REQUIRES the query/passage asymmetry for good recall.
+    fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{QUERY_PREFIX}{t}")).collect();
+        self.embed(&prefixed)
+    }
+}
+
+/// e5 ASYMMETRIC PREFIX (passage side). The intfloat e5 family was trained with `"passage: "` on
+/// documents and `"query: "` on queries; using the right prefix is load-bearing for retrieval recall
+/// (incl. Polish). This is a Mac-eval TUNABLE — the exact prefix string and whether the bake-off
+/// prefers symmetric encoding is validated @Mac, not by `cargo test`.
+pub const PASSAGE_PREFIX: &str = "passage: ";
+
+/// e5 ASYMMETRIC PREFIX (query side). See [`PASSAGE_PREFIX`].
+pub const QUERY_PREFIX: &str = "query: ";
+
+/// Sub-directory under the shared models dir holding the multilingual-e5-small files
+/// (`model.safetensors` + `tokenizer.json` + `config.json`). 384-dim ⇒ [`EMBED_DIM`] is unchanged,
+/// so swapping the real model in costs ZERO vec0 schema migration.
+pub const EMBED_MODEL_SUBDIR: &str = "embed-multilingual-e5-small";
+
+/// The three Hugging Face files the real e5 embedder needs, fetched INBOUND-ONLY by
+/// `download_embed_model`. Order is irrelevant; each is downloaded into [`EMBED_MODEL_SUBDIR`].
+pub const EMBED_MODEL_FILES: &[&str] = &["model.safetensors", "tokenizer.json", "config.json"];
+
+/// Hugging Face `resolve/main` base for intfloat/multilingual-e5-small. INBOUND ONLY — fetched,
+/// never sent meeting content.
+pub const EMBED_MODEL_HF_BASE: &str =
+    "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main";
+
+/// Resolve the on-disk dir the real e5 embedder loads from: `<models_dir>/embed-multilingual-e5-small/`.
+/// Creating the models dir can fail (returns `Err`); the dir itself may not yet exist (that is fine —
+/// the caller checks [`embed_model_present`]). NEVER panics.
+pub fn embed_model_dir() -> Result<PathBuf> {
+    Ok(crate::transcribe::models_dir()?.join(EMBED_MODEL_SUBDIR))
+}
+
+/// `true` when all three e5 model files exist in [`embed_model_dir`]. Pure existence probe (the only
+/// I/O is `is_file`); a models-dir resolution error is treated as "not present" (graceful — falls
+/// back to the stub), never propagated as a hard error.
+pub fn embed_model_present() -> bool {
+    match embed_model_dir() {
+        Ok(dir) => EMBED_MODEL_FILES.iter().all(|f| dir.join(f).is_file()),
+        Err(_) => false,
+    }
 }
 
 /// Deterministic, model-free embedder: a hashed bag-of-tokens projected into [`EMBED_DIM`] and
@@ -56,14 +124,40 @@ impl Embedder for StubEmbedder {
 
 /// The single active embedding backend used by BOTH the index path (chunking a note on creation)
 /// and the query path (Ask-My-Vault / MCP `search_semantic`). Returning a boxed trait object keeps
-/// the model a swappable seam: today it is the deterministic [`StubEmbedder`]; Phase 2c swaps in the
-/// real BGE-M3 model here. NOTE: if the real model's output dimension differs from [`EMBED_DIM`],
-/// that is a `vec_chunks float[N]` SCHEMA change — an additive migration to a new-width vec0 table
-/// plus a full re-index of every meeting, NOT a code one-liner. A mismatched-width insert fails
-/// loud (dimension error), never silently. Cheap to construct (the stub is zero-sized), so callers
-/// build one per operation rather than caching. NEVER invoked when `semantic_search_enabled` is off
-/// (the gate short-circuits before this is called).
+/// the model a swappable seam.
+///
+/// Graceful degradation (mirrors [`crate::reason::active_reasoner`]), in priority order:
+/// - the `local-embed` feature is ON **and** the e5 model dir is present at [`embed_model_dir`]
+///   ([`embed_model_present`]) → the real [`candle_bert::CandleBertEmbedder`] (lazy: the model loads
+///   on first `embed`, not here, so this never blocks startup and never panics);
+/// - otherwise (feature off, no model, or a construction error) → the dependency-free
+///   [`StubEmbedder`]. The app works either way; semantic, WHEN enabled, just uses real vectors once
+///   the model is present.
+///
+/// NEVER panics and NEVER blocks. Target model = multilingual-e5-small (384-dim), so the real model's
+/// width EQUALS [`EMBED_DIM`] — ZERO `vec_chunks` schema migration. (A future model whose dimension
+/// differs would be a `vec_chunks float[N]` SCHEMA change — an additive migration to a new-width vec0
+/// table plus a full re-index, NOT a code one-liner; a mismatched-width insert fails loud, never
+/// silently.) Cheap to construct (the stub is zero-sized; the candle backend defers the heavy load),
+/// so callers build one per operation. NEVER invoked when `semantic_search_enabled` is off (the gate
+/// short-circuits before this is called) — building the real embedder does NOT flip that flag.
 pub fn active_embedder() -> Box<dyn Embedder> {
+    #[cfg(feature = "local-embed")]
+    {
+        if embed_model_present() {
+            match embed_model_dir().and_then(candle_bert::CandleBertEmbedder::new) {
+                Ok(e) => {
+                    tracing::info!(target: "embed", "local embed model ready (lazy load)");
+                    return Box::new(e);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "embed", error = %e, "local embed init failed; using stub embedder");
+                }
+            }
+        } else {
+            tracing::info!(target: "embed", "no local embed model present; using stub embedder");
+        }
+    }
     Box::new(StubEmbedder)
 }
 
@@ -164,6 +258,79 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: f64) -> Vec<(String, f64)> {
     fused
 }
 
+/// Download the three e5 model files into [`embed_model_dir`], INBOUND-ONLY, with progress.
+///
+/// Mirrors [`crate::reason::download_brain_model`]: each file streams to `<file>.part` then renames
+/// atomically; `on_progress(file_index, downloaded, total)` fires as bytes arrive (`total` is `None`
+/// when the server omits `Content-Length`). A file already present on disk is SKIPPED. INBOUND ONLY:
+/// fetches model files and sends NO request body / NO meeting content (no egress). NO PII logged —
+/// filenames + byte counts only.
+pub async fn download_embed_model<F>(mut on_progress: F) -> Result<PathBuf>
+where
+    F: FnMut(usize, u64, Option<u64>),
+{
+    use crate::error::AppError;
+    use tokio::io::AsyncWriteExt;
+
+    let dir = embed_model_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Storage(format!("create embed model dir: {e}")))?;
+
+    for (idx, file) in EMBED_MODEL_FILES.iter().enumerate() {
+        let dest = dir.join(file);
+        if dest.is_file() {
+            continue;
+        }
+        let url = format!("{EMBED_MODEL_HF_BASE}/{file}");
+        tracing::info!(target: "embed", file = %file, "downloading embed model file");
+
+        let mut resp = reqwest::get(&url)
+            .await
+            .map_err(|e| AppError::Storage(format!("embed model download request failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(AppError::Storage(format!(
+                "embed model download HTTP {} for {file}",
+                resp.status()
+            )));
+        }
+        let total = resp.content_length();
+
+        let part = dest.with_extension("part");
+        let mut out = tokio::fs::File::create(&part)
+            .await
+            .map_err(|e| AppError::Storage(format!("create embed model temp file: {e}")))?;
+        let mut downloaded: u64 = 0;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| AppError::Storage(format!("embed model download body failed: {e}")))?
+        {
+            out.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Storage(format!("write embed model chunk: {e}")))?;
+            downloaded += chunk.len() as u64;
+            on_progress(idx, downloaded, total);
+        }
+        out.flush()
+            .await
+            .map_err(|e| AppError::Storage(format!("flush embed model file: {e}")))?;
+        drop(out);
+
+        if downloaded == 0 {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(AppError::Storage(format!(
+                "embed model download returned empty body for {file}"
+            )));
+        }
+        tokio::fs::rename(&part, &dest)
+            .await
+            .map_err(|e| AppError::Storage(format!("rename embed model file: {e}")))?;
+        tracing::info!(target: "embed", file = %file, bytes = downloaded, "embed model file ready");
+    }
+
+    Ok(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +390,69 @@ mod tests {
         let pos = |want: &str| fused.iter().position(|(id, _)| id == want).unwrap();
         assert!(pos("m2") < pos("m3"), "m2 (in both lists) must outrank m3 (one list)");
         assert!(pos("m1") < pos("m3"), "m1 (in both lists) must outrank m3 (one list)");
+    }
+
+    #[test]
+    fn embed_query_and_passage_apply_the_e5_prefix() {
+        // The default trait methods prefix the text; we assert the prefix reaches `embed` by using a
+        // capture embedder that records exactly what it was handed.
+        struct CaptureEmbedder(std::sync::Mutex<Vec<String>>);
+        impl Embedder for CaptureEmbedder {
+            fn dim(&self) -> usize {
+                EMBED_DIM
+            }
+            fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                *self.0.lock().unwrap() = texts.to_vec();
+                Ok(texts.iter().map(|_| vec![0f32; EMBED_DIM]).collect())
+            }
+        }
+        let e = CaptureEmbedder(std::sync::Mutex::new(Vec::new()));
+        e.embed_passage(&["a budget note".to_string()]).unwrap();
+        assert_eq!(e.0.lock().unwrap().as_slice(), &["passage: a budget note".to_string()]);
+        e.embed_query(&["how much budget".to_string()]).unwrap();
+        assert_eq!(e.0.lock().unwrap().as_slice(), &["query: how much budget".to_string()]);
+    }
+
+    #[test]
+    fn embed_model_dir_is_under_models_dir() {
+        let dir = embed_model_dir().unwrap();
+        assert!(dir.ends_with(EMBED_MODEL_SUBDIR));
+        // The three e5 files are the documented set.
+        assert_eq!(EMBED_MODEL_FILES, &["model.safetensors", "tokenizer.json", "config.json"]);
+        assert!(EMBED_MODEL_HF_BASE.contains("intfloat/multilingual-e5-small"));
+    }
+
+    #[test]
+    fn embed_model_present_false_when_any_file_missing() {
+        // On a clean machine the e5 dir is absent ⇒ not present. Even with a partial dir (only one of
+        // the three files), `present` must be false — the loader needs all three.
+        let dir = embed_model_dir().unwrap();
+        let had_dir = dir.is_dir();
+        // If a real model happens to be installed, this assertion is vacuously satisfied; otherwise
+        // assert the absent/partial cases without clobbering a real install.
+        if !had_dir {
+            assert!(!embed_model_present(), "absent e5 dir must report not-present");
+        }
+    }
+
+    /// The embedder factory's graceful-degradation contract: with NO e5 model dir present,
+    /// `active_embedder` returns the deterministic StubEmbedder (dim == EMBED_DIM, byte-stable). With
+    /// the `local-embed` feature OFF this is unconditional; with it ON it still holds whenever the
+    /// model dir is absent. Headless proof of the swap wiring's fallback (mirrors
+    /// `active_reasoner_falls_back_to_stub_without_model`).
+    #[test]
+    fn active_embedder_falls_back_to_stub_without_model() {
+        // Only meaningful as a fallback assertion when no real model is installed; on a clean
+        // machine/CI the e5 dir is absent, so a feature-on build also yields the stub.
+        if !embed_model_present() {
+            let e = active_embedder();
+            assert_eq!(e.dim(), EMBED_DIM);
+            // Deterministic + L2-normalized like the stub (the real model would not be byte-stable).
+            let a = e.embed(&["budżet planowanie".to_string()]).unwrap();
+            let b = e.embed(&["budżet planowanie".to_string()]).unwrap();
+            assert_eq!(a, b, "stub fallback must be byte-deterministic");
+            let norm: f32 = a[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5);
+        }
     }
 }

@@ -1236,8 +1236,9 @@ pub async fn ask_vault(
     // FTS when no vectors exist, and the flag-off branch is byte-for-byte the prior behavior).
     let (corpus, sources) = if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
+        // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
         let query_vec = embedder
-            .embed(std::slice::from_ref(&question))?
+            .embed_query(std::slice::from_ref(&question))?
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -2132,6 +2133,57 @@ pub async fn download_brain_model(
         },
     );
     Ok(dest.to_string_lossy().to_string())
+}
+
+/// `true` when all three multilingual-e5-small files are present in the shared models dir's embed
+/// sub-dir — i.e. the REAL embedder (under `--features local-embed`) would load. Cheap existence
+/// probe; NEVER errors on a missing models dir (treats it as "not present").
+#[tauri::command]
+pub fn embed_model_present() -> Result<bool, AppError> {
+    Ok(crate::embed::embed_model_present())
+}
+
+/// Download the multilingual-e5-small model (3 HF files) into the shared models dir, INBOUND-ONLY,
+/// emitting [`crate::events::EVENT_EMBED_DOWNLOAD`] progress (throttled per file). Sends NO meeting
+/// content (no egress). The downloaded model is NOT loaded here — it is picked up lazily by
+/// `embed::active_embedder` on the next embed (feature-gated by `local-embed`). Returns the model dir.
+#[tauri::command]
+pub async fn download_embed_model(app: AppHandle) -> Result<String, AppError> {
+    let file_count = crate::embed::EMBED_MODEL_FILES.len();
+    // Throttle progress to roughly every 2 MB so the (small) model download doesn't flood the FE.
+    const EMIT_EVERY: u64 = 2 * 1024 * 1024;
+    let mut last_emit: u64 = 0;
+    let mut last_index: usize = usize::MAX;
+    let dir = crate::embed::download_embed_model(|file_index, downloaded, total| {
+        // Always emit on a file boundary; otherwise throttle by bytes.
+        if file_index != last_index || downloaded - last_emit >= EMIT_EVERY {
+            last_index = file_index;
+            last_emit = downloaded;
+            let _ = app.emit(
+                crate::events::EVENT_EMBED_DOWNLOAD,
+                crate::events::EmbedDownloadPayload {
+                    file_index,
+                    file_count,
+                    downloaded,
+                    total,
+                    done: false,
+                },
+            );
+        }
+    })
+    .await?;
+
+    let _ = app.emit(
+        crate::events::EVENT_EMBED_DOWNLOAD,
+        crate::events::EmbedDownloadPayload {
+            file_index: file_count,
+            file_count,
+            downloaded: 0,
+            total: None,
+            done: true,
+        },
+    );
+    Ok(dir.to_string_lossy().to_string())
 }
 
 /// Show/hide the floating recorder bar window (also bound to the global ⌘⇧R shortcut).
