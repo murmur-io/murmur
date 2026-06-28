@@ -5,7 +5,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::audio::Recorder;
 use crate::error::AppError;
 use crate::events::{StatusPayload, EVENT_STATUS};
-use crate::settings::AppConfig;
+use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarEvent, ChatTurn,
@@ -103,11 +103,46 @@ pub struct AppConfigDto {
     /// clear consent — even a partial/omitting payload (`#[serde(default)]` = false) is inert here.
     #[serde(default)]
     pub cloud_egress_consented: bool,
+    /// Phase H — which reasoner powers the on-device "brain" pre-analysis (Flow A): `cloud` |
+    /// `local` | `off`. Unlike `cloud_egress_consented`, this IS settable from the DTO (the Settings
+    /// UI owns the brain toggle). An omitted/unknown value deserializes to the default `Cloud`
+    /// (`deserialize_with` tolerates an unknown token → `Cloud`, and `default` covers an omitted
+    /// key), so a partial OR malformed save can never select an invalid backend.
+    #[serde(default, deserialize_with = "deserialize_brain_backend_lenient")]
+    pub brain_backend: BrainBackend,
+    /// Phase H — the in-meeting VOICE ACTION DISPATCH master gate (Flow B). Settable from the DTO
+    /// (the Settings UI owns the toggle). OPT-IN: an omitted value deserializes to `false`
+    /// (`#[serde(default)]`), so a partial/older save can never silently enable the always-on
+    /// in-meeting assistant.
+    #[serde(default)]
+    pub realtime_reactions: bool,
+    /// Phase H — the SELECTED on-device brain model id (from `reason::BRAIN_MODELS`). Settable from
+    /// the DTO, but `dto_to_config` VALIDATES it against the registry: an unknown/`None` id is
+    /// IGNORED (the live selection is preserved, no error) so a settings save can never store a
+    /// bogus model id. `select_brain_model` remains the other supported mutator.
+    #[serde(default)]
+    pub brain_model_id: Option<String>,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
 fn default_true() -> bool {
     true
+}
+
+/// Lenient `brain_backend` deserialization for the settings DTO: an UNKNOWN/garbage token
+/// degrades to the default `Cloud` instead of failing the whole `save_config` payload (the derived
+/// enum would reject `"bogus"` with an error). Mirrors `BrainBackend::from_str_or_default`, so the
+/// FE can never wedge a settings save with a stale/typo'd backend value. A non-string (e.g. null)
+/// also falls back to `Cloud`.
+fn deserialize_brain_backend_lenient<'de, D>(deserializer: D) -> std::result::Result<BrainBackend, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let token = Option::<String>::deserialize(deserializer)?;
+    Ok(token
+        .as_deref()
+        .map(BrainBackend::from_str_or_default)
+        .unwrap_or_default())
 }
 
 /// A meeting + its latest note + transcript segments (Library Detail view).
@@ -1603,6 +1638,9 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
         cloud_egress_consented: c.cloud_egress_consented,
+        brain_backend: c.brain_backend,
+        realtime_reactions: c.realtime_reactions,
+        brain_model_id: c.brain_model_id.clone(),
     }
 }
 
@@ -1663,17 +1701,22 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // Phase B: the brain model path is not carried on the settings DTO (it is resolved from the
         // shared models dir by default), so a settings save preserves the live value (default None).
         brain_model_path: current.brain_model_path.clone(),
-        // Phase B (registry): the selected brain model id is set ONLY via `select_brain_model`, never
-        // through a settings save — preserve the live value so a save can't clobber the selection.
-        brain_model_id: current.brain_model_id.clone(),
-        // Phase B (brain backend): which reasoner powers the brain (cloud/local/off). Not carried on
-        // the settings DTO yet — preserve the live value (default Cloud) so a settings save can
-        // neither change nor clobber the backend selection.
-        brain_backend: current.brain_backend,
-        // Phase E (Flow B): the in-meeting voice-action dispatch gate is not carried on the settings
-        // DTO yet — preserve the live value (default OFF) so a normal settings save can neither
-        // enable nor clobber the opt-in.
-        realtime_reactions: current.realtime_reactions,
+        // Phase H (registry): the selected brain model id IS carried on the settings DTO, but it is
+        // VALIDATED against the registry first. A `Some(known-id)` is taken; an unknown id or `None`
+        // is IGNORED — the live selection is preserved (no error, no bogus id stored). This mirrors
+        // `select_brain_model`'s registry guard without crashing a settings save on a stale/typo'd id.
+        brain_model_id: match d.brain_model_id.as_deref() {
+            Some(id) if crate::reason::brain_model_by_id(id).is_some() => d.brain_model_id.clone(),
+            _ => current.brain_model_id.clone(),
+        },
+        // Phase H (brain backend): which reasoner powers the brain (cloud/local/off) IS taken from
+        // the DTO (the Settings UI owns the toggle). `BrainBackend` deserializes an unknown/omitted
+        // token to the default `Cloud`, so the value here is always a valid enum variant.
+        brain_backend: d.brain_backend,
+        // Phase H (Flow B): the in-meeting voice-action dispatch gate IS taken from the DTO (the
+        // Settings UI owns the toggle). Plain bool; an omitted value already defaulted to OFF on the
+        // DTO (`#[serde(default)]`), so the opt-in can never be silently enabled by a partial save.
+        realtime_reactions: d.realtime_reactions,
     }
 }
 
@@ -4357,6 +4400,87 @@ mod lifecycle_tests {
         assert!(
             !dto_to_config(dto2, &current2).cloud_egress_consented,
             "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
+        );
+    }
+
+    /// Phase H: the three brain toggles round-trip through the settings DTO. `config_to_dto` carries
+    /// them OUT (so the FE can read them) and `dto_to_config` takes them IN (so the FE can set them),
+    /// for every `BrainBackend` variant + the bool + a known model id.
+    #[test]
+    fn dto_round_trips_brain_backend_realtime_reactions_and_model_id() {
+        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            let cfg = AppConfig {
+                brain_backend: backend,
+                realtime_reactions: true,
+                brain_model_id: Some("bielik-11b-v3".to_string()),
+                ..AppConfig::default()
+            };
+            // OUT: get_config carries the live values to the FE.
+            let dto = config_to_dto(&cfg);
+            assert_eq!(dto.brain_backend, backend);
+            assert!(dto.realtime_reactions);
+            assert_eq!(dto.brain_model_id.as_deref(), Some("bielik-11b-v3"));
+
+            // IN: a settings save sets them from the DTO (start from a DIFFERENT current to prove the
+            // value comes from the DTO, not preservation).
+            let current = AppConfig {
+                brain_backend: BrainBackend::Cloud,
+                realtime_reactions: false,
+                brain_model_id: Some("qwen2.5-3b".to_string()),
+                ..AppConfig::default()
+            };
+            let merged = dto_to_config(dto, &current);
+            assert_eq!(merged.brain_backend, backend);
+            assert!(merged.realtime_reactions);
+            assert_eq!(merged.brain_model_id.as_deref(), Some("bielik-11b-v3"));
+        }
+    }
+
+    /// Phase H graceful degradation: a DTO carrying an UNKNOWN `brain_model_id` must NOT be stored —
+    /// the live selection is preserved (no error, no bogus id) — while an unknown/omitted
+    /// `brain_backend` deserializes to the default `Cloud` rather than crashing the save.
+    #[test]
+    fn dto_unknown_brain_model_id_preserved_and_unknown_backend_defaults_cloud() {
+        // (a) unknown model id ⇒ ignored, current selection preserved.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.brain_model_id = Some("totally-made-up-model".to_string());
+        let current = AppConfig {
+            brain_model_id: Some("qwen2.5-3b".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            dto_to_config(dto, &current).brain_model_id.as_deref(),
+            Some("qwen2.5-3b"),
+            "an unknown brain_model_id must be ignored, preserving the live selection"
+        );
+
+        // (b) a None model id likewise preserves the current selection (a settings save without a
+        // brain pick must not clear an existing one).
+        let mut dto_none = config_to_dto(&AppConfig::default());
+        dto_none.brain_model_id = None;
+        let current_some = AppConfig {
+            brain_model_id: Some("qwen3-14b".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            dto_to_config(dto_none, &current_some).brain_model_id.as_deref(),
+            Some("qwen3-14b")
+        );
+
+        // (c) an unknown/omitted brainBackend token deserializes to the default Cloud (no crash),
+        // then flows through dto_to_config as Cloud.
+        let json = r#"{
+            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
+        }"#;
+        let dto_bad: AppConfigDto = serde_json::from_str(json).unwrap();
+        assert_eq!(dto_bad.brain_backend, BrainBackend::Cloud, "unknown token → Cloud");
+        assert!(!dto_bad.realtime_reactions, "omitted realtimeReactions defaults OFF");
+        assert_eq!(
+            dto_to_config(dto_bad, &AppConfig::default()).brain_backend,
+            BrainBackend::Cloud
         );
     }
 
