@@ -418,11 +418,14 @@ async fn run_inner(
         .db
         .update_meeting_status(meeting_id, MeetingStatus::Transcribed)?;
 
-    // Rebuild the full transcript text from the merged, time-ordered segments.
+    // Rebuild the full transcript text from the merged, time-ordered segments — EXCLUDING segments
+    // the user spoke TO the assistant ("Klaudku, sprawdź pogodę"). Those are assistant commands, not
+    // meeting content: fed to the summarizer they get mangled into owner-less action items. The
+    // assistant's ANSWER lives in the persisted Q&A log (assistant_interactions), not the note.
     let mut full_text = String::new();
     for seg in &merged_segments {
         let t = seg.text.trim();
-        if t.is_empty() {
+        if t.is_empty() || crate::audio::wake::is_assistant_directed(t) {
             continue;
         }
         if !full_text.is_empty() {
@@ -801,11 +804,12 @@ pub async fn resummarize_existing(
         ));
     }
 
-    // Rebuild full text from segments (same joining as the transcriber).
+    // Rebuild full text from segments (same joining as the transcriber), EXCLUDING assistant-
+    // directed utterances ("Klaudku, …") so they never reach the action-items extraction.
     let mut full_text = String::new();
     for seg in &segments {
         let t = seg.text.trim();
-        if t.is_empty() {
+        if t.is_empty() || crate::audio::wake::is_assistant_directed(t) {
             continue;
         }
         if !full_text.is_empty() {

@@ -16,6 +16,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type {
+  AssistantInteraction,
   FolderNode,
   GraphPayload,
   MeetingDetail,
@@ -51,6 +52,33 @@ interface NoteSection {
   bullets: string[];
   /** Checklist entries (kind === 'actions'). */
   actions: ActionItem[];
+}
+
+/**
+ * One grounding citation, parsed from the persisted `string[]` the backend
+ * stores per interaction. The backend writes `[[Title]]` for a vault source and
+ * a `(web)` / `(https://…)` form for a web source — we split the two so the FE
+ * can render `[[vault]]` chips vs distinct "via web" links (mirroring the live
+ * assistant-actions card, whose live store carries structured citations).
+ */
+interface ParsedCitation {
+  kind: "vault" | "web";
+  /** Display label (vault title, or the host/label for a web source). */
+  label: string;
+  /** Resolved URL for a web source; null for a vault citation. */
+  url: string | null;
+}
+
+/** A persisted assistant Q&A interaction enriched with parsed citations. */
+interface AssistantQa {
+  /** Stable id for `@for` tracking (createdAt + index — interactions are append-only). */
+  id: string;
+  command: string;
+  answer: string;
+  citations: ParsedCitation[];
+  status: string;
+  sourceLabel: string | null;
+  createdAt: string;
 }
 
 /** The whole note, decomposed into front-matter + body sections. */
@@ -757,6 +785,87 @@ interface ParsedNote {
             }
           </section>
 
+          <!-- 2·25) ASSISTANT Q&A (persisted in-meeting voice exchanges) ------- -->
+          @if (interactions().length) {
+            <section class="block print-keep">
+              <div class="block-head">
+                <h3>🎙 Asystent — Q&amp;A</h3>
+                <span class="count">{{ interactions().length }}</span>
+              </div>
+
+              <ul class="qa-list">
+                @for (q of interactions(); track q.id) {
+                  <li
+                    class="card qa-row"
+                    [class.is-pending]="q.status === 'pending'"
+                  >
+                    <div class="qa-heard">
+                      <span class="qa-ico" aria-hidden="true">🎙</span>
+                      <span class="qa-heard-text">
+                        Pytałeś:
+                        <strong>{{ q.command || "…" }}</strong>
+                      </span>
+                      @if (qaStatusLabel(q.status)) {
+                        <span class="pill" [class]="qaStatusPillClass(q.status)">
+                          <span class="pill-dot"></span>
+                          {{ qaStatusLabel(q.status) }}
+                        </span>
+                      }
+                    </div>
+
+                    @if (q.answer) {
+                      <p class="qa-answer">{{ q.answer }}</p>
+                    }
+
+                    @if (q.citations.length) {
+                      <div class="qa-cites" aria-label="Źródła">
+                        @for (c of q.citations; track $index) {
+                          @if (c.kind === "web") {
+                            @if (c.url) {
+                              <a
+                                class="cite-chip is-web"
+                                [href]="c.url"
+                                target="_blank"
+                                rel="noreferrer noopener"
+                                [title]="c.url"
+                              >
+                                <span class="cite-web-mark" aria-hidden="true"
+                                  >⊕</span
+                                >
+                                <span class="cite-web-label">{{
+                                  c.label
+                                }}</span>
+                                <span class="cite-web-via">via web</span>
+                              </a>
+                            } @else {
+                              <span class="cite-chip is-web">
+                                <span class="cite-web-mark" aria-hidden="true"
+                                  >⊕</span
+                                >
+                                <span class="cite-web-label">{{
+                                  c.label
+                                }}</span>
+                                <span class="cite-web-via">via web</span>
+                              </span>
+                            }
+                          } @else {
+                            <span class="cite-chip">[[{{ c.label }}]]</span>
+                          }
+                        }
+                      </div>
+                    }
+
+                    @if (q.sourceLabel) {
+                      <span class="qa-source text-muted">{{
+                        q.sourceLabel
+                      }}</span>
+                    }
+                  </li>
+                }
+              </ul>
+            </section>
+          }
+
           <!-- 2·5) ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none) - -->
           <app-meeting-actions [meetingId]="d.meeting.id" />
 
@@ -1392,6 +1501,102 @@ interface ParsedNote {
         line-height: 1.7;
       }
 
+      /* Assistant — Q&A section (mirrors the live assistant-actions card) */
+      .qa-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+      }
+      .qa-row {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        padding: var(--space-3) var(--space-4);
+        animation: rise 360ms var(--transition) both;
+      }
+      .qa-heard,
+      .qa-cites {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+      }
+      .qa-heard-text {
+        color: var(--text-secondary);
+        font-size: 0.875rem;
+      }
+      .qa-heard-text strong {
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+      .qa-heard .pill {
+        margin-left: auto;
+      }
+      .qa-answer {
+        margin: 0;
+        color: var(--text-primary);
+        font-size: 0.9rem;
+        line-height: 1.55;
+        white-space: pre-wrap;
+      }
+      .qa-source {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+      .cite-chip {
+        padding: 2px var(--space-2);
+        border-radius: var(--radius-sm);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-family: var(--font-mono);
+        font-size: 0.78rem;
+      }
+      /* A web source — visibly distinct from the [[vault]] chips, with a loud
+         "via web" tag for the off-device origin (mirrors assistant-actions). */
+      .cite-chip.is-web {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        max-width: 100%;
+        background: var(--surface-input);
+        border: 1px solid var(--border-subtle);
+        color: var(--text-secondary);
+        font-family: inherit;
+        text-decoration: none;
+      }
+      a.cite-chip.is-web:hover {
+        border-color: var(--accent-soft);
+        color: var(--text-primary);
+      }
+      .cite-web-mark {
+        color: var(--accent);
+        line-height: 1;
+      }
+      .cite-web-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 220px;
+      }
+      .cite-web-via {
+        padding: 0 var(--space-1);
+        border-radius: var(--radius-sm);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .qa-row {
+          animation: none;
+        }
+      }
+
       /* Saved-to-vault line */
       .saved {
         display: flex;
@@ -1816,6 +2021,16 @@ export class DetailComponent implements OnInit {
   readonly note = computed<ParsedNote | null>(() => {
     const md = this.detail()?.note?.markdown;
     return md ? this.parseNote(md) : null;
+  });
+
+  /**
+   * The persisted in-meeting assistant Q&A for this meeting, citations parsed
+   * into vault/web shapes for rendering. Empty when the meeting is locked (the
+   * backend gates `assistantInteractions` exactly like `note`/`segments`).
+   */
+  readonly interactions = computed<AssistantQa[]>(() => {
+    const raw = this.detail()?.assistantInteractions ?? [];
+    return raw.map((i, idx) => this.parseInteraction(i, idx));
   });
 
   // --- Interactive timeline (speaker + topic viz) -------------------------
@@ -2667,6 +2882,99 @@ export class DetailComponent implements OnInit {
    * body into `## ` sections. Falls back to raw markdown when no section is
    * found.
    */
+  /**
+   * Enrich a raw persisted interaction with a stable id + parsed citations. The
+   * backend stores citations as plain strings: `[[Title]]` for a vault source,
+   * or a bare URL / `(web)` marker for a web source. We split the two so the
+   * template can render `[[vault]]` chips vs distinct "via web" links.
+   */
+  private parseInteraction(i: AssistantInteraction, idx: number): AssistantQa {
+    return {
+      id: `${i.createdAt}#${idx}`,
+      command: i.command,
+      answer: i.answer,
+      citations: (i.citations ?? []).map((c) => this.parseCitation(c)),
+      status: i.status,
+      sourceLabel: i.sourceLabel,
+      createdAt: i.createdAt,
+    };
+  }
+
+  /** Split one persisted citation string into a vault- vs web-shaped chip. */
+  private parseCitation(raw: string): ParsedCitation {
+    const c = raw.trim();
+    // A bare http(s) URL → web link.
+    if (/^https?:\/\//i.test(c)) {
+      return { kind: "web", label: this.hostOf(c) ?? c, url: c };
+    }
+    // `[[Title]]` (or `Title`) → vault chip; strip the wikilink brackets.
+    const wiki = /^\[\[(.+?)\]\]$/.exec(c);
+    if (wiki) {
+      return { kind: "vault", label: wiki[1].trim(), url: null };
+    }
+    // `(web)` / `web` marker with no URL → a labelless web source.
+    if (/^\(?web\)?$/i.test(c)) {
+      return { kind: "web", label: "web", url: null };
+    }
+    // `Label (https://…)` form → web link with a friendly label.
+    const labelled = /^(.*?)\s*\((https?:\/\/[^)]+)\)$/i.exec(c);
+    if (labelled) {
+      return {
+        kind: "web",
+        label: labelled[1].trim() || this.hostOf(labelled[2]) || labelled[2],
+        url: labelled[2],
+      };
+    }
+    // Fallback: treat as a vault title (no off-device origin implied).
+    return { kind: "vault", label: c, url: null };
+  }
+
+  /** Best-effort host extraction for a web citation label; null if unparseable. */
+  private hostOf(url: string): string | null {
+    try {
+      return new URL(url).host;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Map an interaction status to a global `.pill` variant (mirrors the live card). */
+  protected qaStatusPillClass(status: string): string {
+    switch (status) {
+      case "ok":
+        return "is-success";
+      case "needs_consent":
+        return "is-warning";
+      case "unavailable":
+      case "unrecognized":
+        return "is-accent";
+      case "nothing_heard":
+        return "";
+      default:
+        return "is-danger";
+    }
+  }
+
+  /** Short human label for the status pill. */
+  protected qaStatusLabel(status: string): string {
+    switch (status) {
+      case "ok":
+        return "Odpowiedziano";
+      case "needs_consent":
+        return "Wymaga zgody";
+      case "unavailable":
+        return "Niedostępne";
+      case "unrecognized":
+        return "Nierozpoznane";
+      case "nothing_heard":
+        return "Nic nie usłyszano";
+      case "error":
+        return "Błąd";
+      default:
+        return status;
+    }
+  }
+
   private parseNote(markdown: string): ParsedNote {
     const lines = markdown.replace(/\r\n/g, "\n").split("\n");
 
