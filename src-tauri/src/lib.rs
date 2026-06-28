@@ -105,6 +105,8 @@ pub fn run() {
             commands::model_present,
             commands::download_model,
             commands::brain_model_present,
+            commands::list_brain_models,
+            commands::select_brain_model,
             commands::download_brain_model,
             commands::toggle_bar,
             commands::list_folders,
