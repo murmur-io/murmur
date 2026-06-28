@@ -38,25 +38,43 @@ pub fn app_dir_name() -> &'static str {
 }
 
 /// Live state of a MANUAL voice-command capture (the button trigger). Held in
-/// `AppState::voice_command_capture` while the user is "asking the assistant". The `budget` is a
-/// countdown of live ticks (each ≈3s, see `transcribe::live::TICK`): it is decremented every tick
-/// the capture survives, and when it reaches 0 the captured tail is dispatched as-is (even if its
-/// intent is `Unknown`, yielding a graceful "unrecognized" result) so the capture can never hang.
+/// `AppState::voice_command_capture` while the user is "asking the assistant".
+///
+/// The capture isolates the POST-CLICK utterance: at arm time it latches the recorder's current
+/// total-sample offset (`start_sample`), and each live tick transcribes ONLY the audio captured
+/// SINCE that offset (a growing window) — so the command is exactly what the user said after the
+/// click, never the rolling tail of prior speech. `budget` is a countdown of live ticks (each ≈3s,
+/// see `transcribe::live::TICK`): it is decremented every tick that hears NOTHING (silence), and
+/// when it reaches 0 with nothing heard the capture is cleared gracefully ("nothing_heard"). An
+/// EMPTY window is NEVER dispatched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureState {
-    /// Remaining live ticks before we give up waiting for a recognized intent and dispatch the
-    /// last-heard tail. Armed to a small budget (e.g. 3 ticks ≈ 9s) by `begin_voice_command`.
+    /// Remaining live ticks of SILENCE before we give up waiting for the user to speak and clear the
+    /// capture with a graceful "nothing_heard". Armed to a small budget by `begin_voice_command`.
     pub budget: u32,
+    /// The recorder's total-sample offset latched at arm time. Each tick transcribes the audio
+    /// captured since this offset (`Recorder::snapshot_from`), so the command = what was said AFTER
+    /// the click. `None` only in degenerate paths (no recorder / poisoned lock at arm time), in which
+    /// case the loop falls back to the rolling-tail window so the capture still functions.
+    pub start_sample: Option<usize>,
 }
 
 impl CaptureState {
-    /// How many live ticks (≈3s each) a single manual capture stays armed. ~3 ticks ≈ 9s gives the
-    /// user time to finish one spoken command after clicking.
-    pub const DEFAULT_BUDGET: u32 = 3;
+    /// How many live ticks (≈3s each) of SILENCE a single manual capture tolerates before giving up.
+    /// ~5 ticks ≈ 15s gives the user a comfortable window to click and then speak one command.
+    pub const DEFAULT_BUDGET: u32 = 5;
 
-    /// A freshly-armed capture with the default tick budget.
+    /// A freshly-armed capture with the default tick budget and no latched offset (the offset is set
+    /// by `armed_from` at the call site that has the recorder). Kept for the headless tests that
+    /// don't have a recorder; the live loop falls back to the rolling tail when `start_sample` is None.
     pub fn armed() -> Self {
-        Self { budget: Self::DEFAULT_BUDGET }
+        Self { budget: Self::DEFAULT_BUDGET, start_sample: None }
+    }
+
+    /// A freshly-armed capture that latches the recorder's total-sample `offset` at arm time, so the
+    /// live loop transcribes only the POST-CLICK utterance.
+    pub fn armed_from(offset: usize) -> Self {
+        Self { budget: Self::DEFAULT_BUDGET, start_sample: Some(offset) }
     }
 }
 

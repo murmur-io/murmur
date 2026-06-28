@@ -140,18 +140,34 @@ export interface WakeDetectedPayload {
   intent: string;
 }
 
-/** Phase H — status of a completed voice action. */
-export type VoiceActionStatus = "ok" | "needs_consent" | "unavailable" | "error";
+/**
+ * Phase H — status of a completed voice action. Mirrors the backend
+ * `VoiceActionResult.status` strings (`voice_action.rs`): `ok` (done) |
+ * `needs_consent` (cloud brain refused, fail-closed) | `unavailable` (deferred
+ * capability, e.g. Slack) | `unrecognized` (nothing actionable parsed) |
+ * `nothing_heard` (a manual capture's budget expired with NOTHING spoken) |
+ * `error` (best-effort failure, message non-PII).
+ */
+export type VoiceActionStatus =
+  | "ok"
+  | "needs_consent"
+  | "unavailable"
+  | "unrecognized"
+  | "nothing_heard"
+  | "error";
 
 /**
- * Phase H — the result of a voice action (`EVENT_VOICE_ACTION_RESULT`): a
- * short summary + grounding citations (meeting titles → [[wikilink]] chips) +
- * a status pill.
+ * Phase H — the result of a voice action (`EVENT_VOICE_ACTION_RESULT`): the
+ * HEARD command (the user's own dictated words, so the card can show
+ * "usłyszano: {command}"; empty when nothing was heard), a short summary +
+ * grounding citations (meeting titles → [[wikilink]] chips) + a status pill.
  */
 export interface VoiceActionResultPayload {
   intentKind: string;
   status: VoiceActionStatus;
   summary: string;
+  /** What the user actually said (their OWN dictation). Empty when nothing was heard. */
+  command: string;
   citations: string[];
 }
 

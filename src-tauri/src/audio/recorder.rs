@@ -236,6 +236,27 @@ impl Recorder {
         let start = guard.len().saturating_sub(max_samples);
         guard[start..].to_vec()
     }
+
+    /// Total number of mono samples captured so far (the buffer length). During recording the
+    /// buffer is never drained, so this only grows (until the S2 cap) — making it a monotonic
+    /// "playhead" the MANUAL voice-command capture latches at arm time to isolate the POST-CLICK
+    /// utterance. Read-only, lock-guarded; returns 0 on a poisoned lock (best-effort, never panics).
+    pub fn total_samples(&self) -> usize {
+        self.shared.samples.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Clone every captured mono sample from `offset` to the current end WITHOUT draining — the
+    /// growing window of audio captured SINCE `offset` was latched. Used by the manual voice-command
+    /// capture to transcribe exactly what was said after the click, cleanly isolated from prior
+    /// speech. If `offset` is past the current end (shouldn't happen — the buffer only grows during
+    /// recording) the result is empty. Read-only; never disturbs capture or the final stop() buffer.
+    pub fn snapshot_from(&self, offset: usize) -> Vec<f32> {
+        let Ok(guard) = self.shared.samples.lock() else {
+            return Vec::new();
+        };
+        let start = offset.min(guard.len());
+        guard[start..].to_vec()
+    }
 }
 
 impl Drop for Recorder {

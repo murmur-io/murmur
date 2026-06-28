@@ -40,15 +40,21 @@ import type { AssistantInteraction } from "../../core/assistant.store";
             <li class="action-row" [class.is-pending]="a.status === 'pending'">
               <div class="action-heard">
                 <span class="heard-ico" aria-hidden="true">🎙</span>
-                <span class="heard-text">
-                  usłyszano:
-                  <strong>{{ a.command || "…" }}</strong>
-                </span>
-                @if (a.status !== "pending") {
-                  <span class="pill" [class]="statusPillClass(a)">
-                    <span class="pill-dot"></span>
+                @if (a.status === "nothing_heard") {
+                  <span class="heard-text heard-nudge">
                     {{ statusLabel(a) }}
                   </span>
+                } @else {
+                  <span class="heard-text">
+                    usłyszano:
+                    <strong>{{ a.command || "…" }}</strong>
+                  </span>
+                  @if (a.status !== "pending") {
+                    <span class="pill" [class]="statusPillClass(a)">
+                      <span class="pill-dot"></span>
+                      {{ statusLabel(a) }}
+                    </span>
+                  }
                 }
               </div>
 
@@ -59,6 +65,8 @@ import type { AssistantInteraction } from "../../core/assistant.store";
                   </span>
                   <span class="text-muted">Thinking…</span>
                 </div>
+              } @else if (a.status === "nothing_heard") {
+                <!-- the nudge label above is the whole message; no summary row -->
               } @else {
                 @if (a.summary) {
                   <p class="action-summary">{{ a.summary }}</p>
@@ -151,6 +159,10 @@ import type { AssistantInteraction } from "../../core/assistant.store";
         color: var(--text-primary);
         font-weight: 600;
       }
+      .heard-nudge {
+        color: var(--text-primary);
+        font-weight: 550;
+      }
       .action-heard .pill {
         margin-left: auto;
       }
@@ -240,13 +252,18 @@ export class AssistantActionsComponent implements OnInit {
       case "needs_consent":
         return "is-warning";
       case "unavailable":
+      case "unrecognized":
         return "is-accent";
+      case "nothing_heard":
+        // Not an error — the user simply didn't speak. Keep it calm: the plain
+        // neutral `.pill` (muted secondary text), no alarming `is-danger`.
+        return "";
       default:
         return "is-danger";
     }
   }
 
-  /** Short human label for the status pill. */
+  /** Short human label for the status pill / nudge line. */
   protected statusLabel(a: AssistantInteraction): string {
     switch (a.status) {
       case "ok":
@@ -255,6 +272,10 @@ export class AssistantActionsComponent implements OnInit {
         return "Needs consent";
       case "unavailable":
         return "Unavailable";
+      case "unrecognized":
+        return "Not recognized";
+      case "nothing_heard":
+        return "Nie usłyszałem — spróbuj jeszcze raz";
       case "error":
         return "Error";
       default:
