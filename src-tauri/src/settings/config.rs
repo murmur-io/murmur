@@ -10,8 +10,8 @@ use crate::storage::Db;
 ///   ([`crate::reason::CloudReasoner`]) reasons via the SAME `make_provider` factory the note
 ///   summary uses, so the egress posture is IDENTICAL (RedactingProvider + fail-closed
 ///   `cloud_egress_consented` gate). No local model required.
-/// - **`Local`**: the on-device GGUF (`MistralReasoner`, e.g. Bielik) when the `local-brain`
-///   feature is compiled in AND the selected model file is present; otherwise the `StubReasoner`.
+/// - **`Local`**: the on-device GGUF (`MistralReasoner`, e.g. Bielik) when the selected model file
+///   is present on disk (mistralrs is always compiled); otherwise the `StubReasoner`.
 /// - **`Off`**: the dependency-free `StubReasoner` (the deterministic floor — zero brain).
 ///
 /// `#[serde(default)]` on the field ⇒ a config persisted before this field existed loads as
@@ -144,16 +144,16 @@ pub struct AppConfig {
     pub semantic_search_enabled: bool,
     /// Phase B — optional explicit path to a local reasoning GGUF for the on-device brain
     /// (`MistralReasoner`). `None` (the default) means the resolver falls back to the default model
-    /// filename inside the shared models dir. Consulted ONLY when the `local-brain` feature is
-    /// compiled in; the default build never loads it. `#[serde(default)]` ⇒ a config persisted before
-    /// this field existed loads as `None`.
+    /// filename inside the shared models dir. Consulted at runtime when `brain_backend == Local`;
+    /// with no model on disk the resolver falls back to the stub. `#[serde(default)]` ⇒ a config
+    /// persisted before this field existed loads as `None`.
     #[serde(default)]
     pub brain_model_path: Option<String>,
     /// Phase B (model registry) — the SELECTED on-device brain model id (from `reason::BRAIN_MODELS`,
     /// e.g. `bielik-11b-v3` / `qwen3-14b` / `qwen2.5-3b`). `None` (the default) means no model is
     /// chosen ⇒ the resolver falls back to the `StubReasoner`. Set via the `select_brain_model`
-    /// command. Consulted only when the `local-brain` feature is compiled in. `#[serde(default)]` ⇒
-    /// a config persisted before this field existed loads as `None`.
+    /// command. Consulted at runtime when `brain_backend == Local`. `#[serde(default)]` ⇒ a config
+    /// persisted before this field existed loads as `None`.
     #[serde(default)]
     pub brain_model_id: Option<String>,
     /// Which reasoning backend powers the brain pre-analysis (Flow A). Default `Cloud` — the

@@ -15,16 +15,13 @@ use regex::Regex;
 use crate::error::Result;
 use crate::summarize::provider::{Availability, SummarizeRequest, SummarizerProvider};
 
-// ── Phase D model plumbing (shared by the feature-gated redactor + the download command) ──────────
-// The real DebertaNameRedactor lives in the sibling `crate::summarize::ner_deberta` module (declared
-// in `summarize/mod.rs`, `#[cfg(feature = "local-ner")]`); this file holds only the model resolver,
-// the active-redactor factory, and the inbound-only downloader.
+// ── Phase D model plumbing (shared by the runtime-selected redactor + the download command) ──────
+// The real DebertaNameRedactor lives in the sibling `crate::summarize::ner_deberta` module (always
+// compiled, declared in `summarize/mod.rs`); this file holds only the model resolver, the
+// active-redactor factory, and the inbound-only downloader.
 
 /// The stable `⟪NAME_` token prefix the [`NameRedactor`] family emits (closed by the index + `⟫`).
-/// Centralized so the real redactor and the fixtures/tests agree byte-for-byte. The sole runtime
-/// consumer (`ner_deberta`) is feature-gated behind `local-ner`, so the default build sees it as
-/// "unused" outside of `#[cfg(test)]` — allow that rather than feature-gate the constant itself.
-#[allow(dead_code)]
+/// Centralized so the real redactor and the fixtures/tests agree byte-for-byte.
 pub(crate) const NER_NAME_TOKEN_PREFIX: &str = "\u{27ea}NAME_";
 
 /// Sub-directory under the shared models dir holding the multilingual DeBERTa NER files
@@ -67,30 +64,28 @@ pub fn ner_model_present() -> bool {
 
 /// The single active name-redactor used by [`RedactingProvider`] (mirrors
 /// [`crate::embed::active_embedder`]). Graceful degradation, in priority order:
-/// - the `local-ner` feature is ON **and** the NER model dir is present at [`ner_model_dir`]
-///   ([`ner_model_present`]) → the real [`ner_deberta::DebertaNameRedactor`] (lazy: the model loads on
-///   first `redact_names`, not here, so this never blocks startup and never panics);
-/// - otherwise (feature off, no model, or a construction error) → the dependency-free
-///   [`NoopNameRedactor`]. Egress is then byte-identical to before this seam existed (ZERO regression).
+/// - the NER model dir is present at [`ner_model_dir`] ([`ner_model_present`]) → the real
+///   [`crate::summarize::ner_deberta::DebertaNameRedactor`] (lazy: the model loads on first
+///   `redact_names`, not here, so this never blocks startup and never panics);
+/// - otherwise (no model, or a construction error) → the dependency-free [`NoopNameRedactor`]. Egress
+///   is then byte-identical to before this seam existed (ZERO regression).
 ///
-/// NEVER panics and NEVER blocks. A NER miss leaks no more than the no-op (the redactor only ever
-/// REMOVES content), so the worst case == today's behaviour.
+/// Selection keys ONLY on model presence — the candle NER backend is always compiled (no cargo
+/// feature). NEVER panics and NEVER blocks. A NER miss leaks no more than the no-op (the redactor only
+/// ever REMOVES content), so the worst case == the no-op behaviour.
 pub fn active_name_redactor() -> Arc<dyn NameRedactor> {
-    #[cfg(feature = "local-ner")]
-    {
-        if ner_model_present() {
-            match ner_model_dir().and_then(crate::summarize::ner_deberta::DebertaNameRedactor::new) {
-                Ok(r) => {
-                    tracing::info!(target: "ner", "local NER name-redactor ready (lazy load)");
-                    return Arc::new(r);
-                }
-                Err(e) => {
-                    tracing::warn!(target: "ner", error = %e, "local NER init failed; using no-op name redactor");
-                }
+    if ner_model_present() {
+        match ner_model_dir().and_then(crate::summarize::ner_deberta::DebertaNameRedactor::new) {
+            Ok(r) => {
+                tracing::info!(target: "ner", "local NER name-redactor ready (lazy load)");
+                return Arc::new(r);
             }
-        } else {
-            tracing::info!(target: "ner", "no local NER model present; using no-op name redactor");
+            Err(e) => {
+                tracing::warn!(target: "ner", error = %e, "local NER init failed; using no-op name redactor");
+            }
         }
+    } else {
+        tracing::info!(target: "ner", "no local NER model present; using no-op name redactor");
     }
     Arc::new(NoopNameRedactor)
 }
@@ -573,8 +568,8 @@ mod tests {
     #[test]
     fn active_name_redactor_falls_back_to_noop_without_model() {
         // The graceful-degradation contract: with NO NER model present, `active_name_redactor`
-        // returns a redactor that leaves text byte-identical (the no-op). With `local-ner` OFF this
-        // is unconditional; with it ON it still holds whenever the model dir is absent.
+        // returns a redactor that leaves text byte-identical (the no-op). The candle NER backend is
+        // always compiled now, so selection keys ONLY on model presence — absent model ⇒ no-op.
         if !ner_model_present() {
             let r = active_name_redactor();
             let text = "Anna Kowalska met Bob Smith on Friday.";

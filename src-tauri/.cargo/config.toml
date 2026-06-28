@@ -3,3 +3,8 @@
 # (tauri.conf.json minimumSystemVersion = 13.4) instead of emitting a linker-version mismatch.
 [env]
 MACOSX_DEPLOYMENT_TARGET = "13.4"
+# mistralrs/metal (the on-device brain, ALWAYS compiled) precompiles Metal shaders via `xcrun metal`,
+# which needs the FULL Xcode toolchain. On a Command-Line-Tools-only Mac that step fails, so we defer
+# shader compile to first runtime use. Set here (not force) so every cargo invocation — `npm run dev`,
+# `cargo test --lib`, `tauri build` — gets it automatically; an explicit env override still wins.
+MISTRALRS_METAL_PRECOMPILE = "0"

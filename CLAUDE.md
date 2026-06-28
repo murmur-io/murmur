@@ -15,7 +15,7 @@ The four rule files below are **imported into context automatically** via the `@
 
 ## What Murmur is
 
-A **local-first macOS desktop app** that records meetings, transcribes on-device, turns the transcript into a clean note via a pluggable LLM provider, and lives inside the user's **Obsidian vault**. Currently shipped at **v0.3.0**.
+A **local-first macOS desktop app** that records meetings, transcribes on-device, turns the transcript into a clean note via a pluggable LLM provider, and lives inside the user's **Obsidian vault**. Currently shipped at **v0.7.0**.
 
 - **Stack:** Tauri 2.11 (Rust crate `murmur`, lib `meetnotes_lib`, bin `Murmur`) + Angular 18 **zoneless** (standalone, signals). IPC = Tauri commands (registered in `src-tauri/src/lib.rs` `generate_handler!`) + events. The FE talks to the backend through `src/app/core/ipc.service.ts` — **there is no NgRx**.
 - **Pipeline:** capture (mic via `cpal` + system audio via a Swift **ScreenCaptureKit** sidecar) → **dual-stream** (transcribed separately, merged by wall-clock → `Me`/`Others`) → **whisper.cpp** (`whisper-rs`, Metal; default model **large-v3**) → segments → **SQLite (canonical source of truth, SQLCipher-encrypted)** → `SummarizerProvider` → note markdown → atomic **Obsidian `.md`** export.
@@ -32,12 +32,18 @@ A **local-first macOS desktop app** that records meetings, transcribes on-device
 
 ```bash
 # Dev (the MURMUR_DEV_DEK hatch avoids per-rebuild Keychain re-prompts; see .claude/skills/tauri-dev)
+# No --features needed: the on-device brain/embedder/NER are ALWAYS compiled and activate at runtime
+# on model-presence. `MISTRALRS_METAL_PRECOMPILE=0` is baked into src-tauri/.cargo/config.toml [env]
+# (this Mac has only the Command Line Tools, not full Xcode → defer Metal-shader compile to first run),
+# so `npm run dev` just works.
 source ~/.cargo/env
 MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef npm run dev
 #   → ng on http://localhost:1420, MCP on 127.0.0.1:8765
 
 # Quality gates
 ( cd src-tauri && cargo test --lib )   # the test loop — NEVER `cargo clippy --all-targets` (openssl/sqlcipher profile thrash)
+#   NOTE: the heavy mistralrs/candle ML tree is now ALWAYS compiled (no feature gate), so a COLD
+#   first build is slow (hundreds of MB of ML deps); the incremental loop stays fast once warm.
 npx ng lint
 npx ng build
 bash scripts/ci.sh                      # full: clippy -D warnings + tests + lint + build + headless E2E
