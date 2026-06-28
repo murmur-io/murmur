@@ -441,6 +441,70 @@ pub fn is_mic_muted(state: State<'_, AppState>) -> Result<bool, AppError> {
     Ok(recorder.as_ref().map(|r| r.is_muted()).unwrap_or(false))
 }
 
+/// Result of arming a MANUAL voice command (the button trigger).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCommandArmResult {
+    /// True when the live loop is now armed to capture the next utterance as a command.
+    pub listening: bool,
+    /// Short, non-PII reason when `listening` is false (e.g. "not recording").
+    pub reason: Option<String>,
+}
+
+/// ARM the MANUAL voice-command capture: the user clicked "ask the assistant", so the next spoken
+/// utterance is taken as a command — NO wake word, NO word-order requirement. This command does NOT
+/// itself transcribe; it sets [`crate::state::CaptureState`] on `AppState` so the already-running
+/// live-caption loop (`transcribe::live`) collects + dispatches the command over the SAME gated +
+/// consent-gated `handle_voice_action` path as the wake trigger (no new egress class). Opt-in PER
+/// CLICK — independent of the `realtime_reactions` toggle.
+///
+/// The live loop only runs DURING recording, so if no recording is in progress we arm nothing and
+/// return `listening: false` with a clear reason (the FE should enable the button only while
+/// recording). Emits [`crate::events::EVENT_VOICE_COMMAND_LISTENING`] so the FE can show the
+/// "listening…" state; the answer arrives later via `EVENT_VOICE_ACTION_RESULT`.
+#[tauri::command]
+pub fn begin_voice_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VoiceCommandArmResult, AppError> {
+    let result = begin_voice_command_inner(state.inner())?;
+    if result.listening {
+        tracing::info!(target: "voice", "manual voice command armed");
+        let _ = app.emit(
+            crate::events::EVENT_VOICE_COMMAND_LISTENING,
+            crate::events::VoiceCommandListeningPayload { active: true },
+        );
+    }
+    Ok(result)
+}
+
+/// Headless core of [`begin_voice_command`]: arm the manual-capture state on `AppState`, returning
+/// whether the live loop is now listening. The live loop only runs DURING recording, so when no
+/// recording is in progress we arm nothing and report `listening: false` with a reason (arming a
+/// capture nothing will ever consume would leave the FE stuck "listening"). No `AppHandle`/IPC here,
+/// so it is unit-testable without Tauri.
+pub(crate) fn begin_voice_command_inner(
+    state: &AppState,
+) -> Result<VoiceCommandArmResult, AppError> {
+    let recording = state
+        .recorder
+        .lock()
+        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?
+        .is_some();
+    if !recording {
+        return Ok(VoiceCommandArmResult {
+            listening: false,
+            reason: Some("not recording".into()),
+        });
+    }
+    let mut guard = state
+        .voice_command_capture
+        .lock()
+        .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
+    *guard = Some(crate::state::CaptureState::armed());
+    Ok(VoiceCommandArmResult { listening: true, reason: None })
+}
+
 /// The most recent note (markdown + export path) for the last-note preview pane.
 #[tauri::command]
 pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppError> {
@@ -4252,6 +4316,7 @@ mod lifecycle_tests {
             system_recorder: Mutex::new(None),
             aec_recorder: Mutex::new(None),
             voice_listener: Mutex::new(None),
+            voice_command_capture: Mutex::new(None),
             db,
             config: Mutex::new(AppConfig::default()),
             reasoner: Box::new(crate::reason::StubReasoner),
@@ -4260,6 +4325,43 @@ mod lifecycle_tests {
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),
         }
+    }
+
+    /// MANUAL voice command: with NO recording in progress, arming reports `listening:false`
+    /// ("not recording") and leaves the capture state empty — the live loop (which only runs while
+    /// recording) would never consume it, so we must not pretend to listen.
+    #[test]
+    fn begin_voice_command_not_recording_does_not_arm() {
+        let state = build_state("voicecmd-notrec");
+        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+
+        let res = begin_voice_command_inner(&state).unwrap();
+        assert!(!res.listening, "must not listen when not recording");
+        assert_eq!(res.reason.as_deref(), Some("not recording"));
+        assert!(
+            state.voice_command_capture.lock().unwrap().is_none(),
+            "no capture must be armed when not recording"
+        );
+    }
+
+    /// MANUAL voice command: arming sets a fresh full-budget [`crate::state::CaptureState`] on the
+    /// state (the live loop reads it). We exercise the arming half directly (a live `Recorder` needs
+    /// a real audio device); the decision/dispatch half is unit-tested in `transcribe::live`.
+    #[test]
+    fn begin_voice_command_arms_capture_state() {
+        use crate::state::CaptureState;
+        let state = build_state("voicecmd-arm");
+        // Simulate the arm-while-recording write the inner does once the recorder gate passes.
+        {
+            let mut g = state.voice_command_capture.lock().unwrap();
+            *g = Some(CaptureState::armed());
+        }
+        let armed = state.voice_command_capture.lock().unwrap().clone();
+        assert_eq!(
+            armed,
+            Some(CaptureState { budget: CaptureState::DEFAULT_BUDGET }),
+            "arming must store a fresh full-budget capture the live loop can consume"
+        );
     }
 
     fn seed_meeting(db: &Db, mid: &str, markdown: &str, folder_id: Option<&str>) {
