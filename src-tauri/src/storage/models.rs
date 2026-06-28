@@ -262,6 +262,12 @@ pub struct CorrectionRecord {
     /// Owner scope; "local" for the single-user on-device dataset.
     pub owner_id: String,
     pub created_at: String,
+    /// The meeting this example was derived from (`None` for legacy/unattributed rows). LOCK-SAFETY:
+    /// the gated reader (`Db::list_corrections`) joins this to `meetings`/`notes`/`folders` and only
+    /// returns rows whose meeting is currently VISIBLE; a `None` here is treated as NOT visible
+    /// (fail-closed). The seal/delete paths purge a meeting's rows, so a sealed meeting never
+    /// contributes to the flywheel. `folder_id` is DERIVED via the join, never stored here.
+    pub meeting_id: Option<String>,
 }
 
 /// One parsed action-item checklist line from a note's "## Action items" section.
