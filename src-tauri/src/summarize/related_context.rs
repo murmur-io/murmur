@@ -2,8 +2,10 @@
 //!
 //! Ground each NEW meeting note in a small corpus of related PRIOR notes so notes compound
 //! ("last time you decided X / you still owe Y") instead of being isolated. Uses the LIVE FTS5
-//! retrieval (already shipped) + the existing provider — NO local/embedding model. The whole path
-//! is gated behind the default-OFF `augment_notes_with_context` config flag.
+//! retrieval (already shipped) + the existing provider — NO local/embedding model. This is ALWAYS
+//! ON (no config flag): the pipeline unconditionally builds + injects the gated corpus via
+//! `pipeline::build_grounding_context`, best-effort (an empty result or a retrieval error yields
+//! `related_context = None`, byte-identical to the no-context prompt).
 //!
 //! LOCK INVARIANT (load-bearing): the corpus this builds is injected into the summarization prompt
 //! and therefore EGRESSES to the cloud provider. It MUST contain ONLY visible (not
