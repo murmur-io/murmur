@@ -130,12 +130,22 @@ fn run(db_path: PathBuf, unlocked: UnlockedSet, require_token: bool) {
         }
         match handle_rpc(&db_path, &body, &unlocked, expected_token.as_deref(), auth.as_deref()) {
             Some(resp) => {
-                let h = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-                let _ = req.respond(
-                    Response::from_string(resp.to_string())
-                        .with_status_code(200)
-                        .with_header(h),
-                );
+                // The header pair is a compile-time ASCII constant so this never errors, but we do
+                // NOT unwrap on the per-request server loop (a panic here would kill the MCP thread
+                // for the whole session). Fall back to a header-less 200 in the impossible Err case.
+                let resp_body = resp.to_string();
+                match Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+                    Ok(h) => {
+                        let _ = req.respond(
+                            Response::from_string(resp_body)
+                                .with_status_code(200)
+                                .with_header(h),
+                        );
+                    }
+                    Err(_) => {
+                        let _ = req.respond(Response::from_string(resp_body).with_status_code(200));
+                    }
+                }
             }
             // Notification (no id) → 202, no body.
             None => {
