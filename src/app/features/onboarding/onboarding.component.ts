@@ -1274,6 +1274,11 @@ export class OnboardingComponent implements OnInit {
       lockRequireBiometric: base?.lockRequireBiometric ?? true,
       relockOnScreenshare: base?.relockOnScreenshare ?? true,
       cloudEgressConsented: base?.cloudEgressConsented ?? false,
+      // Phase H — brain / in-meeting voice assistant. Round-trip the snapshot so
+      // onboarding never resets a user's brain choices; defaults mirror a fresh install.
+      brainBackend: base?.brainBackend ?? "cloud",
+      realtimeReactions: base?.realtimeReactions ?? false,
+      brainModelId: base?.brainModelId ?? null,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

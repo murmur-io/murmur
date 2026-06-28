@@ -68,6 +68,91 @@ export interface AppConfigDto {
    * leaves the device for a cloud LLM until the user has consented once.
    */
   cloudEgressConsented: boolean;
+  /**
+   * Phase H — the "brain" (AI assistant) backend that answers questions /
+   * reacts in-meeting. `"cloud"` = Claude (recommended for live latency),
+   * `"local"` = an on-device GGUF model (`brainModelId`), `"off"` = no brain.
+   * Round-tripped on every `save_config` like the other flags.
+   */
+  brainBackend: BrainBackend;
+  /**
+   * Phase H — the in-meeting voice assistant ("realtime reactions"): listen for
+   * a wake phrase during a recording and answer grounded questions live.
+   * Default false (off) — it's a power feature with cost/latency tradeoffs.
+   */
+  realtimeReactions: boolean;
+  /**
+   * Phase H — the selected local brain model id (a registry id like
+   * `"bielik-11b"`, or a custom GGUF file path). Only meaningful when
+   * `brainBackend === "local"`. Null = none selected yet.
+   */
+  brainModelId: string | null;
+}
+
+/** Phase H — which backend powers the brain / in-meeting voice assistant. */
+export type BrainBackend = "cloud" | "local" | "off";
+
+/**
+ * Phase H — a selectable local brain model from the registry (`list_brain_models`).
+ * Mirrors the Rust `BrainModelDto` (camelCase). RAM-fit / download / selected
+ * state are computed by the backend against this Mac.
+ */
+export interface BrainModelDto {
+  id: string;
+  name: string;
+  /** Human size label (e.g. "6.7 GB") for display. */
+  sizeLabel: string;
+  /** Exact on-disk size in bytes (for progress math / precise display). */
+  bytes: number;
+  /** Minimum recommended RAM in GB to run this model. */
+  minRamGb: number;
+  /** Languages the model handles well (e.g. ["pl", "en"]). */
+  languages: string[];
+  /** Already downloaded on this Mac. */
+  downloaded: boolean;
+  /** Fits in this Mac's RAM (false → warn / discourage). */
+  fitsRam: boolean;
+  /** Currently the selected brain model. */
+  selected: boolean;
+}
+
+/**
+ * Phase H — progress payload for a local brain-model download
+ * (`EVENT_BRAIN_DOWNLOAD`). Matches the backend `BrainDownloadPayload`:
+ * `downloaded`/`total` (bytes; `total` is null when the server omits
+ * Content-Length) drive the progress bar; `done` ends the in-flight state.
+ * The backend downloads one model at a time, so the component tracks WHICH
+ * model it started locally (errors surface via the download command's promise).
+ */
+export interface BrainDownloadProgress {
+  downloaded: number;
+  total: number | null;
+  done: boolean;
+}
+
+/**
+ * Phase H — fired when the in-meeting voice assistant hears its wake phrase
+ * (`EVENT_WAKE_DETECTED`). The FE shows a pending "heard: {command}" row.
+ */
+export interface WakeDetectedPayload {
+  matchedPhrase: string;
+  command: string;
+  intent: string;
+}
+
+/** Phase H — status of a completed voice action. */
+export type VoiceActionStatus = "ok" | "needs_consent" | "unavailable" | "error";
+
+/**
+ * Phase H — the result of a voice action (`EVENT_VOICE_ACTION_RESULT`): a
+ * short summary + grounding citations (meeting titles → [[wikilink]] chips) +
+ * a status pill.
+ */
+export interface VoiceActionResultPayload {
+  intentKind: string;
+  status: VoiceActionStatus;
+  summary: string;
+  citations: string[];
 }
 
 /** A selectable microphone input device (from `list_input_devices`). */

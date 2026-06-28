@@ -5,6 +5,8 @@ import type {
   ActionItem,
   Analytics,
   AppConfigDto,
+  BrainDownloadProgress,
+  BrainModelDto,
   InputDeviceInfo,
   AskVaultResult,
   BriefResult,
@@ -29,12 +31,18 @@ import type {
   StatusPayload,
   StopResult,
   TopicThread,
+  VoiceActionResultPayload,
+  WakeDetectedPayload,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
 export const EVENT_VOICE_START = "murmur://voice-start";
 export const EVENT_TOGGLE_RECORD = "murmur://toggle-record";
 export const EVENT_LIVE_CAPTION = "murmur://live-caption";
+// Phase H — the brain / in-meeting voice assistant event stream.
+export const EVENT_WAKE_DETECTED = "murmur://wake-detected";
+export const EVENT_VOICE_ACTION_RESULT = "murmur://voice-action-result";
+export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -368,6 +376,30 @@ export class IpcService {
     return invoke<string>("download_model");
   }
 
+  // ── Phase H — brain (AI assistant) model registry ──────────────────────
+
+  /**
+   * The selectable local brain models (Bielik / Qwen3-14B / Qwen2.5-3B …) with
+   * per-Mac `downloaded` / `fitsRam` / `selected` state computed by the backend.
+   */
+  listBrainModels(): Promise<BrainModelDto[]> {
+    return invoke<BrainModelDto[]>("list_brain_models");
+  }
+
+  /** Make `modelId` the active local brain model (also persisted to config). */
+  selectBrainModel(modelId: string): Promise<void> {
+    return invoke<void>("select_brain_model", { modelId });
+  }
+
+  /**
+   * Download a local brain model by id. Progress streams over
+   * {@link onBrainDownload} (EVENT_BRAIN_DOWNLOAD); the promise resolves when
+   * the download finishes (or rejects on failure).
+   */
+  downloadBrainModel(modelId: string): Promise<void> {
+    return invoke<void>("download_brain_model", { modelId });
+  }
+
   /** Show/hide the floating always-on-top recorder bar window. */
   toggleBar(): Promise<void> {
     return invoke<void>("toggle_bar");
@@ -451,6 +483,37 @@ export class IpcService {
   onLiveCaption(cb: (text: string) => void): Promise<UnlistenFn> {
     return listen<{ text: string }>(EVENT_LIVE_CAPTION, (e) =>
       cb(e.payload.text),
+    );
+  }
+
+  // ── Phase H — brain / in-meeting voice assistant event streams ─────────
+
+  /**
+   * Fires when the in-meeting voice assistant hears its wake phrase. The FE
+   * shows a pending "heard: {command}" row until the matching
+   * {@link onVoiceActionResult} arrives.
+   */
+  onWakeDetected(cb: (p: WakeDetectedPayload) => void): Promise<UnlistenFn> {
+    return listen<WakeDetectedPayload>(EVENT_WAKE_DETECTED, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /** Fires with the result of a voice action (summary + citations + status). */
+  onVoiceActionResult(
+    cb: (p: VoiceActionResultPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<VoiceActionResultPayload>(EVENT_VOICE_ACTION_RESULT, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /** Fires with progress for an in-flight local brain-model download. */
+  onBrainDownload(
+    cb: (p: BrainDownloadProgress) => void,
+  ): Promise<UnlistenFn> {
+    return listen<BrainDownloadProgress>(EVENT_BRAIN_DOWNLOAD, (e) =>
+      cb(e.payload),
     );
   }
 }
