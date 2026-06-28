@@ -14,6 +14,7 @@ pub mod settings;
 pub mod state;
 pub mod storage;
 pub mod summarize;
+pub mod tools;
 pub mod transcribe;
 
 use tauri::window::{Effect, EffectsBuilder};

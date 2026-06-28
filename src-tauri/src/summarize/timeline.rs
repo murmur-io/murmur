@@ -4,7 +4,7 @@
 //! (named if identifiable in the conversation, else "User N") and topic spans from the
 //! timestamped transcript, returning strict JSON we parse into [`MeetingTimeline`].
 
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::storage::models::MeetingTimeline;
 use crate::summarize::provider::SummarizerProvider;
 use crate::transcribe::types::Segment;
@@ -49,18 +49,12 @@ pub async fn generate(
     parse(&reply)
 }
 
-/// Extract the outermost JSON object from a reply and parse it into a [`MeetingTimeline`].
+/// Extract the first balanced JSON object from a reply and parse it into a [`MeetingTimeline`].
 fn parse(reply: &str) -> Result<MeetingTimeline> {
-    let json = match (reply.find('{'), reply.rfind('}')) {
-        (Some(s), Some(e)) if e > s => &reply[s..=e],
-        _ => {
-            return Err(AppError::Summarize(
-                "timeline: model did not return JSON".to_string(),
-            ))
-        }
-    };
-    serde_json::from_str::<MeetingTimeline>(json)
-        .map_err(|e| AppError::Summarize(format!("timeline: invalid JSON ({e})")))
+    // Recover the FIRST balanced top-level JSON object via the string/escape-aware extractor in
+    // `reason.rs` instead of the brittle `find('{')..=rfind('}')` slice — the old slice swept up a
+    // stray `}` in trailing prose (or a second object) and then failed to parse a valid reply.
+    crate::reason::parse_first_json(reply)
 }
 
 #[cfg(test)]
@@ -88,5 +82,18 @@ mod tests {
     #[test]
     fn errors_on_no_json() {
         assert!(parse("no json here").is_err());
+    }
+
+    /// RED-before-GREEN: the OLD `find('{')..=rfind('}')` slice extended to the stray `}` in the
+    /// trailing prose, producing trailing garbage that `serde_json::from_str` rejected.
+    /// `parse_first_json` stops at the first balanced object and parses the timeline cleanly.
+    /// (Verified RED: reverting `parse` to the rfind slice makes this `unwrap()` panic.)
+    #[test]
+    fn parses_despite_trailing_prose_with_stray_brace() {
+        let r = r#"{"speakers":[{"speaker":"User 1","startS":0,"endS":5}],"topics":[{"label":"Intro","startS":0,"endS":5}]} (note: } end of object)"#;
+        let t = parse(r).unwrap();
+        assert_eq!(t.speakers.len(), 1);
+        assert_eq!(t.speakers[0].speaker, "User 1");
+        assert_eq!(t.topics[0].label, "Intro");
     }
 }
