@@ -38,6 +38,7 @@ import type {
   TopicThread,
   VoiceActionResultPayload,
   VoiceCommandListeningPayload,
+  VoiceCommandProcessingPayload,
   WakeDetectedPayload,
 } from "./models";
 
@@ -49,6 +50,8 @@ export const EVENT_LIVE_CAPTION = "murmur://live-caption";
 export const EVENT_WAKE_DETECTED = "murmur://wake-detected";
 export const EVENT_VOICE_ACTION_RESULT = "murmur://voice-action-result";
 export const EVENT_VOICE_COMMAND_LISTENING = "murmur://voice-command-listening";
+export const EVENT_VOICE_COMMAND_PROCESSING =
+  "murmur://voice-command-processing";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
@@ -500,6 +503,18 @@ export class IpcService {
     return invoke<void>("begin_voice_command");
   }
 
+  /**
+   * Phase H — CLICK-TO-STOP: stop the in-meeting voice-command listener the user
+   * started with {@link beginVoiceCommand}, so the FULL accumulated post-click
+   * utterance is dispatched (over the same gated `handle_voice_action` path). The
+   * backend emits `EVENT_VOICE_COMMAND_PROCESSING {active:true}` while the
+   * dispatch is in flight, then the answer arrives via `EVENT_VOICE_ACTION_RESULT`.
+   * A no-op when nothing is armed (double-click / already auto-stopped) — never throws.
+   */
+  endVoiceCommand(): Promise<void> {
+    return invoke<void>("end_voice_command");
+  }
+
   // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
 
   /** The folder tree (roots → children) with per-folder note counts + session lock state. */
@@ -613,6 +628,21 @@ export class IpcService {
   ): Promise<UnlistenFn> {
     return listen<VoiceCommandListeningPayload>(
       EVENT_VOICE_COMMAND_LISTENING,
+      (e) => cb(e.payload),
+    );
+  }
+
+  /**
+   * Fires when a manual voice command has STOPPED listening and is being
+   * DISPATCHED (`active:true`) — the gap between capture-stop and the answer
+   * landing via {@link onVoiceActionResult}. Drives the "🧠 Przetwarzam…"
+   * processing state of the assistant orb.
+   */
+  onVoiceCommandProcessing(
+    cb: (p: VoiceCommandProcessingPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<VoiceCommandProcessingPayload>(
+      EVENT_VOICE_COMMAND_PROCESSING,
       (e) => cb(e.payload),
     );
   }

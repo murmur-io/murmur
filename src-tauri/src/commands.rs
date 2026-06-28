@@ -533,6 +533,56 @@ pub(crate) fn begin_voice_command_inner(
     Ok(VoiceCommandArmResult { listening: true, reason: None })
 }
 
+/// STOP the MANUAL voice-command capture (CLICK-TO-STOP): the user clicked "stop" / "done", so the
+/// FULL accumulated post-click utterance is the command. This does NOT itself transcribe or dispatch;
+/// it flips the armed [`crate::state::CaptureState`]'s `ended` flag so the already-running live loop
+/// (`transcribe::live`) dispatches the FULL accumulated command over the SAME gated + consent-gated
+/// `handle_voice_action` path on its next tick (no new read/egress class).
+///
+/// The dispatch + the "thinking…" PROCESSING event are emitted by the live loop, so the answer still
+/// arrives via [`crate::events::EVENT_VOICE_ACTION_RESULT`]. On a NOT-armed state (no capture in
+/// progress — the user double-clicked, or it already auto-stopped at the backstop) this is a graceful
+/// no-op (`stopped: false`), never an error.
+#[tauri::command]
+pub fn end_voice_command(
+    state: State<'_, AppState>,
+) -> Result<VoiceCommandEndResult, AppError> {
+    let result = end_voice_command_inner(state.inner())?;
+    if result.stopped {
+        tracing::info!(target: "voice", "manual voice command stopped by user — dispatching");
+    }
+    Ok(result)
+}
+
+/// Result of stopping a MANUAL voice command (the "stop" click).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceCommandEndResult {
+    /// True when an armed capture was found and flagged to dispatch; false when nothing was armed
+    /// (graceful no-op — the live loop already cleared it via dispatch or the backstop).
+    pub stopped: bool,
+}
+
+/// Headless core of [`end_voice_command`]: flip the armed capture's `ended` flag so the live loop
+/// dispatches the FULL accumulated utterance on its next tick. A NOT-armed state is a graceful no-op
+/// (`stopped: false`). No `AppHandle`/IPC here, so it is unit-testable without Tauri.
+pub(crate) fn end_voice_command_inner(
+    state: &AppState,
+) -> Result<VoiceCommandEndResult, AppError> {
+    let mut guard = state
+        .voice_command_capture
+        .lock()
+        .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
+    match guard.as_mut() {
+        Some(capture) => {
+            capture.ended = true;
+            Ok(VoiceCommandEndResult { stopped: true })
+        }
+        // Nothing armed (already dispatched / backstop-stopped / never started) → graceful no-op.
+        None => Ok(VoiceCommandEndResult { stopped: false }),
+    }
+}
+
 /// The most recent note (markdown + export path) for the last-note preview pane.
 #[tauri::command]
 pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppError> {
@@ -4570,8 +4620,43 @@ mod lifecycle_tests {
         let armed = *state.voice_command_capture.lock().unwrap();
         assert_eq!(
             armed,
-            Some(CaptureState { budget: CaptureState::DEFAULT_BUDGET, start_sample: None }),
+            Some(CaptureState { budget: CaptureState::DEFAULT_BUDGET, start_sample: None, ended: false }),
             "arming must store a fresh full-budget capture the live loop can consume"
+        );
+    }
+
+    /// CLICK-TO-STOP: `end_voice_command` on an ARMED capture flips `ended` so the live loop
+    /// dispatches the FULL accumulated utterance on its next tick — it does NOT clear the capture
+    /// itself (the live loop owns the terminal clear-on-dispatch).
+    #[test]
+    fn end_voice_command_flags_armed_capture_to_dispatch() {
+        use crate::state::CaptureState;
+        let state = build_state("voicecmd-end-armed");
+        {
+            let mut g = state.voice_command_capture.lock().unwrap();
+            *g = Some(CaptureState::armed_from(1000));
+        }
+
+        let res = end_voice_command_inner(&state).unwrap();
+        assert!(res.stopped, "an armed capture must report stopped:true");
+
+        let after = state.voice_command_capture.lock().unwrap().expect("capture still present");
+        assert!(after.ended, "the user's stop must flip `ended` so the live loop dispatches");
+        assert_eq!(after.start_sample, Some(1000), "the latched offset is preserved");
+    }
+
+    /// CLICK-TO-STOP: `end_voice_command` on a NOT-armed state (double-click, already auto-stopped at
+    /// the backstop, or never started) is a graceful no-op (`stopped: false`), never an error.
+    #[test]
+    fn end_voice_command_not_armed_is_graceful_noop() {
+        let state = build_state("voicecmd-end-noop");
+        assert!(state.voice_command_capture.lock().unwrap().is_none(), "precondition: not armed");
+
+        let res = end_voice_command_inner(&state).unwrap();
+        assert!(!res.stopped, "a not-armed end must be a graceful no-op (stopped:false)");
+        assert!(
+            state.voice_command_capture.lock().unwrap().is_none(),
+            "a no-op end must not fabricate a capture"
         );
     }
 

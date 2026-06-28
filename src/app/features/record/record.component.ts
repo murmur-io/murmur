@@ -15,6 +15,7 @@ import type { Analytics, AppConfigDto } from "../../core/models";
 import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 import { AssistantActionsComponent } from "./assistant-actions.component";
+import { AiOrbComponent } from "./ai-orb.component";
 import { AssistantStore } from "../../core/assistant.store";
 
 @Component({
@@ -26,6 +27,7 @@ import { AssistantStore } from "../../core/assistant.store";
     PreMeetingBriefComponent,
     MicMuteToggleComponent,
     AssistantActionsComponent,
+    AiOrbComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
@@ -138,18 +140,20 @@ import { AssistantStore } from "../../core/assistant.store";
                  Compact (icon-only) so the pill stays uncrowded; the descriptive
                  "still capturing others" copy rides the stage hint below. -->
             <app-mic-mute-toggle [compact]="true" #micToggle />
-            <!-- Ask AI — manually open the voice-command listener (no wake phrase
-                 needed). Pulses + glows while the assistant is listening. The
-                 spoken answer lands in the assistant-actions card below. -->
+            <!-- Ask AI — CLICK-TO-STOP toggle. First click opens the voice-command
+                 listener (no wake phrase); a SECOND click stops it so the full
+                 utterance is dispatched (→ processing). Pulses while listening.
+                 The spoken answer lands in the assistant-actions card below. -->
             <button
               type="button"
               class="ask-btn"
               [class.is-listening]="assistant.listening()"
-              (click)="askAi()"
+              [disabled]="assistant.processing()"
+              (click)="toggleAsk()"
               [attr.aria-pressed]="assistant.listening()"
               [attr.aria-label]="
                 assistant.listening()
-                  ? 'Listening — say your request'
+                  ? 'Stop listening and ask'
                   : 'Ask the AI assistant'
               "
             >
@@ -181,12 +185,38 @@ import { AssistantStore } from "../../core/assistant.store";
             </button>
           </div>
 
-          <!-- Rich "listening" state — appears the instant the manual Ask-AI
-               listener opens; clear copy so it's obvious the app is hearing you. -->
-          @if (assistant.listening()) {
-            <div class="listening" role="status" aria-live="polite">
-              <span class="listening-orb" aria-hidden="true"></span>
-              <span class="listening-text">🎙 Słucham — powiedz polecenie…</span>
+          <!-- The morphing assistant ORB + a state line. The orb expresses the
+               state by motion/color; the paired role="status" line announces it.
+               LISTENING → "Słucham (kliknij by zakończyć)"; PROCESSING → a shimmer
+               "🧠 Przetwarzam…" label. Idle/answer states stay silent here (the
+               answer has its home in the card below). -->
+          @if (
+            assistant.orbState() === "listening" ||
+            assistant.orbState() === "processing"
+          ) {
+            <div
+              class="orb-state"
+              [class.is-processing]="assistant.orbState() === 'processing'"
+            >
+              <app-ai-orb
+                class="bar-orb"
+                [state]="assistant.orbState()"
+                [level]="store.level()"
+              />
+              @if (assistant.orbState() === "listening") {
+                <span class="orb-state-text" role="status" aria-live="polite">
+                  🎙 Słucham
+                  <span class="orb-state-hint">— kliknij ✨ by zakończyć</span>
+                </span>
+              } @else {
+                <span
+                  class="orb-state-text shimmer-text"
+                  role="status"
+                  aria-live="polite"
+                  aria-busy="true"
+                  >🧠 Przetwarzam…</span
+                >
+              }
             </div>
           }
         } @else if (isProcessing()) {
@@ -721,13 +751,19 @@ import { AssistantStore } from "../../core/assistant.store";
         }
       }
 
-      /* Inline "listening" indicator under the pill while the mic is open. */
-      .listening {
+      .ask-btn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+
+      /* The morphing-orb state row under the pill — orb + a status/shimmer line.
+         The orb element is the motion; this row provides the copy + framing. */
+      .orb-state {
         display: inline-flex;
         align-items: center;
-        gap: var(--space-2);
+        gap: var(--space-3);
         margin-top: var(--space-3);
-        padding: var(--space-2) var(--space-3);
+        padding: var(--space-2) var(--space-3) var(--space-2) var(--space-2);
         border-radius: var(--radius-pill);
         background: var(--accent-soft);
         border: 1px solid var(--accent-ring);
@@ -736,23 +772,58 @@ import { AssistantStore } from "../../core/assistant.store";
         font-weight: 550;
         animation: rise 220ms var(--transition) both;
       }
-      .listening-orb {
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
-        background: var(--accent);
-        box-shadow: 0 0 0 0 var(--accent-ring);
-        animation: ask-pulse 1.5s ease-in-out infinite;
+      .orb-state.is-processing {
+        border-color: var(--border-strong);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text-primary);
       }
-      .listening-text {
+      /* Compact orb for the bar (the orb defaults to 56px; here ~30px). */
+      .bar-orb {
+        --orb-size: 30px;
+      }
+      .orb-state-text {
         line-height: 1.3;
+      }
+      .orb-state-hint {
+        opacity: 0.8;
+        font-weight: 500;
+      }
+
+      /* Shimmer text — a moving gradient clipped to the glyphs (Raycast/Vercel
+         "thinking" treatment) naming the processing substep. */
+      .shimmer-text {
+        background: linear-gradient(
+          100deg,
+          var(--text-secondary) 30%,
+          var(--text-primary) 50%,
+          var(--text-secondary) 70%
+        );
+        background-size: 200% 100%;
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        animation: text-shimmer 1.8s linear infinite;
+      }
+      @keyframes text-shimmer {
+        0% {
+          background-position: 200% 0;
+        }
+        100% {
+          background-position: -200% 0;
+        }
       }
 
       @media (prefers-reduced-motion: reduce) {
         .ask-btn.is-listening,
-        .listening-orb,
-        .listening {
+        .orb-state,
+        .shimmer-text {
           animation: none;
+        }
+        .shimmer-text {
+          background: none;
+          -webkit-background-clip: border-box;
+          background-clip: border-box;
+          color: var(--text-primary);
         }
       }
 
@@ -1150,6 +1221,7 @@ export class RecordComponent implements OnInit {
       enabled ||
       this.assistant.hasAny() ||
       this.assistant.listening() ||
+      this.assistant.processing() ||
       this.assistant.manualAskInFlight()
     );
   });
@@ -1396,17 +1468,24 @@ export class RecordComponent implements OnInit {
   }
 
   /**
-   * Manually trigger the voice assistant to listen for a spoken command (the
-   * "Ask AI" button) — no wake phrase needed. The store sets the in-flight flag
-   * (so the answer card stays visible) and the backend streams the listening
-   * state over EVENT_VOICE_COMMAND_LISTENING; the answer lands in the
-   * assistant-actions card. Swallow rejections (e.g. brain backend off) — the
-   * store already resets its pulsing state on error.
+   * CLICK-TO-STOP toggle for the "Ask AI" (✨) button. First click opens the
+   * voice-command listener (no wake phrase); a second click — while listening —
+   * stops it so the FULL utterance is dispatched (→ processing). The backend
+   * streams listening/processing over EVENT_VOICE_COMMAND_LISTENING /
+   * EVENT_VOICE_COMMAND_PROCESSING and the answer lands in the assistant-actions
+   * card. Swallow rejections (e.g. brain backend off) — the store resets its
+   * listening/processing/in-flight state on error.
    */
-  askAi(): void {
-    void this.assistant.askNow().catch(() => {
-      /* listener unavailable — store resets the in-flight/listening state */
-    });
+  toggleAsk(): void {
+    if (this.assistant.listening()) {
+      void this.assistant.endAsk().catch(() => {
+        /* stop failed — store cleared processing/in-flight */
+      });
+    } else {
+      void this.assistant.askNow().catch(() => {
+        /* listener unavailable — store resets the in-flight/listening state */
+      });
+    }
   }
 
   /**
