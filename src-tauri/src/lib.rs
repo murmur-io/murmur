@@ -7,6 +7,7 @@ pub mod events;
 pub mod export;
 pub mod mcp;
 pub mod pipeline;
+pub mod reason;
 pub mod screenshare;
 pub mod secrets;
 pub mod settings;
