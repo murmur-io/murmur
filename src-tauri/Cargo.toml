@@ -149,3 +149,12 @@ local-brain = ["dep:mistralrs"]
 # it gracefully degrades to the StubEmbedder. Target model = multilingual-e5-small (384-dim ⇒ EMBED_DIM
 # is unchanged, ZERO vec0 schema migration). Build: `cargo build --features local-embed`.
 local-embed = ["dep:candle-transformers", "dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+# Phase D — the REAL on-device name-redaction NER (DebertaNameRedactor, `summarize/ner_deberta.rs`).
+# OFF by default so the fast `cargo test --lib` loop never compiles candle. REUSES the SAME optional
+# candle/tokenizers deps `local-embed` added (candle-transformers 0.10.2 ships a built-in
+# `models::debertav2::DebertaV2NERModel` that links with ZERO second onnxruntime — sherpa stays the
+# only ORT). With it ON *and* the NER model dir present, `summarize::redact::active_name_redactor`
+# returns the real DebertaNameRedactor (PERSON spans → ⟪NAME_n⟫ tokens before cloud egress);
+# otherwise it gracefully degrades to the byte-identical NoopNameRedactor. Build:
+# `cargo build --features local-ner --lib`.
+local-ner = ["dep:candle-transformers", "dep:candle-core", "dep:candle-nn", "dep:tokenizers"]

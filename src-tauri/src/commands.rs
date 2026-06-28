@@ -2186,6 +2186,57 @@ pub async fn download_embed_model(app: AppHandle) -> Result<String, AppError> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+/// True iff the on-device PERSON-name NER model (Phase D) is present on disk. Pure existence probe;
+/// NEVER errors on a missing models dir (treats it as "not present"). When false (or the `local-ner`
+/// feature is off), the redaction firewall uses the byte-identical NoopNameRedactor.
+#[tauri::command]
+pub fn ner_model_present() -> Result<bool, AppError> {
+    Ok(crate::summarize::redact::ner_model_present())
+}
+
+/// Download the multilingual mDeBERTa-v3 NER model (3 HF files) into the shared models dir,
+/// INBOUND-ONLY, emitting [`crate::events::EVENT_NER_DOWNLOAD`] progress (throttled per file). Sends
+/// NO meeting content (no egress). The downloaded model is NOT loaded here — it is picked up lazily by
+/// `summarize::redact::active_name_redactor` on the next cloud summarization (feature-gated by
+/// `local-ner`). Returns the model dir.
+#[tauri::command]
+pub async fn download_ner_model(app: AppHandle) -> Result<String, AppError> {
+    let file_count = crate::summarize::redact::NER_MODEL_FILES.len();
+    // Throttle progress to roughly every 2 MB so the model download doesn't flood the FE.
+    const EMIT_EVERY: u64 = 2 * 1024 * 1024;
+    let mut last_emit: u64 = 0;
+    let mut last_index: usize = usize::MAX;
+    let dir = crate::summarize::redact::download_ner_model(|file_index, downloaded, total| {
+        if file_index != last_index || downloaded - last_emit >= EMIT_EVERY {
+            last_index = file_index;
+            last_emit = downloaded;
+            let _ = app.emit(
+                crate::events::EVENT_NER_DOWNLOAD,
+                crate::events::NerDownloadPayload {
+                    file_index,
+                    file_count,
+                    downloaded,
+                    total,
+                    done: false,
+                },
+            );
+        }
+    })
+    .await?;
+
+    let _ = app.emit(
+        crate::events::EVENT_NER_DOWNLOAD,
+        crate::events::NerDownloadPayload {
+            file_index: file_count,
+            file_count,
+            downloaded: 0,
+            total: None,
+            done: true,
+        },
+    );
+    Ok(dir.to_string_lossy().to_string())
+}
+
 /// Show/hide the floating recorder bar window (also bound to the global ⌘⇧R shortcut).
 #[tauri::command]
 pub fn toggle_bar(app: AppHandle) {
