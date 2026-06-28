@@ -51,6 +51,13 @@ pub enum ToolCall {
     /// async [`execute_web_search`], and ONLY when the web connector is exposed (enabled + consented +
     /// keyed). The brain decides web-vs-vault; see `orchestrate.rs` / `voice_action.rs`.
     WebSearch { query: String },
+    /// CONNECTOR — LOCAL CALENDAR lookup ("who's in my next meeting", a pre-meeting brief). Reads the
+    /// user's on-device macOS calendar via the bundled EventKit sidecar. Unlike [`Self::WebSearch`]
+    /// this EGRESSES NOTHING (it is [`crate::connectors::EgressClass::Local`]) — but it still needs an
+    /// `AppHandle` to resolve + drive the sidecar, which the synchronous, AppHandle-free
+    /// [`execute_tool`] does not have. So, like `WebSearch`, it is dispatched ONLY via the async
+    /// [`execute_calendar_search`], NEVER through `execute_tool`.
+    CalendarLookup { query: String },
 }
 
 /// Execute a read-only tool against an OPEN `Db`, gated on the live session `unlocked` set.
@@ -181,6 +188,18 @@ pub fn execute_tool(
                     .to_string(),
             ))
         }
+        ToolCall::CalendarLookup { .. } => {
+            // The local-calendar connector egresses NOTHING, but it needs an `AppHandle` to drive
+            // the bundled EventKit sidecar — which the synchronous, AppHandle-free `execute_tool`
+            // (the MCP surface's only entry) does not have. It is dispatched exclusively via the
+            // async `execute_calendar_search`. Reaching here is a programming error in a caller —
+            // refuse loudly. (This is NOT a leak: nothing was read, nothing egressed.)
+            Err(AppError::InvalidArg(
+                "CalendarLookup needs the async AppHandle path and cannot run through the \
+                 synchronous tool path; use execute_calendar_search"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -221,6 +240,58 @@ pub async fn execute_web_search(query: &str, config: &AppConfig) -> Result<Strin
         // A real external failure (network/HTTP/parse) is surfaced; the caller logs + skips it.
         Err(e @ crate::connectors::ConnectorError::Failed(_)) => Err(e.into()),
     }
+}
+
+/// CONNECTOR DISPATCH — run a LOCAL CALENDAR lookup through the connector seam, returning the same
+/// text-payload shape the vault/web tools return (so the brain treats calendar context identically).
+/// ASYNC because it drives the bundled EventKit sidecar via [`crate::calendar::fetch_events`], which
+/// needs the [`AppHandle`] to resolve the bundled binary — kept OUT of the synchronous, AppHandle-free
+/// [`execute_tool`].
+///
+/// EGRESS: NONE. The macOS calendar is read ON-DEVICE; this is [`crate::connectors::EgressClass::Local`]
+/// and is therefore NOT consent-gated. `fetch_events` degrades to an empty `Vec` on EVERY failure
+/// (sidecar missing, denied Calendars permission, timeout, malformed JSON), so a denied permission
+/// just yields no hits — graceful, never an error. (If this text is later folded into a CLOUD brain
+/// prompt it rides the EXISTING make_provider redaction firewall + consent — no new egress class.)
+///
+/// Window: `[now - 60m, now + 720m]` (recent + the next ~12h), matching `commands.rs`'s
+/// `calendar_context_for`. Returns a `"No calendar events …"` sentinel (matched by the brain's
+/// `is_empty_result`) when nothing matches, so an empty calendar never pollutes the grounding.
+pub async fn execute_calendar_search(query: &str, app: &tauri::AppHandle) -> Result<String> {
+    let q = query.trim();
+    // ON-DEVICE read: drive the bundled sidecar; ANY failure → empty Vec (never an error).
+    let events = crate::calendar::fetch_events(app, 60, 720).await;
+    // `Connector::search` in scope for the call below (the connector impls the trait).
+    use crate::connectors::Connector as _;
+    let hits = crate::connectors::calendar::CalendarConnector::new(events)
+        .search(q)
+        .await?;
+    if hits.is_empty() {
+        return Ok(if q.is_empty() {
+            "No calendar events in the window.".to_string()
+        } else {
+            format!("No calendar events match \"{q}\".")
+        });
+    }
+    Ok(format_calendar_hits(&hits))
+}
+
+/// Render local-calendar connector hits into the tool text payload — one block per event, each LOUD
+/// with its source label: `[calendar] Title — <bounded Meeting/When/Attendees/Agenda context>`. The
+/// snippet already carries newlines (the CalendarContext block); we keep it intact so the brain sees
+/// the full who/when/agenda, just prefixed with the loud `[calendar]` attribution.
+fn format_calendar_hits(hits: &[crate::connectors::ConnectorHit]) -> String {
+    hits.iter()
+        .map(|h| {
+            let mut line = format!("[{}] {}", h.source_label, h.title.trim());
+            let snippet = h.snippet.trim();
+            if !snippet.is_empty() {
+                line.push_str(&format!(" — {snippet}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Render web connector hits into the tool text payload — one line per result, each LOUD with its
@@ -345,6 +416,50 @@ mod tests {
         let cfg = AppConfig::default();
         let out = block_on(execute_web_search("   ", &cfg)).unwrap();
         assert!(out.starts_with("No web results"));
+    }
+
+    /// EGRESS/PLUMBING GUARD: the synchronous, AppHandle-free `execute_tool` MUST refuse a
+    /// `CalendarLookup` (it needs the async sidecar/AppHandle path) — exactly like `WebSearch`.
+    #[test]
+    fn sync_execute_tool_refuses_calendar_lookup() {
+        let db = tmp_db();
+        let nothing = HashSet::new();
+        let cfg = AppConfig::default();
+        let res = execute_tool(
+            &ToolCall::CalendarLookup { query: "standup".into() },
+            &db,
+            &nothing,
+            &cfg,
+        );
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "the synchronous tool path must refuse CalendarLookup (needs the async AppHandle path)"
+        );
+    }
+
+    /// LOUD: calendar hits render with their `[calendar]` source label + the bounded context block,
+    /// so a calendar-grounded answer is visibly attributed to the user's calendar.
+    #[test]
+    fn format_calendar_hits_is_loud_with_source_and_context() {
+        let hits = vec![
+            crate::connectors::ConnectorHit {
+                title: "Sprint Planning".into(),
+                snippet: "Meeting: Sprint Planning\nAttendees: Alice, Bob\nAgenda:\n- velocity".into(),
+                url: String::new(),
+                source_label: "calendar".into(),
+            },
+            crate::connectors::ConnectorHit {
+                title: "1:1".into(),
+                snippet: "Meeting: 1:1".into(),
+                url: String::new(),
+                source_label: "calendar".into(),
+            },
+        ];
+        let out = format_calendar_hits(&hits);
+        assert!(out.contains("[calendar] Sprint Planning"), "loud source label: {out}");
+        assert!(out.contains("Attendees: Alice, Bob"), "context block preserved: {out}");
+        assert!(out.contains("velocity"), "agenda preserved: {out}");
+        assert!(out.contains("[calendar] 1:1"), "every event labelled: {out}");
     }
 
     /// LOUD: web hits render with their source label + URL, so the answer is attributed "via web".

@@ -26,6 +26,7 @@
 //! Connector code logs the connector id, hit counts, and HTTP status — never the query text, the
 //! result snippets, or the API key.
 
+pub mod calendar;
 pub mod web;
 
 use crate::settings::AppConfig;
