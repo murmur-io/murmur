@@ -61,6 +61,18 @@ pub struct AppConfig {
     pub language: Option<String>,
     /// default "claude-opus-4-8"
     pub anthropic_model: String,
+    /// Brain/AI model OVERRIDE for the active cloud provider. Empty `""` (the default) means
+    /// "use the provider's own default". For `claude_code` it is passed as `--model <id>`; for
+    /// `anthropic` it takes precedence over `anthropic_model`. `#[serde(default)]` ⇒ a config
+    /// persisted before this field existed loads as `""` (provider default).
+    #[serde(default)]
+    pub provider_model: String,
+    /// Brain/AI reasoning EFFORT for the active cloud provider: `""` (provider default), `"low"`,
+    /// `"medium"`, or `"high"`. ONLY the direct `anthropic` HTTP provider honors it (adaptive
+    /// thinking + output effort); the `claude_code` CLI has NO effort flag, so it is a no-op there.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `""`.
+    #[serde(default)]
+    pub provider_effort: String,
     /// default "http://localhost:11434"
     pub ollama_base_url: String,
     /// default "llama3.1"
@@ -187,6 +199,8 @@ impl Default for AppConfig {
             whisper_model_path: None,
             language: None,
             anthropic_model: "claude-opus-4-8".to_string(),
+            provider_model: String::new(),
+            provider_effort: String::new(),
             ollama_base_url: "http://localhost:11434".to_string(),
             ollama_model: "llama3.1".to_string(),
             claude_binary: "claude".to_string(),
@@ -224,6 +238,8 @@ const K_VAULT_SUBFOLDER: &str = "vault_subfolder";
 const K_WHISPER_MODEL_PATH: &str = "whisper_model_path";
 const K_LANGUAGE: &str = "language";
 const K_ANTHROPIC_MODEL: &str = "anthropic_model";
+const K_PROVIDER_MODEL: &str = "provider_model";
+const K_PROVIDER_EFFORT: &str = "provider_effort";
 const K_OLLAMA_BASE_URL: &str = "ollama_base_url";
 const K_OLLAMA_MODEL: &str = "ollama_model";
 const K_CLAUDE_BINARY: &str = "claude_binary";
@@ -271,6 +287,14 @@ impl AppConfig {
             if !v.is_empty() {
                 cfg.anthropic_model = v;
             }
+        }
+        // `""` is a VALID value (= provider default) and also the default, so the stored value
+        // is taken verbatim — no non-empty guard (unlike anthropic_model, whose default is a real id).
+        if let Some(v) = db.get_setting(K_PROVIDER_MODEL)? {
+            cfg.provider_model = v;
+        }
+        if let Some(v) = db.get_setting(K_PROVIDER_EFFORT)? {
+            cfg.provider_effort = v;
         }
         if let Some(v) = db.get_setting(K_OLLAMA_BASE_URL)? {
             if !v.is_empty() {
@@ -377,6 +401,8 @@ impl AppConfig {
         )?;
         db.set_setting(K_LANGUAGE, self.language.as_deref().unwrap_or(""))?;
         db.set_setting(K_ANTHROPIC_MODEL, &self.anthropic_model)?;
+        db.set_setting(K_PROVIDER_MODEL, &self.provider_model)?;
+        db.set_setting(K_PROVIDER_EFFORT, &self.provider_effort)?;
         db.set_setting(K_OLLAMA_BASE_URL, &self.ollama_base_url)?;
         db.set_setting(K_OLLAMA_MODEL, &self.ollama_model)?;
         db.set_setting(K_CLAUDE_BINARY, &self.claude_binary)?;
@@ -717,6 +743,36 @@ mod tests {
         assert_eq!(loaded.provider_id, "ollama");
         assert_eq!(loaded.vault_path.as_deref(), Some("/vault"));
         assert_eq!(loaded.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn provider_model_and_effort_round_trip_and_default_empty() {
+        let db = temp_db();
+        // Absent keys ⇒ `""` (provider default) for fresh + pre-existing installs.
+        let fresh = AppConfig::load(&db).unwrap();
+        assert_eq!(fresh.provider_model, "");
+        assert_eq!(fresh.provider_effort, "");
+
+        let cfg = AppConfig {
+            provider_model: "claude-sonnet-4-6".to_string(),
+            provider_effort: "high".to_string(),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.provider_model, "claude-sonnet-4-6");
+        assert_eq!(loaded.provider_effort, "high");
+
+        // Clearing back to `""` (provider default) also round-trips — not a one-way latch.
+        let cleared = AppConfig {
+            provider_model: String::new(),
+            provider_effort: String::new(),
+            ..Default::default()
+        };
+        cleared.save(&db).unwrap();
+        let reloaded = AppConfig::load(&db).unwrap();
+        assert_eq!(reloaded.provider_model, "");
+        assert_eq!(reloaded.provider_effort, "");
     }
 
     #[test]

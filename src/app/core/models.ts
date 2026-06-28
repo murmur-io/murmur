@@ -32,6 +32,16 @@ export interface AppConfigDto {
   whisperModelPath: string | null;
   language: string | null;
   anthropicModel: string;
+  /**
+   * Brain/AI MODEL override for the active cloud provider (settable, mirrors Rust
+   * `AppConfigDto.provider_model`). Empty `""` = provider default.
+   */
+  providerModel: string;
+  /**
+   * Brain/AI reasoning EFFORT (`""`/`low`/`medium`/`high`, mirrors Rust
+   * `AppConfigDto.provider_effort`). Honored ONLY by the `anthropic` provider.
+   */
+  providerEffort: string;
   ollamaBaseUrl: string;
   ollamaModel: string;
   claudeBinary: string;
