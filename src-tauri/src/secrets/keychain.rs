@@ -549,7 +549,52 @@ fn map_osstatus(ctx: &str, status: core_foundation::base::OSStatus) -> AppError 
         // The keychain is locked / no UI context — treat as a denied access, recoverable.
         return AppError::KeychainDenied(format!("{ctx}: OSStatus {status}"));
     }
+    if status == MISSING_ENTITLEMENT_STATUS {
+        // Unsigned/ad-hoc dev build: the data-protection keychain entitlement is absent. Build the
+        // dedicated marker error so the NON-GATED string-secret API can recognize exactly this status
+        // and fall back to the legacy file-based keyring (dev-only; a signed release never gets here).
+        return missing_entitlement_err(ctx);
+    }
     AppError::Secrets(format!("{ctx}: OSStatus {status}"))
+}
+
+/// The data-protection `errSecMissingEntitlement` `OSStatus` (-34018, from `<Security/SecBase.h>`):
+/// the calling binary lacks the data-protection-keychain entitlement. On an UNSIGNED / ad-hoc-signed
+/// dev build (`tauri dev`) every data-protection `SecItem*` op returns this, so the DP keychain is
+/// effectively unavailable. A SIGNED release build HAS the entitlement → this status never occurs →
+/// the dev-only legacy fallback keyed on it is unreachable in release. Cross-platform `i32` so the
+/// marker logic + tests compile on CI (Linux) too, even though the status only ever arises from a
+/// macOS `SecItem*` call.
+const MISSING_ENTITLEMENT_STATUS: i32 = -34018;
+
+/// Stable, non-PII marker prefixed onto the [`AppError`] message for `errSecMissingEntitlement` so
+/// the non-gated string-secret API ([`set_secret`]/[`get_secret`]/[`delete_secret`]) can detect
+/// EXACTLY that status — and ONLY that status — and fall back to the legacy keyring on an unsigned
+/// dev build. NOT a blanket catch-all: any other DP failure (e.g. -25300 notFound is handled inline
+/// as `Ok(None)`; -50 param; a real DP error) is NOT matched here and surfaces as today.
+const MISSING_ENTITLEMENT_MARKER: &str = "errSecMissingEntitlement";
+
+/// Build the typed -34018 signal error. Carries only the marker, context, and numeric status — never
+/// a secret value — so it is safe to log under the no-PII rule. `KeychainDenied` (recoverable) so a
+/// non-falling-back caller still shows a clean message rather than crashing.
+fn missing_entitlement_err(ctx: &str) -> AppError {
+    AppError::KeychainDenied(format!(
+        "{MISSING_ENTITLEMENT_MARKER}: {ctx}: OSStatus {MISSING_ENTITLEMENT_STATUS}"
+    ))
+}
+
+/// True iff `err` is the data-protection `errSecMissingEntitlement` (-34018) signal produced by
+/// [`missing_entitlement_err`]. Matches the specific marker + the exact numeric status, never a broad
+/// class of keychain errors — so the legacy fallback can never mask a genuine DP failure in a signed
+/// release.
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
+fn is_missing_entitlement(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::KeychainDenied(msg)
+            if msg.starts_with(MISSING_ENTITLEMENT_MARKER)
+                && msg.contains(&format!("OSStatus {MISSING_ENTITLEMENT_STATUS}"))
+    )
 }
 
 // ───────────────────── shared data-protection store for NON-gated string secrets (A2/A3/A4/A9) ────
@@ -578,6 +623,75 @@ trait DpStringStore {
     fn read_legacy(&self) -> Result<Option<String>>;
     /// Delete the legacy file-based (keyring) item (idempotent).
     fn delete_legacy(&self) -> Result<()>;
+    /// Write/replace the legacy file-based (keyring) item. Used ONLY by the unsigned-dev-build
+    /// errSecMissingEntitlement (-34018) fallback, where the data-protection keychain is unavailable.
+    fn write_legacy(&self, secret: &str) -> Result<()>;
+}
+
+// ───────────── unsigned-dev-build (-34018) fallback routing over the DpStringStore seam ─────────────
+//
+// On a SIGNED release build the data-protection entitlement is present → the DP ops below succeed →
+// `is_missing_entitlement` is never true → these helpers behave identically to "DP only" and the
+// legacy keyring is never written. On an UNSIGNED/ad-hoc dev build every DP `SecItem*` returns
+// errSecMissingEntitlement (-34018) → the helpers route the op to the legacy keyring (which works
+// without the entitlement), keeping set/get/delete consistent so a dev-written secret round-trips.
+// Pulled out as free functions over the trait so they can be unit-tested with an in-memory fake DP
+// store that returns -34018 (no live keychain, no signature).
+
+/// `set_secret` over the store seam: DP write (then clear any legacy copy); on -34018 write to legacy.
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
+fn dp_set_or_legacy<S: DpStringStore>(store: &S, secret: &str) -> Result<()> {
+    match store.write_dp(secret) {
+        Ok(()) => {
+            let _ = store.delete_legacy();
+            Ok(())
+        }
+        Err(ref e) if is_missing_entitlement(e) => {
+            tracing::warn!(
+                target: "secrets",
+                "data-protection keychain unavailable (errSecMissingEntitlement / unsigned dev build) — storing secret in the legacy keyring"
+            );
+            store.write_legacy(secret)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `get_secret` over the store seam: migrate/read DP; on -34018 read from legacy (so a secret written
+/// via the set fallback — also legacy — reads back).
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
+fn dp_get_or_legacy<S: DpStringStore>(store: &S) -> Result<Option<String>> {
+    match migrate_or_read_dp(store) {
+        Ok(v) => Ok(v),
+        Err(ref e) if is_missing_entitlement(e) => {
+            tracing::warn!(
+                target: "secrets",
+                "data-protection keychain unavailable (errSecMissingEntitlement / unsigned dev build) — reading secret from the legacy keyring"
+            );
+            store.read_legacy()
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `delete_secret` over the store seam: DP delete (then clear any legacy copy); on -34018 delete from
+/// legacy.
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
+fn dp_delete_or_legacy<S: DpStringStore>(store: &S) -> Result<()> {
+    match store.delete_dp() {
+        Ok(()) => {
+            let _ = store.delete_legacy();
+            Ok(())
+        }
+        Err(ref e) if is_missing_entitlement(e) => {
+            tracing::warn!(
+                target: "secrets",
+                "data-protection keychain unavailable (errSecMissingEntitlement / unsigned dev build) — deleting secret from the legacy keyring"
+            );
+            store.delete_legacy()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Resolve a string secret, migrating a legacy keyring item to the data-protection keychain ONCE,
@@ -585,6 +699,7 @@ trait DpStringStore {
 /// item: read it, write the SAME string to DP, CONFIRM BY VALUE (read DP back, assert equal) BEFORE
 /// deleting the legacy item — so a crash mid-migration never loses the secret. Neither present ⇒
 /// `Ok(None)` (caller mints a fresh one and `set_secret`s it).
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
 fn migrate_or_read_dp<S: DpStringStore>(store: &S) -> Result<Option<String>> {
     // Fast path: already on the data-protection keychain.
     if let Some(v) = store.read_dp()? {
@@ -630,6 +745,7 @@ fn migrate_or_read_dp<S: DpStringStore>(store: &S) -> Result<Option<String>> {
 
 /// Constant-time string comparison for secret values (uses `subtle`). Equal-length required; a
 /// length difference short-circuits to "not equal" (lengths are not secret here).
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
 fn ct_eq_str(a: &str, b: &str) -> subtle::Choice {
     use subtle::ConstantTimeEq;
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -641,11 +757,13 @@ fn ct_eq_str(a: &str, b: &str) -> subtle::Choice {
 
 /// macOS data-protection backend for a single non-gated string account.
 #[cfg(target_os = "macos")]
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
 struct MacDpStore {
     account: &'static str,
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
 impl DpStringStore for MacDpStore {
     fn read_dp(&self) -> Result<Option<String>> {
         use core_foundation::base::{CFType, TCFType};
@@ -759,6 +877,10 @@ impl DpStringStore for MacDpStore {
     fn delete_legacy(&self) -> Result<()> {
         legacy_delete_secret(self.account)
     }
+
+    fn write_legacy(&self, secret: &str) -> Result<()> {
+        legacy_set_secret(self.account, secret)
+    }
 }
 
 /// Return the MCP bearer token (a random 64-char hex string), minting + persisting it in the
@@ -824,15 +946,21 @@ fn classify(ctx: impl std::fmt::Display, e: KeyringError) -> AppError {
 /// `WhenUnlockedThisDeviceOnly`, non-syncable) and clears any legacy file-based item so reads can't
 /// resurrect a stale value. Off macOS: the keyring crate.
 pub fn set_secret(account: &str, secret: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    // DEBUG-ONLY: route the non-gated string secrets to the dev plaintext file store (NO keychain) so
+    // an unsigned dev build never hits errSecMissingEntitlement (-34018) or the legacy-keyring prompt
+    // spam. Compiled out of release; a signed release uses the data-protection keychain below.
+    #[cfg(debug_assertions)]
     {
-        let store = MacDpStore { account: leak_account(account) };
-        store.write_dp(secret)?;
-        // Drop any legacy file-based copy so a future get_secret can't see the old value.
-        let _ = store.delete_legacy();
-        Ok(())
+        dev_set_secret_at(&dev_secrets_path()?, account, secret)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        // DP write; on an unsigned dev build the DP op returns errSecMissingEntitlement (-34018) and
+        // the helper falls back to the legacy keyring. Unreachable in a signed release.
+        let store = MacDpStore { account: leak_account(account) };
+        dp_set_or_legacy(&store, secret)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
     {
         legacy_set_secret(account, secret)
     }
@@ -841,12 +969,19 @@ pub fn set_secret(account: &str, secret: &str) -> Result<()> {
 /// Read a secret. `Ok(None)` if absent. On macOS this also performs the one-time, value-preserving
 /// migration of a legacy keyring item into the data-protection keychain.
 pub fn get_secret(account: &str) -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
+    // DEBUG-ONLY: read the dev plaintext file store (NO keychain) — see `set_secret`.
+    #[cfg(debug_assertions)]
     {
-        let store = MacDpStore { account: leak_account(account) };
-        migrate_or_read_dp(&store)
+        dev_get_secret_at(&dev_secrets_path()?, account)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        // Migrate/read DP; on an unsigned dev build the DP read returns -34018 and the helper reads
+        // from the legacy keyring (where the set fallback wrote it). Unreachable in a signed release.
+        let store = MacDpStore { account: leak_account(account) };
+        dp_get_or_legacy(&store)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
     {
         legacy_get_secret(account)
     }
@@ -855,14 +990,19 @@ pub fn get_secret(account: &str) -> Result<Option<String>> {
 /// Delete a secret (idempotent). On macOS removes BOTH the data-protection item and any legacy
 /// file-based item.
 pub fn delete_secret(account: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    // DEBUG-ONLY: delete from the dev plaintext file store (NO keychain) — see `set_secret`.
+    #[cfg(debug_assertions)]
     {
-        let store = MacDpStore { account: leak_account(account) };
-        store.delete_dp()?;
-        let _ = store.delete_legacy();
-        Ok(())
+        dev_delete_secret_at(&dev_secrets_path()?, account)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        // DP delete; on an unsigned dev build the DP op returns -34018 and the helper deletes from
+        // the legacy keyring (where the dev secret lives). Unreachable in a signed release.
+        let store = MacDpStore { account: leak_account(account) };
+        dp_delete_or_legacy(&store)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
     {
         legacy_delete_secret(account)
     }
@@ -874,6 +1014,7 @@ pub fn delete_secret(account: &str) -> Result<()> {
 /// match it to its known static; an unknown account is leaked once (bounded — accounts come from a
 /// small fixed set of string literals, never user input).
 #[cfg(target_os = "macos")]
+#[cfg_attr(debug_assertions, allow(dead_code))] // release-only: debug routes string secrets to the dev file store
 fn leak_account(account: &str) -> &'static str {
     match account {
         ACCOUNT_DB_DEK => ACCOUNT_DB_DEK,
@@ -910,6 +1051,105 @@ fn legacy_delete_secret(account: &str) -> Result<()> {
         Err(KeyringError::NoEntry) => Ok(()),
         Err(e) => Err(classify("delete secret", e)),
     }
+}
+
+// ───────────────────── DEBUG-ONLY dev file store for the non-gated string secrets ─────────────────
+//
+// Mirrors the MURMUR_DEV_DEK / MURMUR_DEV_KEK philosophy (dev avoids the keychain entirely) for the
+// NON-biometric string secrets — MCP token, Anthropic key, Brave web-search key. In an UNSIGNED dev
+// build (`tauri dev`) the macOS data-protection keychain returns errSecMissingEntitlement (-34018)
+// and the legacy keyring re-prompts the login-keychain password on every rebuild (new ad-hoc
+// signature ⇒ ACL mismatch). To kill that prompt-spam AND the -34018 failure, a DEBUG build routes
+// these three secrets to a plaintext JSON map in the DEV data dir instead of ANY keychain.
+//
+// LOAD-BEARING: this whole region is compiled out of release (`#[cfg(debug_assertions)]`). A signed
+// release build NEVER touches this file store — `set_secret`/`get_secret`/`delete_secret` keep the
+// exact data-protection-keychain path below. Dev is not a security boundary (it is the same trust
+// posture as the fixed MURMUR_DEV_DEK key); the file is plaintext on purpose, under the already-
+// location-gitignored app-support dir, written 0600 where the platform allows it.
+//
+// The biometric master KEK is NOT routed here — it keeps its own MURMUR_DEV_KEK env hatch +
+// kSecAttrAccessControl path. Only the three non-gated string accounts use this store.
+
+/// Filename of the dev-only plaintext secret map under the dev data dir.
+#[cfg(debug_assertions)]
+const DEV_SECRETS_FILE: &str = "dev-secrets.json";
+
+/// Resolve the dev-only secrets file path: `<app-data>/MeetNotes-dev/dev-secrets.json`. Mirrors the
+/// DB/audio dir resolution (`dirs::data_dir().join(app_dir_name())`) so the dev secrets live beside
+/// the dev DB, isolated from the release `MeetNotes` dir. Creates the parent dir if absent.
+#[cfg(debug_assertions)]
+fn dev_secrets_path() -> Result<std::path::PathBuf> {
+    let base = dirs::data_dir()
+        .ok_or_else(|| AppError::Secrets("could not resolve app-data directory".into()))?;
+    let dir = base.join(crate::state::app_dir_name());
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Secrets(format!("create dev-secrets dir: {e}")))?;
+    Ok(dir.join(DEV_SECRETS_FILE))
+}
+
+/// Read the dev secret map from `path`. A MISSING file ⇒ an empty map (NOT an error) — the very
+/// first dev access has no file yet. A present-but-malformed file is a hard error (don't silently
+/// drop a dev's saved keys). Never logs the values.
+#[cfg(debug_assertions)]
+fn dev_read_map(path: &std::path::Path) -> Result<std::collections::BTreeMap<String, String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::Secrets(format!("parse dev-secrets file: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::collections::BTreeMap::new())
+        }
+        Err(e) => Err(AppError::Secrets(format!("read dev-secrets file: {e}"))),
+    }
+}
+
+/// Persist the dev secret map to `path` as pretty JSON, best-effort 0600. Writes to a temp sibling
+/// then renames so a crash mid-write never truncates the existing map. Never logs the values.
+#[cfg(debug_assertions)]
+fn dev_write_map(
+    path: &std::path::Path,
+    map: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let json = serde_json::to_vec_pretty(map)
+        .map_err(|e| AppError::Secrets(format!("serialize dev-secrets: {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)
+        .map_err(|e| AppError::Secrets(format!("write dev-secrets temp: {e}")))?;
+    // Best-effort owner-only perms (dev convenience; not a security boundary).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| AppError::Secrets(format!("commit dev-secrets file: {e}")))?;
+    Ok(())
+}
+
+/// `set_secret` against an explicit dev-store path (test seam). Inserts/replaces `account`.
+#[cfg(debug_assertions)]
+fn dev_set_secret_at(path: &std::path::Path, account: &str, secret: &str) -> Result<()> {
+    let mut map = dev_read_map(path)?;
+    map.insert(account.to_string(), secret.to_string());
+    dev_write_map(path, &map)
+}
+
+/// `get_secret` against an explicit dev-store path (test seam). Missing account / missing file ⇒
+/// `Ok(None)`.
+#[cfg(debug_assertions)]
+fn dev_get_secret_at(path: &std::path::Path, account: &str) -> Result<Option<String>> {
+    Ok(dev_read_map(path)?.get(account).cloned())
+}
+
+/// `delete_secret` against an explicit dev-store path (test seam). Absent account / missing file ⇒
+/// `Ok(())` (idempotent).
+#[cfg(debug_assertions)]
+fn dev_delete_secret_at(path: &std::path::Path, account: &str) -> Result<()> {
+    let mut map = dev_read_map(path)?;
+    if map.remove(account).is_some() {
+        dev_write_map(path, &map)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1186,12 +1426,18 @@ mod tests {
         DeleteDp,
         ReadLegacy,
         DeleteLegacy,
+        WriteLegacy(String),
     }
 
     struct FakeDp {
         dp: RefCell<Option<String>>,
         legacy: RefCell<Option<String>>,
         log: RefCell<Vec<DpOp>>,
+        /// If `Some(status)`, EVERY data-protection op (`read_dp`/`write_dp`/`delete_dp`) fails as if
+        /// the SecItem call returned that `OSStatus`. Models the unsigned-dev-build case
+        /// (`-34018`) and the "a real, NON-34018 DP failure" case. The legacy ops still succeed
+        /// (the file-based keyring needs no entitlement).
+        dp_fail_status: Option<i32>,
     }
     impl FakeDp {
         fn new(dp: Option<&str>, legacy: Option<&str>) -> Self {
@@ -1199,24 +1445,53 @@ mod tests {
                 dp: RefCell::new(dp.map(str::to_string)),
                 legacy: RefCell::new(legacy.map(str::to_string)),
                 log: RefCell::new(Vec::new()),
+                dp_fail_status: None,
+            }
+        }
+        /// A store whose data-protection backend fails every op with `status` (the legacy keyring,
+        /// modeled by `legacy`, still works). `-34018` ⇒ unsigned dev build (errSecMissingEntitlement).
+        fn failing_dp(status: i32, legacy: Option<&str>) -> Self {
+            Self {
+                dp: RefCell::new(None),
+                legacy: RefCell::new(legacy.map(str::to_string)),
+                log: RefCell::new(Vec::new()),
+                dp_fail_status: Some(status),
             }
         }
         fn log(&self) -> Vec<DpOp> {
             self.log.borrow().clone()
         }
+        /// Mirror the real [`map_osstatus`] mapping so the test error carries the exact marker the
+        /// production `is_missing_entitlement` matches on (proves the real classifier, not a stand-in).
+        fn dp_err(status: i32) -> AppError {
+            if status == MISSING_ENTITLEMENT_STATUS {
+                missing_entitlement_err("fake dp op")
+            } else {
+                AppError::Secrets(format!("fake dp op: OSStatus {status}"))
+            }
+        }
     }
     impl DpStringStore for FakeDp {
         fn read_dp(&self) -> Result<Option<String>> {
             self.log.borrow_mut().push(DpOp::ReadDp);
+            if let Some(s) = self.dp_fail_status {
+                return Err(Self::dp_err(s));
+            }
             Ok(self.dp.borrow().clone())
         }
         fn write_dp(&self, secret: &str) -> Result<()> {
             self.log.borrow_mut().push(DpOp::WriteDp(secret.to_string()));
+            if let Some(s) = self.dp_fail_status {
+                return Err(Self::dp_err(s));
+            }
             *self.dp.borrow_mut() = Some(secret.to_string());
             Ok(())
         }
         fn delete_dp(&self) -> Result<()> {
             self.log.borrow_mut().push(DpOp::DeleteDp);
+            if let Some(s) = self.dp_fail_status {
+                return Err(Self::dp_err(s));
+            }
             *self.dp.borrow_mut() = None;
             Ok(())
         }
@@ -1227,6 +1502,11 @@ mod tests {
         fn delete_legacy(&self) -> Result<()> {
             self.log.borrow_mut().push(DpOp::DeleteLegacy);
             *self.legacy.borrow_mut() = None;
+            Ok(())
+        }
+        fn write_legacy(&self, secret: &str) -> Result<()> {
+            self.log.borrow_mut().push(DpOp::WriteLegacy(secret.to_string()));
+            *self.legacy.borrow_mut() = Some(secret.to_string());
             Ok(())
         }
     }
@@ -1287,5 +1567,217 @@ mod tests {
             Some("legacy-DIFFERENT".to_string()),
             "a differing legacy item is left untouched"
         );
+    }
+
+    // ── Unsigned-dev-build errSecMissingEntitlement (-34018) → legacy keyring fallback ────────────
+    //
+    // On an UNSIGNED / ad-hoc dev build every data-protection SecItem op returns -34018, so the MCP
+    // token / Anthropic key / Brave key cannot be stored or read via the DP keychain. These exercise
+    // the `dp_*_or_legacy` routing the PUBLIC `set_secret`/`get_secret`/`delete_secret` use, against a
+    // fake DP store that returns -34018, and assert set/get/delete consistently round-trip through the
+    // legacy keyring. The "DP succeeds" + "DP fails with a NON-34018 status" cases prove the fallback
+    // is -34018-specific and unreachable in a signed release.
+
+    #[test]
+    fn marker_round_trips_and_is_specific_to_34018() {
+        // The -34018 error built the way map_osstatus builds it IS recognized…
+        assert!(is_missing_entitlement(&missing_entitlement_err("read data-protection secret")));
+        // …while other keychain/secrets errors are NOT (no blanket catch-all).
+        assert!(!is_missing_entitlement(&AppError::Secrets(
+            "read data-protection secret: OSStatus -25300".into()
+        )));
+        assert!(!is_missing_entitlement(&AppError::Secrets(
+            "read data-protection secret: OSStatus -50".into()
+        )));
+        assert!(!is_missing_entitlement(&AppError::KeychainDenied(
+            "read data-protection secret: OSStatus -25308".into()
+        )));
+        // A KeychainDenied that does NOT carry the marker (e.g. a real deny) does not trigger fallback.
+        assert!(!is_missing_entitlement(&AppError::KeychainDenied("user denied".into())));
+    }
+
+    #[test]
+    fn unsigned_build_set_get_delete_round_trip_through_legacy_fallback() {
+        let secret = "brave-search-api-key-DEADBEEF";
+
+        // SET: DP write fails -34018 → the secret lands in the legacy keyring.
+        let store = FakeDp::failing_dp(MISSING_ENTITLEMENT_STATUS, None);
+        dp_set_or_legacy(&store, secret).unwrap();
+        assert_eq!(*store.legacy.borrow(), Some(secret.to_string()), "fallback wrote to legacy");
+        assert_eq!(*store.dp.borrow(), None, "DP store stays empty on an unsigned build");
+        assert!(store.log().contains(&DpOp::WriteLegacy(secret.to_string())));
+
+        // GET: DP read fails -34018 → the value is read back from the legacy keyring (round-trip).
+        let got = dp_get_or_legacy(&store).unwrap();
+        assert_eq!(got.as_deref(), Some(secret), "the secret written via the fallback reads back");
+
+        // DELETE: DP delete fails -34018 → the legacy item is removed; a subsequent get is None.
+        dp_delete_or_legacy(&store).unwrap();
+        assert_eq!(*store.legacy.borrow(), None, "fallback delete cleared the legacy item");
+        assert_eq!(dp_get_or_legacy(&store).unwrap(), None, "deleted secret no longer reads back");
+    }
+
+    #[test]
+    fn signed_build_dp_succeeds_and_legacy_is_never_used() {
+        // RELEASE behaviour: DP works (entitlement present) → -34018 never occurs → no legacy write.
+        let secret = "anthropic-sk-signed-release";
+        let store = FakeDp::new(None, None); // dp_fail_status = None ⇒ DP ops succeed
+
+        dp_set_or_legacy(&store, secret).unwrap();
+        assert_eq!(*store.dp.borrow(), Some(secret.to_string()), "secret stays in the DP keychain");
+        assert_eq!(*store.legacy.borrow(), None, "legacy keyring is never written in a signed build");
+        assert!(
+            !store.log().iter().any(|o| matches!(o, DpOp::WriteLegacy(_))),
+            "the legacy fallback must NOT run when DP succeeds"
+        );
+
+        let got = dp_get_or_legacy(&store).unwrap();
+        assert_eq!(got.as_deref(), Some(secret), "DP read returns the value");
+        // The get path here is a DP read only (steady state) — never touches the legacy keyring as a
+        // source of truth.
+        assert!(
+            !store.log().iter().any(|o| *o == DpOp::ReadLegacy && store.dp_fail_status.is_some()),
+            "no DP failure ⇒ no legacy read"
+        );
+    }
+
+    #[test]
+    fn non_34018_dp_failure_does_not_fall_back_and_propagates() {
+        // A REAL DP failure that is NOT the unsigned-build signal (e.g. errSecParam -50) must NOT be
+        // masked by the legacy fallback — it surfaces as today so a genuine release DP fault is loud.
+        let real_fault = -50; // errSecParam
+        let legacy_present = "stale-legacy-value-that-must-not-be-resurrected";
+
+        // SET: DP write fails -50 → error propagates, legacy is NOT written.
+        let store = FakeDp::failing_dp(real_fault, Some(legacy_present));
+        let set_res = dp_set_or_legacy(&store, "new-secret");
+        assert!(set_res.is_err(), "a non-34018 DP write failure must propagate");
+        assert!(!is_missing_entitlement(&set_res.unwrap_err()), "and it is not the -34018 signal");
+        assert!(
+            !store.log().iter().any(|o| matches!(o, DpOp::WriteLegacy(_))),
+            "a non-34018 failure must NOT trigger the legacy fallback"
+        );
+
+        // GET: DP read fails -50 → error propagates; the stale legacy value is NOT resurrected.
+        let store2 = FakeDp::failing_dp(real_fault, Some(legacy_present));
+        let get_res = dp_get_or_legacy(&store2);
+        assert!(get_res.is_err(), "a non-34018 DP read failure must propagate, not fall back");
+
+        // DELETE: DP delete fails -50 → error propagates.
+        let store3 = FakeDp::failing_dp(real_fault, Some(legacy_present));
+        assert!(
+            dp_delete_or_legacy(&store3).is_err(),
+            "a non-34018 DP delete failure must propagate"
+        );
+    }
+
+    #[test]
+    fn item_not_found_is_handled_as_today_not_as_a_fallback() {
+        // -25300 (errSecItemNotFound) is handled INLINE by read_dp as Ok(None) (see MacDpStore), so a
+        // real DP store never surfaces it as an error to the router. Model the steady state: DP empty,
+        // no legacy → None, with no legacy fallback / write triggered.
+        let store = FakeDp::new(None, None);
+        assert_eq!(dp_get_or_legacy(&store).unwrap(), None, "absent everywhere → None");
+        assert!(
+            !store.log().iter().any(|o| matches!(o, DpOp::WriteLegacy(_))),
+            "a not-found is not a -34018 fallback"
+        );
+    }
+
+    // ── DEBUG-ONLY dev plaintext file store (MCP token / Anthropic key / Brave key) ──────────────
+    //
+    // The dev file store is what a `tauri dev` build uses for the three non-gated string secrets so
+    // it NEVER touches the data-protection OR legacy keychain (no -34018, no login-keychain prompt
+    // spam). These tests drive the explicit-path seam (`dev_*_secret_at`) against a temp dir — never
+    // the real app-support file — and assert: round-trip set→get, delete removes, the store is a map
+    // (multiple accounts coexist), and a missing file ⇒ `Ok(None)` (not an error). The dev store is
+    // `#[cfg(debug_assertions)]`; `cargo test` runs in debug, so it is compiled in here.
+
+    #[test]
+    fn dev_store_set_get_round_trips_a_value() {
+        let dir = std::env::temp_dir().join(format!("murmur-dev-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dev-secrets-rt.json");
+        let _ = std::fs::remove_file(&path);
+
+        dev_set_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY, "brave-key-DEADBEEF").unwrap();
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(),
+            Some("brave-key-DEADBEEF"),
+            "a value set in the dev store reads back identically"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dev_store_delete_removes_the_value() {
+        let dir = std::env::temp_dir().join(format!("murmur-dev-secrets-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dev-secrets-del.json");
+        let _ = std::fs::remove_file(&path);
+
+        dev_set_secret_at(&path, ACCOUNT_ANTHROPIC_KEY, "anthropic-sk-test").unwrap();
+        dev_delete_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap();
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap(),
+            None,
+            "a deleted secret no longer reads back"
+        );
+        // Idempotent: deleting an absent account is Ok(()).
+        dev_delete_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dev_store_is_a_map_multiple_accounts_coexist() {
+        let dir = std::env::temp_dir().join(format!("murmur-dev-secrets-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dev-secrets-map.json");
+        let _ = std::fs::remove_file(&path);
+
+        // MCP token + Anthropic key + Brave key all live side-by-side in one file.
+        dev_set_secret_at(&path, ACCOUNT_MCP_TOKEN, "mcp-token-1").unwrap();
+        dev_set_secret_at(&path, ACCOUNT_ANTHROPIC_KEY, "anthropic-2").unwrap();
+        dev_set_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY, "brave-3").unwrap();
+
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap().as_deref(), Some("mcp-token-1"));
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap().as_deref(), Some("anthropic-2"));
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(), Some("brave-3"));
+
+        // Replacing one account leaves the others intact.
+        dev_set_secret_at(&path, ACCOUNT_ANTHROPIC_KEY, "anthropic-REPLACED").unwrap();
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap().as_deref(), Some("anthropic-REPLACED"));
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap().as_deref(), Some("mcp-token-1"));
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(), Some("brave-3"));
+
+        // Deleting one leaves the rest.
+        dev_delete_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap();
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap(), None);
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(), Some("brave-3"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dev_store_missing_file_returns_none_not_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "murmur-dev-secrets-absent-{}.json",
+            std::process::id()
+        ));
+        // Ensure the file does NOT exist.
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists());
+
+        // A missing file must yield Ok(None) for a get, and Ok(()) for a delete — never an error.
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap(),
+            None,
+            "no dev-secrets file yet ⇒ get returns None"
+        );
+        dev_delete_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap();
+        // And the missing-file get is still None after a no-op delete.
+        assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap(), None);
     }
 }
