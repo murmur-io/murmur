@@ -493,3 +493,202 @@ body.bar-shell::after { display: none !important; }
   body.murmur-printing .app-main { max-width: none; margin: 0; padding: 0; }
   body.murmur-printing { background: #fff !important; color: #000 !important; }
 }
+
+/* ── App shell chrome (brand header, nav, page frame, toasts) ───────────────
+   These live in the GLOBAL stylesheet ON PURPOSE. The shell is rendered by
+   AppShellComponent (a lazy layout route). In Tauri's WKWebView, Angular's
+   runtime-injected component <style> for the shell was NOT applied on cold
+   launch (header/nav rendered as raw unstyled HTML) — but this build-time
+   styles.css <link>, an active sheet from page load, reliably matches the
+   shell DOM when the router inserts it (the same way .btn/.card global classes
+   work everywhere). So the shell's CSS is global here, matched by class.
+   See app-shell.component.ts for the full FOUC rationale. */
+app-shell {
+  display: block;
+  min-height: 100vh;
+}
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgba(7, 7, 11, 0.55);
+  backdrop-filter: saturate(150%) blur(22px);
+  -webkit-backdrop-filter: saturate(150%) blur(22px);
+  border-bottom: 1px solid var(--border-subtle);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.app-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-3) var(--space-5);
+}
+.app-bar .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  border-radius: var(--radius-md);
+  transition: transform var(--transition-fast);
+}
+.app-bar .brand:hover {
+  transform: translateY(-1px);
+}
+.app-bar .brand:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: var(--accent-soft);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight), 0 4px 16px rgba(110, 118, 255, 0.28);
+}
+.brand-wave {
+  display: block;
+  width: 22px;
+  height: 22px;
+}
+.brand-wave .bar {
+  fill: url(#murmurWave);
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: brand-wave 1.5s ease-in-out infinite;
+}
+.brand-wave .b2 { animation-delay: 0.12s; }
+.brand-wave .b3 { animation-delay: 0.24s; }
+.brand-wave .b4 { animation-delay: 0.36s; }
+.brand-wave .b5 { animation-delay: 0.48s; }
+@keyframes brand-wave {
+  0%, 100% { transform: scaleY(0.5); }
+  50% { transform: scaleY(1); }
+}
+.brand-word {
+  font-size: 1.06rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  background: linear-gradient(180deg, #ffffff 0%, #b9bbe6 130%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: var(--text-primary);
+}
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+}
+.app-nav a {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  transition: color var(--transition), background var(--transition);
+}
+.app-nav a:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.app-nav a:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.app-nav a.active {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+}
+.unlocked-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 26px;
+  padding: 0 var(--space-3) 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.unlocked-glyph { display: block; flex: none; }
+.unlocked-count { font-variant-numeric: tabular-nums; }
+.unlocked-label { color: var(--accent-hover); opacity: 0.85; }
+.app-main {
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) var(--space-8);
+}
+.toast-viewport {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: min(360px, calc(100vw - var(--space-6)));
+  pointer-events: none;
+}
+.toast-viewport .toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  line-height: 1.45;
+  box-shadow: var(--shadow-md), var(--glass-highlight);
+  pointer-events: auto;
+}
+.toast-viewport .toast.is-info { border-left-color: var(--accent); }
+.toast-viewport .toast.is-success { border-left-color: var(--success); }
+.toast-viewport .toast.is-danger { border-left-color: var(--danger); }
+.toast-msg { flex: 1 1 auto; min-width: 0; }
+.toast-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  margin-top: -2px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition);
+}
+.toast-close:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.toast-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-wave .bar { animation: none; }
+  .app-bar .brand:hover { transform: none; }
+}
