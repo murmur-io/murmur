@@ -54,10 +54,10 @@ echo "2) Codesigning INSIDE-OUT (nested helpers first, app last — NO --deep)�
 # --deep mis-signs nested Mach-Os and breaks notarization once a helper is bundled
 # (deprecated since macOS 13; reproduces Tauri #11992). Sign each embedded sidecar FIRST
 # with hardened runtime + timestamp, THEN seal the app bundle last.
-for HELPER in \
-  "$APP/Contents/Resources/meetnotes-sysaudio" \
-  "$APP/Contents/Resources/meetnotes-audiocap" \
-  "$APP/Contents/Resources/meetnotes-aeccap"; do
+# Glob ALL bundled meetnotes-* sidecars (sysaudio/audiocap/aeccap/calendar/…) so a newly-added
+# helper can never be missed — a hardcoded list that omitted meetnotes-calendar is exactly what made
+# the first 0.5.0 notarization Invalid ("meetnotes-calendar: binary is not signed").
+for HELPER in "$APP/Contents/Resources/"meetnotes-*; do
   if [ -f "$HELPER" ]; then
     echo "   • helper: $(basename "$HELPER")"
     codesign --force --options runtime --timestamp \
