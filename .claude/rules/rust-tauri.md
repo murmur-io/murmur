@@ -113,6 +113,20 @@ at launch ("Rust cannot catch foreign exceptions"). See the header doc in
   (`biometric.rs:7`/`29`/`46`). Touch ID + lock-at-rest + screen-share only TRULY verify on a
   signed build — typecheck/`cargo test` is not proof for FFI/permission code.
 
+## 7b. CSP in `tauri.conf.json` — keep `style-src` nonce-FREE or Angular styles vanish in prod
+
+- Tauri injects a per-load nonce into `style-src` (and stamps `nonce=` on every inline `<style>`
+  in `index.html`): `tauri-utils/html.rs` `inject_nonce_token` + `tauri/src/manager/mod.rs`
+  `replace_csp_nonce`. A nonce in `style-src` makes the browser IGNORE `'unsafe-inline'` (CSP3
+  §6.7.3.2), which BLOCKS Angular's runtime-injected emulated-encapsulation component `<style>`
+  nodes → the packaged WKWebView build renders every component unstyled while the global
+  `styles.css` `<link>` still works. (`ng serve` never reproduces it — green `ng build` ≠ shipped.)
+- **REQUIRED:** `app.security` keeps `"dangerousDisableAssetCspModification": ["style-src"]`
+  (added 2026-06-29). Do NOT remove it, and do NOT add a nonce/hash to `style-src`. `script-src`
+  stays strict. Full root-cause + diagnostics + the disproven theories: `angular-zoneless.md` **T4**.
+- `identifier` `com.meetnotes.app` and the rest of the `csp` string are immutable for the usual
+  TCC/Keychain-continuity reasons — change `security` only with a real WKWebView render-test.
+
 ## 8. No PII in logs
 
 - Never log note text, transcript segments, titles, attendee names, file paths that embed
