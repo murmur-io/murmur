@@ -195,6 +195,15 @@ export class IpcService {
     return invoke<SearchHit[]>("search_meetings", { query });
   }
 
+  /**
+   * Semantic neighbors of a meeting ("Powiązane wg znaczenia"). Returns `[]`
+   * when `semantic_search_enabled` is off or the meeting has no neighbors —
+   * the FE simply renders nothing in that case. Gated server-side.
+   */
+  relatedMeetings(meetingId: string): Promise<SearchHit[]> {
+    return invoke<SearchHit[]>("related_meetings", { meetingId });
+  }
+
   /** Permanently delete a meeting (audio + vault note + all DB rows). Irreversible. */
   deleteMeeting(meetingId: string): Promise<void> {
     return invoke<void>("delete_meeting", { meetingId });
