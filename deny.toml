@@ -41,6 +41,7 @@ allow = [
     "OpenSSL",
     "Unlicense",            # whisper-rs / whisper-rs-sys — public-domain dedication.
     "CDLA-Permissive-2.0",  # webpki-roots — Mozilla's permissive cert-root license.
+    "0BSD",                 # doctest-file (via interprocess → mistralrs-core) — OSI-approved, zero-condition (public-domain-equivalent).
 ]
 confidence-threshold = 0.8
 # Treat workspace-local (path) crates as private. NOTE: cargo-deny only auto-detects a crate as
