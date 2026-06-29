@@ -16,7 +16,8 @@
       {
         "title": "Murmur",
         "width": 900,
-        "height": 680
+        "height": 680,
+        "visible": false
       }
     ],
     "security": {
