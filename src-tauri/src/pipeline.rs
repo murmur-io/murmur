@@ -26,6 +26,24 @@ pub struct PipelineResult {
 /// installed release's `MeetNotes` — the same split as the DB dir.
 const AUDIO_SUBDIR: &str = "audio";
 
+/// Max allowed gap between the AEC ASR feed and the raw mic, in seconds. Beyond this the AEC feed
+/// is rejected (raw mic used for ASR) so the transcript timestamps stay aligned with the played
+/// archive. VPIO startup latency is sub-second; the bug this guards (a malformed multi-channel VPIO
+/// capture decoding to ~8 s for a 51 s recording → an 8 s timeline over 51 s of audio) is tens of
+/// seconds off.
+const AEC_FEED_MAX_DRIFT_S: f64 = 2.0;
+
+/// Whether the AEC ASR feed (16 kHz) covers the same span as the raw mic (16 kHz) within tolerance.
+/// `false` → the feed is malformed/short (e.g. a 9-channel VPIO device format, or cpal/VPIO
+/// coexistence starvation) and using it for ASR would desync the timeline from playback, so the
+/// caller MUST fall back to the raw mic. AEC is best-effort; timeline correctness beats echo
+/// cancellation.
+fn aec_feed_matches_raw(raw_16k_len: usize, aec_16k_len: usize) -> bool {
+    let raw_s = raw_16k_len as f64 / audio::TARGET_RATE_HZ as f64;
+    let aec_s = aec_16k_len as f64 / audio::TARGET_RATE_HZ as f64;
+    (raw_s - aec_s).abs() <= AEC_FEED_MAX_DRIFT_S
+}
+
 /// RAII guard that deletes a transient sidecar scratch WAV (AEC mic / system-audio) when it
 /// drops — on EVERY exit path of the pipeline, success OR error OR panic-unwind. These helper
 /// outputs are PLAINTEXT audio fragments in `$TMPDIR`; the old code removed them only on the
@@ -210,7 +228,21 @@ async fn run_inner(
         match audio::read_wav_mono(aec) {
             Ok((a, rate)) => {
                 let asr = audio::resample_to_16k(&a, rate)?;
-                mic_16k_archive = Some(std::mem::replace(&mut mic_16k, asr));
+                // GUARD: the AEC feed MUST span the same wall-clock as the raw mic, or the segment
+                // timestamps (derived from the AEC feed) desync from the played archive (the raw
+                // mic) — the bug where a 51 s recording rendered an 8 s timeline. VPIO yielded a
+                // malformed multi-channel/short capture; reject any divergent feed and keep the raw
+                // mic for ASR. The matching `mic_16k_archive = None` means archive == ASR feed.
+                if aec_feed_matches_raw(mic_16k.len(), asr.len()) {
+                    mic_16k_archive = Some(std::mem::replace(&mut mic_16k, asr));
+                } else {
+                    tracing::warn!(
+                        target: "audio",
+                        raw_s = mic_16k.len() as f64 / audio::TARGET_RATE_HZ as f64,
+                        aec_s = asr.len() as f64 / audio::TARGET_RATE_HZ as f64,
+                        "AEC feed duration diverges from raw mic; using raw mic for ASR to keep the timeline in sync with playback"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(target: "audio", error = %e, "AEC mic unreadable; raw mic for ASR")
@@ -900,6 +932,39 @@ mod tests {
     fn derive_title_prefers_frontmatter() {
         let md = "---\ntitle: Q3 Planning\ndate: 2026-06-24\n---\n# Heading\n";
         assert_eq!(derive_title(md, "2026-06-24"), "Q3 Planning");
+    }
+
+    const HZ: usize = crate::audio::TARGET_RATE_HZ as usize;
+
+    /// RED-before-GREEN: the shipped 51 s recording produced an 8 s AEC ASR feed (malformed 9-ch
+    /// VPIO capture) and the OLD code accepted it unconditionally → the timeline desynced from the
+    /// played raw-mic archive. The guard MUST reject a feed this far off.
+    #[test]
+    fn aec_feed_51s_recording_8s_feed_is_rejected() {
+        assert!(
+            !aec_feed_matches_raw(52 * HZ, 8 * HZ),
+            "an 8 s AEC feed for a 52 s recording must be rejected (would desync the timeline)"
+        );
+    }
+
+    #[test]
+    fn aec_feed_matching_raw_is_accepted() {
+        // Same length, and a sub-second VPIO startup gap, are both fine.
+        assert!(aec_feed_matches_raw(52 * HZ, 52 * HZ));
+        assert!(aec_feed_matches_raw(52 * HZ, 52 * HZ - HZ / 2)); // 0.5 s shorter
+    }
+
+    #[test]
+    fn aec_feed_just_past_tolerance_is_rejected() {
+        // > 2 s shorter → reject; exactly within 2 s → accept (boundary either side of the const).
+        assert!(aec_feed_matches_raw(60 * HZ, 60 * HZ - 2 * HZ)); // exactly 2 s → within tolerance
+        assert!(!aec_feed_matches_raw(60 * HZ, 60 * HZ - 3 * HZ)); // 3 s → rejected
+    }
+
+    /// A longer-than-raw feed (e.g. a multi-channel mis-decode inflating the buffer) is also rejected.
+    #[test]
+    fn aec_feed_longer_than_raw_is_rejected() {
+        assert!(!aec_feed_matches_raw(10 * HZ, 90 * HZ));
     }
 
     #[test]
