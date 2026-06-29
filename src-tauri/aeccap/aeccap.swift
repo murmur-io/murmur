@@ -33,6 +33,8 @@ final class AecCapturer {
     private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var file: AVAudioFile?
+    private var monoFormat: AVAudioFormat?
+    private var converter: AVAudioConverter?
 
     init(outURL: URL) { self.outURL = outURL }
 
@@ -43,24 +45,56 @@ final class AecCapturer {
         // to the raw cpal mic.
         try input.setVoiceProcessingEnabled(true)
 
-        let format = input.outputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            self?.write(buffer, format: format)
+        let tapFormat = input.outputFormat(forBus: 0)
+        // ALWAYS persist a single MONO channel. VPIO can hand us a MULTI-CHANNEL device format (a
+        // 9-channel aggregate input was seen in the field) — writing that verbatim ballooned the WAV
+        // ~9x (a stuck session once stranded a 91 GB scratch file) AND the downstream Rust ASR feed
+        // expects a compact mono track aligned with the raw mic. Downmix every buffer to mono so the
+        // output is small, well-formed, and duration-faithful regardless of the device channel count.
+        let mono = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: tapFormat.sampleRate,
+            channels: 1,
+            interleaved: false)
+        monoFormat = mono
+        if tapFormat.channelCount > 1, let mono = mono {
+            converter = AVAudioConverter(from: tapFormat, to: mono)
+        }
+
+        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
+            self?.write(buffer)
         }
         engine.prepare()
         try engine.start()
-        FileHandle.standardError.write(Data("aeccap: capturing\n".utf8))
+        FileHandle.standardError.write(
+            Data(
+                "aeccap: capturing (\(Int(tapFormat.sampleRate)) Hz, \(tapFormat.channelCount) ch in → 1 ch out)\n"
+                    .utf8))
     }
 
-    private func write(_ buffer: AVAudioPCMBuffer, format: AVAudioFormat) {
+    private func write(_ buffer: AVAudioPCMBuffer) {
         lock.lock()
         defer { lock.unlock() }
+        // Downmix to mono when the input has >1 channel (same sample rate → no SRC); else write as-is.
+        let outBuffer: AVAudioPCMBuffer
+        if let converter = converter, let mono = monoFormat,
+            let out = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: buffer.frameLength)
+        {
+            do {
+                try converter.convert(to: out, from: buffer)
+            } catch {
+                return  // skip this buffer rather than write a malformed frame
+            }
+            outBuffer = out
+        } else {
+            outBuffer = buffer
+        }
         if file == nil {
             file = try? AVAudioFile(
-                forWriting: outURL, settings: format.settings,
+                forWriting: outURL, settings: outBuffer.format.settings,
                 commonFormat: .pcmFormatFloat32, interleaved: false)
         }
-        try? file?.write(from: buffer)
+        try? file?.write(from: outBuffer)
     }
 
     func stop() {
