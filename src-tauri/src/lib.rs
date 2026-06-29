@@ -172,6 +172,10 @@ pub fn run() {
             };
             app.manage(state);
 
+            // Reclaim any capture scratch WAVs stranded by a previous crashed/stuck session
+            // (a stuck VPIO/AEC helper once left a 91 GB temp file). Nothing records yet at setup.
+            crate::audio::aec::sweep_stale_scratch();
+
             create_bar_window(app.handle())?;
             if let Err(e) = app.global_shortcut().register(SUMMON_SHORTCUT) {
                 tracing::warn!(target: "shortcut", error = %e, "could not register global shortcut");
