@@ -994,6 +994,91 @@ impl Db {
         Ok(hits)
     }
 
+    /// Meetings most semantically similar to `meeting_id`, GATED through `search_semantic_visible`
+    /// (which applies `visibility_clause`, so a sealed-not-session-unlocked neighbour is excluded).
+    ///
+    /// The query vector is RE-EMBEDDED from this meeting's own plaintext `note_chunks.text` (a plain
+    /// table SELECT — we deliberately do NOT read embeddings back out of the vec0 table) and reduced
+    /// to its L2-normalized mean (centroid). `embed_passage` matches the convention used to index the
+    /// chunks in `index_meeting_chunks`.
+    ///
+    /// Natural gating: chunks are PURGED on lock, so a sealed `meeting_id` has zero chunk texts ⇒
+    /// `Ok(vec![])` (nothing to embed, no leak). Self is filtered out (a meeting is always its own
+    /// nearest neighbour) and the list is truncated to `k`. NEVER panics; logs only id/count.
+    ///
+    /// The embedder is injected (not pulled from `active_embedder` here) so gating tests can pass a
+    /// deterministic `StubEmbedder`; the command layer passes `active_embedder().as_ref()`.
+    pub fn related_meetings_visible(
+        &self,
+        meeting_id: &str,
+        embedder: &dyn crate::embed::Embedder,
+        k: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<SearchHit>> {
+        if k <= 0 {
+            return Ok(Vec::new());
+        }
+        // Read THIS meeting's own chunk plaintext. Purged-on-lock ⇒ a sealed meeting yields zero
+        // rows ⇒ empty result (no leak, no need for an explicit unlock check on the source).
+        let texts: Vec<String> = {
+            let conn = self.lock();
+            let mut stmt = conn
+                .prepare("SELECT text FROM note_chunks WHERE meeting_id = ?1 ORDER BY chunk_idx")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![meeting_id], |row| row.get::<_, String>(0))
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Query vector = L2-normalized centroid of the per-chunk passage embeddings.
+        let vectors = embedder.embed_passage(&texts)?;
+        let dim = embedder.dim();
+        let mut centroid = vec![0f32; dim];
+        let mut counted = 0usize;
+        for v in &vectors {
+            if v.len() != dim {
+                continue; // defensive: skip a malformed vector rather than panic.
+            }
+            for (acc, x) in centroid.iter_mut().zip(v.iter()) {
+                *acc += *x;
+            }
+            counted += 1;
+        }
+        if counted == 0 {
+            return Ok(Vec::new());
+        }
+        for x in centroid.iter_mut() {
+            *x /= counted as f32;
+        }
+        let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return Ok(Vec::new()); // degenerate (all-zero) centroid — no meaningful direction.
+        }
+        for x in centroid.iter_mut() {
+            *x /= norm;
+        }
+
+        // GATED KNN. Ask for k+1 because self is always the nearest hit; then drop self + truncate.
+        let mut hits = self.search_semantic_visible(&centroid, k + 1, unlocked)?;
+        hits.retain(|h| h.meeting.id != meeting_id);
+        hits.truncate(k as usize);
+        tracing::debug!(
+            target: "embed",
+            meeting_id,
+            returned = hits.len(),
+            "related_meetings_visible"
+        );
+        Ok(hits)
+    }
+
     /// Hybrid retrieval (GraphRAG-lite, Phase 2d): fuse THREE already-visibility-gated ranked lists
     /// by Reciprocal Rank Fusion — the FTS5/BM25 `search_visible` ranking, the vector
     /// `search_semantic_visible` ranking, AND the entity-graph neighbourhood
@@ -4199,6 +4284,109 @@ mod tests {
             shown.iter().any(|h| h.meeting.id == "sealed"),
             "session-unlocked meeting must reappear in semantic results"
         );
+    }
+
+    /// RELATED-BY-MEANING GATE: `related_meetings_visible` re-embeds the SOURCE meeting's own chunk
+    /// text into a centroid, runs the gated KNN, and must NEVER surface a sealed-not-session-unlocked
+    /// neighbour — even when that neighbour's chunk row deliberately survives (so exclusion can ONLY
+    /// come from the visibility gate, not from purge). Session-unlocking its folder admits it again.
+    /// RED if the gate inside `search_semantic_visible` were removed.
+    #[test]
+    fn related_meetings_visible_is_gated_by_visibility() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+
+        // Source (open) + an open target with the SAME note text (near in stub space) + a sealed
+        // meeting with the SAME text (would be near). All indexed via the stub so vectors are real.
+        let body = "shared budget planning topic for the quarter";
+        for id in ["source", "target", "sealed"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z"))
+                .unwrap();
+            note_for(&db, id, "claude_code", body);
+        }
+        db.set_note_folder("source", Some("f-open")).unwrap();
+        db.set_note_folder("target", Some("f-open")).unwrap();
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+        for id in ["source", "target", "sealed"] {
+            db.index_meeting_chunks(id, &crate::embed::StubEmbedder).unwrap();
+        }
+        // Lock the sealed folder WITHOUT purging — its chunk row survives, so any exclusion must be
+        // the gate doing its job.
+        db.set_folder_locked("f-locked", true, None).unwrap();
+        assert!(chunk_count(&db, "sealed") > 0, "sealed chunk must survive for a true gate test");
+
+        let stub = crate::embed::StubEmbedder;
+
+        // Empty unlock set → the sealed neighbour is ABSENT (no hit, no snippet); the open target IS.
+        let nothing = std::collections::HashSet::new();
+        let hidden = db
+            .related_meetings_visible("source", &stub, 5, &nothing)
+            .unwrap();
+        assert!(
+            hidden.iter().any(|h| h.meeting.id == "target"),
+            "open semantically-near target must be returned"
+        );
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed-not-unlocked neighbour leaked through related_meetings_visible"
+        );
+
+        // Session-unlock the sealed folder → it now appears.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db
+            .related_meetings_visible("source", &stub, 5, &unlocked)
+            .unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "sealed"),
+            "session-unlocked neighbour must reappear in related results"
+        );
+    }
+
+    /// SELF-EXCLUSION: the source meeting is never present in its own related results, even though it
+    /// is (trivially) its own nearest neighbour in the KNN.
+    #[test]
+    fn related_meetings_visible_excludes_self() {
+        let db = mem_db();
+        let body = "atlas roadmap and hiring plan";
+        for id in ["self", "other"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z"))
+                .unwrap();
+            note_for(&db, id, "claude_code", body);
+            db.index_meeting_chunks(id, &crate::embed::StubEmbedder).unwrap();
+        }
+        let stub = crate::embed::StubEmbedder;
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .related_meetings_visible("self", &stub, 5, &nothing)
+            .unwrap();
+        assert!(
+            !hits.iter().any(|h| h.meeting.id == "self"),
+            "a meeting must never be in its own related results"
+        );
+        assert!(
+            hits.iter().any(|h| h.meeting.id == "other"),
+            "the other meeting (same text) should still be returned"
+        );
+    }
+
+    /// EMPTY: a meeting with no `note_chunks` (never indexed, or chunks purged on lock) yields an
+    /// empty result — never an error, never a panic.
+    #[test]
+    fn related_meetings_visible_empty_without_chunks() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("bare", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "bare", "claude_code", "has a note but was never indexed");
+        // No index_meeting_chunks call → zero chunk rows.
+        assert_eq!(chunk_count(&db, "bare"), 0);
+        let stub = crate::embed::StubEmbedder;
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .related_meetings_visible("bare", &stub, 5, &nothing)
+            .unwrap();
+        assert!(hits.is_empty(), "no chunks ⇒ empty related result");
     }
 
     /// PURGE-ON-LOCK: index a meeting's chunks while visible, then re-blank its folder (the relock

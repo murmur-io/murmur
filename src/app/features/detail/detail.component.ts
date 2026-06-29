@@ -36,6 +36,7 @@ import { MeetingActionsComponent } from "./meeting-actions.component";
 import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingRecipesComponent } from "./meeting-recipes.component";
 import { MeetingTimelineComponent } from "./meeting-timeline.component";
+import { RelatedMeetingsComponent } from "./related-meetings.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
@@ -106,6 +107,7 @@ interface ParsedNote {
     MoveToMenuComponent,
     MarkdownComponent,
     AssistantSourcesComponent,
+    RelatedMeetingsComponent,
   ],
   template: `
     <section class="detail">
@@ -901,6 +903,12 @@ interface ParsedNote {
               </div>
             }
           </section>
+
+          <!-- 4) RELATED BY MEANING (semantic neighbors; silent when empty) -- -->
+          <app-related-meetings
+            [meetingId]="d.meeting.id"
+            (open)="openRelated($event)"
+          />
         }
       } @else if (loading()) {
         <div class="card state-card">
@@ -2012,6 +2020,48 @@ export class DetailComponent implements OnInit {
       this.loading.set(false);
       return;
     }
+    await this.loadMeeting(id);
+  }
+
+  /**
+   * Navigate to a semantically-related meeting and reload the view in place.
+   * The `/meeting/:id` route reuses THIS component (the default
+   * RouteReuseStrategy keeps it when only the param changes), so a same-route
+   * navigation does NOT re-run `ngOnInit` — we reload explicitly. The related
+   * section then re-fetches via its `meetingId` input.
+   */
+  async openRelated(id: string): Promise<void> {
+    if (!id || this.detail()?.meeting.id === id) {
+      return;
+    }
+    await this.router.navigate(["/meeting", id]);
+    await this.loadMeeting(id);
+  }
+
+  /**
+   * Load (or reload) a meeting by id into the view. Resets the per-meeting
+   * signals that aren't derived from `detail()` so an in-place reload never
+   * shows the previous meeting's timeline/tags/graph or a stale open editor.
+   * (Derived state — note/audio/interactions/folderBadge — recomputes off
+   * `detail()` automatically.)
+   */
+  private async loadMeeting(id: string): Promise<void> {
+    this.loading.set(true);
+    // Clear non-derived per-meeting state for a clean same-route reload.
+    this.timeline.set(null);
+    this.timelineError.set(false);
+    this.tags.set([]);
+    this.graph.set(null);
+    this.graphError.set("");
+    this.editing.set(false);
+    this.renaming.set(false);
+    this.moveOpen.set(false);
+    this.confirmingDelete.set(false);
+    // Reset audio-playback signals so an in-place meeting→meeting nav never shows the
+    // previous meeting's position/play-state until a media event self-corrects.
+    this.playing.set(false);
+    this.currentTime.set(0);
+    this.duration.set(0);
     try {
       this.detail.set(await this.ipc.getMeetingDetail(id));
     } finally {
