@@ -1265,16 +1265,30 @@ pub async fn build_and_persist_entities(
     let payload =
         crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
 
-    // Sink A — ALWAYS persist to the encrypted DB (the graph's source of truth).
+    // Sink A — ALWAYS persist to the encrypted DB (the graph's source of truth). Collect the
+    // resolved (entity_id, name) pairs so the bitemporal-facts pass below can extract + reconcile
+    // facts ABOUT these very entities.
+    let mut entity_refs: Vec<(String, String)> = Vec::new();
     for p in &payload.people {
         let id = state.db.upsert_entity(p, crate::storage::models::EntityKind::Person)?;
         state.db.add_mention(&id, meeting_id)?;
+        entity_refs.push((id, p.clone()));
     }
     for pr in &payload.projects {
         let id = state
             .db
             .upsert_entity(pr, crate::storage::models::EntityKind::Project)?;
         state.db.add_mention(&id, meeting_id)?;
+        entity_refs.push((id, pr.clone()));
+    }
+
+    // brain2 R2 — BITEMPORAL FACTS. BEST-EFFORT + NEVER fails the note: extract entity·predicate·
+    // object candidates (on-device reasoner; empty with the stub / no model), load the existing facts
+    // for these entities, run the PURE DETERMINISTIC reconcile, stamp the source meeting, and apply
+    // the ops in ONE tx. `valid_from = recorded_at = the meeting's time` (started_at) — the deterministic
+    // `at`. A reconcile/extract hiccup is logged (non-PII) and swallowed.
+    if let Err(e) = persist_facts_for_meeting(state, meeting_id, title, markdown, &entity_refs) {
+        tracing::warn!(target: "facts", error = %e, "fact reconcile failed (note unaffected)");
     }
 
     // Sink B — vault [[ ]] stubs, ONLY when a vault is configured AND the meeting's folder is
@@ -1304,6 +1318,48 @@ pub async fn build_and_persist_entities(
     }
 
     Ok(payload)
+}
+
+/// brain2 R2 — extract → reconcile → apply bitemporal FACTS for one summarized meeting. Pulled out
+/// of [`build_and_persist_entities`] so it can fail in isolation (its caller logs + swallows): a
+/// facts hiccup must NEVER block the note pipeline. Steps:
+///   1. BEST-EFFORT extract candidates from the note about `entity_refs` (empty with the stub/no
+///      model — the deterministic core is what carries the value),
+///   2. load the EXISTING facts for those entities (un-gated lifecycle read),
+///   3. run the PURE deterministic [`crate::facts::reconcile_facts`] at the meeting's time,
+///   4. stamp the source meeting onto the Add ops and apply them in ONE atomic tx.
+///
+/// `at` is the meeting's `started_at` (the fact's valid-time origin), falling back to now.
+fn persist_facts_for_meeting(
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    markdown: &str,
+    entity_refs: &[(String, String)],
+) -> Result<(), AppError> {
+    if entity_refs.is_empty() {
+        return Ok(());
+    }
+    // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure).
+    let candidates =
+        crate::facts::extract_fact_candidates(&*state.reasoner, title, markdown, entity_refs);
+    if candidates.is_empty() {
+        return Ok(()); // nothing to reconcile — common in the default (no-model) build.
+    }
+    // 2) Existing facts for exactly these entities.
+    let entity_ids: Vec<String> = entity_refs.iter().map(|(id, _)| id.clone()).collect();
+    let existing = state.db.facts_for_entities(&entity_ids)?;
+    // 3) Deterministic reconcile at the meeting's time (valid-time origin).
+    let at = state
+        .db
+        .get_meeting(meeting_id)?
+        .map(|m| m.started_at)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let mut ops = crate::facts::reconcile_facts(&existing, &candidates, &at);
+    // 4) Stamp the source meeting (gating + purge anchor) and apply atomically.
+    crate::facts::set_meeting_id(&mut ops, meeting_id);
+    state.db.apply_fact_ops(&ops)?;
+    Ok(())
 }
 
 /// Resolve the people + projects in a meeting note → persist them to the encrypted DB graph
