@@ -2500,6 +2500,41 @@ pub async fn reindex_embeddings(
     )
 }
 
+/// "Powiązane wg znaczenia": the up-to-5 meetings most semantically similar to `meeting_id`.
+///
+/// GATING: routes through `Db::related_meetings_visible`, which re-embeds the meeting's OWN plaintext
+/// chunks into a centroid and runs the gated `search_semantic_visible` (visibility_clause) — a
+/// sealed-not-session-unlocked neighbour is never returned. When `semantic_search_enabled` is OFF
+/// (the default) we short-circuit to an empty list so the FE simply hides the section. No raw
+/// embedding ever crosses IPC (the centroid is computed and consumed in Rust; the DTO is `SearchHit`).
+#[tauri::command]
+pub async fn related_meetings(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<SearchHit>, AppError> {
+    let enabled = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .semantic_search_enabled
+    };
+    if !enabled {
+        return Ok(Vec::new()); // feature OFF → empty → FE hides the section.
+    }
+    // Defense-in-depth: purge-on-lock already empties a sealed source's chunks (→ []) and the
+    // neighbour list is itself visibility-gated, but refuse a sealed-not-session-unlocked SOURCE
+    // explicitly so the safety is stated, not merely emergent.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Ok(Vec::new());
+    }
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let emb = crate::embed::active_embedder();
+    state
+        .db
+        .related_meetings_visible(&meeting_id, emb.as_ref(), 5, &unlocked)
+}
+
 /// Pure, AppHandle-free core of [`reindex_embeddings`] so the model-missing guard + the
 /// visibility-gated loop are unit-testable headless. Takes the `Db`, the live `unlocked` session set,
 /// whether the REAL e5 model is present (`model_present`), the active embedder, and a progress sink.
