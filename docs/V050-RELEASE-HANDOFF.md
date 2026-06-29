@@ -1,16 +1,16 @@
-<!-- The 0.7.0 release handoff. Supersedes V060-RELEASE-HANDOFF.md. Read this to ship. Pairs with .claude/skills/release-murmur. -->
-# v0.7.0 — release handoff (brain + voice + connectors + semantic)
+<!-- The 0.5.0 release handoff. Supersedes V060-RELEASE-HANDOFF.md. Read this to ship. Pairs with .claude/skills/release-murmur. -->
+# 0.5.0 — release handoff (brain + voice + connectors + semantic)
 
-**Status:** trunk `murmur` @ **0.7.0** (PR #74), all headless gates green — `cargo test --lib` **431/0** ·
-`cargo clippy --all-targets -D warnings` clean · `ng lint` + `ng build` clean · `cargo build --lib` clean at 0.7.0.
+**Status:** trunk `murmur` @ **0.5.0** (PR #74), all headless gates green — `cargo test --lib` **431/0** ·
+`cargo clippy --all-targets -D warnings` clean · `ng lint` + `ng build` clean · `cargo build --lib` clean at 0.5.0.
 Every change shipped via build → adversarial-verify → (lock-security-review where lock/egress was touched) → PR-merge.
 **The only things left are your build-feature choice + the signed release** (sign/notarize/publish need your Mac + auth).
 
 ---
 
-## What shipped in 0.7.0 (PRs #54–#74, on top of 0.6.0)
+## What shipped in 0.5.0 (PRs #54–#74, on top of 0.6.0)
 
-| Area | 0.7.0 |
+| Area | 0.5.0 |
 |---|---|
 | **Brain** | real orchestration (brain decides context via gated tools) + **model + effort picker** (Settings → Brain/AI: Default/Opus 4.8/Sonnet 4.6/Haiku 4.5; effort low/med/high — Anthropic-only, honestly gated) |
 | **In-meeting voice assistant** | wake "Klaudku" (recall-first shape-gate, **fires anywhere in the live window + dedup**) **+ the ✨ click-to-stop button** (you control when you're done — no fixed-timeout cutoff) **+ a PROCESSING state** + an **animated AI orb** (idle → listening/audio-reactive → processing/conic+shimmer → answer; pure CSS/SVG, reduced-motion-aware) |
@@ -42,7 +42,7 @@ MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --b
 ## Release steps (your Mac — sign/notarize/publish need your auth)
 
 ```bash
-# clean tree on murmur @ 0.7.0:
+# clean tree on murmur @ 0.5.0:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 pkill -x Murmur ; pkill -f 'tauri dev' || true            # free the cargo target lock
 # build (full product = the default build; no --features):
@@ -52,7 +52,7 @@ bash scripts/macos-sign-notarize.sh        # signs each nested helper FIRST, the
 # notarize + staple + verify + publish (notarytool keychain profile "murmur"):
 xcrun notarytool submit <dmg> --keychain-profile murmur --wait
 xcrun stapler staple <dmg> ; spctl -a -vvv -t open --context context:primary-signature <dmg>   # expect "Notarized Developer ID"
-gh release create v0.7.0 -R JakubGawr/murmur <dmg>
+gh release create 0.5.0 -R JakubGawr/murmur <dmg>
 ```
 **Hard rules (do not repeat the 2026-06-27 mess):** notarization is MANDATORY; sign INSIDE-OUT, never `--deep` (it skips the `Contents/Resources/` helpers → notarization `Invalid`); get the identity by HASH (the cert CN has "Gawroński"); run any `security`/keychain/`notarytool store-credentials` op YOURSELF interactively (the agent shell hangs them); merge via PR only.
 
@@ -65,9 +65,9 @@ gh release create v0.7.0 -R JakubGawr/murmur <dmg>
 6. **Bielik local brain** in a RELEASE build (debug was ~min/token) + the model/effort picker against the live API/CLI (confirm the exact model-id strings are accepted).
 7. **Touch ID / lock-at-rest / screen-share auto-relock** — signed-build-only.
 
-## Deferred (clean follow-ups, not in 0.7.0)
+## Deferred (clean follow-ups, not in 0.5.0)
 - Slack/Jira/Google connectors (OAuth) — the framework + the Local/External seam are ready.
 - The LoRA fine-tune of the local brain on the now-lock-safe flywheel (premature until clean correction pairs accrue).
 - Trim the `record.component.ts` (+292 B) / `detail.component.ts` (+1.51 kB) per-component style WARNs (both under the 16 kB ERROR budget; cosmetic).
 
-The product is on `murmur` @ 0.7.0, green and reviewed. Pick a build option and ship. 🚀
+The product is on `murmur` @ 0.5.0, green and reviewed. Pick a build option and ship. 🚀
