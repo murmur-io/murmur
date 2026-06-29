@@ -213,6 +213,56 @@ dropdowns, the lock gate's chrome) must use `var(--surface-overlay)` +
 `backdrop-filter: none` or the underlying list bleeds through. Rationale comment
 lives at `move-to-menu.component.ts:140-148`.
 
+### T4 — prod WKWebView drops ALL component styles: Tauri's `style-src` nonce kills `'unsafe-inline'`
+**Symptom (shipped in 0.5.0, see screenshot in PR history):** the packaged/notarized
+`.dmg` renders with the GLOBAL stylesheet working (nav/header/`.btn`/`.card` — anything
+in `styles.css`, loaded via `<link>`) but EVERY component's encapsulated styles missing —
+folder chips bare, meeting rows run title+date together, lists show raw `•` bullets.
+**`ng serve` (dev) is always fine**, so a green `ng build` proves nothing here.
+
+**Root cause (proven 3 ways — empirical WebKit repro + Tauri source + CSP3 spec):**
+Angular emulated encapsulation injects each component's styles at RUNTIME as
+`document.createElement("style")` `<style>` nodes (there are NO per-component `.css` files —
+the prod `dist` has exactly ONE css file, the global `styles.css`). At build time Tauri
+(`tauri-utils/html.rs` `inject_nonce_token` → `inject_nonce(document, "style", STYLE_NONCE_TOKEN)`,
+then `tauri/src/manager/mod.rs` `replace_csp_nonce` for `"style-src"`) stamps a nonce on every
+inline `<style>` in `index.html` and appends `'nonce-<perload>'` to the served `style-src`.
+**Per CSP3 §6.7.3.2, once `style-src` contains a nonce/hash source, `'unsafe-inline'` is
+IGNORED** — so Angular's runtime `<style>` nodes (which carry NO nonce, because `<app-root>`
+has no `ngCspNonce`) are refused. The `<link>` global sheet survives (it's `'self'`, not inline).
+Console shows: *"Refused to apply a stylesheet because its hash, its nonce, or 'unsafe-inline'
+does not appear in the style-src directive."* This is independent of `inlineCritical` and of
+the window/`visible:false` reveal.
+
+**THE FIX (one line, maintainer-recommended, applied 2026-06-29):** in
+`src-tauri/tauri.conf.json` `app.security`, tell Tauri NOT to touch `style-src`:
+```json
+"security": {
+  "csp": "… style-src 'self' 'unsafe-inline'; …",
+  "dangerousDisableAssetCspModification": ["style-src"]
+}
+```
+Tauri then leaves the declared `'unsafe-inline'` effective → component `<style>` apply.
+`script-src` stays strict (hashes + nonce — the real XSS surface is untouched). Do NOT instead
+move every component's CSS into the global `styles.css` (doesn't scale, abandons encapsulation —
+that was only ever a shell-only stopgap).
+
+**Disproven theories — do NOT chase these again** (they cost 3 failed fixes before the real one):
+it is NOT "WKWebView doesn't apply runtime-injected `<style>` until the viewport is invalidated"
+(a window RESIZE does not fix it — decisive: a blocked style stays blocked through any reflow),
+NOT an `inlineCritical`/`<link media=print onload>` issue (that's a *separate*, real `script-src`
+bug fixed by `inlineCritical:false`, but it only affects the GLOBAL sheet, never component styles),
+and NOT a hide-until-ready/`window.show()` timing bug. 0.4.0 "worked" only because its different
+build masked the always-present CSP conflict.
+
+**How to diagnose this class fast (no full Tauri build):** (1) the RESIZE test — resize the broken
+window; if styles do NOT snap in, it's CSP-blocked, not a paint/timing bug. (2) Reproduce on the
+real engine: serve `dist/meetnotes/browser` and load it in Playwright **WebKit** with the
+`style-src` nonce added to a `Content-Security-Policy` header; check per-`<style>` `el.sheet === null`
+(blocked) and read the console for the CSP refusal. A green `ng build` / a Chromium check will NOT
+reproduce it — only WebKit + the real CSP does. Verify the actual fix in the REAL packaged WKWebView
+build (notarized `.dmg`), never just `ng serve`.
+
 ---
 
 ## Quality gate (a change is not done until these are green)
