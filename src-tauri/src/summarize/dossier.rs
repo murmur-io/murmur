@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 
 use crate::error::Result;
+use crate::facts::Fact;
 use crate::storage::models::{Commitment, EntityNeighbor, GraphEntity, VaultSource};
 use crate::storage::Db;
 use crate::summarize::template::language_directive;
@@ -52,6 +53,10 @@ pub struct DossierData {
     pub commitments: Vec<Commitment>,
     /// Top co-occurring neighbour entities (shared visible meetings).
     pub neighbors: Vec<EntityNeighbor>,
+    /// brain2 R2 — the entity's VISIBLE bitemporal facts (open + recently-closed), newest first.
+    /// Open facts (`valid_to == None`) are the CURRENT state; closed facts are WHAT CHANGED. Gated
+    /// by `list_facts_visible` — a sealed-not-unlocked meeting's facts are absent.
+    pub facts: Vec<Fact>,
     /// Citation-tagged note corpus, each meeting headed `### [[Title]] · date · id:`.
     pub corpus: String,
 }
@@ -119,6 +124,9 @@ pub fn build_dossier_data(
 
     let meetings = db.entity_mentions_visible(entity_id, unlocked)?;
     let neighbors = db.entity_neighbors_visible(entity_id, unlocked, DOSSIER_NEIGHBOR_LIMIT)?;
+    // brain2 R2 — the entity's VISIBLE bitemporal facts. Same `unlocked` gate as every other read
+    // here: a sealed-not-unlocked meeting's facts (its source meeting) never surface.
+    let facts = db.list_facts_visible(entity_id, unlocked)?;
 
     // The visible meetings that mention this entity, as an id set for the commitment filter.
     let mention_ids: HashSet<&str> = meetings.iter().map(|m| m.meeting_id.as_str()).collect();
@@ -168,6 +176,7 @@ pub fn build_dossier_data(
         meetings,
         commitments,
         neighbors,
+        facts,
         corpus,
     }))
 }
@@ -196,6 +205,43 @@ owners, or dates. Do not emit YAML front-matter.\n\n{lang}",
 fn render_structured(data: &DossierData) -> String {
     let kind = format!("{:?}", data.entity.kind).to_lowercase();
     let mut s = format!("ENTITY: {} ({kind})\n", data.entity.name);
+
+    // brain2 R2 — CURRENT FACTS (open: valid_to == None) and WHAT CHANGED (closed: superseded).
+    let current: Vec<&Fact> = data.facts.iter().filter(|f| f.valid_to.is_none()).collect();
+    let changed: Vec<&Fact> = data.facts.iter().filter(|f| f.valid_to.is_some()).collect();
+    s.push_str("\nCURRENT FACTS (as of the latest meeting):\n");
+    if current.is_empty() {
+        s.push_str("(none)\n");
+    } else {
+        for f in &current {
+            let date = f.valid_from.split(['T', ' ']).next().unwrap_or("");
+            s.push_str(&format!(
+                "- {} {}: {} (since {date})\n",
+                f.subject.trim(),
+                f.predicate.trim(),
+                f.object.trim()
+            ));
+        }
+    }
+    s.push_str("\nWHAT CHANGED (superseded facts — history):\n");
+    if changed.is_empty() {
+        s.push_str("(none)\n");
+    } else {
+        for f in &changed {
+            let from = f.valid_from.split(['T', ' ']).next().unwrap_or("");
+            let to = f
+                .valid_to
+                .as_deref()
+                .and_then(|t| t.split(['T', ' ']).next())
+                .unwrap_or("");
+            s.push_str(&format!(
+                "- {} {}: was \"{}\" ({from} → {to})\n",
+                f.subject.trim(),
+                f.predicate.trim(),
+                f.object.trim()
+            ));
+        }
+    }
 
     s.push_str("\nTIMELINE OF MENTIONS (newest first):\n");
     if data.meetings.is_empty() {
@@ -427,6 +473,59 @@ mod tests {
         assert!(data2.commitments.iter().any(|c| c.text.contains("sign")));
     }
 
+    /// brain2 R2 — the dossier surfaces the entity's CURRENT FACTS (open) + WHAT CHANGED (closed),
+    /// and they are GATED: a fact whose source meeting is sealed-not-unlocked is absent, reappearing
+    /// on session-unlock. Both the structured payload (cloud + MCP) carries the rendered sections.
+    #[test]
+    fn dossier_surfaces_and_gates_bitemporal_facts() {
+        use crate::facts::{FactOp, NewFact};
+        let db = temp_db();
+        seed_folder(&db, "f-lock");
+        seed_meeting(&db, "open1", "Kickoff", "Atlas status", None);
+        seed_meeting(&db, "sealedX", "Secret Review", "Atlas secret", Some("f-lock"));
+        let atlas = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&atlas, "open1").unwrap();
+        db.add_mention(&atlas, "sealedX").unwrap();
+
+        let mk = |object: &str, from: &str, mid: &str| {
+            FactOp::Add(NewFact {
+                entity_id: atlas.clone(),
+                subject: "Atlas".into(),
+                predicate: "status".into(),
+                object: object.into(),
+                valid_from: from.into(),
+                recorded_at: from.into(),
+                confidence: 1.0,
+                meeting_id: Some(mid.into()),
+            })
+        };
+        // An open fact from the OPEN meeting + a (sealed-meeting) fact that must be gated out.
+        db.apply_fact_ops(&[mk("shipped", "2026-06-20T00:00:00Z", "open1")]).unwrap();
+        db.apply_fact_ops(&[mk("price-secret", "2026-06-21T00:00:00Z", "sealedX")]).unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let nothing = HashSet::new();
+        let data = build_dossier_data(&db, &atlas, &nothing).unwrap().unwrap();
+        // Open meeting's fact present; sealed meeting's fact absent (gate).
+        assert!(data.facts.iter().any(|f| f.object == "shipped"));
+        assert!(
+            data.facts.iter().all(|f| f.object != "price-secret"),
+            "sealed-meeting fact leaked into the dossier (gate violation)"
+        );
+        let rendered = render_structured(&data);
+        assert!(rendered.contains("CURRENT FACTS"));
+        assert!(rendered.contains("shipped"));
+        assert!(!rendered.contains("price-secret"));
+
+        // Session-unlock → the sealed fact reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let data2 = build_dossier_data(&db, &atlas, &unlocked).unwrap().unwrap();
+        assert!(data2.facts.iter().any(|f| f.object == "price-secret"));
+    }
+
     /// The prompt builder emits the four cited sections + respects the provider budget cap (mirrors
     /// the digest.rs prompt test).
     #[test]
@@ -451,6 +550,7 @@ mod tests {
             }],
             commitments: vec![],
             neighbors: vec![],
+            facts: vec![],
             corpus: "X".repeat(500_000),
         };
         // ollama → tight 4k budget caps the user message hard; the [[Title]] cite still renders.

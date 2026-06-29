@@ -288,7 +288,31 @@ impl Db {
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );
              CREATE INDEX IF NOT EXISTS idx_assistant_interactions_meeting
-               ON assistant_interactions(meeting_id);",
+               ON assistant_interactions(meeting_id);
+             -- brain2 R2: the BITEMPORAL FACTS layer. One row per entity·predicate·object
+             -- assertion with TWO time axes: valid_from/valid_to (valid time — when the fact was
+             -- true; valid_to NULL = currently valid, set when superseded) and recorded_at
+             -- (transaction time — when we learned it). Superseded facts are CLOSED (valid_to set),
+             -- never deleted, so history is preserved. `meeting_id` is the gating + purge anchor:
+             -- facts are DERIVED content (like note_chunks / correction_log / assistant_interactions)
+             -- → PURGED on seal in the same atomic tx and visibility-gated on every read. FK CASCADE
+             -- on both entity_id and meeting_id so a deleted entity/meeting drops its facts.
+             CREATE TABLE IF NOT EXISTS facts (
+               id TEXT PRIMARY KEY,
+               entity_id TEXT NOT NULL,
+               subject TEXT NOT NULL,
+               predicate TEXT NOT NULL,
+               object TEXT NOT NULL,
+               valid_from TEXT NOT NULL,
+               valid_to TEXT,
+               recorded_at TEXT NOT NULL,
+               meeting_id TEXT,
+               confidence REAL NOT NULL DEFAULT 1.0,
+               FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity_id);
+             CREATE INDEX IF NOT EXISTS idx_facts_meeting ON facts(meeting_id);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -886,7 +910,29 @@ impl Db {
         // Voice-assistant Q&A log is plaintext-derived convenience data mirroring sealed content —
         // drop it in the SAME seal tx (purge-on-seal, like corrections). Dropped by design.
         Self::purge_assistant_interactions_tx(&tx, meeting_ids)?;
+        // brain2 R2: bitemporal facts are DERIVED content tied to the meeting (plaintext at rest);
+        // drop them in the SAME seal tx so a sealed meeting contributes no fact — same purge-on-seal
+        // contract as corrections / chunks / assistant interactions.
+        Self::purge_facts_tx(&tx, meeting_ids)?;
         tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// brain2 R2 LOCK-SAFETY: delete every `facts` row for `meeting_ids` within an EXISTING
+    /// transaction, so the purge lands in the SAME atomic unit as the plaintext blanking on a seal
+    /// (and on `delete_meeting` / the startup reconcile). Facts are plaintext-derived (entity ·
+    /// predicate · object) content that mirrors a meeting; a sealed meeting must surface NOTHING, so
+    /// — exactly like `correction_log` / `note_chunks` / `assistant_interactions` — we DELETE rather
+    /// than key-seal. Dropped by design + not recoverable (never keyed); the underlying transcript is
+    /// still sealed + restorable, and a later re-summarize re-derives facts.
+    fn purge_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM facts WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -2009,6 +2055,15 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
+        // brain2 R2 LOCK-SAFETY: purge the bitemporal facts for every meeting in a locked folder, in
+        // this same reconciliation transaction — so a crash-while-unlocked (which may have re-derived
+        // facts against a since-sealed meeting) cannot leave plaintext facts at rest after a restart.
+        // Same purge-on-seal contract as the correction-log / assistant-interactions above.
+        tx.execute(
+            &format!("DELETE FROM facts WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
         // Collect the at-rest audio columns of locked meetings for the caller's filesystem re-seal
         // pass — the playback WAV AND both hi-res masters (B1). A meeting is surfaced if ANY of the
         // three columns is set; each path is reconciled independently by the caller.
@@ -3105,6 +3160,129 @@ impl Db {
             neighbors,
         }))
     }
+
+    // ── bitemporal FACTS layer (brain2 R2) ────────────────────────────────────
+    //
+    // Facts are DERIVED content tied to a meeting (the `meeting_id` anchor). The reconcile engine
+    // (`crate::facts`) is pure + deterministic; these methods are the persistence + the GATED read.
+    // LOCK MODEL: `facts_for_entities` is an INTERNAL un-gated read used ONLY by the pipeline to
+    // reconcile (never exposed to the FE — like `raw_segments`); every USER-FACING read goes through
+    // `list_facts_visible`, and a sealed meeting's facts are PURGED on seal (`purge_facts_tx`).
+
+    /// ALL facts (open + closed) for `entity_ids` — the reconcile input. INTERNAL: this is the
+    /// un-gated lifecycle read (the pipeline reconciles before any seal can hide rows), NOT a
+    /// user-facing surface. Empty input → empty vec.
+    pub fn facts_for_entities(&self, entity_ids: &[String]) -> Result<Vec<crate::facts::Fact>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let placeholders = (1..=entity_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, entity_id, subject, predicate, object, valid_from, valid_to, recorded_at, \
+                    meeting_id, confidence \
+               FROM facts WHERE entity_id IN ({placeholders}) ORDER BY recorded_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let params = rusqlite::params_from_iter(entity_ids.iter());
+        let rows = stmt.query_map(params, row_to_fact).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Apply a batch of reconcile [`FactOp`]s in ONE atomic transaction: INSERT each `Add`, set
+    /// `valid_to` on each `Invalidate` (only if still open — idempotent), skip `NoOp`. A fresh UUID
+    /// is minted per Add. The whole batch commits or rolls back together, so a crash mid-apply never
+    /// leaves a half-reconciled (e.g. old closed but new not added) store.
+    pub fn apply_fact_ops(&self, ops: &[crate::facts::FactOp]) -> Result<()> {
+        use crate::facts::FactOp;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        for op in ops {
+            match op {
+                FactOp::Add(nf) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    tx.execute(
+                        "INSERT INTO facts \
+                           (id, entity_id, subject, predicate, object, valid_from, valid_to, \
+                            recorded_at, meeting_id, confidence) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                        rusqlite::params![
+                            id,
+                            nf.entity_id,
+                            nf.subject,
+                            nf.predicate,
+                            nf.object,
+                            nf.valid_from,
+                            nf.recorded_at,
+                            nf.meeting_id,
+                            nf.confidence,
+                        ],
+                    )
+                    .map_err(map_err)?;
+                }
+                FactOp::Invalidate { id, valid_to } => {
+                    tx.execute(
+                        "UPDATE facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
+                        rusqlite::params![id, valid_to],
+                    )
+                    .map_err(map_err)?;
+                }
+                FactOp::NoOp => {}
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED read: the VISIBLE facts for `entity_id` (open + recently-closed), newest valid_from
+    /// first. A fact is visible iff its source meeting is visible under the SAME predicate as every
+    /// other graph/MCP read (`EXISTS(visible note) OR NOT EXISTS(any note)`), so a
+    /// sealed-and-not-session-unlocked meeting's facts surface NOTHING. A fact with a NULL
+    /// `meeting_id` (legacy/unattributed) is NOT visible — the INNER JOIN to `meetings` drops it
+    /// (fail-closed). This is the single user-facing fact read (UI dossier + egress-free MCP).
+    pub fn list_facts_visible(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::facts::Fact>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT ft.id, ft.entity_id, ft.subject, ft.predicate, ft.object, ft.valid_from, \
+                    ft.valid_to, ft.recorded_at, ft.meeting_id, ft.confidence \
+               FROM facts ft \
+               JOIN meetings m ON m.id = ft.meeting_id \
+              WHERE ft.entity_id = ?1 \
+                AND ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              ORDER BY (ft.valid_to IS NULL) DESC, ft.valid_from DESC, ft.id DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![entity_id], row_to_fact)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
 }
 
 /// One note row needed to seal/unseal a folder.
@@ -3213,6 +3391,22 @@ fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>> {
         status,
         folder_id,
     }))
+}
+
+/// Map a `facts` row (column order matches every facts SELECT) to a [`crate::facts::Fact`].
+fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
+    Ok(crate::facts::Fact {
+        id: row.get(0)?,
+        entity_id: row.get(1)?,
+        subject: row.get(2)?,
+        predicate: row.get(3)?,
+        object: row.get(4)?,
+        valid_from: row.get(5)?,
+        valid_to: row.get(6)?,
+        recorded_at: row.get(7)?,
+        meeting_id: row.get(8)?,
+        confidence: row.get(9)?,
+    })
 }
 
 /// Escape LIKE wildcards so user input is matched literally (paired with `ESCAPE '\'`).
@@ -5401,6 +5595,139 @@ mod lock_tests {
             return false;
         }
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // ── brain2 R2 bitemporal facts: persistence + gating + purge ──────────────
+
+    use crate::facts::{FactCandidate, FactOp, NewFact};
+
+    fn add_op(entity_id: &str, predicate: &str, object: &str, valid_from: &str, meeting_id: &str) -> FactOp {
+        FactOp::Add(NewFact {
+            entity_id: entity_id.to_string(),
+            subject: "Atlas".to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: valid_from.to_string(),
+            recorded_at: valid_from.to_string(),
+            confidence: 1.0,
+            meeting_id: Some(meeting_id.to_string()),
+        })
+    }
+
+    /// apply_fact_ops persists an open fact; a later reconcile of a CHANGED object closes the old
+    /// (valid_to set) and opens the new — both rows survive (bitemporal history). RED-before-GREEN:
+    /// without the Invalidate UPDATE the old fact stays open (two open rows), failing the assertions.
+    #[test]
+    fn facts_apply_and_bitemporal_history_round_trips() {
+        let db = file_db("facts-bitemporal");
+        seed_note(&db, "m1", "Atlas is in progress", None);
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m1").unwrap();
+
+        // First meeting records: status = in-progress (open).
+        db.apply_fact_ops(&[add_op(&atlas, "status", "in-progress", "2026-06-01T00:00:00Z", "m1")])
+            .unwrap();
+
+        // Second meeting says: status = shipped → reconcile.
+        let existing = db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap();
+        assert_eq!(existing.len(), 1);
+        let cands = vec![FactCandidate {
+            entity_id: atlas.clone(),
+            subject: "Atlas".to_string(),
+            predicate: "status".to_string(),
+            object: "shipped".to_string(),
+            confidence: 1.0,
+        }];
+        let at = "2026-06-20T00:00:00Z";
+        let mut ops = crate::facts::reconcile_facts(&existing, &cands, at);
+        crate::facts::set_meeting_id(&mut ops, "m1");
+        db.apply_fact_ops(&ops).unwrap();
+
+        // Both rows present: old closed at `at`, new open.
+        let all = db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap();
+        assert_eq!(all.len(), 2, "history preserved — old fact kept, not overwritten");
+        let open: Vec<_> = all.iter().filter(|f| f.valid_to.is_none()).collect();
+        let closed: Vec<_> = all.iter().filter(|f| f.valid_to.is_some()).collect();
+        assert_eq!(open.len(), 1, "exactly one currently-valid fact");
+        assert_eq!(open[0].object, "shipped");
+        assert_eq!(open[0].valid_from, at);
+        assert_eq!(closed.len(), 1, "exactly one superseded fact");
+        assert_eq!(closed[0].object, "in-progress");
+        assert_eq!(closed[0].valid_to.as_deref(), Some(at), "old fact closed at the supersession instant");
+
+        // The gated read returns both (open first), since m1 is in an open folder.
+        let facts = db.list_facts_visible(&atlas, &HashSet::new()).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts[0].valid_to.is_none(), "open (current) fact ordered first");
+    }
+
+    /// list_facts_visible GATE: a fact whose source meeting is in a sealed-and-not-unlocked folder is
+    /// INVISIBLE, and reappears once the folder is session-unlocked. Uses set_folder_locked directly
+    /// (NOT lock_folder) so the row survives at rest — this proves the READ GATE, independent of the
+    /// purge-on-seal. RED-before-GREEN: drop the meetings-JOIN visibility predicate → the sealed
+    /// fact leaks.
+    #[test]
+    fn list_facts_visible_excludes_sealed_meeting() {
+        let db = file_db("facts-gate");
+        seed_folder(&db, "f-lock", "Secret");
+        seed_note(&db, "secret1", "Atlas acquisition", Some("f-lock"));
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "secret1").unwrap();
+        db.apply_fact_ops(&[add_op(&atlas, "price", "10M", "2026-06-01T00:00:00Z", "secret1")])
+            .unwrap();
+
+        // Open folder → fact visible.
+        assert_eq!(db.list_facts_visible(&atlas, &HashSet::new()).unwrap().len(), 1);
+
+        // Seal the folder flag directly (no purge) → the row survives at rest but must be GATED OUT.
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        assert!(
+            db.list_facts_visible(&atlas, &HashSet::new()).unwrap().is_empty(),
+            "a sealed-not-unlocked meeting's facts must not surface (gate violation)"
+        );
+
+        // Session-unlock → the fact reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert_eq!(
+            db.list_facts_visible(&atlas, &unlocked).unwrap().len(),
+            1,
+            "facts reappear once the folder is session-unlocked"
+        );
+    }
+
+    /// PURGE-ON-SEAL: the same atomic tx that purges chunks/corrections/assistant-interactions also
+    /// DELETES the meeting's facts (purge_facts_tx). RED-before-GREEN: without the purge_facts_tx
+    /// call the fact row survives the seal.
+    #[test]
+    fn seal_purges_facts() {
+        let db = file_db("facts-purge");
+        seed_note(&db, "m1", "Atlas shipped", None);
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m1").unwrap();
+        db.apply_fact_ops(&[add_op(&atlas, "status", "shipped", "2026-06-01T00:00:00Z", "m1")])
+            .unwrap();
+        assert_eq!(db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap().len(), 1);
+
+        // The seal purge (chunks + corrections + assistant interactions + FACTS) in one tx.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert!(
+            db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap().is_empty(),
+            "facts must be purged on seal (drop-on-seal, like correction_log / note_chunks)"
+        );
+    }
+
+    /// delete_meeting cascades to facts (FK ON DELETE CASCADE).
+    #[test]
+    fn delete_meeting_cascades_to_facts() {
+        let db = file_db("facts-cascade");
+        seed_note(&db, "m1", "Atlas", None);
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m1").unwrap();
+        db.apply_fact_ops(&[add_op(&atlas, "status", "shipped", "2026-06-01T00:00:00Z", "m1")])
+            .unwrap();
+        db.delete_meeting("m1").unwrap();
+        assert!(db.facts_for_entities(&[atlas]).unwrap().is_empty(), "FK CASCADE drops facts");
     }
 }
 
