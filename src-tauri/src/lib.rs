@@ -138,6 +138,7 @@ pub fn run() {
             commands::embed_model_present,
             commands::download_embed_model,
             commands::reindex_embeddings,
+            commands::related_meetings,
             commands::ner_model_present,
             commands::download_ner_model,
             commands::toggle_bar,
