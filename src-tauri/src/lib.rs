@@ -7,6 +7,7 @@ pub mod embed;
 pub mod error;
 pub mod events;
 pub mod export;
+pub mod facts;
 pub mod mcp;
 pub mod orchestrate;
 pub mod pipeline;
