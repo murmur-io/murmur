@@ -105,8 +105,10 @@ pub struct AppState {
     /// SAME gated `handle_voice_action` path as the wake trigger. Opt-in PER CLICK — independent of
     /// the `realtime_reactions` toggle.
     pub voice_command_capture: Mutex<Option<CaptureState>>,
-    /// Db is internally Send+Sync (Mutex<Connection>).
-    pub db: Db,
+    /// Db is internally Send+Sync (Mutex<Connection>). Held in an `Arc` so the egress-ledger
+    /// sink (`DbEgressSink`) can hold a cheaply-cloned handle without requiring a second keychain
+    /// access or separate connection (the ledger writes go through the same locked `Mutex<Conn>`).
+    pub db: Arc<Db>,
     /// In-memory cache of the settings table.
     pub config: Mutex<AppConfig>,
     /// The active on-device reasoning backend (Phase B). Resolved ONCE at startup by
@@ -175,7 +177,7 @@ impl AppState {
             tracing::info!(target: "state", "plaintext DB detected — encrypting at rest");
             crate::storage::migration::encrypt_in_place(db_path, dek)?;
         }
-        let db = Db::open_with_key(db_path, dek)?;
+        let db = Arc::new(Db::open_with_key(db_path, dek)?);
         let config = AppConfig::load(&db)?;
 
         // Phase B: resolve the on-device reasoning backend once. Cheap + panic-free: the real brain
@@ -189,7 +191,7 @@ impl AppState {
         // those columns (the blobs remain the source of truth) and re-seal any stray plaintext WAV
         // whose `.enc` already exists, so plaintext never survives a crash into the next session.
         // Best-effort: a reconciliation error is logged, never fatal to startup.
-        reconcile_locked_at_rest(&db);
+        reconcile_locked_at_rest(&*db);
 
         tracing::info!(target: "state", "app state initialized");
 

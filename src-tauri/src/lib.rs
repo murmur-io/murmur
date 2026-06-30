@@ -184,6 +184,16 @@ pub fn run() {
             };
             app.manage(state);
 
+            // Phase 2b — wire the content-free egress ledger. Done here, once, after a successful
+            // AppState::init() so the DB is guaranteed open. Every subsequent cloud provider call
+            // (routed through RedactingProvider) writes ONE content-free row to egress_log.
+            {
+                let state = app.state::<AppState>();
+                crate::summarize::egress_log::set_egress_sink(std::sync::Arc::new(
+                    crate::summarize::egress_log::DbEgressSink::new(state.db.clone()),
+                ));
+            }
+
             // Reclaim any capture scratch WAVs stranded by a previous crashed/stuck session
             // (a stuck VPIO/AEC helper once left a 91 GB temp file). Nothing records yet at setup.
             crate::audio::aec::sweep_stale_scratch();

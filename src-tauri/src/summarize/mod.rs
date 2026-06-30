@@ -8,6 +8,7 @@ use crate::summarize::provider::SummarizerProvider;
 
 pub mod action_items;
 pub mod anthropic;
+pub mod egress_log;
 pub mod gateway;
 pub mod meta;
 pub mod brief;
@@ -161,10 +162,37 @@ pub fn make_provider(
     // egress, restored in the reply); otherwise it is the byte-identical NoopNameRedactor, so a
     // no-model build's egress is unchanged. The redactor only ever REMOVES content (a NER miss leaks
     // no more than the no-op).
+    //
+    // Phase 2b — wire the process-global egress sink so every cloud call records a content-free
+    // audit row. Non-PII destination label + requested model are computed per provider arm here;
+    // the full constructor is `with_name_redactor_and_sink`.
+    let destination = match id {
+        PROVIDER_CLAUDE_CODE => "claude_code (Anthropic CLI)".to_string(),
+        PROVIDER_ANTHROPIC => "api.anthropic.com".to_string(),
+        PROVIDER_GATEWAY => reqwest::Url::parse(&config.gateway_base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "gateway".to_string()),
+        PROVIDER_OLLAMA => reqwest::Url::parse(&config.ollama_base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "ollama".to_string()),
+        _ => id.to_string(),
+    };
+    let model_requested = match id {
+        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC => config.provider_model.clone(),
+        PROVIDER_GATEWAY => config.gateway_model.clone(),
+        PROVIDER_OLLAMA => config.ollama_model.clone(),
+        _ => String::new(),
+    };
     Ok(Arc::new(
-        crate::summarize::redact::RedactingProvider::with_name_redactor(
+        crate::summarize::redact::RedactingProvider::with_name_redactor_and_sink(
             inner,
             crate::summarize::redact::active_name_redactor(),
+            crate::summarize::egress_log::active_sink(),
+            id.to_string(),
+            destination,
+            model_requested,
         ),
     ))
 }
