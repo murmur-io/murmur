@@ -38,6 +38,25 @@ The agentic brain (`agent.rs` + `GatedToolExecutor` + `run_agentic_loop`), the w
 - FE: `ng lint` + `ng build` green; adversarial-verifier live mocked-IPC smoke — a note line saves + shows; an `@brain` line routes to the agent; an agent answer + an action-confirmation render distinctly; the recording bar + thread coexist.
 - Full `scripts/ci.sh` before merge. Batch to trunk, no version bump, no release.
 
+## REVISION 2 — Slack threads + agent-proposes/you-accept (SUPERSEDES the interaction + write model above)
+
+After review, the flat-interleaved thread is replaced with a **Slack-style threading** model, and agent writes become **propose-then-accept** (the agent never auto-commits to your notes).
+
+**Surface:**
+- The main flow is the user's **NOTES** — a vertical flow of note lines the user writes (the primary content).
+- Typing `@brain …` on a line opens an **anchored THREAD under that line** (Slack-style): the user's question + the agent's reply live in that nested thread. The thread is **multi-turn** — follow-ups typed inside the thread go to the agent WITHOUT re-typing `@brain`.
+- **Multiple independent threads** can hang off different note lines; the user keeps writing the main notes flow uninterrupted.
+
+**Agent proposes, user accepts (human-in-the-loop):**
+- The agent **ANSWERS in the thread** — it GENERATES content (incl. a note draft enriched with the meeting/conversation context when asked, e.g. "@brain make me a note about the decisions, enriched with context").
+- Every agent reply in a thread offers **`✓ Add to notes` / dismiss**. Accept → the content is appended to the user's main notes via the existing `save_manual_notes`. Reject/ignore → discarded. **The agent NEVER auto-writes** — the user controls exactly what enters the notes.
+
+**Backend (smaller than Rev 1):** the in-meeting agentic loop is **READ-ONLY** (`allow_writes: false` in `run_informational`) — the agent generates/answers, never writes the DB. The `save_note`/`create_reminder` write tools added in Rev 1 stay **DORMANT** (not advertised while read-only) for a FUTURE structured "agent acts" iteration (reminders via the same propose-accept). KEEP: routing every request through the loop (no hardcoded write classifier) + the floor's write-intent → `Research` demotion. The FE does the commit on Accept (reuse `save_manual_notes`).
+
+**FE:** the record screen = the slim recording bar + a **notes-with-threads** surface (NOT a flat chat). Note lines = the main flow; `@brain` → an anchored multi-turn thread; agent replies carry `✓ Add to notes`. (This reworks the Rev-1 flat-thread FE.)
+
+**Deferred:** reminders/other actions as structured propose-accept (notes first); the agent explicitly tagging a reply as a "proposal" vs a plain answer (v1: every agent reply is acceptable-to-notes).
+
 ## Out of scope
 - The `/brain` knowledge-sources page redesign (separate, paused on `feat/brain-view-redesign`).
 - Voice questions replaying full prior chat history (the voice path stays one-shot per turn; it still lands in the thread).
