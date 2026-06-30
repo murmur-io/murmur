@@ -60,6 +60,11 @@ pub struct VoiceActionResult {
     /// `[[Title]]` wikilink citations the answer was grounded on (VISIBLE meetings only). Empty for
     /// non-RAG intents.
     pub citations: Vec<String>,
+    /// The model's NOTE DRAFT for this turn, set ONLY when the agent decided the user asked for a note
+    /// (it called the `propose_note` tool). `None` ⇒ the reply is a plain ANSWER (a conversation);
+    /// `Some(content)` ⇒ a NOTE PROPOSAL the FE shows "Add to notes" on. No DB write happens server-side
+    /// — the FE commits the accepted draft via `save_manual_notes`. Serializes to `proposedNote`.
+    pub proposed_note: Option<String>,
 }
 
 impl VoiceActionResult {
@@ -70,6 +75,7 @@ impl VoiceActionResult {
             summary: summary.into(),
             command: String::new(),
             citations: Vec::new(),
+            proposed_note: None,
         }
     }
 
@@ -77,6 +83,19 @@ impl VoiceActionResult {
     /// surface what the user actually said without re-plumbing each constructor.
     pub fn with_command(mut self, command: &str) -> Self {
         self.command = command.to_string();
+        self
+    }
+
+    /// Thread a model NOTE PROPOSAL onto a result (builder-style). `Some(content)` marks the reply as
+    /// a note draft (the FE offers "Add to notes"); `None` is a no-op (plain answer). The caller reads
+    /// the proposal off the executor after the agentic loop and threads it here.
+    pub fn with_proposed_note(mut self, proposed: Option<String>) -> Self {
+        if let Some(content) = proposed {
+            let content = content.trim();
+            if !content.is_empty() {
+                self.proposed_note = Some(content.to_string());
+            }
+        }
         self
     }
 
@@ -94,6 +113,9 @@ impl VoiceActionResult {
             summary: outcome.answer,
             command: String::new(),
             citations: outcome.citations,
+            // The caller (`run_informational`) threads any `propose_note` draft on via
+            // `with_proposed_note` after reading the executor; the loop outcome itself has none.
+            proposed_note: None,
         }
     }
 
@@ -503,6 +525,7 @@ fn rag_answer(
                 summary,
                 command: String::new(),
                 citations,
+                proposed_note: None,
             }
         }
         Err(AppError::Unavailable(_)) => VoiceActionResult {
@@ -514,6 +537,7 @@ fn rag_answer(
                 .to_string(),
             command: String::new(),
             citations,
+            proposed_note: None,
         },
         Err(e) => VoiceActionResult {
             intent_kind: intent_kind.to_string(),
@@ -521,6 +545,7 @@ fn rag_answer(
             summary: non_pii_error(&e),
             command: String::new(),
             citations,
+            proposed_note: None,
         },
     }
 }
@@ -903,6 +928,7 @@ mod tests {
             meeting_id: "",
             app: None,
             allow_writes: false,
+            proposed_note: std::sync::Mutex::new(None),
         };
 
         // (1) Direct gate proof on the executor (RED-able).
@@ -1230,6 +1256,36 @@ mod tests {
         assert_eq!(r.command, "zrób research o X");
         // nothing_heard carries an empty command (nothing was heard).
         assert!(VoiceActionResult::nothing_heard().command.is_empty());
+    }
+
+    /// `proposed_note` round-trips through `VoiceActionResult`: defaults to None (a plain ANSWER),
+    /// `with_proposed_note(Some(..))` marks the reply as a NOTE PROPOSAL, and it serializes to the
+    /// camelCase `proposedNote` field the FE reads (so it can show "Add to notes" only when present).
+    #[test]
+    fn voice_action_result_round_trips_proposed_note() {
+        // Default: no proposal ⇒ plain answer.
+        let plain = VoiceActionResult::new("research", "ok", "an answer");
+        assert_eq!(plain.proposed_note, None, "a result defaults to no note proposal (a plain answer)");
+
+        // With a proposal: the reply IS a note draft.
+        let proposed = plain
+            .clone()
+            .with_proposed_note(Some("Decision: ship Friday.".to_string()));
+        assert_eq!(proposed.proposed_note.as_deref(), Some("Decision: ship Friday."));
+
+        // None / whitespace are no-ops (still a plain answer).
+        assert_eq!(plain.clone().with_proposed_note(None).proposed_note, None);
+        assert_eq!(plain.with_proposed_note(Some("   ".into())).proposed_note, None);
+
+        // Serializes to the camelCase `proposedNote` field the FE consumes; absent (null) ⇒ plain.
+        let json = serde_json::to_value(
+            VoiceActionResult::new("research", "ok", "draft reply")
+                .with_proposed_note(Some("note body".into())),
+        )
+        .unwrap();
+        assert_eq!(json.get("proposedNote").and_then(|v| v.as_str()), Some("note body"));
+        let null_json = serde_json::to_value(VoiceActionResult::new("research", "ok", "x")).unwrap();
+        assert!(null_json.get("proposedNote").unwrap().is_null(), "no proposal ⇒ proposedNote is null");
     }
 
     #[test]
