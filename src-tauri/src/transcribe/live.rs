@@ -306,13 +306,16 @@ fn run_assistant_turn(app: &AppHandle, command: String) {
 
 /// THE shared query core — the brain's executive entry, reused by the card turn AND the chat panel.
 /// 1. Re-snapshot config + the LIVE `unlocked` set + the current meeting id — FRESH per turn (C6).
-/// 2. Resolve `command` (the user's LATEST message) to an intent (keyword → brain → fallback): used to
-///    route user-dictated writes + as the deterministic floor's intent. A write-vs-informational split
-///    is a legitimate routing decision — NOT a hardcoded ANSWERING router.
-/// 3. A user-dictated WRITE (reminder / note) runs `handle_voice_action` directly (auto-OK; never the
-///    read-only loop). An INFORMATIONAL request runs the model-driven AGENTIC LOOP over `loop_user`
-///    (= `command` for the card; = the whole conversation for the chat), FALLING THROUGH to the
-///    deterministic floor on non-convergence / `Unavailable` / the local backend — ZERO regression.
+/// 2. Resolve `command` (the user's LATEST message) to an intent (keyword → brain → fallback). This is
+///    NO LONGER a write router — the agentic loop's tool-use DECIDES whether to answer or write (the
+///    user's explicit "no hardcoded regex" philosophy). The resolved `intent` is used ONLY as the
+///    deterministic FLOOR's read fan-out + its surfaced `intent_kind` (so the no-consent/local path is
+///    unchanged and there is no read-answer regression).
+/// 3. EVERY request (voice / text / @brain) runs the model-driven AGENTIC LOOP (now `allow_writes`)
+///    over `loop_user` (= `command` for the card; = the whole conversation for the chat). The agent
+///    picks `save_note` / `create_reminder` (gated) or answers. On non-convergence / `Unavailable` (no
+///    cloud consent) / the local-or-stub backend it FALLS THROUGH to the deterministic floor — the
+///    floor no longer owns write routing; it is the informational safety net (ZERO read regression).
 /// 4. PERSIST the interaction (gated, purged-on-seal) + RETURN the result; the per-tool trace streams
 ///    to `tool_event` (card vs chat). The CALLER delivers the result (emit for the card, return for chat).
 pub fn run_assistant_query(
@@ -338,33 +341,20 @@ pub fn run_assistant_query(
         .and_then(|m| m.map(|id| id.to_string()))
         .unwrap_or_default();
 
+    // Resolve an intent for the FLOOR only (its read fan-out + surfaced kind) — it NO LONGER routes
+    // writes. The agentic loop (with writes) is the single executive path; the agent DECIDES.
     let intent = resolve_command_intent(&*state.reasoner, command);
-    let result = match &intent {
-        // User-dictated WRITE → the existing gated action path (auto-OK), never the read-only loop.
-        crate::audio::wake::VoiceIntent::CreateReminder { .. }
-        | crate::audio::wake::VoiceIntent::NoteAside { .. } => crate::voice_action::handle_voice_action(
-            &intent,
-            &*state.reasoner,
-            &state.db,
-            &unlocked,
-            &config,
-            &meeting_id,
-            command,
-            Some(app),
-        ),
-        // Informational → model-driven agentic loop (cloud) over `loop_user`, deterministic floor as net.
-        _ => run_informational(
-            app,
-            state.inner(),
-            &config,
-            &unlocked,
-            &meeting_id,
-            command,
-            loop_user,
-            &intent,
-            tool_event,
-        ),
-    }
+    let result = run_informational(
+        app,
+        state.inner(),
+        &config,
+        &unlocked,
+        &meeting_id,
+        command,
+        loop_user,
+        &intent,
+        tool_event,
+    )
     .with_command(command);
 
     // PII rule: log only the coarse intent kind + status, never the command/summary text.
@@ -378,11 +368,17 @@ pub fn run_assistant_query(
     result
 }
 
-/// Answer an INFORMATIONAL request. On the CLOUD brain, run the model-driven agentic loop over the
-/// gated, READ-ONLY tool executor; on convergence (`Ok(Some)`) map the outcome to a `VoiceActionResult`.
-/// On `Ok(None)` (no convergence), any `Err` (e.g. `Unavailable` = no cloud consent), or the LOCAL/stub
-/// backend, FALL THROUGH to the deterministic `handle_voice_action` floor (gated fan-out + cited
-/// synthesis + `needs_consent`) — the verified safety net that guarantees no regression vs today.
+/// Answer a request. On the CLOUD brain, run the model-driven agentic loop over the gated, WRITE-CAPABLE
+/// tool executor (the agent DECIDES answer-vs-write); on convergence (`Ok(Some)`) map the outcome to a
+/// `VoiceActionResult`. On `Ok(None)` (no convergence), any `Err` (e.g. `Unavailable` = no cloud
+/// consent), or the LOCAL/stub backend, FALL THROUGH to the deterministic `handle_voice_action` floor —
+/// the verified informational safety net (gated fan-out + cited synthesis + `needs_consent`).
+///
+/// The floor is INFORMATIONAL ONLY: it no longer owns write routing, so a `CreateReminder`/`NoteAside`
+/// intent is DEMOTED to a `Research` over the literal command before flooring. Otherwise a no-consent /
+/// local user saying "note that …" would trigger a deterministic write that bypassed the agent's
+/// decision — exactly the hardcoded routing this change removes. So a write only ever happens when the
+/// AGENT chose it; when the agent can't run, the user gets a deterministic informational answer instead.
 #[allow(clippy::too_many_arguments)] // cohesive dispatch surface: gated state + loop-user + trace event.
 fn run_informational(
     app: &AppHandle,
@@ -407,7 +403,13 @@ fn run_informational(
             config,
             meeting_id,
             app: Some(app),
-            allow_writes: false, // read-only loop — user-dictated writes go through handle_voice_action
+            // PROPOSE-then-ACCEPT model (Rev 2): the in-meeting agent is READ-ONLY — it GENERATES
+            // content (incl. note drafts enriched with the live context) but NEVER auto-writes. The
+            // user commits a draft via the FE's "Add to notes" (→ `save_manual_notes`). The
+            // `save_note`/`create_reminder` write tools stay DORMANT (not advertised while read-only)
+            // for a future structured "agent acts" iteration. The dispatch still routes EVERY request
+            // through this loop (no hardcoded write classifier), so the model decides answer-vs-draft.
+            allow_writes: false,
         };
         let sink = ToolEventSink { app: app.clone(), event: tool_event };
         // Inject the LIVE transcript of the recording IN PROGRESS so the brain can answer questions
@@ -454,9 +456,12 @@ fn run_informational(
             ),
         }
     }
-    // FLOOR — deterministic, gated, cited, needs_consent-aware. The verified safety net (no regression).
+    // FLOOR — deterministic, gated, cited, needs_consent-aware, INFORMATIONAL ONLY. `floor_intent_for`
+    // demotes a write intent to a Research so the floor NEVER performs a hardcoded write (a write
+    // happens only when the AGENT chooses it; the floor is the read safety net).
+    let floor_intent = floor_intent_for(intent, command);
     crate::voice_action::handle_voice_action(
-        intent,
+        &floor_intent,
         &*state.reasoner,
         &state.db,
         unlocked,
@@ -465,6 +470,25 @@ fn run_informational(
         command,
         Some(app),
     )
+}
+
+/// The intent the INFORMATIONAL FLOOR runs with. Read intents (Research / Recall / SlackSearch /
+/// Unknown) pass through UNCHANGED — zero read-answer regression. A WRITE intent
+/// (`CreateReminder` / `NoteAside`) is DEMOTED to a `Research` over the literal command, so a
+/// no-consent / local user whose phrase happened to parse as a write gets a deterministic
+/// informational answer instead of a hardcoded write the AGENT never chose. This is the load-bearing
+/// "the floor no longer owns write routing" rule, made pure + headless-testable.
+fn floor_intent_for(
+    intent: &crate::audio::wake::VoiceIntent,
+    command: &str,
+) -> crate::audio::wake::VoiceIntent {
+    match intent {
+        crate::audio::wake::VoiceIntent::CreateReminder { .. }
+        | crate::audio::wake::VoiceIntent::NoteAside { .. } => {
+            crate::audio::wake::VoiceIntent::Research { topic: command.trim().to_string() }
+        }
+        other => other.clone(),
+    }
 }
 
 /// The live tool-trace sink: emits a per-tool-call event (`EVENT_ASSISTANT_TOOL` for the card,
@@ -1228,6 +1252,50 @@ mod tests {
             VoiceIntent::Research { topic: "find me the latest on widgets".into() },
             "a non-empty command with no brain must default to Research over the literal text"
         );
+    }
+
+    // ── DISPATCH: the floor no longer owns WRITE routing (conversation-first design, 2026-06-30) ────
+    // The agentic loop (with writes) is the SINGLE executive path — the agent DECIDES answer-vs-write,
+    // NOT a hardcoded classifier branch. The intent is resolved ONLY for the informational floor, and
+    // the floor is INFORMATIONAL ONLY: a parsed write intent is demoted to a Research so a no-consent /
+    // local user never gets a hardcoded write the agent never chose.
+
+    #[test]
+    fn floor_demotes_write_intents_to_informational_research() {
+        // A "save"-style phrase that the classifier parses as a WRITE (NoteAside) must NOT drive a
+        // hardcoded write on the floor — it is demoted to a Research over the literal command. (The
+        // actual answer-vs-act DECISION belongs to the agentic loop, not this floor.)
+        let note = VoiceIntent::NoteAside { text: "send the deck to Anna".into() };
+        assert_eq!(
+            floor_intent_for(&note, "note that I send the deck to Anna"),
+            VoiceIntent::Research { topic: "note that I send the deck to Anna".into() },
+            "the floor must NOT perform a hardcoded NoteAside write — it answers informationally"
+        );
+
+        let reminder = VoiceIntent::CreateReminder { text: "email Bob".into(), due: None };
+        assert_eq!(
+            floor_intent_for(&reminder, "remind me to email Bob"),
+            VoiceIntent::Research { topic: "remind me to email Bob".into() },
+            "the floor must NOT perform a hardcoded CreateReminder write — it answers informationally"
+        );
+    }
+
+    #[test]
+    fn floor_passes_read_intents_through_unchanged_no_regression() {
+        // Read intents are UNTOUCHED by the floor demotion ⇒ the no-consent/local informational answer
+        // is exactly today's behavior (zero regression). Research/Recall/SlackSearch/Unknown all pass.
+        for intent in [
+            VoiceIntent::Research { topic: "atlas pricing".into() },
+            VoiceIntent::Recall { entity: "Anna".into() },
+            VoiceIntent::SlackSearch { query: "raport".into() },
+            VoiceIntent::Unknown { raw: "gibberish".into() },
+        ] {
+            assert_eq!(
+                floor_intent_for(&intent, "the literal command"),
+                intent,
+                "a read intent must reach the floor unchanged: {intent:?}"
+            );
+        }
     }
 
     // ── FIX 3: GARBAGE / FILLER filter — "Uh," / "eee" / single char must NOT dispatch ───────────
