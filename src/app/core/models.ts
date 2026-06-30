@@ -479,6 +479,20 @@ export interface SearchHit {
   matchedIn: string;
 }
 
+/**
+ * brain2 documents — lightweight metadata for one uploaded document (the Brain
+ * view's document list DTO). Mirrors the Rust `DocumentInfo` (serde camelCase):
+ * carries NO text (the text is gated content surfaced only by `getDocument`,
+ * never in the list). `createdAt` is epoch MILLISECONDS (i64), so format it via
+ * `new Date(createdAt)`. A sealed-and-NOT-session-unlocked folder returns an
+ * EMPTY list (masked — never even a document name behind the lock).
+ */
+export interface DocumentInfo {
+  id: string;
+  name: string;
+  createdAt: number;
+}
+
 export interface ChatTurn {
   role: "user" | "assistant";
   content: string;
