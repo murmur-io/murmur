@@ -190,7 +190,7 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                                 crate::events::EVENT_VOICE_COMMAND_PROCESSING,
                                 crate::events::VoiceCommandProcessingPayload { active: true },
                             );
-                            spawn_command_dispatch(app.clone(), command);
+                            spawn_assistant_turn(app.clone(), command);
                         }
                         ManualCaptureDecision::NothingHeard => {
                             // Budget expired with nothing heard → graceful, NOT a confusing
@@ -251,7 +251,7 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                             "wake word detected in live caption"
                         );
                         if dispatch {
-                            spawn_dispatch(app.clone(), payload.intent.clone());
+                            spawn_assistant_turn(app.clone(), payload.command.clone());
                         }
                         let _ = app.emit(crate::events::EVENT_WAKE_DETECTED, payload);
                     }
@@ -271,66 +271,201 @@ fn should_dispatch(config: &crate::settings::AppConfig) -> bool {
     config.realtime_reactions
 }
 
-/// Dispatch a parsed [`crate::audio::wake::VoiceIntent`] OFF the live transcription tick, on a
-/// detached OS thread, and emit [`crate::events::EVENT_VOICE_ACTION_RESULT`] with the result. The
-/// brain call can take seconds, so it MUST run off-thread — the live loop never blocks on it. The
-/// whole body is best-effort + panic-free (`handle_voice_action` never panics, the emit error is
-/// ignored), and it runs on its OWN thread so even an unexpected panic is contained and cannot
-/// disrupt the recording or the caption.
-///
-/// All state (config snapshot, reasoner, db, the LIVE `unlocked` set, the current meeting id) is
-/// read from the managed [`AppState`] inside the thread — the reasoner is borrowed (`&*`) rather
-/// than cloned (it is `Box<dyn LocalReasoner>`), which is sound because `AppState` lives for the
-/// whole app lifetime. Gating: `handle_voice_action` routes every read through the visibility gate
-/// over THIS unlocked set, and the brain honors the consent gate.
-fn spawn_dispatch(app: AppHandle, intent: crate::audio::wake::VoiceIntent) {
-    let _ = std::thread::Builder::new()
-        .name("murmur-voice-action".into())
-        .spawn(move || {
-            let state = app.state::<AppState>();
-            // Snapshot the config + the live unlocked set + the current meeting id. Cheap clones so
-            // we don't hold the locks across the (possibly slow) dispatch.
-            let config = match state.config.lock() {
-                Ok(c) => c.clone(),
-                Err(_) => return,
-            };
-            let unlocked = match state.unlocked_folders.lock() {
-                Ok(u) => u.clone(),
-                Err(_) => return,
-            };
-            let meeting_id = state
-                .current_meeting
-                .lock()
-                .ok()
-                .and_then(|m| m.map(|id| id.to_string()))
-                .unwrap_or_default();
+/// Max agentic rounds on the cloud brain (decide → tool → … → answer). Bounded for live latency.
+const CLOUD_MAX_STEPS: usize = 4;
 
-            // The wake parser does NOT translate — the intent's own topic/entity IS the user's
-            // literal words, so retrieval already keys off them. Pass them as the literal command.
-            let literal = literal_command_of(&intent);
-            let result = crate::voice_action::handle_voice_action(
-                &intent,
-                &*state.reasoner,
-                &state.db,
-                &unlocked,
-                &config,
-                &meeting_id,
-                &literal,
-                Some(&app),
-            );
-            // PII rule: log only the coarse intent kind + status, never the summary/citations.
-            tracing::info!(
+/// Spawn ONE assistant turn on a DETACHED OS thread — the SINGLE entry to the in-meeting brain for the
+/// wake path, the manual button, AND the text composer (all three funnel here with a `command` string).
+/// The brain + tools can take seconds, so it MUST run off-thread; the whole body is best-effort +
+/// panic-free and runs on its own thread, so even an unexpected panic is contained and can never
+/// disrupt recording or the caption.
+pub fn spawn_assistant_turn(app: AppHandle, command: String) {
+    let _ = std::thread::Builder::new()
+        .name("murmur-assistant-turn".into())
+        .spawn(move || run_assistant_turn(&app, command));
+}
+
+/// The CARD path (wake / manual button / single-shot text composer): run the shared query core, then
+/// EMIT `EVENT_VOICE_ACTION_RESULT` so the assistant card resolves the pending row. The per-tool trace
+/// streams via `EVENT_ASSISTANT_TOOL`.
+fn run_assistant_turn(app: &AppHandle, command: String) {
+    let result = run_assistant_query(app, &command, &command, crate::events::EVENT_ASSISTANT_TOOL);
+    let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
+}
+
+/// THE shared query core — the brain's executive entry, reused by the card turn AND the chat panel.
+/// 1. Re-snapshot config + the LIVE `unlocked` set + the current meeting id — FRESH per turn (C6).
+/// 2. Resolve `command` (the user's LATEST message) to an intent (keyword → brain → fallback): used to
+///    route user-dictated writes + as the deterministic floor's intent. A write-vs-informational split
+///    is a legitimate routing decision — NOT a hardcoded ANSWERING router.
+/// 3. A user-dictated WRITE (reminder / note) runs `handle_voice_action` directly (auto-OK; never the
+///    read-only loop). An INFORMATIONAL request runs the model-driven AGENTIC LOOP over `loop_user`
+///    (= `command` for the card; = the whole conversation for the chat), FALLING THROUGH to the
+///    deterministic floor on non-convergence / `Unavailable` / the local backend — ZERO regression.
+/// 4. PERSIST the interaction (gated, purged-on-seal) + RETURN the result; the per-tool trace streams
+///    to `tool_event` (card vs chat). The CALLER delivers the result (emit for the card, return for chat).
+pub fn run_assistant_query(
+    app: &AppHandle,
+    command: &str,
+    loop_user: &str,
+    tool_event: &'static str,
+) -> crate::voice_action::VoiceActionResult {
+    let state = app.state::<AppState>();
+    let config = match state.config.lock() {
+        Ok(c) => c.clone(),
+        Err(_) => return crate::voice_action::VoiceActionResult::nothing_heard().with_command(command),
+    };
+    // C6: re-snapshot the LIVE unlocked set for THIS turn (never trust a snapshot taken before it).
+    let unlocked = match state.unlocked_folders.lock() {
+        Ok(u) => u.clone(),
+        Err(_) => return crate::voice_action::VoiceActionResult::nothing_heard().with_command(command),
+    };
+    let meeting_id = state
+        .current_meeting
+        .lock()
+        .ok()
+        .and_then(|m| m.map(|id| id.to_string()))
+        .unwrap_or_default();
+
+    let intent = resolve_command_intent(&*state.reasoner, command);
+    let result = match &intent {
+        // User-dictated WRITE → the existing gated action path (auto-OK), never the read-only loop.
+        crate::audio::wake::VoiceIntent::CreateReminder { .. }
+        | crate::audio::wake::VoiceIntent::NoteAside { .. } => crate::voice_action::handle_voice_action(
+            &intent,
+            &*state.reasoner,
+            &state.db,
+            &unlocked,
+            &config,
+            &meeting_id,
+            command,
+            Some(app),
+        ),
+        // Informational → model-driven agentic loop (cloud) over `loop_user`, deterministic floor as net.
+        _ => run_informational(
+            app,
+            state.inner(),
+            &config,
+            &unlocked,
+            &meeting_id,
+            command,
+            loop_user,
+            &intent,
+            tool_event,
+        ),
+    }
+    .with_command(command);
+
+    // PII rule: log only the coarse intent kind + status, never the command/summary text.
+    tracing::info!(
+        target: "voice",
+        intent = %result.intent_kind,
+        status = %result.status,
+        "assistant query dispatched"
+    );
+    persist_interaction(state.inner(), &meeting_id, command, &result);
+    result
+}
+
+/// Answer an INFORMATIONAL request. On the CLOUD brain, run the model-driven agentic loop over the
+/// gated, READ-ONLY tool executor; on convergence (`Ok(Some)`) map the outcome to a `VoiceActionResult`.
+/// On `Ok(None)` (no convergence), any `Err` (e.g. `Unavailable` = no cloud consent), or the LOCAL/stub
+/// backend, FALL THROUGH to the deterministic `handle_voice_action` floor (gated fan-out + cited
+/// synthesis + `needs_consent`) — the verified safety net that guarantees no regression vs today.
+#[allow(clippy::too_many_arguments)] // cohesive dispatch surface: gated state + loop-user + trace event.
+fn run_informational(
+    app: &AppHandle,
+    state: &AppState,
+    config: &crate::settings::AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+    meeting_id: &str,
+    command: &str,
+    loop_user: &str,
+    intent: &crate::audio::wake::VoiceIntent,
+    tool_event: &'static str,
+) -> crate::voice_action::VoiceActionResult {
+    // The agentic loop runs only on the CLOUD brain — local-GGUF multi-step tool-call reliability is
+    // unproven (Q4 + the Bielik 32K-overflow lesson), so the local + stub backends use the
+    // deterministic floor: honest, fast, and a strict no-regression vs today.
+    if config.brain_backend == crate::settings::BrainBackend::Cloud {
+        let executor = crate::tools::GatedToolExecutor {
+            db: &state.db,
+            // The LIVE set behind its Mutex — re-read per tool call (C6), so a mid-loop relock is gated
+            // out immediately. (The deterministic floor below still uses the per-turn `unlocked` snapshot.)
+            unlocked: &state.unlocked_folders,
+            config,
+            meeting_id,
+            app: Some(app),
+            allow_writes: false, // read-only loop — user-dictated writes go through handle_voice_action
+        };
+        let sink = ToolEventSink { app: app.clone(), event: tool_event };
+        let system = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
+                      sentences), grounded ONLY in tool results from the user's own gated vault (and \
+                      web/calendar when you use them). If the tools turn up nothing relevant, say so \
+                      plainly. Do not invent facts.";
+        match crate::agent::run_agentic_loop(
+            &*state.reasoner,
+            system,
+            loop_user,
+            &executor,
+            CLOUD_MAX_STEPS,
+            Some(&sink as &dyn crate::agent::DeltaSink),
+        ) {
+            Ok(Some(outcome)) => return crate::voice_action::VoiceActionResult::from_agent(intent, outcome),
+            Ok(None) => tracing::debug!(
                 target: "voice",
-                intent = %result.intent_kind,
-                status = %result.status,
-                "voice action dispatched"
-            );
-            // PERSIST the interaction against the CURRENT recording (best-effort + panic-free): the
-            // wake-path command lives in the intent's literal words. A persist failure NEVER disrupts
-            // the dispatch — it is logged (non-PII) and dropped.
-            persist_interaction(&state, &meeting_id, &literal, &result);
-            let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
-        });
+                "agentic loop did not converge; flooring to deterministic retrieval"
+            ),
+            Err(e) => tracing::debug!(
+                target: "voice",
+                error = %e,
+                "agentic loop unavailable/failed; flooring to deterministic retrieval"
+            ),
+        }
+    }
+    // FLOOR — deterministic, gated, cited, needs_consent-aware. The verified safety net (no regression).
+    crate::voice_action::handle_voice_action(
+        intent,
+        &*state.reasoner,
+        &state.db,
+        unlocked,
+        config,
+        meeting_id,
+        command,
+        Some(app),
+    )
+}
+
+/// The live tool-trace sink: emits a per-tool-call event (`EVENT_ASSISTANT_TOOL` for the card,
+/// `EVENT_CHAT_TOOL` for the chat panel — chosen by `event`) so the FE can render the "Searching
+/// notes… ✓" chips. NO PII — tool NAME + a coarse result-size count only.
+struct ToolEventSink {
+    app: AppHandle,
+    event: &'static str,
+}
+impl crate::agent::DeltaSink for ToolEventSink {
+    fn tool_running(&self, tool: &str) {
+        let _ = self.app.emit(
+            self.event,
+            crate::events::AssistantToolPayload {
+                tool: tool.to_string(),
+                state: "running".into(),
+                ok: true,
+                count: None,
+            },
+        );
+    }
+    fn tool_done(&self, tool: &str, ok: bool, result_chars: usize) {
+        let _ = self.app.emit(
+            self.event,
+            crate::events::AssistantToolPayload {
+                tool: tool.to_string(),
+                state: "done".into(),
+                ok,
+                count: Some(result_chars as u32),
+            },
+        );
+    }
 }
 
 /// Persist one dispatched voice interaction against the CURRENT recording meeting — best-effort +
@@ -367,64 +502,6 @@ fn persist_interaction(
             "persisting assistant interaction failed; continuing"
         ),
     }
-}
-
-/// Resolve a NON-EMPTY heard `command` to an intent (keyword → brain → fallback) and dispatch it
-/// over the SAME gated `handle_voice_action` path as the wake trigger, with the HEARD command
-/// surfaced onto the result so the FE card can show "usłyszano: {command}". Runs entirely OFF the
-/// transcription tick on its own detached OS thread — the brain interpret + the dispatch can each
-/// take seconds and MUST NOT block the live loop. Best-effort + panic-free, exactly like
-/// [`spawn_dispatch`]; a poisoned lock simply aborts the thread.
-fn spawn_command_dispatch(app: AppHandle, command: String) {
-    let _ = std::thread::Builder::new()
-        .name("murmur-voice-command".into())
-        .spawn(move || {
-            let state = app.state::<AppState>();
-            let config = match state.config.lock() {
-                Ok(c) => c.clone(),
-                Err(_) => return,
-            };
-            let unlocked = match state.unlocked_folders.lock() {
-                Ok(u) => u.clone(),
-                Err(_) => return,
-            };
-            let meeting_id = state
-                .current_meeting
-                .lock()
-                .ok()
-                .and_then(|m| m.map(|id| id.to_string()))
-                .unwrap_or_default();
-
-            // Keyword fast-path → BRAIN interpret (consent-gated, same reasoner) → keyword fallback.
-            let intent = resolve_command_intent(&*state.reasoner, &command);
-            // RETRIEVAL keys off the user's LITERAL dictated `command` (their own language/words),
-            // NOT the brain-interpreted topic — so a Polish note matches a Polish question.
-            let result = crate::voice_action::handle_voice_action(
-                &intent,
-                &*state.reasoner,
-                &state.db,
-                &unlocked,
-                &config,
-                &meeting_id,
-                &command,
-                Some(&app),
-            )
-            // Surface the user's OWN dictated command onto the result for the FE card.
-            .with_command(&command);
-
-            // PII rule: log only the coarse intent kind + status, never the command/summary text.
-            tracing::info!(
-                target: "voice",
-                intent = %result.intent_kind,
-                status = %result.status,
-                "manual voice command dispatched"
-            );
-            // PERSIST the interaction against the CURRENT recording (best-effort + panic-free): the
-            // manual-path command is the user's HEARD dictation. A persist failure NEVER disrupts the
-            // dispatch — it is logged (non-PII) and dropped.
-            persist_interaction(&state, &meeting_id, &command, &result);
-            let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
-        });
 }
 
 /// What the live loop should do with the MANUAL voice-command capture on this tick.
@@ -691,22 +768,6 @@ fn resolve_command_intent(
     }
     // Brain unavailable / no mapping → Research over the literal command is a fine default.
     crate::audio::wake::VoiceIntent::Research { topic: command.trim().to_string() }
-}
-
-/// The user's LITERAL words carried by an intent, for use as the retrieval-side literal command on
-/// the WAKE path (where the deterministic parser already kept the user's own language — it never
-/// translates). For non-RAG intents this is the payload text; the Research/Recall topics ARE the
-/// literal command tail. Empty `String` for `Unknown` (nothing actionable).
-fn literal_command_of(intent: &crate::audio::wake::VoiceIntent) -> String {
-    use crate::audio::wake::VoiceIntent as VI;
-    match intent {
-        VI::Research { topic } => topic.clone(),
-        VI::Recall { entity } => entity.clone(),
-        VI::SlackSearch { query } => query.clone(),
-        VI::CreateReminder { text, .. } => text.clone(),
-        VI::NoteAside { text } => text.clone(),
-        VI::Unknown { .. } => String::new(),
-    }
 }
 
 /// Pure, headless-testable core of the wake wiring: detect a wake utterance at the head of a

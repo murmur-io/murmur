@@ -878,6 +878,19 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
             <span class="field-label">Claude binary</span>
             <input formControlName="claudeBinary" />
           </label>
+
+          <label class="toggle-row">
+            <span class="toggle-copy">
+              <span class="toggle-title">Pass shell environment to the Claude CLI</span>
+              <span class="text-secondary toggle-sub">
+                Restores older-version behavior: an ANTHROPIC_API_KEY (and proxy /
+                base-URL vars) set in your shell reach the claude CLI again, so it
+                can authenticate via your env key. Off by default for security — your
+                database encryption keys are never passed through.
+              </span>
+            </span>
+            <input type="checkbox" formControlName="claudeCodeInheritEnv" />
+          </label>
         </fieldset>
       </div>
 
@@ -2014,6 +2027,8 @@ export class SettingsComponent implements OnInit {
     ollamaBaseUrl: "http://localhost:11434",
     ollamaModel: "llama3.1",
     claudeBinary: "claude",
+    // Opt-in: pass the shell env to the `claude` CLI (restores env ANTHROPIC_API_KEY auth).
+    claudeCodeInheritEnv: false,
     inputDevice: "",
     captureSystemAudio: false,
     vadEnabled: true,
@@ -2195,6 +2210,7 @@ export class SettingsComponent implements OnInit {
         ollamaBaseUrl: cfg.ollamaBaseUrl,
         ollamaModel: cfg.ollamaModel,
         claudeBinary: cfg.claudeBinary,
+        claudeCodeInheritEnv: cfg.claudeCodeInheritEnv ?? false,
         inputDevice: cfg.inputDevice ?? "",
         captureSystemAudio: cfg.captureSystemAudio ?? false,
         vadEnabled: cfg.vadEnabled ?? true,
@@ -2427,6 +2443,8 @@ export class SettingsComponent implements OnInit {
       lockRequireBiometric: this.loadedLockRequireBiometric,
       relockOnScreenshare: this.loadedRelockOnScreenshare,
       cloudEgressConsented: this.cloudConsented(),
+      // Opt-in: pass the shell env to the `claude` CLI (restores env ANTHROPIC_API_KEY auth).
+      claudeCodeInheritEnv: v.claudeCodeInheritEnv,
     };
     try {
       await this.ipc.saveConfig(cfg);

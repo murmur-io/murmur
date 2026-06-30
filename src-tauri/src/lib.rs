@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod audio;
 pub mod calendar;
 pub mod commands;
@@ -77,6 +78,8 @@ pub fn run() {
             commands::is_mic_muted,
             commands::begin_voice_command,
             commands::end_voice_command,
+            commands::ask_assistant_text,
+            commands::ask_assistant_chat,
             commands::list_input_devices,
             commands::get_last_note,
             commands::update_note,
