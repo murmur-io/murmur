@@ -76,9 +76,11 @@ fn apply_effort(body: &mut serde_json::Value, effort: &str) {
 /// the pipeline. Falls back to `Client::new()` only if the builder somehow fails (it shouldn't with
 /// the rustls backend) so the provider is never un-constructible.
 ///
+/// `pub(crate)` so `gateway.rs` can reuse the same hardened builder without duplicating it.
+///
 /// FOLLOW-UP: adopt `rustls-platform-verifier` for OS trust-store / policy-aware cert verification
 /// once it is an approved dependency (not added here — needs user sign-off).
-fn build_client() -> reqwest::Client {
+pub(crate) fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .timeout(std::time::Duration::from_secs(120))
