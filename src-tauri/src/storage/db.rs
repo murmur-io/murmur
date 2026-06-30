@@ -343,6 +343,21 @@ impl Db {
         // masked DTO; they are export-only via gated commands.
         Self::add_column_if_missing(&conn, "meetings", "mic_master_path", "TEXT")?;
         Self::add_column_if_missing(&conn, "meetings", "sys_master_path", "TEXT")?;
+        // brain2 realtime notes: the user's free-text notes typed DURING a meeting — the live
+        // editable buffer, ONE per meeting, and the DURABLE CANONICAL STORE of those typed notes.
+        // It is (a) injected into the in-meeting brain's system prompt while recording, and (b)
+        // re-read on EVERY (re)summarize and FOLDED into the note (`## My notes`) — so a resummarize
+        // never drops the typed notes. The buffer is USER-AUTHORED PRIMARY content, so it is
+        // SEALED-AND-RESTORED exactly like the note markdown / transcript / timeline (NEVER
+        // blanked-and-lost): on lock the plaintext is encrypted under the folder CK →
+        // `manual_notes_blob` with VERIFY-BEFORE-DESTROY, then the plaintext is blanked; on
+        // session-unlock / remove-lock the blob is decrypted back. The plaintext is re-blanked on
+        // relock/reconcile ONLY when the blob exists (never destroy the only copy). Guarded ALTER
+        // (idempotent); NULL for every legacy meeting → reads back as "" (zero behavior change). Kept
+        // OFF the `Meeting` struct + every meeting SELECT so it can never leak through a masked DTO —
+        // read only via the gated commands.
+        Self::add_column_if_missing(&conn, "meetings", "manual_notes", "TEXT")?;
+        Self::add_column_if_missing(&conn, "meetings", "manual_notes_blob", "BLOB")?;
         // Phase 1 — FTS5/BM25 full-text retrieval over the three text sources
         // (meeting titles, transcript segments, note markdown). Replaces the prior
         // substring LIKE search so word-order/term retrieval works ("alpha beta" == "beta alpha")
@@ -672,6 +687,92 @@ impl Db {
         conn.execute(
             "UPDATE meetings SET title = ?2 WHERE id = ?1",
             rusqlite::params![id, title],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    // ── brain2 realtime typed @brain notes (the `meetings.manual_notes` durable buffer) ────────
+    //
+    // One free-text buffer per meeting that the user types DURING recording — the DURABLE CANONICAL
+    // STORE of those typed notes (re-folded into the note on every (re)summarize; never the only
+    // copy is destroyed). The plaintext column is SEALED-AND-RESTORED under the folder CK exactly
+    // like the note `content_blob` / transcript / timeline: `seal_manual_notes` (verify-before-
+    // destroy at the call site) → `raw_manual_notes` (read for unseal/reblank) → `set_manual_notes`
+    // (restore plaintext) → `clear_manual_notes_blob` (permanent remove-lock). These are LOW-LEVEL
+    // helpers with NO lock gating — the COMMAND layer (`save_manual_notes`/`get_manual_notes`) does
+    // the `meeting_is_unlocked` gating; the internal seal/unseal paths drive these directly.
+
+    /// Upsert the meeting's typed-notes plaintext. Used by the FE autosave (write the whole buffer)
+    /// AND by the unseal/remove-lock RESTORE (write the decrypted plaintext back). No-op on an
+    /// unknown meeting.
+    pub fn set_manual_notes(&self, meeting_id: &str, text: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET manual_notes = ?2 WHERE id = ?1",
+            rusqlite::params![meeting_id, text],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The meeting's typed-notes plaintext, or "" when never set / NULL (legacy rows) / unknown id /
+    /// sealed-and-blanked. UNGATED at the DB layer — callers that return this to a surface MUST gate
+    /// first (`meeting_is_unlocked` in commands / `meeting_is_visible` for the live brain). The
+    /// (re)summarize fold reads it raw (it is the producer of the note plaintext, not a leak surface).
+    pub fn get_manual_notes(&self, meeting_id: &str) -> Result<String> {
+        let conn = self.lock();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT manual_notes FROM meetings WHERE id = ?1",
+                rusqlite::params![meeting_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .flatten();
+        Ok(text.unwrap_or_default())
+    }
+
+    /// The meeting's typed notes in EITHER seal state (plaintext + the AES-GCM blob under the folder
+    /// CK) — the read used by the unseal/reblank lifecycle. `None` only when the meeting row is
+    /// absent. Mirrors [`Db::raw_timeline`].
+    pub fn raw_manual_notes(&self, meeting_id: &str) -> Result<Option<RawManualNotes>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(manual_notes, ''), manual_notes_blob FROM meetings WHERE id = ?1",
+            rusqlite::params![meeting_id],
+            |r| {
+                Ok(RawManualNotes {
+                    text: r.get(0)?,
+                    blob: r.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Seal a meeting's typed notes: store the AES-GCM `manual_notes_blob`, blank the plaintext
+    /// `manual_notes`. The CALLER must verify the blob decrypts back byte-identical BEFORE calling
+    /// this (verify-before-destroy) — exactly like [`Db::seal_timeline`].
+    pub fn seal_manual_notes(&self, meeting_id: &str, blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET manual_notes_blob = ?2, manual_notes = '' WHERE id = ?1",
+            rusqlite::params![meeting_id, blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear a meeting's sealed `manual_notes_blob` (permanent remove-lock, after the plaintext is
+    /// restored). Mirrors [`Db::clear_timeline_blob`].
+    pub fn clear_manual_notes_blob(&self, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET manual_notes_blob = NULL WHERE id = ?1",
+            rusqlite::params![meeting_id],
         )
         .map_err(map_err)?;
         Ok(())
@@ -1979,6 +2080,12 @@ impl Db {
             // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
             // nothing to the flywheel.
             Self::purge_corrections_tx(&tx, &meeting_ids)?;
+            // NOTE: the typed-notes (`manual_notes`) re-blank does NOT live here — it is SEALED-AND-
+            // RESTORED content (not a derived/purgeable artifact like chunks/corrections), so its
+            // plaintext is re-blanked only WHERE the `manual_notes_blob` exists, by
+            // `reblank_folder_extras` (relock) / `reblank_locked_folders_at_rest` (startup). Blanking
+            // it here (unconditionally, with no CK to re-seal) would destroy the only copy of a
+            // typed buffer that had not yet been sealed — the verify-before-destroy violation.
         }
         tx.commit().map_err(map_err)?;
         Ok(())
@@ -2061,6 +2168,16 @@ impl Db {
         // Same purge-on-seal contract as the correction-log / assistant-interactions above.
         tx.execute(
             &format!("DELETE FROM facts WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // brain2 realtime notes LOCK-SAFETY: re-blank the typed-notes plaintext of every meeting in a
+        // locked folder ONLY WHERE its `manual_notes_blob` exists (the sealed copy is present) — so a
+        // crash-while-unlocked (which restored the plaintext) cannot leave typed plaintext at rest
+        // after a restart, but a buffer that was NEVER sealed (no blob) is left intact (never destroy
+        // the only copy). Mirrors the `text_blob IS NOT NULL` / `data_blob IS NOT NULL` guards above.
+        tx.execute(
+            &format!("UPDATE meetings SET manual_notes = '' WHERE manual_notes_blob IS NOT NULL AND manual_notes != '' AND id IN ({LOCKED_MEETINGS})"),
             [],
         )
         .map_err(map_err)?;
@@ -3312,6 +3429,15 @@ pub struct RawTimeline {
     pub data_blob: Option<Vec<u8>>,
 }
 
+/// A meeting's typed in-meeting notes in either seal state (brain2 realtime-notes lock lifecycle).
+/// `text` is the plaintext column (blank while sealed); `blob` is the AES-GCM ciphertext under the
+/// folder CK (present while sealed). Mirrors [`RawTimeline`].
+#[derive(Debug, Clone)]
+pub struct RawManualNotes {
+    pub text: String,
+    pub blob: Option<Vec<u8>>,
+}
+
 /// Build the SQL predicate (no params) that selects notes whose folder is open or
 /// session-unlocked. `alias` is the notes-table alias (`n`); a sibling `folders f` join is
 /// assumed for the alias. The unlocked ids are inlined as quoted literals — safe because they
@@ -3625,6 +3751,100 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    /// brain2 realtime notes: the `manual_notes` buffer round-trips (set → get), defaults to "" for a
+    /// meeting that never set it (NULL legacy column), and `set("")` clears it. The buffer is DURABLE
+    /// (canonical store) — it is not destroyed by any plain getter/setter.
+    #[test]
+    fn manual_notes_round_trip_and_default_empty() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-30T09:00:00Z")).unwrap();
+
+        // Default: never set ⇒ "" (NULL column reads back empty, no behavior change for legacy rows).
+        assert_eq!(db.get_manual_notes("m1").unwrap(), "");
+        // Unknown meeting ⇒ "" (no row), never an error.
+        assert_eq!(db.get_manual_notes("nope").unwrap(), "");
+
+        // Set → get round-trips verbatim.
+        db.set_manual_notes("m1", "ship the deck by Friday; Anna owns QA").unwrap();
+        assert_eq!(db.get_manual_notes("m1").unwrap(), "ship the deck by Friday; Anna owns QA");
+
+        // Overwrite replaces the whole buffer (FE owns the full text).
+        db.set_manual_notes("m1", "rewritten").unwrap();
+        assert_eq!(db.get_manual_notes("m1").unwrap(), "rewritten");
+    }
+
+    /// SEAL ROUND-TRIP (mirrors `seal_transcript_timeline_round_trips_byte_identical`): the typed
+    /// notes seal to a `manual_notes_blob` (plaintext blanked, ciphertext does NOT leak), and unlock
+    /// restores the plaintext BYTE-IDENTICAL. Uses the DB seal/restore primitives + crypto directly.
+    #[test]
+    fn seal_manual_notes_round_trips_byte_identical() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-30T09:00:00Z")).unwrap();
+        let typed = "zażółć gęślą jaźń 🔒 — DECISION: ship Friday; Anna owns QA";
+        db.set_manual_notes("m1", typed).unwrap();
+
+        let ck = crate::crypto::random_key().unwrap();
+        // SEAL: encrypt → verify-before-destroy → blank plaintext (the seal_meeting_extras pattern).
+        let rn = db.raw_manual_notes("m1").unwrap().unwrap();
+        let blob = crate::crypto::encrypt(&ck, rn.text.as_bytes(), b"aad").unwrap();
+        assert_eq!(crate::crypto::decrypt(&ck, &blob, b"aad").unwrap(), rn.text.as_bytes());
+        db.seal_manual_notes("m1", &blob).unwrap();
+
+        // At rest while sealed: plaintext blanked, blob present, ciphertext doesn't leak the plaintext.
+        let sealed = db.raw_manual_notes("m1").unwrap().unwrap();
+        assert_eq!(sealed.text, "", "plaintext blanked while sealed");
+        assert!(sealed.blob.is_some(), "manual_notes_blob present while sealed");
+        assert_eq!(db.get_manual_notes("m1").unwrap(), "", "the gated reader sees blank while sealed");
+        let cipher = sealed.blob.as_ref().unwrap();
+        let leaks = cipher
+            .windows(typed.len())
+            .any(|w| w == typed.as_bytes());
+        assert!(!leaks, "manual-notes ciphertext must not leak plaintext");
+
+        // UNLOCK: decrypt the blob → restore plaintext byte-identical.
+        let blob = sealed.blob.unwrap();
+        let pt = String::from_utf8(crate::crypto::decrypt(&ck, &blob, b"aad").unwrap()).unwrap();
+        db.set_manual_notes("m1", &pt).unwrap();
+        assert_eq!(db.get_manual_notes("m1").unwrap(), typed, "typed notes round-trip byte-identical");
+
+        // PERMANENT remove-lock: clear the blob after the plaintext is back.
+        db.clear_manual_notes_blob("m1").unwrap();
+        assert!(db.raw_manual_notes("m1").unwrap().unwrap().blob.is_none(), "blob cleared on remove-lock");
+        assert_eq!(db.get_manual_notes("m1").unwrap(), typed, "plaintext survives the blob clear");
+    }
+
+    /// LOCK-SAFETY (verify-before-destroy): startup reconciliation re-blanks the typed-notes
+    /// plaintext of a locked meeting ONLY when the sealed `manual_notes_blob` exists. A buffer that
+    /// was NEVER sealed (no blob) is LEFT INTACT — reconciliation must never destroy the only copy.
+    #[test]
+    fn reconcile_reblanks_manual_notes_only_when_blob_present() {
+        let db = mem_db();
+        seed_folder(&db, "f-lock", "Secret");
+        // Meeting A: sealed blob present + plaintext stranded by a crash-while-unlocked → MUST re-blank.
+        db.insert_meeting(&sample_meeting("m-sealed", "2026-06-30T09:00:00Z")).unwrap();
+        note_for(&db, "m-sealed", "claude_code", "");
+        db.set_note_folder("m-sealed", Some("f-lock")).unwrap();
+        db.seal_note("m-sealed", "claude_code", b"ciphertext").unwrap();
+        db.seal_manual_notes("m-sealed", b"ck-ciphertext-blob").unwrap(); // blob present
+        db.set_manual_notes("m-sealed", "restored plaintext stranded by the crash").unwrap();
+
+        // Meeting B: NO blob (buffer typed but never sealed) → MUST be left intact (no encrypted copy).
+        db.insert_meeting(&sample_meeting("m-unsealed", "2026-06-30T09:30:00Z")).unwrap();
+        note_for(&db, "m-unsealed", "claude_code", "note");
+        db.set_note_folder("m-unsealed", Some("f-lock")).unwrap();
+        db.set_manual_notes("m-unsealed", "typed but never sealed — must not be destroyed").unwrap();
+
+        db.set_folder_locked("f-lock", true, Some(b"wrapped")).unwrap();
+        db.reblank_locked_folders_at_rest().unwrap();
+
+        assert_eq!(db.get_manual_notes("m-sealed").unwrap(), "", "sealed meeting's stranded plaintext re-blanked");
+        assert_eq!(
+            db.get_manual_notes("m-unsealed").unwrap(),
+            "typed but never sealed — must not be destroyed",
+            "an unsealed buffer (no blob) must NEVER be blanked — that would destroy the only copy"
+        );
     }
 
     /// Test-only builder for a correction example tied to a meeting.

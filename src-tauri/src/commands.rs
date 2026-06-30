@@ -788,6 +788,65 @@ pub fn update_note(
     })
 }
 
+/// brain2 realtime typed @brain notes — persist the user's free-text notes typed DURING a meeting
+/// (the FE autosaves the whole buffer here). The buffer (a) feeds the in-meeting brain's system
+/// prompt while recording and (b) is folded into the finalized note at summarize time.
+///
+/// READ/WRITE-GATE: refuse to write a sealed-and-not-session-unlocked meeting's buffer
+/// (`AppError::Locked`). Its content is blanked while sealed, and an ungated write would resurrect
+/// typed plaintext at rest behind the lock. Fail closed — mirrors `update_note`'s D4 gate.
+#[tauri::command]
+pub fn save_manual_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    text: String,
+) -> Result<(), AppError> {
+    save_manual_notes_inner(state.inner(), &meeting_id, &text)
+}
+
+/// Inner of [`save_manual_notes`] taking `&AppState` (so the gate is unit-testable without a
+/// `tauri::State`). GATED: a sealed-and-not-session-unlocked meeting is refused with
+/// `AppError::Locked` (mirrors `update_note`'s D4 write-gate — never resurrect typed plaintext
+/// behind a lock).
+pub(crate) fn save_manual_notes_inner(
+    state: &AppState,
+    meeting_id: &str,
+    text: &str,
+) -> Result<(), AppError> {
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to edit your notes".into(),
+        ));
+    }
+    state.db.set_manual_notes(meeting_id, text)?;
+    // PII rule: log only the meeting id + buffer length, never the typed text.
+    tracing::debug!(target: "notes", meeting_id = %meeting_id, len = text.len(), "manual notes saved");
+    Ok(())
+}
+
+/// brain2 realtime typed @brain notes — read the meeting's live typed-notes buffer (the FE rehydrates
+/// the editor from this). GATED by `meeting_is_unlocked`: a sealed-and-not-session-unlocked meeting
+/// returns "" (mask — never leak the buffer), exactly like the masked detail DTO drops note/segments.
+#[tauri::command]
+pub fn get_manual_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<String, AppError> {
+    get_manual_notes_inner(state.inner(), &meeting_id)
+}
+
+/// Inner of [`get_manual_notes`] taking `&AppState` (unit-testable gate). A sealed-and-not-session-
+/// unlocked meeting returns "" (masked) — its buffer is never surfaced.
+pub(crate) fn get_manual_notes_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<String, AppError> {
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Ok(String::new()); // sealed-not-unlocked ⇒ masked, never the stored buffer.
+    }
+    state.db.get_manual_notes(meeting_id)
+}
+
 /// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
 #[tauri::command]
 pub fn search_meetings(
@@ -4278,6 +4337,24 @@ fn seal_meeting_extras(
     if let Some(enc) = seal_audio_at_rest(ck, sys, &aad_audio_role(mid, folder_id, StreamRole::Sys))? {
         state.db.set_meeting_sys_master_path(mid, Some(&enc))?;
     }
+
+    // brain2 realtime notes: SEAL the user's typed in-meeting notes (USER-AUTHORED PRIMARY content)
+    // exactly like the timeline — encrypt the plaintext under the folder CK, VERIFY it decrypts back
+    // byte-identical (verify-before-destroy), then blank the plaintext. NEVER blanked without the
+    // sealed copy, and reversed by the matching unseal (session-unlock / remove-lock). An empty
+    // buffer ⇒ nothing to seal (blob stays NULL); an already-sealed buffer (blank text) is skipped.
+    if let Some(rn) = state.db.raw_manual_notes(mid)? {
+        if !rn.text.is_empty() {
+            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
+            let blob = crate::crypto::encrypt(ck, rn.text.as_bytes(), &aad)?;
+            if crate::crypto::decrypt(ck, &blob, &aad)? != rn.text.as_bytes() {
+                return Err(AppError::Storage(
+                    "manual-notes seal verification failed (blob mismatch)".into(),
+                ));
+            }
+            state.db.seal_manual_notes(mid, &blob)?;
+        }
+    }
     Ok(())
 }
 
@@ -4302,6 +4379,17 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
                 let data = String::from_utf8(pt)
                     .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
                 state.db.restore_timeline_data(mid, &data)?;
+            }
+        }
+        // Typed notes: decrypt the sealed blob back into the plaintext column for the session (the
+        // blob is kept — the folder is still locked on disk). Mirrors the timeline unseal.
+        if let Some(rn) = state.db.raw_manual_notes(mid)? {
+            if let Some(blob) = &rn.blob {
+                let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
+                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+                let text = String::from_utf8(pt)
+                    .map_err(|_| AppError::Storage("decrypted manual notes is not valid UTF-8".into()))?;
+                state.db.set_manual_notes(mid, &text)?;
             }
         }
         // Audio at rest: materialize a playable WAV for the session (playback + both masters), each
@@ -4341,6 +4429,13 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
         if let Some(tl) = state.db.raw_timeline(&mid)? {
             if tl.data_blob.is_some() && !tl.data.is_empty() {
                 state.db.restore_timeline_data(&mid, "")?;
+            }
+        }
+        // Typed notes: re-blank the plaintext ONLY when the sealed blob exists (never destroy the
+        // only copy). Mirrors the timeline reblank.
+        if let Some(rn) = state.db.raw_manual_notes(&mid)? {
+            if rn.blob.is_some() && !rn.text.is_empty() {
+                state.db.set_manual_notes(&mid, "")?;
             }
         }
         if let Some(enc) = reblank_audio(state.db.get_meeting(&mid)?.and_then(|m| m.audio_path))? {
@@ -4390,6 +4485,20 @@ fn unseal_folder_extras_permanent(
             }
         }
         state.db.clear_timeline_blob(&mid)?;
+
+        // Typed notes: permanently restore the plaintext from the blob (or keep the in-memory
+        // plaintext if the folder was session-unlocked and the blob is absent), then clear the blob.
+        // NEVER lose the typed notes — the plaintext is back before the blob is dropped.
+        if let Some(rn) = state.db.raw_manual_notes(&mid)? {
+            if let Some(blob) = &rn.blob {
+                let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "manual_notes");
+                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+                let text = String::from_utf8(pt)
+                    .map_err(|_| AppError::Storage("decrypted manual notes is not valid UTF-8".into()))?;
+                state.db.set_manual_notes(&mid, &text)?;
+            }
+        }
+        state.db.clear_manual_notes_blob(&mid)?;
 
         // Audio at rest: permanently restore the playback WAV + both masters from their .enc, each
         // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts); the
@@ -4954,6 +5063,111 @@ mod lifecycle_tests {
             created_at: "2026-06-27T08:00:00Z".to_string(),
         })
         .unwrap();
+    }
+
+    /// brain2 realtime notes: with the meeting in an OPEN folder (or no folder) the gate is open, so
+    /// `save`/`get` round-trip the buffer.
+    #[test]
+    fn manual_notes_save_get_round_trip_when_unlocked() {
+        let state = build_state("manual-notes-open");
+        seed_meeting(&state.db, "m1", "note", None); // no folder ⇒ always open
+
+        get_manual_notes_inner(&state, "m1").map(|s| assert_eq!(s, "")).unwrap();
+        save_manual_notes_inner(&state, "m1", "ship Friday; Anna owns QA").unwrap();
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "ship Friday; Anna owns QA",
+            "open-folder buffer round-trips through the gated commands"
+        );
+    }
+
+    /// LOCK-GATE: on a sealed-and-NOT-session-unlocked meeting, `save_manual_notes` is refused with
+    /// `AppError::Locked` (never resurrect typed plaintext behind a lock) and `get_manual_notes`
+    /// returns "" (masked) EVEN THOUGH the column still holds content — never leaking the buffer.
+    /// Unlocking the folder restores both read and write.
+    #[test]
+    fn manual_notes_save_refused_and_get_masked_when_sealed() {
+        let state = build_state("manual-notes-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "note", Some("f-lock"));
+        // The buffer holds content at rest (e.g. typed pre-seal); the gate must mask/refuse it.
+        state.db.set_manual_notes("m1", "secret typed plaintext").unwrap();
+        // Seal the folder (locked, NOT in the session unlock set).
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        // WRITE is refused with Locked.
+        let err = save_manual_notes_inner(&state, "m1", "new secret").unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)), "sealed write must be AppError::Locked, got {err:?}");
+        // The refused write left the stored buffer untouched.
+        assert_eq!(state.db.get_manual_notes("m1").unwrap(), "secret typed plaintext", "refused write must not mutate");
+        // READ is masked to "" despite the column holding content.
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "",
+            "sealed-not-unlocked read must mask the buffer, never leak it"
+        );
+
+        // Session-unlock the folder ⇒ both read and write work again.
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        assert_eq!(get_manual_notes_inner(&state, "m1").unwrap(), "secret typed plaintext");
+        save_manual_notes_inner(&state, "m1", "edited after unlock").unwrap();
+        assert_eq!(get_manual_notes_inner(&state, "m1").unwrap(), "edited after unlock");
+    }
+
+    /// COUNTEREXAMPLE A (verify-before-destroy): the user's typed notes SURVIVE a real lock→unlock
+    /// cycle — SEALED under the folder CK (plaintext blanked, blob present) on lock, RESTORED
+    /// byte-identical on unlock. Drives the PRODUCTION seal (`lock_folder_inner` →
+    /// `seal_meeting_extras`) and unseal (`unseal_folder_extras`), so the typed notes are never
+    /// blanked-and-lost. RED on the prior blank-on-seal code (no blob → nothing to restore).
+    #[test]
+    fn manual_notes_survive_lock_unlock_cycle_sealed_and_restored() {
+        let state = build_state("manual-notes-seal-cycle");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        let typed = "zażółć 🔒 DECISION: ship Friday; Anna owns QA sign-off";
+        state.db.set_manual_notes("m1", typed).unwrap();
+
+        // LOCK → production seal: plaintext blanked at rest, manual_notes_blob present.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let sealed = state.db.raw_manual_notes("m1").unwrap().unwrap();
+        assert_eq!(sealed.text, "", "typed notes plaintext blanked while sealed");
+        assert!(sealed.blob.is_some(), "typed notes sealed under the folder CK (blob present)");
+
+        // UNLOCK (mirror unlock_folder's internals): KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            typed,
+            "typed notes restored byte-identical on unlock — sealed-and-restored, never lost"
+        );
+    }
+
+    /// REMOVE-LOCK: permanently removing a folder's lock decrypts the typed notes back to plaintext
+    /// and clears the blob — the typed notes are NEVER lost.
+    #[test]
+    fn manual_notes_survive_remove_lock_permanently() {
+        let state = build_state("manual-notes-remove-lock");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        let typed = "permanent: revisit auth next sprint";
+        state.db.set_manual_notes("m1", typed).unwrap();
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.raw_manual_notes("m1").unwrap().unwrap().text, "", "blanked while sealed");
+
+        // Cache the KEK for remove_lock (it reads the gated master KEK), then permanently remove.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+
+        let rn = state.db.raw_manual_notes("m1").unwrap().unwrap();
+        assert_eq!(rn.text, typed, "typed notes permanently restored to plaintext on remove-lock");
+        assert!(rn.blob.is_none(), "manual_notes_blob cleared on remove-lock");
     }
 
     /// BLK-1: hammer the off-thread `relock_all_inner` (the blanker) WHILE `remove_lock_inner` runs
