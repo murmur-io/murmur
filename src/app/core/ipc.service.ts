@@ -19,6 +19,7 @@ import type {
   CalendarContext,
   ChatTurn,
   DigestResult,
+  DocumentInfo,
   EntityDetail,
   Folder,
   FolderNode,
@@ -295,6 +296,49 @@ export class IpcService {
   /** Detail for one entity: the entity + its visible backlinked meetings + top neighbors. */
   getEntityDetail(entityId: string): Promise<EntityDetail> {
     return invoke<EntityDetail>("get_entity_detail", { entityId });
+  }
+
+  // ── brain2 documents — expand the brain with imported .md/.txt files ────
+
+  /**
+   * Import a `.md`/`.txt` document into `folderId` to expand the brain: the
+   * backend reads it as UTF-8 text, stores it, and (when the on-device embedding
+   * model is present) indexes it into the vector layer. Resolves with the new
+   * document id. Rejects with `AppError::Locked` when the folder is
+   * sealed-and-NOT-session-unlocked (never resurrect plaintext behind a lock),
+   * and with `AppError::InvalidArg` for a non-`.md`/`.txt` or unreadable file —
+   * surface both as friendly messages. The path comes from the native file
+   * dialog (`@tauri-apps/plugin-dialog` `open`); only `.md`/`.txt` are accepted.
+   */
+  importDocument(path: string, folderId: string): Promise<string> {
+    return invoke<string>("import_document", { path, folderId });
+  }
+
+  /**
+   * A folder's documents (metadata only — name + created_at; NO text). GATED
+   * server-side: a sealed-and-NOT-session-unlocked folder returns an EMPTY array
+   * (masked — never even a document name behind the lock), so re-fetch on a
+   * FoldersService lock-state change to drop masked docs live.
+   */
+  listDocuments(folderId: string): Promise<DocumentInfo[]> {
+    return invoke<DocumentInfo[]>("list_documents", { folderId });
+  }
+
+  /**
+   * Read ONE document's full text. GATED: a sealed-and-NOT-session-unlocked
+   * folder returns "" (masked — never the stored text), like `getManualNotes`.
+   */
+  getDocument(id: string): Promise<string> {
+    return invoke<string>("get_document", { id });
+  }
+
+  /**
+   * Permanently delete a document (cascade-deletes its chunks + vectors). GATED:
+   * a sealed-and-NOT-session-unlocked folder is refused (`AppError::Locked`);
+   * an unknown id is an idempotent no-op.
+   */
+  deleteDocument(id: string): Promise<void> {
+    return invoke<void>("delete_document", { id });
   }
 
   /** Ask-My-Vault: grounded Q&A across ALL meetings, with source meetings. */
