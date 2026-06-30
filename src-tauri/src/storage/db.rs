@@ -372,6 +372,33 @@ impl Db {
         // deliberately separate from note_chunks so the load-bearing meeting-gating joins stay
         // untouched. Additive + guarded so migrate() stays idempotent.
         Self::migrate_documents(&conn)?;
+        // Phase 2b — content-free egress audit log. One row per cloud provider call written by
+        // `DbEgressSink`. The table carries ONLY counts, ids, labels, byte sizes, and token counts —
+        // NEVER transcript, prompt, scrubbed values, API keys, or any meeting content (§8: no PII
+        // in logs). Additive + guarded so migrate() stays idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS egress_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               ts INTEGER NOT NULL,
+               provider_id TEXT NOT NULL,
+               destination TEXT NOT NULL,
+               model_requested TEXT,
+               model_served TEXT,
+               call_kind TEXT NOT NULL,
+               prompt_tokens INTEGER,
+               completion_tokens INTEGER,
+               total_tokens INTEGER,
+               cached_tokens INTEGER,
+               redactions_email INTEGER NOT NULL DEFAULT 0,
+               redactions_card INTEGER NOT NULL DEFAULT 0,
+               redactions_phone INTEGER NOT NULL DEFAULT 0,
+               redactions_name INTEGER NOT NULL DEFAULT 0,
+               system_bytes INTEGER NOT NULL DEFAULT 0,
+               user_bytes INTEGER NOT NULL DEFAULT 0,
+               meeting_id TEXT
+             );",
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -607,6 +634,49 @@ impl Db {
         let conn = self.lock();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(map_err)
+    }
+
+    // ── egress audit log ────────────────────────────────────────────────────
+
+    /// Insert one content-free audit row into `egress_log`. Called by `DbEgressSink::record`.
+    ///
+    /// `ts` is a Unix epoch (seconds) computed by the caller (`SystemTime::now()`). The row
+    /// carries ONLY counts, ids, labels, byte sizes, and token counts — NO content (§8).
+    pub fn insert_egress(
+        &self,
+        ts: i64,
+        e: &crate::summarize::egress_log::EgressEntry,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO egress_log (
+               ts, provider_id, destination, model_requested, model_served, call_kind,
+               prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+               redactions_email, redactions_card, redactions_phone, redactions_name,
+               system_bytes, user_bytes, meeting_id
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            rusqlite::params![
+                ts,
+                e.provider_id,
+                e.destination,
+                e.model_requested,
+                e.meta.model_served.as_deref(),
+                e.call_kind,
+                e.meta.prompt_tokens.map(|v| v as i64),
+                e.meta.completion_tokens.map(|v| v as i64),
+                e.meta.total_tokens.map(|v| v as i64),
+                e.meta.cached_tokens.map(|v| v as i64),
+                e.redactions.email as i64,
+                e.redactions.card as i64,
+                e.redactions.phone as i64,
+                e.redactions.name as i64,
+                e.system_bytes as i64,
+                e.user_bytes as i64,
+                e.meeting_id.as_deref(),
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     // ── correction-log flywheel ──────────────────────────────────────────────
@@ -4197,6 +4267,77 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    // ── Phase 2b: egress_log ─────────────────────────────────────────────────
+
+    fn sample_egress_entry() -> crate::summarize::egress_log::EgressEntry {
+        use crate::summarize::egress_log::EgressEntry;
+        use crate::summarize::meta::{CallMeta, RedactionCounts};
+        EgressEntry {
+            provider_id: "anthropic".to_string(),
+            destination: "api.anthropic.com".to_string(),
+            model_requested: "claude-opus-4-8".to_string(),
+            call_kind: "complete",
+            meta: CallMeta {
+                model_served: Some("claude-opus-4-8-20251001".to_string()),
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                total_tokens: Some(150),
+                cached_tokens: None,
+            },
+            redactions: RedactionCounts { email: 1, card: 0, phone: 1, name: 2 },
+            system_bytes: 512,
+            user_bytes: 1024,
+            meeting_id: Some("m1".to_string()),
+        }
+    }
+
+    /// After migrate(), `egress_log` exists; insert_egress then SELECT COUNT(*) == 1.
+    #[test]
+    fn egress_log_table_exists_after_migrate_and_insert_works() {
+        let db = mem_db();
+        let entry = sample_egress_entry();
+        db.insert_egress(1_700_000_000, &entry).unwrap();
+
+        let conn = db.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM egress_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "one row must have been inserted into egress_log");
+    }
+
+    /// migrate() is idempotent even with the new egress_log table (re-running migrate() on an
+    /// already-migrated DB must not error).
+    #[test]
+    fn egress_log_migrate_idempotent() {
+        let db = mem_db(); // migrate() already ran once
+        db.migrate().unwrap(); // second run must succeed
+    }
+
+    /// insert_egress stores token counts and redaction counts correctly.
+    #[test]
+    fn egress_log_insert_round_trips_counts() {
+        let db = mem_db();
+        let entry = sample_egress_entry();
+        db.insert_egress(9999, &entry).unwrap();
+
+        let conn = db.lock();
+        let (ts, prompt_tokens, redactions_email, redactions_name, system_bytes): (
+            i64, Option<i64>, i64, i64, i64,
+        ) = conn
+            .query_row(
+                "SELECT ts, prompt_tokens, redactions_email, redactions_name, system_bytes
+                   FROM egress_log LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(ts, 9999);
+        assert_eq!(prompt_tokens, Some(100));
+        assert_eq!(redactions_email, 1);
+        assert_eq!(redactions_name, 2);
+        assert_eq!(system_bytes, 512);
     }
 
     /// brain2 realtime notes: the `manual_notes` buffer round-trips (set → get), defaults to "" for a

@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use regex::Regex;
 
 use crate::error::Result;
+use crate::summarize::egress_log::{EgressEntry, EgressSink, NoopEgressSink};
+use crate::summarize::meta::{CallMeta, RedactionCounts};
 use crate::summarize::provider::{Availability, SummarizeRequest, SummarizerProvider};
 
 // ── Phase D model plumbing (shared by the runtime-selected redactor + the download command) ──────
@@ -269,35 +271,99 @@ fn apply(
     .into_owned()
 }
 
-/// Provider decorator: redacts PII from inputs, restores it in outputs.
+/// Count redaction placeholders by kind from the regex map and the name-pair count.
+///
+/// The regex map keys are of the form `⟪EMAIL_n⟫`, `⟪CARD_n⟫`, `⟪PHONE_n⟫` (one entry per
+/// UNIQUE matched value — duplicates reuse the same token). Iterate once and bucket by prefix.
+/// `name_count` is the number of name pairs returned by the `NameRedactor` (one per unique name).
+fn count_redactions(map: &HashMap<String, String>, name_count: usize) -> RedactionCounts {
+    let mut counts = RedactionCounts { name: name_count as u32, ..Default::default() };
+    for key in map.keys() {
+        // Keys are `⟪KIND_n⟫`; strip the leading `⟪` (U+27EA) and match on the suffix.
+        let inner = key.trim_start_matches('\u{27ea}');
+        if inner.starts_with("EMAIL") {
+            counts.email += 1;
+        } else if inner.starts_with("CARD") {
+            counts.card += 1;
+        } else if inner.starts_with("PHONE") {
+            counts.phone += 1;
+        }
+    }
+    counts
+}
+
+/// Provider decorator: redacts PII from inputs, restores it in outputs, and records a
+/// content-free egress audit entry per call.
 ///
 /// Two layers, both restored in the reply: the always-on regex scrubbers (emails/cards/phones,
 /// via [`redact`]/[`restore`]) and the [`NameRedactor`] seam. The name layer defaults to
 /// [`NoopNameRedactor`] (`new`), so production egress is byte-identical until a real NER model is
 /// installed via [`with_name_redactor`](RedactingProvider::with_name_redactor).
+///
+/// The egress audit sink defaults to [`NoopEgressSink`] in `new`/`with_name_redactor`, preserving
+/// byte-identical behaviour for all existing callers and tests. `with_name_redactor_and_sink` is
+/// the full constructor used by `make_provider` to wire the live `DbEgressSink`.
 pub struct RedactingProvider {
     inner: Arc<dyn SummarizerProvider>,
     names: Arc<dyn NameRedactor>,
+    /// Stable provider id forwarded into every `EgressEntry`, e.g. `"anthropic"`.
+    provider_id: String,
+    /// Non-PII destination label, e.g. `"api.anthropic.com"` or `"claude_code (Anthropic CLI)"`.
+    destination: String,
+    /// Model id that was requested from config (may differ from `model_served` in the response).
+    model_requested: String,
+    /// Sink that receives one content-free audit row per call. `NoopEgressSink` by default.
+    sink: Arc<dyn EgressSink>,
 }
 
 impl RedactingProvider {
-    /// Wrap `inner` with the regex firewall and the DEFAULT (no-op) name redactor. Name egress is
-    /// unchanged — this is the production constructor.
+    /// Wrap `inner` with the regex firewall and the DEFAULT (no-op) name redactor and NO-OP sink.
+    /// Name egress and audit logging are unchanged — this is the back-compat constructor; all
+    /// existing callers and tests are unaffected.
     pub fn new(inner: Arc<dyn SummarizerProvider>) -> Self {
         Self {
+            provider_id: inner.id().to_string(),
+            destination: String::new(),
+            model_requested: String::new(),
             inner,
             names: Arc::new(NoopNameRedactor),
+            sink: Arc::new(NoopEgressSink),
         }
     }
 
     /// Wrap `inner` with the regex firewall and an EXPLICIT name redactor (Phase 3b drop-in /
     /// tests). The name layer scrubs before egress and restores in the reply, alongside the regex
-    /// layer.
+    /// layer. Sink defaults to no-op — back-compat for all existing call sites.
     pub fn with_name_redactor(
         inner: Arc<dyn SummarizerProvider>,
         names: Arc<dyn NameRedactor>,
     ) -> Self {
-        Self { inner, names }
+        Self {
+            provider_id: inner.id().to_string(),
+            destination: String::new(),
+            model_requested: String::new(),
+            inner,
+            names,
+            sink: Arc::new(NoopEgressSink),
+        }
+    }
+
+    /// Full constructor used by `make_provider`: regex firewall + name redactor + egress sink.
+    ///
+    /// - `sink` receives one content-free [`EgressEntry`] per call (counts + meta, NO content).
+    /// - `provider_id` / `destination` / `model_requested` are forwarded into every entry.
+    ///
+    /// Existing tests and callers that use `new`/`with_name_redactor` are byte-identical —
+    /// only `make_provider` wires the live `DbEgressSink` through this path.
+    pub fn with_name_redactor_and_sink(
+        inner: Arc<dyn SummarizerProvider>,
+        names: Arc<dyn NameRedactor>,
+        sink: Arc<dyn EgressSink>,
+        provider_id: String,
+        destination: String,
+        model_requested: String,
+    ) -> Self {
+        Self { inner, names, sink, provider_id, destination, model_requested }
     }
 }
 
@@ -312,6 +378,20 @@ impl SummarizerProvider for RedactingProvider {
     }
 
     async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+        let (text, _meta) = self.summarize_with_meta(req).await?;
+        Ok(text)
+    }
+
+    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let (text, _meta) = self.complete_with_meta(system, user).await?;
+        Ok(text)
+    }
+
+    /// Redact inputs, call inner provider (capturing `CallMeta`), restore outputs, record egress.
+    async fn summarize_with_meta(
+        &self,
+        req: &SummarizeRequest,
+    ) -> Result<(String, CallMeta)> {
         // Shared regex map across the transcript AND the Phase-4 `related_context` so a value
         // redacted in either restores consistently in the reply. With `related_context = None`
         // (the default + flag-OFF case) the map is built from the transcript alone, exactly as the
@@ -332,29 +412,68 @@ impl SummarizerProvider for RedactingProvider {
             name_pairs.extend(more);
             c2
         });
+        // Byte sizes of the REDACTED content (sizes, never the text itself).
+        let user_bytes = red_transcript.len()
+            + red_related.as_ref().map(|c| c.len()).unwrap_or(0);
         let mut r = req.clone();
         r.transcript = red_transcript;
         r.related_context = red_related;
-        let out = self.inner.summarize(&r).await?;
+        let (out, meta) = self.inner.summarize_with_meta(&r).await?;
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
-        Ok(restore(&out, &map))
+        let out = restore(&out, &map);
+        // Count PII placeholders by prefix in the redaction map + name pairs length.
+        let redactions = count_redactions(&map, name_pairs.len());
+        self.sink.record(EgressEntry {
+            provider_id: self.provider_id.clone(),
+            destination: self.destination.clone(),
+            model_requested: self.model_requested.clone(),
+            call_kind: "summarize",
+            meta: meta.clone(),
+            redactions,
+            system_bytes: 0, // summarize has no separate system prompt
+            user_bytes,
+            meeting_id: None,
+        });
+        Ok((out, meta))
     }
 
-    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+    /// Redact inputs, call inner provider (capturing `CallMeta`), restore outputs, record egress.
+    async fn complete_with_meta(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> Result<(String, CallMeta)> {
         // Shared map so a value redacted in either prompt restores consistently.
         let mut map = HashMap::new();
         let mut rev = HashMap::new();
         let rsys = redact_into(system, &mut map, &mut rev);
         let ruser = redact_into(user, &mut map, &mut rev);
+        // Byte sizes of the REDACTED content (sizes, never the text itself).
+        let system_bytes = rsys.len();
+        let user_bytes = ruser.len();
         // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
         // the same name to the same token across both prompts, so the merged pairs restore cleanly.
         let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
         let (ruser, more) = self.names.redact_names(&ruser);
         name_pairs.extend(more);
-        let out = self.inner.complete(&rsys, &ruser).await?;
+        let (out, meta) = self.inner.complete_with_meta(&rsys, &ruser).await?;
         let out = restore_names(&out, &name_pairs);
-        Ok(restore(&out, &map))
+        let out = restore(&out, &map);
+        // Count PII placeholders by prefix in the redaction map + name pairs length.
+        let redactions = count_redactions(&map, name_pairs.len());
+        self.sink.record(EgressEntry {
+            provider_id: self.provider_id.clone(),
+            destination: self.destination.clone(),
+            model_requested: self.model_requested.clone(),
+            call_kind: "complete",
+            meta: meta.clone(),
+            redactions,
+            system_bytes,
+            user_bytes,
+            meeting_id: None,
+        });
+        Ok((out, meta))
     }
 }
 
@@ -627,5 +746,126 @@ mod tests {
             .unwrap();
         assert!(!out.contains("NAME_"));
         assert_eq!(out.matches("Anna Kowalska").count(), 2);
+    }
+
+    // ── Phase 2b — egress ledger ─────────────────────────────────────────────
+
+    /// `CaptureEgressSink` captures every `EgressEntry` for assertion in tests.
+    struct CaptureEgressSink(std::sync::Arc<std::sync::Mutex<Vec<crate::summarize::egress_log::EgressEntry>>>);
+
+    impl crate::summarize::egress_log::EgressSink for CaptureEgressSink {
+        fn record(&self, entry: crate::summarize::egress_log::EgressEntry) {
+            self.0.lock().unwrap().push(entry);
+        }
+    }
+
+    /// `EchoMetaProvider` — like `EchoProvider` but returns a fixed `CallMeta` from `*_with_meta`.
+    struct EchoMetaProvider;
+
+    #[async_trait]
+    impl SummarizerProvider for EchoMetaProvider {
+        fn id(&self) -> &str { "echo-meta" }
+        async fn availability(&self) -> Availability { Availability::Available }
+        async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+            Ok(req.transcript.clone())
+        }
+        async fn complete(&self, system: &str, user: &str) -> Result<String> {
+            Ok(format!("{system}\n---\n{user}"))
+        }
+        async fn summarize_with_meta(&self, req: &SummarizeRequest) -> Result<(String, crate::summarize::meta::CallMeta)> {
+            use crate::summarize::meta::CallMeta;
+            Ok((req.transcript.clone(), CallMeta {
+                model_served: Some("claude-opus-4-8-test".to_string()),
+                prompt_tokens: Some(42),
+                completion_tokens: Some(13),
+                total_tokens: Some(55),
+                cached_tokens: None,
+            }))
+        }
+        async fn complete_with_meta(&self, system: &str, user: &str) -> Result<(String, crate::summarize::meta::CallMeta)> {
+            use crate::summarize::meta::CallMeta;
+            Ok((format!("{system}\n---\n{user}"), CallMeta {
+                model_served: Some("claude-opus-4-8-test".to_string()),
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                total_tokens: Some(15),
+                cached_tokens: None,
+            }))
+        }
+    }
+
+    /// The content-free proof: an EgressEntry records counts + meta but NOT the input content.
+    ///
+    /// Build a `RedactingProvider::with_name_redactor_and_sink` wrapping `EchoMetaProvider`;
+    /// feed input containing one email + one phone. Assert:
+    /// - ONE entry was recorded with `redactions.email == 1`, `redactions.phone == 1`.
+    /// - `CallMeta` propagated (prompt_tokens == 10 for `complete`).
+    /// - `format!("{:?}", entry)` contains NEITHER the email string NOR the note text.
+    #[test]
+    fn egress_entry_is_content_free_and_captures_meta_and_counts() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::new(CaptureEgressSink(captured.clone()));
+        let prov = RedactingProvider::with_name_redactor_and_sink(
+            Arc::new(EchoMetaProvider),
+            Arc::new(NoopNameRedactor),
+            sink,
+            "anthropic".to_string(),
+            "api.anthropic.com".to_string(),
+            "claude-opus-4-8".to_string(),
+        );
+        let note_text = "Meeting about the Atlas project — please contact alice@corp.example and call +1 800 555 0100.";
+        block_on(prov.complete("You are a helpful assistant.", note_text)).unwrap();
+
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 1, "exactly one egress entry per call");
+        let entry = &entries[0];
+
+        // Counts correct:
+        assert_eq!(entry.redactions.email, 1, "one email was scrubbed");
+        assert_eq!(entry.redactions.phone, 1, "one phone was scrubbed");
+        assert_eq!(entry.redactions.card, 0);
+        assert_eq!(entry.redactions.name, 0); // no-op name redactor
+
+        // CallMeta propagated:
+        assert_eq!(entry.meta.prompt_tokens, Some(10));
+        assert_eq!(entry.meta.model_served.as_deref(), Some("claude-opus-4-8-test"));
+
+        // call_kind:
+        assert_eq!(entry.call_kind, "complete");
+
+        // THE CONTENT-FREE INVARIANT: the Debug output must contain neither the email nor note text.
+        let debug = format!("{:?}", entry);
+        assert!(
+            !debug.contains("alice@corp.example"),
+            "email must NOT appear in egress entry debug: {debug}"
+        );
+        assert!(
+            !debug.contains("Atlas project"),
+            "note text must NOT appear in egress entry debug: {debug}"
+        );
+        // Only non-PII metadata present:
+        assert!(debug.contains("api.anthropic.com"), "destination label is non-PII");
+    }
+
+    /// The default `with_name_redactor` path records to a NoopEgressSink — no panic, no row.
+    #[test]
+    fn default_constructor_records_to_noop_sink_no_panic() {
+        let prov = RedactingProvider::with_name_redactor(
+            Arc::new(EchoProvider),
+            Arc::new(NoopNameRedactor),
+        );
+        // Must not panic; sink is no-op so nothing is written anywhere.
+        block_on(prov.complete("sys", "user content alice@example.com")).unwrap();
+    }
+
+    /// `count_redactions` correctly buckets email/card/phone from the redaction map keys.
+    #[test]
+    fn count_redactions_buckets_by_kind() {
+        let (_, map) = redact("Email bob@acme.com, card 4111111111111111, phone +1-800-555-0100.");
+        let counts = count_redactions(&map, 3 /* simulate 3 name pairs */);
+        assert_eq!(counts.email, 1);
+        assert_eq!(counts.card, 1);
+        assert_eq!(counts.phone, 1);
+        assert_eq!(counts.name, 3);
     }
 }
