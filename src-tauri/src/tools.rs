@@ -196,9 +196,18 @@ pub fn execute_tool(
                 Ok(v) => v.into_iter().next().unwrap_or_default(),
                 Err(e) => return Err(AppError::Summarize(format!("embed failed: {e}"))),
             };
+            // Document ingestion: ALSO surface uploaded md/txt that match — gated by
+            // `search_doc_chunks_visible` (the SAME `visibility_clause` against `unlocked`), so a
+            // locked-and-not-unlocked folder's documents are invisible here exactly like a sealed
+            // meeting. Append them as a `DOCUMENTS:` section so the model can ground on them too.
+            let docs = db
+                .search_doc_chunks_visible(&query_vec, 20, unlocked)
+                .unwrap_or_default();
             match db.search_hybrid_visible(q, &query_vec, 20, unlocked) {
-                Ok(hits) if hits.is_empty() => Ok(format!("No meetings match \"{q}\".")),
-                Ok(hits) => Ok(format_hits(&hits)),
+                Ok(hits) if hits.is_empty() && docs.is_empty() => {
+                    Ok(format!("No meetings or documents match \"{q}\"."))
+                }
+                Ok(hits) => Ok(format_hits_and_docs(&hits, &docs)),
                 Err(e) => Err(AppError::Storage(format!("semantic search failed: {e}"))),
             }
         }
@@ -445,6 +454,33 @@ fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Format meeting hits + gated document-chunk hits (the document-ingestion search leg). Documents are
+/// NOT meetings (no id/date citation), so they get their own `DOCUMENTS:` section listing the source
+/// name + snippet. Both inputs are already visibility-gated by the caller.
+fn format_hits_and_docs(
+    hits: &[crate::storage::models::SearchHit],
+    docs: &[crate::storage::models::DocChunkHit],
+) -> String {
+    let mut out = String::new();
+    if !hits.is_empty() {
+        out.push_str(&format_hits(hits));
+    }
+    if !docs.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("DOCUMENTS:\n");
+        out.push_str(
+            &docs
+                .iter()
+                .map(|d| format!("- {} — {}", d.name, d.snippet))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    out
 }
 
 /// THE one gated, egress-aware tool executor shared by the agentic loop (cloud + local, voice + text).

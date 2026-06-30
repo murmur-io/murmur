@@ -100,7 +100,48 @@ pub fn build_vault_context_hybrid_visible(
     if meetings.is_empty() {
         meetings = db.list_meetings_visible(30, unlocked)?;
     }
-    pack_meetings(db, meetings, budget, unlocked)
+    let (mut corpus, sources) = pack_meetings(db, meetings, budget, unlocked)?;
+    // Document ingestion: APPEND a gated `## Documents` section so the brain/Ask can also ground on
+    // uploaded md/txt. `search_doc_chunks_visible` re-applies the SAME `visibility_clause` against
+    // `unlocked` (joined doc_chunks → documents → folders), so a sealed-and-not-session-unlocked
+    // folder's document chunks are NEVER returned — identical gate to the meeting legs. Each hit
+    // contributes its document name + the nearest chunk snippet (no meeting citation — documents are
+    // not meetings, so they don't add a `VaultSource`). Capped by the same `budget`.
+    pack_doc_chunks(db, query_vec, budget, &mut corpus, unlocked)?;
+    Ok((corpus, sources))
+}
+
+/// Append a budget-capped `## Documents` section of gated document-chunk snippets to `corpus`. The
+/// retrieval is `search_doc_chunks_visible` (KNN gated by `visibility_clause`); a locked-and-not-
+/// unlocked folder's chunks are invisible there. Best-effort: an empty doc index simply adds nothing.
+fn pack_doc_chunks(
+    db: &Db,
+    query_vec: &[f32],
+    budget: usize,
+    corpus: &mut String,
+    unlocked: &HashSet<String>,
+) -> Result<()> {
+    if query_vec.is_empty() {
+        return Ok(());
+    }
+    let hits = db.search_doc_chunks_visible(query_vec, 20, unlocked)?;
+    if hits.is_empty() {
+        return Ok(());
+    }
+    for h in hits {
+        if corpus.len() >= budget {
+            break;
+        }
+        let header = format!("\n\n### Document: {}\n", h.name);
+        let remaining = budget.saturating_sub(corpus.len() + header.len());
+        if remaining < 100 {
+            break;
+        }
+        let snippet: String = h.snippet.chars().take(remaining).collect();
+        corpus.push_str(&header);
+        corpus.push_str(&snippet);
+    }
+    Ok(())
 }
 
 /// Pack the candidate `meetings`' VISIBLE notes into a `budget`-capped corpus, each headed by a
