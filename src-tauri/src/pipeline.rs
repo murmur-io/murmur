@@ -591,7 +591,12 @@ async fn summarize_and_export(
     // does literally nothing (no embedder built, no writes). A note that is subsequently sealed into
     // a locked folder (the `SealInto` auto-file path below) has its chunks purged by the seal, so the
     // net at-rest state never carries a sealed meeting's vectors.
-    if config.semantic_search_enabled {
+    //
+    // ALSO gated on the real embed model being present (`should_auto_index`): with the flag ON but
+    // the model ABSENT, `active_embedder()` is the hash StubEmbedder (not semantic) — writing those
+    // into `vec_chunks` would pollute the index, so we skip (mirrors `reindex_embeddings`'s stub
+    // refusal). This closes the flag-on-without-model gap.
+    if should_auto_index(config.semantic_search_enabled, crate::embed::embed_model_present()) {
         let unlocked = state
             .unlocked_folders
             .lock()
@@ -924,9 +929,30 @@ fn derive_title(markdown: &str, date_iso: &str) -> String {
     format!("Meeting {date_iso}")
 }
 
+/// Whether the post-note AUTO semantic index should run: requires BOTH the master flag AND the real
+/// embed model present on disk. With the flag ON but no model, `active_embedder()` is the hash
+/// StubEmbedder (semantically meaningless) — auto-indexing it would pollute `vec_chunks` with noise,
+/// so we skip. Mirrors `reindex_embeddings`, which already refuses the stub. Pure + unit-tested.
+fn should_auto_index(semantic_enabled: bool, embed_model_present: bool) -> bool {
+    semantic_enabled && embed_model_present
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_index_requires_both_flag_and_model() {
+        // The gap this closes: flag ON but model ABSENT must NOT auto-index (would write hash-stub
+        // vectors into vec_chunks). Only flag-AND-model-present writes real vectors.
+        assert!(should_auto_index(true, true), "flag on + model present → index");
+        assert!(
+            !should_auto_index(true, false),
+            "flag on WITHOUT the model must NOT write stub vectors"
+        );
+        assert!(!should_auto_index(false, true), "flag off → never index");
+        assert!(!should_auto_index(false, false));
+    }
 
     #[test]
     fn derive_title_prefers_frontmatter() {
