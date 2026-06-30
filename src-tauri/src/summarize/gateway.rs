@@ -7,9 +7,11 @@
 //!   R3 — the API key is the GATEWAY key only; it NEVER falls back to the Anthropic key.
 //!   R4 — http:// is rejected for non-loopback URLs; validated at construction in `new()`.
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
+use crate::summarize::meta::CallMeta;
 use crate::summarize::provider::*;
 use crate::summarize::template;
 
@@ -64,6 +66,94 @@ pub(crate) fn chat_body(model: &str, system: &str, user: &str) -> Value {
         ],
         "stream": false,
     })
+}
+
+/// Minimal mirror of the OpenAI `/v1/chat/completions` success response.
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    #[serde(default)]
+    choices: Vec<ChatChoice>,
+    /// Token-usage breakdown — `None` if the gateway did not include it.
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+    /// Model id as reported in the response — may differ from the requested model.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    #[serde(default)]
+    message: Option<ChatMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Token-usage block returned by OpenAI-compatible APIs.
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    /// Nested block containing the prompt-cache hit count.
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+/// Parse a raw OpenAI-compatible `/v1/chat/completions` response body into `(text, CallMeta)`.
+///
+/// `CallMeta` is populated from `usage.{prompt_tokens,completion_tokens,total_tokens}`,
+/// `usage.prompt_tokens_details.cached_tokens`, and the top-level `model`. Any absent field
+/// degrades to `None` — a response without `usage`/`model` still parses successfully.
+pub(crate) fn parse_chat_response(body: &str) -> Result<(String, CallMeta)> {
+    let parsed: ChatCompletionResponse = serde_json::from_str(body)
+        .map_err(|e| AppError::Summarize(format!("failed to parse gateway response: {e}")))?;
+
+    let text = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message)
+        .and_then(|m| m.content)
+        .ok_or_else(|| {
+            AppError::Summarize(
+                "gateway response missing choices[0].message.content".to_string(),
+            )
+        })?;
+
+    let note = text.trim_start_matches('\u{feff}').trim();
+    if note.is_empty() {
+        return Err(AppError::Summarize(
+            "gateway response contained no text content".to_string(),
+        ));
+    }
+
+    let meta = CallMeta {
+        model_served: parsed.model.filter(|m| !m.is_empty()),
+        prompt_tokens: parsed.usage.as_ref().and_then(|u| u.prompt_tokens),
+        completion_tokens: parsed.usage.as_ref().and_then(|u| u.completion_tokens),
+        total_tokens: parsed.usage.as_ref().and_then(|u| u.total_tokens),
+        cached_tokens: parsed
+            .usage
+            .as_ref()
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens),
+    };
+
+    Ok((note.to_string(), meta))
 }
 
 /// Extract a useful error message from an OpenAI-format error envelope, or return `None` if the
@@ -125,11 +215,10 @@ impl OpenAiCompatProvider {
     }
 
     /// POST to `{base}/chat/completions`, set the `Authorization` header only when a key is
-    /// present (R3), and extract the first choice's `message.content`. Maps non-2xx responses to
+    /// present (R3), and return the raw response body text. Maps non-2xx responses to
     /// `AppError::Summarize` with the gateway's `error.message` when available.
-    async fn call(&self, system: &str, user: &str) -> Result<String> {
+    async fn post_chat(&self, system: &str, user: &str) -> Result<String> {
         let url = self.chat_endpoint()?;
-
         let body = chat_body(&self.model, system, user);
 
         let mut req = self
@@ -158,30 +247,15 @@ impl OpenAiCompatProvider {
             return Err(AppError::Summarize(format!("gateway: {}", detail.trim())));
         }
 
-        let json: Value = resp
-            .json()
+        resp.text()
             .await
-            .map_err(|e| AppError::Summarize(format!("failed to parse gateway response: {e}")))?;
+            .map_err(|e| AppError::Summarize(format!("failed to read gateway response body: {e}")))
+    }
 
-        let text = json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| {
-                AppError::Summarize(
-                    "gateway response missing choices[0].message.content".to_string(),
-                )
-            })?;
-
-        let note = text.trim_start_matches('\u{feff}').trim();
-        if note.is_empty() {
-            return Err(AppError::Summarize(
-                "gateway response contained no text content".to_string(),
-            ));
-        }
-        Ok(note.to_string())
+    /// Shared call path returning both the text and the `CallMeta`.
+    async fn call_with_meta(&self, system: &str, user: &str) -> Result<(String, CallMeta)> {
+        let body_text = self.post_chat(system, user).await?;
+        parse_chat_response(&body_text)
     }
 }
 
@@ -200,23 +274,95 @@ impl SummarizerProvider for OpenAiCompatProvider {
     }
 
     async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+        let (text, _meta) = self.summarize_with_meta(req).await?;
+        Ok(text)
+    }
+
+    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let (text, _meta) = self.call_with_meta(system, user).await?;
+        Ok(text)
+    }
+
+    async fn summarize_with_meta(
+        &self,
+        req: &SummarizeRequest,
+    ) -> Result<(String, CallMeta)> {
         let system_prompt = if req.template.trim().is_empty() {
             template::default_template()
         } else {
             req.template.clone()
         };
         let user_content = template::render_user_content(req);
-        self.call(&system_prompt, &user_content).await
+        self.call_with_meta(&system_prompt, &user_content).await
     }
 
-    async fn complete(&self, system: &str, user: &str) -> Result<String> {
-        self.call(system, user).await
+    async fn complete_with_meta(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> Result<(String, CallMeta)> {
+        self.call_with_meta(system, user).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Task 2.4 — parse_chat_response fixture tests (RED → GREEN) ─────────────────────────────
+
+    /// Full OpenAI-compat fixture with usage + model + cached_tokens.
+    const OPENAI_FIXTURE: &str = r#"{
+        "id": "chatcmpl-abc123",
+        "object": "chat.completion",
+        "created": 1677858242,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hello world" },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 13,
+            "completion_tokens": 7,
+            "total_tokens": 20,
+            "prompt_tokens_details": {
+                "cached_tokens": 4
+            }
+        }
+    }"#;
+
+    #[test]
+    fn parse_chat_response_extracts_usage_and_model() {
+        let (text, meta) = parse_chat_response(OPENAI_FIXTURE).unwrap();
+        assert_eq!(text, "Hello world");
+        assert_eq!(meta.prompt_tokens, Some(13), "prompt_tokens");
+        assert_eq!(meta.completion_tokens, Some(7), "completion_tokens");
+        assert_eq!(meta.total_tokens, Some(20), "total_tokens (API-reported)");
+        assert_eq!(meta.cached_tokens, Some(4), "prompt_tokens_details.cached_tokens");
+        assert_eq!(meta.model_served.as_deref(), Some("gpt-4o"), "model → model_served");
+    }
+
+    /// A response missing `usage` and `model` degrades gracefully.
+    #[test]
+    fn parse_chat_response_degrades_gracefully_without_usage() {
+        let body = r#"{
+            "choices": [{"message": {"content": "Minimal"}, "finish_reason": "stop"}]
+        }"#;
+        let (text, meta) = parse_chat_response(body).unwrap();
+        assert_eq!(text, "Minimal");
+        assert_eq!(meta, CallMeta::default(), "no usage/model → all None");
+    }
+
+    /// A response with no choices errors cleanly.
+    #[test]
+    fn parse_chat_response_errors_on_empty_choices() {
+        let body = r#"{"choices": []}"#;
+        assert!(
+            matches!(parse_chat_response(body), Err(AppError::Summarize(_))),
+            "empty choices must map to AppError::Summarize"
+        );
+    }
 
     #[test]
     fn loopback_detection() {
