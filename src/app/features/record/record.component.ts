@@ -15,10 +15,8 @@ import { IpcService } from "../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../core/models";
 import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
-import { AssistantActionsComponent } from "./assistant-actions.component";
-import { MeetingNotesComponent } from "./meeting-notes.component";
-import { AiOrbComponent } from "./ai-orb.component";
-import { AssistantStore } from "../../core/assistant.store";
+import { MeetingConversationComponent } from "./meeting-conversation.component";
+import { MeetingConversationStore } from "../../core/meeting-conversation.store";
 
 @Component({
   selector: "app-record",
@@ -28,9 +26,7 @@ import { AssistantStore } from "../../core/assistant.store";
     RouterLink,
     PreMeetingBriefComponent,
     MicMuteToggleComponent,
-    AssistantActionsComponent,
-    MeetingNotesComponent,
-    AiOrbComponent,
+    MeetingConversationComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
@@ -89,33 +85,139 @@ import { AssistantStore } from "../../core/assistant.store";
         </div>
       }
 
-      <!-- ── The morphing recording bar (the hero) ───────────────────────── -->
-      <div class="stage" [class.live]="store.isRecording()">
-        <!-- Meeting-app nudge: a subtle, dismissible suggestion to hit record. -->
-        @if (showNudge()) {
-          <div class="nudge" role="status">
-            <span class="nudge-dot" aria-hidden="true"></span>
-            <span class="nudge-text">
-              <strong>{{ detectedApp() }}</strong> is running — start recording?
-            </span>
-            <span class="nudge-actions">
-              <button
-                type="button"
-                class="btn btn-primary btn-sm"
-                (click)="startFromNudge()"
-              >
-                Start recording
-              </button>
-              <button
-                type="button"
-                class="btn btn-ghost btn-sm"
-                (click)="dismissNudge()"
-              >
-                Dismiss
-              </button>
-            </span>
+      <!-- ── Slim recording bar — ambient status, NOT the hero ─────────────── -->
+      @if (store.isRecording()) {
+        <!-- Recording is now ambient: a compact horizontal bar carrying the orb,
+             timer, level meter, the LIVE caption ticker, mic-mute, Ask, and Stop.
+             The conversation thread below is the hero. -->
+        <div class="rec-strip is-recording" role="status">
+          <span class="orb live" aria-hidden="true"></span>
+          <span class="timer">{{ elapsedLabel() }}</span>
+          <div class="wave" [style.--level]="store.level()" aria-hidden="true">
+            @for (b of bars; track b) {
+              <span class="wbar" [style.--i]="b"></span>
+            }
           </div>
-        }
+
+          <!-- Live caption ticker — rides inline in the strip. -->
+          <p class="cc-line" aria-live="polite">
+            @if (liveCaption(); as cc) {
+              @for (rev of [cc]; track rev) {
+                <span class="cc-text">{{ cc }}</span>
+              }
+            } @else {
+              <span class="cc-idle">Listening…</span>
+            }
+          </p>
+
+          <!-- Mic-mute: silences only the local mic; system audio keeps recording.
+               Compact (icon-only) so the strip stays uncrowded. -->
+          <app-mic-mute-toggle [compact]="true" #micToggle />
+          <!-- Ask AI — CLICK-TO-STOP voice toggle. The spoken answer lands in the
+               conversation thread below (the one home for asking mid-meeting). -->
+          <button
+            type="button"
+            class="ask-btn"
+            [class.is-listening]="assistant.listening()"
+            [disabled]="assistant.processing()"
+            (click)="toggleAsk()"
+            [attr.aria-pressed]="assistant.listening()"
+            [attr.aria-label]="
+              assistant.listening()
+                ? 'Stop listening and ask'
+                : 'Ask the AI assistant'
+            "
+          >
+            <svg
+              class="ask-ico"
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              aria-hidden="true"
+            >
+              <path
+                d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+                fill="currentColor"
+              />
+              <path
+                d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+                fill="currentColor"
+                opacity="0.85"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="stop-btn"
+            (click)="store.stop()"
+            aria-label="Stop recording"
+          >
+            <span class="stop-ico" aria-hidden="true"></span>
+          </button>
+        </div>
+      } @else {
+        <!-- Not recording — a compact start header (nudge + brief + the start
+             control). Still calm; the thread remains the main surface. -->
+        <div class="rec-strip is-idle">
+          <!-- Meeting-app nudge: a subtle, dismissible suggestion to hit record. -->
+          @if (showNudge()) {
+            <div class="nudge" role="status">
+              <span class="nudge-dot" aria-hidden="true"></span>
+              <span class="nudge-text">
+                <strong>{{ detectedApp() }}</strong> is running — start recording?
+              </span>
+              <span class="nudge-actions">
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                  (click)="startFromNudge()"
+                >
+                  Start recording
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  (click)="dismissNudge()"
+                >
+                  Dismiss
+                </button>
+              </span>
+            </div>
+          }
+
+          @if (isProcessing()) {
+            <div class="proc-inline" role="status">
+              <span class="orb proc" aria-hidden="true"></span>
+              <span class="proc-label">{{
+                store.message() || store.stage()
+              }}</span>
+              <div class="proc-track" aria-hidden="true">
+                <div class="proc-shimmer"></div>
+              </div>
+            </div>
+          } @else {
+            <button
+              type="button"
+              class="start-btn"
+              (click)="store.start()"
+              [disabled]="!canRecord()"
+            >
+              <span class="orb ready" aria-hidden="true"></span>
+              <span class="start-text">
+                {{
+                  store.stage() === "done" ? "Record again" : "Start recording"
+                }}
+              </span>
+              <span class="kbd" aria-hidden="true">⌘R</span>
+            </button>
+          }
+
+          <span class="rec-strip-hint">{{ hint() }}</span>
+          <button type="button" class="popout" (click)="popOut()">
+            Pop out
+            <span class="kbd-inline">⌘⇧R</span>
+          </button>
+        </div>
 
         <!-- Pre-meeting brief: a subtle prep affordance — only when not recording. -->
         @if (showBrief()) {
@@ -124,166 +226,16 @@ import { AssistantStore } from "../../core/assistant.store";
             (dismissed)="dismissBrief()"
           />
         }
-
-        @if (store.isRecording()) {
-          <div class="rec-bar is-recording" role="status">
-            <span class="orb live" aria-hidden="true"></span>
-            <span class="timer">{{ elapsedLabel() }}</span>
-            <div
-              class="wave"
-              [style.--level]="store.level()"
-              aria-hidden="true"
-            >
-              @for (b of bars; track b) {
-                <span class="wbar" [style.--i]="b"></span>
-              }
-            </div>
-            <!-- Mic-mute: silences only the local mic; system audio keeps
-                 recording. Sits beside Stop but never starts/stops anything.
-                 Compact (icon-only) so the pill stays uncrowded; the descriptive
-                 "still capturing others" copy rides the stage hint below. -->
-            <app-mic-mute-toggle [compact]="true" #micToggle />
-            <!-- Ask AI — CLICK-TO-STOP toggle. First click opens the voice-command
-                 listener (no wake phrase); a SECOND click stops it so the full
-                 utterance is dispatched (→ processing). Pulses while listening.
-                 The spoken answer lands in the assistant-actions card below. -->
-            <button
-              type="button"
-              class="ask-btn"
-              [class.is-listening]="assistant.listening()"
-              [disabled]="assistant.processing()"
-              (click)="toggleAsk()"
-              [attr.aria-pressed]="assistant.listening()"
-              [attr.aria-label]="
-                assistant.listening()
-                  ? 'Stop listening and ask'
-                  : 'Ask the AI assistant'
-              "
-            >
-              <svg
-                class="ask-ico"
-                viewBox="0 0 24 24"
-                width="20"
-                height="20"
-                aria-hidden="true"
-              >
-                <path
-                  d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
-                  fill="currentColor"
-                />
-                <path
-                  d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
-                  fill="currentColor"
-                  opacity="0.85"
-                />
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="stop-btn"
-              (click)="store.stop()"
-              aria-label="Stop recording"
-            >
-              <span class="stop-ico" aria-hidden="true"></span>
-            </button>
-          </div>
-
-          <!-- The morphing assistant ORB + a state line. The orb expresses the
-               state by motion/color; the paired role="status" line announces it.
-               LISTENING → "Słucham (kliknij by zakończyć)"; PROCESSING → a shimmer
-               "🧠 Przetwarzam…" label. Idle/answer states stay silent here (the
-               answer has its home in the card below). -->
-          @if (
-            assistant.orbState() === "listening" ||
-            assistant.orbState() === "processing"
-          ) {
-            <div
-              class="orb-state"
-              [class.is-processing]="assistant.orbState() === 'processing'"
-            >
-              <app-ai-orb
-                class="bar-orb"
-                [state]="assistant.orbState()"
-                [level]="store.level()"
-              />
-              @if (assistant.orbState() === "listening") {
-                <span class="orb-state-text" role="status" aria-live="polite">
-                  🎙 Słucham
-                  <span class="orb-state-hint">— kliknij ✨ by zakończyć</span>
-                </span>
-              } @else {
-                <span
-                  class="orb-state-text shimmer-text"
-                  role="status"
-                  aria-live="polite"
-                  aria-busy="true"
-                  >🧠 Przetwarzam…</span
-                >
-              }
-            </div>
-          }
-        } @else if (isProcessing()) {
-          <div class="rec-bar is-processing" role="status">
-            <span class="orb proc" aria-hidden="true"></span>
-            <span class="proc-label">{{
-              store.message() || store.stage()
-            }}</span>
-            <div class="proc-track" aria-hidden="true">
-              <div class="proc-shimmer"></div>
-            </div>
-          </div>
-        } @else {
-          <button
-            type="button"
-            class="rec-bar is-ready"
-            (click)="store.start()"
-            [disabled]="!canRecord()"
-          >
-            <span class="orb ready" aria-hidden="true"></span>
-            <span class="ready-text">
-              {{
-                store.stage() === "done" ? "Record again" : "Ready to record"
-              }}
-            </span>
-            <span class="kbd" aria-hidden="true">⌘R</span>
-          </button>
-        }
-
-        <p class="stage-hint">{{ hint() }}</p>
-        <button type="button" class="popout" (click)="popOut()">
-          Pop out floating bar
-          <span class="kbd-inline">⌘⇧R</span>
-        </button>
-      </div>
-
-      <!-- ── Live captions — ephemeral partial transcript while recording ──── -->
-      @if (store.isRecording()) {
-        <div class="captions" role="group" aria-label="Live captions">
-          <span class="cc-pill" aria-hidden="true">
-            <span class="cc-dot"></span>
-            LIVE
-          </span>
-          <p class="cc-line" aria-live="polite">
-            @if (liveCaption(); as cc) {
-              <!-- Keyed so each new partial replays the gentle fade/slide. -->
-              @for (rev of [cc]; track rev) {
-                <span class="cc-text">{{ cc }}</span>
-              }
-            } @else {
-              <span class="cc-idle">Listening…</span>
-            }
-          </p>
-        </div>
       }
 
-      <!-- ── My notes — free-text + inline @brain, shown only while recording ── -->
-      @if (store.isRecording()) {
-        <app-meeting-notes [meetingId]="store.meetingId()" />
-      }
-
-      <!-- ── In-meeting voice assistant — recent actions (Phase H) ────────── -->
+      <!-- ── The notes + @brain threads surface — the full-height main view ── -->
+      <!-- The main flow is the user's NOTES (persisted to manual_notes); the one
+           composer splits a line by @brain (a plain note vs opening a thread). -->
       @if (showAssistant()) {
-        <app-assistant-actions />
+        <app-meeting-conversation
+          class="conversation"
+          [meetingId]="store.meetingId()"
+        />
       }
 
       @if (store.error(); as err) {
@@ -319,8 +271,9 @@ import { AssistantStore } from "../../core/assistant.store";
         }
       }
 
-      <!-- ── Minimal stats strip (home hero — links to full analytics) ────── -->
-      @if (analytics(); as a) {
+      <!-- ── Minimal stats strip — hidden once the conversation thread is the
+           hero (recording / a live ask), so the thread fills the screen. ───── -->
+      @if (!showAssistant() && analytics(); as a) {
         @if (a.totalMeetings > 0) {
           <div class="card stats" role="group" aria-label="Your stats">
             <dl class="figures">
@@ -375,8 +328,18 @@ import { AssistantStore } from "../../core/assistant.store";
       .record {
         display: flex;
         flex-direction: column;
-        gap: var(--space-5);
+        gap: var(--space-4);
+        /* Fill the routed viewport so the conversation thread can grow to the
+           bottom (conversation-first). The host is the flex parent. */
+        min-height: calc(100vh - var(--space-8));
         animation: rise 420ms var(--transition) both;
+      }
+
+      /* ── The conversation thread = the full-height main surface ─────────── */
+      .conversation {
+        display: block;
+        flex: 1 1 auto;
+        min-height: 0;
       }
 
       /* --- Model-download banner --- */
@@ -463,44 +426,93 @@ import { AssistantStore } from "../../core/assistant.store";
         margin-top: var(--space-1);
       }
 
-      /* ── Stage: the hero area with an atmospheric glow ─────────────────── */
-      .stage {
-        position: relative;
+      /* ── The slim recording strip — ambient status, full-width ─────────── */
+      .rec-strip {
         display: flex;
-        flex-direction: column;
         align-items: center;
-        gap: var(--space-4);
-        padding: var(--space-8) var(--space-4) var(--space-7);
+        gap: var(--space-3);
+        flex: none;
+        padding: var(--space-2) var(--space-3);
+        border-radius: var(--radius-lg);
+        border: 1px solid var(--glass-border);
+        background: rgba(255, 255, 255, 0.04);
+        -webkit-backdrop-filter: blur(var(--glass-blur))
+          saturate(var(--glass-saturate));
+        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+        box-shadow: var(--glass-highlight);
+        animation: bar-in 320ms var(--ease-spring) both;
       }
-      .stage::before {
-        content: "";
-        position: absolute;
-        top: 8%;
-        left: 50%;
-        width: 460px;
-        height: 260px;
-        transform: translateX(-50%);
-        border-radius: 50%;
-        background: radial-gradient(
-          closest-side,
-          rgba(110, 118, 255, 0.28),
-          transparent 72%
-        );
-        filter: blur(28px);
-        opacity: 0.7;
+      .rec-strip.is-recording {
+        border-color: rgba(255, 122, 92, 0.4);
+        box-shadow: var(--live-glow), var(--glass-highlight);
+      }
+      .rec-strip.is-idle {
+        flex-wrap: wrap;
+        gap: var(--space-3);
+      }
+      @keyframes bar-in {
+        from {
+          opacity: 0;
+          transform: scale(0.98);
+        }
+        to {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      /* Start control (idle) — compact pill, the whole thing is the button. */
+      .start-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-3);
+        height: 44px;
+        padding: 0 var(--space-3) 0 var(--space-4);
+        border-radius: var(--radius-pill);
+        border: 1px solid var(--glass-border);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text-primary);
+        font-family: inherit;
+        cursor: pointer;
         transition:
+          border-color var(--transition),
           background var(--transition),
-          opacity var(--transition);
-        pointer-events: none;
+          transform var(--transition-fast);
       }
-      /* When recording, the glow warms + intensifies. */
-      .stage.live::before {
-        background: radial-gradient(
-          closest-side,
-          rgba(255, 110, 100, 0.32),
-          transparent 72%
-        );
-        opacity: 0.95;
+      .start-btn:hover:not(:disabled) {
+        transform: translateY(-1px);
+        border-color: var(--border-strong);
+        background: var(--surface-hover);
+      }
+      .start-btn:active:not(:disabled) {
+        transform: translateY(0);
+      }
+      .start-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .start-btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .start-text {
+        font-size: 0.95rem;
+        font-weight: 550;
+        letter-spacing: -0.01em;
+      }
+      .rec-strip-hint {
+        flex: 1 1 12rem;
+        min-width: 0;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        letter-spacing: -0.005em;
+      }
+      .proc-inline {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        flex: none;
+        min-width: 220px;
       }
 
       /* ── Meeting-app nudge: subtle accent strip, never blocking ────────── */
@@ -508,8 +520,8 @@ import { AssistantStore } from "../../core/assistant.store";
         display: flex;
         align-items: center;
         gap: var(--space-3);
-        width: 100%;
-        max-width: 560px;
+        flex: 1 1 100%;
+        min-width: 0;
         padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
         border: 1px solid rgba(110, 118, 255, 0.3);
         border-radius: var(--radius-pill);
@@ -543,113 +555,38 @@ import { AssistantStore } from "../../core/assistant.store";
         font-size: 0.85rem;
       }
 
-      /* ── The capsule, shared across states (each state swaps content) ──── */
-      .rec-bar {
-        position: relative;
-        display: flex;
-        align-items: center;
-        gap: var(--space-3);
-        height: 72px;
-        padding: 0 var(--space-3) 0 var(--space-5);
-        border-radius: var(--radius-pill);
-        border: 1px solid var(--glass-border);
-        background: rgba(255, 255, 255, 0.05);
-        -webkit-backdrop-filter: blur(var(--glass-blur))
-          saturate(var(--glass-saturate));
-        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-        box-shadow: var(--shadow-lg), var(--glass-highlight);
-        animation: bar-in 360ms var(--ease-spring) both;
-        transition:
-          width var(--transition),
-          border-color var(--transition),
-          box-shadow var(--transition),
-          transform var(--transition-fast);
-      }
-      @keyframes bar-in {
-        from {
-          opacity: 0;
-          transform: scale(0.94);
-        }
-        to {
-          opacity: 1;
-          transform: scale(1);
-        }
-      }
-
-      /* Ready — the whole capsule is the button. */
-      .rec-bar.is-ready {
-        width: 340px;
-        max-width: 100%;
-        cursor: pointer;
-        color: var(--text-primary);
-        font-family: inherit;
-      }
-      .rec-bar.is-ready:hover:not(:disabled) {
-        transform: translateY(-2px);
-        border-color: var(--border-strong);
-        box-shadow:
-          0 32px 80px rgba(0, 0, 0, 0.6),
-          0 0 0 1px var(--accent-soft),
-          var(--glass-highlight);
-      }
-      .rec-bar.is-ready:active:not(:disabled) {
-        transform: translateY(0);
-      }
-      .rec-bar.is-ready:focus-visible {
-        outline: none;
-        box-shadow:
-          0 0 0 3px var(--accent-ring),
-          var(--shadow-lg);
-      }
-      .rec-bar.is-ready:disabled {
-        opacity: 0.45;
-        cursor: not-allowed;
-      }
-      .ready-text {
-        flex: 1;
-        text-align: left;
-        font-size: 1.0625rem;
-        font-weight: 550;
-        letter-spacing: -0.01em;
-      }
       .kbd {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        height: 28px;
-        padding: 0 var(--space-3);
+        height: 26px;
+        padding: 0 var(--space-2);
         border-radius: var(--radius-sm);
         background: rgba(255, 255, 255, 0.07);
         border: 1px solid var(--border);
         color: var(--text-secondary);
         font-family: var(--font-mono);
-        font-size: 0.8rem;
+        font-size: 0.78rem;
         font-weight: 500;
       }
 
-      /* Recording — warm, alive. */
-      .rec-bar.is-recording {
-        width: 520px;
-        max-width: 100%;
-        border-color: rgba(255, 122, 92, 0.4);
-        box-shadow: var(--live-glow), var(--shadow-lg), var(--glass-highlight);
-      }
       .timer {
         font-family: var(--font-mono);
-        font-size: 1.0625rem;
+        font-size: 0.95rem;
         font-weight: 500;
         font-variant-numeric: tabular-nums;
         letter-spacing: 0.02em;
         color: var(--text-primary);
-        min-width: 56px;
+        min-width: 48px;
+        flex: none;
       }
       .wave {
-        flex: 1;
+        flex: 0 0 auto;
         display: flex;
         align-items: center;
-        gap: 3px;
-        height: 36px;
-        padding: 0 var(--space-2);
+        gap: 2px;
+        width: 84px;
+        height: 28px;
       }
       .wbar {
         flex: 1;
@@ -673,14 +610,15 @@ import { AssistantStore } from "../../core/assistant.store";
         }
       }
 
-      /* Stop — warm circular button with a rounded square glyph. */
+      /* Stop — warm circular button with a rounded square glyph (slim). */
       .stop-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 52px;
-        height: 52px;
-        min-width: 52px;
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+        flex: none;
         border: none;
         border-radius: 50%;
         background: var(--live-gradient);
@@ -714,9 +652,10 @@ import { AssistantStore } from "../../core/assistant.store";
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 44px;
-        height: 44px;
-        min-width: 44px;
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+        flex: none;
         border: 1px solid var(--accent-ring);
         border-radius: 50%;
         color: var(--accent-hover);
@@ -764,91 +703,23 @@ import { AssistantStore } from "../../core/assistant.store";
         cursor: default;
       }
 
-      /* The morphing-orb state row under the pill — orb + a status/shimmer line.
-         The orb element is the motion; this row provides the copy + framing. */
-      .orb-state {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-3);
-        margin-top: var(--space-3);
-        padding: var(--space-2) var(--space-3) var(--space-2) var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--accent-soft);
-        border: 1px solid var(--accent-ring);
-        color: var(--accent-hover);
-        font-size: 0.9rem;
-        font-weight: 550;
-        animation: rise 220ms var(--transition) both;
-      }
-      .orb-state.is-processing {
-        border-color: var(--border-strong);
-        background: rgba(255, 255, 255, 0.04);
-        color: var(--text-primary);
-      }
-      /* Compact orb for the bar (the orb defaults to 56px; here ~30px). */
-      .bar-orb {
-        --orb-size: 30px;
-      }
-      .orb-state-text {
-        line-height: 1.3;
-      }
-      .orb-state-hint {
-        opacity: 0.8;
-        font-weight: 500;
-      }
-
-      /* Shimmer text — a moving gradient clipped to the glyphs (Raycast/Vercel
-         "thinking" treatment) naming the processing substep. */
-      .shimmer-text {
-        background: linear-gradient(
-          100deg,
-          var(--text-secondary) 30%,
-          var(--text-primary) 50%,
-          var(--text-secondary) 70%
-        );
-        background-size: 200% 100%;
-        -webkit-background-clip: text;
-        background-clip: text;
-        color: transparent;
-        animation: text-shimmer 1.8s linear infinite;
-      }
-      @keyframes text-shimmer {
-        0% {
-          background-position: 200% 0;
-        }
-        100% {
-          background-position: -200% 0;
-        }
-      }
-
       @media (prefers-reduced-motion: reduce) {
-        .ask-btn.is-listening,
-        .orb-state,
-        .shimmer-text {
+        .ask-btn.is-listening {
           animation: none;
         }
-        .shimmer-text {
-          background: none;
-          -webkit-background-clip: border-box;
-          background-clip: border-box;
-          color: var(--text-primary);
-        }
       }
 
-      /* Processing — cool, calm, working. */
-      .rec-bar.is-processing {
-        width: 420px;
-        max-width: 100%;
-      }
+      /* Processing — cool, calm, working (inline in the idle strip). */
       .proc-label {
         flex: none;
         color: var(--text-primary);
-        font-size: 0.95rem;
+        font-size: 0.92rem;
         font-weight: 550;
         text-transform: capitalize;
       }
       .proc-track {
         flex: 1;
+        min-width: 80px;
         height: 4px;
         border-radius: var(--radius-pill);
         background: rgba(255, 255, 255, 0.08);
@@ -930,25 +801,19 @@ import { AssistantStore } from "../../core/assistant.store";
         }
       }
 
-      .stage-hint {
-        margin: 0;
-        min-height: 1.2em;
-        color: var(--text-muted);
-        font-size: 0.875rem;
-        letter-spacing: -0.005em;
-      }
       .popout {
         display: inline-flex;
         align-items: center;
         gap: var(--space-2);
-        margin-top: var(--space-1);
-        padding: var(--space-2) var(--space-4);
+        flex: none;
+        margin-left: auto;
+        padding: var(--space-1) var(--space-3);
         border: 1px solid var(--border);
         border-radius: var(--radius-pill);
         background: rgba(255, 255, 255, 0.03);
         color: var(--text-secondary);
         font-family: inherit;
-        font-size: 0.85rem;
+        font-size: 0.82rem;
         font-weight: 500;
         cursor: pointer;
         transition:
@@ -970,57 +835,22 @@ import { AssistantStore } from "../../core/assistant.store";
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
 
-      /* ── Live captions — frosted, secondary, ephemeral ─────────────────── */
-      .captions {
-        display: flex;
-        align-items: flex-start;
-        gap: var(--space-3);
-        width: 100%;
-        max-width: 560px;
-        margin: 0 auto;
-        padding: var(--space-3) var(--space-4);
-        border: 1px solid var(--glass-border);
-        border-radius: var(--radius-lg);
-        background: rgba(255, 255, 255, 0.035);
-        -webkit-backdrop-filter: blur(var(--glass-blur))
-          saturate(var(--glass-saturate));
-        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-        box-shadow: var(--glass-highlight);
-        animation: rise 360ms var(--transition) both;
-      }
-      .cc-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-1);
-        flex: none;
-        margin-top: 1px;
-        padding: 2px var(--space-2);
-        border-radius: var(--radius-pill);
-        background: var(--live-soft);
-        color: var(--live-hover);
-        font-size: 0.625rem;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        line-height: 1.4;
-      }
-      .cc-dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: var(--live);
-        box-shadow: 0 0 8px rgba(255, 122, 92, 0.9);
-        animation: live-pulse 1.4s ease-in-out infinite;
-      }
+      /* ── Live caption ticker — rides inline in the recording strip ─────── */
       .cc-line {
-        flex: 1;
+        flex: 1 1 auto;
         min-width: 0;
         margin: 0;
         color: var(--text-secondary);
-        font-size: 0.9rem;
-        line-height: 1.5;
+        font-size: 0.875rem;
+        line-height: 1.4;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
       }
       .cc-text {
         display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
         animation: cc-in 260ms var(--transition) both;
       }
       .cc-idle {
@@ -1177,9 +1007,9 @@ import { AssistantStore } from "../../core/assistant.store";
 })
 export class RecordComponent implements OnInit {
   readonly store = inject(RecorderStore);
-  /** The unified in-meeting assistant store. Injected + init()'d here (not only from the
-   * surface) so it subscribes to the wake/result streams even before the surface is shown. */
-  readonly assistant = inject(AssistantStore);
+  /** The in-meeting NOTES + @brain THREADS store. Injected + init()'d here (not only from
+   * the surface) so it subscribes to the wake/result streams even before the surface shows. */
+  readonly assistant = inject(MeetingConversationStore);
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
 
@@ -1234,23 +1064,20 @@ export class RecordComponent implements OnInit {
   );
 
   /**
-   * Show the in-meeting voice-assistant card (Phase H): only when the user has
-   * enabled "realtime reactions" AND the brain backend isn't off. The card
-   * itself subscribes to the wake/result streams regardless of recording state
-   * (a wake can land any time the listener is active).
+   * Show the conversation thread — the full-height main surface of the
+   * conversation-first record screen. It is the home for BOTH note-taking AND
+   * the agent, so it surfaces during ANY recording (notes always persist via
+   * `save_manual_notes`, even when the brain backend is off — only the @brain
+   * agent path is then unavailable), whenever realtime reactions are enabled,
+   * and whenever a manual "Ask AI" is listening / in flight (so the answer has a
+   * home). The thread itself subscribes to the wake/result streams regardless.
    */
   readonly showAssistant = computed(() => {
     const c = this.config();
     const enabled = !!c && c.realtimeReactions === true && c.brainBackend !== "off";
-    // Surface the unified thread during ANY recording (unless the brain is off) so the
-    // voice + text composer is always the home for asking a question mid-meeting. The
-    // thread itself is the always-home now (no "has any interaction" gate); also surface
-    // it whenever a manual "Ask AI" is listening / in-flight so the answer has a home.
-    const recordingWithBrain =
-      this.store.isRecording() && !!c && c.brainBackend !== "off";
     return (
       enabled ||
-      recordingWithBrain ||
+      this.store.isRecording() ||
       this.assistant.listening() ||
       this.assistant.processing() ||
       this.assistant.manualAskInFlight()
@@ -1416,7 +1243,7 @@ export class RecordComponent implements OnInit {
 
   async ngOnInit(): Promise<void> {
     await this.store.init();
-    // Subscribe the unified assistant store to the wake/result + BOTH tool-trace
+    // Subscribe the notes/threads store to the wake/result + BOTH tool-trace
     // streams now, regardless of whether the surface is visible yet — otherwise
     // events fired before it renders (or while the config snapshot is stale) drop.
     void this.assistant.init();
@@ -1503,9 +1330,9 @@ export class RecordComponent implements OnInit {
    * voice-command listener (no wake phrase); a second click — while listening —
    * stops it so the FULL utterance is dispatched (→ processing). The backend
    * streams listening/processing over EVENT_VOICE_COMMAND_LISTENING /
-   * EVENT_VOICE_COMMAND_PROCESSING and the answer lands in the assistant-actions
-   * card. Swallow rejections (e.g. brain backend off) — the store resets its
-   * listening/processing/in-flight state on error.
+   * EVENT_VOICE_COMMAND_PROCESSING and the spoken answer lands in a thread on the
+   * notes surface below. Swallow rejections (e.g. brain backend off) — the store
+   * resets its listening/processing/in-flight state on error.
    */
   toggleAsk(): void {
     if (this.assistant.listening()) {
