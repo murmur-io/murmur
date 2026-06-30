@@ -553,6 +553,28 @@ export class IpcService {
     return invoke<VoiceActionResultPayload>("ask_assistant_chat", { messages });
   }
 
+  // ── brain2 realtime typed @brain notes (record screen "My notes") ──────
+
+  /**
+   * Persist a meeting's live typed-notes buffer (debounced autosave from the
+   * record screen "My notes" editor). GATED server-side: a
+   * sealed-and-not-session-unlocked meeting is refused with `AppError::Locked`
+   * (never resurrect typed plaintext behind a lock) — the FE swallows that and
+   * keeps the local draft. The text is the user's OWN words (no new egress).
+   */
+  saveManualNotes(meetingId: string, text: string): Promise<void> {
+    return invoke<void>("save_manual_notes", { meetingId, text });
+  }
+
+  /**
+   * Read a meeting's live typed-notes buffer (the editor rehydrates from this on
+   * mount / when the active meeting changes). GATED server-side: a
+   * sealed-and-not-session-unlocked meeting returns "" (masked, never the buffer).
+   */
+  getManualNotes(meetingId: string): Promise<string> {
+    return invoke<string>("get_manual_notes", { meetingId });
+  }
+
   // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
 
   /** The folder tree (roots → children) with per-folder note counts + session lock state. */
