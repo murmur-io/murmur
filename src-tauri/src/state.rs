@@ -115,6 +115,11 @@ pub struct AppState {
     /// Sync` and all methods take `&self`, so no `Mutex` is needed.
     pub reasoner: Box<dyn crate::reason::LocalReasoner>,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
+    /// Accumulated rough transcript of the recording IN PROGRESS, built from the live captions
+    /// (`transcribe::live`). Segments aren't persisted until Stop, so this is the ONLY in-flight
+    /// view of "what's being said right now" — the in-meeting assistant injects it so it can answer
+    /// questions about the current meeting. Cleared at each recording start; bounded in size.
+    pub live_transcript: Mutex<String>,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
     /// thread shares the SAME set as the command surface.
@@ -198,6 +203,7 @@ impl AppState {
             config: Mutex::new(config),
             reasoner,
             current_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),
