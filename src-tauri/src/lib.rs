@@ -83,6 +83,8 @@ pub fn run() {
             commands::list_input_devices,
             commands::get_last_note,
             commands::update_note,
+            commands::save_manual_notes,
+            commands::get_manual_notes,
             commands::get_config,
             commands::save_config,
             commands::consent_to_cloud_egress,
