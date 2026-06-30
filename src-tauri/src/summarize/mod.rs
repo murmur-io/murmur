@@ -79,11 +79,13 @@ pub fn make_provider(
     id: &str,
     config: &AppConfig,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
-    // E10 — fail-closed consent gate: no cloud provider is built (so no content can be sent)
-    // until the user has explicitly consented once. ollama is local, so it is never gated.
-    if is_cloud(id) && !config.cloud_egress_consented {
+    // E10 — fail-closed consent gate, now classification-aware: no cloud provider is built (so no
+    // content can be sent) until the user has explicitly consented once. ollama is gated ONLY when
+    // its base URL is non-loopback (remote) — closing the gap where a remote ollama_base_url would
+    // bypass the redaction firewall and consent check.
+    if egress_is_cloud(id, config) && !config.cloud_egress_consented {
         return Err(crate::error::AppError::Unavailable(
-            "cloud egress not consented: this provider sends meeting content to a cloud LLM; \
+            "cloud egress not consented: this provider sends meeting content off-device; \
              grant one-time consent before using it"
                 .to_string(),
         ));
@@ -115,10 +117,14 @@ pub fn make_provider(
             ))
         }
         PROVIDER_OLLAMA => {
-            return Ok(Arc::new(OllamaProvider::new(
+            let ollama = Arc::new(OllamaProvider::new(
                 config.ollama_base_url.clone(),
                 config.ollama_model.clone(),
-            )))
+            ));
+            if !egress_is_cloud(id, config) {
+                return Ok(ollama); // LOCAL ollama: unwrapped, unchanged behavior
+            }
+            ollama // REMOTE ollama: falls through to the RedactingProvider wrap below
         }
         other => {
             return Err(crate::error::AppError::InvalidArg(format!(
@@ -212,6 +218,27 @@ mod tests {
 
         // Unknown provider ids default to cloud (fail-safe).
         assert!(egress_is_cloud("unknown-provider", &cfg));
+    }
+
+    #[test]
+    fn remote_ollama_requires_consent() {
+        let mut cfg = AppConfig::default();
+        cfg.ollama_base_url = "https://ollama.remote.example/api".into();
+        cfg.cloud_egress_consented = false;
+        let res = make_provider(PROVIDER_OLLAMA, &cfg);
+        assert!(
+            matches!(res, Err(crate::error::AppError::Unavailable(_))),
+            "expected Unavailable for remote ollama without consent"
+        );
+    }
+
+    #[test]
+    fn local_ollama_stays_unwrapped_and_ungated() {
+        let mut cfg = AppConfig::default();
+        cfg.ollama_base_url = "http://localhost:11434".into();
+        cfg.cloud_egress_consented = false;
+        // local ollama must build without consent
+        assert!(make_provider(PROVIDER_OLLAMA, &cfg).is_ok());
     }
 
     fn consented_config() -> AppConfig {
