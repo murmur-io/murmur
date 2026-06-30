@@ -104,6 +104,11 @@ pub fn spawn(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
 }
 
 fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
+    // Fresh transcript per recording: clear any leftover from a previous meeting so the in-meeting
+    // assistant can never answer about a stale recording.
+    if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
+        lt.clear();
+    }
     let transcriber = match Transcriber::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
@@ -165,6 +170,12 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                     .join(" ")
                     .trim()
                     .to_string();
+
+                // Accumulate the rolling caption into the live transcript (best-effort, read-only) so
+                // the in-meeting assistant can answer questions about the recording IN PROGRESS.
+                // Deduped (overlapping tails) + size-bounded inside `accumulate_live_caption`.
+                accumulate_live_caption(app.state::<AppState>().inner(), &text);
+
                 // MANUAL voice-command capture (the button trigger) — CLICK-TO-STOP, checked EVERY
                 // tick, independent of the wake path and independent of `realtime_reactions`. When the
                 // user has clicked "ask the assistant" the growing post-click window IS the command:
@@ -399,13 +410,19 @@ fn run_informational(
             allow_writes: false, // read-only loop — user-dictated writes go through handle_voice_action
         };
         let sink = ToolEventSink { app: app.clone(), event: tool_event };
-        let system = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
-                      sentences), grounded ONLY in tool results from the user's own gated vault (and \
-                      web/calendar when you use them). If the tools turn up nothing relevant, say so \
-                      plainly. Do not invent facts.";
+        // Inject the LIVE transcript of the recording IN PROGRESS so the brain can answer questions
+        // about the CURRENT meeting (whose segments aren't persisted until Stop). It egresses through
+        // the SAME redaction firewall as every prompt (`RedactingProvider::complete` scrubs `system`
+        // + `user`), and only when cloud egress is consented (this branch is Cloud-only).
+        let live = state
+            .live_transcript
+            .lock()
+            .map(|t| t.clone())
+            .unwrap_or_default();
+        let system = assistant_system_prompt(&live);
         match crate::agent::run_agentic_loop(
             &*state.reasoner,
-            system,
+            &system,
             loop_user,
             &executor,
             CLOUD_MAX_STEPS,
@@ -787,6 +804,109 @@ fn wake_event_for(tail: &str) -> Option<crate::events::WakeDetectedPayload> {
     })
 }
 
+// ── Live-meeting awareness: accumulate the rolling captions into a running transcript and inject it
+// into the in-meeting assistant's context, so it can answer "what is this meeting about?" about the
+// recording IN PROGRESS (whose segments aren't persisted until Stop). ──────────────────────────────
+
+/// Hard cap on the accumulated live-transcript buffer (chars) — bounds memory over a multi-hour
+/// meeting; the oldest text is trimmed from the FRONT (keep the recent tail, which is what matters).
+const MAX_LIVE_TRANSCRIPT_CHARS: usize = 16_000;
+/// How much of the live transcript (most-recent tail) is injected into the assistant's prompt. The
+/// tail is what's relevant + bounds the per-turn token cost across the agentic loop.
+const LIVE_TRANSCRIPT_INJECT_CHARS: usize = 6_000;
+
+/// Append a rolling live CAPTION to the accumulated live transcript, removing the OVERLAP between the
+/// end of `accumulated` and the start of `caption` (live captions are overlapping tail windows, so a
+/// naive append would trIplicate every phrase). Word-level overlap: find the largest `k` where the
+/// last `k` words of `accumulated` equal the first `k` words of `caption`, and append only the words
+/// after `k`. Approximate (Whisper varies run-to-run) but good enough for the assistant's gist
+/// context. Pure + cheap (no extra transcription — reuses the caption the loop already produced).
+fn merge_live_caption(accumulated: &str, caption: &str) -> String {
+    let cap = caption.trim();
+    if cap.is_empty() {
+        return accumulated.to_string();
+    }
+    let acc = accumulated.trim_end();
+    if acc.is_empty() {
+        return cap.to_string();
+    }
+    let acc_words: Vec<&str> = acc.split_whitespace().collect();
+    let cap_words: Vec<&str> = cap.split_whitespace().collect();
+    let max_k = acc_words.len().min(cap_words.len());
+    let mut overlap = 0;
+    for k in (1..=max_k).rev() {
+        let acc_tail = &acc_words[acc_words.len() - k..];
+        let cap_head = &cap_words[..k];
+        if acc_tail
+            .iter()
+            .zip(cap_head)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            overlap = k;
+            break;
+        }
+    }
+    let new_part = cap_words[overlap..].join(" ");
+    if new_part.is_empty() {
+        return acc.to_string();
+    }
+    format!("{acc} {new_part}")
+}
+
+/// Merge a caption into the shared live-transcript buffer (read-modify-write under its Mutex) and
+/// trim to [`MAX_LIVE_TRANSCRIPT_CHARS`] from the FRONT. Best-effort: a poisoned lock is ignored so a
+/// caption tick can never disrupt the recording.
+fn accumulate_live_caption(state: &AppState, caption: &str) {
+    if caption.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut buf) = state.live_transcript.lock() {
+        let merged = merge_live_caption(&buf, caption);
+        *buf = if merged.chars().count() > MAX_LIVE_TRANSCRIPT_CHARS {
+            tail_chars(&merged, MAX_LIVE_TRANSCRIPT_CHARS)
+                .trim_start_matches('…')
+                .to_string()
+        } else {
+            merged
+        };
+    }
+}
+
+/// The most-recent `n` chars of `s` (on a char boundary), prefixed with `…` when truncated.
+fn tail_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        s.to_string()
+    } else {
+        let tail: String = chars[chars.len() - n..].iter().collect();
+        format!("…{tail}")
+    }
+}
+
+/// Build the in-meeting assistant's system prompt. When the LIVE transcript of the current recording
+/// is present, inject its recent tail (≤ [`LIVE_TRANSCRIPT_INJECT_CHARS`]) so the brain can answer
+/// questions about the meeting IN PROGRESS; otherwise the base prompt is unchanged (no regression when
+/// not recording / before any caption). The injected transcript egresses through the SAME redaction
+/// firewall as every other prompt (`RedactingProvider::complete` scrubs `system` + `user`).
+fn assistant_system_prompt(live_transcript: &str) -> String {
+    let base = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
+                sentences). Do not invent facts; if you cannot find the answer, say so plainly.";
+    let t = live_transcript.trim();
+    if t.is_empty() {
+        return format!(
+            "{base} Ground answers in tool results from the user's own gated vault (and web / \
+             calendar when you use them)."
+        );
+    }
+    let tail = tail_chars(t, LIVE_TRANSCRIPT_INJECT_CHARS);
+    format!(
+        "{base} You are CURRENTLY in a live meeting being recorded — use the LIVE TRANSCRIPT below \
+         to answer questions about THIS current meeting (its topic, decisions, who said what), and \
+         your gated tools for anything in the user's saved notes/vault.\n\nLIVE TRANSCRIPT (rough \
+         real-time captions, may be partial or slightly garbled):\n{tail}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,5 +1273,54 @@ mod tests {
         assert_eq!(resolve_clip_lang_core(None, Some("auto")), None);
         assert_eq!(resolve_clip_lang_core(Some("  "), Some("  ")), None);
         assert_eq!(resolve_clip_lang_core(None, None), None);
+    }
+
+    #[test]
+    fn merge_live_caption_seeds_then_dedups_overlap() {
+        // First caption seeds the buffer.
+        let a = merge_live_caption("", "we need to ship the beta");
+        assert_eq!(a, "we need to ship the beta");
+        // Rolling captions OVERLAP (same tail re-transcribed) — the shared head must NOT be duplicated;
+        // only the genuinely-new tail is appended.
+        let b = merge_live_caption(&a, "ship the beta on Friday");
+        assert_eq!(b, "we need to ship the beta on Friday");
+        // A caption fully contained in the buffer adds nothing.
+        let c = merge_live_caption(&b, "on Friday");
+        assert_eq!(c, "we need to ship the beta on Friday");
+    }
+
+    #[test]
+    fn merge_live_caption_handles_empty_and_no_overlap() {
+        // Empty caption leaves the buffer untouched; empty buffer takes the caption verbatim.
+        assert_eq!(merge_live_caption("hello world", "   "), "hello world");
+        assert_eq!(merge_live_caption("", "fresh start"), "fresh start");
+        // No shared boundary ⇒ space-joined (a gap in captions, not an overlap).
+        assert_eq!(
+            merge_live_caption("budget approved", "contract signed"),
+            "budget approved contract signed"
+        );
+    }
+
+    #[test]
+    fn assistant_system_prompt_injects_transcript_only_when_present() {
+        // No live transcript (not recording / no captions yet) ⇒ the base prompt, no transcript section.
+        let base = assistant_system_prompt("");
+        assert!(!base.contains("LIVE TRANSCRIPT"), "no transcript section when empty: {base}");
+        assert!(base.contains("in-meeting assistant"));
+        // With a transcript ⇒ it is embedded + the brain is told to use it for the current meeting.
+        let with = assistant_system_prompt("we shipped the beta and assigned the deck to Anna");
+        assert!(with.contains("LIVE TRANSCRIPT"), "names the transcript section: {with}");
+        assert!(with.contains("assigned the deck to Anna"), "embeds the transcript text");
+        assert!(with.to_lowercase().contains("current"), "tells the brain it's the current meeting");
+    }
+
+    #[test]
+    fn assistant_system_prompt_truncates_to_recent_tail() {
+        // A very long transcript is truncated to the RECENT tail (so a 2-hour meeting can't blow the
+        // context) and marked elided.
+        let long = "x ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS); // way over the inject budget
+        let p = assistant_system_prompt(&long);
+        assert!(p.contains('…'), "elision marker present when truncated");
+        assert!(p.chars().count() < long.chars().count(), "shorter than the raw transcript");
     }
 }
