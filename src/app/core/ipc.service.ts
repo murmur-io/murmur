@@ -8,6 +8,7 @@ import type {
   BrainDownloadProgress,
   BrainModelDto,
   EmbedDownloadProgress,
+  GatewayHealth,
   GatewayModel,
   ReindexProgress,
   ReindexResult,
@@ -191,6 +192,16 @@ export class IpcService {
    */
   listGatewayModels(): Promise<GatewayModel[]> {
     return invoke<GatewayModel[]>("list_gateway_models");
+  }
+
+  /**
+   * AI Gateway (Phase 4) — probe whether the configured gateway is reachable and
+   * return the number of models in its catalog. The backend never errors on this
+   * command (unreachable → `{ reachable: false, modelCount: 0 }`). The FE still
+   * catches for safety.
+   */
+  gatewayHealth(): Promise<GatewayHealth> {
+    return invoke<GatewayHealth>("gateway_health");
   }
 
   /**
