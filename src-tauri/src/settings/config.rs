@@ -188,6 +188,17 @@ pub struct AppConfig {
     /// as `false`.
     #[serde(default)]
     pub web_search_consented: bool,
+    /// Opt-in: restore the OLDER-VERSION behavior of INHERITING the shell environment into the
+    /// `claude` CLI subprocess, so env vars set in the user's shell — `ANTHROPIC_API_KEY`,
+    /// `ANTHROPIC_BASE_URL`, proxy vars (`HTTPS_PROXY`) — reach the CLI again. The F2 audit hardening
+    /// started CLEARING the child env, which broke users who authenticated the CLI via an env API key
+    /// ("worked in older versions, exit 1 after update"). Default OFF (`#[serde(default)]` ⇒
+    /// pre-existing configs load as `false`) = the hardened, env-cleared behavior. When ON the child
+    /// inherits the environment EXCEPT `MURMUR_DEV_DEK` / `MURMUR_DEV_KEK` (the DB encryption keys),
+    /// which are ALWAYS stripped — they decrypt the whole library and must NEVER reach a subprocess.
+    /// Affects ONLY the `claude_code` provider (the `anthropic` provider uses the Keychain key).
+    #[serde(default)]
+    pub claude_code_inherit_env: bool,
 }
 
 impl Default for AppConfig {
@@ -227,6 +238,7 @@ impl Default for AppConfig {
             realtime_reactions: false,
             web_search_enabled: false,
             web_search_consented: false,
+            claude_code_inherit_env: false,
         }
     }
 }
@@ -266,6 +278,7 @@ const K_BRAIN_BACKEND: &str = "brain_backend";
 const K_REALTIME_REACTIONS: &str = "realtime_reactions";
 const K_WEB_SEARCH_ENABLED: &str = "web_search_enabled";
 const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
+const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -382,6 +395,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_WEB_SEARCH_CONSENTED)? {
             cfg.web_search_consented = v == "true";
         }
+        if let Some(v) = db.get_setting(K_CLAUDE_CODE_INHERIT_ENV)? {
+            cfg.claude_code_inherit_env = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -479,6 +495,10 @@ impl AppConfig {
         db.set_setting(
             K_WEB_SEARCH_CONSENTED,
             if self.web_search_consented { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_CLAUDE_CODE_INHERIT_ENV,
+            if self.claude_code_inherit_env { "true" } else { "false" },
         )?;
         Ok(())
     }

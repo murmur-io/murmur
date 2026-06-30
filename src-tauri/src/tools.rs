@@ -60,6 +60,102 @@ pub enum ToolCall {
     CalendarLookup { query: String },
 }
 
+/// Model-facing description of one tool the agentic brain may call. `parameters` is a JSON-schema
+/// object (the same shape `mcp.rs` advertises). A `write: true` tool mutates state and is NEVER
+/// exposed to the autonomous loop in v1 (the loop runs read-only; user-dictated writes go through
+/// `handle_voice_action`). This is the single source of truth for the model-facing catalog.
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: serde_json::Value,
+    pub write: bool,
+}
+
+/// The model-facing tool catalog. Built per call (cheap; ~10 entries). The read tools map 1:1 onto
+/// gated `execute_tool` / connector dispatchers; the two write entries are present as DATA (so the
+/// catalog is complete) but `write: true` keeps them out of the read-only loop's advertised set.
+pub fn tool_specs() -> Vec<ToolSpec> {
+    let str_arg = |prop: &'static str, desc: &str| -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { prop: { "type": "string", "description": desc } },
+            "required": [prop]
+        })
+    };
+    vec![
+        ToolSpec {
+            name: "search_meetings",
+            description: "Full-text search across the user's past meeting titles, notes and transcripts.",
+            parameters: str_arg("query", "Search terms, in the user's own language."),
+            write: false,
+        },
+        ToolSpec {
+            name: "search_semantic",
+            description: "Hybrid semantic + keyword search over meetings (finds related-by-meaning notes).",
+            parameters: str_arg("query", "A natural-language description of what to find."),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_meeting",
+            description: "Fetch one meeting's AI note and full transcript by its id (from a prior search hit).",
+            parameters: str_arg("meetingId", "The meeting id from a prior search result."),
+            write: false,
+        },
+        ToolSpec {
+            name: "list_recent_meetings",
+            description: "List the most recent meetings (newest first).",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "description": "How many (1..=100)." } }
+            }),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_open_commitments",
+            description: "Roll up every open action item, optionally filtered by owner.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "owner": { "type": "string", "description": "Optional owner filter." } }
+            }),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_entity_dossier",
+            description: "Assemble what the vault knows about one person / project / entity.",
+            parameters: str_arg("entity", "The entity name to look up."),
+            write: false,
+        },
+        ToolSpec {
+            name: "web_search",
+            description: "Search the public web. Only available when the user has enabled + consented to web search; the result is loud-attributed '(via web)'.",
+            parameters: str_arg("query", "What to look up on the web."),
+            write: false,
+        },
+        ToolSpec {
+            name: "calendar_lookup",
+            description: "Look up the user's local (on-device) calendar for recent/upcoming events.",
+            parameters: str_arg("query", "What meeting / agenda detail to find."),
+            write: false,
+        },
+        ToolSpec {
+            name: "note_aside",
+            description: "Append a short aside note to the meeting currently being recorded.",
+            parameters: str_arg("text", "The note text."),
+            write: true,
+        },
+        ToolSpec {
+            name: "create_reminder",
+            description: "Create a reminder.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" }, "due": { "type": "string" } },
+                "required": ["text"]
+            }),
+            write: true,
+        },
+    ]
+}
+
 /// Execute a read-only tool against an OPEN `Db`, gated on the live session `unlocked` set.
 ///
 /// Returns the tool's text payload (the same strings the MCP surface returned before this seam was
@@ -349,6 +445,108 @@ fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// THE one gated, egress-aware tool executor shared by the agentic loop (cloud + local, voice + text).
+/// Holds the LIVE session `unlocked` set behind its `Mutex` and RE-READS it on EVERY tool call (not
+/// once at loop start), so a mid-loop screen-share auto-relock is honored immediately — a folder
+/// relocked during a multi-second turn becomes invisible to the very next tool call. Every read
+/// routes through the visibility gate regardless of what the model requests: the model can ASK for a
+/// search, but a sealed-not-unlocked meeting is invisible by construction. Connectors (web/calendar)
+/// need the `AppHandle`; write tools need `allow_writes` (off for the v1 loop — user-dictated writes
+/// go through `handle_voice_action`).
+pub struct GatedToolExecutor<'a> {
+    pub db: &'a Db,
+    pub unlocked: &'a std::sync::Mutex<HashSet<String>>,
+    pub config: &'a AppConfig,
+    pub meeting_id: &'a str,
+    pub app: Option<&'a tauri::AppHandle>,
+    pub allow_writes: bool,
+}
+
+impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let has_app = self.app.is_some();
+        let allow_writes = self.allow_writes;
+        tool_specs()
+            .into_iter()
+            .filter(|s| match s.name {
+                // Connectors require the AppHandle (async sidecar / consent path).
+                "web_search" | "calendar_lookup" => has_app,
+                // Write actions require explicit allow_writes (off in the v1 loop).
+                _ if s.write => allow_writes,
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn run(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+        // ENFORCE the allowlist: the model can NEVER run a tool we did not advertise this turn.
+        if !self.specs().iter().any(|s| s.name == name) {
+            return Err(AppError::InvalidArg(format!("tool '{name}' is not available")));
+        }
+        // RE-READ the live unlocked set on THIS call (C6): a folder relocked mid-loop is gated out
+        // immediately, never seen through a snapshot taken at loop start.
+        let unlocked = self
+            .unlocked
+            .lock()
+            .map_err(|_| AppError::Other(anyhow::anyhow!("unlocked set mutex poisoned")))?
+            .clone();
+        let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        match name {
+            "search_meetings" => {
+                execute_tool(&ToolCall::SearchMeetings { query: s("query") }, self.db, &unlocked, self.config)
+            }
+            "search_semantic" => {
+                execute_tool(&ToolCall::SearchSemantic { query: s("query") }, self.db, &unlocked, self.config)
+            }
+            "get_meeting" => {
+                execute_tool(&ToolCall::GetMeeting { meeting_id: s("meetingId") }, self.db, &unlocked, self.config)
+            }
+            "list_recent_meetings" => {
+                let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10).clamp(1, 100);
+                execute_tool(&ToolCall::ListRecentMeetings { limit }, self.db, &unlocked, self.config)
+            }
+            "get_open_commitments" => {
+                let owner = args.get("owner").and_then(|v| v.as_str()).map(str::to_string);
+                execute_tool(&ToolCall::GetOpenCommitments { owner }, self.db, &unlocked, self.config)
+            }
+            "get_entity_dossier" => {
+                execute_tool(&ToolCall::GetEntityDossier { entity: s("entity") }, self.db, &unlocked, self.config)
+            }
+            "web_search" => match self.app {
+                Some(_) => block_on_tool(execute_web_search(&s("query"), self.config)),
+                None => Err(AppError::InvalidArg("web_search needs an AppHandle".into())),
+            },
+            "calendar_lookup" => match self.app {
+                Some(app) => block_on_tool(execute_calendar_search(&s("query"), app)),
+                None => Err(AppError::InvalidArg("calendar_lookup needs an AppHandle".into())),
+            },
+            other => Err(AppError::InvalidArg(format!("unknown tool '{other}'"))),
+        }
+    }
+}
+
+/// Drive an async connector dispatcher to completion from the synchronous executor without panicking,
+/// regardless of caller context (the loop may run inside the async note pipeline). Mirrors
+/// `reason::block_on_complete` / `voice_action::web_search_blocking`: a dedicated scoped OS thread with
+/// its own current-thread runtime, so we never "start a runtime within a runtime" and the future never
+/// crosses a thread boundary (only the `Result<String>` does).
+fn block_on_tool(
+    fut: impl std::future::Future<Output = Result<String>> + Send,
+) -> Result<String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Other(anyhow::anyhow!("tool runtime build failed: {e}")))?
+                    .block_on(fut)
+            })
+            .join()
+            .map_err(|_| AppError::Other(anyhow::anyhow!("tool worker thread panicked")))?
+    })
 }
 
 #[cfg(test)]

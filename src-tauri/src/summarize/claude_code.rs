@@ -19,9 +19,28 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
 /// tokens, and anything else in the app's environment can NEVER be inherited by the child (F2).
 const PASSTHROUGH_ENV: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL"];
 
-/// Apply the F2 hardened environment to a tokio `Command`: clear everything, set `PATH` to the
-/// resolved shell PATH, and re-add only the minimal non-secret vars that exist in our process.
-fn harden_env(cmd: &mut Command) {
+/// Vars that MUST NEVER reach the `claude` child even when the user opted into env inheritance: the
+/// DB encryption keys decrypt the ENTIRE library, and the child talks to the cloud — so they are
+/// stripped unconditionally. Everything else is the user's call (the inherit opt-in).
+const NEVER_INHERIT_ENV: &[&str] = &["MURMUR_DEV_DEK", "MURMUR_DEV_KEK"];
+
+/// Apply the environment policy to a tokio `Command`.
+///
+/// - `inherit = false` (DEFAULT, the F2 hardening): start from an EMPTY env (`env_clear`), set `PATH`
+///   to the resolved login-shell PATH, and re-add ONLY the minimal non-secret [`PASSTHROUGH_ENV`], so
+///   `MURMUR_DEV_*`, API keys, tokens, and anything else can NEVER be inherited by the child.
+/// - `inherit = true` (OPT-IN, config `claude_code_inherit_env`): the child INHERITS our environment
+///   (so an env `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / proxy var works like older versions),
+///   EXCEPT [`NEVER_INHERIT_ENV`] which is always removed. `PATH` is still pinned to the login shell's
+///   so a GUI-launched app can find `claude` + the `node` it spawns.
+fn harden_env(cmd: &mut Command, inherit: bool) {
+    if inherit {
+        cmd.env("PATH", shell_path());
+        for key in NEVER_INHERIT_ENV {
+            cmd.env_remove(key);
+        }
+        return;
+    }
     cmd.env_clear();
     cmd.env("PATH", shell_path());
     for key in PASSTHROUGH_ENV {
@@ -175,6 +194,11 @@ pub struct ClaudeCodeProvider {
     /// "let the `claude` CLI pick its own default model" — no `--model` flag is added in that case.
     /// (The CLI has no reasoning-effort flag, so `provider_effort` is intentionally NOT wired here.)
     model: String,
+    /// Opt-in (config `claude_code_inherit_env`): inherit the shell environment into the `claude`
+    /// child (restores older-version behavior where an env `ANTHROPIC_API_KEY` reached the CLI).
+    /// Default false = the hardened env-cleared run. Even when true the DB encryption keys
+    /// (`MURMUR_DEV_DEK`/`MURMUR_DEV_KEK`) are ALWAYS stripped — see [`harden_env`].
+    inherit_env: bool,
 }
 
 impl ClaudeCodeProvider {
@@ -183,6 +207,7 @@ impl ClaudeCodeProvider {
             binary: DEFAULT_BINARY.to_string(),
             system_prompt: template::default_template(),
             model: String::new(),
+            inherit_env: false,
         }
     }
 
@@ -196,12 +221,21 @@ impl ClaudeCodeProvider {
             binary,
             system_prompt: template::default_template(),
             model: String::new(),
+            inherit_env: false,
         }
     }
 
     /// Set the model override (builder-style). Empty/blank ⇒ no `--model` flag (CLI default).
     pub fn with_model(mut self, model: String) -> Self {
         self.model = model;
+        self
+    }
+
+    /// Opt-in to inheriting the shell environment into the `claude` child (builder-style). When the
+    /// user's config has `claude_code_inherit_env = true`, an env `ANTHROPIC_API_KEY` (and proxy /
+    /// base-url vars) reach the CLI again — the DB keys are still always stripped (see [`harden_env`]).
+    pub fn with_inherit_env(mut self, inherit: bool) -> Self {
+        self.inherit_env = inherit;
         self
     }
 }
@@ -231,7 +265,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        harden_env(&mut cmd); // F2: env_clear + minimal PATH so no secrets leak to the child.
+        harden_env(&mut cmd, self.inherit_env); // F2: env_clear + minimal PATH so no secrets leak to the child.
         match cmd.status().await {
             Ok(status) if status.success() => Availability::Available,
             Ok(status) => Availability::Unavailable {
@@ -274,7 +308,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
         // Brain/AI model override: only add `--model` when the user picked a specific model;
         // an empty value lets the CLI use its own default.
         cmd.args(model_args(&self.model));
-        harden_env(&mut cmd); // F2: env_clear + minimal PATH.
+        harden_env(&mut cmd, self.inherit_env); // F2: env_clear + minimal PATH.
         let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
@@ -354,7 +388,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .kill_on_drop(true); // F6
         // Brain/AI model override (mirrors `summarize`): add `--model` only when set.
         cmd.args(model_args(&self.model));
-        harden_env(&mut cmd); // F2
+        harden_env(&mut cmd, self.inherit_env); // F2
         let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
@@ -452,6 +486,39 @@ mod tests {
             model_args(&p.model),
             vec!["--model".to_string(), "claude-sonnet-4-6".to_string()]
         );
+    }
+
+    #[test]
+    fn with_inherit_env_threads_the_flag() {
+        assert!(!ClaudeCodeProvider::with_binary("claude".into()).inherit_env, "default is hardened");
+        assert!(
+            ClaudeCodeProvider::with_binary("claude".into()).with_inherit_env(true).inherit_env,
+            "opt-in flag is threaded"
+        );
+    }
+
+    #[test]
+    fn inherit_env_always_strips_db_encryption_keys() {
+        // OPT-IN inherit: the child inherits our env — EXCEPT the DB encryption keys, which are
+        // explicitly REMOVED (mapped to None via env_remove) so they can NEVER reach a cloud-bound
+        // subprocess. This is the load-bearing guard that keeps the opt-in safe.
+        let mut cmd = Command::new("true");
+        harden_env(&mut cmd, true);
+        let envs: std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+            cmd.as_std().get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MURMUR_DEV_DEK")),
+            Some(&None),
+            "the DB DEK must be stripped even in inherit mode"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MURMUR_DEV_KEK")),
+            Some(&None),
+            "the DB KEK must be stripped even in inherit mode"
+        );
+        // PATH is still pinned so a GUI-launched app can find `claude` + its `node`.
+        let path = envs.get(std::ffi::OsStr::new("PATH"));
+        assert!(path.is_some() && path.unwrap().is_some(), "PATH is pinned in inherit mode");
     }
 
     #[test]

@@ -27,13 +27,18 @@
         "enable": true,
         "scope": {
           "allow": [
-            "$HOME/Library/Application Support/MeetNotes/audio/*.wav"
+            "$HOME/Library/Application Support/MeetNotes/audio/*.wav",
+            "$HOME/Library/Application Support/MeetNotes-dev/audio/*.wav"
           ],
           "deny": [
             "$HOME/Library/Application Support/MeetNotes/audio/**/*.enc",
             "$HOME/Library/Application Support/MeetNotes/audio/*.enc",
             "$HOME/Library/Application Support/MeetNotes/audio/**/*.encrypting",
-            "$HOME/Library/Application Support/MeetNotes/audio/*.encrypting"
+            "$HOME/Library/Application Support/MeetNotes/audio/*.encrypting",
+            "$HOME/Library/Application Support/MeetNotes-dev/audio/**/*.enc",
+            "$HOME/Library/Application Support/MeetNotes-dev/audio/*.enc",
+            "$HOME/Library/Application Support/MeetNotes-dev/audio/**/*.encrypting",
+            "$HOME/Library/Application Support/MeetNotes-dev/audio/*.encrypting"
           ],
           "requireLiteralLeadingDot": false
         }
