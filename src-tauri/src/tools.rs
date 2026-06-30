@@ -15,6 +15,9 @@
 //! `create_reminder`) live on [`GatedToolExecutor`] (NOT [`execute_tool`]): they run only when the
 //! executor was built with `allow_writes`, and `save_note` re-checks `meeting_is_visible` against the
 //! live `unlocked` set BEFORE it appends to `manual_notes` — a sealed-not-unlocked meeting refuses.
+//! The `propose_note` tool (always advertised) writes NO DB AT ALL — it only records a note DRAFT in
+//! interior-mutable scratch for the FE to offer "Add to notes"; the user commits it on Accept. So it
+//! needs no gate (it touches no content store) and carries no leak surface.
 //!
 //! ## Egress
 //! [`execute_tool`] EGRESSES NOTHING — it only reads the local SQLite DB and (for semantic search)
@@ -78,10 +81,12 @@ pub struct ToolSpec {
     pub write: bool,
 }
 
-/// The model-facing tool catalog. Built per call (cheap; ~10 entries). The read tools map 1:1 onto
-/// gated `execute_tool` / connector dispatchers; the two `write: true` entries (`save_note`,
-/// `create_reminder`) map onto the gated write arms of `GatedToolExecutor::run` and are advertised to
-/// the model ONLY when the executor was built with `allow_writes` (the in-meeting loop).
+/// The model-facing tool catalog. Built per call (cheap; ~11 entries). The read tools map 1:1 onto
+/// gated `execute_tool` / connector dispatchers. `propose_note` is `write: false` (ALWAYS advertised):
+/// it has NO DB side effect — it only RECORDS a note DRAFT for the user to review/accept via the FE,
+/// so it is the model-driven "the user asked for a note" signal that needs no write capability. The two
+/// `write: true` entries (`save_note`, `create_reminder`) map onto the gated write arms of
+/// `GatedToolExecutor::run` and are advertised ONLY when the executor was built with `allow_writes`.
 pub fn tool_specs() -> Vec<ToolSpec> {
     let str_arg = |prop: &'static str, desc: &str| -> serde_json::Value {
         serde_json::json!({
@@ -143,6 +148,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "calendar_lookup",
             description: "Look up the user's local (on-device) calendar for recent/upcoming events.",
             parameters: str_arg("query", "What meeting / agenda detail to find."),
+            write: false,
+        },
+        ToolSpec {
+            name: "propose_note",
+            description: "When the user asks you to MAKE / SAVE / DRAFT / WRITE a note (e.g. \"make me \
+                          a note about the decisions\", \"save that we ship Friday\", \"zapisz notatkę \
+                          o …\"), call this with the note content, enriched with the relevant meeting \
+                          context. This DRAFTS a note for the user to review and accept — it does NOT \
+                          save anything itself. Do NOT call it for plain questions or conversation — \
+                          just answer those normally.",
+            parameters: str_arg("content", "The drafted note content, in the user's own language, enriched with meeting context."),
             write: false,
         },
         ToolSpec {
@@ -511,6 +527,11 @@ fn format_hits_and_docs(
 /// surfaces). A write executes ONLY when `allow_writes` AND the target meeting is visible to the live
 /// `unlocked` set — a sealed-not-unlocked meeting refuses (`AppError::Locked`), never resurrecting
 /// plaintext behind a lock.
+///
+/// `proposed_note` is interior-mutable scratch for the always-on `propose_note` tool: when the model
+/// decides the user asked for a NOTE (vs a plain answer), it calls `propose_note(content)`, which
+/// records the draft HERE (no DB write). The caller (`run_informational`) reads it after the loop and
+/// threads it onto the result so the FE can offer "Add to notes" — the user commits on Accept.
 pub struct GatedToolExecutor<'a> {
     pub db: &'a Db,
     pub unlocked: &'a std::sync::Mutex<HashSet<String>>,
@@ -518,6 +539,9 @@ pub struct GatedToolExecutor<'a> {
     pub meeting_id: &'a str,
     pub app: Option<&'a tauri::AppHandle>,
     pub allow_writes: bool,
+    /// The note draft the model proposed this turn (via `propose_note`), if any. `None` ⇒ the reply
+    /// is a plain ANSWER; `Some(content)` ⇒ a NOTE PROPOSAL the FE should offer to add. No DB effect.
+    pub proposed_note: std::sync::Mutex<Option<String>>,
 }
 
 impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
@@ -578,6 +602,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 Some(app) => block_on_tool(execute_calendar_search(&s("query"), app)),
                 None => Err(AppError::InvalidArg("calendar_lookup needs an AppHandle".into())),
             },
+            // ── PROPOSE (always-on, NO DB side effect): the model signals the user asked for a note.
+            //    Records the draft in interior-mutable scratch; the caller threads it onto the result so
+            //    the FE can offer "Add to notes". Writes NOTHING — the user commits on Accept.
+            "propose_note" => self.propose_note(&s("content")),
             // ── WRITE tools (advertised only when `allow_writes`; the allowlist check above already
             //    refused them otherwise). Each is GATED to a VISIBLE/unlocked meeting before it mutates.
             "save_note" => self.save_note(&s("text"), &unlocked),
@@ -591,6 +619,26 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
 }
 
 impl GatedToolExecutor<'_> {
+    /// PROPOSE (no DB side effect) — the model decided the user asked for a NOTE: record the drafted
+    /// `content` in the interior-mutable `proposed_note` scratch so the caller can thread it onto the
+    /// result and the FE can offer "Add to notes". This NEVER writes `manual_notes` or any DB row — the
+    /// user commits the draft on Accept (→ `save_manual_notes`). PII rule: log id/len ONLY, never the
+    /// proposed content. The LAST proposal wins if the model (mistakenly) proposes twice in one turn.
+    fn propose_note(&self, content: &str) -> Result<String> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(AppError::InvalidArg("nothing to propose".into()));
+        }
+        // Record the draft (no DB write). A poisoned mutex is a programming error, not a leak.
+        *self
+            .proposed_note
+            .lock()
+            .map_err(|_| AppError::Other(anyhow::anyhow!("proposed_note mutex poisoned")))? =
+            Some(content.to_string());
+        tracing::debug!(target: "agent", len = content.len(), "agent proposed a note draft (not written)");
+        Ok("Drafted a note for the user to review.".to_string())
+    }
+
     /// WRITE — append the agent's note to the CURRENT meeting's durable typed-notes buffer
     /// (`meetings.manual_notes`, Feature A): the sealed-and-restored, folds-into-the-note home. Read
     /// the existing buffer, append the new line, and write it back — a non-destructive append (the
@@ -877,6 +925,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: true,
+            proposed_note: Mutex::new(None),
         };
         let names: Vec<&str> = writeable.specs().iter().map(|s| s.name).collect();
         assert!(names.contains(&"save_note"), "the write loop must advertise save_note: {names:?}");
@@ -884,12 +933,28 @@ mod tests {
             names.contains(&"create_reminder"),
             "the write loop must advertise create_reminder: {names:?}"
         );
+        // propose_note is always advertised (write: false), regardless of allow_writes.
+        assert!(names.contains(&"propose_note"), "propose_note must always be advertised: {names:?}");
 
-        let readonly = GatedToolExecutor { allow_writes: false, ..writeable };
+        let readonly = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: false,
+            proposed_note: Mutex::new(None),
+        };
         let ro_names: Vec<&str> = readonly.specs().iter().map(|s| s.name).collect();
         assert!(
             !ro_names.iter().any(|n| *n == "save_note" || *n == "create_reminder"),
             "a read-only executor must NOT advertise write tools: {ro_names:?}"
+        );
+        // propose_note (write: false, no DB effect) is STILL advertised on a read-only executor — it is
+        // the always-on path the model uses to signal a note draft.
+        assert!(
+            ro_names.contains(&"propose_note"),
+            "propose_note must be advertised even when allow_writes is false: {ro_names:?}"
         );
     }
 
@@ -909,6 +974,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: true,
+            proposed_note: Mutex::new(None),
         };
 
         // First note SEEDS the empty buffer.
@@ -957,6 +1023,7 @@ mod tests {
             meeting_id: "sealed1",
             app: None,
             allow_writes: true,
+            proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "secret note" }));
         assert!(
@@ -985,6 +1052,7 @@ mod tests {
             meeting_id: "", // no active recording
             app: None,
             allow_writes: true,
+            proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "orphan note" }));
         assert!(
@@ -1008,6 +1076,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: false, // read-only — write tools not advertised
+            proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "should not run" }));
         assert!(
@@ -1016,5 +1085,128 @@ mod tests {
         );
         // Nothing was written.
         assert_eq!(db.get_manual_notes("live1").unwrap(), "");
+    }
+
+    // ── propose_note: the always-on, DB-free NOTE-DRAFT signal (propose-then-accept, Rev 2) ─────────
+    // The model DECIDES (no regex in our code) whether its reply is a plain answer or a note proposal;
+    // when it proposes, the FE shows "Add to notes". The executor only RECORDS the draft — no DB write.
+
+    /// `propose_note` is ADVERTISED regardless of `allow_writes` (it is `write: false` — no DB effect),
+    /// on BOTH a read-only and a write-capable executor. The model-driven note-draft path is always on.
+    #[test]
+    fn propose_note_advertised_regardless_of_allow_writes() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        for allow_writes in [false, true] {
+            let exec = GatedToolExecutor {
+                db: &db,
+                unlocked: &unlocked,
+                config: &cfg,
+                meeting_id: "live1",
+                app: None,
+                allow_writes,
+                proposed_note: Mutex::new(None),
+            };
+            let names: Vec<&str> = exec.specs().iter().map(|s| s.name).collect();
+            assert!(
+                names.contains(&"propose_note"),
+                "propose_note must be advertised with allow_writes={allow_writes}: {names:?}"
+            );
+            // It is a read tool (write: false), so it is NOT gated out on the read surface.
+            let spec = tool_specs().into_iter().find(|s| s.name == "propose_note").unwrap();
+            assert!(!spec.write, "propose_note must be write: false (no DB side effect)");
+        }
+    }
+
+    /// The `propose_note` arm RECORDS the drafted content into the executor's `proposed_note` scratch
+    /// and writes NO DB — `manual_notes` is unchanged, NOTHING is persisted. RED-able: were the arm to
+    /// call `set_manual_notes`, the assertion that the buffer stays empty would fail.
+    #[test]
+    fn propose_note_records_draft_and_writes_no_db() {
+        let db = tmp_db();
+        seed_live_meeting(&db, "live1");
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: false, // propose works even read-only
+            proposed_note: Mutex::new(None),
+        };
+
+        // Before any call the scratch is None ⇒ the reply would be a plain ANSWER.
+        assert!(exec.proposed_note.lock().unwrap().is_none(), "no proposal until propose_note is called");
+
+        let out = exec
+            .run("propose_note", &serde_json::json!({ "content": "Decision: ship Friday; Anna owns QA." }))
+            .unwrap();
+        assert!(out.to_lowercase().contains("draft"), "confirmation mentions a draft: {out}");
+
+        // The draft is RECORDED in scratch (this is what the caller threads onto the result).
+        assert_eq!(
+            exec.proposed_note.lock().unwrap().as_deref(),
+            Some("Decision: ship Friday; Anna owns QA."),
+            "propose_note must record the drafted content"
+        );
+        // And NOTHING was written to the DB — manual_notes is untouched (no persistence on propose).
+        assert_eq!(
+            db.get_manual_notes("live1").unwrap(),
+            "",
+            "propose_note must NOT write manual_notes (the user commits on Accept)"
+        );
+        assert!(
+            db.list_note_asides("live1").unwrap().is_empty(),
+            "propose_note must NOT write notes_asides either"
+        );
+    }
+
+    /// `proposed_note` stays None when the model does NOT call `propose_note` (a plain answer turn) —
+    /// only a read tool ran, so the scratch is never set.
+    #[test]
+    fn proposed_note_is_none_when_propose_not_called() {
+        let db = tmp_db();
+        seed_live_meeting(&db, "live1");
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: false,
+            proposed_note: Mutex::new(None),
+        };
+        // A plain read tool (the kind a question would use) does NOT set a proposal.
+        let _ = exec.run("search_meetings", &serde_json::json!({ "query": "anything" })).unwrap();
+        assert!(
+            exec.proposed_note.lock().unwrap().is_none(),
+            "an answer turn (no propose_note) must leave proposed_note None"
+        );
+    }
+
+    /// An empty/whitespace `content` is refused (`InvalidArg`) and records NO draft — we never surface
+    /// an empty proposal the FE would render as a blank "Add to notes".
+    #[test]
+    fn propose_note_refuses_empty_content() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: false,
+            proposed_note: Mutex::new(None),
+        };
+        let res = exec.run("propose_note", &serde_json::json!({ "content": "   " }));
+        assert!(matches!(res, Err(AppError::InvalidArg(_))), "empty proposal refused: {res:?}");
+        assert!(exec.proposed_note.lock().unwrap().is_none(), "no draft recorded for an empty proposal");
     }
 }
