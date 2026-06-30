@@ -1289,6 +1289,8 @@ export class OnboardingComponent implements OnInit {
       // the snapshot so onboarding never resets them, both default off (no egress).
       webSearchEnabled: base?.webSearchEnabled ?? false,
       webSearchConsented: base?.webSearchConsented ?? false,
+      // Opt-in claude-CLI env inheritance — round-trip the snapshot so onboarding never resets it.
+      claudeCodeInheritEnv: base?.claudeCodeInheritEnv ?? false,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

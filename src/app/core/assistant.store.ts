@@ -6,6 +6,7 @@ import type {
   VoiceActionStatus,
   VoiceCommandListeningPayload,
   VoiceCommandProcessingPayload,
+  AssistantToolPayload,
   WakeDetectedPayload,
 } from "./models";
 
@@ -37,15 +38,37 @@ export interface AssistantCitation {
   url?: string;
 }
 
+/**
+ * One tool the brain used during an agentic turn — drives the LIVE trace chips
+ * ("Searching notes… ✓", "Checking the web…"). Carries the tool name + a coarse
+ * count only (no PII). Pushed/updated by {@link AssistantStore.onAssistantTool}.
+ */
+export interface ToolTraceStep {
+  /** Stable id for `@for` tracking (never key a trace chip on $index). */
+  id: number;
+  /** The tool name (search_meetings / search_semantic / web_search / …). */
+  tool: string;
+  /** "running" while the call is in flight, "done" once it returns. */
+  state: "running" | "done";
+  /** False when the call errored (the chip shows a muted state). */
+  ok: boolean;
+  /** Coarse result-size badge ("✓ N") — never the content. */
+  count: number | null;
+}
+
 export interface AssistantInteraction {
   /** Stable id for `@for` tracking (we never key on $index). */
   id: number;
-  /** What the user said after the wake phrase. */
+  /** Where the question came from — drives the row icon (mic / keyboard / wake). */
+  source: "voice" | "wake" | "text";
+  /** What the user said (voice) or typed (text). */
   command: string;
   /** "pending" until the result arrives, then mirrors the result status. */
   status: "pending" | VoiceActionStatus;
   /** The assistant's answer (empty while pending). */
   summary: string;
+  /** The live tool-trace for THIS turn (the chips), in call order. */
+  trace: ToolTraceStep[];
   /** Parsed grounding citations → vault `[[Title]]` chips + "via web" links. */
   citations: AssistantCitation[];
 }
@@ -143,11 +166,14 @@ export class AssistantStore {
 
   /** Monotonic id source for interaction rows (stable `@for` keys). */
   private nextId = 1;
+  /** Monotonic id source for tool-trace chips (stable `@for` keys). */
+  private nextTraceId = 1;
 
   private unlistenWake: UnlistenFn | null = null;
   private unlistenResult: UnlistenFn | null = null;
   private unlistenListening: UnlistenFn | null = null;
   private unlistenProcessing: UnlistenFn | null = null;
+  private unlistenTool: UnlistenFn | null = null;
   /** Synchronous re-entrancy guard so two concurrent init() calls (e.g. the record
    * screen + the card both initialising) can't double-subscribe before the first
    * `await` resolves. */
@@ -167,6 +193,9 @@ export class AssistantStore {
     this.unlistenProcessing = await this.ipc.onVoiceCommandProcessing((p) =>
       this.onProcessing(p),
     );
+    this.unlistenTool = await this.ipc.onAssistantTool((p) =>
+      this.onAssistantTool(p),
+    );
   }
 
   /** Release the event subscriptions (e.g. on app teardown). */
@@ -175,10 +204,12 @@ export class AssistantStore {
     this.unlistenResult?.();
     this.unlistenListening?.();
     this.unlistenProcessing?.();
+    this.unlistenTool?.();
     this.unlistenWake = null;
     this.unlistenResult = null;
     this.unlistenListening = null;
     this.unlistenProcessing = null;
+    this.unlistenTool = null;
   }
 
   /**
@@ -220,17 +251,103 @@ export class AssistantStore {
     }
   }
 
-  private onWake(p: WakeDetectedPayload): void {
+  /**
+   * Ask the assistant a TYPED question (the text composer). Optimistically prepend
+   * a pending row with the typed text BEFORE the await (the {@link onWake} pattern)
+   * so the user sees it instantly, mark a turn in flight (orb → processing), then
+   * route through the SAME gated brain via IPC. The live tool-trace lands via
+   * {@link onAssistantTool}; the answer resolves the pending row via {@link onResult}.
+   */
+  async askText(text: string): Promise<void> {
+    const command = text.trim();
+    if (!command) return;
     const row: AssistantInteraction = {
       id: this.nextId++,
-      command: p.command,
+      source: "text",
+      command,
       status: "pending",
       summary: "",
+      trace: [],
       citations: [],
     };
     this._interactions.update((rows) =>
       [row, ...rows].slice(0, AssistantStore.MAX),
     );
+    this._processing.set(true);
+    try {
+      await this.ipc.askAssistantText(command);
+    } catch (e) {
+      this._processing.set(false);
+      // Don't leave the optimistic row stuck "pending" if the dispatch was rejected.
+      this._interactions.update((rows) =>
+        rows.map((r) =>
+          r.id === row.id
+            ? { ...r, status: "error" as const, summary: "Couldn't send your question." }
+            : r,
+        ),
+      );
+      throw e;
+    }
+  }
+
+  private onWake(p: WakeDetectedPayload): void {
+    const row: AssistantInteraction = {
+      id: this.nextId++,
+      source: "wake",
+      command: p.command,
+      status: "pending",
+      summary: "",
+      trace: [],
+      citations: [],
+    };
+    this._interactions.update((rows) =>
+      [row, ...rows].slice(0, AssistantStore.MAX),
+    );
+  }
+
+  /**
+   * Attach a LIVE tool-trace chip to the in-flight (top pending) interaction. A
+   * "running" event pushes a new chip; a "done" event resolves the most recent
+   * matching running chip (or appends one if none). No pending row → ignore (the
+   * trace has no home). Pure immutable signal updates — no NG0600.
+   */
+  private onAssistantTool(p: AssistantToolPayload): void {
+    this._interactions.update((rows) => {
+      const idx = rows.findIndex((r) => r.status === "pending");
+      if (idx === -1) return rows;
+      const row = rows[idx];
+      const trace = row.trace.slice();
+      if (p.state === "running") {
+        trace.push({
+          id: this.nextTraceId++,
+          tool: p.tool,
+          state: "running",
+          ok: true,
+          count: p.count,
+        });
+      } else {
+        let resolved = false;
+        for (let i = trace.length - 1; i >= 0; i--) {
+          if (trace[i].tool === p.tool && trace[i].state === "running") {
+            trace[i] = { ...trace[i], state: "done", ok: p.ok, count: p.count };
+            resolved = true;
+            break;
+          }
+        }
+        if (!resolved) {
+          trace.push({
+            id: this.nextTraceId++,
+            tool: p.tool,
+            state: "done",
+            ok: p.ok,
+            count: p.count,
+          });
+        }
+      }
+      const next = rows.slice();
+      next[idx] = { ...row, trace };
+      return next;
+    });
   }
 
   private onListening(p: VoiceCommandListeningPayload): void {
@@ -259,9 +376,11 @@ export class AssistantStore {
         // user actually said (not an empty "usłyszano: …").
         const row: AssistantInteraction = {
           id: this.nextId++,
+          source: "voice",
           command: p.command,
           status: p.status,
           summary: p.summary,
+          trace: [],
           citations: parseCitations(p.citations),
         };
         return [row, ...rows].slice(0, AssistantStore.MAX);

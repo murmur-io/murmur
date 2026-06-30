@@ -80,6 +80,23 @@ impl VoiceActionResult {
         self
     }
 
+    /// Map a converged agentic-loop [`crate::agent::AgentOutcome`] onto the FE result DTO. The intent
+    /// KIND comes from the resolved intent (recall vs research); the answer + GATED citations come
+    /// straight off the loop. `command` is threaded on by the caller via [`Self::with_command`].
+    pub fn from_agent(intent: &VoiceIntent, outcome: crate::agent::AgentOutcome) -> Self {
+        let intent_kind = match intent {
+            VoiceIntent::Recall { .. } => "recall",
+            _ => "research",
+        };
+        Self {
+            intent_kind: intent_kind.to_string(),
+            status: "ok".to_string(),
+            summary: outcome.answer,
+            command: String::new(),
+            citations: outcome.citations,
+        }
+    }
+
     /// The graceful outcome when a MANUAL voice-command capture's budget expired with NOTHING heard
     /// (the user never spoke after clicking). NOT a confusing "didn't catch an action" — a friendly
     /// Polish nudge to click + speak again. Empty `command` (nothing was heard) and no citations.
@@ -658,8 +675,9 @@ fn is_empty_tool_result(text: &str) -> bool {
 
 /// Pull distinct `[[Title]]` wikilinks out of the gated tool grounding text, in first-seen order.
 /// Deterministic, no regex. Only the tool output is scanned, so a citation can only ever name a
-/// VISIBLE meeting (the tools never emit a sealed-not-unlocked title).
-fn extract_citations(text: &str) -> Vec<String> {
+/// VISIBLE meeting (the tools never emit a sealed-not-unlocked title). `pub(crate)` so the agentic
+/// loop (`crate::agent`) reuses the SAME gated-citation extraction instead of duplicating it.
+pub(crate) fn extract_citations(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -841,6 +859,102 @@ mod tests {
 
     fn empty_unlocked() -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// LOAD-BEARING (verification 2026-06-30): the AGENTIC LOOP must NEVER surface SEALED content.
+    /// Proven two ways. (1) The gated executor itself hides the sealed meeting from BOTH a direct
+    /// `get_meeting` and a `search_meetings` — RED-able: were the executor to bypass the live
+    /// `unlocked` set, the sealed id would appear in the search results. (2) The full loop, driven by
+    /// a brain scripted to exfiltrate the sealed meeting (fetch its id, then search its title) and
+    /// then answer, surfaces NOTHING sealed in its citations. The model can REQUEST a read, but the
+    /// host-held gate filters it.
+    #[test]
+    fn agentic_loop_and_executor_never_surface_sealed_content() {
+        use crate::agent::run_agentic_loop;
+        use crate::agent::ToolExecutor;
+        use crate::tools::GatedToolExecutor;
+
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+
+        // SEED SELF-CHECK: prove the seed produced the EXPECTED gate state BEFORE exercising the loop,
+        // so this test is unambiguous about what it proves. If this ever trips it is a SEED/harness
+        // fault (a flaked fixture), NOT a gate bypass — it fails loudly here, never disguised as a leak
+        // through the executor below. (The production gate `meeting_is_visible` is exercised by ~100
+        // other tests; this guards the FIXTURE so the executor assertions below are meaningful.)
+        let nothing = HashSet::new();
+        assert!(
+            db.meeting_is_visible("open1", &nothing).unwrap(),
+            "seed fixture: the visible meeting must be visible"
+        );
+        assert!(
+            !db.meeting_is_visible("sealed1", &nothing).unwrap(),
+            "seed fixture: the sealed meeting must be gated (sealed-not-unlocked)"
+        );
+
+        let cfg = AppConfig::default();
+        // The executor holds the live set behind its Mutex (re-read per call). Nothing unlocked here
+        // → the sealed folder is invisible to every gated read.
+        let unlocked = std::sync::Mutex::new(empty_unlocked());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "",
+            app: None,
+            allow_writes: false,
+        };
+
+        // (1) Direct gate proof on the executor (RED-able).
+        let got = exec
+            .run("get_meeting", &serde_json::json!({ "meetingId": "sealed1" }))
+            .unwrap();
+        assert!(got.starts_with("No data"), "sealed meeting fetch must be gated: {got}");
+        let searched = exec
+            .run("search_meetings", &serde_json::json!({ "query": "Atlas" }))
+            .unwrap();
+        assert!(!searched.contains("sealed1"), "sealed meeting must NOT appear in gated search: {searched}");
+        assert!(searched.contains("open1"), "the VISIBLE meeting is still found");
+
+        // (2) The full loop routes every read through that gate.
+        struct Exfil {
+            steps: std::sync::Mutex<std::collections::VecDeque<Value>>,
+        }
+        impl LocalReasoner for Exfil {
+            fn id(&self) -> &str {
+                "exfil"
+            }
+            fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+                Ok("floored".into())
+            }
+            fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> crate::error::Result<Value> {
+                Ok(self
+                    .steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(serde_json::json!({ "answer": "done" })))
+            }
+        }
+        let brain = Exfil {
+            steps: std::sync::Mutex::new(
+                vec![
+                    serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "sealed1" } }),
+                    serde_json::json!({ "tool": "search_meetings", "args": { "query": "Atlas Secret Terms" } }),
+                    serde_json::json!({ "answer": "Here is what I found." }),
+                ]
+                .into(),
+            ),
+        };
+        let outcome = run_agentic_loop(&brain, "sys", "what are the secret terms?", &exec, 5, None)
+            .unwrap()
+            .expect("the brain answered");
+        assert!(
+            !outcome.citations.iter().any(|c| c.contains("Atlas Secret Terms")),
+            "the loop must never cite the sealed meeting: {:?}",
+            outcome.citations
+        );
+        assert!(outcome.steps.iter().all(|s| s.ok), "gated tool calls ran without panic");
     }
 
     #[test]
