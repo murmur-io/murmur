@@ -345,18 +345,21 @@ impl SummarizerProvider for ClaudeCodeProvider {
         };
 
         if !output.status.success() {
-            // F6: do NOT echo claude's stderr at a PII-retaining level. stderr can contain prompt
-            // fragments / transcript echoes; surface only the exit code, and log stderr length
-            // (not content) at debug for diagnostics.
+            // F6: never echo claude's stderr at a PII-retaining level (it can carry prompt/transcript
+            // echoes). Log only code + length; surface an ACTIONABLE, PII-free error; and ONLY when
+            // the user opted in (MURMUR_DEBUG_CLAUDE_STDERR=1) capture the real stderr to a debug file.
+            let code = output.status.code().unwrap_or(-1);
             tracing::debug!(
                 target: "summarize",
-                code = output.status.code().unwrap_or(-1),
+                code,
                 stderr_len = output.stderr.len(),
                 "claude exited non-zero"
             );
-            return Err(AppError::Summarize(format!(
-                "claude exited with status {} (stderr suppressed: may contain transcript content)",
-                output.status.code().unwrap_or(-1),
+            let debug_path = capture_claude_stderr(&output.stderr);
+            return Err(AppError::Summarize(claude_failure_message(
+                code,
+                &self.model,
+                debug_path.as_deref(),
             )));
         }
 
@@ -420,16 +423,20 @@ impl SummarizerProvider for ClaudeCodeProvider {
             }
         };
         if !output.status.success() {
-            // F6: suppress stderr content (may carry prompt/transcript text); code only.
+            // F6: suppress stderr content (may carry prompt/transcript text); code only. Same
+            // actionable error + opt-in capture as `summarize`.
+            let code = output.status.code().unwrap_or(-1);
             tracing::debug!(
                 target: "summarize",
-                code = output.status.code().unwrap_or(-1),
+                code,
                 stderr_len = output.stderr.len(),
                 "claude (complete) exited non-zero"
             );
-            return Err(AppError::Summarize(format!(
-                "claude exited with status {} (stderr suppressed: may contain prompt content)",
-                output.status.code().unwrap_or(-1),
+            let debug_path = capture_claude_stderr(&output.stderr);
+            return Err(AppError::Summarize(claude_failure_message(
+                code,
+                &self.model,
+                debug_path.as_deref(),
             )));
         }
         String::from_utf8(output.stdout)
@@ -456,6 +463,55 @@ fn starts_with_frontmatter(text: &str) -> bool {
         Some(first) => first.trim_end() == "---",
         None => false,
     }
+}
+
+/// Build the PII-free, ACTIONABLE error for a non-zero `claude` exit. The model id (the user's own
+/// pick — NOT transcript content) is named when a `--model` override was in play, because the #1
+/// real cause is the CLI / a LiteLLM proxy not knowing that id (the model-picker regression: 0.1.0
+/// passed no `--model` and worked), and the fix is one click. `debug_path` is `Some` when
+/// `MURMUR_DEBUG_CLAUDE_STDERR` captured the real stderr — then we name the file instead of telling
+/// the user to set the flag. Never includes stderr content (may carry transcript echoes).
+fn claude_failure_message(code: i32, model: &str, debug_path: Option<&str>) -> String {
+    let model = model.trim();
+    let mut msg = format!("claude exited with status {code}");
+    if model.is_empty() {
+        msg.push_str(
+            " — `claude` could not complete the request. Check that `claude -p \"hi\"` works in a \
+             terminal and that the CLI is signed in / its auth is configured",
+        );
+    } else {
+        msg.push_str(&format!(
+            " — the selected model `{model}` may not be available in your `claude` setup \
+             (a proxy / LiteLLM endpoint may not know that id). Fix: Settings → Brain/AI → \
+             Model → \"Default (provider's pick)\", or pick a model your setup supports",
+        ));
+    }
+    match debug_path {
+        Some(p) => msg.push_str(&format!(". Real stderr was captured to {p}")),
+        None => msg.push_str(
+            ". stderr suppressed (may contain transcript content) — set MURMUR_DEBUG_CLAUDE_STDERR=1 \
+             to capture it to a debug file",
+        ),
+    }
+    msg
+}
+
+/// When `MURMUR_DEBUG_CLAUDE_STDERR=1`, write the failed child's stderr to
+/// `<app-data>/<app_dir>/debug/claude-stderr.log` and return its path, so a stuck user can read the
+/// REAL diagnostic (the model 404 / auth message) that we otherwise suppress. OFF by default; the
+/// file is local + user-controlled, and we capture ONLY stderr (the diagnostic stream) — never
+/// stdout (the note content). Best-effort: any IO/env miss yields `None` and never breaks summarize.
+fn capture_claude_stderr(stderr: &[u8]) -> Option<String> {
+    if std::env::var("MURMUR_DEBUG_CLAUDE_STDERR").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let dir = dirs::data_dir()?
+        .join(crate::state::app_dir_name())
+        .join("debug");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("claude-stderr.log");
+    std::fs::write(&path, stderr).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -519,6 +575,39 @@ mod tests {
         // PATH is still pinned so a GUI-launched app can find `claude` + its `node`.
         let path = envs.get(std::ffi::OsStr::new("PATH"));
         assert!(path.is_some() && path.unwrap().is_some(), "PATH is pinned in inherit mode");
+    }
+
+    #[test]
+    fn failure_message_names_the_model_and_offers_default() {
+        // The #1 real cause: a `--model` override the user's claude CLI / proxy doesn't know
+        // (regression from the model picker). The error MUST name the model + the one-click fix.
+        let m = claude_failure_message(1, "claude-sonnet-4-6", None);
+        assert!(m.contains("claude-sonnet-4-6"), "names the offending model: {m}");
+        assert!(m.contains("Default"), "offers the Model = Default workaround: {m}");
+        assert!(
+            m.contains("MURMUR_DEBUG_CLAUDE_STDERR"),
+            "tells the user how to capture the real stderr: {m}"
+        );
+    }
+
+    #[test]
+    fn failure_message_is_generic_without_a_model_override() {
+        // No model picked ⇒ no model hint; point at the terminal auth check instead.
+        let m = claude_failure_message(1, "   ", None);
+        assert!(!m.contains("selected model"), "no model hint when none set: {m}");
+        assert!(m.contains("claude -p"), "points at the terminal check: {m}");
+    }
+
+    #[test]
+    fn failure_message_points_to_the_debug_file_when_captured() {
+        // When MURMUR_DEBUG_CLAUDE_STDERR captured stderr, name the file instead of telling the
+        // user to set the flag (they already did).
+        let m = claude_failure_message(2, "", Some("/x/claude-stderr.log"));
+        assert!(m.contains("/x/claude-stderr.log"), "names the capture path: {m}");
+        assert!(
+            !m.contains("MURMUR_DEBUG_CLAUDE_STDERR"),
+            "no 'set the flag' hint once already captured: {m}"
+        );
     }
 
     #[test]
