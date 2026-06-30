@@ -4833,6 +4833,7 @@ mod lifecycle_tests {
             config: Mutex::new(AppConfig::default()),
             reasoner: Box::new(crate::reason::StubReasoner),
             current_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),
