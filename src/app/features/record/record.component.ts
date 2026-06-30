@@ -16,6 +16,7 @@ import type { Analytics, AppConfigDto } from "../../core/models";
 import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 import { AssistantActionsComponent } from "./assistant-actions.component";
+import { MeetingNotesComponent } from "./meeting-notes.component";
 import { AiOrbComponent } from "./ai-orb.component";
 import { AssistantStore } from "../../core/assistant.store";
 
@@ -28,6 +29,7 @@ import { AssistantStore } from "../../core/assistant.store";
     PreMeetingBriefComponent,
     MicMuteToggleComponent,
     AssistantActionsComponent,
+    MeetingNotesComponent,
     AiOrbComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
@@ -272,6 +274,11 @@ import { AssistantStore } from "../../core/assistant.store";
             }
           </p>
         </div>
+      }
+
+      <!-- ── My notes — free-text + inline @brain, shown only while recording ── -->
+      @if (store.isRecording()) {
+        <app-meeting-notes [meetingId]="store.meetingId()" />
       }
 
       <!-- ── In-meeting voice assistant — recent actions (Phase H) ────────── -->
