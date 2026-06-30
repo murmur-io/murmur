@@ -17,6 +17,7 @@ import type {
   AppConfigDto,
   BrainBackend,
   BrainModelDto,
+  GatewayModel,
   InputDeviceInfo,
   ProviderStatus,
   ReindexResult,
@@ -1024,19 +1025,62 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
               }
             </label>
 
-            <label class="field">
+            <div class="field">
               <span class="field-label">Model</span>
-              <input
-                formControlName="gatewayModel"
-                placeholder="gpt-4o (leave blank to use the gateway default)"
-                autocomplete="off"
-                spellcheck="false"
-              />
-              <span class="field-help text-muted">
-                Sent as the <code>model</code> field in every request — leave
-                blank to let the gateway choose.
-              </span>
-            </label>
+              <div class="gateway-model-row">
+                @if (gatewayModels().length > 0) {
+                  <select formControlName="gatewayModel" class="gateway-model-select">
+                    <option value="">Gateway default</option>
+                    @for (m of gatewayModels(); track m.id) {
+                      <option [value]="m.id">{{ m.id }}</option>
+                    }
+                    <!--
+                      If the currently-saved model is not in the catalog (e.g. the
+                      catalog changed), keep it selectable so a manually-typed value
+                      is never silently lost. gatewayModelIsCustom() is a computed
+                      to avoid arrow-function syntax in the template.
+                    -->
+                    @if (gatewayModelIsCustom()) {
+                      <option [value]="form.controls.gatewayModel.value">
+                        {{ form.controls.gatewayModel.value }} (custom)
+                      </option>
+                    }
+                  </select>
+                } @else {
+                  <input
+                    formControlName="gatewayModel"
+                    placeholder="gpt-4o (leave blank to use the gateway default)"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="gateway-model-input"
+                  />
+                }
+                <button
+                  type="button"
+                  class="btn btn-ghost gateway-model-refresh"
+                  (click)="refreshGatewayModels()"
+                  [disabled]="gatewayModelsLoading()"
+                  title="Fetch models from the gateway's /v1/models endpoint"
+                >
+                  @if (gatewayModelsLoading()) {
+                    Loading…
+                  } @else {
+                    ↻ Refresh models
+                  }
+                </button>
+              </div>
+              @if (gatewayModelError()) {
+                <span class="field-help text-muted">
+                  Couldn't load models — check the base URL and key, or type the
+                  model id manually.
+                </span>
+              } @else {
+                <span class="field-help text-muted">
+                  Sent as the <code>model</code> field in every request — leave
+                  blank to let the gateway choose.
+                </span>
+              }
+            </div>
 
             <!-- Gateway API key (optional) -->
             <div class="key-status">
@@ -2104,6 +2148,26 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         font-size: 0.8125rem;
         line-height: 1.5;
       }
+
+      /* --- AI Gateway (Phase 3) — live model picker row --- */
+      .gateway-model-row {
+        display: flex;
+        gap: var(--space-2);
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .gateway-model-select,
+      .gateway-model-input {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .gateway-model-refresh {
+        flex: none;
+        height: 36px;
+        padding: 0 var(--space-3);
+        font-size: 0.8125rem;
+        white-space: nowrap;
+      }
     `,
   ],
 })
@@ -2251,6 +2315,38 @@ export class SettingsComponent implements OnInit {
   readonly hasGatewayKey = signal(false);
   /** Surfaced if storing or clearing the gateway key rejects. */
   readonly gatewayKeyError = signal<string | null>(null);
+
+  // ── AI Gateway (Phase 3) — live model picker ────────────────────────────
+
+  /** Models fetched from the gateway's `/v1/models` endpoint. Empty = use text fallback. */
+  readonly gatewayModels = signal<GatewayModel[]>([]);
+  /** True while list_gateway_models is in-flight — disables the Refresh button. */
+  readonly gatewayModelsLoading = signal(false);
+  /** Non-null when the last refreshGatewayModels() call failed — surfaces a fallback hint. */
+  readonly gatewayModelError = signal<string | null>(null);
+
+  /**
+   * Live signal of the gatewayModel form control's value. Mirrors the pattern used
+   * for `_gatewayBaseUrlValue` below so `gatewayModelIsCustom` is reactive.
+   */
+  private readonly _gatewayModelValue = toSignal(
+    this.form.controls.gatewayModel.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+
+  /**
+   * True when a model is currently saved in the form AND that model is NOT present
+   * in the fetched `gatewayModels` catalog. In that case the template adds it as a
+   * "(custom)" option so the manually-typed value is never silently lost.
+   *
+   * Implemented as a `computed` rather than an inline arrow function in the template
+   * to satisfy the Angular template parser (arrow functions are banned in expressions).
+   */
+  readonly gatewayModelIsCustom = computed(() => {
+    const current = this._gatewayModelValue();
+    if (!current) return false;
+    return !this.gatewayModels().some((m) => m.id === current);
+  });
 
   /**
    * Live signal of the gatewayBaseUrl form control's value — built from
@@ -2742,6 +2838,27 @@ export class SettingsComponent implements OnInit {
       this.hasGatewayKey.set(await this.ipc.hasGatewayKey());
     } catch (e) {
       this.gatewayKeyError.set(String(e));
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 3) — fetch the model catalog from the configured gateway's
+   * `/v1/models` endpoint and populate the model picker. Leaves the list empty on
+   * error so the text-input fallback is shown instead — the user can still type the
+   * model id manually. Not an effect: driven by the explicit "↻ Refresh models"
+   * button click (no NG0600 risk, no unwanted network call on load).
+   */
+  async refreshGatewayModels(): Promise<void> {
+    this.gatewayModelError.set(null);
+    this.gatewayModelsLoading.set(true);
+    try {
+      this.gatewayModels.set(await this.ipc.listGatewayModels());
+    } catch (e) {
+      // Leave the existing list (may be empty) and show the fallback hint.
+      this.gatewayModels.set([]);
+      this.gatewayModelError.set(String(e));
+    } finally {
+      this.gatewayModelsLoading.set(false);
     }
   }
 

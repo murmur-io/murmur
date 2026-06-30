@@ -8,6 +8,7 @@ import type {
   BrainDownloadProgress,
   BrainModelDto,
   EmbedDownloadProgress,
+  GatewayModel,
   ReindexProgress,
   ReindexResult,
   InputDeviceInfo,
@@ -179,6 +180,17 @@ export class IpcService {
    */
   clearGatewayKey(): Promise<void> {
     return invoke<void>("clear_gateway_key");
+  }
+
+  /**
+   * AI Gateway (Phase 3) — fetch the model catalog from the configured gateway's
+   * `/v1/models` endpoint. Returns an array of `{ id }` objects (one per model).
+   * Rejects when the gateway is unreachable, the key is wrong, or the endpoint does
+   * not exist (not all gateways expose `/v1/models`). The FE falls back to a plain
+   * text input when the list is empty or the call rejects.
+   */
+  listGatewayModels(): Promise<GatewayModel[]> {
+    return invoke<GatewayModel[]>("list_gateway_models");
   }
 
   /**
