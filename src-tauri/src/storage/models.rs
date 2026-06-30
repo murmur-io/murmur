@@ -237,6 +237,28 @@ pub struct SearchHit {
     pub matched_in: String,
 }
 
+/// Lightweight metadata for one uploaded document — the FE list DTO. Carries NO text (the text is
+/// gated content surfaced only by `get_document`, never in the list). `created_at` is epoch millis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+/// One gated document-chunk retrieval hit (the document analogue of [`SearchHit`], minus the
+/// meeting): the nearest chunk's snippet + the source document name + its (visible) folder id.
+/// Returned by `search_doc_chunks_visible` and folded into the brain/Ask grounding corpus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocChunkHit {
+    pub document_id: String,
+    pub name: String,
+    pub folder_id: String,
+    pub snippet: String,
+}
+
 /// One turn in a meeting chat conversation. `role` is "user" | "assistant".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
