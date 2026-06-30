@@ -163,6 +163,29 @@ fn extract_gateway_error(body: &str) -> Option<String> {
     v.get("error")?.get("message")?.as_str().map(str::to_string)
 }
 
+/// Map an HTTP error status + raw response body to a structured, actionable `AppError`.
+///
+/// Parses the OpenAI error envelope `{"error":{"message":"…","type":"…","code":"…"}}` (best-effort
+/// — body may not be JSON). Branches on status:
+///   401/403 → `Unavailable` (bad key, actionable message)
+///   404     → `Summarize` with the envelope message (e.g. "model 'x' not found")
+///   429     → `Unavailable` (rate-limited / budget exceeded)
+///   5xx     → `Summarize` with "gateway error {status}: {detail}"
+///   else    → `Summarize` with the envelope message or "HTTP {status}"
+///
+/// NEVER includes the API key in the message (R3).
+pub(crate) fn map_gateway_error(status: u16, body: &str) -> AppError {
+    let detail = extract_gateway_error(body).unwrap_or_else(|| format!("HTTP {status}"));
+    match status {
+        401 | 403 => AppError::Unavailable(
+            "gateway rejected the API key (check the key for this endpoint)".into(),
+        ),
+        429 => AppError::Unavailable("gateway rate-limited or out of budget".into()),
+        500..=599 => AppError::Summarize(format!("gateway error {status}: {}", detail.trim())),
+        _ => AppError::Summarize(format!("gateway: {}", detail.trim())),
+    }
+}
+
 /// Minimal mirror of the OpenAI `/v1/models` response — only `data[].id` is extracted.
 /// A missing or unrecognised body (non-OpenAI gateway) degrades to an empty list, never a panic.
 #[derive(Debug, Deserialize, Default)]
@@ -311,9 +334,7 @@ impl OpenAiCompatProvider {
         let status = resp.status();
         if !status.is_success() {
             let err_body = resp.text().await.unwrap_or_default();
-            let detail =
-                extract_gateway_error(&err_body).unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(AppError::Summarize(format!("gateway: {}", detail.trim())));
+            return Err(map_gateway_error(status.as_u16(), &err_body));
         }
 
         resp.text()
@@ -578,6 +599,96 @@ mod tests {
         assert!(matches!(err2, AppError::InvalidArg(_)));
         // No credentials → still valid.
         assert!(validate_gateway_url("https://gw.example.com/v1").is_ok());
+    }
+
+    // ─── Task 4.1 — map_gateway_error fixture tests (RED → GREEN) ──────────────────────────────
+
+    /// 404 with an OpenAI error envelope → `Summarize` containing the envelope message.
+    #[test]
+    fn map_gateway_error_404_with_message_is_summarize() {
+        let err = map_gateway_error(
+            404,
+            r#"{"error":{"message":"model 'gpt-5' not found","type":"invalid_request_error"}}"#,
+        );
+        match err {
+            AppError::Summarize(msg) => {
+                assert!(
+                    msg.contains("model 'gpt-5' not found"),
+                    "404 Summarize must include the envelope message, got: {msg}"
+                );
+            }
+            other => panic!("expected Summarize for 404, got: {other:?}"),
+        }
+    }
+
+    /// 401 → `Unavailable` with an actionable key-check message.
+    #[test]
+    fn map_gateway_error_401_is_unavailable() {
+        let err = map_gateway_error(401, "");
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "401 must map to Unavailable, got: {err:?}"
+        );
+        if let AppError::Unavailable(msg) = err {
+            assert!(
+                msg.contains("API key"),
+                "401 Unavailable must mention 'API key', got: {msg}"
+            );
+        }
+    }
+
+    /// 429 → `Unavailable` (rate-limited / budget exceeded).
+    #[test]
+    fn map_gateway_error_429_is_unavailable() {
+        let err = map_gateway_error(429, "");
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "429 must map to Unavailable, got: {err:?}"
+        );
+    }
+
+    /// 403 → `Unavailable` (key rejected).
+    #[test]
+    fn map_gateway_error_403_is_unavailable() {
+        let err = map_gateway_error(403, "");
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "403 must map to Unavailable, got: {err:?}"
+        );
+    }
+
+    /// 500 → `Summarize` with "gateway error 500: …".
+    #[test]
+    fn map_gateway_error_500_is_summarize_with_status() {
+        let err = map_gateway_error(
+            500,
+            r#"{"error":{"message":"internal server error"}}"#,
+        );
+        match err {
+            AppError::Summarize(msg) => {
+                assert!(
+                    msg.contains("gateway error 500"),
+                    "5xx Summarize must include 'gateway error <status>', got: {msg}"
+                );
+            }
+            other => panic!("expected Summarize for 500, got: {other:?}"),
+        }
+    }
+
+    /// Non-JSON body degrades gracefully (no panic, falls back to "HTTP {status}").
+    #[test]
+    fn map_gateway_error_non_json_body_degrades_gracefully() {
+        let err = map_gateway_error(503, "Service Unavailable");
+        match err {
+            AppError::Summarize(msg) => {
+                // falls back to "HTTP 503" when JSON parse fails
+                assert!(
+                    msg.contains("503") || msg.contains("HTTP"),
+                    "non-JSON 5xx must still include status info, got: {msg}"
+                );
+            }
+            other => panic!("expected Summarize for 503, got: {other:?}"),
+        }
     }
 
     /// Task 1.2 — gateway error extraction from an OpenAI-format error envelope.
