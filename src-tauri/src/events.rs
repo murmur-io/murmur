@@ -66,6 +66,32 @@ pub struct VoiceCommandProcessingPayload {
     pub active: bool,
 }
 
+/// Emitted once per TOOL CALL the in-meeting brain makes during an agentic turn, so the FE can render
+/// the live "tool trace" chips ("Searching notes… ✓", "Checking the web…"). Low-frequency (a handful
+/// per turn), so a typed event is the right primitive. Carries the tool NAME + a coarse result-size
+/// count only — NO PII (never the args, the results, or any content).
+pub const EVENT_ASSISTANT_TOOL: &str = "murmur://assistant-tool";
+
+/// Same shape as [`EVENT_ASSISTANT_TOOL`] but scoped to the in-meeting CHAT PANEL (the dedicated
+/// multi-turn conversation), so the chat's live tool-trace never bleeds into the quick-Q&A assistant
+/// card and vice-versa. Payload is [`AssistantToolPayload`] (tool name + state + count, NO PII).
+pub const EVENT_CHAT_TOOL: &str = "murmur://chat-tool";
+
+/// Payload for [`EVENT_ASSISTANT_TOOL`]. `state` is "running" | "done"; `ok` is false when the tool
+/// call errored; `count` is a coarse result-size signal for the "✓ N" badge (NEVER the content).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantToolPayload {
+    /// The tool name (search_meetings / search_semantic / web_search / calendar_lookup / …).
+    pub tool: String,
+    /// "running" when the call starts, "done" when it finishes.
+    pub state: String,
+    /// False when the tool call errored (the chip shows a muted / failed state).
+    pub ok: bool,
+    /// Coarse result-size signal for the done badge — NOT the content.
+    pub count: Option<u32>,
+}
+
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
 pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
 

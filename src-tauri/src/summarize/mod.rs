@@ -79,7 +79,9 @@ pub fn make_provider(
             ClaudeCodeProvider::with_binary(config.claude_binary.clone())
                 // Brain/AI model picker: a chosen model is passed as `--model`; an empty value
                 // (the default) lets the CLI use its own default. Effort is N/A for the CLI.
-                .with_model(config.provider_model.clone()),
+                .with_model(config.provider_model.clone())
+                // Opt-in: inherit the shell env (restores env ANTHROPIC_API_KEY); DB keys stay stripped.
+                .with_inherit_env(config.claude_code_inherit_env),
         ),
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
@@ -146,7 +148,8 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
     vec![
         Arc::new(
             ClaudeCodeProvider::with_binary(config.claude_binary.clone())
-                .with_model(config.provider_model.clone()),
+                .with_model(config.provider_model.clone())
+                .with_inherit_env(config.claude_code_inherit_env),
         ),
         Arc::new(AnthropicProvider::with_effort(
             anthropic_key,
