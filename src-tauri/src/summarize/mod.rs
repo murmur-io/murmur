@@ -40,17 +40,25 @@ pub const DEFAULT_PROVIDER_ID: &str = "claude_code";
 pub const PROVIDER_CLAUDE_CODE: &str = "claude_code";
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
 pub const PROVIDER_OLLAMA: &str = "ollama";
+/// OpenAI-compatible AI Gateway provider (LiteLLM / Kong / Portkey / vLLM / …).
+pub const PROVIDER_GATEWAY: &str = "gateway";
 
 /// Keychain account under which the Anthropic API key is stored
 /// (matches `set_anthropic_key` / `has_anthropic_key` in `commands.rs`).
 pub const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
+/// Keychain account under which the AI Gateway API key is stored.
+/// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` — never a fallback to the Anthropic key (R3).
+pub const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
 
-/// Egress classification for `make_provider`. claude_code/anthropic always send content
+/// Egress classification for `make_provider`. claude_code/anthropic/gateway always send content
 /// off-device. ollama is local ONLY when its base URL host is loopback — a remote `ollama_base_url`
 /// is cloud egress and MUST be redacted + consent-gated. Unknown ids default to cloud (fail-safe).
+///
+/// NOTE: `gateway` is cloud even when its base URL is loopback — a localhost gateway can still
+/// FORWARD to the cloud — so it is never consent-exempt and is always redaction-wrapped.
 pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
     match id {
-        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC => true,
+        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC | PROVIDER_GATEWAY => true,
         PROVIDER_OLLAMA => match reqwest::Url::parse(&config.ollama_base_url) {
             Ok(u) => !gateway::host_is_loopback(&u),
             Err(_) => true, // unparseable → fail safe (treat as cloud)
@@ -115,6 +123,24 @@ pub fn make_provider(
                 return Ok(ollama); // LOCAL ollama: unwrapped, unchanged behavior
             }
             ollama // REMOTE ollama: falls through to the RedactingProvider wrap below
+        }
+        PROVIDER_GATEWAY => {
+            if config.gateway_base_url.trim().is_empty() {
+                return Err(crate::error::AppError::InvalidArg(
+                    "gateway base URL is not set".into(),
+                ));
+            }
+            // R3 — resolve the GATEWAY key only; NEVER falls back to the Anthropic key.
+            let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+            // R1/R4 enforced at construction via `validate_gateway_url` inside `new()`.
+            Arc::new(
+                crate::summarize::gateway::OpenAiCompatProvider::new(
+                    config.gateway_base_url.clone(),
+                    config.gateway_model.clone(),
+                    api_key,
+                )?,
+            )
+            // Falls through to the RedactingProvider wrap below (R2).
         }
         other => {
             return Err(crate::error::AppError::InvalidArg(format!(
@@ -271,5 +297,84 @@ mod tests {
                 "expected Unavailable for {id} without consent (got Ok or wrong error)"
             );
         }
+    }
+
+    // ─── Task 1.3 — the four gateway security guardrails ───────────────────────────────────────
+
+    /// R1 — gateway is refused when cloud-egress consent has not been granted.
+    #[test]
+    fn gateway_refused_without_consent() {
+        let mut c = AppConfig::default();
+        c.gateway_base_url = "https://gw.example.com/v1".into();
+        c.cloud_egress_consented = false;
+        let err = make_provider(PROVIDER_GATEWAY, &c)
+            .err()
+            .expect("expected Err for gateway without consent");
+        assert!(
+            matches!(err, crate::error::AppError::Unavailable(_)),
+            "expected Unavailable, got: {err}"
+        );
+    }
+
+    /// R2 — a consented gateway with a loopback base URL builds successfully.
+    /// (The RedactingProvider wrap is structural — it is transparent to `id()`, which reports the
+    /// inner provider id. We assert construction succeeds; the wrapping is proven by the RedactingProvider
+    /// tests in redact.rs and by the lock-security-reviewer audit.)
+    #[test]
+    fn gateway_localhost_is_still_redaction_wrapped() {
+        let mut c = AppConfig::default();
+        c.gateway_base_url = "http://127.0.0.1:4000/v1".into();
+        c.cloud_egress_consented = true;
+        // Must build without error — the make_provider consent gate + URL validation passed.
+        assert!(
+            make_provider(PROVIDER_GATEWAY, &c).is_ok(),
+            "consented localhost gateway must build successfully"
+        );
+    }
+
+    /// R4 — a remote http:// URL is rejected at provider-construction time (InvalidArg).
+    #[test]
+    fn gateway_remote_http_rejected() {
+        let mut c = AppConfig::default();
+        c.gateway_base_url = "http://gw.example.com/v1".into();
+        c.cloud_egress_consented = true;
+        let err = make_provider(PROVIDER_GATEWAY, &c)
+            .err()
+            .expect("expected Err for remote http gateway");
+        assert!(
+            matches!(err, crate::error::AppError::InvalidArg(_)),
+            "expected InvalidArg for remote http://, got: {err}"
+        );
+    }
+
+    /// Empty base URL → InvalidArg (before even trying to validate the URL).
+    #[test]
+    fn gateway_empty_url_rejected() {
+        let mut c = AppConfig::default();
+        c.gateway_base_url = String::new(); // empty — not set
+        c.cloud_egress_consented = true;
+        let err = make_provider(PROVIDER_GATEWAY, &c)
+            .err()
+            .expect("expected Err for empty gateway URL");
+        assert!(
+            matches!(err, crate::error::AppError::InvalidArg(_)),
+            "expected InvalidArg for empty URL, got: {err}"
+        );
+    }
+
+    /// Task 1.3 — `egress_is_cloud` explicitly classifies `PROVIDER_GATEWAY` as cloud.
+    #[test]
+    fn gateway_is_always_cloud() {
+        let cfg = AppConfig::default();
+        assert!(
+            egress_is_cloud(PROVIDER_GATEWAY, &cfg),
+            "gateway must always be cloud regardless of base URL"
+        );
+        let mut cfg_loopback = AppConfig::default();
+        cfg_loopback.gateway_base_url = "http://127.0.0.1:4000/v1".into();
+        assert!(
+            egress_is_cloud(PROVIDER_GATEWAY, &cfg_loopback),
+            "a loopback gateway is still cloud-classified"
+        );
     }
 }
