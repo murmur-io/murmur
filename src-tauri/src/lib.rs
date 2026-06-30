@@ -98,6 +98,7 @@ pub fn run() {
             commands::set_gateway_key,
             commands::has_gateway_key,
             commands::clear_gateway_key,
+            commands::list_gateway_models,
             commands::set_web_search_api_key,
             commands::has_web_search_key,
             commands::provider_statuses,

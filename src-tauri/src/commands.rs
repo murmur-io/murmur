@@ -2435,6 +2435,51 @@ pub fn clear_gateway_key() -> Result<(), AppError> {
     secrets::delete_secret(GATEWAY_KEY_ACCOUNT)
 }
 
+/// DTO for a single model returned by `list_gateway_models`.
+///
+/// Shape: `{ "id": "gpt-4o" }` (camelCase). The FE populates the model picker from this.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelDto {
+    pub id: String,
+}
+
+/// Fetch the model catalog from the configured AI Gateway (`GET {base}/v1/models`) and return
+/// the list of model ids the gateway exposes.
+///
+/// Inbound-only: this call sends NO meeting content — only an optional `Authorization: Bearer`
+/// header carrying the stored gateway key. It therefore does NOT need the redaction firewall or
+/// the cloud-egress consent gate.
+///
+/// Returns `AppError::InvalidArg` when no gateway base URL is configured.
+#[tauri::command]
+pub async fn list_gateway_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<GatewayModelDto>, AppError> {
+    let (base_url, model, api_key) = {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        let base_url = config.gateway_base_url.clone();
+        let model = config.gateway_model.clone();
+        // R3: resolve the gateway key; never falls back to the Anthropic key.
+        let api_key = secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+        (base_url, model, api_key)
+    };
+
+    if base_url.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "no gateway base URL configured — set it in Settings before fetching the model catalog"
+                .into(),
+        ));
+    }
+
+    let provider = crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key)?;
+    let ids = provider.list_models().await?;
+    Ok(ids.into_iter().map(|id| GatewayModelDto { id }).collect())
+}
+
 /// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
 /// An empty input clears it. The key is NEVER logged and NEVER returned to the FE — only `has_*`
 /// reports presence. Mirrors `set_anthropic_key`.
