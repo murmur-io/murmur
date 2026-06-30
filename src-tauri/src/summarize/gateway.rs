@@ -163,6 +163,28 @@ fn extract_gateway_error(body: &str) -> Option<String> {
     v.get("error")?.get("message")?.as_str().map(str::to_string)
 }
 
+/// Minimal mirror of the OpenAI `/v1/models` response — only `data[].id` is extracted.
+/// A missing or unrecognised body (non-OpenAI gateway) degrades to an empty list, never a panic.
+#[derive(Debug, Deserialize, Default)]
+struct ModelsListResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+/// Parse a raw OpenAI-compatible `/v1/models` response body into a `Vec<String>` of model ids.
+///
+/// A malformed or empty body returns `Ok(vec![])` — the caller (the FE picker) handles an empty
+/// list gracefully. This is inbound-only metadata: NO meeting content is sent to produce this.
+pub(crate) fn parse_models_response(body: &str) -> Result<Vec<String>> {
+    let parsed: ModelsListResponse = serde_json::from_str(body).unwrap_or_default();
+    Ok(parsed.data.into_iter().map(|m| m.id).collect())
+}
+
 /// An OpenAI-compatible AI Gateway provider (LiteLLM / Kong / Portkey / vLLM / local LiteLLM /
 /// LM Studio / …). Talks to `{base}/chat/completions` with an optional `Authorization: Bearer`
 /// header.
@@ -212,6 +234,53 @@ impl OpenAiCompatProvider {
         self.base
             .join("chat/completions")
             .map_err(|e| AppError::Summarize(format!("gateway URL join failed: {e}")))
+    }
+
+    /// Compose the `/models` endpoint URL from the normalized base.
+    pub(crate) fn models_endpoint(&self) -> Result<reqwest::Url> {
+        self.base
+            .join("models")
+            .map_err(|e| AppError::Summarize(format!("gateway URL join failed: {e}")))
+    }
+
+    /// `GET {base}/models` → list of model ids from the gateway catalog.
+    ///
+    /// Inbound-only: sends NO meeting content — only an optional `Authorization: Bearer` header.
+    /// Therefore this path does NOT need the redaction firewall or the consent gate.
+    /// A non-2xx response maps to `AppError::Unavailable` (the gateway is reachable but refused).
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        let url = self.models_endpoint()?;
+
+        let mut req = self.client.get(url);
+
+        // R3 — only attach the gateway key; never falls back to another provider's key.
+        if let Some(ref key) = self.api_key {
+            if !key.trim().is_empty() {
+                req = req.header("authorization", format!("Bearer {key}"));
+            }
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Unavailable(format!("gateway /models request failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            let detail =
+                extract_gateway_error(&err_body).unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(AppError::Unavailable(format!(
+                "gateway /models: {}",
+                detail.trim()
+            )));
+        }
+
+        let body = resp.text().await.map_err(|e| {
+            AppError::Unavailable(format!("failed to read gateway /models body: {e}"))
+        })?;
+
+        parse_models_response(&body)
     }
 
     /// POST to `{base}/chat/completions`, set the `Authorization` header only when a key is
@@ -519,5 +588,58 @@ mod tests {
         // No error field → None (callers fall back to a generic message).
         assert!(extract_gateway_error("{}").is_none());
         assert!(extract_gateway_error("not json").is_none());
+    }
+
+    // ─── Task 3.1 — parse_models_response fixture tests (RED → GREEN) ────────────────────────────
+
+    /// Standard OpenAI-compat `/v1/models` response: two ids are returned in order.
+    #[test]
+    fn parse_models_response_extracts_ids() {
+        let body = r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"llama-3"}]}"#;
+        let ids = parse_models_response(body).unwrap();
+        assert_eq!(ids, vec!["gpt-4o", "llama-3"], "ids must match fixture order");
+    }
+
+    /// A malformed (non-JSON) body degrades to an empty list — never a panic.
+    #[test]
+    fn parse_models_response_malformed_body_returns_empty() {
+        let ids = parse_models_response("not json at all").unwrap();
+        assert!(ids.is_empty(), "malformed body must degrade to an empty list");
+    }
+
+    /// An empty data array returns an empty list cleanly.
+    #[test]
+    fn parse_models_response_empty_data_returns_empty() {
+        let body = r#"{"object":"list","data":[]}"#;
+        let ids = parse_models_response(body).unwrap();
+        assert!(ids.is_empty(), "empty data must return an empty list");
+    }
+
+    /// A non-OpenAI body (e.g. a provider that returns only `{"models":[…]}`) degrades to empty.
+    #[test]
+    fn parse_models_response_non_openai_schema_returns_empty() {
+        let body = r#"{"models":["gpt-4o","llama-3"]}"#;
+        let ids = parse_models_response(body).unwrap();
+        assert!(
+            ids.is_empty(),
+            "a non-OpenAI schema with no 'data' key must degrade to an empty list"
+        );
+    }
+
+    /// Task 3.1 — models_endpoint appends to the base path (same RFC 3986 invariant as
+    /// chat_endpoint — the `/v1` must survive; join must APPEND, not replace).
+    #[test]
+    fn models_endpoint_preserves_base_path() {
+        let p = OpenAiCompatProvider::new(
+            "http://localhost:4000/v1".to_string(),
+            "gpt-4o".to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.models_endpoint().unwrap().as_str(),
+            "http://localhost:4000/v1/models",
+            "base path /v1 must be preserved (not replaced) in the join"
+        );
     }
 }
