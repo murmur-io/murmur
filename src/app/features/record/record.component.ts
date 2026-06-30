@@ -587,6 +587,8 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
         gap: 2px;
         width: 84px;
         height: 28px;
+        /* Guard: bars can never spill past the fixed box into the caption line. */
+        overflow: hidden;
       }
       .wbar {
         flex: 1;
@@ -1046,8 +1048,10 @@ export class RecordComponent implements OnInit {
   /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
   private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
 
-  /** Bars in the live waveform (driven by the real mic level signal). */
-  readonly bars = Array.from({ length: 28 }, (_, i) => i);
+  /** Bars in the live waveform (driven by the real mic level signal). 16 bars fit the fixed
+   * 84px `.wave` box (16×2px min + 15×2px gap ≈ 62px) with room to flex; 28 overflowed the box
+   * and spilled into the caption ("…IIIIDzięki za oglądanie!"). */
+  readonly bars = Array.from({ length: 16 }, (_, i) => i);
 
   /** The in-pill mic-mute toggle — its `muted()` signal drives the stage hint. */
   private readonly micToggle = viewChild(MicMuteToggleComponent);
