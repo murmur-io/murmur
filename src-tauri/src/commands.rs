@@ -21,6 +21,10 @@ use tauri::Emitter;
 /// Keychain account for the Anthropic API key (matches `summarize::ANTHROPIC_KEY_ACCOUNT`).
 const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
 
+/// Keychain account for the AI Gateway API key (matches `summarize::GATEWAY_KEY_ACCOUNT`).
+/// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` — never a fallback to the Anthropic key (R3).
+const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
+
 // ── IPC DTOs (camelCase mirrors of PHASE0-PLAN §6) ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +163,14 @@ pub struct AppConfigDto {
     /// encryption keys are never inherited (see `AppConfig::claude_code_inherit_env`).
     #[serde(default)]
     pub claude_code_inherit_env: bool,
+    /// Base URL of the user's OpenAI-compatible AI gateway. Settable from the DTO (the Settings UI
+    /// owns the field). An omitted value deserializes to `""` (`#[serde(default)]`). A non-empty
+    /// value is validated at provider-construction time; `saveConfig` + `getConfig` persist it verbatim.
+    #[serde(default)]
+    pub gateway_base_url: String,
+    /// Model id to send to the gateway (e.g. `"gpt-4o"`). Settable from the DTO. Default `""`.
+    #[serde(default)]
+    pub gateway_model: String,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -2269,6 +2281,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // in `dto_to_config`).
         web_search_consented: c.web_search_consented,
         claude_code_inherit_env: c.claude_code_inherit_env,
+        gateway_base_url: c.gateway_base_url.clone(),
+        gateway_model: c.gateway_model.clone(),
     }
 }
 
@@ -2362,6 +2376,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // the toggle). Default OFF on the DTO (`#[serde(default)]`), so a partial/older save can never
         // silently enable it. Even ON, the DB keys are never inherited (claude_code.rs `harden_env`).
         claude_code_inherit_env: d.claude_code_inherit_env,
+        // AI Gateway fields ARE settable from the DTO (the Settings UI owns them). An omitted value
+        // deserializes to `""` (`#[serde(default)]`), which is a valid "unset" state.
+        gateway_base_url: d.gateway_base_url,
+        gateway_model: d.gateway_model,
     }
 }
 
@@ -2385,6 +2403,36 @@ pub fn set_anthropic_key(key: String) -> Result<(), AppError> {
 #[tauri::command]
 pub fn has_anthropic_key() -> Result<bool, AppError> {
     Ok(secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?.is_some())
+}
+
+/// Store/replace the AI Gateway API key in Keychain (account "gateway_api_key").
+/// An empty/blank key is rejected — call `clear_gateway_key` to remove an existing key.
+/// The key is NEVER logged and NEVER returned to the FE — only `has_gateway_key` reports presence.
+/// Uses a SEPARATE keychain account from the Anthropic key (R3 — no cross-provider fallback).
+#[tauri::command]
+pub fn set_gateway_key(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "gateway API key must not be empty; use clear_gateway_key to remove an existing key"
+                .into(),
+        ));
+    }
+    secrets::set_secret(GATEWAY_KEY_ACCOUNT, key.trim())
+}
+
+/// Whether an AI Gateway key is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_gateway_key() -> Result<bool, AppError> {
+    Ok(secrets::get_secret(GATEWAY_KEY_ACCOUNT)?
+        .filter(|k| !k.trim().is_empty())
+        .is_some())
+}
+
+/// Remove the stored AI Gateway API key from the Keychain.
+/// Idempotent — no error if no key is stored. Mirrors `set_anthropic_key("")` semantics.
+#[tauri::command]
+pub fn clear_gateway_key() -> Result<(), AppError> {
+    secrets::delete_secret(GATEWAY_KEY_ACCOUNT)
 }
 
 /// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
@@ -6553,5 +6601,31 @@ mod reminder_script_tests {
         );
         // Every embedded double-quote from the payload is backslash-escaped in the program.
         assert!(s.contains("\\\""), "payload quotes are escaped");
+    }
+}
+
+// ─── Task 1.4 — gateway key command argument validation ────────────────────────────────────────
+#[cfg(test)]
+mod gateway_key_tests {
+    use super::*;
+
+    /// `set_gateway_key("")` must return `InvalidArg`, not silently succeed.
+    #[test]
+    fn set_gateway_key_empty_is_invalid_arg() {
+        let err = set_gateway_key(String::new()).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "empty gateway key must be InvalidArg, got: {err:?}"
+        );
+    }
+
+    /// `set_gateway_key("   ")` (whitespace-only) is also invalid.
+    #[test]
+    fn set_gateway_key_whitespace_is_invalid_arg() {
+        let err = set_gateway_key("   ".to_string()).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "whitespace-only gateway key must be InvalidArg"
+        );
     }
 }
