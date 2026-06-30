@@ -9,9 +9,9 @@ use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarContext,
-    CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, EntityDetail, Folder,
-    FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline, NoteRecord, PinResult,
-    RecipeRecord, SearchHit, TopicThread,
+    CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
+    EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
+    NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -845,6 +845,169 @@ pub(crate) fn get_manual_notes_inner(
         return Ok(String::new()); // sealed-not-unlocked ⇒ masked, never the stored buffer.
     }
     state.db.get_manual_notes(meeting_id)
+}
+
+/// The md/txt extensions document ingestion accepts. md/txt only — NO new parsing crate; the file is
+/// read as UTF-8 text via `std::fs::read_to_string`. Anything else is rejected with `InvalidArg`.
+const DOC_ALLOWED_EXTS: &[&str] = &["md", "txt"];
+
+/// Document ingestion — upload a local md/txt file INTO a folder so its text is chunked + embedded
+/// into the on-device vector layer and the brain/Ask can retrieve it. Returns the new document id.
+///
+/// LOCK-MODEL:
+/// - WRITE-GATE: refuse a sealed-and-NOT-session-unlocked folder (`AppError::Locked`) — an ungated
+///   write would land plaintext at rest behind the lock (mirrors `save_manual_notes`'s gate).
+/// - Extension allowlist (`md`/`txt`) — reject anything else with `AppError::InvalidArg`; NO new
+///   crate (read as UTF-8 text).
+/// - EMBED only when the REAL e5 model is present (`embed_model_present()`): otherwise the chunks are
+///   stored WITHOUT vectors (no stub vectors polluting the index — mirrors `should_auto_index`).
+/// - The text is SEALED-AND-RESTORED with the folder on lock/unlock; its chunks are PURGED on lock,
+///   re-embeddable on unlock.
+#[tauri::command]
+pub fn import_document(
+    state: State<'_, AppState>,
+    path: String,
+    folder_id: String,
+) -> Result<String, AppError> {
+    import_document_inner(state.inner(), &path, &folder_id)
+}
+
+/// Inner of [`import_document`] taking `&AppState` (so the gate + allowlist are unit-testable without
+/// a `tauri::State`).
+pub(crate) fn import_document_inner(
+    state: &AppState,
+    path: &str,
+    folder_id: &str,
+) -> Result<String, AppError> {
+    // The folder must exist (so the FK holds + the meeting/document gating has an anchor).
+    let folder = state
+        .db
+        .folder_by_id(folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+
+    // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused — never resurrect plaintext at
+    // rest behind a lock. (`folder.locked` + the session set, via `folder_is_unlocked`.)
+    if folder.locked && !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to add a document".into(),
+        ));
+    }
+
+    // Extension allowlist (md/txt only). Lowercased; an extension-less path is rejected.
+    let p = std::path::Path::new(path);
+    let ext_ok = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .map(|e| DOC_ALLOWED_EXTS.contains(&e.as_str()))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err(AppError::InvalidArg(
+            "only .md and .txt documents can be imported".into(),
+        ));
+    }
+
+    // Read the file as UTF-8 text (no parsing crate). A non-UTF-8 / unreadable file fails closed.
+    let text = std::fs::read_to_string(p)
+        .map_err(|e| AppError::InvalidArg(format!("could not read document: {e}")))?;
+
+    // The display name = the file name (component only — never an on-disk path with personal content
+    // in logs). Fallback to "document" if the path has no file-name component.
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "document".to_string());
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().timestamp_millis();
+    state
+        .db
+        .insert_document(&id, folder_id, &name, &text, created_at)?;
+
+    // Index the document's text into the vector layer — ONLY when the REAL e5 model is present (never
+    // write stub vectors; mirrors `should_auto_index` / the pipeline's auto-index gate). Best-effort:
+    // a failure logs (no PII) and does NOT fail the import (the row + plaintext are already durable,
+    // and a later `reindex_embeddings`-equivalent / unlock re-embed recovers the index).
+    if crate::embed::embed_model_present() {
+        let embedder = crate::embed::active_embedder();
+        if let Err(e) = state.db.index_document_chunks(&id, embedder.as_ref()) {
+            tracing::warn!(target: "rag", error = %e, "document import: chunk/embed failed (document stored)");
+        }
+    }
+
+    // PII rule: log only the document id, the folder id, and byte/char counts — never the text/name.
+    tracing::info!(
+        target: "documents",
+        document_id = %id,
+        folder_id = %folder_id,
+        bytes = text.len(),
+        "document imported"
+    );
+    Ok(id)
+}
+
+/// List a folder's documents (metadata only — NO text). GATED: a sealed-and-NOT-session-unlocked
+/// folder returns an EMPTY list (masked — never surface even a document name behind the lock),
+/// exactly like the masked detail DTO drops note/segments.
+#[tauri::command]
+pub fn list_documents(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<Vec<DocumentInfo>, AppError> {
+    list_documents_inner(state.inner(), &folder_id)
+}
+
+/// Inner of [`list_documents`] taking `&AppState` (unit-testable gate).
+pub(crate) fn list_documents_inner(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<Vec<DocumentInfo>, AppError> {
+    if !folder_is_unlocked(state, folder_id)? {
+        return Ok(Vec::new()); // sealed-not-unlocked ⇒ masked (no ids, no names).
+    }
+    state.db.documents_in_folder(folder_id)
+}
+
+/// Read ONE document's full text. GATED: a sealed-and-NOT-session-unlocked folder returns "" (masked
+/// — never leak the document text), exactly like `get_manual_notes`.
+#[tauri::command]
+pub fn get_document(state: State<'_, AppState>, id: String) -> Result<String, AppError> {
+    get_document_inner(state.inner(), &id)
+}
+
+/// Inner of [`get_document`] taking `&AppState` (unit-testable gate).
+pub(crate) fn get_document_inner(state: &AppState, id: &str) -> Result<String, AppError> {
+    let Some((folder_id, _name, text)) = state.db.get_document(id)? else {
+        return Ok(String::new()); // unknown id → nothing.
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Ok(String::new()); // sealed-not-unlocked ⇒ masked, never the stored text.
+    }
+    Ok(text)
+}
+
+/// Permanently delete a document and cascade-delete its chunks + vectors. GATED: a
+/// sealed-and-NOT-session-unlocked folder is refused (`AppError::Locked`) so the lock state can't be
+/// mutated from behind the gate (consistent with `import_document`'s write-gate).
+#[tauri::command]
+pub fn delete_document(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    delete_document_inner(state.inner(), &id)
+}
+
+/// Inner of [`delete_document`] taking `&AppState` (unit-testable gate).
+pub(crate) fn delete_document_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    let Some(folder_id) = state.db.folder_for_document(id)? else {
+        return Ok(()); // unknown id → idempotent no-op.
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to delete a document".into(),
+        ));
+    }
+    state.db.delete_document(id)?;
+    tracing::info!(target: "documents", document_id = %id, "document deleted");
+    Ok(())
 }
 
 /// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
@@ -3390,6 +3553,11 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // leaky).
     let sealed_meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
     state.db.purge_chunks_for_meetings(&sealed_meeting_ids)?;
+    // Document ingestion LOCK-SAFETY: purge the (now-sealed) documents' plaintext-derived chunks +
+    // their invertible vectors too — a doc vector is PII derived from the plaintext, so it must not
+    // survive at rest in a locked folder. Re-embeddable on unlock (the text seal is restorable).
+    let sealed_document_ids = state.db.document_ids_in_folder(&folder_id)?;
+    state.db.purge_doc_chunks_for_documents(&sealed_document_ids)?;
 
     // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
     // lost content is not — so this is last).
@@ -4105,6 +4273,17 @@ fn aad_content(
     .into_bytes()
 }
 
+/// AAD for an uploaded DOCUMENT's sealed text blob. Bound to `folder_id | document_id | type=document
+/// | schema_version` — documents anchor on a FOLDER (not a meeting), so the AAD uses the document id
+/// in the role the meeting/provider play for note blobs. A document blob therefore cannot be lifted
+/// onto a different folder/document row and decrypted there (B7).
+fn aad_document(folder_id: &str, document_id: &str) -> Vec<u8> {
+    format!(
+        "murmur:document:v{AAD_SCHEMA_VERSION}|folder={folder_id}|document={document_id}|type=document"
+    )
+    .into_bytes()
+}
+
 /// The ROLE-LESS audio AAD (the historical B8 form): bound to `meeting_id | folder_id`. Retained as
 /// the lower rung of the decrypt ladder so masters/playback sealed BEFORE stream-role binding (which
 /// carry exactly this NON-empty AAD) still decrypt — see [`aad_audio_role`] and
@@ -4270,6 +4449,24 @@ fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Resul
     for mid in &meeting_ids {
         seal_meeting_extras(state, folder_id, mid, ck)?;
     }
+    // Document ingestion: SEAL every uploaded document's text (USER-AUTHORED PRIMARY content,
+    // SEALED-AND-RESTORED like the note markdown / typed notes — never lost). Encrypt the plaintext
+    // under the folder CK, VERIFY it decrypts back byte-identical (verify-before-destroy), THEN blank
+    // the plaintext. Done per FOLDER (documents anchor on the folder, not a meeting). An empty text ⇒
+    // nothing to seal (blob stays NULL); an already-sealed document (blank text) is skipped.
+    for d in state.db.raw_documents_in_folder(folder_id)? {
+        if d.text.is_empty() {
+            continue;
+        }
+        let aad = aad_document(folder_id, &d.id);
+        let blob = crate::crypto::encrypt(ck, d.text.as_bytes(), &aad)?;
+        if crate::crypto::decrypt(ck, &blob, &aad)? != d.text.as_bytes() {
+            return Err(AppError::Storage(
+                "document seal verification failed (blob mismatch)".into(),
+            ));
+        }
+        state.db.seal_document(&d.id, &blob)?;
+    }
     Ok(())
 }
 
@@ -4413,6 +4610,31 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
             state.db.set_meeting_sys_master_path(mid, Some(&plain))?;
         }
     }
+    // Document ingestion: decrypt each sealed document's text back into the plaintext column for the
+    // session (the blob is kept — folder still locked on disk), then RE-EMBED so semantic search /
+    // Ask works again in-session. Mirrors the timeline/manual-notes unseal + the meeting re-index.
+    let mut restored_doc_ids: Vec<String> = Vec::new();
+    for d in state.db.raw_documents_in_folder(folder_id)? {
+        if let Some(blob) = &d.blob {
+            let aad = aad_document(folder_id, &d.id);
+            let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+            let text = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted document is not valid UTF-8".into()))?;
+            state.db.set_document_text(&d.id, &text)?;
+            restored_doc_ids.push(d.id.clone());
+        }
+    }
+    // Re-embed the restored documents — ONLY when the REAL e5 model is present (never write stub
+    // vectors; mirrors `import_document` / `should_auto_index`). Best-effort: an embed failure logs
+    // (no PII) and does NOT fail the unlock — the plaintext text is already restored.
+    if !restored_doc_ids.is_empty() && crate::embed::embed_model_present() {
+        let embedder = crate::embed::active_embedder();
+        for did in &restored_doc_ids {
+            if let Err(e) = state.db.index_document_chunks(did, embedder.as_ref()) {
+                tracing::warn!(target: "rag", error = %e, "document re-embed on unlock failed (text restored)");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4449,6 +4671,18 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
             state.db.set_meeting_sys_master_path(&mid, Some(&enc))?;
         }
     }
+    // Document ingestion: re-blank the plaintext text of every sealed document ONLY WHERE its
+    // `text_blob` exists (never destroy the only copy), and PURGE the doc chunks the session unlock
+    // re-embedded (a relocked folder must leave no doc vector at rest). Mirrors the manual-notes
+    // reblank + the chunk purge.
+    let mut reblanked_doc_ids: Vec<String> = Vec::new();
+    for d in state.db.raw_documents_in_folder(folder_id)? {
+        if d.blob.is_some() && !d.text.is_empty() {
+            state.db.set_document_text(&d.id, "")?;
+        }
+        reblanked_doc_ids.push(d.id.clone());
+    }
+    state.db.purge_doc_chunks_for_documents(&reblanked_doc_ids)?;
     Ok(())
 }
 
@@ -4521,6 +4755,31 @@ fn unseal_folder_extras_permanent(
             state.db.set_meeting_sys_master_path(&mid, Some(&plain))?;
         }
     }
+    // Document ingestion: PERMANENTLY restore each document's plaintext from its blob (or keep the
+    // in-memory plaintext if the folder was session-unlocked and the blob is absent), then clear the
+    // blob. NEVER lose the document — the plaintext is back before the blob is dropped (mirrors the
+    // note / manual-notes permanent restore). Then re-embed (model-present-gated) so the now-open
+    // folder's documents are semantically searchable again.
+    let mut restored_doc_ids: Vec<String> = Vec::new();
+    for d in state.db.raw_documents_in_folder(folder_id)? {
+        if let Some(blob) = &d.blob {
+            let aad = aad_document(folder_id, &d.id);
+            let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+            let text = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted document is not valid UTF-8".into()))?;
+            state.db.set_document_text(&d.id, &text)?;
+        }
+        state.db.clear_document_blob(&d.id)?;
+        restored_doc_ids.push(d.id.clone());
+    }
+    if !restored_doc_ids.is_empty() && crate::embed::embed_model_present() {
+        let embedder = crate::embed::active_embedder();
+        for did in &restored_doc_ids {
+            if let Err(e) = state.db.index_document_chunks(did, embedder.as_ref()) {
+                tracing::warn!(target: "rag", error = %e, "document re-embed on remove-lock failed (text restored)");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4556,6 +4815,25 @@ fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppEr
         .lock()
         .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
     Ok(unlocked.contains(&folder_id))
+}
+
+/// FOLDER-level read gate (the document analogue of [`meeting_is_unlocked`]): a folder is unlocked
+/// iff it is open (`locked=0`) OR its id is in the current session unlock set. Documents anchor on a
+/// folder directly (not a meeting), so the document commands gate on this. A non-existent folder
+/// reports `false` (fail-closed — there is nothing legitimate to read).
+fn folder_is_unlocked(state: &AppState, folder_id: &str) -> Result<bool, AppError> {
+    let folder = match state.db.folder_by_id(folder_id)? {
+        Some(f) => f,
+        None => return Ok(false), // unknown folder → nothing to surface.
+    };
+    if !folder.locked {
+        return Ok(true); // open folder.
+    }
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+    Ok(unlocked.contains(folder_id))
 }
 
 /// The configured vault path (non-empty), or `None`. Takes `&AppState` (callers holding a
@@ -5168,6 +5446,232 @@ mod lifecycle_tests {
         let rn = state.db.raw_manual_notes("m1").unwrap().unwrap();
         assert_eq!(rn.text, typed, "typed notes permanently restored to plaintext on remove-lock");
         assert!(rn.blob.is_none(), "manual_notes_blob cleared on remove-lock");
+    }
+
+    // ── document ingestion ──────────────────────────────────────────────────
+
+    /// Write a temp md/txt file with `text`, return its absolute path. Cleaned up by the OS temp dir.
+    fn write_temp_doc(tag: &str, ext: &str, text: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-doc-{tag}-{}-{}.{ext}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// IMPORT round-trip: an md document uploaded into an OPEN folder is stored (text readable) and
+    /// listed (metadata, no text). A .txt is accepted too. The doc-chunk rows exist (chunked) — and,
+    /// on a no-model CI machine, carry NO vectors (stub vectors are never written).
+    #[test]
+    fn import_document_round_trip_md_and_txt_open_folder() {
+        let state = build_state("doc-import");
+        make_open_folder(&state.db, "f-open", "Project");
+
+        let md = write_temp_doc("md", "md", "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
+        // Stored + readable through the gated get.
+        assert_eq!(
+            get_document_inner(&state, &id).unwrap(),
+            "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.",
+            "document text readable in an open folder"
+        );
+        // Listed with metadata only (the DTO has no text field).
+        let listed = list_documents_inner(&state, "f-open").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert!(listed[0].name.ends_with(".md"));
+        // Embedding is MODEL-PRESENCE-gated in `import_document_inner` (never write stub vectors —
+        // mirrors `should_auto_index`'s no-stub contract). So the chunk count is environment-dependent
+        // and MUST be asserted per branch, or this test goes RED on a no-model CI machine / fresh
+        // checkout (the merge gate provisions no e5 model):
+        //   - model present → real e5 vectors indexed → ≥1 doc_chunks row;
+        //   - model ABSENT  → NO embedding → exactly 0 doc_chunks rows.
+        // The assertions above (row stored, text retrievable, listed) are model-INDEPENDENT.
+        if crate::embed::embed_model_present() {
+            assert!(
+                state.db.doc_chunk_count(&id).unwrap() >= 1,
+                "with the e5 model present, the document must be chunked + embedded"
+            );
+        } else {
+            assert_eq!(
+                state.db.doc_chunk_count(&id).unwrap(),
+                0,
+                "with no e5 model, NO stub vectors are written (no-stub contract)"
+            );
+        }
+
+        // A .txt import is also accepted.
+        let txt = write_temp_doc("txt", "txt", "plain text notes about hiring");
+        let id2 = import_document_inner(&state, txt.to_str().unwrap(), "f-open").unwrap();
+        assert_eq!(list_documents_inner(&state, "f-open").unwrap().len(), 2);
+        assert!(!id2.is_empty());
+    }
+
+    /// ALLOWLIST: a non-md/txt extension (and an extension-less path) is rejected with InvalidArg,
+    /// and NO row is inserted (the folder stays empty).
+    #[test]
+    fn import_document_rejects_non_md_txt() {
+        let state = build_state("doc-allowlist");
+        make_open_folder(&state.db, "f-open", "Project");
+
+        let pdf = write_temp_doc("pdf", "pdf", "%PDF-1.4 ...");
+        let err = import_document_inner(&state, pdf.to_str().unwrap(), "f-open").unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)), "pdf must be rejected, got {err:?}");
+
+        // Extension-less path.
+        let noext = {
+            let mut p = std::env::temp_dir();
+            p.push(format!("murmur-doc-noext-{}", std::process::id()));
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+        let err2 = import_document_inner(&state, noext.to_str().unwrap(), "f-open").unwrap_err();
+        assert!(matches!(err2, AppError::InvalidArg(_)), "extension-less must be rejected");
+
+        assert!(list_documents_inner(&state, "f-open").unwrap().is_empty(), "no row inserted on reject");
+    }
+
+    /// WRITE-GATE + LIST/GET MASK: importing into a sealed-and-NOT-session-unlocked folder is refused
+    /// (`AppError::Locked`); a sealed folder's existing documents are masked from `list_documents`
+    /// (empty) and `get_document` ("") even though the row still exists. Unlocking restores both.
+    #[test]
+    fn document_import_refused_and_list_get_masked_when_sealed() {
+        let state = build_state("doc-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        // Seed a document while open, then seal the folder (locked, NOT in the session set).
+        let md = write_temp_doc("seal", "md", "secret: launch date is the 14th");
+        let existing = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        // IMPORT is refused with Locked.
+        let md2 = write_temp_doc("seal2", "md", "another secret");
+        let err = import_document_inner(&state, md2.to_str().unwrap(), "f-lock").unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)), "sealed import must be Locked, got {err:?}");
+        // DELETE is refused with Locked too.
+        let derr = delete_document_inner(&state, &existing).unwrap_err();
+        assert!(matches!(derr, AppError::Locked(_)), "sealed delete must be Locked, got {derr:?}");
+
+        // LIST is masked to empty; GET is masked to "" — even though the row + text column persist.
+        assert!(list_documents_inner(&state, "f-lock").unwrap().is_empty(), "sealed list masked");
+        assert_eq!(get_document_inner(&state, &existing).unwrap(), "", "sealed get masked");
+
+        // Session-unlock ⇒ list + get + import work again.
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        assert_eq!(list_documents_inner(&state, "f-lock").unwrap().len(), 1, "unlocked list visible");
+        assert_eq!(
+            get_document_inner(&state, &existing).unwrap(),
+            "secret: launch date is the 14th",
+            "unlocked get returns the text"
+        );
+        let md3 = write_temp_doc("seal3", "md", "after unlock");
+        import_document_inner(&state, md3.to_str().unwrap(), "f-lock").unwrap();
+    }
+
+    /// COUNTEREXAMPLE (verify-before-destroy): an uploaded document's TEXT survives a real lock→unlock
+    /// cycle — SEALED under the folder CK (plaintext blanked, blob present) on lock, RESTORED
+    /// byte-identical on unlock. Drives the PRODUCTION seal (`lock_folder_inner` →
+    /// `seal_folder_extras`) and unseal (`unseal_folder_extras`). The doc chunks are purged on lock.
+    #[test]
+    fn document_text_survives_lock_unlock_cycle_sealed_and_restored() {
+        let state = build_state("doc-seal-cycle");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let md = write_temp_doc("cycle", "md", "zażółć 🔒 DECISION: ship Friday; Anna owns QA");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
+        let original = "zażółć 🔒 DECISION: ship Friday; Anna owns QA";
+
+        // LOCK → production seal: text blanked at rest, text_blob present, doc chunks purged.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let sealed = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(sealed.text, "", "document text plaintext blanked while sealed");
+        assert!(sealed.blob.is_some(), "document sealed under the folder CK (blob present)");
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "doc chunks purged on lock (re-embeddable on unlock)"
+        );
+
+        // UNLOCK (mirror unlock_folder's internals): KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+
+        let restored = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(
+            restored.text, original,
+            "document text restored byte-identical on unlock — sealed-and-restored, never lost"
+        );
+    }
+
+    /// REMOVE-LOCK: permanently removing a folder's lock decrypts the document text back to plaintext
+    /// and clears the blob — the document is NEVER lost.
+    #[test]
+    fn document_text_survives_remove_lock_permanently() {
+        let state = build_state("doc-remove-lock");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let md = write_temp_doc("perm", "md", "permanent: revisit auth next sprint");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let sealed = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(sealed.text, "", "blanked while sealed");
+
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+
+        let d = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(d.text, "permanent: revisit auth next sprint", "permanently restored on remove-lock");
+        assert!(d.blob.is_none(), "document text_blob cleared on remove-lock");
+    }
+
+    /// DELETE cascades the document's chunks/vectors away.
+    #[test]
+    fn delete_document_cascades_chunks() {
+        let state = build_state("doc-delete");
+        make_open_folder(&state.db, "f-open", "Project");
+        let md = write_temp_doc("del", "md", "alpha bravo charlie");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
+        assert_eq!(list_documents_inner(&state, "f-open").unwrap().len(), 1);
+
+        delete_document_inner(&state, &id).unwrap();
+        assert!(list_documents_inner(&state, "f-open").unwrap().is_empty(), "document deleted");
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "doc chunks cascade-deleted with the document"
+        );
     }
 
     /// BLK-1: hammer the off-thread `relock_all_inner` (the blanker) WHILE `remove_lock_inner` runs

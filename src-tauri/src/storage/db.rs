@@ -8,9 +8,10 @@ use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
 use crate::storage::models::{
-    Analytics, AssistantInteraction, Commitment, CorrectionRecord, DayCount, EntityDetail,
-    EntityKind, EntityNeighbor, Folder, GraphData, GraphEdge, GraphEntity, GraphNode, Meeting,
-    MeetingStatus, NoteRecord, RecipeRecord, SearchHit, StatusCount, VaultSource,
+    Analytics, AssistantInteraction, Commitment, CorrectionRecord, DayCount, DocChunkHit,
+    DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData, GraphEdge,
+    GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
+    StatusCount, VaultSource,
 };
 use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
@@ -367,6 +368,61 @@ impl Db {
         // Phase 2a — vector retrieval layer (note_chunks + the vec0 KNN table). Additive + guarded
         // (CREATE TABLE / CREATE VIRTUAL TABLE IF NOT EXISTS) so migrate() stays idempotent.
         Self::migrate_vector(&conn)?;
+        // Document ingestion — PARALLEL doc tables (documents + doc_chunks + the doc_vec0 KNN table),
+        // deliberately separate from note_chunks so the load-bearing meeting-gating joins stay
+        // untouched. Additive + guarded so migrate() stays idempotent.
+        Self::migrate_documents(&conn)?;
+        Ok(())
+    }
+
+    /// Idempotent DOCUMENT-ingestion schema, kept PARALLEL to the meeting note layer so the
+    /// load-bearing meeting-gating joins (`note_chunks` ↔ `meetings`) are never destabilized.
+    ///
+    /// - `documents` — one uploaded md/txt per row, ANCHORED to a `folders` row (the lock gate). The
+    ///   plaintext `text` mirrors the note `markdown`: it is BLANKED while the folder is sealed and
+    ///   the AES-GCM copy lives in `text_blob` (sealed under the folder CK, restored on unlock /
+    ///   remove-lock) — SEALED-AND-RESTORED exactly like the note `content_blob` / `manual_notes`.
+    /// - `doc_chunks` — plaintext chunks DERIVED from a document's text (the embed source + snippet
+    ///   store), 1:1 with `doc_vec_chunks` by `id`. CASCADE on the parent document.
+    /// - `doc_vec_chunks` — the `vec0` KNN table whose `chunk_id` mirrors `doc_chunks.id`.
+    ///
+    /// Lock model: chunks/vectors are invertible PII derived from the plaintext, so they exist ONLY
+    /// for VISIBLE documents — PURGED in the same transaction that seals a folder (mirrors
+    /// `purge_chunks_tx`), and re-embeddable on unlock. The gated read `search_doc_chunks_visible`
+    /// re-applies `visibility_clause` (defense-in-depth) so a stray chunk can never surface a sealed
+    /// folder's document.
+    fn migrate_documents(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS documents (
+               id TEXT PRIMARY KEY,
+               folder_id TEXT NOT NULL,
+               name TEXT NOT NULL,
+               text TEXT NOT NULL DEFAULT '',
+               text_blob BLOB,
+               created_at INTEGER NOT NULL,
+               FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_documents_folder ON documents(folder_id);
+             CREATE TABLE IF NOT EXISTS doc_chunks (
+               id INTEGER PRIMARY KEY,
+               document_id TEXT NOT NULL,
+               chunk_index INTEGER NOT NULL,
+               text TEXT NOT NULL,
+               FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_doc_chunks_document ON doc_chunks(document_id);",
+        )
+        .map_err(map_err)?;
+        // The vec0 column width is the embedder's EMBED_DIM (== the note vec_chunks width). Format the
+        // DDL (no user input). Parallel to `vec_chunks` but keyed to `doc_chunks.id`.
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS doc_vec_chunks USING vec0(
+                 chunk_id INTEGER PRIMARY KEY,
+                 embedding float[{dim}]
+             );",
+            dim = crate::embed::EMBED_DIM
+        ))
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -1293,6 +1349,337 @@ impl Db {
         Ok(out)
     }
 
+    // ── document ingestion (PARALLEL doc layer) ───────────────────────────────
+    //
+    // `documents` rows are uploaded md/txt files anchored to a FOLDER (the lock gate). The plaintext
+    // `text` is SEALED-AND-RESTORED exactly like the note `markdown` (encrypt → `text_blob`, blank
+    // plaintext on lock, decrypt back on unlock). `doc_chunks`/`doc_vec_chunks` are invertible PII
+    // derived from the plaintext, so they exist ONLY for visible documents — purged on lock,
+    // re-embeddable on unlock. Every read here is folder-gated by the COMMAND layer
+    // (`folder_is_unlocked`) or by `visibility_clause` (`search_doc_chunks_visible`).
+
+    /// Insert a `documents` row (plaintext `text`). The `id` + `created_at` are caller-supplied (the
+    /// command generates a UUID + an epoch-millis timestamp). The folder must exist (FK).
+    pub fn insert_document(
+        &self,
+        id: &str,
+        folder_id: &str,
+        name: &str,
+        text: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO documents (id, folder_id, name, text, text_blob, created_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            rusqlite::params![id, folder_id, name, text, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Lightweight metadata (NO text) for every document in a folder, newest-first. The COMMAND layer
+    /// gates the folder before calling this (a sealed-not-unlocked folder returns the masked/empty
+    /// list there) — this is a low-level read with no gating of its own.
+    pub fn documents_in_folder(&self, folder_id: &str) -> Result<Vec<DocumentInfo>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, created_at FROM documents
+                   WHERE folder_id = ?1 ORDER BY created_at DESC, name",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok(DocumentInfo {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    created_at: r.get(2)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Number of `doc_chunks` rows currently indexed for a document (0 when sealed/purged or never
+    /// embedded). A non-leaky count read — used by the lock tests to assert purge-on-lock /
+    /// re-embed-on-unlock without reaching the private connection. Test-only (no production caller).
+    #[cfg(test)]
+    pub(crate) fn doc_chunk_count(&self, document_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM doc_chunks WHERE document_id = ?1",
+            rusqlite::params![document_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// A document's `(folder_id, name, plaintext text)`, or `None` if unknown. The COMMAND layer gates
+    /// the folder before surfacing the text to the FE.
+    pub fn get_document(&self, id: &str) -> Result<Option<(String, String, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT folder_id, name, text FROM documents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// The owning folder id for a document, or `None` if unknown. The folder-lock gate anchor.
+    pub fn folder_for_document(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT folder_id FROM documents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Distinct document ids governed by a folder's lock (its `documents` rows). Used to seal/unseal/
+    /// purge each document's text + chunks.
+    pub fn document_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM documents WHERE folder_id = ?1")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Raw `(text, text_blob)` for every document in a folder — the seal/unseal source-of-truth read
+    /// (mirrors [`Db::raw_manual_notes`]). `text` is "" once sealed; `text_blob` carries the sealed
+    /// copy. Used by the seal (encrypt+verify the plaintext), unseal (decrypt the blob), and reblank
+    /// (re-blank only WHERE the blob exists) paths.
+    pub fn raw_documents_in_folder(&self, folder_id: &str) -> Result<Vec<RawDocument>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, COALESCE(text, ''), text_blob FROM documents WHERE folder_id = ?1",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok(RawDocument {
+                    id: r.get(0)?,
+                    text: r.get(1)?,
+                    blob: r.get(2)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Seal ONE document's text: store the AES-GCM `text_blob`, blank the plaintext `text`. The CALLER
+    /// must verify the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) —
+    /// exactly like [`Db::seal_manual_notes`] / [`Db::seal_note`].
+    pub fn seal_document(&self, id: &str, blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET text_blob = ?2, text = '' WHERE id = ?1",
+            rusqlite::params![id, blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Restore (or re-blank) a document's plaintext `text` for the session, leaving `text_blob`
+    /// intact. Pass the decrypted plaintext on unlock; pass "" on reblank (relock). Mirrors
+    /// [`Db::set_manual_notes`].
+    pub fn set_document_text(&self, id: &str, text: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET text = ?2 WHERE id = ?1",
+            rusqlite::params![id, text],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear a document's sealed `text_blob` (permanent remove-lock, after the plaintext is restored).
+    /// Mirrors [`Db::clear_manual_notes_blob`].
+    pub fn clear_document_blob(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET text_blob = NULL WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Permanently delete a document (its `doc_chunks` + `doc_vec_chunks` go first in the same tx —
+    /// `doc_vec_chunks` is a vec0 virtual table with no FK so the `documents` ON DELETE CASCADE
+    /// reaches `doc_chunks` but NOT `doc_vec_chunks`; deleting them explicitly avoids orphan vectors,
+    /// mirroring `delete_meeting`). Idempotent on an unknown id.
+    pub fn delete_document(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_doc_chunks_tx(&tx, &[id.to_string()])?;
+        tx.execute("DELETE FROM documents WHERE id = ?1", rusqlite::params![id])
+            .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// (Re)index a VISIBLE document's plaintext into `doc_chunks` + `doc_vec_chunks`. Old rows for the
+    /// document are purged first (clean replace). Caller MUST only invoke this for visible/unlocked
+    /// content — a sealed document's plaintext is blank, so chunking yields zero chunks (no-op).
+    /// Mirrors [`Db::index_meeting_chunks`]; uses the same `chunk_note` + `embed_passage` convention
+    /// so doc vectors are comparable to note vectors in the shared embedding space.
+    pub fn index_document_chunks(&self, document_id: &str, embedder: &dyn Embedder) -> Result<()> {
+        let Some((_folder_id, name, text)) = self.get_document(document_id)? else {
+            return Ok(()); // unknown document — nothing to index.
+        };
+        // Header carries the document name as provenance (the date axis is N/A for an upload, so the
+        // header is just the name — `chunk_note` tolerates an empty date).
+        let chunks = crate::embed::chunk_note(&name, "", &text);
+        let vectors = if chunks.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed_passage(&chunks)?
+        };
+
+        let this_doc = [document_id.to_string()];
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_doc_chunks_tx(&tx, &this_doc)?;
+        {
+            let mut ins_chunk = tx
+                .prepare(
+                    "INSERT INTO doc_chunks (document_id, chunk_index, text)
+                     VALUES (?1, ?2, ?3)",
+                )
+                .map_err(map_err)?;
+            let mut ins_vec = tx
+                .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
+                .map_err(map_err)?;
+            for (idx, (text, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
+                ins_chunk
+                    .execute(rusqlite::params![document_id, idx as i64, text])
+                    .map_err(map_err)?;
+                let chunk_id = tx.last_insert_rowid();
+                let blob = crate::embed::vec_to_blob(vector);
+                ins_vec
+                    .execute(rusqlite::params![chunk_id, blob])
+                    .map_err(map_err)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Purge (delete) every `doc_chunks` + `doc_vec_chunks` row for the given documents. The vec0 row
+    /// is deleted by its `chunk_id` (== doc_chunks.id) BEFORE the doc_chunks row. Used on lock (seal),
+    /// on the index "clean replace", and on document delete. Mirrors [`Db::purge_chunks_for_meetings`].
+    pub fn purge_doc_chunks_for_documents(&self, document_ids: &[String]) -> Result<()> {
+        if document_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_doc_chunks_tx(&tx, document_ids)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete doc-chunk rows for `document_ids` within an EXISTING transaction (so the purge lands in
+    /// the same atomic unit as the plaintext blanking on lock). vec0 first (its FK-less rowid mirrors
+    /// doc_chunks.id), then the source rows. Mirrors [`Db::purge_chunks_tx`].
+    fn purge_doc_chunks_tx(
+        tx: &rusqlite::Transaction<'_>,
+        document_ids: &[String],
+    ) -> Result<()> {
+        for did in document_ids {
+            tx.execute(
+                "DELETE FROM doc_vec_chunks WHERE chunk_id IN
+                   (SELECT id FROM doc_chunks WHERE document_id = ?1)",
+                rusqlite::params![did],
+            )
+            .map_err(map_err)?;
+            tx.execute(
+                "DELETE FROM doc_chunks WHERE document_id = ?1",
+                rusqlite::params![did],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// GATED semantic (vector KNN) search over DOCUMENT chunks. Runs a `doc_vec_chunks` KNN for the
+    /// top-`k` nearest chunks, then applies EXACTLY the `visibility_clause` predicate (joined
+    /// doc_chunks → documents → folders) so a chunk in a sealed-and-not-session-unlocked folder is
+    /// EXCLUDED even if a stray chunk survived purge — the same defense-in-depth as
+    /// `search_semantic_visible`. Dedups to one hit per document (best/nearest). Returns the chunk
+    /// snippet + the document name + its folder id (NO meeting — documents are not meetings).
+    pub fn search_doc_chunks_visible(
+        &self,
+        query_vec: &[f32],
+        k: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<DocChunkHit>> {
+        if query_vec.is_empty() || k <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        // KNN isolated to the vec0 table in a CTE; visibility + document columns joined OUTSIDE it.
+        let sql = format!(
+            "WITH knn(chunk_id, distance) AS (
+                 SELECT chunk_id, distance FROM doc_vec_chunks
+                  WHERE embedding MATCH ?1 AND k = ?2
+                  ORDER BY distance
+             )
+             SELECT d.id, d.name, d.folder_id, dc.text, knn.distance
+               FROM knn
+               JOIN doc_chunks dc ON dc.id = knn.chunk_id
+               JOIN documents d ON d.id = dc.document_id
+               JOIN folders f ON f.id = d.folder_id
+              WHERE {visible}
+              ORDER BY knn.distance ASC, d.id ASC"
+        );
+        let blob = crate::embed::vec_to_blob(query_vec);
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![blob, k], |row| {
+                Ok(DocChunkHit {
+                    document_id: row.get(0)?,
+                    name: row.get(1)?,
+                    folder_id: row.get(2)?,
+                    snippet: row.get(3)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut hits = Vec::new();
+        for r in rows {
+            let hit = r.map_err(map_err)?;
+            if !seen.insert(hit.document_id.clone()) {
+                continue; // already have a nearer chunk for this document.
+            }
+            hits.push(hit);
+        }
+        Ok(hits)
+    }
+
     // ── segments ────────────────────────────────────────────────────────────
 
     pub fn insert_segments(&self, meeting_id: &str, segments: &[Segment]) -> Result<()> {
@@ -2076,6 +2463,25 @@ impl Db {
             }
             drop(mids);
             Self::purge_chunks_tx(&tx, &meeting_ids)?;
+            // Document ingestion LOCK-SAFETY: purge the (invertible) doc chunks + vectors of every
+            // document in these (re-blanked / sealed) folders in the SAME transaction — so a relocked
+            // folder never leaves a document's semantic vector at rest. (The document TEXT re-blank is
+            // SEALED-AND-RESTORED content handled by `reblank_folder_extras`, exactly like
+            // `manual_notes` — it must NOT be blanked here, where there is no CK to re-seal.)
+            let mut dids = tx
+                .prepare("SELECT id FROM documents WHERE folder_id = ?1")
+                .map_err(map_err)?;
+            let mut document_ids: Vec<String> = Vec::new();
+            for id in folder_ids {
+                let rows = dids
+                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .map_err(map_err)?;
+                for r in rows {
+                    document_ids.push(r.map_err(map_err)?);
+                }
+            }
+            drop(dids);
+            Self::purge_doc_chunks_tx(&tx, &document_ids)?;
             // Phase F0 LOCK-SAFETY: purge the correction-log rows of every meeting in these (now
             // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
             // nothing to the flywheel.
@@ -2178,6 +2584,36 @@ impl Db {
         // the only copy). Mirrors the `text_blob IS NOT NULL` / `data_blob IS NOT NULL` guards above.
         tx.execute(
             &format!("UPDATE meetings SET manual_notes = '' WHERE manual_notes_blob IS NOT NULL AND manual_notes != '' AND id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // Document ingestion LOCK-SAFETY: re-blank the plaintext `text` of every document in a locked
+        // folder ONLY WHERE its `text_blob` exists (the sealed copy is present) — so a
+        // crash-while-unlocked (which restored the plaintext) cannot leave document plaintext at rest
+        // after a restart, but a document that was NEVER sealed (no blob) is left intact (never
+        // destroy the only copy). Mirrors the `manual_notes_blob IS NOT NULL` guard above.
+        tx.execute(
+            "UPDATE documents SET text = '' WHERE text_blob IS NOT NULL AND text != '' \
+               AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
+            [],
+        )
+        .map_err(map_err)?;
+        // And purge the (invertible) doc chunks + vectors of every document in a locked folder, in
+        // this same reconciliation transaction — so a crash-while-unlocked (which may have
+        // re-embedded) cannot leave a document's semantic vector of sealed content at rest after a
+        // restart. Delete doc_vec_chunks rows first (by chunk_id), then the source doc_chunks rows.
+        tx.execute(
+            "DELETE FROM doc_vec_chunks WHERE chunk_id IN \
+               (SELECT id FROM doc_chunks WHERE document_id IN \
+                  (SELECT id FROM documents WHERE folder_id IN \
+                     (SELECT id FROM folders WHERE locked = 1)))",
+            [],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM doc_chunks WHERE document_id IN \
+               (SELECT id FROM documents WHERE folder_id IN \
+                  (SELECT id FROM folders WHERE locked = 1))",
             [],
         )
         .map_err(map_err)?;
@@ -3434,6 +3870,16 @@ pub struct RawTimeline {
 /// folder CK (present while sealed). Mirrors [`RawTimeline`].
 #[derive(Debug, Clone)]
 pub struct RawManualNotes {
+    pub text: String,
+    pub blob: Option<Vec<u8>>,
+}
+
+/// An uploaded document's plaintext in either seal state (document-ingestion lock lifecycle).
+/// `text` is the plaintext column (blank while sealed); `blob` is the AES-GCM ciphertext under the
+/// folder CK (present while sealed). Mirrors [`RawManualNotes`]. `id` is the document id.
+#[derive(Debug, Clone)]
+pub struct RawDocument {
+    pub id: String,
     pub text: String,
     pub blob: Option<Vec<u8>>,
 }
@@ -4698,6 +5144,150 @@ mod tests {
             shown.iter().any(|h| h.meeting.id == "sealed"),
             "session-unlocked meeting must reappear in semantic results"
         );
+    }
+
+    // ── document ingestion (documents + doc_chunks + doc_vec0) ────────────────
+
+    /// IMPORT/INDEX round-trip at the DB layer: an inserted document chunks + embeds (via the stub so
+    /// vectors are deterministic), the metadata read returns it (no text), and the full-text read
+    /// returns the plaintext. Purging the doc removes its chunks AND vectors (1:1).
+    #[test]
+    fn document_index_and_purge_round_trip() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Project");
+        db.insert_document("d1", "f-open", "spec.md", "budget planning for the quarter", 100)
+            .unwrap();
+        db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
+
+        // Metadata (no text) + full text read back.
+        let listed = db.documents_in_folder("f-open").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "d1");
+        assert_eq!(listed[0].name, "spec.md");
+        let (folder, name, text) = db.get_document("d1").unwrap().unwrap();
+        assert_eq!(folder, "f-open");
+        assert_eq!(name, "spec.md");
+        assert_eq!(text, "budget planning for the quarter");
+
+        // Chunks + 1:1 vectors exist.
+        let count = |sql: &str| -> i64 {
+            db.lock().query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        let chunks = count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'");
+        let vecs = count(
+            "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN \
+               (SELECT id FROM doc_chunks WHERE document_id = 'd1')",
+        );
+        assert!(chunks >= 1, "document must be chunked");
+        assert_eq!(chunks, vecs, "doc_vec_chunks is 1:1 with doc_chunks");
+
+        // Purge drops BOTH chunks and vectors.
+        db.purge_doc_chunks_for_documents(&["d1".to_string()]).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM doc_vec_chunks"), 0, "vectors purged with chunks");
+        // The document row + its plaintext survive the chunk purge (re-embeddable).
+        assert_eq!(db.get_document("d1").unwrap().unwrap().2, "budget planning for the quarter");
+    }
+
+    /// GATE: a document in a sealed-and-not-session-unlocked folder is ABSENT from
+    /// `search_doc_chunks_visible` with an empty unlock set, and PRESENT when its folder is in the
+    /// set. The doc-chunk row deliberately STILL EXISTS, so exclusion can ONLY come from the gate —
+    /// RED if the `visibility_clause` inside `search_doc_chunks_visible` were removed.
+    #[test]
+    fn doc_chunk_search_is_gated_by_visibility() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", 100)
+            .unwrap();
+        db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
+        // Query vector = the stub passage embedding of the doc's own chunk text → guaranteed nearest.
+        let chunk_text: String = db
+            .lock()
+            .query_row(
+                "SELECT text FROM doc_chunks WHERE document_id = 'd1' ORDER BY chunk_index LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let query = crate::embed::StubEmbedder
+            .embed_passage(std::slice::from_ref(&chunk_text))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        // Open folder → visible.
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.search_doc_chunks_visible(&query, 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d1"),
+            "open-folder document chunk must be visible to search"
+        );
+
+        // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
+        db.set_folder_locked("f-locked", true, None).unwrap();
+        let hidden = db.search_doc_chunks_visible(&query, 10, &nothing).unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.document_id == "d1"),
+            "sealed-not-unlocked document chunk leaked through the gate"
+        );
+
+        // Session-unlock → present again.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db.search_doc_chunks_visible(&query, 10, &unlocked).unwrap();
+        assert!(
+            shown.iter().any(|h| h.document_id == "d1"),
+            "session-unlocked document chunk must reappear in search"
+        );
+    }
+
+    /// SEAL ROUND-TRIP (verify-before-destroy, byte-identical): a document's text encrypts under a CK
+    /// (AAD-less here for the unit, mirroring the `seal_*_round_trips_byte_identical` pattern), blanks,
+    /// and decrypts back byte-identical via `seal_document` / `set_document_text` / `clear_document_blob`.
+    #[test]
+    fn seal_document_round_trips_byte_identical() {
+        let db = mem_db();
+        seed_folder(&db, "f", "F");
+        let original = "zażółć gęślą jaźń — DECISION: ship Friday";
+        db.insert_document("d1", "f", "n.md", original, 100).unwrap();
+
+        let ck = crate::crypto::random_key().unwrap();
+        // Encrypt + VERIFY decryptable BEFORE sealing (the command's verify-before-destroy rule).
+        let blob = crate::crypto::encrypt(&ck, original.as_bytes(), b"").unwrap();
+        assert_eq!(crate::crypto::decrypt(&ck, &blob, b"").unwrap(), original.as_bytes());
+        db.seal_document("d1", &blob).unwrap();
+        // Plaintext blanked, blob present.
+        let raw = db.raw_documents_in_folder("f").unwrap();
+        assert_eq!(raw[0].text, "");
+        let stored_blob = raw[0].blob.clone().unwrap();
+        // Decrypt the STORED blob → byte-identical to the original.
+        let restored = crate::crypto::decrypt(&ck, &stored_blob, b"").unwrap();
+        assert_eq!(restored, original.as_bytes(), "sealed document round-trips byte-identical");
+        // Restore + clear the blob (remove-lock shape).
+        db.set_document_text("d1", &String::from_utf8(restored).unwrap()).unwrap();
+        db.clear_document_blob("d1").unwrap();
+        let raw2 = db.raw_documents_in_folder("f").unwrap();
+        assert_eq!(raw2[0].text, original);
+        assert!(raw2[0].blob.is_none());
+    }
+
+    /// delete_document drops the row AND cascades its chunks/vectors (mirrors delete_meeting).
+    #[test]
+    fn delete_document_drops_row_and_chunks() {
+        let db = mem_db();
+        seed_folder(&db, "f", "F");
+        db.insert_document("d1", "f", "n.md", "alpha bravo charlie", 100).unwrap();
+        db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
+        db.delete_document("d1").unwrap();
+        assert!(db.get_document("d1").unwrap().is_none(), "document row deleted");
+        let count: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "doc chunks cascade-deleted");
     }
 
     /// RELATED-BY-MEANING GATE: `related_meetings_visible` re-embeds the SOURCE meeting's own chunk
