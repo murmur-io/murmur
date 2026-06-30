@@ -68,6 +68,13 @@ export const routes: Routes = [
           ),
       },
       {
+        path: "brain",
+        loadComponent: () =>
+          import("./features/brain/brain.component").then(
+            (m) => m.BrainComponent,
+          ),
+      },
+      {
         path: "onboarding",
         loadComponent: () =>
           import("./features/onboarding/onboarding.component").then(
