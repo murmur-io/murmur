@@ -2480,6 +2480,61 @@ pub async fn list_gateway_models(
     Ok(ids.into_iter().map(|id| GatewayModelDto { id }).collect())
 }
 
+/// DTO returned by `gateway_health`.
+///
+/// Shape: `{ "reachable": true, "modelCount": 6 }` (camelCase, matches the FE `GatewayHealth`
+/// type). `reachable: false` with `model_count: 0` means the gateway is unreachable or not
+/// configured — the FE renders a red dot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHealthDto {
+    pub reachable: bool,
+    pub model_count: u32,
+}
+
+/// Probe the configured AI Gateway by fetching `GET {base}/models`.
+///
+/// Returns `GatewayHealthDto { reachable: true, model_count: N }` when the request succeeds, and
+/// `{ reachable: false, model_count: 0 }` on ANY failure (network error, auth error, empty URL) —
+/// this command NEVER returns an `Err` variant so the FE health dot always gets a clean value.
+///
+/// Inbound-only: sends NO meeting content, only an optional `Authorization: Bearer` header. Does
+/// NOT need the redaction firewall or the consent gate (same rationale as `list_gateway_models`).
+#[tauri::command]
+pub async fn gateway_health(
+    state: State<'_, AppState>,
+) -> Result<GatewayHealthDto, AppError> {
+    let (base_url, model, api_key) = {
+        let config = match state.config.lock() {
+            Ok(c) => c,
+            Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+        };
+        let base_url = config.gateway_base_url.clone();
+        let model = config.gateway_model.clone();
+        // R3: resolve the gateway key; never falls back to the Anthropic key.
+        let api_key = secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+        (base_url, model, api_key)
+    };
+
+    if base_url.trim().is_empty() {
+        // Not configured → degrade silently.
+        return Ok(GatewayHealthDto { reachable: false, model_count: 0 });
+    }
+
+    let provider = match crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key) {
+        Ok(p) => p,
+        Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+    };
+
+    match provider.list_models().await {
+        Ok(ids) => Ok(GatewayHealthDto {
+            reachable: true,
+            model_count: ids.len() as u32,
+        }),
+        Err(_) => Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+    }
+}
+
 /// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
 /// An empty input clears it. The key is NEVER logged and NEVER returned to the FE — only `has_*`
 /// reports presence. Mirrors `set_anthropic_key`.
