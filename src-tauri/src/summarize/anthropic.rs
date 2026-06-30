@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::AppError;
+use crate::summarize::meta::CallMeta;
 use crate::summarize::provider::*;
 use crate::summarize::template;
 
@@ -89,13 +90,31 @@ pub(crate) fn build_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-/// Minimal mirror of the `/v1/messages` success response — we only need the text blocks.
+/// Minimal mirror of the `/v1/messages` success response.
 #[derive(Debug, Deserialize)]
 struct MessagesResponse {
     #[serde(default)]
     content: Vec<ContentBlock>,
     #[serde(default)]
     stop_reason: Option<String>,
+    /// Token-usage breakdown — `None` if the API response did not include it.
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+    /// Model id as echoed back by the API — may differ from requested if the endpoint re-routes.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Token-usage block returned by the Anthropic Messages API.
+#[derive(Debug, Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    /// Tokens served from the prompt cache (prompt-caching feature).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +123,60 @@ struct ContentBlock {
     block_type: String,
     #[serde(default)]
     text: Option<String>,
+}
+
+/// Parse a raw Anthropic Messages API JSON response body into `(text, CallMeta)`.
+///
+/// The text is the concatenation of all `"text"` content blocks, BOM-stripped and trimmed.
+/// `CallMeta` is populated from the `usage` and `model` fields; any absent field is `None`.
+/// A response that is missing `usage` / `model` still parses successfully — those fields
+/// degrade to `None` rather than erroring.
+pub(crate) fn parse_messages_response(body: &str) -> crate::error::Result<(String, CallMeta)> {
+    let parsed: MessagesResponse = serde_json::from_str(body)
+        .map_err(|e| AppError::Summarize(format!("failed to parse Anthropic response: {e}")))?;
+
+    if parsed.stop_reason.as_deref() == Some("refusal") {
+        return Err(AppError::Summarize(
+            "Anthropic declined the request (stop_reason=refusal)".to_string(),
+        ));
+    }
+
+    let text: String = parsed
+        .content
+        .iter()
+        .filter(|b| b.block_type == "text")
+        .filter_map(|b| b.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("");
+
+    let note = text.trim_start_matches('\u{feff}').trim();
+    if note.is_empty() {
+        return Err(AppError::Summarize(
+            "Anthropic response contained no text content".to_string(),
+        ));
+    }
+
+    // Build CallMeta from the optional `usage` + `model` fields.
+    let meta = {
+        let prompt = parsed.usage.as_ref().and_then(|u| u.input_tokens);
+        let completion = parsed.usage.as_ref().and_then(|u| u.output_tokens);
+        let total = match (prompt, completion) {
+            (Some(p), Some(c)) => Some(p + c),
+            _ => None,
+        };
+        CallMeta {
+            model_served: parsed.model.filter(|m| !m.is_empty()),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+            cached_tokens: parsed
+                .usage
+                .as_ref()
+                .and_then(|u| u.cache_read_input_tokens),
+        }
+    };
+
+    Ok((note.to_string(), meta))
 }
 
 #[async_trait::async_trait]
@@ -125,80 +198,54 @@ impl SummarizerProvider for AnthropicProvider {
     /// POST to `/v1/messages` with the note-format template as `system` and the meeting
     /// content as the `user` message; return the concatenated text of the response.
     async fn summarize(&self, req: &SummarizeRequest) -> crate::error::Result<String> {
-        let api_key = self.api_key.as_deref().filter(|k| !k.trim().is_empty()).ok_or_else(|| {
-            AppError::Unavailable("Anthropic API key is not set".to_string())
-        })?;
-
         let system_prompt = if req.template.trim().is_empty() {
             template::default_template()
         } else {
             req.template.clone()
         };
         let user_content = template::render_user_content(req);
-
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": MAX_TOKENS,
-            "system": system_prompt,
-            "messages": [
-                { "role": "user", "content": user_content }
-            ],
-        });
-        apply_effort(&mut body, &self.effort);
-
-        let resp = self
-            .client
-            .post(API_URL)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::Summarize(format!("Anthropic request failed: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            // Surface the API error message but keep it PII-free (it's about the request,
-            // not personal data).
-            let err_body = resp.text().await.unwrap_or_default();
-            let detail = extract_api_error(&err_body).unwrap_or_else(|| err_body.clone());
-            return Err(AppError::Summarize(format!(
-                "Anthropic API returned {status}: {}",
-                detail.trim()
-            )));
-        }
-
-        let parsed: MessagesResponse = resp
-            .json()
-            .await
-            .map_err(|e| AppError::Summarize(format!("failed to parse Anthropic response: {e}")))?;
-
-        if parsed.stop_reason.as_deref() == Some("refusal") {
-            return Err(AppError::Summarize(
-                "Anthropic declined the request (stop_reason=refusal)".to_string(),
-            ));
-        }
-
-        let text: String = parsed
-            .content
-            .iter()
-            .filter(|b| b.block_type == "text")
-            .filter_map(|b| b.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
-
-        let note = text.trim_start_matches('\u{feff}').trim();
-        if note.is_empty() {
-            return Err(AppError::Summarize(
-                "Anthropic response contained no text content".to_string(),
-            ));
-        }
-
-        Ok(note.to_string())
+        let (text, _meta) = self.messages_call(&system_prompt, &user_content).await?;
+        Ok(text)
     }
 
     async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
+        let (text, _meta) = self.messages_call(system, user).await?;
+        Ok(text)
+    }
+
+    async fn summarize_with_meta(
+        &self,
+        req: &SummarizeRequest,
+    ) -> crate::error::Result<(String, CallMeta)> {
+        let system_prompt = if req.template.trim().is_empty() {
+            template::default_template()
+        } else {
+            req.template.clone()
+        };
+        let user_content = template::render_user_content(req);
+        self.messages_call(&system_prompt, &user_content).await
+    }
+
+    async fn complete_with_meta(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> crate::error::Result<(String, CallMeta)> {
+        self.messages_call(system, user).await
+    }
+}
+
+impl AnthropicProvider {
+    /// Shared internal POST+parse path for both `summarize*` and `complete*`.
+    ///
+    /// Builds the `/v1/messages` request body, POSTs it, checks the status, and delegates
+    /// parsing (text extraction + `CallMeta` population) to [`parse_messages_response`].
+    /// All four public trait methods funnel through here so the HTTP code is never duplicated.
+    async fn messages_call(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> crate::error::Result<(String, CallMeta)> {
         let api_key = self
             .api_key
             .as_deref()
@@ -226,6 +273,8 @@ impl SummarizerProvider for AnthropicProvider {
 
         let status = resp.status();
         if !status.is_success() {
+            // Surface the API error message but keep it PII-free (it's about the request,
+            // not personal data).
             let err_body = resp.text().await.unwrap_or_default();
             let detail = extract_api_error(&err_body).unwrap_or_else(|| err_body.clone());
             return Err(AppError::Summarize(format!(
@@ -234,18 +283,12 @@ impl SummarizerProvider for AnthropicProvider {
             )));
         }
 
-        let parsed: MessagesResponse = resp
-            .json()
+        let body_text = resp
+            .text()
             .await
-            .map_err(|e| AppError::Summarize(format!("failed to parse Anthropic response: {e}")))?;
-        let text: String = parsed
-            .content
-            .iter()
-            .filter(|b| b.block_type == "text")
-            .filter_map(|b| b.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
-        Ok(text.trim().to_string())
+            .map_err(|e| AppError::Summarize(format!("failed to read Anthropic response body: {e}")))?;
+
+        parse_messages_response(&body_text)
     }
 }
 
@@ -258,6 +301,63 @@ fn extract_api_error(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Task 2.3 — parse_messages_response fixture tests (RED → GREEN) ─────────────────────────
+
+    /// Anthropic JSON fixture with `usage` + `model` — confirms we stop discarding them.
+    const ANTHROPIC_FIXTURE: &str = r#"{
+        "id": "msg_01234",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [{"type": "text", "text": "Hello world"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 11,
+            "output_tokens": 22,
+            "cache_read_input_tokens": 5
+        }
+    }"#;
+
+    #[test]
+    fn parse_messages_response_extracts_usage_and_model() {
+        let (text, meta) = parse_messages_response(ANTHROPIC_FIXTURE).unwrap();
+        assert_eq!(text, "Hello world");
+        assert_eq!(meta.prompt_tokens, Some(11), "input_tokens → prompt_tokens");
+        assert_eq!(meta.completion_tokens, Some(22), "output_tokens → completion_tokens");
+        assert_eq!(meta.total_tokens, Some(33), "total = 11 + 22");
+        assert_eq!(meta.cached_tokens, Some(5), "cache_read_input_tokens → cached_tokens");
+        assert_eq!(
+            meta.model_served.as_deref(),
+            Some("claude-opus-4-8"),
+            "model field → model_served"
+        );
+    }
+
+    /// A response missing `usage` and `model` still parses — degrades gracefully to `None`.
+    #[test]
+    fn parse_messages_response_degrades_gracefully_without_usage() {
+        let body = r#"{
+            "content": [{"type": "text", "text": "Minimal response"}],
+            "stop_reason": "end_turn"
+        }"#;
+        let (text, meta) = parse_messages_response(body).unwrap();
+        assert_eq!(text, "Minimal response");
+        assert_eq!(meta, CallMeta::default(), "no usage/model → all None");
+    }
+
+    /// A `stop_reason=refusal` response propagates as an error (unchanged behavior).
+    #[test]
+    fn parse_messages_response_errors_on_refusal() {
+        let body = r#"{
+            "content": [],
+            "stop_reason": "refusal"
+        }"#;
+        assert!(
+            matches!(parse_messages_response(body), Err(AppError::Summarize(_))),
+            "refusal must map to AppError::Summarize"
+        );
+    }
 
     fn base_body() -> serde_json::Value {
         json!({
