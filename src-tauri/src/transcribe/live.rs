@@ -410,6 +410,9 @@ fn run_informational(
             // for a future structured "agent acts" iteration. The dispatch still routes EVERY request
             // through this loop (no hardcoded write classifier), so the model decides answer-vs-draft.
             allow_writes: false,
+            // The always-on `propose_note` tool records its draft HERE (no DB write). We read it after
+            // the loop to mark the reply as a NOTE PROPOSAL vs a plain ANSWER. The model decides which.
+            proposed_note: std::sync::Mutex::new(None),
         };
         let sink = ToolEventSink { app: app.clone(), event: tool_event };
         // Inject the LIVE transcript of the recording IN PROGRESS so the brain can answer questions
@@ -444,7 +447,14 @@ fn run_informational(
             CLOUD_MAX_STEPS,
             Some(&sink as &dyn crate::agent::DeltaSink),
         ) {
-            Ok(Some(outcome)) => return crate::voice_action::VoiceActionResult::from_agent(intent, outcome),
+            Ok(Some(outcome)) => {
+                // Read the model's NOTE PROPOSAL (if it called `propose_note` this turn) off the
+                // executor scratch and thread it onto the result — `Some` ⇒ a note draft, `None` ⇒ a
+                // plain answer. No DB write happened; the FE commits the draft on Accept.
+                let proposed = executor.proposed_note.lock().ok().and_then(|g| g.clone());
+                return crate::voice_action::VoiceActionResult::from_agent(intent, outcome)
+                    .with_proposed_note(proposed);
+            }
             Ok(None) => tracing::debug!(
                 target: "voice",
                 "agentic loop did not converge; flooring to deterministic retrieval"
@@ -932,7 +942,12 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// (`RedactingProvider::complete` scrubs `system` + `user`) — they are NOT a new egress class.
 fn assistant_system_prompt(live_transcript: &str, typed_notes: &str) -> String {
     let base = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
-                sentences). Do not invent facts; if you cannot find the answer, say so plainly.";
+                sentences). Do not invent facts; if you cannot find the answer, say so plainly. \
+                Decide what the user wants: for a plain QUESTION or conversation, just ANSWER it. \
+                ONLY when the user asks you to MAKE / SAVE / DRAFT / WRITE a note (e.g. \"make me a \
+                note about the decisions\", \"save that we ship Friday\"), call the propose_note tool \
+                with the note content enriched from the meeting context — that drafts a note for the \
+                user to review and accept; do NOT call propose_note for ordinary questions.";
     let t = live_transcript.trim();
     let mut prompt = if t.is_empty() {
         format!(
@@ -1409,6 +1424,25 @@ mod tests {
         assert!(with.contains("LIVE TRANSCRIPT"), "names the transcript section: {with}");
         assert!(with.contains("assigned the deck to Anna"), "embeds the transcript text");
         assert!(with.to_lowercase().contains("current"), "tells the brain it's the current meeting");
+    }
+
+    /// The system prompt instructs the model to DECIDE answer-vs-propose: name the `propose_note` tool
+    /// and tell it to call it ONLY when the user asks for a note (the model decides; no regex in code).
+    /// Present in BOTH the no-transcript and with-transcript branches (it lives in the shared base).
+    #[test]
+    fn assistant_system_prompt_instructs_propose_note_decision() {
+        for prompt in [
+            assistant_system_prompt("", ""),
+            assistant_system_prompt("we shipped the beta", ""),
+        ] {
+            assert!(prompt.contains("propose_note"), "names the propose_note tool: {prompt}");
+            assert!(
+                prompt.to_lowercase().contains("note"),
+                "tells the model when to draft a note: {prompt}"
+            );
+            // Both an answer path and a note-draft path are described (decide between them).
+            assert!(prompt.to_lowercase().contains("answer"), "describes plain answering too: {prompt}");
+        }
     }
 
     #[test]
