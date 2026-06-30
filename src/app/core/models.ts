@@ -122,6 +122,14 @@ export interface AppConfigDto {
    * `AppConfigDto.web_search_consented`.
    */
   webSearchConsented: boolean;
+  /**
+   * Opt-in: pass the shell environment through to the `claude` CLI subprocess, so an env
+   * `ANTHROPIC_API_KEY` (and proxy / base-url vars) reach it again — restores how older versions
+   * authenticated the CLI before the env-hardening. Settable flag, round-tripped on `save_config`.
+   * Default false = the hardened, env-cleared run. Even when on, the DB encryption keys are never
+   * inherited. Mirrors Rust `AppConfigDto.claude_code_inherit_env`.
+   */
+  claudeCodeInheritEnv: boolean;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
@@ -264,6 +272,33 @@ export interface VoiceCommandListeningPayload {
  */
 export interface VoiceCommandProcessingPayload {
   active: boolean;
+}
+
+/**
+ * Fired once per TOOL CALL the in-meeting brain makes during an agentic turn
+ * (`EVENT_ASSISTANT_TOOL`), so the assistant card can render the live tool-trace
+ * chips ("Searching notes… ✓", "Checking the web…"). NO PII — the tool NAME +
+ * a coarse result-size count only (never args, results, or content).
+ */
+export interface AssistantToolPayload {
+  /** The tool name (search_meetings / search_semantic / web_search / calendar_lookup / …). */
+  tool: string;
+  /** "running" when the call starts, "done" when it finishes. */
+  state: "running" | "done";
+  /** False when the tool call errored (the chip shows a muted state). */
+  ok: boolean;
+  /** Coarse result-size signal for the "✓ N" badge — never the content. */
+  count: number | null;
+}
+
+/**
+ * One message in the in-meeting CHAT conversation (the dedicated chat panel,
+ * `ask_assistant_chat`). The FE sends the FULL conversation (incl. the new user
+ * message as the last item) on every turn, so the brain gets multi-turn memory.
+ */
+export interface ChatMsg {
+  role: "user" | "assistant";
+  text: string;
 }
 
 /** A selectable microphone input device (from `list_input_devices`). */

@@ -152,6 +152,13 @@ pub struct AppConfigDto {
     /// neither grant nor clear web-search egress consent. `#[serde(default)]` = false (fail-closed).
     #[serde(default)]
     pub web_search_consented: bool,
+    /// Opt-in: inherit the shell environment into the `claude` CLI subprocess (restores the older
+    /// behavior where an env `ANTHROPIC_API_KEY` reached the CLI). Settable from the DTO (the Settings
+    /// UI owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`) = the
+    /// hardened env-cleared run, so a partial/older save can never silently enable it. Even ON the DB
+    /// encryption keys are never inherited (see `AppConfig::claude_code_inherit_env`).
+    #[serde(default)]
+    pub claude_code_inherit_env: bool,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -590,6 +597,137 @@ pub(crate) fn end_voice_command_inner(
         }
         // Nothing armed (already dispatched / backstop-stopped / never started) → graceful no-op.
         None => Ok(VoiceCommandEndResult { stopped: false }),
+    }
+}
+
+/// Ask the in-meeting assistant a TYPED question (the text composer — the twin of the voice trigger).
+/// Routes the typed command through the SAME gated agentic brain as voice ([`spawn_assistant_turn`] →
+/// `run_assistant_turn`): the model decides which gated tools to call, falling through to the
+/// deterministic floor on no-consent / non-convergence, and the answer arrives via
+/// `EVENT_VOICE_ACTION_RESULT` with the live tool-trace on `EVENT_ASSISTANT_TOOL`. Runs OFF-thread
+/// (the brain can take seconds). The text is the user's OWN words — the SAME egress class as a
+/// dictated voice command (no new egress). Emits the "thinking…" processing affordance immediately.
+#[tauri::command]
+pub fn ask_assistant_text(app: AppHandle, text: String) -> Result<(), AppError> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(AppError::InvalidArg("empty question".into()));
+    }
+    let _ = app.emit(
+        crate::events::EVENT_VOICE_COMMAND_PROCESSING,
+        crate::events::VoiceCommandProcessingPayload { active: true },
+    );
+    crate::transcribe::live::spawn_assistant_turn(app, text);
+    Ok(())
+}
+
+/// One message in the in-meeting CHAT conversation (the dedicated chat panel). `role` is `"user"` or
+/// `"assistant"`; the FE sends the FULL conversation (incl. the new user message as the last item) on
+/// every turn, so the brain gets the prior turns as context (multi-turn memory). NO id/timestamp — the
+/// FE owns the conversation state; the backend is stateless per call.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMsg {
+    pub role: String,
+    pub text: String,
+}
+
+/// Cap on conversation turns fed back as context — bounds tokens (and cloud egress) on a long chat.
+const CHAT_CONTEXT_TURNS: usize = 12;
+
+/// Format the chat `messages` into `(latest, conversation)`: `latest` is the user's newest message
+/// (drives intent-routing + the deterministic floor), `conversation` is the recent history rendered
+/// for the agentic loop's context. Errors when the last message is not a non-empty user message.
+fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
+    let last = messages
+        .last()
+        .ok_or_else(|| AppError::InvalidArg("empty chat".into()))?;
+    if !last.role.eq_ignore_ascii_case("user") || last.text.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "the last chat message must be a non-empty user message".into(),
+        ));
+    }
+    let latest = last.text.trim().to_string();
+    let start = messages.len().saturating_sub(CHAT_CONTEXT_TURNS);
+    let mut convo = String::from(
+        "This is an ongoing chat during a live meeting. Conversation so far:\n",
+    );
+    for m in &messages[start..] {
+        let who = if m.role.eq_ignore_ascii_case("assistant") { "Assistant" } else { "User" };
+        convo.push_str(&format!("{who}: {}\n", m.text.trim()));
+    }
+    convo.push_str("\nAnswer the User's LATEST message, using the conversation above for context.");
+    Ok((latest, convo))
+}
+
+/// Ask the in-meeting assistant a CHAT message — the dedicated multi-turn conversation panel. Unlike
+/// the fire-and-forget voice/card path, this RETURNS the reply (a `VoiceActionResult`) so the chat
+/// panel can resolve the in-flight assistant bubble; the live tool-trace streams via `EVENT_CHAT_TOOL`.
+/// The FE sends the FULL conversation each turn, so the brain has multi-turn memory. The heavy agentic
+/// work runs on a blocking thread (it can take seconds) so the async runtime stays free. SAME gated +
+/// consent-gated + redacting brain as voice (no new egress class).
+#[tauri::command]
+pub async fn ask_assistant_chat(
+    app: AppHandle,
+    messages: Vec<ChatMsg>,
+) -> Result<crate::voice_action::VoiceActionResult, AppError> {
+    let (latest, conversation) = format_chat(&messages)?;
+    tokio::task::spawn_blocking(move || {
+        crate::transcribe::live::run_assistant_query(
+            &app,
+            &latest,
+            &conversation,
+            crate::events::EVENT_CHAT_TOOL,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(anyhow::anyhow!("chat task join failed: {e}")))
+}
+
+#[cfg(test)]
+mod chat_format_tests {
+    use super::*;
+
+    fn msg(role: &str, text: &str) -> ChatMsg {
+        ChatMsg { role: role.into(), text: text.into() }
+    }
+
+    #[test]
+    fn format_chat_extracts_latest_and_renders_history() {
+        let msgs = vec![
+            msg("user", "what did we decide on pricing?"),
+            msg("assistant", "You agreed on tiered pricing."),
+            msg("user", "and the timeline?"),
+        ];
+        let (latest, convo) = format_chat(&msgs).unwrap();
+        // `latest` (drives intent + the floor) is the newest USER message.
+        assert_eq!(latest, "and the timeline?");
+        // The conversation context carries the prior turns labelled by role → multi-turn memory.
+        assert!(convo.contains("User: what did we decide on pricing?"));
+        assert!(convo.contains("Assistant: You agreed on tiered pricing."));
+        assert!(convo.contains("User: and the timeline?"));
+        assert!(convo.contains("LATEST"));
+    }
+
+    #[test]
+    fn format_chat_rejects_empty_or_non_user_last() {
+        assert!(format_chat(&[]).is_err(), "empty chat is rejected");
+        assert!(format_chat(&[msg("user", "   ")]).is_err(), "blank last message is rejected");
+        assert!(
+            format_chat(&[msg("user", "hi"), msg("assistant", "hello")]).is_err(),
+            "the last message must be from the user"
+        );
+    }
+
+    #[test]
+    fn format_chat_caps_history_to_recent_turns() {
+        // A long chat: only the last CHAT_CONTEXT_TURNS are rendered (bounds tokens + cloud egress).
+        let mut msgs: Vec<ChatMsg> = (0..39).map(|i| msg("user", &format!("turn-{i}-text"))).collect();
+        msgs.push(msg("user", "the final question"));
+        let (latest, convo) = format_chat(&msgs).unwrap();
+        assert_eq!(latest, "the final question");
+        assert!(convo.contains("the final question"));
+        assert!(!convo.contains("turn-0-text"), "turns beyond the cap are dropped");
     }
 }
 
@@ -1908,6 +2046,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
         // in `dto_to_config`).
         web_search_consented: c.web_search_consented,
+        claude_code_inherit_env: c.claude_code_inherit_env,
     }
 }
 
@@ -1997,6 +2136,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // live value (BLK-4 mirror). Only `consent_to_web_search` may flip it, so a settings save can
         // neither grant nor clear web-search egress consent.
         web_search_consented: current.web_search_consented,
+        // Opt-in env inheritance for the `claude` CLI IS settable from the DTO (the Settings UI owns
+        // the toggle). Default OFF on the DTO (`#[serde(default)]`), so a partial/older save can never
+        // silently enable it. Even ON, the DB keys are never inherited (claude_code.rs `harden_env`).
+        claude_code_inherit_env: d.claude_code_inherit_env,
     }
 }
 

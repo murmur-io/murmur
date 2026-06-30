@@ -198,7 +198,7 @@ import { FolderDropDirective } from "./folder-drop.directive";
         align-items: center;
         gap: var(--space-2);
         padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
-        line-height: 1.3;
+        line-height: 1.5;
         border: 1px solid transparent;
         border-radius: var(--radius-md);
         background: transparent;
