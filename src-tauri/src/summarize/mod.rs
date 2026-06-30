@@ -8,6 +8,7 @@ use crate::summarize::provider::SummarizerProvider;
 
 pub mod action_items;
 pub mod anthropic;
+pub mod gateway;
 pub mod brief;
 pub mod chat;
 pub mod claude_code;
@@ -43,6 +44,20 @@ pub const PROVIDER_OLLAMA: &str = "ollama";
 /// Keychain account under which the Anthropic API key is stored
 /// (matches `set_anthropic_key` / `has_anthropic_key` in `commands.rs`).
 pub const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
+
+/// Egress classification for `make_provider`. claude_code/anthropic always send content
+/// off-device. ollama is local ONLY when its base URL host is loopback — a remote `ollama_base_url`
+/// is cloud egress and MUST be redacted + consent-gated. Unknown ids default to cloud (fail-safe).
+pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
+    match id {
+        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC => true,
+        PROVIDER_OLLAMA => match reqwest::Url::parse(&config.ollama_base_url) {
+            Ok(u) => !gateway::host_is_loopback(&u),
+            Err(_) => true, // unparseable → fail safe (treat as cloud)
+        },
+        _ => true, // any future provider id defaults to cloud
+    }
+}
 
 /// True iff `id` names a provider that sends meeting content OFF-DEVICE to a cloud LLM.
 ///
@@ -173,6 +188,30 @@ mod tests {
         assert!(is_cloud(PROVIDER_ANTHROPIC));
         assert!(!is_cloud(PROVIDER_OLLAMA));
         assert!(!is_cloud("something-else"));
+    }
+
+    #[test]
+    fn egress_is_cloud_classification() {
+        // claude_code and anthropic are always cloud.
+        let cfg = AppConfig::default();
+        assert!(egress_is_cloud(PROVIDER_CLAUDE_CODE, &cfg));
+        assert!(egress_is_cloud(PROVIDER_ANTHROPIC, &cfg));
+
+        // ollama with default localhost URL is NOT cloud.
+        assert!(!egress_is_cloud(PROVIDER_OLLAMA, &cfg));
+
+        // ollama with a remote URL IS cloud.
+        let mut remote_cfg = AppConfig::default();
+        remote_cfg.ollama_base_url = "https://ollama.remote.example/api".into();
+        assert!(egress_is_cloud(PROVIDER_OLLAMA, &remote_cfg));
+
+        // ollama with an unparseable URL fails safe (treated as cloud).
+        let mut bad_cfg = AppConfig::default();
+        bad_cfg.ollama_base_url = "not a url".into();
+        assert!(egress_is_cloud(PROVIDER_OLLAMA, &bad_cfg));
+
+        // Unknown provider ids default to cloud (fail-safe).
+        assert!(egress_is_cloud("unknown-provider", &cfg));
     }
 
     fn consented_config() -> AppConfig {
