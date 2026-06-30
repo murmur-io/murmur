@@ -39,6 +39,8 @@ import type {
   VoiceActionResultPayload,
   VoiceCommandListeningPayload,
   VoiceCommandProcessingPayload,
+  AssistantToolPayload,
+  ChatMsg,
   WakeDetectedPayload,
 } from "./models";
 
@@ -52,6 +54,10 @@ export const EVENT_VOICE_ACTION_RESULT = "murmur://voice-action-result";
 export const EVENT_VOICE_COMMAND_LISTENING = "murmur://voice-command-listening";
 export const EVENT_VOICE_COMMAND_PROCESSING =
   "murmur://voice-command-processing";
+// The live tool-trace of an in-meeting agentic turn (one event per tool call).
+export const EVENT_ASSISTANT_TOOL = "murmur://assistant-tool";
+// The chat panel's own tool-trace stream (kept separate from the assistant card's).
+export const EVENT_CHAT_TOOL = "murmur://chat-tool";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
@@ -524,6 +530,29 @@ export class IpcService {
     return invoke<void>("end_voice_command");
   }
 
+  /**
+   * Ask the in-meeting assistant a TYPED question (the text composer — the twin of
+   * the voice trigger). Routes the typed command through the SAME gated agentic
+   * brain as voice: the model decides which gated tools to call, the live tool
+   * trace streams via {@link onAssistantTool}, and the answer arrives via
+   * {@link onVoiceActionResult}. Resolves once the turn is dispatched (not when
+   * the answer is ready). Rejects (InvalidArg) on an empty question.
+   */
+  askAssistantText(text: string): Promise<void> {
+    return invoke<void>("ask_assistant_text", { text });
+  }
+
+  /**
+   * Ask the in-meeting assistant a CHAT message (the dedicated multi-turn panel).
+   * Sends the FULL conversation (incl. the new user message as the last item) so
+   * the brain has multi-turn memory, and RESOLVES with the reply (summary +
+   * citations + status) so the panel can resolve the in-flight assistant bubble.
+   * The live tool-trace streams via {@link onChatTool}.
+   */
+  askAssistantChat(messages: ChatMsg[]): Promise<VoiceActionResultPayload> {
+    return invoke<VoiceActionResultPayload>("ask_assistant_chat", { messages });
+  }
+
   // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
 
   /** The folder tree (roots → children) with per-folder note counts + session lock state. */
@@ -654,6 +683,24 @@ export class IpcService {
       EVENT_VOICE_COMMAND_PROCESSING,
       (e) => cb(e.payload),
     );
+  }
+
+  /**
+   * Fires once per TOOL CALL the in-meeting brain makes during an agentic turn,
+   * so the card can render the live tool-trace chips ("Searching notes… ✓").
+   * NO PII — tool name + a coarse count only.
+   */
+  onAssistantTool(
+    cb: (p: AssistantToolPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<AssistantToolPayload>(EVENT_ASSISTANT_TOOL, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /** The CHAT panel's own live tool-trace (separate from the assistant card's). */
+  onChatTool(cb: (p: AssistantToolPayload) => void): Promise<UnlistenFn> {
+    return listen<AssistantToolPayload>(EVENT_CHAT_TOOL, (e) => cb(e.payload));
   }
 
   /** Fires with progress for an in-flight local brain-model download. */

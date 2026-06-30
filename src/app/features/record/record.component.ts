@@ -17,6 +17,8 @@ import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 import { AssistantActionsComponent } from "./assistant-actions.component";
 import { AiOrbComponent } from "./ai-orb.component";
 import { AssistantStore } from "../../core/assistant.store";
+import { MeetingChatPanelComponent } from "./meeting-chat-panel.component";
+import { MeetingChatStore } from "../../core/meeting-chat.store";
 
 @Component({
   selector: "app-record",
@@ -28,6 +30,7 @@ import { AssistantStore } from "../../core/assistant.store";
     MicMuteToggleComponent,
     AssistantActionsComponent,
     AiOrbComponent,
+    MeetingChatPanelComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
@@ -359,6 +362,10 @@ import { AssistantStore } from "../../core/assistant.store";
             </a>
           </div>
         }
+      }
+      <!-- ── Dedicated multi-turn CHAT panel (slide-out FAB + panel, while recording) ── -->
+      @if (showChat()) {
+        <app-meeting-chat-panel />
       }
     </section>
   `,
@@ -1172,6 +1179,13 @@ export class RecordComponent implements OnInit {
   /** The in-meeting voice-assistant store. Injected + init()'d here (not only from the
    * card) so it subscribes to the wake/result streams even before the card is shown. */
   readonly assistant = inject(AssistantStore);
+  readonly chat = inject(MeetingChatStore);
+
+  /** The dedicated chat panel (FAB + slide-out) is available while recording, unless the brain is off. */
+  readonly showChat = computed(() => {
+    const c = this.config();
+    return this.store.isRecording() && !!c && c.brainBackend !== "off";
+  });
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
 
@@ -1213,12 +1227,16 @@ export class RecordComponent implements OnInit {
   readonly showAssistant = computed(() => {
     const c = this.config();
     const enabled = !!c && c.realtimeReactions === true && c.brainBackend !== "off";
-    // Also surface the card the instant an interaction lands — covers a stale config
-    // snapshot (realtime toggled on in Settings after this screen mounted). The store is
-    // init()'d in ngOnInit, so it subscribes even when the card was never shown. A manual
-    // "Ask AI" (listening or in-flight) ALWAYS shows the card so the answer has a home.
+    // Surface the card+composer during ANY recording (unless the brain is off) so the
+    // TEXT composer is always available to ask a question mid-meeting — the twin of the
+    // voice trigger. Also surface it the instant an interaction lands (covers a stale
+    // config snapshot) and whenever a manual "Ask AI" is listening / in-flight so the
+    // answer always has a home.
+    const recordingWithBrain =
+      this.store.isRecording() && !!c && c.brainBackend !== "off";
     return (
       enabled ||
+      recordingWithBrain ||
       this.assistant.hasAny() ||
       this.assistant.listening() ||
       this.assistant.processing() ||
@@ -1389,6 +1407,9 @@ export class RecordComponent implements OnInit {
     // whether the card is visible yet — otherwise events fired before the card renders
     // (or while the config snapshot is stale) would be dropped.
     void this.assistant.init();
+    // Subscribe the chat store to its live tool-trace stream (the panel mounts lazily,
+    // but the EVENT_CHAT_TOOL subscription must be live before the first reply arrives).
+    void this.chat.init();
     this.config.set(await this.ipc.getConfig());
     this.modelPresent.set(await this.ipc.modelPresent());
     // Stats are secondary — never let a failure here block the record screen.
