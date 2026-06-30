@@ -39,6 +39,10 @@ import { SourcesComponent } from "../../shared/sources.component";
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MarkdownComponent, SourcesComponent],
   template: `
+    <!-- Temporarily hidden per request (2026-06-30): gated behind showBrief (initialized false)
+         to hide it for now. To restore: set showBrief's initial value to true, or remove this
+         @if guard + its closing brace below. -->
+    @if (showBrief()) {
     <section class="brief card" role="group" aria-label="Prepare for a meeting">
       <div class="brief-head">
         <div class="brief-head-text">
@@ -119,6 +123,7 @@ import { SourcesComponent } from "../../shared/sources.component";
         </div>
       }
     </section>
+    }
   `,
   styles: [
     `
@@ -394,6 +399,11 @@ import { SourcesComponent } from "../../shared/sources.component";
 export class PreMeetingBriefComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+
+  /** Temporarily hidden per request (2026-06-30): gates the whole "Prepare for a meeting"
+   *  card via the @if in the template. Set the initial value to `true` (or remove the @if
+   *  guard + its closing brace in the template) to restore. */
+  protected readonly showBrief = signal(false);
 
   /** Initial subject the parent prefills (calendar event / detected app / ""). */
   readonly initialSubject = input<string>("");
