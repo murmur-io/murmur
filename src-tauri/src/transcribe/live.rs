@@ -419,7 +419,21 @@ fn run_informational(
             .lock()
             .map(|t| t.clone())
             .unwrap_or_default();
-        let system = assistant_system_prompt(&live);
+        // brain2 realtime notes: ALSO inject the user's OWN typed notes for the CURRENT meeting so the
+        // brain weights their emphasis. GATED by `meeting_is_visible` on the LIVE per-turn `unlocked`
+        // set (fail-closed: a sealed-and-not-session-unlocked meeting injects NOTHING) — the in-progress
+        // recording has no note row yet, so it is trivially visible. This egresses through the SAME
+        // redaction firewall as `live`/`system` (`RedactingProvider::complete` scrubs `system` + `user`)
+        // and only on the Cloud branch (this whole block is Cloud-only, consent-gated) — NO new egress
+        // class. Best-effort: a read/gate error degrades to no typed-notes injection, never a failure.
+        let typed_notes = if !meeting_id.is_empty()
+            && state.db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false)
+        {
+            state.db.get_manual_notes(meeting_id).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let system = assistant_system_prompt(&live, &typed_notes);
         match crate::agent::run_agentic_loop(
             &*state.reasoner,
             &system,
@@ -886,25 +900,40 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// Build the in-meeting assistant's system prompt. When the LIVE transcript of the current recording
 /// is present, inject its recent tail (≤ [`LIVE_TRANSCRIPT_INJECT_CHARS`]) so the brain can answer
 /// questions about the meeting IN PROGRESS; otherwise the base prompt is unchanged (no regression when
-/// not recording / before any caption). The injected transcript egresses through the SAME redaction
-/// firewall as every other prompt (`RedactingProvider::complete` scrubs `system` + `user`).
-fn assistant_system_prompt(live_transcript: &str) -> String {
+/// not recording / before any caption). When the user has typed their OWN notes for this meeting
+/// (`typed_notes`), inject them as their own bounded section (their emphasis — weight these),
+/// truncated to the recent tail like the transcript. EMPTY `typed_notes` ⇒ the prompt is BYTE-IDENTICAL
+/// to the pre-feature output (the section is simply absent). Both the injected transcript AND the typed
+/// notes egress through the SAME redaction firewall as every other prompt
+/// (`RedactingProvider::complete` scrubs `system` + `user`) — they are NOT a new egress class.
+fn assistant_system_prompt(live_transcript: &str, typed_notes: &str) -> String {
     let base = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
                 sentences). Do not invent facts; if you cannot find the answer, say so plainly.";
     let t = live_transcript.trim();
-    if t.is_empty() {
-        return format!(
+    let mut prompt = if t.is_empty() {
+        format!(
             "{base} Ground answers in tool results from the user's own gated vault (and web / \
              calendar when you use them)."
-        );
+        )
+    } else {
+        let tail = tail_chars(t, LIVE_TRANSCRIPT_INJECT_CHARS);
+        format!(
+            "{base} You are CURRENTLY in a live meeting being recorded — use the LIVE TRANSCRIPT below \
+             to answer questions about THIS current meeting (its topic, decisions, who said what), and \
+             your gated tools for anything in the user's saved notes/vault.\n\nLIVE TRANSCRIPT (rough \
+             real-time captions, may be partial or slightly garbled):\n{tail}"
+        )
+    };
+    // The user's OWN typed notes for this meeting — their explicit emphasis, so the brain should
+    // weight them. Appended as a distinct bounded section; absent when empty (prompt unchanged).
+    let notes = typed_notes.trim();
+    if !notes.is_empty() {
+        let notes_tail = tail_chars(notes, LIVE_TRANSCRIPT_INJECT_CHARS);
+        prompt.push_str(&format!(
+            "\n\nUSER'S OWN TYPED NOTES for this meeting (their emphasis — weight these):\n{notes_tail}"
+        ));
     }
-    let tail = tail_chars(t, LIVE_TRANSCRIPT_INJECT_CHARS);
-    format!(
-        "{base} You are CURRENTLY in a live meeting being recorded — use the LIVE TRANSCRIPT below \
-         to answer questions about THIS current meeting (its topic, decisions, who said what), and \
-         your gated tools for anything in the user's saved notes/vault.\n\nLIVE TRANSCRIPT (rough \
-         real-time captions, may be partial or slightly garbled):\n{tail}"
-    )
+    prompt
 }
 
 #[cfg(test)]
@@ -1304,11 +1333,11 @@ mod tests {
     #[test]
     fn assistant_system_prompt_injects_transcript_only_when_present() {
         // No live transcript (not recording / no captions yet) ⇒ the base prompt, no transcript section.
-        let base = assistant_system_prompt("");
+        let base = assistant_system_prompt("", "");
         assert!(!base.contains("LIVE TRANSCRIPT"), "no transcript section when empty: {base}");
         assert!(base.contains("in-meeting assistant"));
         // With a transcript ⇒ it is embedded + the brain is told to use it for the current meeting.
-        let with = assistant_system_prompt("we shipped the beta and assigned the deck to Anna");
+        let with = assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "");
         assert!(with.contains("LIVE TRANSCRIPT"), "names the transcript section: {with}");
         assert!(with.contains("assigned the deck to Anna"), "embeds the transcript text");
         assert!(with.to_lowercase().contains("current"), "tells the brain it's the current meeting");
@@ -1319,8 +1348,41 @@ mod tests {
         // A very long transcript is truncated to the RECENT tail (so a 2-hour meeting can't blow the
         // context) and marked elided.
         let long = "x ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS); // way over the inject budget
-        let p = assistant_system_prompt(&long);
+        let p = assistant_system_prompt(&long, "");
         assert!(p.contains('…'), "elision marker present when truncated");
         assert!(p.chars().count() < long.chars().count(), "shorter than the raw transcript");
+    }
+
+    /// brain2 realtime notes: typed notes are injected as their own section when present, and the
+    /// EMPTY-typed-notes prompt is BYTE-IDENTICAL to the pre-feature output (no regression).
+    #[test]
+    fn assistant_system_prompt_injects_typed_notes_and_empty_is_byte_identical() {
+        // Empty typed notes ⇒ no typed-notes section, AND byte-identical to the no-notes prompt for
+        // BOTH the no-transcript and with-transcript branches.
+        let no_tx = assistant_system_prompt("", "");
+        assert!(!no_tx.contains("TYPED NOTES"), "no typed-notes section when empty: {no_tx}");
+        let tx = "we shipped the beta and assigned the deck to Anna";
+        assert_eq!(
+            assistant_system_prompt(tx, ""),
+            assistant_system_prompt(tx, "   "),
+            "whitespace-only typed notes must be byte-identical to none (no regression)"
+        );
+
+        // Present typed notes ⇒ embedded under the labeled section, alongside the transcript.
+        let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.");
+        assert!(with.contains("TYPED NOTES"), "names the typed-notes section: {with}");
+        assert!(with.contains("Anna owns QA sign-off"), "embeds the typed-notes text");
+        assert!(with.contains("LIVE TRANSCRIPT"), "still injects the transcript too");
+
+        // Typed notes inject even with NO transcript (the user can type before any caption lands).
+        let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker");
+        assert!(notes_only.contains("TYPED NOTES"), "typed notes inject without a transcript");
+        assert!(notes_only.contains("budget cap is the blocker"));
+        assert!(!notes_only.contains("LIVE TRANSCRIPT"), "no transcript section when transcript empty");
+
+        // A very long typed-notes buffer is truncated to the recent tail (bounded like the transcript).
+        let long = "y ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS);
+        let p = assistant_system_prompt("", &long);
+        assert!(p.contains('…'), "elision marker present when typed notes truncated");
     }
 }

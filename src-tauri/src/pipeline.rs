@@ -570,7 +570,17 @@ async fn summarize_and_export(
     };
 
     let provider = make_provider(&config.provider_id, config)?;
-    let markdown = provider.summarize(&request).await?;
+    let generated = provider.summarize(&request).await?;
+
+    // brain2 realtime notes FOLD: append the user's OWN typed in-meeting notes to the generated note
+    // under a `## My notes` section, BEFORE the note is persisted/exported/sealed. The `manual_notes`
+    // buffer is the DURABLE CANONICAL store of the typed notes — it is NOT blanked here, so this fold
+    // re-runs on EVERY (re)summarize: a regenerated note (which has no `## My notes` yet) gets one
+    // clean append, and a Resummarize can never drop the typed notes. Empty buffer ⇒ `markdown` is
+    // byte-identical to the generated note (no behavior change). The buffer's at-rest protection on a
+    // locked folder is the seal-and-restore lifecycle (`seal_manual_notes` + unseal), not blanking.
+    let manual_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
+    let markdown = fold_manual_notes(&generated, &manual_notes);
 
     state
         .db
@@ -720,6 +730,19 @@ fn finalize_note_without_vault(
     let title = derive_title(markdown, date_iso);
     db.set_meeting_title(meeting_id, &title)?;
     Ok(title)
+}
+
+/// brain2 realtime notes FINALIZE-FOLD: append the user's typed in-meeting notes to the generated
+/// note markdown under a `## My notes` section. Empty / whitespace-only `manual_notes` ⇒ the markdown
+/// is returned UNCHANGED (byte-identical to the generated note), so a meeting with no typed notes
+/// produces exactly today's output. The folded notes then ride the EXISTING note seal (`content_blob`)
+/// — never a second plaintext copy. Pure + Db-free so it is unit-testable in isolation.
+fn fold_manual_notes(markdown: &str, manual_notes: &str) -> String {
+    let notes = manual_notes.trim();
+    if notes.is_empty() {
+        return markdown.to_string();
+    }
+    format!("{markdown}\n\n## My notes\n\n{notes}\n")
 }
 
 /// brain2 RAG Phase 2b — the GATED entry point for indexing a note into the vector layer. Pure +
@@ -1122,6 +1145,81 @@ mod tests {
             "no-vault recording must finish Summarized, never Error"
         );
         assert_ne!(meeting.status, MeetingStatus::Error);
+    }
+
+    /// brain2 realtime notes: `fold_manual_notes` appends a `## My notes` section with the typed
+    /// notes, and returns the note UNCHANGED (byte-identical) for an empty / whitespace-only buffer.
+    #[test]
+    fn fold_manual_notes_appends_section_and_empty_is_byte_identical() {
+        let note = "# Sync\n\n- decided X";
+        // Empty / whitespace-only ⇒ byte-identical to the generated note (no behavior change).
+        assert_eq!(fold_manual_notes(note, ""), note);
+        assert_eq!(fold_manual_notes(note, "   \n\t "), note);
+        // Present ⇒ appended under a `## My notes` heading, verbatim (trimmed).
+        let folded = fold_manual_notes(note, "ship Friday; Anna owns QA");
+        assert!(folded.starts_with(note), "preserves the generated note");
+        assert!(folded.contains("## My notes"), "adds the My notes heading: {folded}");
+        assert!(folded.contains("ship Friday; Anna owns QA"), "embeds the typed notes verbatim");
+    }
+
+    /// brain2 realtime notes FOLD + COUNTEREXAMPLE B (the seam `summarize_and_export` runs, minus
+    /// the AppHandle/provider): get buffer → fold into the generated note → upsert. The buffer is
+    /// the DURABLE canonical store — NOT blanked — so a RESUMMARIZE (which regenerates a fresh note
+    /// with no `## My notes`) re-reads the buffer and re-folds it, and the typed notes are NEVER
+    /// dropped. RED on the prior blank-at-finalize code: the buffer would be "" on resummarize and
+    /// the regenerated note would lose `## My notes`.
+    #[test]
+    fn finalize_folds_manual_notes_durably_and_resummarize_refolds() {
+        use crate::storage::models::Meeting;
+
+        let db = crate::storage::Db::open_with_key(&temp_db_path("fold-manual"), TEST_DEK).unwrap();
+        let mid = "m-fold";
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-30T09:00:00Z".to_string(),
+            ended_at: Some("2026-06-30T09:10:00Z".to_string()),
+            title: None,
+            duration_s: 600,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        let typed = "DECISION: cut scope to MVP; revisit auth next sprint";
+        db.set_manual_notes(mid, typed).unwrap();
+
+        // Helper mirroring the EXACT finalize fold seam (no blank — the buffer stays durable).
+        let finalize = |generated: &str| {
+            let manual_notes = db.get_manual_notes(mid).unwrap();
+            let markdown = fold_manual_notes(generated, &manual_notes);
+            db.upsert_note(&NoteRecord {
+                meeting_id: mid.to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown,
+                created_at: "2026-06-30T09:11:00Z".to_string(),
+                exported_path: None,
+            })
+            .unwrap();
+        };
+
+        // First summarize: the note carries the typed notes under `## My notes`.
+        finalize("---\ntitle: Roadmap\n---\n# Roadmap\n\nBody.");
+        let note = db.get_note(mid, "claude_code").unwrap().expect("note saved");
+        assert!(note.markdown.contains("## My notes"), "folded section present: {}", note.markdown);
+        assert!(note.markdown.contains(typed), "typed notes folded into the note");
+        // The buffer is DURABLE — still holds the canonical typed notes (not blanked).
+        assert_eq!(db.get_manual_notes(mid).unwrap(), typed, "manual_notes buffer is the durable canonical store");
+
+        // COUNTEREXAMPLE B: Resummarize regenerates a FRESH note (no `## My notes`); the fold re-reads
+        // the durable buffer and re-appends it. The typed notes are NOT lost (and not duplicated).
+        finalize("---\ntitle: Roadmap v2\n---\n# Roadmap v2\n\nDifferent body.");
+        let resummarized = db.get_note(mid, "claude_code").unwrap().expect("note saved");
+        assert!(resummarized.markdown.contains("Roadmap v2"), "note regenerated");
+        assert!(resummarized.markdown.contains("## My notes"), "resummarize keeps the typed-notes section");
+        assert!(resummarized.markdown.contains(typed), "resummarize re-folds the durable typed notes (B fixed)");
+        assert_eq!(resummarized.markdown.matches("## My notes").count(), 1, "exactly one My notes section (no dup)");
+
+        let _ = std::fs::remove_file(temp_db_path("fold-manual"));
     }
 
     // ── Phase 2b: gated semantic indexing on note creation ──────────────────────────────────────
