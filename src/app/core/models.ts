@@ -663,3 +663,14 @@ export interface BriefResult {
 export interface GatewayModel {
   id: string;
 }
+
+/**
+ * AI Gateway (Phase 4) — result of `gateway_health`. The backend never errors
+ * on this command (unreachable → `reachable: false, modelCount: 0`), so the FE
+ * can safely `.catch(() => ({reachable:false, modelCount:0}))` as an extra guard.
+ * Mirrors Rust `GatewayHealth` (camelCase via `serde(rename_all = "camelCase")`).
+ */
+export interface GatewayHealth {
+  reachable: boolean;
+  modelCount: number;
+}

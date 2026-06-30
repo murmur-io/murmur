@@ -17,6 +17,7 @@ import type {
   AppConfigDto,
   BrainBackend,
   BrainModelDto,
+  GatewayHealth,
   GatewayModel,
   InputDeviceInfo,
   ProviderStatus,
@@ -1080,6 +1081,40 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
                   blank to let the gateway choose.
                 </span>
               }
+            </div>
+
+            <!-- AI Gateway (Phase 4) — health probe -->
+            <div class="gateway-health-row">
+              <span class="text-secondary">Gateway status</span>
+              <div class="gateway-health-status">
+                @if (gatewayHealth(); as h) {
+                  @if (h.reachable) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      {{ h.modelCount }} {{ h.modelCount === 1 ? 'model' : 'models' }} reachable
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot gateway-dot-unreachable"></span>
+                      Gateway unreachable
+                    </span>
+                  }
+                } @else {
+                  <span class="text-muted gateway-health-hint">Not checked</span>
+                }
+                <button
+                  type="button"
+                  class="btn btn-ghost gateway-health-btn"
+                  (click)="checkGatewayHealth()"
+                  [disabled]="gatewayHealthChecking()"
+                >
+                  @if (gatewayHealthChecking()) {
+                    Checking…
+                  } @else {
+                    Check
+                  }
+                </button>
+              </div>
             </div>
 
             <!-- Gateway API key (optional) -->
@@ -2168,6 +2203,33 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         font-size: 0.8125rem;
         white-space: nowrap;
       }
+
+      /* --- AI Gateway (Phase 4) — health probe row --- */
+      .gateway-health-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+        margin-bottom: var(--space-2);
+      }
+      .gateway-health-status {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+      }
+      .gateway-health-hint {
+        font-size: 0.8125rem;
+      }
+      .gateway-dot-unreachable {
+        background: var(--text-muted);
+      }
+      .gateway-health-btn {
+        height: 28px;
+        padding: 0 var(--space-3);
+        font-size: 0.8125rem;
+        white-space: nowrap;
+      }
     `,
   ],
 })
@@ -2324,6 +2386,13 @@ export class SettingsComponent implements OnInit {
   readonly gatewayModelsLoading = signal(false);
   /** Non-null when the last refreshGatewayModels() call failed — surfaces a fallback hint. */
   readonly gatewayModelError = signal<string | null>(null);
+
+  // ── AI Gateway (Phase 4) — health probe ─────────────────────────────────
+
+  /** Last health-probe result; null = not yet checked. */
+  readonly gatewayHealth = signal<GatewayHealth | null>(null);
+  /** True while gateway_health is in-flight — disables the Check button. */
+  readonly gatewayHealthChecking = signal(false);
 
   /**
    * Live signal of the gatewayModel form control's value. Mirrors the pattern used
@@ -2859,6 +2928,25 @@ export class SettingsComponent implements OnInit {
       this.gatewayModelError.set(String(e));
     } finally {
       this.gatewayModelsLoading.set(false);
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 4) — probe the configured gateway and update the health
+   * indicator. Driven by the explicit "Check" button click (no NG0600 risk, no
+   * unwanted network call on load). The backend never errors on this command but
+   * we catch for safety.
+   */
+  async checkGatewayHealth(): Promise<void> {
+    this.gatewayHealthChecking.set(true);
+    try {
+      this.gatewayHealth.set(
+        await this.ipc
+          .gatewayHealth()
+          .catch(() => ({ reachable: false, modelCount: 0 })),
+      );
+    } finally {
+      this.gatewayHealthChecking.set(false);
     }
   }
 
