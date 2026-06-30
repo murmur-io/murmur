@@ -30,10 +30,19 @@ pub fn host_is_loopback(url: &reqwest::Url) -> bool {
 }
 
 /// Validate a user-supplied gateway base URL (guardrails R1/R4): https required, except http on
-/// loopback; reject every other scheme (no file:/ftp:/gopher: SSRF surface).
+/// loopback; reject every other scheme (no file:/ftp:/gopher: SSRF surface). Also rejects
+/// embedded credentials (`https://key:@host/v1`) — they would leak through reqwest error Display;
+/// the API key belongs in the dedicated keychain field instead.
 pub fn validate_gateway_url(raw: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw.trim())
         .map_err(|_| AppError::InvalidArg("gateway URL is not a valid URL".into()))?;
+    // Reject embedded credentials before the scheme check — they would leak through reqwest error
+    // Display strings and are never the right way to supply an API key.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::InvalidArg(
+            "gateway URL must not embed credentials — set the API key in the key field".into(),
+        ));
+    }
     match url.scheme() {
         "https" => Ok(url),
         "http" if host_is_loopback(&url) => Ok(url),
@@ -72,8 +81,10 @@ fn extract_gateway_error(body: &str) -> Option<String> {
 ///   • consent-gated by `make_provider` before construction,
 ///   • redaction-wrapped by `make_provider` after construction (R2).
 pub struct OpenAiCompatProvider {
-    /// Validated base URL (e.g. `http://127.0.0.1:4000/v1`). Trailing slashes are stripped so
-    /// `join("chat/completions")` always produces the correct path.
+    /// Validated base URL with a trailing `/` ENSURED so that `join("chat/completions")` always
+    /// appends rather than replacing the last path segment (RFC 3986: a join on a base WITHOUT a
+    /// trailing slash replaces the final segment — `"http://h/v1".join("chat/completions")` →
+    /// `"http://h/chat/completions"`, dropping `/v1`). The trailing slash is added in `new()`.
     base: reqwest::Url,
     /// Model id sent in the request body. An empty string sends whatever the gateway defaults to.
     model: String,
@@ -86,24 +97,38 @@ pub struct OpenAiCompatProvider {
 impl OpenAiCompatProvider {
     /// Validate the base URL (R4) and construct the provider. `api_key` is optional (R3);
     /// if `None` no `Authorization` header is sent (useful for unauthenticated local gateways).
+    ///
+    /// The base path is normalized to end with `/` so that `join("chat/completions")` always
+    /// APPENDS — never replaces the last segment (RFC 3986 trap, e.g. `/v1` → `/v1/`).
     pub fn new(base_url: String, model: String, api_key: Option<String>) -> Result<Self> {
-        let base = validate_gateway_url(&base_url)?; // enforces R1/R4 at construction
+        let mut base = validate_gateway_url(&base_url)?; // enforces R1/R4 + no-creds at construction
+        // Ensure trailing slash so join("chat/completions") appends rather than replacing the last
+        // path segment. `http://host/v1` → `http://host/v1/`; `http://host/v1/` is a no-op.
+        if !base.path().ends_with('/') {
+            let p = format!("{}/", base.path());
+            base.set_path(&p);
+        }
         Ok(Self {
             base,
             model,
             api_key,
-            client: crate::summarize::anthropic::build_client(), // reuse the hardened builder (R4)
+            client: crate::summarize::anthropic::build_client(), // reuse the hardened builder
         })
+    }
+
+    /// Compose the `/chat/completions` endpoint URL from the normalized base. Exposed as
+    /// `pub(crate)` so unit tests can assert the composed URL without making a network call.
+    pub(crate) fn chat_endpoint(&self) -> Result<reqwest::Url> {
+        self.base
+            .join("chat/completions")
+            .map_err(|e| AppError::Summarize(format!("gateway URL join failed: {e}")))
     }
 
     /// POST to `{base}/chat/completions`, set the `Authorization` header only when a key is
     /// present (R3), and extract the first choice's `message.content`. Maps non-2xx responses to
     /// `AppError::Summarize` with the gateway's `error.message` when available.
     async fn call(&self, system: &str, user: &str) -> Result<String> {
-        let url = self
-            .base
-            .join("chat/completions")
-            .map_err(|e| AppError::Summarize(format!("gateway URL join failed: {e}")))?;
+        let url = self.chat_endpoint()?;
 
         let body = chat_body(&self.model, system, user);
 
@@ -263,6 +288,81 @@ mod tests {
             matches!(err2, AppError::InvalidArg(_)),
             "expected InvalidArg for bad scheme, got: {err2}"
         );
+    }
+
+    /// Fix — the composed chat-completions URL must APPEND to the base path, not replace it.
+    /// `http://h:4000/v1` → `http://h:4000/v1/chat/completions` (the `/v1` must survive).
+    /// `http://h:4000` (no path) → `http://h:4000/chat/completions`.
+    #[test]
+    fn chat_endpoint_preserves_base_path() {
+        let p = OpenAiCompatProvider::new(
+            "http://localhost:4000/v1".to_string(),
+            "gpt-4o".to_string(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.chat_endpoint().unwrap().as_str(),
+            "http://localhost:4000/v1/chat/completions",
+            "base path /v1 must be preserved (not replaced) in the join"
+        );
+
+        // Base without any path: join → /chat/completions.
+        let p2 = OpenAiCompatProvider::new(
+            "http://localhost:4000".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p2.chat_endpoint().unwrap().as_str(),
+            "http://localhost:4000/chat/completions"
+        );
+
+        // HTTPS remote with /v1 path also preserved.
+        let p3 = OpenAiCompatProvider::new(
+            "https://gw.example.com/v1".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p3.chat_endpoint().unwrap().as_str(),
+            "https://gw.example.com/v1/chat/completions"
+        );
+
+        // Trailing slash in the user-supplied URL is idempotent.
+        let p4 = OpenAiCompatProvider::new(
+            "http://localhost:4000/v1/".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p4.chat_endpoint().unwrap().as_str(),
+            "http://localhost:4000/v1/chat/completions"
+        );
+    }
+
+    /// Minor fix — embedded credentials in the URL must be rejected to prevent leaking the secret
+    /// through reqwest error Display strings.
+    #[test]
+    fn validate_gateway_url_rejects_embedded_credentials() {
+        // username + empty password (common key-in-URL pattern).
+        let err = validate_gateway_url("https://mykey:@gw.example.com/v1")
+            .err()
+            .expect("embedded creds must be rejected");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for embedded creds, got: {err}"
+        );
+        // username + password.
+        let err2 = validate_gateway_url("https://user:pass@gw.example.com/v1")
+            .err()
+            .expect("embedded user:pass must be rejected");
+        assert!(matches!(err2, AppError::InvalidArg(_)));
+        // No credentials → still valid.
+        assert!(validate_gateway_url("https://gw.example.com/v1").is_ok());
     }
 
     /// Task 1.2 — gateway error extraction from an OpenAI-format error envelope.
