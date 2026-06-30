@@ -11,11 +11,16 @@
 //! visibility-gated against it (`search_visible` / `search_hybrid_visible` / `meeting_is_visible` /
 //! `get_note_if_visible` / `list_meetings_visible` / `list_open_commitments` /
 //! `build_dossier_data`), so a sealed-and-not-session-unlocked meeting is invisible to all of them.
-//! There is no constructor that lets a caller skip the gate.
+//! There is no constructor that lets a caller skip the gate. The WRITE tools (`save_note`,
+//! `create_reminder`) live on [`GatedToolExecutor`] (NOT [`execute_tool`]): they run only when the
+//! executor was built with `allow_writes`, and `save_note` re-checks `meeting_is_visible` against the
+//! live `unlocked` set BEFORE it appends to `manual_notes` — a sealed-not-unlocked meeting refuses.
 //!
 //! ## Egress
-//! NONE. `execute_tool` only reads the local SQLite DB and (for semantic search) runs the local
-//! embedder. It never constructs a cloud provider or makes a network call.
+//! [`execute_tool`] EGRESSES NOTHING — it only reads the local SQLite DB and (for semantic search)
+//! runs the local embedder; it never constructs a cloud provider or makes a network call. The
+//! `create_reminder` write reaches the local macOS Reminders app via osascript (on-device, no network);
+//! `save_note` writes only the local DB.
 
 use std::collections::HashSet;
 
@@ -61,9 +66,11 @@ pub enum ToolCall {
 }
 
 /// Model-facing description of one tool the agentic brain may call. `parameters` is a JSON-schema
-/// object (the same shape `mcp.rs` advertises). A `write: true` tool mutates state and is NEVER
-/// exposed to the autonomous loop in v1 (the loop runs read-only; user-dictated writes go through
-/// `handle_voice_action`). This is the single source of truth for the model-facing catalog.
+/// object (the same shape `mcp.rs` advertises). A `write: true` tool MUTATES state: it is exposed to
+/// the agentic loop ONLY when the executor was built with `allow_writes` (the in-meeting loop), and
+/// even then every write goes through the gated executor (write only to an UNLOCKED/visible meeting —
+/// a sealed-not-unlocked meeting refuses). The MCP read-only surface (which constructs no executor
+/// with writes) never sees them. This is the single source of truth for the model-facing catalog.
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
@@ -72,8 +79,9 @@ pub struct ToolSpec {
 }
 
 /// The model-facing tool catalog. Built per call (cheap; ~10 entries). The read tools map 1:1 onto
-/// gated `execute_tool` / connector dispatchers; the two write entries are present as DATA (so the
-/// catalog is complete) but `write: true` keeps them out of the read-only loop's advertised set.
+/// gated `execute_tool` / connector dispatchers; the two `write: true` entries (`save_note`,
+/// `create_reminder`) map onto the gated write arms of `GatedToolExecutor::run` and are advertised to
+/// the model ONLY when the executor was built with `allow_writes` (the in-meeting loop).
 pub fn tool_specs() -> Vec<ToolSpec> {
     let str_arg = |prop: &'static str, desc: &str| -> serde_json::Value {
         serde_json::json!({
@@ -138,17 +146,26 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             write: false,
         },
         ToolSpec {
-            name: "note_aside",
-            description: "Append a short aside note to the meeting currently being recorded.",
-            parameters: str_arg("text", "The note text."),
+            name: "save_note",
+            description: "Save a note for the user about the meeting currently being recorded. Use this \
+                          when the user asks you to write/note/save/jot/remember something for THIS \
+                          meeting (\"note that …\", \"save that I send the deck to Anna\"). The text is \
+                          appended to the user's own meeting notes and folds into the finalized note.",
+            parameters: str_arg("text", "The note text to save, in the user's own language."),
             write: true,
         },
         ToolSpec {
             name: "create_reminder",
-            description: "Create a reminder.",
+            description: "Create a follow-up reminder in the user's Reminders app. Use this when the \
+                          user asks to be reminded to DO something later (\"remind me to email Bob\", \
+                          \"przypomnij mi …\"), i.e. an action with a future due — NOT a note about the \
+                          meeting (use save_note for that).",
             parameters: serde_json::json!({
                 "type": "object",
-                "properties": { "text": { "type": "string" }, "due": { "type": "string" } },
+                "properties": {
+                    "text": { "type": "string", "description": "What to be reminded about." },
+                    "due": { "type": "string", "description": "Optional natural-language due time." }
+                },
                 "required": ["text"]
             }),
             write: true,
@@ -489,8 +506,11 @@ fn format_hits_and_docs(
 /// relocked during a multi-second turn becomes invisible to the very next tool call. Every read
 /// routes through the visibility gate regardless of what the model requests: the model can ASK for a
 /// search, but a sealed-not-unlocked meeting is invisible by construction. Connectors (web/calendar)
-/// need the `AppHandle`; write tools need `allow_writes` (off for the v1 loop — user-dictated writes
-/// go through `handle_voice_action`).
+/// need the `AppHandle`; write tools need `allow_writes` (ON for the in-meeting loop, where the agent
+/// DECIDES — via tool-use, no hardcoded regex — whether to answer or write; OFF for the MCP/read
+/// surfaces). A write executes ONLY when `allow_writes` AND the target meeting is visible to the live
+/// `unlocked` set — a sealed-not-unlocked meeting refuses (`AppError::Locked`), never resurrecting
+/// plaintext behind a lock.
 pub struct GatedToolExecutor<'a> {
     pub db: &'a Db,
     pub unlocked: &'a std::sync::Mutex<HashSet<String>>,
@@ -558,8 +578,70 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 Some(app) => block_on_tool(execute_calendar_search(&s("query"), app)),
                 None => Err(AppError::InvalidArg("calendar_lookup needs an AppHandle".into())),
             },
+            // ── WRITE tools (advertised only when `allow_writes`; the allowlist check above already
+            //    refused them otherwise). Each is GATED to a VISIBLE/unlocked meeting before it mutates.
+            "save_note" => self.save_note(&s("text"), &unlocked),
+            "create_reminder" => {
+                let due = args.get("due").and_then(|v| v.as_str()).filter(|d| !d.trim().is_empty());
+                self.create_reminder(&s("text"), due)
+            }
             other => Err(AppError::InvalidArg(format!("unknown tool '{other}'"))),
         }
+    }
+}
+
+impl GatedToolExecutor<'_> {
+    /// WRITE — append the agent's note to the CURRENT meeting's durable typed-notes buffer
+    /// (`meetings.manual_notes`, Feature A): the sealed-and-restored, folds-into-the-note home. Read
+    /// the existing buffer, append the new line, and write it back — a non-destructive append (the
+    /// folder seal lifecycle still owns verify-before-destroy; this only ever GROWS plaintext for a
+    /// VISIBLE meeting). GATED: refuses (`AppError::Locked`) when there is no live meeting or the
+    /// meeting is sealed-not-unlocked, so the agent can never resurrect/write plaintext behind a lock.
+    fn save_note(&self, text: &str, unlocked: &HashSet<String>) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(AppError::InvalidArg("nothing to note".into()));
+        }
+        let meeting_id = self.meeting_id;
+        if meeting_id.is_empty() {
+            return Err(AppError::Locked(
+                "no meeting is being recorded — there is nothing to attach the note to".into(),
+            ));
+        }
+        // GATE: write ONLY to a meeting the live session can see. The in-progress recording has no
+        // note row yet → trivially visible; a sealed-not-unlocked meeting is refused, never written.
+        if !self.db.meeting_is_visible(meeting_id, unlocked)? {
+            return Err(AppError::Locked(
+                "this meeting is locked — unlock it to save a note".into(),
+            ));
+        }
+        // Non-destructive APPEND onto the durable buffer (newline-separated). `get_manual_notes`
+        // returns "" for an empty/never-set buffer, so the first note seeds it cleanly.
+        let existing = self.db.get_manual_notes(meeting_id).unwrap_or_default();
+        let merged = if existing.trim().is_empty() {
+            text.to_string()
+        } else {
+            format!("{existing}\n{text}")
+        };
+        self.db.set_manual_notes(meeting_id, &merged)?;
+        // PII rule: log the meeting id + new-buffer length only — never the note text.
+        tracing::debug!(target: "agent", meeting_id = %meeting_id, len = merged.len(), "agent saved a note to manual_notes");
+        Ok("Saved a note to this meeting.".to_string())
+    }
+
+    /// WRITE — create a follow-up reminder in the user's Reminders app via the existing blocking
+    /// osascript path. No meeting content is touched (it is an external action, not a vault write), so
+    /// there is no sealed-content surface here; an empty text is refused. The `allow_writes` gate + the
+    /// per-turn allowlist (checked in `run`) are what authorize reaching this at all.
+    fn create_reminder(&self, text: &str, due: Option<&str>) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(AppError::InvalidArg("nothing to remind about".into()));
+        }
+        crate::commands::add_reminder_blocking(text, due)?;
+        // PII rule: never log the reminder text (it is the user's own words).
+        tracing::debug!(target: "agent", "agent created a reminder");
+        Ok("Created a follow-up reminder.".to_string())
     }
 }
 
@@ -719,5 +801,220 @@ mod tests {
         assert!(out.contains("(https://w.example/krakow)"), "url present: {out}");
         // A hit with no snippet/url still renders its labelled title.
         assert!(out.contains("[web · Brave] No URL result"), "labelled even without url: {out}");
+    }
+
+    // ── In-meeting WRITE tools: advertised only with allow_writes, executed, and GATED ──────────────
+    // The agentic loop's NEW write surface (conversation-first design, 2026-06-30). The agent DECIDES
+    // (answer vs write) — but every write is host-gated here: a sealed-not-unlocked meeting refuses.
+
+    use crate::agent::ToolExecutor;
+    use crate::storage::models::{Folder, Meeting, MeetingStatus, NoteRecord};
+    use std::sync::Mutex;
+
+    /// A live, un-foldered (visible) recording meeting — the in-progress recording the agent writes to.
+    fn seed_live_meeting(db: &Db, id: &str) {
+        db.insert_meeting(&Meeting {
+            id: id.into(),
+            started_at: "2026-06-30T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Live".into()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+    }
+
+    /// A SEALED-NOT-UNLOCKED meeting: a locked folder + a blanked-plaintext note row (the at-rest
+    /// shape). With nothing in the `unlocked` set this meeting is invisible to `meeting_is_visible`.
+    fn seed_sealed_meeting(db: &Db, id: &str, folder: &str) {
+        db.insert_folder(&Folder {
+            id: folder.into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-30T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_meeting(&Meeting {
+            id: id.into(),
+            started_at: "2026-06-30T08:00:00Z".into(),
+            ended_at: None,
+            title: Some("Sealed".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: id.into(),
+            provider_id: "claude_code".into(),
+            markdown: String::new(), // blanked plaintext + a folder ⇒ sealed-not-unlocked for the gate.
+            created_at: "2026-06-30T08:05:00Z".into(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_note_folder(id, Some(folder)).unwrap();
+    }
+
+    /// With `allow_writes: true`, the in-meeting executor ADVERTISES the write tools to the model
+    /// (`save_note` + `create_reminder`) — the catalog the agent reads. With `allow_writes: false`
+    /// (the MCP/read surface) they are HIDDEN. RED-able: drop the `_ if s.write => allow_writes` filter
+    /// and the read surface would leak the write tools.
+    #[test]
+    fn write_tools_advertised_only_when_allow_writes() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+
+        let writeable = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: true,
+        };
+        let names: Vec<&str> = writeable.specs().iter().map(|s| s.name).collect();
+        assert!(names.contains(&"save_note"), "the write loop must advertise save_note: {names:?}");
+        assert!(
+            names.contains(&"create_reminder"),
+            "the write loop must advertise create_reminder: {names:?}"
+        );
+
+        let readonly = GatedToolExecutor { allow_writes: false, ..writeable };
+        let ro_names: Vec<&str> = readonly.specs().iter().map(|s| s.name).collect();
+        assert!(
+            !ro_names.iter().any(|n| *n == "save_note" || *n == "create_reminder"),
+            "a read-only executor must NOT advertise write tools: {ro_names:?}"
+        );
+    }
+
+    /// The `save_note` write tool APPENDS to the meeting's durable `manual_notes` buffer (Feature A's
+    /// sealed-and-restored, folds-into-the-note home — NOT the orphaned `notes_asides`). Asserts the
+    /// column GROWS with each appended note (newline-separated, prior content preserved).
+    #[test]
+    fn save_note_appends_to_manual_notes() {
+        let db = tmp_db();
+        seed_live_meeting(&db, "live1");
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: true,
+        };
+
+        // First note SEEDS the empty buffer.
+        let out = exec
+            .run("save_note", &serde_json::json!({ "text": "send the deck to Anna" }))
+            .unwrap();
+        assert!(out.to_lowercase().contains("saved"), "confirmation text: {out}");
+        assert_eq!(db.get_manual_notes("live1").unwrap(), "send the deck to Anna");
+
+        // A second note APPENDS (newline-separated) — the buffer GROWS, the first note is preserved.
+        exec.run("save_note", &serde_json::json!({ "text": "follow up with QA on Friday" }))
+            .unwrap();
+        assert_eq!(
+            db.get_manual_notes("live1").unwrap(),
+            "send the deck to Anna\nfollow up with QA on Friday",
+            "save_note must APPEND to manual_notes, never overwrite the prior buffer"
+        );
+
+        // The orphaned notes_asides store is NOT touched (the agent writes the durable buffer).
+        assert!(
+            db.list_note_asides("live1").unwrap().is_empty(),
+            "save_note must write manual_notes, NOT notes_asides"
+        );
+    }
+
+    /// GATE: `save_note` REFUSES a write to a SEALED-not-unlocked meeting (`AppError::Locked`) and
+    /// writes NOTHING. RED-able: drop the `meeting_is_visible` check in `save_note` and a locked
+    /// meeting's buffer would be written (resurrecting plaintext behind a lock).
+    #[test]
+    fn save_note_refused_for_sealed_meeting() {
+        let db = tmp_db();
+        seed_sealed_meeting(&db, "sealed1", "fsec");
+        let nothing = HashSet::new();
+        // Seed self-check: the sealed meeting must be gated before we prove the refusal.
+        assert!(
+            !db.meeting_is_visible("sealed1", &nothing).unwrap(),
+            "seed fixture: the sealed meeting must be sealed-not-unlocked"
+        );
+
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new()); // nothing unlocked ⇒ sealed1 invisible.
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "sealed1",
+            app: None,
+            allow_writes: true,
+        };
+        let res = exec.run("save_note", &serde_json::json!({ "text": "secret note" }));
+        assert!(
+            matches!(res, Err(AppError::Locked(_))),
+            "a write to a sealed-not-unlocked meeting must be refused with AppError::Locked: {res:?}"
+        );
+        // And NOTHING was written (the buffer stays blanked/empty).
+        assert_eq!(
+            db.get_manual_notes("sealed1").unwrap(),
+            "",
+            "no plaintext may be written behind a lock"
+        );
+    }
+
+    /// GATE: `save_note` with NO active recording (empty `meeting_id`) refuses — there is nothing to
+    /// attach a note to, and we never write to an empty/unknown meeting.
+    #[test]
+    fn save_note_refused_without_active_recording() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "", // no active recording
+            app: None,
+            allow_writes: true,
+        };
+        let res = exec.run("save_note", &serde_json::json!({ "text": "orphan note" }));
+        assert!(
+            matches!(res, Err(AppError::Locked(_))),
+            "no active recording ⇒ save_note refuses: {res:?}"
+        );
+    }
+
+    /// ALLOWLIST: a read-only executor that does NOT advertise the write tools must REFUSE to run them
+    /// even if a (mis-)caller names one directly — the `run` allowlist check fails closed.
+    #[test]
+    fn read_only_executor_refuses_to_run_write_tools() {
+        let db = tmp_db();
+        seed_live_meeting(&db, "live1");
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: false, // read-only — write tools not advertised
+        };
+        let res = exec.run("save_note", &serde_json::json!({ "text": "should not run" }));
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "an un-advertised write tool must be refused by the allowlist: {res:?}"
+        );
+        // Nothing was written.
+        assert_eq!(db.get_manual_notes("live1").unwrap(), "");
     }
 }
