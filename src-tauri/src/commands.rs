@@ -5257,7 +5257,7 @@ mod lifecycle_tests {
     /// re-export, keeping the test filesystem-quiet).
     fn build_state(tag: &str) -> AppState {
         ensure_dev_kek();
-        let db = Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap();
+        let db = Arc::new(Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap());
         AppState {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
