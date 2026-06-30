@@ -1,33 +1,39 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
   OnInit,
+  afterNextRender,
   computed,
+  effect,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { AssistantStore } from "../../core/assistant.store";
-import type { AssistantInteraction } from "../../core/assistant.store";
+import type { ChatMessage } from "../../core/assistant.store";
 import { MarkdownComponent } from "../../shared/markdown.component";
 import { AssistantSourcesComponent } from "../../shared/assistant-sources.component";
 import { AiOrbComponent } from "./ai-orb.component";
 
 /**
- * The live "assistant" card on the record surface — the home of the in-meeting
- * BRAIN. Subscribes (once, via AssistantStore.init()) to the wake + result + live
- * tool-trace streams and renders a newest-first list of interactions: a pending
- * row (🎙 spoken / ⌨ typed) that shows the brain's LIVE tool trace as it works
- * ("Searching notes… ✓", "Checking the web…"), resolved to a SANITIZED-markdown
- * answer (`app-markdown`) + a deduped "🔗 Źródła" block (`app-assistant-sources`).
+ * The unified in-meeting assistant surface — the single home of the in-meeting
+ * BRAIN. One chronological conversation thread fed by BOTH voice and text, with
+ * multi-turn memory, cleared on each new recording (by the record screen).
  *
- * It also carries the TEXT COMPOSER at its foot — the twin of the voice trigger:
- * the user can TYPE a question that funnels through the exact same gated brain
- * (`IpcService.askAssistantText` → `run_assistant_turn`), so speech and text share
- * one timeline, one orb, one trace.
+ * Subscribes (once, via {@link AssistantStore.init}) to the wake + result + live
+ * tool-trace streams. Renders a scrollable thread (oldest → newest) of user /
+ * assistant bubbles, each assistant bubble showing its LIVE tool trace as the
+ * brain works ("Searching notes… ✓", "Checking the web…") then a SANITIZED
+ * markdown answer (`app-markdown`) + a deduped "🔗 Źródła" block
+ * (`app-assistant-sources`). The INPUT is pinned at the foot: the voice mic
+ * (askNow/endAsk) + the text composer (send) side by side — speech and text
+ * share one thread, one orb, one trace.
  *
- * The card is in-flow on the record page (not a floating overlay), so it uses the
- * frosted `.card`. If it were ever floated OVER content it would have to switch to
- * `var(--surface-overlay)` (trap T3) — it is intentionally NOT floated.
+ * The surface is IN-FLOW on the record page (not a floating overlay), so the
+ * frosted `.card` is correct here (trap T3 applies only to floating popovers —
+ * this is intentionally NOT floated, unlike the deleted slide-out chat panel).
  */
 @Component({
   selector: "app-assistant-actions",
@@ -45,87 +51,90 @@ import { AiOrbComponent } from "./ai-orb.component";
         </span>
       </div>
 
-      @if (store.hasAny()) {
-        <ul class="actions-list">
-          @for (a of store.interactions(); track a.id) {
-            <li class="action-row" [class.is-pending]="a.status === 'pending'">
-              <div class="action-heard">
-                <span class="heard-ico" aria-hidden="true">{{
-                  a.source === "text" ? "⌨" : "🎙"
-                }}</span>
-                @if (a.status === "nothing_heard") {
-                  <span class="heard-text heard-nudge">{{ statusLabel(a) }}</span>
-                } @else {
-                  <span class="heard-text">
-                    {{ a.source === "text" ? "you asked:" : "usłyszano:" }}
-                    <strong>{{ a.command || "…" }}</strong>
-                  </span>
-                  @if (a.status !== "pending") {
-                    <span class="pill" [class]="statusPillClass(a)">
-                      <span class="pill-dot"></span>
-                      {{ statusLabel(a) }}
-                    </span>
-                  }
-                }
-              </div>
-
-              @if (a.trace.length > 0) {
-                <div class="trace" role="status" aria-label="Tool use">
-                  @for (t of a.trace; track t.id) {
-                    <span
-                      class="trace-chip"
-                      [class.is-running]="t.state === 'running'"
-                      [class.is-web]="t.tool === 'web_search'"
-                      [class.is-failed]="!t.ok"
-                    >
-                      <span class="trace-ico" aria-hidden="true">
-                        @if (t.state === "running") {
-                          <span class="trace-spin"></span>
-                        } @else if (!t.ok) {
-                          ⚠
-                        } @else {
-                          ✓
+      <div class="thread" #thread>
+        @if (!store.hasMessages()) {
+          <p class="thread-empty text-muted">
+            Ask anything about this meeting or your past notes. Follow-ups
+            remember the conversation.
+          </p>
+        }
+        @for (m of store.messages(); track m.id) {
+          @if (m.role === "user") {
+            <div class="msg msg-user">
+              <div class="bubble bubble-user">{{ m.text }}</div>
+            </div>
+          } @else {
+            <div class="msg msg-bot">
+              <div class="bubble bubble-bot">
+                @if (m.trace.length > 0) {
+                  <div class="trace" role="status" aria-label="Tool use">
+                    @for (t of m.trace; track t.id) {
+                      <span
+                        class="trace-chip"
+                        [class.is-running]="t.state === 'running'"
+                        [class.is-web]="t.tool === 'web_search'"
+                        [class.is-failed]="!t.ok"
+                      >
+                        <span class="trace-ico" aria-hidden="true">
+                          @if (t.state === "running") {
+                            <span class="trace-spin"></span>
+                          } @else if (!t.ok) {
+                            ⚠
+                          } @else {
+                            ✓
+                          }
+                        </span>
+                        {{ toolLabel(t.tool) }}
+                        @if (t.state === "done" && t.count) {
+                          <span class="trace-count">{{ t.count }}</span>
                         }
                       </span>
-                      {{ toolLabel(t.tool) }}
-                      @if (t.state === "done" && t.count) {
-                        <span class="trace-count">{{ t.count }}</span>
-                      }
-                    </span>
-                  }
-                </div>
-              }
-
-              @if (a.status === "pending") {
-                @if (a.trace.length === 0) {
-                  <div class="action-pending" role="status">
-                    <span class="dots" aria-hidden="true">
-                      <span></span><span></span><span></span>
-                    </span>
-                    <span class="text-muted">Thinking…</span>
+                    }
                   </div>
                 }
-              } @else if (a.status === "nothing_heard") {
-                <!-- the nudge label above is the whole message; no summary row -->
-              } @else {
-                @if (a.summary) {
-                  <app-markdown class="action-summary" [markdown]="a.summary" compact />
+                @if (m.status === "pending" && m.trace.length === 0) {
+                  <span class="dots" aria-hidden="true">
+                    <span></span><span></span><span></span>
+                  </span>
+                } @else if (m.text) {
+                  <app-markdown [markdown]="m.text" compact />
+                } @else if (m.status !== "pending") {
+                  <span class="bubble-note">{{ emptyNote(m.status) }}</span>
                 }
-                @if (a.citations.length > 0) {
-                  <app-assistant-sources [citations]="a.citations" />
+                @if (m.citations.length > 0) {
+                  <app-assistant-sources [citations]="m.citations" />
                 }
-              }
-            </li>
+              </div>
+            </div>
           }
-        </ul>
-      } @else {
-        <p class="assistant-empty text-muted">
-          Ask the assistant a grounded question — type below, or say your wake
-          phrase. Answers and their sources appear here.
-        </p>
-      }
+        }
+      </div>
 
       <form class="composer" (submit)="submit($event)">
+        <button
+          type="button"
+          class="mic-btn"
+          [class.is-listening]="store.listening()"
+          [disabled]="store.processing()"
+          (click)="toggleAsk()"
+          [attr.aria-pressed]="store.listening()"
+          [attr.aria-label]="
+            store.listening() ? 'Stop listening and ask' : 'Ask by voice'
+          "
+          [title]="store.listening() ? 'Stop & ask' : 'Ask by voice'"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path
+              d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+              fill="currentColor"
+            />
+            <path
+              d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+              fill="currentColor"
+              opacity="0.85"
+            />
+          </svg>
+        </button>
         <textarea
           class="composer-input"
           rows="1"
@@ -189,57 +198,56 @@ import { AiOrbComponent } from "./ai-orb.component";
       .assistant-live {
         margin-left: auto;
       }
-      .assistant-empty {
+
+      /* ── The scrollable conversation thread (oldest → newest) ─────────── */
+      .thread {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+        max-height: 420px;
+        overflow-y: auto;
+        padding-right: var(--space-1);
+      }
+      .thread-empty {
         margin: 0;
         font-size: 0.875rem;
         line-height: 1.55;
       }
-
-      .actions-list {
-        list-style: none;
-        margin: 0;
-        padding: 0;
+      .msg {
         display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
       }
-      .action-row {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
+      .msg-user {
+        justify-content: flex-end;
+      }
+      .msg-bot {
+        justify-content: flex-start;
+      }
+      .bubble {
+        max-width: 86%;
         padding: var(--space-3);
-        border-radius: var(--radius-md);
+        border-radius: var(--radius-lg);
+        font-size: 0.9rem;
+        line-height: 1.5;
+        animation: rise 220ms var(--transition) both;
+      }
+      .bubble-user {
+        background: var(--accent-gradient);
+        color: var(--text-on-accent);
+        border-bottom-right-radius: var(--radius-sm);
+        white-space: pre-wrap;
+      }
+      .bubble-bot {
         background: var(--surface-input);
         border: 1px solid var(--border-subtle);
-        animation: rise 260ms var(--transition) both;
-      }
-      .action-row.is-pending {
-        border-color: var(--accent-soft);
-      }
-      .action-heard {
+        color: var(--text-primary);
+        border-bottom-left-radius: var(--radius-sm);
         display: flex;
-        align-items: center;
+        flex-direction: column;
         gap: var(--space-2);
-        flex-wrap: wrap;
       }
-      .heard-ico {
-        font-size: 0.85rem;
-        line-height: 1;
-      }
-      .heard-text {
+      .bubble-note {
         color: var(--text-secondary);
         font-size: 0.875rem;
-      }
-      .heard-text strong {
-        color: var(--text-primary);
-        font-weight: 600;
-      }
-      .heard-nudge {
-        color: var(--text-primary);
-        font-weight: 550;
-      }
-      .action-heard .pill {
-        margin-left: auto;
       }
 
       /* ── live tool trace ──────────────────────────────────────────── */
@@ -302,12 +310,6 @@ import { AiOrbComponent } from "./ai-orb.component";
         }
       }
 
-      .action-pending {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        font-size: 0.85rem;
-      }
       .dots {
         display: inline-flex;
         gap: 3px;
@@ -336,16 +338,60 @@ import { AiOrbComponent } from "./ai-orb.component";
         }
       }
 
-      .action-summary {
-        display: block;
-        font-size: 0.9rem;
-      }
-
-      /* ── text composer ────────────────────────────────────────────── */
+      /* ── input row: voice mic + text composer, pinned at the foot ─────── */
       .composer {
         display: flex;
         align-items: flex-end;
         gap: var(--space-2);
+      }
+      .mic-btn {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        height: 40px;
+        border: 1px solid var(--accent-ring);
+        border-radius: 50%;
+        color: var(--accent-hover);
+        background: var(--accent-soft);
+        cursor: pointer;
+        transition:
+          transform var(--transition-fast),
+          background var(--transition),
+          box-shadow var(--transition),
+          color var(--transition);
+      }
+      .mic-btn:hover:not(:disabled) {
+        background: var(--accent);
+        color: #fff;
+        transform: scale(1.05);
+      }
+      .mic-btn:active:not(:disabled) {
+        transform: scale(0.96);
+      }
+      .mic-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .mic-btn.is-listening {
+        background: var(--accent-gradient);
+        color: #fff;
+        border-color: transparent;
+        animation: mic-pulse 1.5s ease-in-out infinite;
+      }
+      .mic-btn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      @keyframes mic-pulse {
+        0%,
+        100% {
+          box-shadow: 0 0 0 0 var(--accent-ring);
+        }
+        50% {
+          box-shadow: 0 0 0 8px rgba(110, 118, 255, 0);
+        }
       }
       .composer-input {
         flex: 1;
@@ -377,12 +423,13 @@ import { AiOrbComponent } from "./ai-orb.component";
       }
 
       @media (prefers-reduced-motion: reduce) {
-        .action-row {
+        .bubble {
           animation: none;
         }
         .dots span,
         .trace-spin,
-        .composer-spin {
+        .composer-spin,
+        .mic-btn.is-listening {
           animation: none;
         }
         .dots span {
@@ -394,6 +441,8 @@ import { AiOrbComponent } from "./ai-orb.component";
 })
 export class AssistantActionsComponent implements OnInit {
   protected readonly store = inject(AssistantStore);
+  private readonly injector = inject(Injector);
+  private readonly thread = viewChild<ElementRef<HTMLElement>>("thread");
 
   /** The text composer draft (signal-backed — zoneless). */
   protected readonly draft = signal("");
@@ -403,6 +452,22 @@ export class AssistantActionsComponent implements OnInit {
     () => !this.store.processing() && this.draft().trim().length > 0,
   );
 
+  constructor() {
+    // Auto-scroll the thread to the newest bubble whenever the conversation
+    // changes. Tracks the messages signal in the effect, schedules the DOM work
+    // via afterNextRender (zoneless-safe; no signal writes → no NG0600).
+    effect(() => {
+      this.store.messages();
+      afterNextRender(
+        () => {
+          const el = this.thread()?.nativeElement;
+          if (el) el.scrollTop = el.scrollHeight;
+        },
+        { injector: this.injector },
+      );
+    });
+  }
+
   ngOnInit(): void {
     // Subscribe once to the wake/result/tool streams (idempotent). The store is a
     // root singleton, so its subscriptions outlive this component — we don't
@@ -410,14 +475,14 @@ export class AssistantActionsComponent implements OnInit {
     void this.store.init();
   }
 
-  /** Submit the typed question through the shared gated brain. */
+  /** Submit the typed question through the shared multi-turn brain (memory). */
   protected submit(event: Event): void {
     event.preventDefault();
     const text = this.draft().trim();
     if (!text || this.store.processing()) return;
     this.draft.set("");
-    void this.store.askText(text).catch(() => {
-      /* the store surfaces the error on the optimistic row */
+    void this.store.send(text).catch(() => {
+      /* the store surfaces the error on the assistant bubble */
     });
   }
 
@@ -426,6 +491,23 @@ export class AssistantActionsComponent implements OnInit {
     const ke = event as KeyboardEvent;
     if (ke.shiftKey) return; // allow a newline
     this.submit(event);
+  }
+
+  /**
+   * CLICK-TO-STOP voice trigger: while listening, stop so the full utterance is
+   * dispatched; otherwise open the listener. Swallow rejections — the store
+   * resets its listening/processing/in-flight state on error.
+   */
+  protected toggleAsk(): void {
+    if (this.store.listening()) {
+      void this.store.endAsk().catch(() => {
+        /* stop failed — store cleared processing/in-flight */
+      });
+    } else {
+      void this.store.askNow().catch(() => {
+        /* listener unavailable — store resets the listening/in-flight state */
+      });
+    }
   }
 
   /** Human label for a tool-trace chip. */
@@ -452,40 +534,21 @@ export class AssistantActionsComponent implements OnInit {
     }
   }
 
-  /** Map a resolved status to a global `.pill` variant. */
-  protected statusPillClass(a: AssistantInteraction): string {
-    switch (a.status) {
-      case "ok":
-        return "is-success";
-      case "needs_consent":
-        return "is-warning";
-      case "unavailable":
-      case "unrecognized":
-        return "is-accent";
-      case "nothing_heard":
-        return "";
-      default:
-        return "is-danger";
-    }
-  }
-
-  /** Short human label for the status pill / nudge line. */
-  protected statusLabel(a: AssistantInteraction): string {
-    switch (a.status) {
-      case "ok":
-        return "Done";
-      case "needs_consent":
-        return "Needs consent";
-      case "unavailable":
-        return "Unavailable";
-      case "unrecognized":
-        return "Not recognized";
+  /** Short message for a resolved assistant bubble that carries no answer text. */
+  protected emptyNote(status: ChatMessage["status"]): string {
+    switch (status) {
       case "nothing_heard":
         return "Nie usłyszałem — spróbuj jeszcze raz";
+      case "needs_consent":
+        return "Needs consent to answer.";
+      case "unavailable":
+        return "That isn't available yet.";
+      case "unrecognized":
+        return "I didn't catch a question there.";
       case "error":
-        return "Error";
+        return "Something went wrong.";
       default:
-        return "";
+        return "(no answer)";
     }
   }
 }
