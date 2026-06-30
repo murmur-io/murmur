@@ -249,6 +249,15 @@ export interface VoiceActionResultPayload {
   /** What the user actually said (their OWN dictation). Empty when nothing was heard. */
   command: string;
   citations: string[];
+  /**
+   * The agent's PROPOSED note draft, or `null`. NON-null ONLY when the model
+   * decided the user asked it to MAKE/SAVE a note (it called the `propose_note`
+   * tool) — for a plain answer/question it is `null`. The FE shows the quiet
+   * "✓ Add to notes" affordance ONLY when this is non-null, and on accept appends
+   * THIS draft (not the whole reply) to the user's notes. The agent never
+   * auto-writes; accept is the only path content enters the notes.
+   */
+  proposedNote: string | null;
 }
 
 /**

@@ -56,10 +56,13 @@ export interface ToolTraceStep {
  * One turn inside a note's `@brain` THREAD (Slack-style). A thread is a small
  * multi-turn conversation anchored UNDER a note line:
  *   - `user`  — the user's question (the `@brain` marker stripped), or a typed
- *               follow-up inside the thread (no marker needed there);
- *   - `agent` — the brain's reply, with its live tool-trace + citations. Every
- *               agent turn offers "✓ Add to notes" (the agent PROPOSES; the user
- *               ACCEPTS — the only path content enters the main notes).
+ *               follow-up inside the thread (no marker needed there). The FIRST
+ *               user turn IS the anchor question — the surface renders it ONCE on
+ *               the anchor line and skips it inside the thread (no duplication);
+ *   - `agent` — the brain's reply, with its live tool-trace + citations. An agent
+ *               turn offers "✓ Add to notes" ONLY when it carries a `proposedNote`
+ *               (the model decided the user asked it to MAKE a note); a plain
+ *               answer has `proposedNote: null` and NO add affordance.
  */
 export interface ThreadTurn {
   /** Stable id for `@for` tracking (never key on $index). */
@@ -73,8 +76,21 @@ export interface ThreadTurn {
   trace: ToolTraceStep[];
   /** Agent only: grounding citations (vault `[[Title]]` + "via web"). */
   citations: AssistantCitation[];
-  /** Agent only: true once the user has accepted this turn into the main notes. */
+  /**
+   * Agent only: the proposed NOTE draft, or `null`. NON-null ONLY when the model
+   * called `propose_note` (the user asked it to make/save a note). Drives the
+   * "✓ Add to notes" affordance: shown ONLY when this is non-null; on accept THIS
+   * draft (not the whole reply) is appended to the notes.
+   */
+  proposedNote: string | null;
+  /** Agent only: true once the user has ACCEPTED this turn's draft into the main notes. */
   accepted: boolean;
+  /**
+   * Agent only: true once the user DISMISSED this turn's proposal. Distinct from
+   * `accepted` so the surface shows "Dismissed" (not "✓ Added to notes") — both
+   * paths clear the affordance, but only a real accept committed content.
+   */
+  dismissed: boolean;
 }
 
 /**
@@ -135,9 +151,11 @@ export function parseCitations(raw: string[]): AssistantCitation[] {
  * The in-meeting NOTES + `@brain` THREADS store (Slack-style; the agent PROPOSES,
  * the user ACCEPTS). The MAIN flow is the user's notes — a vertical list of
  * {@link NoteItem} lines persisted to `manual_notes`. An `@brain` line opens an
- * anchored, multi-turn {@link ThreadTurn} thread under that note; every agent
- * reply offers "✓ Add to notes" — the ONLY path content enters the main notes
- * (the agent never auto-writes; the backend in-meeting loop is READ-ONLY).
+ * anchored, multi-turn {@link ThreadTurn} thread under that note; an agent reply
+ * that carries a `proposedNote` (the model decided the user asked it to MAKE a
+ * note) offers "✓ Add to notes" — the ONLY path content enters the main notes
+ * (the agent never auto-writes; the backend in-meeting loop is READ-ONLY). A
+ * plain answer has no proposal and no add affordance — it reads as conversation.
  *
  * Subscribes ONCE (the RecorderStore.init() pattern) to the wake + result +
  * listening + processing + BOTH tool-trace streams and lands every payload in a
@@ -418,7 +436,9 @@ export class MeetingConversationStore {
       status: "ok",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     const agentTurn: ThreadTurn = {
       id: this.nextTurnId++,
@@ -427,7 +447,9 @@ export class MeetingConversationStore {
       status: "pending",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     this._notes.update((ns) => [
       ...ns,
@@ -440,6 +462,65 @@ export class MeetingConversationStore {
         persisted: false,
       },
     ]);
+    await this.runAgentTurn(noteId, agentTurn.id);
+  }
+
+  /**
+   * "✨ ask brain" on an EXISTING plain note: retroactively open a thread on a
+   * note that has none yet, seeding the agent from the NOTE'S OWN TEXT as context.
+   * The note line STAYS the user's note (NOT converted/deleted, still `persisted`)
+   * — the thread just hangs under it like a `@brain` thread.
+   *
+   * The seeded first user turn carries the note text as the question so the agent
+   * can ANSWER about it or PROPOSE a note from it; it ships through the same
+   * `runAgentTurn` / `ask_assistant_chat` path as `@brain`, so the tool-trace,
+   * `proposedNote`-gated Add-to-notes, and follow-ups all behave identically. A
+   * no-op for a missing note, a note that ALREADY has a thread, or blank text.
+   */
+  async askBrainOnNote(noteId: number): Promise<void> {
+    const note = this._notes().find((n) => n.id === noteId);
+    if (!note || note.thread) return; // only notes WITHOUT a thread yet
+    const subject = note.text.trim();
+    if (!subject) return;
+    const userTurn: ThreadTurn = {
+      id: this.nextTurnId++,
+      role: "user",
+      // Seed the agent from the note's own words (this becomes the thread's first
+      // user turn → shipped as the question). It's sliced from the rendered thread
+      // by visibleTurns() because the note line already shows the text above.
+      text: subject,
+      status: "ok",
+      trace: [],
+      citations: [],
+      proposedNote: null,
+      accepted: false,
+      dismissed: false,
+    };
+    const agentTurn: ThreadTurn = {
+      id: this.nextTurnId++,
+      role: "agent",
+      text: "",
+      status: "pending",
+      trace: [],
+      citations: [],
+      proposedNote: null,
+      accepted: false,
+      dismissed: false,
+    };
+    this._notes.update((ns) =>
+      ns.map((n) =>
+        n.id === noteId
+          ? {
+              ...n,
+              // The note stays exactly as it is (text + persisted unchanged); we
+              // only attach the thread + open it.
+              thread: [userTurn, agentTurn],
+              threadOpen: true,
+              threadPending: true,
+            }
+          : n,
+      ),
+    );
     await this.runAgentTurn(noteId, agentTurn.id);
   }
 
@@ -461,7 +542,9 @@ export class MeetingConversationStore {
       status: "ok",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     const agentTurn: ThreadTurn = {
       id: this.nextTurnId++,
@@ -470,7 +553,9 @@ export class MeetingConversationStore {
       status: "pending",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     this._notes.update((ns) =>
       ns.map((n) =>
@@ -519,17 +604,23 @@ export class MeetingConversationStore {
         status: reply.status,
         text: reply.summary || "(no answer)",
         citations: parseCitations(reply.citations),
+        proposedNote: reply.proposedNote,
       });
     } catch {
       this.resolveTurn(noteId, agentTurnId, {
         status: "error",
         text: "Couldn't reach the assistant.",
         citations: [],
+        proposedNote: null,
       });
     }
   }
 
-  /** Resolve a pending agent turn + clear its thread's pending flag (immutable). */
+  /**
+   * Resolve a pending agent turn + clear its thread's pending flag (immutable).
+   * Captures `proposedNote` — the agent's note draft (or null) — which drives the
+   * "✓ Add to notes" affordance ONLY when non-null.
+   */
   private resolveTurn(
     noteId: number,
     agentTurnId: number,
@@ -537,6 +628,7 @@ export class MeetingConversationStore {
       status: VoiceActionStatus;
       text: string;
       citations: AssistantCitation[];
+      proposedNote: string | null;
     },
   ): void {
     this._notes.update((ns) =>
@@ -547,7 +639,13 @@ export class MeetingConversationStore {
           threadPending: false,
           thread: n.thread.map((turn) =>
             turn.id === agentTurnId
-              ? { ...turn, status: patch.status, text: patch.text, citations: patch.citations }
+              ? {
+                  ...turn,
+                  status: patch.status,
+                  text: patch.text,
+                  citations: patch.citations,
+                  proposedNote: patch.proposedNote,
+                }
               : turn,
           ),
         };
@@ -565,17 +663,19 @@ export class MeetingConversationStore {
   }
 
   /**
-   * ACCEPT an agent turn into the MAIN notes (the agent PROPOSES; this is the
-   * user's accept — the only path content enters the notes). Append a NEW plain,
-   * PERSISTED note line carrying the agent's text + mark the source turn accepted
-   * (so its "✓ Add to notes" affordance flips to "Added"), then persist. A no-op
-   * for an already-accepted / empty turn.
+   * ACCEPT an agent turn's PROPOSED NOTE into the MAIN notes (the agent PROPOSES;
+   * this is the user's accept — the only path content enters the notes). Append a
+   * NEW plain, PERSISTED note line carrying the turn's `proposedNote` DRAFT (NOT
+   * the whole reply) + mark the source turn accepted (so its "✓ Add to notes"
+   * affordance flips to "Added"), then persist. A no-op for an already-accepted
+   * turn or a turn with NO proposed note (a plain answer — nothing to add).
    */
   acceptIntoNotes(noteId: number, agentTurnId: number): void {
     const note = this._notes().find((n) => n.id === noteId);
     const turn = note?.thread?.find((t) => t.id === agentTurnId);
     if (!turn || turn.role !== "agent" || turn.accepted) return;
-    const text = turn.text.trim();
+    // Append the PROPOSED note draft, never the whole conversational reply.
+    const text = (turn.proposedNote ?? "").trim();
     if (!text) return;
     this._notes.update((ns) => {
       const marked = ns.map((n) => {
@@ -603,9 +703,12 @@ export class MeetingConversationStore {
   }
 
   /**
-   * DISMISS an agent turn (the propose-accept "reject"). The reply is discarded:
-   * the turn's text is blanked to a quiet placeholder + marked accepted so the
-   * "✓ Add to notes" affordance disappears. Nothing enters the notes.
+   * DISMISS an agent turn's note PROPOSAL (the propose-accept "reject"). Only the
+   * "✓ Add to notes" affordance is dismissed — the reply text STAYS in the thread
+   * (it's still a useful answer); we just drop the proposal (`proposedNote: null`)
+   * and mark it `dismissed` so the affordance disappears WITHOUT claiming a save.
+   * `dismissed` (not `accepted`) is what makes the surface show "Dismissed" rather
+   * than "✓ Added to notes". Nothing enters the notes.
    */
   dismissTurn(noteId: number, agentTurnId: number): void {
     this._notes.update((ns) =>
@@ -615,7 +718,7 @@ export class MeetingConversationStore {
           ...n,
           thread: n.thread.map((t) =>
             t.id === agentTurnId
-              ? { ...t, accepted: true, citations: [], text: "" }
+              ? { ...t, dismissed: true, proposedNote: null }
               : t,
           ),
         };
@@ -641,7 +744,9 @@ export class MeetingConversationStore {
       status: "ok",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     const agentTurn: ThreadTurn = {
       id: this.nextTurnId++,
@@ -650,7 +755,9 @@ export class MeetingConversationStore {
       status: "pending",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     this.voiceTargetNoteId = noteId;
     this._notes.update((ns) => [
@@ -674,6 +781,7 @@ export class MeetingConversationStore {
         status: "error",
         text: "Couldn't start the listener.",
         citations: [],
+        proposedNote: null,
       });
       throw e;
     }
@@ -710,7 +818,9 @@ export class MeetingConversationStore {
       status: "ok",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     const agentTurn: ThreadTurn = {
       id: this.nextTurnId++,
@@ -719,7 +829,9 @@ export class MeetingConversationStore {
       status: "pending",
       trace: [],
       citations: [],
+      proposedNote: null,
       accepted: false,
+      dismissed: false,
     };
     this.voiceTargetNoteId = noteId;
     this._notes.update((ns) => [
@@ -837,7 +949,9 @@ export class MeetingConversationStore {
         status: "ok",
         trace: [],
         citations: [],
+        proposedNote: null,
         accepted: false,
+        dismissed: false,
       };
       const agentTurn: ThreadTurn = {
         id: this.nextTurnId++,
@@ -846,7 +960,9 @@ export class MeetingConversationStore {
         status: p.status,
         trace: [],
         citations: parseCitations(p.citations),
+        proposedNote: p.proposedNote,
         accepted: false,
+        dismissed: false,
       };
       // Only include the user turn when something was actually heard (a manual ask
       // that caught nothing must not leave an empty user bubble).
@@ -879,6 +995,7 @@ export class MeetingConversationStore {
               status: p.status,
               text: p.summary,
               citations: parseCitations(p.citations),
+              proposedNote: p.proposedNote,
             };
             // Backfill the heard command onto the preceding empty user turn.
             const prev = thread[i - 1];
