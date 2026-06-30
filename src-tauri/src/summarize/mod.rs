@@ -59,16 +59,6 @@ pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
     }
 }
 
-/// True iff `id` names a provider that sends meeting content OFF-DEVICE to a cloud LLM.
-///
-/// `claude_code` shells out to the local `claude` CLI, but that CLI is a *thin client* for
-/// Anthropic's hosted models — the transcript is uploaded to the cloud just like the direct
-/// `anthropic` HTTP provider. Both are therefore "cloud" and MUST go through the redaction
-/// firewall + consent gate. `ollama` runs the model locally (no egress) and is exempt.
-fn is_cloud(id: &str) -> bool {
-    matches!(id, PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC)
-}
-
 /// Build a provider by id, wiring config + secrets. Unknown id → `AppError::InvalidArg`.
 ///
 /// Egress policy (E6/E7/E10): every cloud provider — `claude_code` AND `anthropic` — is wrapped
@@ -133,10 +123,11 @@ pub fn make_provider(
         }
     };
 
-    // E6/E7 — redaction firewall on BOTH cloud providers: scrub emails/cards/phones before they
+    // E6/E7 — redaction firewall on all cloud providers: scrub emails/cards/phones before they
     // reach the cloud (restored in the reply). `claude_code` shells out to the local `claude`
     // CLI, but that CLI uploads to Anthropic's cloud, so it needs the firewall exactly as the
-    // direct HTTP `anthropic` provider does. ollama (local) already returned above, unwrapped.
+    // direct HTTP `anthropic` provider does. A LOCAL ollama already returned above, unwrapped;
+    // a REMOTE ollama falls through here and gets the same firewall treatment.
     //
     // Phase D — the name layer is now the ACTIVE on-device redactor: when the NER model is present,
     // `active_name_redactor()` returns the real DebertaNameRedactor (PERSON names → ⟪NAME_n⟫ before
@@ -152,6 +143,9 @@ pub fn make_provider(
 }
 
 /// All three provider instances (for availability fan-out in the Settings UI).
+///
+/// Availability-only: intentionally skips the consent gate and `RedactingProvider` wrap.
+/// MUST NOT be used to summarize content — use [`make_provider`] for that.
 ///
 /// Best-effort: a failure to read the Anthropic key from the Keychain degrades to a
 /// keyless `AnthropicProvider` (which then reports `Unavailable`) rather than failing the
@@ -189,22 +183,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_cloud_classification() {
-        assert!(is_cloud(PROVIDER_CLAUDE_CODE));
-        assert!(is_cloud(PROVIDER_ANTHROPIC));
-        assert!(!is_cloud(PROVIDER_OLLAMA));
-        assert!(!is_cloud("something-else"));
-    }
-
-    #[test]
     fn egress_is_cloud_classification() {
-        // claude_code and anthropic are always cloud.
+        // claude_code and anthropic are always cloud regardless of config.
         let cfg = AppConfig::default();
         assert!(egress_is_cloud(PROVIDER_CLAUDE_CODE, &cfg));
         assert!(egress_is_cloud(PROVIDER_ANTHROPIC, &cfg));
 
-        // ollama with default localhost URL is NOT cloud.
-        assert!(!egress_is_cloud(PROVIDER_OLLAMA, &cfg));
+        // ollama with default loopback URL is NOT cloud.
+        let mut local_cfg = AppConfig::default();
+        local_cfg.ollama_base_url = "http://localhost:11434".into();
+        assert!(!egress_is_cloud(PROVIDER_OLLAMA, &local_cfg));
 
         // ollama with a remote URL IS cloud.
         let mut remote_cfg = AppConfig::default();
@@ -262,7 +250,8 @@ mod tests {
 
     #[test]
     fn ollama_is_not_consent_gated() {
-        // ollama is local-only: it builds even with consent OFF (the default).
+        // ollama with a LOOPBACK url builds without consent (the default url is localhost).
+        // A remote ollama_base_url is covered by remote_ollama_requires_consent.
         let cfg = AppConfig::default();
         assert!(!cfg.cloud_egress_consented);
         let ol = make_provider(PROVIDER_OLLAMA, &cfg).unwrap();
