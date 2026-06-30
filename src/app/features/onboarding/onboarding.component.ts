@@ -1291,6 +1291,9 @@ export class OnboardingComponent implements OnInit {
       webSearchConsented: base?.webSearchConsented ?? false,
       // Opt-in claude-CLI env inheritance — round-trip the snapshot so onboarding never resets it.
       claudeCodeInheritEnv: base?.claudeCodeInheritEnv ?? false,
+      // AI Gateway (Phase 1) — round-trip the snapshot so onboarding never resets the URL / model.
+      gatewayBaseUrl: base?.gatewayBaseUrl ?? "",
+      gatewayModel: base?.gatewayModel ?? "",
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

@@ -159,6 +159,29 @@ export class IpcService {
   }
 
   /**
+   * AI Gateway (Phase 1) — store/replace the gateway API key in Keychain.
+   * An empty/blank key is rejected — call `clearGatewayKey` to remove an existing key.
+   * The key is NEVER logged and NEVER returned to the FE — only `hasGatewayKey` reports presence.
+   * Mirrors {@link setAnthropicKey}.
+   */
+  setGatewayKey(key: string): Promise<void> {
+    return invoke<void>("set_gateway_key", { key });
+  }
+
+  /** Whether a gateway API key is currently stored. Never the value. Mirrors {@link hasAnthropicKey}. */
+  hasGatewayKey(): Promise<boolean> {
+    return invoke<boolean>("has_gateway_key");
+  }
+
+  /**
+   * AI Gateway (Phase 1) — remove the stored gateway API key from Keychain (if any).
+   * No-op when no key is stored. Mirrors how one might remove the Anthropic key.
+   */
+  clearGatewayKey(): Promise<void> {
+    return invoke<void>("clear_gateway_key");
+  }
+
+  /**
    * brain2 connectors — grant the one-time consent for WEB-SEARCH egress. This is
    * the ONLY supported way to flip `webSearchConsented` true: the backend persists
    * the flag AND updates its in-memory config cache, so the next brain/Ask answer

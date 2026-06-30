@@ -130,6 +130,19 @@ export interface AppConfigDto {
    * inherited. Mirrors Rust `AppConfigDto.claude_code_inherit_env`.
    */
   claudeCodeInheritEnv: boolean;
+  /**
+   * AI Gateway (Phase 1) — base URL of the user's OpenAI-compatible gateway
+   * (LiteLLM / Kong / Portkey / vLLM / …). Default `""` (unset). Required
+   * when `providerId === "gateway"`. Mirrors Rust `AppConfigDto.gateway_base_url`
+   * (camelCase via `#[serde(rename_all = "camelCase")]`).
+   */
+  gatewayBaseUrl: string;
+  /**
+   * AI Gateway (Phase 1) — model id forwarded to the gateway (e.g. `"gpt-4o"`,
+   * `"mistral/mistral-7b"`). An empty string lets the gateway use its own default.
+   * Mirrors Rust `AppConfigDto.gateway_model`.
+   */
+  gatewayModel: string;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */

@@ -7,7 +7,9 @@ import {
   inject,
   signal,
 } from "@angular/core";
+import { toSignal } from "@angular/core/rxjs-interop";
 import { FormBuilder, FormControl, ReactiveFormsModule } from "@angular/forms";
+import { startWith } from "rxjs";
 import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
@@ -144,6 +146,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
               <option value="claude_code">Claude Code (default)</option>
               <option value="anthropic">Anthropic API</option>
               <option value="ollama">Ollama</option>
+              <option value="gateway">AI Gateway (OpenAI-compatible)</option>
             </select>
           </label>
 
@@ -999,6 +1002,113 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
           <input type="checkbox" formControlName="voiceTrigger" />
         </label>
       </div>
+
+      <!-- AI Gateway configuration (shown only when "gateway" provider is selected) -->
+      @if (form.controls.providerId.value === 'gateway') {
+        <div class="card gateway-card">
+          <fieldset>
+            <legend>AI Gateway</legend>
+
+            <label class="field">
+              <span class="field-label">Base URL</span>
+              <input
+                formControlName="gatewayBaseUrl"
+                placeholder="http://localhost:4000/v1"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              @if (gatewayUrlWarning()) {
+                <span class="field-help text-danger">
+                  Use https:// (http:// is allowed only for localhost).
+                </span>
+              }
+            </label>
+
+            <label class="field">
+              <span class="field-label">Model</span>
+              <input
+                formControlName="gatewayModel"
+                placeholder="gpt-4o (leave blank to use the gateway default)"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <span class="field-help text-muted">
+                Sent as the <code>model</code> field in every request — leave
+                blank to let the gateway choose.
+              </span>
+            </label>
+
+            <!-- Gateway API key (optional) -->
+            <div class="key-status">
+              <span class="text-secondary">
+                API key
+                <span class="text-muted">(optional)</span>
+              </span>
+              @if (hasGatewayKey()) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Set
+                </span>
+              } @else {
+                <span class="pill">
+                  <span class="pill-dot"></span>
+                  Not set
+                </span>
+              }
+            </div>
+            <span class="row">
+              <input
+                type="password"
+                [formControl]="gatewayKeyControl"
+                placeholder="sk-… or any bearer token"
+                autocomplete="new-password"
+              />
+              <button
+                type="button"
+                class="btn"
+                (click)="saveGatewayKey()"
+                [disabled]="!gatewayKeyControl.value.trim()"
+              >
+                Save key
+              </button>
+              @if (hasGatewayKey()) {
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  (click)="removeGatewayKey()"
+                >
+                  Clear
+                </button>
+              }
+            </span>
+            @if (gatewayKeyError()) {
+              <p class="text-danger gateway-key-error">{{ gatewayKeyError() }}</p>
+            }
+          </fieldset>
+
+          <!-- Destination banner: calmer note for localhost, warning for remote -->
+          @if (gatewayDestination(); as dest) {
+            @if (dest.isRemote) {
+              <div class="banner is-warning gateway-banner">
+                <span class="banner-icon" aria-hidden="true">!</span>
+                <span>
+                  Content will be sent to <strong>{{ dest.host }}</strong> over
+                  the network — always scrubbed by the redaction firewall first
+                  and requires cloud-egress consent.
+                </span>
+              </div>
+            } @else {
+              <div class="banner gateway-banner">
+                <span class="banner-icon" aria-hidden="true">i</span>
+                <span>
+                  Localhost gateway — a local gateway can still forward to the
+                  cloud, so content is still redacted and consent-gated.
+                </span>
+              </div>
+            }
+          }
+        </div>
+      }
 
       <!-- Anthropic API key -->
       <div class="card">
@@ -2049,6 +2159,9 @@ export class SettingsComponent implements OnInit {
     semanticSearchEnabled: false,
     // brain2 connectors — web-search master toggle (NEW EGRESS; round-tripped).
     webSearchEnabled: false,
+    // AI Gateway (Phase 1) — base URL and model, round-tripped on save.
+    gatewayBaseUrl: "",
+    gatewayModel: "",
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
   /** BYO Brave Search API key input (web-search connector). Cleared after save. */
@@ -2129,6 +2242,65 @@ export class SettingsComponent implements OnInit {
   readonly savingWebKey = signal(false);
   /** Surfaced if storing the web-search key rejects. */
   readonly webKeyError = signal<string | null>(null);
+
+  // ── AI Gateway (Phase 1) — key management + destination computed signals ──
+
+  /** Gateway API key input. Cleared after save; value never sent back. */
+  readonly gatewayKeyControl = new FormControl("", { nonNullable: true });
+  /** Whether a gateway API key is currently stored (has-key probe; never the value). */
+  readonly hasGatewayKey = signal(false);
+  /** Surfaced if storing or clearing the gateway key rejects. */
+  readonly gatewayKeyError = signal<string | null>(null);
+
+  /**
+   * Live signal of the gatewayBaseUrl form control's value — built from
+   * `valueChanges` so computed() signals can track it reactively. `startWith`
+   * seeds the initial value (the form control starts as `""`).
+   */
+  private readonly _gatewayBaseUrlValue = toSignal(
+    // valueChanges not available until the form is fully constructed, but because
+    // this field initialiser runs after the `form` field above, the form group
+    // (and its controls) already exist at this point.
+    this.form.controls.gatewayBaseUrl.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+
+  /**
+   * Computed URL validation warning: true when the URL is non-empty AND is not a
+   * valid https:// URL AND is not an http:// loopback (localhost / 127.0.0.1 / [::1]).
+   * Derived from `_gatewayBaseUrlValue` so it updates on every keystroke.
+   */
+  readonly gatewayUrlWarning = computed(() => {
+    const url = this._gatewayBaseUrlValue();
+    if (!url) return false;
+    if (url.startsWith("https://")) return false;
+    if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(url))
+      return false;
+    return true;
+  });
+
+  /**
+   * Computed destination info from the gateway base URL:
+   * - `null` when the URL is empty or unparseable (no banner shown)
+   * - `{ isRemote: true, host }` for https:// non-loopback → shows the warning banner
+   * - `{ isRemote: false, host }` for loopback http:// → shows the calmer note
+   */
+  readonly gatewayDestination = computed((): { isRemote: boolean; host: string } | null => {
+    const url = this._gatewayBaseUrlValue();
+    if (!url) return null;
+    try {
+      const parsed = new URL(url);
+      const host = parsed.hostname;
+      const isLoopback =
+        host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "[::1]" ||
+        host === "::1";
+      return { isRemote: !isLoopback, host: parsed.host };
+    } catch {
+      return null;
+    }
+  });
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
 
@@ -2227,11 +2399,15 @@ export class SettingsComponent implements OnInit {
         brainModelId: cfg.brainModelId ?? "",
         semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
         webSearchEnabled: cfg.webSearchEnabled ?? false,
+        // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
+        gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
+        gatewayModel: cfg.gatewayModel ?? "",
       });
       this.updateDownloadHint();
       this.inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       this.hasKey.set(await this.ipc.hasAnthropicKey());
       this.hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
+      this.hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshProviders();
       // Phase H — brain model registry + download-progress stream (best-effort).
@@ -2445,6 +2621,9 @@ export class SettingsComponent implements OnInit {
       cloudEgressConsented: this.cloudConsented(),
       // Opt-in: pass the shell env to the `claude` CLI (restores env ANTHROPIC_API_KEY auth).
       claudeCodeInheritEnv: v.claudeCodeInheritEnv,
+      // AI Gateway (Phase 1) — base URL + model, round-tripped so a settings save preserves them.
+      gatewayBaseUrl: v.gatewayBaseUrl,
+      gatewayModel: v.gatewayModel,
     };
     try {
       await this.ipc.saveConfig(cfg);
@@ -2531,6 +2710,38 @@ export class SettingsComponent implements OnInit {
       this.webConsentError.set(String(e));
     } finally {
       this.webConsenting.set(false);
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 1) — store/replace the gateway API key in Keychain, then
+   * re-probe presence so the pill flips. The value is cleared from the input after
+   * saving (it's never shown back). Mirrors saveKey() / saveWebKey().
+   */
+  async saveGatewayKey(): Promise<void> {
+    const key = this.gatewayKeyControl.value;
+    if (!key.trim()) return;
+    this.gatewayKeyError.set(null);
+    try {
+      await this.ipc.setGatewayKey(key);
+      this.gatewayKeyControl.setValue("");
+      this.hasGatewayKey.set(await this.ipc.hasGatewayKey());
+    } catch (e) {
+      this.gatewayKeyError.set(String(e));
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 1) — remove the stored gateway API key from Keychain.
+   * Updates the pill afterward. No-op when no key is stored.
+   */
+  async removeGatewayKey(): Promise<void> {
+    this.gatewayKeyError.set(null);
+    try {
+      await this.ipc.clearGatewayKey();
+      this.hasGatewayKey.set(await this.ipc.hasGatewayKey());
+    } catch (e) {
+      this.gatewayKeyError.set(String(e));
     }
   }
 
