@@ -91,6 +91,24 @@ type Range = (typeof RANGES)[number];
           }
         </div>
 
+        <!-- Tokens by day -->
+        @if (dayBars().length > 0) {
+          <div class="eg-section">
+            <h4 class="eg-section-title">Tokens by day</h4>
+            <ul class="eg-bars" aria-label="Tokens by day">
+              @for (d of dayBars(); track d.day) {
+                <li class="eg-bar-row">
+                  <span class="eg-bar-label eg-bar-label--day" [title]="d.day">{{ d.day }}</span>
+                  <span class="eg-bar-track" role="presentation">
+                    <span class="eg-bar-fill" [style.width.%]="d.pct"></span>
+                  </span>
+                  <span class="eg-bar-count">{{ fmtTokens(d.tokens) }}</span>
+                </li>
+              }
+            </ul>
+          </div>
+        }
+
         <!-- What left this device -->
         <div class="eg-section">
           <h4 class="eg-section-title">
@@ -122,7 +140,14 @@ type Range = (typeof RANGES)[number];
           <div class="eg-section">
             <h4 class="eg-section-title">Recent calls</h4>
             <ul class="eg-recent" aria-label="Recent egress calls">
-              @for (r of l.recent; track r.ts) {
+              <!--
+                track $index is correct here (not a rule violation): l.recent is a
+                read-only snapshot wholesale-replaced by _ledger.set() — rows are
+                never reordered or item-mutated in place. ts is a whole-second Unix
+                timestamp; two calls in the same second (e.g. summarise + timeline in
+                one meeting on a fast gateway) produce duplicate keys = NG0955 crash.
+              -->
+              @for (r of l.recent; track $index) {
                 <li class="eg-recent-row">
                   <span class="eg-recent-dest" [title]="r.destination">{{ r.destination }}</span>
                   <span class="eg-recent-model">{{ r.modelServed ?? '—' }}</span>
@@ -300,6 +325,13 @@ type Range = (typeof RANGES)[number];
         text-align: right;
       }
 
+      /* Day-label column is narrower than the model-label column (YYYY-MM-DD is
+         10 chars wide; the shared .eg-bar-label width of 140px is sufficient but
+         we apply letter-spacing:0 so the date reads as a clean ISO string). */
+      .eg-bar-label--day {
+        letter-spacing: 0;
+      }
+
       /* --- PII chips --- */
       .eg-chips {
         display: flex;
@@ -416,6 +448,23 @@ export class EgressLedgerComponent {
       model: m.model,
       tokens: m.tokens,
       pct: Math.round((m.tokens / max) * 100),
+    }));
+  });
+
+  /**
+   * Per-day bars with width % precomputed (denominator = the highest-token day).
+   * Same pattern as {@link modelBars} — derived once per ledger change.
+   */
+  readonly dayBars = computed(() => {
+    const l = this._ledger();
+    if (!l || l.byDay.length === 0) {
+      return [] as { day: string; tokens: number; pct: number }[];
+    }
+    const max = Math.max(1, ...l.byDay.map((d) => d.tokens));
+    return l.byDay.map((d) => ({
+      day: d.day,
+      tokens: d.tokens,
+      pct: Math.round((d.tokens / max) * 100),
     }));
   });
 
