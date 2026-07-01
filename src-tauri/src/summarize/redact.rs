@@ -12,10 +12,11 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use regex::Regex;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::summarize::egress_log::{EgressEntry, EgressSink, NoopEgressSink};
 use crate::summarize::meta::{CallMeta, RedactionCounts};
 use crate::summarize::provider::{Availability, SummarizeRequest, SummarizerProvider};
+use serde_json::Value;
 
 // ── Phase D model plumbing (shared by the runtime-selected redactor + the download command) ──────
 // The real DebertaNameRedactor lives in the sibling `crate::summarize::ner_deberta` module (always
@@ -475,6 +476,68 @@ impl SummarizerProvider for RedactingProvider {
         });
         Ok((out, meta))
     }
+
+    /// Redact inputs, call the INNER provider's own `complete_json` (not the trait default), restore
+    /// PII in the returned `Value` via a JSON string round-trip, and record a content-free egress entry.
+    ///
+    /// Without this override the trait default would fire: it calls `self.complete()` (free-text path)
+    /// which bypasses the inner's `complete_json` override entirely — so the gateway's native
+    /// `response_format: json_schema` mode would never be reached even though the gateway provider
+    /// correctly overrides `complete_json`. This override closes that gap.
+    async fn complete_json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<Value> {
+        // Shared map so a value redacted in either prompt restores consistently in the reply.
+        let mut map = HashMap::new();
+        let mut rev = HashMap::new();
+        let rsys = redact_into(system, &mut map, &mut rev);
+        let ruser = redact_into(user, &mut map, &mut rev);
+        // Byte sizes of the REDACTED content (sizes, never the text itself).
+        let system_bytes = rsys.len();
+        let user_bytes = ruser.len();
+        // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
+        // the same name to the same token across both prompts, so the merged pairs restore cleanly.
+        let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
+        let (ruser, more) = self.names.redact_names(&ruser);
+        name_pairs.extend(more);
+        // Forward to the INNER's own complete_json — dispatches to the gateway's native
+        // json_schema override, or the trait default for anthropic/claude_code/ollama.
+        let value = self.inner.complete_json(&rsys, &ruser, schema).await?;
+        // Restore PII in the returned Value via a JSON string round-trip. The ⟪TOKEN⟫ placeholders
+        // are embedded verbatim in the JSON string values, so serialization preserves them and
+        // the regex replacements find them correctly.
+        let serialized = serde_json::to_string(&value).map_err(|e| {
+            AppError::Summarize(format!(
+                "complete_json: failed to serialize value for PII restore: {e}"
+            ))
+        })?;
+        // Restore both layers in the same order as complete_with_meta (names first, then regex).
+        let restored = restore_names(&serialized, &name_pairs);
+        let restored = restore(&restored, &map);
+        let out = serde_json::from_str::<Value>(&restored).map_err(|e| {
+            AppError::Summarize(format!(
+                "complete_json: restore produced invalid JSON: {e}"
+            ))
+        })?;
+        // Record a content-free audit entry. `complete_json` returns no CallMeta (unlike
+        // `complete_with_meta`), so `CallMeta::default()` is the correct sentinel here.
+        let redactions = count_redactions(&map, name_pairs.len());
+        self.sink.record(EgressEntry {
+            provider_id: self.provider_id.clone(),
+            destination: self.destination.clone(),
+            model_requested: self.model_requested.clone(),
+            call_kind: "complete_json",
+            meta: CallMeta::default(),
+            redactions,
+            system_bytes,
+            user_bytes,
+            meeting_id: None,
+        });
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -867,5 +930,123 @@ mod tests {
         assert_eq!(counts.card, 1);
         assert_eq!(counts.phone, 1);
         assert_eq!(counts.name, 3);
+    }
+
+    // ── Task 8 fix — complete_json override ─────────────────────────────────
+
+    /// RED-before-GREEN: `RedactingProvider::complete_json` must (1) call the INNER provider's
+    /// own `complete_json` override (not the trait default, which would call `complete()`),
+    /// (2) pass REDACTED inputs, (3) RESTORE PII in the returned `Value`, and (4) record a
+    /// content-free egress entry with `call_kind == "complete_json"`.
+    ///
+    /// RED state (before the override): the trait default fires → it calls `self.complete()` →
+    /// the inner's `complete_json` override is NEVER reached → `complete_json_called` stays false.
+    #[test]
+    fn complete_json_redacts_forwards_restores_and_records() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let captured_user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let complete_json_called = std::sync::Arc::new(AtomicBool::new(false));
+
+        /// Inner that (a) flags when its `complete_json` is called, (b) captures the user prompt
+        /// it received, and (c) echoes the ⟪EMAIL_1⟫ token back inside a JSON Value — so we can
+        /// verify the `RedactingProvider` restores it to the original email on the way out.
+        struct RecordingJsonProvider {
+            captured_user: std::sync::Arc<std::sync::Mutex<String>>,
+            called: std::sync::Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl SummarizerProvider for RecordingJsonProvider {
+            fn id(&self) -> &str { "recording-json" }
+            async fn availability(&self) -> Availability { Availability::Available }
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                // Must NOT be called when complete_json override is wired correctly.
+                Ok(String::new())
+            }
+            async fn complete_json(
+                &self,
+                _system: &str,
+                user: &str,
+                _schema: &serde_json::Value,
+            ) -> Result<serde_json::Value> {
+                self.called.store(true, Ordering::SeqCst);
+                *self.captured_user.lock().unwrap() = user.to_string();
+                // Return a Value that embeds the ⟪EMAIL_1⟫ placeholder — proves the
+                // RedactingProvider restores it to `alice@corp.example` on the way out.
+                Ok(serde_json::json!({ "note": "contact \u{27ea}EMAIL_1\u{27eb}" }))
+            }
+        }
+
+        let inner = Arc::new(RecordingJsonProvider {
+            captured_user: captured_user.clone(),
+            called: complete_json_called.clone(),
+        });
+        let captured_entries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::new(CaptureEgressSink(captured_entries.clone()));
+
+        let prov = RedactingProvider::with_name_redactor_and_sink(
+            inner,
+            Arc::new(NoopNameRedactor),
+            sink,
+            "gateway".to_string(),
+            "localhost:4000".to_string(),
+            "gpt-4o".to_string(),
+        );
+
+        let schema = serde_json::json!({"type": "object"});
+        let value = block_on(prov.complete_json(
+            "You are a helper.",
+            "Please summarize for alice@corp.example",
+            &schema,
+        ))
+        .unwrap();
+
+        // 1. The inner's complete_json was called (not the trait default via complete()).
+        assert!(
+            complete_json_called.load(Ordering::SeqCst),
+            "inner.complete_json must be invoked; RED: before the override the trait default \
+             fires self.complete() instead, so this flag stays false"
+        );
+
+        // 2. The inner received REDACTED user — email was scrubbed before egress.
+        let sent_user = captured_user.lock().unwrap().clone();
+        assert!(
+            !sent_user.contains("alice@corp.example"),
+            "inner must receive REDACTED user (email must not egress), got: {sent_user}"
+        );
+        assert!(
+            sent_user.contains("\u{27ea}EMAIL_"),
+            "inner must see the ⟪EMAIL_n⟫ placeholder token, got: {sent_user}"
+        );
+
+        // 3. The returned Value has PII restored — the note field has the original email.
+        let note = value["note"].as_str().unwrap_or("");
+        assert!(
+            note.contains("alice@corp.example"),
+            "PII must be RESTORED in the returned Value (JSON string round-trip), note: {note}"
+        );
+        assert!(
+            !note.contains("\u{27ea}EMAIL_"),
+            "⟪EMAIL_n⟫ token must be absent from the restored Value, note: {note}"
+        );
+
+        // 4. Egress sink: one entry, correct call_kind, correct redaction count, content-free.
+        let entries = captured_entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "exactly one egress entry per complete_json call");
+        let entry = &entries[0];
+        assert_eq!(entry.call_kind, "complete_json", "call_kind must be 'complete_json'");
+        assert_eq!(entry.redactions.email, 1, "one email was redacted");
+
+        let debug = format!("{:?}", entry);
+        assert!(
+            !debug.contains("alice@corp.example"),
+            "email must NOT appear in the egress entry debug output: {debug}"
+        );
+        assert!(
+            !debug.contains("contact"),
+            "response content must NOT appear in the egress entry debug output: {debug}"
+        );
     }
 }
