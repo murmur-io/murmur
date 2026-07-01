@@ -246,9 +246,12 @@
     .pricing { background: linear-gradient(180deg, transparent, rgba(110,118,255,0.04)); }
     .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-items: stretch; }
     @media (max-width: 920px) { .plans { grid-template-columns: 1fr; max-width: 460px; margin: 0 auto; } }
-    .plan { display: flex; flex-direction: column; background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 32px 28px; }
-    .plan.featured { border-color: var(--accent-ring); background: linear-gradient(180deg, rgba(110,118,255,0.10), var(--surface-raised)); box-shadow: var(--shadow-accent); position: relative; }
-    .plan.featured::before { content: "Most popular"; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: var(--accent-gradient); color: #fff; font-size: 12px; font-weight: 700; padding: 5px 14px; border-radius: var(--radius-pill); letter-spacing: 0.02em; }
+    .plan { position: relative; display: flex; flex-direction: column; background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 32px 28px; }
+    .plan.featured { border-color: var(--accent-ring); background: linear-gradient(180deg, rgba(110,118,255,0.10), var(--surface-raised)); box-shadow: var(--shadow-accent); }
+    .plan.soon { opacity: 0.82; }
+    .plan-badge { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 11.5px; font-weight: 700; padding: 5px 13px; border-radius: var(--radius-pill); letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; font-family: var(--font-mono); }
+    .plan-badge.now { background: var(--accent-gradient); color: #fff; box-shadow: var(--shadow-accent); }
+    .plan-badge.soon { background: var(--surface-solid); color: var(--text-secondary); border: 1px solid var(--border-strong); }
     .plan h3 { font-size: 20px; }
     .plan .price { display: flex; align-items: baseline; gap: 4px; margin: 16px 0 4px; }
     .plan .price .amt { font-size: 44px; font-weight: 700; letter-spacing: -0.04em; }
@@ -522,52 +525,62 @@
     <div class="wrap">
       <div class="section-head reveal">
         <span class="eyebrow">Pricing</span>
-        <h2>Start free. Lock it down when you need to.</h2>
-        <p>The full local pipeline is free forever. Paid plans add the per-folder lock, sharing, and team management.</p>
+        <h2>Free today. Built to grow with you.</h2>
+        <p>Everything Murmur does right now is <b>completely free</b> — no account, no trial, no catch. Pro and Team plans are on the roadmap, and every one keeps the same end-to-end-encrypted, on-device-first design.</p>
       </div>
       <div class="plans">
-        <!-- Free -->
-        <div class="plan reveal">
+        <!-- Free — the whole app, available now -->
+        <div class="plan featured reveal">
+          <span class="plan-badge now">Available now</span>
           <h3>Free</h3>
           <div class="price"><span class="amt">$0</span><span class="per">/ forever</span></div>
-          <p class="tagline">Run Murmur locally, end to end.</p>
+          <p class="tagline">The complete app. Everything runs on your Mac.</p>
           <ul>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Full record → transcribe → note pipeline</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device brain &amp; semantic search</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Obsidian Markdown export</li>
-            <li class="off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg> Per-folder app lock</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Unlimited on-device recording &amp; transcription</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> In-meeting AI assistant + Ask Your Vault</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Semantic search &amp; the auto knowledge graph</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-folder Touch ID lock &amp; AES-256 encryption</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Screen-share auto-relock</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Local MCP server + Obsidian export</li>
           </ul>
-          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur/releases/latest">Download</a>
+          <a class="btn btn-primary" href="https://github.com/JakubGawr/murmur/releases/latest">Download for macOS</a>
         </div>
 
-        <!-- Pro -->
-        <div class="plan featured reveal">
+        <!-- Pro — roadmap -->
+        <div class="plan soon reveal">
+          <span class="plan-badge soon">Coming soon</span>
           <h3>Pro</h3>
-          <div class="price"><span class="amt">$3.99</span><span class="per">/ month</span></div>
-          <p class="tagline">Lock, encrypt, and share your work.</p>
+          <div class="price"><span class="amt">$3.99</span><span class="per">/ month · planned</span></div>
+          <p class="tagline">Your memory, on every device — still end-to-end encrypted.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Free</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-folder Touch ID lock &amp; file encryption</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Auto-lock while sharing your screen</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Share projects</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> End-to-end encrypted sync across your Macs &amp; iPhone</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Zero-knowledge encrypted cloud backup</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Expiring, encrypted share links for a note or meeting</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional low-latency managed brain (redacted)</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Custom recipes &amp; automations</li>
           </ul>
-          <a class="btn btn-primary" href="https://github.com/JakubGawr/murmur">Get Pro</a>
+          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur">Follow on GitHub</a>
         </div>
 
-        <!-- Enterprise -->
-        <div class="plan reveal">
-          <h3>Enterprise</h3>
+        <!-- Team / Enterprise — roadmap -->
+        <div class="plan soon reveal">
+          <span class="plan-badge soon">Coming soon</span>
+          <h3>Team</h3>
           <div class="price"><span class="amt">Contact</span></div>
-          <p class="tagline">For teams that manage access centrally.</p>
+          <p class="tagline">Shared meeting memory for a team — privacy kept intact.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Pro</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Create an organization &amp; invite users</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Centralized user management</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Priority support</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Shared workspaces &amp; projects (end-to-end encrypted)</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Invite members, roles &amp; permissions</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> SSO &amp; SCIM provisioning</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Security policy, retention &amp; audit log</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Priority support &amp; SLA</li>
           </ul>
-          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur">Contact us</a>
+          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur">Talk to us</a>
         </div>
       </div>
+      <p style="text-align:center; color:var(--text-muted); font-size:13.5px; margin-top:26px;">Pricing for Pro and Team is indicative and not final. Murmur stays free while in early access.</p>
     </div>
   </section>
 
