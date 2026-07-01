@@ -2601,12 +2601,14 @@ pub struct GatewayHealthDto {
     pub model_count: u32,
 }
 
-/// Probe the configured AI Gateway by fetching `GET {base}/models`.
+/// Probe the configured AI Gateway for reachability and (optionally) catalog size.
 ///
-/// Returns `GatewayHealthDto { reachable: true, model_count: N }` when the request succeeds, and
-/// `{ reachable: false, model_count: 0 }` on ANY failure (network error, auth error, empty URL) —
-/// this command NEVER returns an `Err` variant so the FE health dot always gets a clean value.
+/// Uses `OpenAiCompatProvider::probe()` which sends a GET to the models endpoint when one
+/// exists, or to the chat endpoint for custom routes (a GET to a POST-only route returns
+/// 4xx/405 but proves the server is reachable — no LLM call, no cost). Any HTTP response
+/// (any status) → `reachable: true`; a transport failure → `reachable: false`.
 ///
+/// This command NEVER returns an `Err` variant so the FE health dot always gets a clean value.
 /// Inbound-only: sends NO meeting content, only an optional `Authorization: Bearer` header. Does
 /// NOT need the redaction firewall or the consent gate (same rationale as `list_gateway_models`).
 #[tauri::command]
@@ -2635,13 +2637,9 @@ pub async fn gateway_health(
         Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
     };
 
-    match provider.list_models().await {
-        Ok(ids) => Ok(GatewayHealthDto {
-            reachable: true,
-            model_count: ids.len() as u32,
-        }),
-        Err(_) => Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
-    }
+    // probe() never returns Err — degrades to (false, 0) on transport failure.
+    let (reachable, model_count) = provider.probe().await;
+    Ok(GatewayHealthDto { reachable, model_count })
 }
 
 // ── Egress ledger DTOs (Phase 6) ────────────────────────────────────────────────────────────────
