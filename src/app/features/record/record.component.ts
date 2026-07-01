@@ -4,7 +4,6 @@ import {
   DestroyRef,
   OnInit,
   computed,
-  effect,
   inject,
   signal,
   viewChild,
@@ -13,7 +12,6 @@ import { RouterLink } from "@angular/router";
 import { RecorderStore } from "../../core/recorder.store";
 import { IpcService } from "../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../core/models";
-import { PreMeetingBriefComponent } from "./pre-meeting-brief.component";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 import { MeetingConversationComponent } from "./meeting-conversation.component";
 import { MeetingConversationStore } from "../../core/meeting-conversation.store";
@@ -24,7 +22,6 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
-    PreMeetingBriefComponent,
     MicMuteToggleComponent,
     MeetingConversationComponent,
   ],
@@ -218,14 +215,6 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
             <span class="kbd-inline">⌘⇧R</span>
           </button>
         </div>
-
-        <!-- Pre-meeting brief: a subtle prep affordance — only when not recording. -->
-        @if (showBrief()) {
-          <app-pre-meeting-brief
-            [initialSubject]="briefPrefill()"
-            (dismissed)="dismissBrief()"
-          />
-        }
       }
 
       <!-- ── The notes + @brain threads surface — the full-height main view ── -->
@@ -1015,36 +1004,17 @@ export class RecordComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
 
-  /** Tracks the previous isRecording() value so the clear-on-record effect fires
-   * only on the false → true edge (a NEW recording), not on every CD pass. */
-  private prevRecording = false;
-
-  /**
-   * Clear the assistant thread on each NEW recording (the false → true edge of
-   * isRecording()) so a fresh meeting opens with an empty conversation — mirrors
-   * the backend's per-recording live-transcript clear. `clear()` writes a signal
-   * inside an effect, so `allowSignalWrites` is REQUIRED (trap T1 / NG0600).
-   */
-  private readonly _clearOnRecord = effect(
-    () => {
-      const recording = this.store.isRecording();
-      if (recording && !this.prevRecording) {
-        this.assistant.clear();
-      }
-      this.prevRecording = recording;
-    },
-    { allowSignalWrites: true },
-  );
+  // NOTE: "clear the conversation on a new recording" now lives in
+  // MeetingConversationStore.setMeetingId (keyed on the meeting id, which survives
+  // navigation), NOT in a per-component isRecording-edge effect. The old effect
+  // wiped the thread when you left the record tab and came back mid-recording,
+  // because its edge state (a plain field) reset to false on component re-mount.
 
   /** Name of a running meeting app (Zoom/Teams/Webex), or null if none detected. */
   readonly detectedApp = signal<string | null>(null);
   /** Once dismissed, the nudge stays hidden for the rest of this session. */
   private readonly nudgeDismissed = signal(false);
 
-  /** Title of the next calendar event (best-effort prefill), or null. */
-  private readonly nextEventTitle = signal<string | null>(null);
-  /** Once dismissed, the prep card stays hidden for the rest of this session. */
-  private readonly briefDismissed = signal(false);
   /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
   private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
 
@@ -1170,27 +1140,6 @@ export class RecordComponent implements OnInit {
       this.canRecord(),
   );
 
-  /**
-   * Subject to prefill the prep card: the next calendar event's title first,
-   * else the detected meeting-app name (if the nudge already surfaces one),
-   * else empty so the user types their own.
-   */
-  readonly briefPrefill = computed(
-    () => this.nextEventTitle() ?? this.detectedApp() ?? "",
-  );
-
-  /**
-   * Show the prep affordance only when NOT recording / processing and the user
-   * hasn't dismissed it this session. Kept subtle — it never competes with the
-   * record hero, and is hidden the moment a recording (or its processing) runs.
-   */
-  readonly showBrief = computed(
-    () =>
-      !this.store.isRecording() &&
-      !this.isProcessing() &&
-      !this.briefDismissed(),
-  );
-
   /** Elapsed recording time as m:ss. */
   readonly elapsedLabel = computed(() => {
     const s = this.store.elapsed();
@@ -1260,15 +1209,6 @@ export class RecordComponent implements OnInit {
       this.analytics.set(null);
     }
 
-    // Next-event prefill for the prep card — purely best-effort; on any failure
-    // (or no upcoming event) we simply leave the subject blank for the user.
-    try {
-      const next = await this.ipc.nextCalendarEvent();
-      this.nextEventTitle.set(next?.title ?? null);
-    } catch {
-      this.nextEventTitle.set(null);
-    }
-
     // Meeting-app detection: check once now, then poll on a tracked interval.
     void this.checkMeetingApp();
     this.meetingAppPoll = setInterval(
@@ -1300,11 +1240,6 @@ export class RecordComponent implements OnInit {
   /** Nudge ghost action — hide it for the rest of this session. */
   dismissNudge(): void {
     this.nudgeDismissed.set(true);
-  }
-
-  /** Prep-card dismiss — hide it for the rest of this session. */
-  dismissBrief(): void {
-    this.briefDismissed.set(true);
   }
 
   /** No-vault info-notice dismiss — hide it for the rest of this session. */
