@@ -255,7 +255,24 @@ pub struct SearchHit {
 pub struct DocumentInfo {
     pub id: String,
     pub name: String,
+    /// `"document"` (uploaded file) or `"note"` (typed brain note) — lets the Brain page split the
+    /// two source kinds. Both ride the same seal/gating; this is presentation only.
+    pub kind: String,
     pub created_at: i64,
+}
+
+/// Headline counts + flags for the Brain page ("what's in my brain"). All counts are over
+/// VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are never counted). Carries
+/// NO text — counts + the two semantic flags, so it is leak-free.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrainOverview {
+    pub meeting_count: i64,
+    pub document_count: i64,
+    pub note_count: i64,
+    pub indexed_chunk_count: i64,
+    pub semantic_enabled: bool,
+    pub embed_model_present: bool,
 }
 
 /// One gated document-chunk retrieval hit (the document analogue of [`SearchHit`], minus the

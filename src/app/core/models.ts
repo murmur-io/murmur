@@ -262,6 +262,15 @@ export interface VoiceActionResultPayload {
   /** What the user actually said (their OWN dictation). Empty when nothing was heard. */
   command: string;
   citations: string[];
+  /**
+   * The agent's PROPOSED note draft, or `null`. NON-null ONLY when the model
+   * decided the user asked it to MAKE/SAVE a note (it called the `propose_note`
+   * tool) — for a plain answer/question it is `null`. The FE shows the quiet
+   * "✓ Add to notes" affordance ONLY when this is non-null, and on accept appends
+   * THIS draft (not the whole reply) to the user's notes. The agent never
+   * auto-writes; accept is the only path content enters the notes.
+   */
+  proposedNote: string | null;
 }
 
 /**
@@ -517,7 +526,33 @@ export interface SearchHit {
 export interface DocumentInfo {
   id: string;
   name: string;
+  /**
+   * `"document"` (an uploaded `.md`/`.txt` file) or `"note"` (a typed brain
+   * note). Lets the Brain page split the two source kinds into their own cards.
+   * Both ride the SAME seal/gating path — this is presentation only. Mirrors the
+   * Rust `DocumentInfo.kind`. Empty when the folder is sealed (masked list).
+   */
+  kind: "document" | "note";
   createdAt: number;
+}
+
+/**
+ * brain2 — headline counts + semantic flags for the Brain page ("what's in my
+ * brain"). Mirrors the Rust `BrainOverview` (serde camelCase). Every count is
+ * over VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are
+ * never counted). Carries NO text — counts + the two flags, so it is leak-free.
+ * Re-fetch on a FoldersService lock-state change so a session unlock/relock
+ * shifts the counts live, like the graph.
+ */
+export interface BrainOverview {
+  meetingCount: number;
+  documentCount: number;
+  noteCount: number;
+  indexedChunkCount: number;
+  /** `config.semantic_search_enabled` — the semantic-search master flag. */
+  semanticEnabled: boolean;
+  /** The on-device e5 embedding model is present (so vectors can be built). */
+  embedModelPresent: boolean;
 }
 
 export interface ChatTurn {

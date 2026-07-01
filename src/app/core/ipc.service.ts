@@ -15,6 +15,7 @@ import type {
   ReindexResult,
   InputDeviceInfo,
   AskVaultResult,
+  BrainOverview,
   BriefResult,
   BuiltinRecipe,
   CalendarEvent,
@@ -356,7 +357,34 @@ export class IpcService {
     return invoke<EntityDetail>("get_entity_detail", { entityId });
   }
 
+  // ── brain2 — the Brain page "what's in my brain" overview ──────────────
+
+  /**
+   * Headline counts + semantic flags for the Brain page's status header:
+   * VISIBLE meetings / documents / typed notes, the indexed-chunk count, and
+   * whether semantic search is enabled + the e5 embedding model is present.
+   * Counts ONLY visible/unlocked content (sealed-not-unlocked items are never
+   * counted) and carries NO text, so re-fetch on a FoldersService lock-state
+   * change to shift the counts live (mirrors {@link getGraph}).
+   */
+  brainOverview(): Promise<BrainOverview> {
+    return invoke<BrainOverview>("brain_overview");
+  }
+
   // ── brain2 documents — expand the brain with imported .md/.txt files ────
+
+  /**
+   * Ingest TYPED text as a brain NOTE (`kind='note'`) into `folderId` — the twin
+   * of {@link importDocument} for the "+ Add note" editor. Chunks + (when the e5
+   * model is present) vector-indexes it exactly like an uploaded document, minus
+   * the file/extension step. Resolves with the new document id. Rejects with
+   * `AppError::Locked` when the folder is sealed-and-NOT-session-unlocked (never
+   * resurrect plaintext behind a lock) and with `AppError::InvalidArg` on empty
+   * text — surface both as friendly messages.
+   */
+  importText(name: string, text: string, folderId: string): Promise<string> {
+    return invoke<string>("import_text", { name, text, folderId });
+  }
 
   /**
    * Import a `.md`/`.txt` document into `folderId` to expand the brain: the

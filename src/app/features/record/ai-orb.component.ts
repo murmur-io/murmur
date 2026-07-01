@@ -4,7 +4,7 @@ import {
   computed,
   input,
 } from "@angular/core";
-import type { OrbState } from "../../core/assistant.store";
+import type { OrbState } from "../../core/meeting-conversation.store";
 
 /**
  * The in-meeting AI-assistant ORB — a single morphing gradient orb whose STATE is
