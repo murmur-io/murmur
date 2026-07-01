@@ -98,13 +98,16 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "search_meetings",
-            description: "Full-text search across the user's past meeting titles, notes and transcripts.",
+            description: "Full-text search across the user's past meeting titles, notes, transcripts, \
+                          and imported documents/brain notes.",
             parameters: str_arg("query", "Search terms, in the user's own language."),
             write: false,
         },
         ToolSpec {
             name: "search_semantic",
-            description: "Hybrid semantic + keyword search over meetings (finds related-by-meaning notes).",
+            description: "Hybrid semantic + keyword search over meetings and imported documents/brain \
+                          notes (finds related-by-meaning content). Falls back to keyword-only \
+                          matching when semantic search is disabled.",
             parameters: str_arg("query", "A natural-language description of what to find."),
             write: false,
         },
@@ -204,22 +207,43 @@ pub fn execute_tool(
     match call {
         ToolCall::SearchMeetings { query } => {
             let q = query.as_str();
+            // Documents/brain notes ride the SAME fan-out — the gated keyword (FTS/BM25) doc leg
+            // works WITHOUT the e5 model, so ingested content is reachable through the primary
+            // search tool on a default install. `search_doc_chunks_fts_visible` applies the SAME
+            // `visibility_clause` against `unlocked` as the meeting legs.
+            let docs = db
+                .search_doc_chunks_fts_visible(q, 20, unlocked)
+                .unwrap_or_default();
             match db.search_visible(q, 20, unlocked) {
-                Ok(hits) if hits.is_empty() => Ok(format!("No meetings match \"{q}\".")),
-                Ok(hits) => Ok(format_hits(&hits)),
+                Ok(hits) if hits.is_empty() && docs.is_empty() => {
+                    Ok(format!("No meetings or documents match \"{q}\"."))
+                }
+                Ok(hits) => Ok(format_hits_and_docs(&hits, &docs)),
                 Err(e) => Err(AppError::Storage(format!("search failed: {e}"))),
             }
         }
         ToolCall::SearchSemantic { query } => {
             let q = query.as_str();
             // GATE: the master flag lives in the (whole-DB-encrypted) settings table. When OFF,
-            // return an explicit "disabled" result — do NOT silently fall back to an ungated read.
-            // No `vec_chunks` row is ever touched.
+            // DEGRADE HONESTLY to gated keyword (BM25) matching — never an ungated read, and no
+            // `vec_chunks`/`doc_vec_chunks` row is ever touched (no stub-vector KNN). The output is
+            // labelled as keyword matching so the model is never told a semantic search ran.
             if !config.semantic_search_enabled {
-                return Ok(
-                    "Semantic search is disabled. Enable it in Murmur settings to use this tool."
-                        .to_string(),
-                );
+                let hits = db
+                    .search_visible(q, 20, unlocked)
+                    .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
+                let docs = db
+                    .search_doc_chunks_fts_visible(q, 20, unlocked)
+                    .unwrap_or_default();
+                if hits.is_empty() && docs.is_empty() {
+                    return Ok(format!(
+                        "No meetings or documents match \"{q}\" (keyword match — semantic search is off)."
+                    ));
+                }
+                return Ok(format!(
+                    "Keyword (exact-word) matches — semantic search is off:\n{}",
+                    format_hits_and_docs(&hits, &docs)
+                ));
             }
             // Embed the query with the SAME active embedder used to index, then HYBRID-search through
             // the SAME visibility gate as `search_meetings` (both FTS + vector legs are gated).
@@ -229,13 +253,17 @@ pub fn execute_tool(
                 Ok(v) => v.into_iter().next().unwrap_or_default(),
                 Err(e) => return Err(AppError::Summarize(format!("embed failed: {e}"))),
             };
-            // Document ingestion: ALSO surface uploaded md/txt that match — gated by
-            // `search_doc_chunks_visible` (the SAME `visibility_clause` against `unlocked`), so a
-            // locked-and-not-unlocked folder's documents are invisible here exactly like a sealed
-            // meeting. Append them as a `DOCUMENTS:` section so the model can ground on them too.
-            let docs = db
+            // Document ingestion: ALSO surface uploaded md/txt that match — the vector-KNN and
+            // keyword-FTS doc legs are RRF-fused, and BOTH are gated by the SAME `visibility_clause`
+            // against `unlocked`, so a locked-and-not-unlocked folder's documents are invisible here
+            // exactly like a sealed meeting. Appended as a `DOCUMENTS:` section.
+            let knn_docs = db
                 .search_doc_chunks_visible(&query_vec, 20, unlocked)
                 .unwrap_or_default();
+            let fts_docs = db
+                .search_doc_chunks_fts_visible(q, 20, unlocked)
+                .unwrap_or_default();
+            let docs = crate::embed::fuse_doc_hits(knn_docs, fts_docs);
             match db.search_hybrid_visible(q, &query_vec, 20, unlocked) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
