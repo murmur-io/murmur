@@ -72,20 +72,17 @@ type Range = (typeof RANGES)[number];
         <!-- Tokens by model -->
         <div class="eg-section">
           <h4 class="eg-section-title">Tokens by model</h4>
-          @if (l.byModel.length === 0) {
+          @if (modelBars().length === 0) {
             <p class="empty-state">
               No cloud calls in this window — everything stayed on-device.
             </p>
           } @else {
             <ul class="eg-bars" aria-label="Tokens by model">
-              @for (m of l.byModel; track m.model) {
+              @for (m of modelBars(); track m.model) {
                 <li class="eg-bar-row">
                   <span class="eg-bar-label" [title]="m.model">{{ m.model }}</span>
                   <span class="eg-bar-track" role="presentation">
-                    <span
-                      class="eg-bar-fill"
-                      [style.width.%]="barPct(m.tokens)"
-                    ></span>
+                    <span class="eg-bar-fill" [style.width.%]="m.pct"></span>
                   </span>
                   <span class="eg-bar-count">{{ fmtTokens(m.tokens) }}</span>
                 </li>
@@ -404,13 +401,22 @@ export class EgressLedgerComponent {
   readonly loading = signal(false);
   readonly error = signal<string | null>(null);
 
-  /** Max total tokens across all models — denominator for bar widths. */
-  private readonly _maxModelTokens = computed(() => {
+  /**
+   * Per-model bars with their width % precomputed (denominator = the max model's tokens).
+   * Derived once per ledger change so the template reads a plain array — no per-cell method
+   * that reads a signal (the zoneless "derive, don't recompute in the template" rule).
+   */
+  readonly modelBars = computed(() => {
     const l = this._ledger();
     if (!l || l.byModel.length === 0) {
-      return 1;
+      return [] as { model: string; tokens: number; pct: number }[];
     }
-    return Math.max(1, ...l.byModel.map((m) => m.tokens));
+    const max = Math.max(1, ...l.byModel.map((m) => m.tokens));
+    return l.byModel.map((m) => ({
+      model: m.model,
+      tokens: m.tokens,
+      pct: Math.round((m.tokens / max) * 100),
+    }));
   });
 
   /** Sum of all four PII redaction kinds. */
@@ -429,15 +435,13 @@ export class EgressLedgerComponent {
       const d = this.days();
       this.loading.set(true);
       this.error.set(null);
+      // Clear the previous window's data so the loading state doesn't render stale bars
+      // alongside the spinner during the refetch (clean transition on 7↔30↔90 toggles).
+      this._ledger.set(null);
       void this.fetch(d);
     },
     { allowSignalWrites: true },
   );
-
-  /** Width % for one model's bar (0–100). */
-  barPct(tokens: number): number {
-    return Math.round((tokens / this._maxModelTokens()) * 100);
-  }
 
   /** Compact token formatter: ≥1 000 → "1.2k", ≥1 000 000 → "1.2M". */
   fmtTokens(n: number): string {
