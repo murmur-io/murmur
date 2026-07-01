@@ -2556,6 +2556,121 @@ pub async fn gateway_health(
     }
 }
 
+// ── Egress ledger DTOs (Phase 6) ────────────────────────────────────────────────────────────────
+//
+// All structs are `camelCase` on the wire (matches the FE `EgressLedger` / `EgressRow` types in
+// `core/models.ts`). Carries ONLY counts, ids, labels, and token/byte numbers — no content (§8).
+
+/// Per-model token-usage roll-up for `EgressLedger.byModel`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageDto {
+    pub model: String,
+    pub calls: u32,
+    pub tokens: u32,
+}
+
+/// Per-day token-usage roll-up for `EgressLedger.byDay`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayUsageDto {
+    /// ISO-8601 date string ("YYYY-MM-DD") in UTC.
+    pub day: String,
+    pub tokens: u32,
+}
+
+/// Redaction-count totals for the queried window.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactionTotalsDto {
+    pub email: u32,
+    pub card: u32,
+    pub phone: u32,
+    pub name: u32,
+}
+
+/// One row from the `egress_log` table (content-free: counts + ids only).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressRowDto {
+    /// Unix epoch (seconds) of the call.
+    pub ts: i64,
+    pub provider_id: String,
+    pub destination: String,
+    pub model_served: Option<String>,
+    pub total_tokens: Option<u32>,
+    pub redactions: RedactionTotalsDto,
+}
+
+/// Aggregated egress ledger for a rolling window (`days` days back from now).
+///
+/// Shape matches `EgressLedger` in `src/app/core/models.ts` (camelCase).
+/// Every aggregate handles an empty `egress_log` gracefully — totals are zero, vecs empty.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressLedgerDto {
+    pub total_calls: u32,
+    pub total_tokens: u32,
+    pub by_model: Vec<ModelUsageDto>,
+    pub by_day: Vec<DayUsageDto>,
+    pub total_redactions: RedactionTotalsDto,
+    /// Last ≤20 rows from `egress_log`, newest first.
+    pub recent: Vec<EgressRowDto>,
+}
+
+/// Aggregate the content-free `egress_log` table for the given rolling window and return the
+/// ledger for the "Egress & Usage" Analytics panel.
+///
+/// `days` is the window width; pass `30` for the default 30-day view. The window is computed as
+/// `ts >= (now_unix - days * 86400)`. An empty table (no cloud calls yet) returns all-zero totals
+/// and empty vecs — never an error.
+///
+/// Read-only: queries `egress_log` only. No content columns are touched.
+#[tauri::command]
+pub fn get_egress_ledger(
+    days: i64,
+    state: State<'_, AppState>,
+) -> Result<EgressLedgerDto, AppError> {
+    let ledger = state.db.egress_summary(days)?;
+    Ok(EgressLedgerDto {
+        total_calls: ledger.total_calls,
+        total_tokens: ledger.total_tokens,
+        by_model: ledger
+            .by_model
+            .into_iter()
+            .map(|m| ModelUsageDto { model: m.model, calls: m.calls, tokens: m.tokens })
+            .collect(),
+        by_day: ledger
+            .by_day
+            .into_iter()
+            .map(|d| DayUsageDto { day: d.day, tokens: d.tokens })
+            .collect(),
+        total_redactions: RedactionTotalsDto {
+            email: ledger.total_redactions.email,
+            card: ledger.total_redactions.card,
+            phone: ledger.total_redactions.phone,
+            name: ledger.total_redactions.name,
+        },
+        recent: ledger
+            .recent
+            .into_iter()
+            .map(|r| EgressRowDto {
+                ts: r.ts,
+                provider_id: r.provider_id,
+                destination: r.destination,
+                model_served: r.model_served,
+                total_tokens: r.total_tokens,
+                redactions: RedactionTotalsDto {
+                    email: r.redactions.email,
+                    card: r.redactions.card,
+                    phone: r.redactions.phone,
+                    name: r.redactions.name,
+                },
+            })
+            .collect(),
+    })
+}
+
 /// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
 /// An empty input clears it. The key is NEVER logged and NEVER returned to the FE — only `has_*`
 /// reports presence. Mirrors `set_anthropic_key`.
