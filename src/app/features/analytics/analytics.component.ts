@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
 import type { Analytics } from "../../core/models";
+import { EgressLedgerComponent } from "./egress-ledger.component";
 import { TopicThreadsComponent } from "./topic-threads.component";
 import { WeeklyDigestComponent } from "./weekly-digest.component";
 
@@ -46,7 +47,7 @@ const STATUS_ORDER = [
 @Component({
   selector: "app-analytics",
   standalone: true,
-  imports: [TopicThreadsComponent, WeeklyDigestComponent],
+  imports: [EgressLedgerComponent, TopicThreadsComponent, WeeklyDigestComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <section class="analytics">
@@ -173,6 +174,9 @@ const STATUS_ORDER = [
 
         <!-- Weekly digest (on-demand synthesis of recent meetings) -->
         <app-weekly-digest />
+
+        <!-- Egress & Usage (content-free local egress ledger, Phase 6) -->
+        <app-egress-ledger />
       }
     </section>
   `,

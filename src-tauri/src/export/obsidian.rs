@@ -482,6 +482,84 @@ pub fn detect_vaults_from(config_path: &Path) -> Result<Vec<DetectedVault>> {
     Ok(vaults)
 }
 
+// ── Provenance frontmatter injection (Phase 5) ──────────────────────────────
+
+/// Inject model-provenance keys (`ai-provider:` and `ai-model:`) into the YAML frontmatter of a
+/// Murmur note. The note is LLM-generated and always starts with a `---` / `---` YAML fence. If
+/// the frontmatter is absent or malformed, the markdown is returned UNCHANGED (byte-identical).
+///
+/// **Rules:**
+/// - `ai-provider`: the provider id (e.g. `"gateway"`, `"anthropic"`, `"claude_code"`). Always
+///   included when `provider` is non-empty.
+/// - `ai-model`: prefer `model_served` (what the API actually served); fall back to
+///   `model_requested` (what we asked for). Omitted when neither is available.
+/// - Both keys are omitted when the note already contains them (idempotent re-export).
+/// - When `provider` is empty and both model fields are `None`, the markdown is returned unchanged.
+///
+/// Pure (no I/O, no state). The returned string has identical bytes to the input when no injection
+/// is needed, so callers may compare identity cheaply.
+pub fn inject_provenance_frontmatter(
+    markdown: &str,
+    provider: &str,
+    model_requested: Option<&str>,
+    model_served: Option<&str>,
+) -> String {
+    let provider = provider.trim();
+    let effective_model = model_served.or(model_requested);
+
+    // Nothing to inject — preserve byte identity.
+    if provider.is_empty() && effective_model.is_none() {
+        return markdown.to_string();
+    }
+
+    // The note must start with `---\n` to have a frontmatter block.
+    let Some(rest_after_open) = markdown.strip_prefix("---\n") else {
+        return markdown.to_string();
+    };
+
+    // Find the closing `---` line.
+    let Some(close_pos) = rest_after_open.find("\n---\n").or_else(|| {
+        // The block may end at the very last line with `---` followed by no body.
+        if rest_after_open.ends_with("\n---") {
+            Some(rest_after_open.len() - 4)
+        } else {
+            None
+        }
+    }) else {
+        return markdown.to_string();
+    };
+
+    let fm_content = &rest_after_open[..close_pos]; // the YAML lines between the fences
+
+    // Idempotent: if both keys are already present, nothing to do.
+    let already_has_provider = fm_content.lines().any(|l| l.starts_with("ai-provider:"));
+    let already_has_model = fm_content.lines().any(|l| l.starts_with("ai-model:"));
+    if already_has_provider && already_has_model {
+        return markdown.to_string();
+    }
+
+    // Build the new frontmatter content by appending only the missing keys.
+    let mut new_fm = fm_content.to_string();
+    if !new_fm.ends_with('\n') && !new_fm.is_empty() {
+        new_fm.push('\n');
+    }
+    if !already_has_provider && !provider.is_empty() {
+        new_fm.push_str(&format!("ai-provider: {}\n", provider));
+    }
+    if !already_has_model {
+        if let Some(model) = effective_model {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                new_fm.push_str(&format!("ai-model: {}\n", trimmed));
+            }
+        }
+    }
+
+    // Reconstruct the full note.
+    let after_close = &rest_after_open[close_pos..]; // starts with `\n---`
+    format!("---\n{new_fm}{after_close}")
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -660,5 +738,83 @@ mod tests {
         assert_eq!(vaults[0].name, "Work");
         assert!(vaults[0].is_open);
         assert_eq!(vaults[1].name, "Personal");
+    }
+
+    // ── Phase 5: inject_provenance_frontmatter ──────────────────────────────
+
+    /// A well-formed note with no provenance keys yet receives both keys injected.
+    #[test]
+    fn inject_provenance_adds_keys_to_clean_frontmatter() {
+        let md = "---\ntitle: Sprint Planning\ndate: 2026-06-30\n---\n# Sprint Planning\n\nBody.\n";
+        let out = inject_provenance_frontmatter(md, "gateway", Some("gpt-4o"), Some("gpt-4o-2024-11-20"));
+        assert!(out.contains("ai-provider: gateway"), "provider injected: {out}");
+        // model_served takes precedence over model_requested.
+        assert!(out.contains("ai-model: gpt-4o-2024-11-20"), "served model injected: {out}");
+        // Original keys preserved.
+        assert!(out.contains("title: Sprint Planning"), "original key preserved: {out}");
+        // Still a valid YAML fence.
+        assert!(out.starts_with("---\n"), "fence preserved");
+        assert!(out.contains("\n---\n"), "closing fence preserved");
+    }
+
+    /// `model_served` is preferred; when absent, `model_requested` is used.
+    #[test]
+    fn inject_provenance_falls_back_to_model_requested_when_served_absent() {
+        let md = "---\ntitle: T\n---\nBody.";
+        let out = inject_provenance_frontmatter(md, "anthropic", Some("claude-opus-4-8"), None);
+        assert!(out.contains("ai-model: claude-opus-4-8"), "fallback to requested: {out}");
+        assert!(out.contains("ai-provider: anthropic"), "provider: {out}");
+    }
+
+    /// When both model fields are `None`, only `ai-provider` is injected.
+    #[test]
+    fn inject_provenance_provider_only_when_no_model() {
+        let md = "---\ndate: 2026-06-30\n---\nBody.";
+        let out = inject_provenance_frontmatter(md, "claude_code", None, None);
+        assert!(out.contains("ai-provider: claude_code"), "provider injected: {out}");
+        assert!(!out.contains("ai-model:"), "no model key when both absent: {out}");
+    }
+
+    /// When provider is empty and both model fields are `None`, the markdown is returned UNCHANGED.
+    #[test]
+    fn inject_provenance_noop_when_nothing_to_inject() {
+        let md = "---\ntitle: T\n---\nBody.";
+        let out = inject_provenance_frontmatter(md, "", None, None);
+        assert_eq!(out, md, "byte-identical when nothing to inject");
+    }
+
+    /// Idempotent: already-present keys are NOT duplicated on a second call.
+    #[test]
+    fn inject_provenance_is_idempotent() {
+        let md = "---\ntitle: T\n---\nBody.";
+        let once = inject_provenance_frontmatter(md, "gateway", Some("gpt-4o"), None);
+        let twice = inject_provenance_frontmatter(&once, "gateway", Some("gpt-4o"), None);
+        assert_eq!(once, twice, "second inject is a no-op");
+        // Only one occurrence of each key.
+        assert_eq!(once.matches("ai-provider:").count(), 1, "no duplicate provider key");
+        assert_eq!(once.matches("ai-model:").count(), 1, "no duplicate model key");
+    }
+
+    /// Notes WITHOUT a `---` frontmatter block are returned UNCHANGED.
+    #[test]
+    fn inject_provenance_leaves_notes_without_frontmatter_unchanged() {
+        let md = "# Just a heading\n\nNo frontmatter.";
+        let out = inject_provenance_frontmatter(md, "anthropic", Some("claude-sonnet-4-6"), None);
+        assert_eq!(out, md, "no frontmatter → unchanged");
+    }
+
+    /// The injected keys appear INSIDE the frontmatter block, not after the closing `---`.
+    #[test]
+    fn inject_provenance_keys_are_inside_the_frontmatter_block() {
+        let md = "---\ntitle: T\ndate: 2026-06-30\n---\n# Body\n";
+        let out = inject_provenance_frontmatter(md, "anthropic", None, Some("claude-opus-4-8"));
+        // The structure must be: ---\n...<keys>...\n---\n<body>
+        let close = out.find("\n---\n").expect("closing fence present");
+        let fm_end = close;
+        let fm = &out[..fm_end];
+        assert!(fm.contains("ai-provider: anthropic"), "provider key inside fm: {fm}");
+        assert!(fm.contains("ai-model: claude-opus-4-8"), "model key inside fm: {fm}");
+        // Body untouched.
+        assert!(out.ends_with("# Body\n"), "body unchanged: {out}");
     }
 }

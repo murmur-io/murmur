@@ -199,6 +199,18 @@ pub struct AppConfig {
     /// Affects ONLY the `claude_code` provider (the `anthropic` provider uses the Keychain key).
     #[serde(default)]
     pub claude_code_inherit_env: bool,
+    /// Base URL of the user's OpenAI-compatible AI gateway (LiteLLM / Kong / Portkey / vLLM / …).
+    /// Default `""` (unset). Required when `provider_id == "gateway"`. Must be https:// (or http://
+    /// on loopback). Validated + stored via `getConfig`/`saveConfig`; validated again at provider-
+    /// construction time by `validate_gateway_url`. `#[serde(default)]` ⇒ pre-existing configs load
+    /// as `""` (unset) — no behavioral change for existing installs.
+    #[serde(default)]
+    pub gateway_base_url: String,
+    /// Model id to send to the gateway (e.g. `"gpt-4o"`, `"mistral/mistral-7b"`). Default `""`.
+    /// An empty value sends whatever the gateway's default is. `#[serde(default)]` ⇒ pre-existing
+    /// configs load as `""`.
+    #[serde(default)]
+    pub gateway_model: String,
 }
 
 impl Default for AppConfig {
@@ -239,6 +251,8 @@ impl Default for AppConfig {
             web_search_enabled: false,
             web_search_consented: false,
             claude_code_inherit_env: false,
+            gateway_base_url: String::new(),
+            gateway_model: String::new(),
         }
     }
 }
@@ -279,6 +293,8 @@ const K_REALTIME_REACTIONS: &str = "realtime_reactions";
 const K_WEB_SEARCH_ENABLED: &str = "web_search_enabled";
 const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
+const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
+const K_GATEWAY_MODEL: &str = "gateway_model";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -398,6 +414,14 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_CLAUDE_CODE_INHERIT_ENV)? {
             cfg.claude_code_inherit_env = v == "true";
         }
+        // `""` is valid (= unset) for the gateway fields, so we take the stored value verbatim
+        // (no non-empty guard — mirrors `provider_model` rather than `anthropic_model`).
+        if let Some(v) = db.get_setting(K_GATEWAY_BASE_URL)? {
+            cfg.gateway_base_url = v;
+        }
+        if let Some(v) = db.get_setting(K_GATEWAY_MODEL)? {
+            cfg.gateway_model = v;
+        }
 
         Ok(cfg)
     }
@@ -500,6 +524,8 @@ impl AppConfig {
             K_CLAUDE_CODE_INHERIT_ENV,
             if self.claude_code_inherit_env { "true" } else { "false" },
         )?;
+        db.set_setting(K_GATEWAY_BASE_URL, &self.gateway_base_url)?;
+        db.set_setting(K_GATEWAY_MODEL, &self.gateway_model)?;
         Ok(())
     }
 
@@ -803,5 +829,63 @@ mod tests {
         let loaded = AppConfig::load(&db).unwrap();
         assert!(loaded.vault_path.is_none());
         let _ = PathBuf::new();
+    }
+
+    /// Task 1.1 — gateway fields default to `""` and are never set by pre-existing configs.
+    #[test]
+    fn gateway_fields_default_empty() {
+        // In-memory struct default.
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.gateway_base_url, "", "gateway_base_url must default to empty");
+        assert_eq!(cfg.gateway_model, "", "gateway_model must default to empty");
+
+        // Settings-table path: an empty DB (no key written) loads the defaults.
+        let db = temp_db();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.gateway_base_url, "");
+        assert_eq!(loaded.gateway_model, "");
+    }
+
+    /// Task 1.1 — gateway fields round-trip through save/load unchanged.
+    #[test]
+    fn gateway_fields_round_trip() {
+        let db = temp_db();
+        let cfg = AppConfig {
+            gateway_base_url: "https://my-gateway.example.com/v1".to_string(),
+            gateway_model: "gpt-4o".to_string(),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(
+            loaded.gateway_base_url,
+            "https://my-gateway.example.com/v1"
+        );
+        assert_eq!(loaded.gateway_model, "gpt-4o");
+
+        // Clearing back to `""` (unset) also round-trips — not a one-way latch.
+        let cleared = AppConfig { ..Default::default() };
+        cleared.save(&db).unwrap();
+        let reloaded = AppConfig::load(&db).unwrap();
+        assert_eq!(reloaded.gateway_base_url, "");
+        assert_eq!(reloaded.gateway_model, "");
+    }
+
+    /// Task 1.1 — serde: a payload omitting the gateway fields loads with empty defaults.
+    #[test]
+    fn gateway_fields_serde_default() {
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.gateway_base_url, "", "serde default must be empty string");
+        assert_eq!(cfg.gateway_model, "", "serde default must be empty string");
     }
 }

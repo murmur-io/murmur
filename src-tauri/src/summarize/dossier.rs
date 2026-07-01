@@ -367,6 +367,9 @@ mod tests {
             markdown: md.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(id, folder).unwrap();

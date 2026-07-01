@@ -8,6 +8,9 @@ import type {
   BrainDownloadProgress,
   BrainModelDto,
   EmbedDownloadProgress,
+  EgressLedger,
+  GatewayHealth,
+  GatewayModel,
   ReindexProgress,
   ReindexResult,
   InputDeviceInfo,
@@ -157,6 +160,61 @@ export class IpcService {
 
   hasAnthropicKey(): Promise<boolean> {
     return invoke<boolean>("has_anthropic_key");
+  }
+
+  /**
+   * AI Gateway (Phase 1) — store/replace the gateway API key in Keychain.
+   * An empty/blank key is rejected — call `clearGatewayKey` to remove an existing key.
+   * The key is NEVER logged and NEVER returned to the FE — only `hasGatewayKey` reports presence.
+   * Mirrors {@link setAnthropicKey}.
+   */
+  setGatewayKey(key: string): Promise<void> {
+    return invoke<void>("set_gateway_key", { key });
+  }
+
+  /** Whether a gateway API key is currently stored. Never the value. Mirrors {@link hasAnthropicKey}. */
+  hasGatewayKey(): Promise<boolean> {
+    return invoke<boolean>("has_gateway_key");
+  }
+
+  /**
+   * AI Gateway (Phase 1) — remove the stored gateway API key from Keychain (if any).
+   * No-op when no key is stored. Mirrors how one might remove the Anthropic key.
+   */
+  clearGatewayKey(): Promise<void> {
+    return invoke<void>("clear_gateway_key");
+  }
+
+  /**
+   * AI Gateway (Phase 3) — fetch the model catalog from the configured gateway's
+   * `/v1/models` endpoint. Returns an array of `{ id }` objects (one per model).
+   * Rejects when the gateway is unreachable, the key is wrong, or the endpoint does
+   * not exist (not all gateways expose `/v1/models`). The FE falls back to a plain
+   * text input when the list is empty or the call rejects.
+   */
+  listGatewayModels(): Promise<GatewayModel[]> {
+    return invoke<GatewayModel[]>("list_gateway_models");
+  }
+
+  /**
+   * AI Gateway (Phase 4) — probe whether the configured gateway is reachable and
+   * return the number of models in its catalog. The backend never errors on this
+   * command (unreachable → `{ reachable: false, modelCount: 0 }`). The FE still
+   * catches for safety.
+   */
+  gatewayHealth(): Promise<GatewayHealth> {
+    return invoke<GatewayHealth>("gateway_health");
+  }
+
+  /**
+   * Phase 6 — content-free egress ledger summary for the given rolling window.
+   * Returns aggregate call + token counts, per-model and per-day breakdowns,
+   * total PII redaction counts, and the most-recent call rows — all metadata,
+   * NO transcript text. The command never errors (an empty ledger returns zero
+   * aggregates and empty arrays).
+   */
+  getEgressLedger(days: number): Promise<EgressLedger> {
+    return invoke<EgressLedger>("get_egress_ledger", { days });
   }
 
   /**

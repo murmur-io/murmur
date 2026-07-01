@@ -128,6 +128,66 @@ fn register_vec_extension() {
     });
 }
 
+// ── Egress ledger summary types (Phase 6) ───────────────────────────────────────────────────────
+//
+// Internal aggregate types returned by `Db::egress_summary`. The IPC-facing DTOs in `commands.rs`
+// hold a 1:1 mapping of these (camelCase on the wire). No content fields — counts/ids/labels only.
+
+/// Per-model token-usage roll-up within a time window.
+///
+/// Fields are `u64` (not `u32`) so an all-time SUM over a large egress history cannot
+/// silently overflow (a single meeting can use ~100 k tokens; 2^32 ≈ 4 M tokens total).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressModelUsage {
+    pub model: String,
+    pub calls: u64,
+    pub tokens: u64,
+}
+
+/// Per-day token-usage roll-up within a time window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressDayUsage {
+    /// ISO-8601 date string ("YYYY-MM-DD") in UTC.
+    pub day: String,
+    pub tokens: u64,
+}
+
+/// Summed redaction counts over all rows in the time window.
+///
+/// Fields are `u64` so a large corpus cannot truncate the aggregate (same rationale as the
+/// token totals above).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EgressRedactionTotals {
+    pub email: u64,
+    pub card: u64,
+    pub phone: u64,
+    pub name: u64,
+}
+
+/// One recent row from `egress_log` (last ≤20, newest first), content-free.
+#[derive(Debug, Clone)]
+pub struct EgressRecentRow {
+    pub ts: i64,
+    pub provider_id: String,
+    pub destination: String,
+    pub model_served: Option<String>,
+    pub total_tokens: Option<u32>,
+    pub redactions: EgressRedactionTotals,
+}
+
+/// Full aggregated egress ledger for a rolling time window. Returned by `Db::egress_summary`.
+/// Handles an empty table gracefully — all totals are zero, all vecs are empty.
+#[derive(Debug, Clone)]
+pub struct EgressLedger {
+    pub total_calls: u64,
+    pub total_tokens: u64,
+    pub by_model: Vec<EgressModelUsage>,
+    pub by_day: Vec<EgressDayUsage>,
+    pub total_redactions: EgressRedactionTotals,
+    /// Last ≤20 rows, newest first.
+    pub recent: Vec<EgressRecentRow>,
+}
+
 /// Thread-safe SQLite wrapper (internal Mutex<rusqlite::Connection>).
 pub struct Db {
     conn: Mutex<Connection>,
@@ -359,6 +419,14 @@ impl Db {
         // read only via the gated commands.
         Self::add_column_if_missing(&conn, "meetings", "manual_notes", "TEXT")?;
         Self::add_column_if_missing(&conn, "meetings", "manual_notes_blob", "BLOB")?;
+        // Phase 5 — per-note model provenance. Three additive TEXT columns (NULL-safe: legacy notes
+        // that predate this migration read back as `None` via `row_to_note`; `upsert_note` persists
+        // them when the pipeline passes them in). Content-free: these are model IDs / host strings,
+        // never transcript or note text, so they are NOT sealed/blanked during folder-lock — they
+        // ride the SQLCipher-at-rest layer only.
+        Self::add_column_if_missing(&conn, "notes", "model_requested", "TEXT")?;
+        Self::add_column_if_missing(&conn, "notes", "model_served", "TEXT")?;
+        Self::add_column_if_missing(&conn, "notes", "gateway_host", "TEXT")?;
         // Phase 1 — FTS5/BM25 full-text retrieval over the three text sources
         // (meeting titles, transcript segments, note markdown). Replaces the prior
         // substring LIKE search so word-order/term retrieval works ("alpha beta" == "beta alpha")
@@ -372,6 +440,33 @@ impl Db {
         // deliberately separate from note_chunks so the load-bearing meeting-gating joins stay
         // untouched. Additive + guarded so migrate() stays idempotent.
         Self::migrate_documents(&conn)?;
+        // Phase 2b — content-free egress audit log. One row per cloud provider call written by
+        // `DbEgressSink`. The table carries ONLY counts, ids, labels, byte sizes, and token counts —
+        // NEVER transcript, prompt, scrubbed values, API keys, or any meeting content (§8: no PII
+        // in logs). Additive + guarded so migrate() stays idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS egress_log (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               ts INTEGER NOT NULL,
+               provider_id TEXT NOT NULL,
+               destination TEXT NOT NULL,
+               model_requested TEXT,
+               model_served TEXT,
+               call_kind TEXT NOT NULL,
+               prompt_tokens INTEGER,
+               completion_tokens INTEGER,
+               total_tokens INTEGER,
+               cached_tokens INTEGER,
+               redactions_email INTEGER NOT NULL DEFAULT 0,
+               redactions_card INTEGER NOT NULL DEFAULT 0,
+               redactions_phone INTEGER NOT NULL DEFAULT 0,
+               redactions_name INTEGER NOT NULL DEFAULT 0,
+               system_bytes INTEGER NOT NULL DEFAULT 0,
+               user_bytes INTEGER NOT NULL DEFAULT 0,
+               meeting_id TEXT
+             );",
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -611,6 +706,201 @@ impl Db {
         let conn = self.lock();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(map_err)
+    }
+
+    // ── egress audit log ────────────────────────────────────────────────────
+
+    /// Insert one content-free audit row into `egress_log`. Called by `DbEgressSink::record`.
+    ///
+    /// `ts` is a Unix epoch (seconds) computed by the caller (`SystemTime::now()`). The row
+    /// carries ONLY counts, ids, labels, byte sizes, and token counts — NO content (§8).
+    pub fn insert_egress(
+        &self,
+        ts: i64,
+        e: &crate::summarize::egress_log::EgressEntry,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO egress_log (
+               ts, provider_id, destination, model_requested, model_served, call_kind,
+               prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+               redactions_email, redactions_card, redactions_phone, redactions_name,
+               system_bytes, user_bytes, meeting_id
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            rusqlite::params![
+                ts,
+                e.provider_id,
+                e.destination,
+                e.model_requested,
+                e.meta.model_served.as_deref(),
+                e.call_kind,
+                e.meta.prompt_tokens.map(|v| v as i64),
+                e.meta.completion_tokens.map(|v| v as i64),
+                e.meta.total_tokens.map(|v| v as i64),
+                e.meta.cached_tokens.map(|v| v as i64),
+                e.redactions.email as i64,
+                e.redactions.card as i64,
+                e.redactions.phone as i64,
+                e.redactions.name as i64,
+                e.system_bytes as i64,
+                e.user_bytes as i64,
+                e.meeting_id.as_deref(),
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Aggregate the `egress_log` table over the last `days` calendar days and return a rich
+    /// summary for the "Egress & Usage" Analytics panel.
+    ///
+    /// The time window is `[now_unix - days*86400, now_unix]`. A `days <= 0` value returns ALL
+    /// rows. An empty table (no cloud calls yet) returns all-zero totals and empty vecs — never
+    /// an error.
+    ///
+    /// Read-only: touches `egress_log` only; no content columns. (§6: egress_log has none.)
+    pub fn egress_summary(&self, days: i64) -> Result<EgressLedger> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let since = if days > 0 { now_unix - days * 86_400 } else { 0 };
+
+        let conn = self.lock();
+
+        // ── total calls + total tokens ──────────────────────────────────────
+        // Cast to u64 so an all-time SUM cannot wrap (i64→u64 is safe for non-negative sums).
+        let (total_calls, total_tokens): (u64, u64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(total_tokens),0)
+                   FROM egress_log
+                  WHERE ts >= ?1",
+                rusqlite::params![since],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .map_err(map_err)?;
+
+        // ── total redactions ────────────────────────────────────────────────
+        let total_redactions: EgressRedactionTotals = conn
+            .query_row(
+                "SELECT COALESCE(SUM(redactions_email),0),
+                        COALESCE(SUM(redactions_card),0),
+                        COALESCE(SUM(redactions_phone),0),
+                        COALESCE(SUM(redactions_name),0)
+                   FROM egress_log
+                  WHERE ts >= ?1",
+                rusqlite::params![since],
+                |r| {
+                    Ok(EgressRedactionTotals {
+                        email: r.get::<_, i64>(0)? as u64,
+                        card: r.get::<_, i64>(1)? as u64,
+                        phone: r.get::<_, i64>(2)? as u64,
+                        name: r.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .map_err(map_err)?;
+
+        // ── by_model (GROUP BY model label, tokens DESC) ────────────────────
+        let by_model = {
+            let mut stmt = conn
+                .prepare(
+                    // NULLIF guards: an empty string '' in model_served or model_requested
+                    // (the default when no model is sent by claude_code/anthropic) must bucket
+                    // under '(unknown)' rather than producing a blank label in the Settings UI.
+                    "SELECT COALESCE(NULLIF(model_served,''), NULLIF(model_requested,''), '(unknown)') AS model,
+                            COUNT(*) AS calls,
+                            COALESCE(SUM(total_tokens), 0) AS tokens
+                       FROM egress_log
+                      WHERE ts >= ?1
+                      GROUP BY model
+                      ORDER BY tokens DESC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since], |r| {
+                    Ok(EgressModelUsage {
+                        model: r.get(0)?,
+                        calls: r.get::<_, i64>(1)? as u64,
+                        tokens: r.get::<_, i64>(2)? as u64,
+                    })
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+
+        // ── by_day (GROUP BY UTC date, ascending) ──────────────────────────
+        let by_day = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT date(ts, 'unixepoch') AS day,
+                            COALESCE(SUM(total_tokens), 0) AS tokens
+                       FROM egress_log
+                      WHERE ts >= ?1
+                      GROUP BY day
+                      ORDER BY day ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since], |r| {
+                    Ok(EgressDayUsage {
+                        day: r.get(0)?,
+                        tokens: r.get::<_, i64>(1)? as u64,
+                    })
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+
+        // ── recent rows (last ≤20, newest first) ───────────────────────────
+        let recent = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, provider_id, destination, model_served, total_tokens,
+                            redactions_email, redactions_card, redactions_phone, redactions_name
+                       FROM egress_log
+                      WHERE ts >= ?1
+                      ORDER BY ts DESC
+                      LIMIT 20",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since], |r| {
+                    Ok(EgressRecentRow {
+                        ts: r.get(0)?,
+                        provider_id: r.get(1)?,
+                        destination: r.get(2)?,
+                        model_served: r.get(3)?,
+                        total_tokens: r
+                            .get::<_, Option<i64>>(4)?
+                            .map(|v| v as u32),
+                        redactions: EgressRedactionTotals {
+                            email: r.get::<_, i64>(5)? as u64,
+                            card: r.get::<_, i64>(6)? as u64,
+                            phone: r.get::<_, i64>(7)? as u64,
+                            name: r.get::<_, i64>(8)? as u64,
+                        },
+                    })
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+
+        Ok(EgressLedger { total_calls, total_tokens, by_model, by_day, total_redactions, recent })
     }
 
     // ── correction-log flywheel ──────────────────────────────────────────────
@@ -1796,18 +2086,25 @@ impl Db {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO notes
-               (meeting_id, provider_id, markdown, created_at, exported_path)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+               (meeting_id, provider_id, markdown, created_at, exported_path,
+                model_requested, model_served, gateway_host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(meeting_id, provider_id) DO UPDATE SET
                markdown = excluded.markdown,
                created_at = excluded.created_at,
-               exported_path = excluded.exported_path",
+               exported_path = excluded.exported_path,
+               model_requested = excluded.model_requested,
+               model_served = excluded.model_served,
+               gateway_host = excluded.gateway_host",
             rusqlite::params![
                 note.meeting_id,
                 note.provider_id,
                 note.markdown,
                 note.created_at,
                 note.exported_path,
+                note.model_requested,
+                note.model_served,
+                note.gateway_host,
             ],
         )
         .map_err(map_err)?;
@@ -1817,7 +2114,8 @@ impl Db {
     pub fn get_note(&self, meeting_id: &str, provider_id: &str) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
+                    model_requested, model_served, gateway_host
                FROM notes WHERE meeting_id = ?1 AND provider_id = ?2",
             rusqlite::params![meeting_id, provider_id],
             row_to_note,
@@ -1829,7 +2127,8 @@ impl Db {
     pub fn latest_note(&self) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
+                    model_requested, model_served, gateway_host
                FROM notes ORDER BY created_at DESC LIMIT 1",
             [],
             row_to_note,
@@ -1845,7 +2144,8 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
-            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path
+            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
+                    n.model_requested, n.model_served, n.gateway_host
                FROM notes n
                LEFT JOIN folders f ON f.id = n.folder_id
               WHERE {visible}
@@ -1860,7 +2160,8 @@ impl Db {
     pub fn get_latest_note_for_meeting(&self, meeting_id: &str) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
+                    model_requested, model_served, gateway_host
                FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
             rusqlite::params![meeting_id],
             row_to_note,
@@ -3060,7 +3361,8 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
-            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path
+            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
+                    n.model_requested, n.model_served, n.gateway_host
                FROM notes n
                LEFT JOIN folders f ON f.id = n.folder_id
               WHERE n.meeting_id = ?1 AND {visible}
@@ -4198,6 +4500,9 @@ fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {
         markdown: row.get(2)?,
         created_at: row.get(3)?,
         exported_path: row.get(4)?,
+        model_requested: row.get(5)?,
+        model_served: row.get(6)?,
+        gateway_host: row.get(7)?,
     })
 }
 
@@ -4250,6 +4555,268 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    // ── Phase 2b: egress_log ─────────────────────────────────────────────────
+
+    fn sample_egress_entry() -> crate::summarize::egress_log::EgressEntry {
+        use crate::summarize::egress_log::EgressEntry;
+        use crate::summarize::meta::{CallMeta, RedactionCounts};
+        EgressEntry {
+            provider_id: "anthropic".to_string(),
+            destination: "api.anthropic.com".to_string(),
+            model_requested: "claude-opus-4-8".to_string(),
+            call_kind: "complete",
+            meta: CallMeta {
+                model_served: Some("claude-opus-4-8-20251001".to_string()),
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                total_tokens: Some(150),
+                cached_tokens: None,
+            },
+            redactions: RedactionCounts { email: 1, card: 0, phone: 1, name: 2 },
+            system_bytes: 512,
+            user_bytes: 1024,
+            meeting_id: Some("m1".to_string()),
+        }
+    }
+
+    /// After migrate(), `egress_log` exists; insert_egress then SELECT COUNT(*) == 1.
+    #[test]
+    fn egress_log_table_exists_after_migrate_and_insert_works() {
+        let db = mem_db();
+        let entry = sample_egress_entry();
+        db.insert_egress(1_700_000_000, &entry).unwrap();
+
+        let conn = db.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM egress_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "one row must have been inserted into egress_log");
+    }
+
+    /// migrate() is idempotent even with the new egress_log table (re-running migrate() on an
+    /// already-migrated DB must not error).
+    #[test]
+    fn egress_log_migrate_idempotent() {
+        let db = mem_db(); // migrate() already ran once
+        db.migrate().unwrap(); // second run must succeed
+    }
+
+    /// insert_egress stores token counts and redaction counts correctly.
+    #[test]
+    fn egress_log_insert_round_trips_counts() {
+        let db = mem_db();
+        let entry = sample_egress_entry();
+        db.insert_egress(9999, &entry).unwrap();
+
+        let conn = db.lock();
+        let (ts, prompt_tokens, redactions_email, redactions_name, system_bytes): (
+            i64, Option<i64>, i64, i64, i64,
+        ) = conn
+            .query_row(
+                "SELECT ts, prompt_tokens, redactions_email, redactions_name, system_bytes
+                   FROM egress_log LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(ts, 9999);
+        assert_eq!(prompt_tokens, Some(100));
+        assert_eq!(redactions_email, 1);
+        assert_eq!(redactions_name, 2);
+        assert_eq!(system_bytes, 512);
+    }
+
+    // ── Phase 6: egress_summary ───────────────────────────────────────────────
+
+    /// Helper: build an `EgressEntry` with the given model_served, total_tokens, and redaction
+    /// email count (other fields are stable across tests).
+    fn egress_entry_for_summary(
+        model_served: &str,
+        total_tokens: u32,
+        redaction_email: u32,
+        redaction_name: u32,
+    ) -> crate::summarize::egress_log::EgressEntry {
+        use crate::summarize::egress_log::EgressEntry;
+        use crate::summarize::meta::{CallMeta, RedactionCounts};
+        EgressEntry {
+            provider_id: "anthropic".to_string(),
+            destination: "api.anthropic.com".to_string(),
+            model_requested: model_served.to_string(),
+            call_kind: "complete",
+            meta: CallMeta {
+                model_served: Some(model_served.to_string()),
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: Some(total_tokens),
+                cached_tokens: None,
+            },
+            redactions: RedactionCounts {
+                email: redaction_email,
+                card: 0,
+                phone: 0,
+                name: redaction_name,
+            },
+            system_bytes: 0,
+            user_bytes: 0,
+            meeting_id: None,
+        }
+    }
+
+    /// `egress_summary(30)` on an EMPTY table returns all-zero totals and empty vecs — not an error.
+    /// RED → verify the function exists and handles the zero case before we insert any rows.
+    #[test]
+    fn egress_summary_empty_table_returns_zeros() {
+        let db = mem_db();
+        let ledger = db.egress_summary(30).expect("egress_summary must not error on empty table");
+        assert_eq!(ledger.total_calls, 0, "total_calls should be 0 on empty table");
+        assert_eq!(ledger.total_tokens, 0, "total_tokens should be 0 on empty table");
+        assert!(ledger.by_model.is_empty(), "by_model should be empty on empty table");
+        assert!(ledger.by_day.is_empty(), "by_day should be empty on empty table");
+        assert_eq!(ledger.total_redactions.email, 0);
+        assert_eq!(ledger.total_redactions.name, 0);
+        assert!(ledger.recent.is_empty(), "recent should be empty on empty table");
+    }
+
+    /// Insert 3 rows — 2 models ("claude-opus", "gpt-4o"), 2 distinct UTC dates, known redaction
+    /// counts — and assert `egress_summary(30)` aggregates them correctly.
+    ///
+    /// Row layout:
+    ///   ts=1_700_000_000 (2023-11-14 UTC) — claude-opus, 100 tokens, email=1, name=0
+    ///   ts=1_700_086_400 (2023-11-15 UTC) — gpt-4o,     200 tokens, email=0, name=1
+    ///   ts=1_700_086_401 (2023-11-15 UTC) — claude-opus,  50 tokens, email=2, name=1
+    #[test]
+    fn egress_summary_aggregates_correctly() {
+        let db = mem_db();
+
+        // Insert outside the 30-day window: ts=0 should be excluded once `since` is computed.
+        // (We use absolute timestamps well in the past — window uses `now - 30*86400` which will
+        // exclude ts=0. But we can't control "now" in tests so use days <= 0 for all-rows, or
+        // override the window. Here we use days=0 which means "all rows" per our implementation.)
+        let entry1 = egress_entry_for_summary("claude-opus", 100, 1, 0);
+        let entry2 = egress_entry_for_summary("gpt-4o", 200, 0, 1);
+        let entry3 = egress_entry_for_summary("claude-opus", 50, 2, 1);
+
+        // Use realistic timestamps on the same "relative past" — for the rolling window test we
+        // use days=0 (all-rows mode: since=0) to avoid clock skew in CI.
+        db.insert_egress(1_700_000_000, &entry1).unwrap();
+        db.insert_egress(1_700_086_400, &entry2).unwrap();
+        db.insert_egress(1_700_086_401, &entry3).unwrap();
+
+        let ledger = db.egress_summary(0).expect("egress_summary must not error");
+
+        // ── totals ────────────────────────────────────────────────────────
+        assert_eq!(ledger.total_calls, 3, "total_calls must be 3");
+        assert_eq!(ledger.total_tokens, 350, "total_tokens must be 100+200+50=350");
+
+        // ── by_model (ordered tokens DESC: gpt-4o=200, claude-opus=150) ──
+        assert_eq!(ledger.by_model.len(), 2, "by_model must have 2 entries");
+        let gpt = ledger
+            .by_model
+            .iter()
+            .find(|m| m.model == "gpt-4o")
+            .expect("gpt-4o entry must exist");
+        assert_eq!(gpt.calls, 1, "gpt-4o: 1 call");
+        assert_eq!(gpt.tokens, 200, "gpt-4o: 200 tokens");
+
+        let opus = ledger
+            .by_model
+            .iter()
+            .find(|m| m.model == "claude-opus")
+            .expect("claude-opus entry must exist");
+        assert_eq!(opus.calls, 2, "claude-opus: 2 calls");
+        assert_eq!(opus.tokens, 150, "claude-opus: 100+50=150 tokens");
+
+        // First entry is the one with more tokens (gpt-4o=200 > claude-opus=150)
+        assert_eq!(ledger.by_model[0].model, "gpt-4o", "by_model[0] must be gpt-4o (most tokens)");
+
+        // ── by_day (2 distinct UTC days, ascending) ───────────────────────
+        assert_eq!(ledger.by_day.len(), 2, "by_day must have 2 entries");
+        // 1_700_000_000 = 2023-11-14 UTC; 1_700_086_400/1_700_086_401 = 2023-11-15 UTC
+        assert_eq!(ledger.by_day[0].day, "2023-11-14", "by_day[0] must be 2023-11-14");
+        assert_eq!(ledger.by_day[0].tokens, 100, "2023-11-14: 100 tokens");
+        assert_eq!(ledger.by_day[1].day, "2023-11-15", "by_day[1] must be 2023-11-15");
+        assert_eq!(ledger.by_day[1].tokens, 250, "2023-11-15: 200+50=250 tokens");
+
+        // ── total_redactions: email=1+0+2=3, name=0+1+1=2 ────────────────
+        assert_eq!(ledger.total_redactions.email, 3, "total email redactions must be 3");
+        assert_eq!(ledger.total_redactions.card, 0);
+        assert_eq!(ledger.total_redactions.phone, 0);
+        assert_eq!(ledger.total_redactions.name, 2, "total name redactions must be 2");
+
+        // ── recent: 3 rows, newest first ─────────────────────────────────
+        assert_eq!(ledger.recent.len(), 3, "recent must have 3 rows");
+        assert_eq!(ledger.recent[0].ts, 1_700_086_401, "recent[0] must be the newest row");
+        assert_eq!(ledger.recent[2].ts, 1_700_000_000, "recent[2] must be the oldest row");
+    }
+
+    /// `egress_summary(30)` excludes rows outside the time window. Two rows in the past (ts≈0 =
+    /// 1970, well before any 30-day window); one row at `now_unix - 1` (inside the window).
+    /// We verify that only the in-window row is counted when days=30.
+    #[test]
+    fn egress_summary_respects_time_window() {
+        let db = mem_db();
+
+        // A row far in the past — should be excluded from any 30-day window.
+        let old = egress_entry_for_summary("old-model", 9999, 5, 5);
+        db.insert_egress(1_000, &old).unwrap(); // 1970, definitley outside 30d window
+
+        // A row "now" — should be included.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let recent = egress_entry_for_summary("new-model", 42, 0, 0);
+        db.insert_egress(now_unix, &recent).unwrap();
+
+        let ledger = db.egress_summary(30).expect("egress_summary must not error");
+        assert_eq!(ledger.total_calls, 1, "only 1 in-window row should be counted");
+        assert_eq!(ledger.total_tokens, 42, "only in-window tokens should be counted");
+        assert_eq!(ledger.by_model.len(), 1, "by_model should only contain new-model");
+        assert_eq!(ledger.by_model[0].model, "new-model");
+        // Redaction totals from the old row must NOT appear.
+        assert_eq!(ledger.total_redactions.email, 0, "old row redactions must be excluded");
+    }
+
+    /// FIX 2: a row where BOTH `model_served` and `model_requested` are empty strings (the common
+    /// case for claude_code / anthropic default-model calls before the gateway provider was added)
+    /// must appear in `by_model` under the label `'(unknown)'`, not as a blank `""` string.
+    #[test]
+    fn egress_summary_blank_model_fields_bucket_under_unknown() {
+        use crate::summarize::egress_log::EgressEntry;
+        use crate::summarize::meta::{CallMeta, RedactionCounts};
+
+        let db = mem_db();
+
+        // Row with both model fields empty (default-model call; model_requested="" stored verbatim).
+        let entry_no_model = EgressEntry {
+            provider_id: "claude_code".to_string(),
+            destination: "claude_code (Anthropic CLI)".to_string(),
+            model_requested: String::new(), // "" — the real default
+            call_kind: "complete",
+            meta: CallMeta {
+                model_served: None, // stored as NULL
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                total_tokens: Some(15),
+                cached_tokens: None,
+            },
+            redactions: RedactionCounts::default(),
+            system_bytes: 0,
+            user_bytes: 0,
+            meeting_id: None,
+        };
+
+        db.insert_egress(0, &entry_no_model).unwrap();
+
+        let ledger = db.egress_summary(0).expect("egress_summary must not error");
+        assert_eq!(ledger.by_model.len(), 1, "must have one by_model entry");
+        assert_eq!(
+            ledger.by_model[0].model, "(unknown)",
+            "empty model_served + empty model_requested must bucket under '(unknown)', not ''"
+        );
+        assert_eq!(ledger.by_model[0].tokens, 15);
     }
 
     /// brain2 realtime notes: the `manual_notes` buffer round-trips (set → get), defaults to "" for a
@@ -4779,6 +5346,9 @@ mod tests {
             markdown: "# v1".into(),
             created_at: "2026-06-24T10:31:00Z".into(),
             exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         };
         db.upsert_note(&note).unwrap();
 
@@ -4796,6 +5366,83 @@ mod tests {
 
         assert!(db.get_note("m1", "ollama").unwrap().is_none());
         assert_eq!(db.latest_note().unwrap().unwrap().markdown, "# v2");
+    }
+
+    /// Phase 5 — provenance round-trip: model_requested / model_served / gateway_host are
+    /// persisted via `upsert_note` and read back correctly by every note-fetch path.
+    #[test]
+    fn note_provenance_round_trips() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("prov1", "2026-06-30T10:00:00Z"))
+            .unwrap();
+
+        let note = NoteRecord {
+            meeting_id: "prov1".into(),
+            provider_id: "gateway".into(),
+            markdown: "---\ntitle: T\n---\nBody.".into(),
+            created_at: "2026-06-30T10:05:00Z".into(),
+            exported_path: None,
+            model_requested: Some("gpt-4o".into()),
+            model_served: Some("gpt-4o-2024-11-20".into()),
+            gateway_host: Some("gw.example.com".into()),
+        };
+        db.upsert_note(&note).unwrap();
+
+        let got = db.get_note("prov1", "gateway").unwrap().unwrap();
+        assert_eq!(got.model_requested.as_deref(), Some("gpt-4o"));
+        assert_eq!(got.model_served.as_deref(), Some("gpt-4o-2024-11-20"));
+        assert_eq!(got.gateway_host.as_deref(), Some("gw.example.com"));
+
+        let got2 = db.get_latest_note_for_meeting("prov1").unwrap().unwrap();
+        assert_eq!(got2.model_served.as_deref(), Some("gpt-4o-2024-11-20"));
+    }
+
+    /// Phase 5 — legacy notes (columns NULL) read back as `None` provenance fields.
+    #[test]
+    fn note_provenance_legacy_rows_read_as_none() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("leg1", "2026-06-30T10:00:00Z"))
+            .unwrap();
+        // A note with no provenance (as all pre-Phase-5 notes would be after migration).
+        db.upsert_note(&NoteRecord {
+            meeting_id: "leg1".into(),
+            provider_id: "claude_code".into(),
+            markdown: "# Legacy note".into(),
+            created_at: "2026-06-30T10:01:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        let got = db.get_note("leg1", "claude_code").unwrap().unwrap();
+        assert!(got.model_requested.is_none(), "legacy: model_requested is None");
+        assert!(got.model_served.is_none(), "legacy: model_served is None");
+        assert!(got.gateway_host.is_none(), "legacy: gateway_host is None");
+    }
+
+    /// Phase 5 — `migrate()` twice is still a no-op (idempotent migration covering the new columns).
+    /// The existing `migrate_is_idempotent` test covers the full table list; this one checks
+    /// specifically that the three provenance columns are present after `migrate()` runs once (they
+    /// would be absent in a real pre-Phase-5 DB and must be added by the first migrate).
+    #[test]
+    fn migrate_adds_provenance_columns_to_notes() {
+        let db = mem_db(); // mem_db() calls migrate() once during open_with_key
+        let conn = db.lock();
+        // PRAGMA table_info returns one row per column; verify all three are present.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(notes)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for col in &["model_requested", "model_served", "gateway_host"] {
+            assert!(
+                cols.iter().any(|c| c == col),
+                "column {col} must be present after migrate(); columns: {cols:?}"
+            );
+        }
     }
 
     #[test]
@@ -4839,6 +5486,9 @@ mod tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}-{provider_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
     }
@@ -5856,6 +6506,9 @@ mod lock_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(meeting_id, folder_id).unwrap();
@@ -5870,6 +6523,9 @@ mod lock_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:06:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}-{provider_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         // Keep the new row in the same folder as its siblings.
@@ -6672,6 +7328,9 @@ mod graph_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(meeting_id, folder_id).unwrap();
