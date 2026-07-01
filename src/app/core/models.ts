@@ -443,6 +443,20 @@ export interface MeetingDetail {
    * full unmasked content (`locked` then absent/false).
    */
   locked?: boolean;
+  /**
+   * Phase 5 — AI Gateway model provenance. Populated by the backend from the
+   * `egress_log` table (the recorded `provider_id` + `model_requested` /
+   * `model_served` from the note-generation call). All three are `null` when
+   * the meeting is locked, or when no provenance was recorded (legacy meetings
+   * pre-Phase 5, or providers that don't emit a `CallMeta`). The FE renders a
+   * small provenance badge in the Analysis section when any field is present.
+   */
+  aiProvider: string | null;
+  /** The model name that was REQUESTED when generating the note (e.g. "claude-opus-4-8"). */
+  aiModel: string | null;
+  /** The model name actually SERVED by the provider (may differ from requested when the
+   *  gateway/proxy remaps the id). Preferred over `aiModel` for display when present. */
+  modelServed: string | null;
 }
 
 export interface StatusCount {
