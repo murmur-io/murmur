@@ -2212,6 +2212,13 @@ pub fn save_config(
     state: State<'_, AppState>,
     config: AppConfigDto,
 ) -> Result<(), AppError> {
+    // Validate the gateway URL eagerly, before persisting, so a malformed or credential-bearing
+    // URL (`https://key:@host/v1`) is never stored in the plaintext settings row and never
+    // round-trips to the FE. An empty URL is allowed (no gateway configured).
+    if !config.gateway_base_url.trim().is_empty() {
+        crate::summarize::gateway::validate_gateway_url(&config.gateway_base_url)?;
+    }
+
     // Merge against the CURRENT config under the config lock so the security-sensitive flags that
     // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
     // from the live value, not the incoming payload. Holding the guard across the merge+save+swap
@@ -2562,12 +2569,16 @@ pub async fn gateway_health(
 // `core/models.ts`). Carries ONLY counts, ids, labels, and token/byte numbers — no content (§8).
 
 /// Per-model token-usage roll-up for `EgressLedger.byModel`.
+///
+/// Fields are `u64` so a large all-time cumulative sum (mirroring `EgressModelUsage`) cannot
+/// silently wrap. JavaScript `number` (f64) handles these values without precision loss up to
+/// 2^53 (~9 petaTokens), which is far beyond any realistic usage window.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelUsageDto {
     pub model: String,
-    pub calls: u32,
-    pub tokens: u32,
+    pub calls: u64,
+    pub tokens: u64,
 }
 
 /// Per-day token-usage roll-up for `EgressLedger.byDay`.
@@ -2576,17 +2587,17 @@ pub struct ModelUsageDto {
 pub struct DayUsageDto {
     /// ISO-8601 date string ("YYYY-MM-DD") in UTC.
     pub day: String,
-    pub tokens: u32,
+    pub tokens: u64,
 }
 
 /// Redaction-count totals for the queried window.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedactionTotalsDto {
-    pub email: u32,
-    pub card: u32,
-    pub phone: u32,
-    pub name: u32,
+    pub email: u64,
+    pub card: u64,
+    pub phone: u64,
+    pub name: u64,
 }
 
 /// One row from the `egress_log` table (content-free: counts + ids only).
@@ -2609,8 +2620,8 @@ pub struct EgressRowDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressLedgerDto {
-    pub total_calls: u32,
-    pub total_tokens: u32,
+    pub total_calls: u64,
+    pub total_tokens: u64,
     pub by_model: Vec<ModelUsageDto>,
     pub by_day: Vec<DayUsageDto>,
     pub total_redactions: RedactionTotalsDto,
@@ -6904,6 +6915,36 @@ mod gateway_key_tests {
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "whitespace-only gateway key must be InvalidArg"
+        );
+    }
+
+    // ── FIX 6: gateway URL validated at save time ──────────────────────────────────────────────
+
+    /// `save_config` rejects a gateway URL that embeds credentials — the validation used by the
+    /// save path (`validate_gateway_url`) refuses `https://key:@host/v1` before it reaches the DB.
+    /// Empty URL (no gateway configured) and a valid https URL are both accepted.
+    #[test]
+    fn save_config_gateway_url_with_credentials_is_rejected() {
+        // Credential-bearing URL → InvalidArg (never stored).
+        let err = crate::summarize::gateway::validate_gateway_url("https://key:@host/v1")
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "URL with credentials must be InvalidArg, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn save_config_valid_gateway_url_is_accepted() {
+        // Valid https URL → Ok.
+        assert!(
+            crate::summarize::gateway::validate_gateway_url("https://gw.example.com/v1").is_ok(),
+            "valid https gateway URL must be accepted"
+        );
+        // Localhost http → Ok.
+        assert!(
+            crate::summarize::gateway::validate_gateway_url("http://127.0.0.1:4000/v1").is_ok(),
+            "loopback http gateway URL must be accepted"
         );
     }
 }

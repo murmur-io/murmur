@@ -108,6 +108,10 @@ pub struct AppState {
     /// Db is internally Send+Sync (Mutex<Connection>). Held in an `Arc` so the egress-ledger
     /// sink (`DbEgressSink`) can hold a cheaply-cloned handle without requiring a second keychain
     /// access or separate connection (the ledger writes go through the same locked `Mutex<Conn>`).
+    ///
+    /// INVARIANT: never hold the Db lock across a provider/await call — the egress sink re-locks
+    /// the same non-reentrant Mutex<Connection> inside `DbEgressSink::record`; holding it across
+    /// any provider `await` point would self-deadlock.
     pub db: Arc<Db>,
     /// In-memory cache of the settings table.
     pub config: Mutex<AppConfig>,

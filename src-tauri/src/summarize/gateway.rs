@@ -313,12 +313,9 @@ impl OpenAiCompatProvider {
         let status = resp.status();
         if !status.is_success() {
             let err_body = resp.text().await.unwrap_or_default();
-            let detail =
-                extract_gateway_error(&err_body).unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(AppError::Unavailable(format!(
-                "gateway /models: {}",
-                detail.trim()
-            )));
+            // Route through map_gateway_error for message parity with the chat path (401/429
+            // produce the same actionable messages here as on a bad summarization key/rate-limit).
+            return Err(map_gateway_error(status.as_u16(), &err_body));
         }
 
         let body = resp.text().await.map_err(|e| {
@@ -425,23 +422,27 @@ impl SummarizerProvider for OpenAiCompatProvider {
     }
 
     /// Gateway override: use `response_format: json_schema` so the gateway enforces valid JSON
-    /// output natively (constrained decoding). The content field in the response is already a
-    /// JSON string — extract it via `parse_chat_response` then parse it as a `Value`.
-    async fn complete_json(
+    /// output natively (constrained decoding). Returns both the parsed value AND the real
+    /// `CallMeta` (token usage + served model) from the response — so the egress ledger records
+    /// actual token counts for timeline/graph side-tasks instead of the default empty meta.
+    async fn complete_json_with_meta(
         &self,
         system: &str,
         user: &str,
         schema: &Value,
-    ) -> Result<Value> {
+    ) -> Result<(Value, crate::summarize::meta::CallMeta)> {
         let body = chat_body_json(&self.model, system, user, schema);
         let raw = self.post_chat_raw(body).await?;
-        let (text, _meta) = parse_chat_response(&raw)?;
-        serde_json::from_str::<Value>(&text).map_err(|e| {
+        let (text, meta) = parse_chat_response(&raw)?;
+        let v = serde_json::from_str::<Value>(&text).map_err(|e| {
             AppError::Summarize(format!(
                 "complete_json: gateway returned invalid JSON in content field: {e}"
             ))
-        })
+        })?;
+        Ok((v, meta))
     }
+    // `complete_json` inherits the delegating default: calls `complete_json_with_meta` and
+    // drops the meta — callers that only need the value are unchanged.
 }
 
 #[cfg(test)]
