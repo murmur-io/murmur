@@ -2212,6 +2212,16 @@ pub fn save_config(
     state: State<'_, AppState>,
     config: AppConfigDto,
 ) -> Result<(), AppError> {
+    save_config_inner(state.inner(), config)?;
+    // Reconcile the voice-trigger listener with the new config (AppHandle-dependent; runs after
+    // the config lock is released by `save_config_inner`).
+    restart_voice_listener(app);
+    Ok(())
+}
+
+/// Headless core of [`save_config`]: validate, merge, persist, and refresh the in-memory cache.
+/// No `AppHandle`/event emission here, so it is unit-testable without Tauri.
+pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Result<(), AppError> {
     // Validate the gateway URL eagerly, before persisting, so a malformed or credential-bearing
     // URL (`https://key:@host/v1`) is never stored in the plaintext settings row and never
     // round-trips to the FE. An empty URL is allowed (no gateway configured).
@@ -2223,18 +2233,13 @@ pub fn save_config(
     // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
     // from the live value, not the incoming payload. Holding the guard across the merge+save+swap
     // makes it atomic w.r.t. a concurrent `consent_to_cloud_egress`.
-    {
-        let mut cache = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        let new_config = dto_to_config(config, &cache);
-        new_config.save(&state.db)?;
-        *cache = new_config;
-    }
-    // Reconcile the voice-trigger listener with the new config (re-locks the guard internally, so
-    // it MUST run after the guard above is dropped).
-    restart_voice_listener(app);
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    let new_config = dto_to_config(config, &cache);
+    new_config.save(&state.db)?;
+    *cache = new_config;
     Ok(())
 }
 
@@ -6805,6 +6810,58 @@ mod lifecycle_tests {
         assert!(
             !reindex_semantic_finds(&state.db, "m-open", "budget planning", &nothing),
             "model_missing guard must index NOTHING (no stub poisoning)"
+        );
+    }
+
+    // ── FIX 6 integration: save_config_inner → validate_gateway_url boundary ─────────────────
+
+    /// Drives the REAL `save_config_inner` (the headless core of `save_config`) to guard the
+    /// integration boundary: a future edit that removes the URL-validation guard from
+    /// `save_config_inner` would break this test, not just the unit-level `validate_gateway_url`
+    /// call-site tests.
+    ///
+    /// Three sub-cases:
+    ///   (a) credential-bearing URL → `InvalidArg`; persisted config IS NOT changed.
+    ///   (b) empty URL → `Ok`; empty round-trips.
+    ///   (c) valid https URL → `Ok`; value persists and is visible in the in-memory cache.
+    #[test]
+    fn save_config_inner_validates_gateway_url_at_the_integration_seam() {
+        let state = build_state("cfg-gw-url-integration");
+
+        // ── (a) credential-bearing URL → rejected before writing to DB ───────────────────────
+        let mut dto_bad = config_to_dto(&AppConfig::default());
+        dto_bad.gateway_base_url = "https://key:@gw.example.com/v1".to_string();
+        let err = save_config_inner(&state, dto_bad)
+            .expect_err("credential URL must be rejected by save_config_inner");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for credential URL, got: {err:?}"
+        );
+        // The bad URL must NOT have been written into the in-memory config cache.
+        let cached_url = state.config.lock().unwrap().gateway_base_url.clone();
+        assert_ne!(
+            cached_url, "https://key:@gw.example.com/v1",
+            "credential URL must not reach the config cache (save_config_inner must reject first)"
+        );
+
+        // ── (b) empty URL → Ok (no gateway configured) ───────────────────────────────────────
+        let mut dto_empty = config_to_dto(&AppConfig::default());
+        dto_empty.gateway_base_url = String::new();
+        save_config_inner(&state, dto_empty).expect("empty gateway URL must be accepted");
+        assert_eq!(
+            state.config.lock().unwrap().gateway_base_url,
+            "",
+            "empty gateway URL must persist and round-trip"
+        );
+
+        // ── (c) valid https URL → Ok + persisted in the cache ────────────────────────────────
+        let mut dto_ok = config_to_dto(&AppConfig::default());
+        dto_ok.gateway_base_url = "https://gw.example.com/v1".to_string();
+        save_config_inner(&state, dto_ok).expect("valid https gateway URL must be accepted");
+        assert_eq!(
+            state.config.lock().unwrap().gateway_base_url,
+            "https://gw.example.com/v1",
+            "valid URL must be persisted and visible in the in-memory config cache"
         );
     }
 }
