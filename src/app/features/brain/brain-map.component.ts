@@ -5,6 +5,7 @@ import {
   Injector,
   afterNextRender,
   computed,
+  effect,
   inject,
   input,
   signal,
@@ -390,11 +391,83 @@ export class BrainMapComponent {
     h: WORLD,
   });
 
+  /** Canvas width/height ratio (for squaring the fit-box to the viewport). */
+  private readonly canvasAspect = computed(() => {
+    const cs = this.clientSize();
+    return cs.h > 0 ? cs.w / cs.h : 1.6;
+  });
+
+  /** True once the user has panned/zoomed — stops the auto-fit from stomping them. */
+  private touched = false;
+
   constructor() {
     // Measure the SVG once after first render so wheel/drag deltas convert from
     // client px to user units accurately. afterNextRender — never setTimeout.
     afterNextRender(() => this.measure(), { injector: this.injector });
+
+    // FIT-TO-VIEW: when the laid-out node bounding box changes (new data, or the
+    // first layout) and the user hasn't panned/zoomed yet, snap the viewBox to
+    // that bbox + padding so the nodes FILL the canvas instead of clustering in a
+    // corner of the 1000×1000 world. Reading `fitBox()` registers the dependency;
+    // this writes `_viewBox`, so allowSignalWrites is required (NG0600 guard).
+    effect(
+      () => {
+        const box = this.fitBox();
+        if (box && !this.touched) {
+          this._viewBox.set(box);
+        }
+      },
+      { allowSignalWrites: true },
+    );
   }
+
+  /**
+   * The tight bounding box of the laid-out nodes (their circles + labels),
+   * padded so nothing clips the canvas edge, and squared to the canvas aspect so
+   * the SVG's `preserveAspectRatio` doesn't letterbox it off-centre. Null while
+   * there are no nodes (nothing to fit). This is what fixes "4 dots in a corner":
+   * the initial view frames exactly the drawn graph, not the whole 1000×1000
+   * world the layout happens to seed into.
+   */
+  private readonly fitBox = computed<ViewBox | null>(() => {
+    const nodes = this.placedNodes();
+    if (nodes.length === 0) {
+      return null;
+    }
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of nodes) {
+      // Include the node radius AND its label (drawn below the dot).
+      minX = Math.min(minX, n.x - n.r);
+      minY = Math.min(minY, n.y - n.r);
+      maxX = Math.max(maxX, n.x + n.r);
+      maxY = Math.max(maxY, n.y + n.r + 20);
+    }
+    // Pad by a fraction of the larger span (min floor so a lone node isn't zoomed
+    // to fill the whole canvas).
+    const spanX = maxX - minX;
+    const spanY = maxY - minY;
+    const pad = Math.max(60, Math.max(spanX, spanY) * 0.12);
+    let x = minX - pad;
+    let y = minY - pad;
+    let w = spanX + pad * 2;
+    let h = spanY + pad * 2;
+    // Square to the ~viewport aspect (canvas is roughly landscape); grow the
+    // shorter axis so the fit stays centred and the whole graph is visible.
+    const aspect = this.canvasAspect();
+    if (w / h < aspect) {
+      const nw = h * aspect;
+      x -= (nw - w) / 2;
+      w = nw;
+    } else {
+      const nh = w / aspect;
+      y -= (nh - h) / 2;
+      h = nh;
+    }
+    return { x, y, w, h };
+  });
 
   /**
    * The capped, laid-out nodes. Pure function of {@link data}: take the top-K by
@@ -623,6 +696,7 @@ export class BrainMapComponent {
   /** Wheel = zoom toward the cursor (clamped). */
   protected onWheel(event: WheelEvent): void {
     event.preventDefault();
+    this.touched = true;
     const factor = event.deltaY > 0 ? 1.12 : 1 / 1.12;
     this.zoomAt(event.clientX, event.clientY, factor);
   }
@@ -633,6 +707,7 @@ export class BrainMapComponent {
     if (event.button !== 0) {
       return;
     }
+    this.touched = true;
     this.measure();
     this.panning.set(true);
     this.panStart = { px: event.clientX, py: event.clientY };
@@ -662,14 +737,23 @@ export class BrainMapComponent {
 
   /** Toolbar +/− : zoom about the viewBox centre. */
   protected zoomBy(factor: number): void {
+    this.touched = true;
     const v = this._viewBox();
     const cx = v.x + v.w / 2;
     const cy = v.y + v.h / 2;
     this.applyZoom(cx, cy, factor);
   }
 
+  /**
+   * Reset = re-fit to the laid-out graph (NOT the whole 1000×1000 world), so the
+   * nodes fill the canvas. Clears the `touched` flag so the auto-fit effect owns
+   * the view again. Falls back to the full world only when there is nothing to fit.
+   */
   protected resetView(): void {
-    this._viewBox.set({ x: 0, y: 0, w: WORLD, h: WORLD });
+    this.touched = false;
+    this.measure();
+    const box = this.fitBox();
+    this._viewBox.set(box ?? { x: 0, y: 0, w: WORLD, h: WORLD });
   }
 
   /** Zoom about a CLIENT (px) anchor — keeps the point under the cursor fixed. */
