@@ -100,6 +100,39 @@
         -moz-osx-font-smoothing: grayscale;
       }
 
+      /* Pre-paint LIGHT tokens (kept in sync with styles.css) so a Light/System
+         user never flashes the dark backdrop before styles.css loads. Only the
+         first-paint essentials (surfaces + text + color-scheme) are duplicated. */
+      :root[data-theme="light"] {
+        color-scheme: light;
+        --surface-base: #f3f3f8;
+        --surface-raised: rgba(255, 255, 255, 0.72);
+        --surface-overlay: #ffffff;
+        --surface-input: rgba(18, 18, 40, 0.04);
+        --surface-solid: #ffffff;
+        --surface-hover: rgba(18, 18, 40, 0.05);
+        --text-primary: #17171f;
+        --text-secondary: #55555f;
+        --text-muted: #86868f;
+        --border: rgba(18, 18, 40, 0.12);
+      }
+      @media (prefers-color-scheme: light) {
+        :root[data-theme="system"],
+        :root:not([data-theme]) {
+          color-scheme: light;
+          --surface-base: #f3f3f8;
+          --surface-raised: rgba(255, 255, 255, 0.72);
+          --surface-overlay: #ffffff;
+          --surface-input: rgba(18, 18, 40, 0.04);
+          --surface-solid: #ffffff;
+          --surface-hover: rgba(18, 18, 40, 0.05);
+          --text-primary: #17171f;
+          --text-secondary: #55555f;
+          --text-muted: #86868f;
+          --border: rgba(18, 18, 40, 0.12);
+        }
+      }
+
       * {
         box-sizing: border-box;
       }

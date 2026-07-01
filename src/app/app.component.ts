@@ -13,6 +13,7 @@ import { filter, map } from "rxjs";
 import { IpcService } from "./core/ipc.service";
 import { FoldersService } from "./services/folders.service";
 import { ScreenShareService } from "./services/screen-share.service";
+import { ThemeService } from "./services/theme.service";
 
 @Component({
   selector: "app-root",
@@ -31,6 +32,9 @@ export class AppComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly screenShare = inject(ScreenShareService);
+  // Injected at bootstrap so the theme is applied (in the service constructor)
+  // before the main window is revealed — no flash of the wrong theme.
+  private readonly theme = inject(ThemeService);
 
   /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
   readonly isBar = toSignal(
@@ -97,6 +101,9 @@ export class AppComponent implements OnInit {
    * The bar window does neither — it stays chromeless and side-effect-free.
    */
   async ngOnInit(): Promise<void> {
+    // Re-assert the chosen theme on startup (idempotent) for both windows.
+    this.theme.ensureApplied();
+
     if (this.isBar()) return;
 
     // Arm the screen-share guard + prime the folder store (main window only).
