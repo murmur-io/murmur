@@ -467,6 +467,10 @@ impl Db {
              );",
         )
         .map_err(map_err)?;
+        // Keyword (FTS5/BM25) retrieval over doc chunks so documents/brain notes are reachable on a
+        // DEFAULT install (no e5 model, semantic flag off). Additive + guarded so migrate() stays
+        // idempotent. Runs AFTER migrate_documents (the triggers reference doc_chunks).
+        Self::migrate_doc_fts(&conn)?;
         Ok(())
     }
 
@@ -522,6 +526,74 @@ impl Db {
             dim = crate::embed::EMBED_DIM
         ))
         .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Idempotent FTS5 index over `doc_chunks` (the SAME external-content + trigger pattern and the
+    /// SAME `unicode61 remove_diacritics 2` tokenizer as [`Db::migrate_fts`]), so documents and
+    /// typed brain notes are keyword-retrievable WITHOUT the e5 model.
+    ///
+    /// Lock model: the FTS index is DERIVED from `doc_chunks.text`, whose canonical copy while
+    /// sealed is the document's `text_blob` — so purging the index destroys nothing. The seal path
+    /// deletes a sealed folder's `doc_chunks` rows (`purge_doc_chunks_tx`), which fires the `_ad`
+    /// trigger and removes the sealed tokens from this index in the SAME statement; unseal
+    /// re-chunks, and the `_ai` trigger re-indexes. Gated reads go through
+    /// [`Db::search_doc_chunks_fts_visible`] (visibility_clause defense-in-depth on top).
+    fn migrate_doc_fts(conn: &Connection) -> Result<()> {
+        let already_built: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fts_doc_chunks'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
+
+        // One-time backfill from rows that predate the index (a model-present install already has
+        // doc_chunks). Only on first creation — later launches are trigger-maintained no-ops, so
+        // migrate() stays idempotent. The backfill rides the SAME transaction as the CREATEs: a
+        // crash between "table exists" and "backfill ran" would otherwise leave pre-existing chunks
+        // permanently keyword-dark (the `already_built` guard would skip the backfill forever).
+        let backfill = if already_built {
+            ""
+        } else {
+            "INSERT INTO fts_doc_chunks(rowid, text) SELECT id, text FROM doc_chunks;"
+        };
+        let batch = format!(
+            "BEGIN IMMEDIATE;
+             CREATE VIRTUAL TABLE IF NOT EXISTS fts_doc_chunks USING fts5(
+                 text,
+                 content='doc_chunks',
+                 content_rowid='id',
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+
+             -- doc_chunks → fts_doc_chunks. Chunk text is write-once (purge-then-reinsert), but the
+             -- _au trigger is kept for parity with the meeting FTS trio (an UPDATE can never leave
+             -- stale tokens behind).
+             CREATE TRIGGER IF NOT EXISTS fts_doc_chunks_ai AFTER INSERT ON doc_chunks BEGIN
+                 INSERT INTO fts_doc_chunks(rowid, text) VALUES (new.id, new.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_doc_chunks_ad AFTER DELETE ON doc_chunks BEGIN
+                 INSERT INTO fts_doc_chunks(fts_doc_chunks, rowid, text)
+                   VALUES ('delete', old.id, old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_doc_chunks_au AFTER UPDATE ON doc_chunks BEGIN
+                 INSERT INTO fts_doc_chunks(fts_doc_chunks, rowid, text)
+                   VALUES ('delete', old.id, old.text);
+                 INSERT INTO fts_doc_chunks(rowid, text) VALUES (new.id, new.text);
+             END;
+             {backfill}
+             COMMIT;"
+        );
+        let res = conn.execute_batch(&batch);
+        if res.is_err() {
+            // A failed batch leaves the explicit transaction open on this connection — roll it
+            // back so the error path hands later code a clean connection state.
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+        res.map_err(map_err)?;
         Ok(())
     }
 
@@ -1762,6 +1834,20 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Number of `doc_vec_chunks` rows currently indexed for a document. Lets the tests assert the
+    /// no-stub-vector contract (chunk-only indexing writes ZERO vectors). Test-only.
+    #[cfg(test)]
+    pub(crate) fn doc_vec_count(&self, document_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN
+               (SELECT id FROM doc_chunks WHERE document_id = ?1)",
+            rusqlite::params![document_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
     /// A document's `(folder_id, name, plaintext text)`, or `None` if unknown. The COMMAND layer gates
     /// the folder before surfacing the text to the FE.
     pub fn get_document(&self, id: &str) -> Result<Option<(String, String, String)>> {
@@ -1883,22 +1969,28 @@ impl Db {
         Ok(())
     }
 
-    /// (Re)index a VISIBLE document's plaintext into `doc_chunks` + `doc_vec_chunks`. Old rows for the
-    /// document are purged first (clean replace). Caller MUST only invoke this for visible/unlocked
-    /// content — a sealed document's plaintext is blank, so chunking yields zero chunks (no-op).
+    /// (Re)index a VISIBLE document's plaintext into `doc_chunks` (always — the `fts_doc_chunks`
+    /// triggers keep keyword retrieval alive on a default install) and `doc_vec_chunks` (only when
+    /// `embedder` is `Some`, i.e. the REAL e5 model is present — `None` writes NO vectors, never
+    /// stub ones). Old rows for the document are purged first (clean replace). Caller MUST only
+    /// invoke this for visible/unlocked content — a sealed document's plaintext is blank, so
+    /// chunking yields zero chunks (the purge still runs, leaving the index dark).
     /// Mirrors [`Db::index_meeting_chunks`]; uses the same `chunk_note` + `embed_passage` convention
     /// so doc vectors are comparable to note vectors in the shared embedding space.
-    pub fn index_document_chunks(&self, document_id: &str, embedder: &dyn Embedder) -> Result<()> {
+    pub fn index_document_chunks(
+        &self,
+        document_id: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<()> {
         let Some((_folder_id, name, text)) = self.get_document(document_id)? else {
             return Ok(()); // unknown document — nothing to index.
         };
         // Header carries the document name as provenance (the date axis is N/A for an upload, so the
         // header is just the name — `chunk_note` tolerates an empty date).
         let chunks = crate::embed::chunk_note(&name, "", &text);
-        let vectors = if chunks.is_empty() {
-            Vec::new()
-        } else {
-            embedder.embed_passage(&chunks)?
+        let vectors = match embedder {
+            Some(e) if !chunks.is_empty() => e.embed_passage(&chunks)?,
+            _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
         };
 
         let this_doc = [document_id.to_string()];
@@ -1915,15 +2007,17 @@ impl Db {
             let mut ins_vec = tx
                 .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
                 .map_err(map_err)?;
-            for (idx, (text, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
+            for (idx, text) in chunks.iter().enumerate() {
                 ins_chunk
                     .execute(rusqlite::params![document_id, idx as i64, text])
                     .map_err(map_err)?;
-                let chunk_id = tx.last_insert_rowid();
-                let blob = crate::embed::vec_to_blob(vector);
-                ins_vec
-                    .execute(rusqlite::params![chunk_id, blob])
-                    .map_err(map_err)?;
+                if let Some(vector) = vectors.get(idx) {
+                    let chunk_id = tx.last_insert_rowid();
+                    let blob = crate::embed::vec_to_blob(vector);
+                    ins_vec
+                        .execute(rusqlite::params![chunk_id, blob])
+                        .map_err(map_err)?;
+                }
             }
         }
         tx.commit().map_err(map_err)?;
@@ -2021,6 +2115,99 @@ impl Db {
             hits.push(hit);
         }
         Ok(hits)
+    }
+
+    /// GATED keyword (FTS5/BM25) search over DOCUMENT chunks — the model-free twin of
+    /// [`Db::search_doc_chunks_visible`], so documents/brain notes are reachable on a DEFAULT
+    /// install (no e5 model, semantic flag off). Applies EXACTLY the `visibility_clause` predicate
+    /// (joined doc_chunks → documents → folders) so a chunk in a sealed-and-not-session-unlocked
+    /// folder is EXCLUDED even if a stray chunk survived purge — defense-in-depth on top of the
+    /// trigger-purged FTS index. Dedups to one hit per document (best bm25), capped at `limit`.
+    pub fn search_doc_chunks_fts_visible(
+        &self,
+        query: &str,
+        limit: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<DocChunkHit>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let Some(match_expr) = fts_match_query(query.trim()) else {
+            return Ok(Vec::new()); // punctuation-only / empty query → no hits, never an FTS error.
+        };
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT d.id, d.name, d.folder_id, dc.text, bm25(fts_doc_chunks) AS rank
+               FROM fts_doc_chunks
+               JOIN doc_chunks dc ON dc.id = fts_doc_chunks.rowid
+               JOIN documents d ON d.id = dc.document_id
+               JOIN folders f ON f.id = d.folder_id
+              WHERE fts_doc_chunks MATCH ?1 AND {visible}
+              ORDER BY rank ASC, d.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_expr], |row| {
+                Ok(DocChunkHit {
+                    document_id: row.get(0)?,
+                    name: row.get(1)?,
+                    folder_id: row.get(2)?,
+                    snippet: row.get(3)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut hits = Vec::new();
+        for r in rows {
+            let hit = r.map_err(map_err)?;
+            if !seen.insert(hit.document_id.clone()) {
+                continue; // already have a better-ranked chunk for this document.
+            }
+            hits.push(hit);
+            if hits.len() as i64 >= limit {
+                break;
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Ids of every VISIBLE document (its folder open or session-unlocked), oldest-first. The
+    /// reindex-backfill corpus: a sealed-and-not-unlocked folder's documents are NEVER returned, so
+    /// their (blank) plaintext is never chunked and their index rows STAY purged.
+    pub fn visible_document_ids(&self, unlocked: &HashSet<String>) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT d.id FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE {visible}
+              ORDER BY d.created_at ASC, d.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// True iff a document currently has `doc_chunks` rows. Lets the model-absent reindex backfill
+    /// SKIP documents that are already chunked (a purge-then-reinsert without vectors would DESTROY
+    /// their existing real vectors — chunk-only backfill is for write-only rows, never a downgrade).
+    pub fn document_has_chunks(&self, document_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM doc_chunks WHERE document_id = ?1",
+                rusqlite::params![document_id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
     }
 
     // ── segments ────────────────────────────────────────────────────────────
@@ -5860,7 +6047,7 @@ mod tests {
         seed_folder(&db, "f-open", "Project");
         db.insert_document("d1", "f-open", "spec.md", "budget planning for the quarter", "document", 100)
             .unwrap();
-        db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder)).unwrap();
 
         // Metadata (no text) + full text read back.
         let listed = db.documents_in_folder("f-open").unwrap();
@@ -5902,7 +6089,7 @@ mod tests {
         seed_folder(&db, "f-locked", "Secret");
         db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", "document", 100)
             .unwrap();
-        db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder)).unwrap();
         // Query vector = the stub passage embedding of the doc's own chunk text → guaranteed nearest.
         let chunk_text: String = db
             .lock()
@@ -5947,6 +6134,137 @@ mod tests {
         );
     }
 
+    /// ALWAYS-CHUNK contract (PR B): indexing with NO embedder (`None` — the model-less default
+    /// install) stores `doc_chunks` rows and ZERO vectors, and the chunk text is immediately
+    /// keyword-findable via the gated FTS leg. Deterministic regardless of whether the dev machine
+    /// has the real e5 model.
+    #[test]
+    fn index_document_chunks_none_embedder_chunks_no_vectors_fts_finds() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Project");
+        db.insert_document("d1", "f-open", "spec.md", "the pistachio launch is in March", "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+
+        assert!(db.doc_chunk_count("d1").unwrap() >= 1, "chunk rows stored without a model");
+        assert_eq!(db.doc_vec_count("d1").unwrap(), 0, "no vectors written without a model");
+
+        let nothing = std::collections::HashSet::new();
+        let hits = db.search_doc_chunks_fts_visible("pistachio", 10, &nothing).unwrap();
+        assert!(
+            hits.iter().any(|h| h.document_id == "d1" && h.snippet.contains("pistachio")),
+            "chunk-only document must be keyword-findable: {hits:?}"
+        );
+        // Punctuation-only query defuses to no hits (never an FTS syntax error).
+        assert!(db.search_doc_chunks_fts_visible("?!*(", 10, &nothing).unwrap().is_empty());
+    }
+
+    /// GATE twin of `doc_chunk_search_is_gated_by_visibility` for the KEYWORD leg: a doc chunk row
+    /// that deliberately SURVIVES in a sealed-not-unlocked folder is EXCLUDED by
+    /// `search_doc_chunks_fts_visible` (defense-in-depth `visibility_clause`) and reappears only
+    /// with the session unlock set. RED if the clause were dropped from the FTS join.
+    #[test]
+    fn doc_chunk_fts_search_is_gated_by_visibility() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.search_doc_chunks_fts_visible("launch", 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d1"),
+            "open-folder document chunk must be keyword-visible"
+        );
+
+        // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
+        db.set_folder_locked("f-locked", true, None).unwrap();
+        assert!(
+            !db.search_doc_chunks_fts_visible("launch", 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d1"),
+            "sealed-not-unlocked document chunk leaked through the FTS gate"
+        );
+
+        // Session-unlock → present again.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        assert!(
+            db.search_doc_chunks_fts_visible("launch", 10, &unlocked)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d1"),
+            "session-unlocked document chunk must reappear in FTS search"
+        );
+    }
+
+    /// SEAL-DARKNESS at the INDEX level: purging a document's chunks (what the lock path does)
+    /// removes its tokens from `fts_doc_chunks` in the same statement (the `_ad` trigger), so no
+    /// sealed token survives in the inverted index at rest; re-indexing restores them. Mirrors
+    /// `sealed_tokens_purged_from_fts_after_blank` for the meeting FTS trio.
+    #[test]
+    fn doc_fts_tokens_purged_with_chunks_and_restored_on_reindex() {
+        let db = mem_db();
+        seed_folder(&db, "f", "F");
+        db.insert_document("d1", "f", "n.md", "unicornfeather budget detail", "note", 100)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+
+        let fts_count = |db: &Db| -> i64 {
+            db.lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM fts_doc_chunks WHERE fts_doc_chunks MATCH '\"unicornfeather\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert!(fts_count(&db) >= 1, "token indexed after chunking");
+
+        db.purge_doc_chunks_for_documents(&["d1".to_string()]).unwrap();
+        assert_eq!(fts_count(&db), 0, "sealed/purged token must not survive in the FTS index");
+        let nothing = std::collections::HashSet::new();
+        assert!(db.search_doc_chunks_fts_visible("unicornfeather", 10, &nothing).unwrap().is_empty());
+
+        db.index_document_chunks("d1", None).unwrap();
+        assert!(fts_count(&db) >= 1, "re-index restores the keyword index");
+    }
+
+    /// POLISH DIACRITICS: the doc FTS uses the SAME `unicode61 remove_diacritics 2` tokenizer as
+    /// the meeting tables, so an ASCII-folded query matches the diacritic original and vice versa
+    /// for NFD-decomposable marks (ż/ź/ę/ś/ą/ó/ć/ń — note ł, a stroked letter with NO Unicode
+    /// decomposition, is genuinely NOT foldable by any FTS5 remove_diacritics mode).
+    #[test]
+    fn doc_fts_matches_polish_diacritics_folded() {
+        let db = mem_db();
+        seed_folder(&db, "f", "F");
+        db.insert_document("d1", "f", "pl.md", "gęślą jaźń — budżet kwartalny", "note", 100)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        for q in ["budzet", "jazn", "gesla"] {
+            assert!(
+                db.search_doc_chunks_fts_visible(q, 10, &nothing)
+                    .unwrap()
+                    .iter()
+                    .any(|h| h.document_id == "d1"),
+                "ASCII query {q:?} must match the diacritic original (remove_diacritics 2)"
+            );
+        }
+        assert!(
+            db.search_doc_chunks_fts_visible("gęślą", 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d1"),
+            "diacritic query must match too"
+        );
+    }
+
     /// SEAL ROUND-TRIP (verify-before-destroy, byte-identical): a document's text encrypts under a CK
     /// (AAD-less here for the unit, mirroring the `seal_*_round_trips_byte_identical` pattern), blanks,
     /// and decrypts back byte-identical via `seal_document` / `set_document_text` / `clear_document_blob`.
@@ -5983,7 +6301,7 @@ mod tests {
         let db = mem_db();
         seed_folder(&db, "f", "F");
         db.insert_document("d1", "f", "n.md", "alpha bravo charlie", "document", 100).unwrap();
-        db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder)).unwrap();
         db.delete_document("d1").unwrap();
         assert!(db.get_document("d1").unwrap().is_none(), "document row deleted");
         let count: i64 = db

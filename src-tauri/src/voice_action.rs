@@ -684,11 +684,14 @@ fn web_citation_from_line(line: &str) -> Option<String> {
 /// Whether a tool result is a "nothing found" / "disabled" placeholder rather than real content,
 /// so it can be excluded from the brain grounding (an included placeholder would falsely count as
 /// grounding and trigger a brain call on an empty vault). Matches the deterministic prefixes
-/// `execute_tool` emits (`No meetings match`, `No data`, `No open commitments`, `No visible
-/// entity`, and the `Semantic search is disabled` notice).
+/// `execute_tool` emits (`No meetings or documents match` — including `search_semantic`'s flag-off
+/// keyword-fallback variant — `No data`, `No open commitments`, `No visible entity`; the legacy
+/// `No meetings match` / `Semantic search is disabled` prefixes are kept so an old-shape sentinel
+/// can never miscount as grounding).
 fn is_empty_tool_result(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("No meetings match")
+        || t.starts_with("No meetings or documents match")
         || t.starts_with("No data")
         || t.starts_with("No open commitments")
         || t.starts_with("No visible entity")
