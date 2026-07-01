@@ -87,4 +87,4 @@ spctl -a -vvv -t open --context context:primary-signature "$OUT_DMG" 2>&1 | tail
 
 echo "✅ Notarized universal DMG: $OUT_DMG"
 echo "   Upload to the release:"
-echo "     gh release upload v$VERSION --repo JakubGawr/murmur \"$OUT_DMG\" --clobber"
+echo "     gh release upload v$VERSION --repo murmur-io/murmur \"$OUT_DMG\" --clobber"
