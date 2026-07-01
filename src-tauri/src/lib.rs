@@ -86,6 +86,8 @@ pub fn run() {
             commands::save_manual_notes,
             commands::get_manual_notes,
             commands::import_document,
+            commands::import_text,
+            commands::brain_overview,
             commands::list_documents,
             commands::get_document,
             commands::delete_document,

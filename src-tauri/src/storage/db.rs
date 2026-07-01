@@ -413,6 +413,10 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_doc_chunks_document ON doc_chunks(document_id);",
         )
         .map_err(map_err)?;
+        // `kind` distinguishes an UPLOADED file ('document') from a TYPED brain note ('note'). Additive
+        // + guarded so migrate() stays idempotent; legacy rows default to 'document'. Both kinds ride
+        // the SAME seal/unseal/purge/gating — `kind` is a presentation split for the Brain page only.
+        Self::add_column_if_missing(conn, "documents", "kind", "TEXT NOT NULL DEFAULT 'document'")?;
         // The vec0 column width is the embedder's EMBED_DIM (== the note vec_chunks width). Format the
         // DDL (no user input). Parallel to `vec_chunks` but keyed to `doc_chunks.id`.
         conn.execute_batch(&format!(
@@ -1366,13 +1370,14 @@ impl Db {
         folder_id: &str,
         name: &str,
         text: &str,
+        kind: &str,
         created_at: i64,
     ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO documents (id, folder_id, name, text, text_blob, created_at)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-            rusqlite::params![id, folder_id, name, text, created_at],
+            "INSERT INTO documents (id, folder_id, name, text, kind, text_blob, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+            rusqlite::params![id, folder_id, name, text, kind, created_at],
         )
         .map_err(map_err)?;
         Ok(())
@@ -1385,7 +1390,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, created_at FROM documents
+                "SELECT id, name, kind, created_at FROM documents
                    WHERE folder_id = ?1 ORDER BY created_at DESC, name",
             )
             .map_err(map_err)?;
@@ -1394,7 +1399,8 @@ impl Db {
                 Ok(DocumentInfo {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    created_at: r.get(2)?,
+                    kind: r.get(2)?,
+                    created_at: r.get(3)?,
                 })
             })
             .map_err(map_err)?;
@@ -1403,6 +1409,53 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok(out)
+    }
+
+    /// VISIBLE-content counts for the Brain page: `(meeting_count, document_count, note_count,
+    /// indexed_chunk_count)`. Meetings + documents/notes are gated by `visibility_clause` (a
+    /// sealed-not-unlocked folder's items are NOT counted). Chunks are PURGED on lock, so a plain
+    /// total counts only what is currently indexed (= visible) and is leak-free (a bare number).
+    pub fn brain_counts(&self, unlocked: &HashSet<String>) -> Result<(i64, i64, i64, i64)> {
+        let conn = self.lock();
+        // Meetings — mirror `list_meetings_visible`: visible if no notes OR any visible note.
+        let m_visible = visibility_clause("f", unlocked);
+        let meeting_count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM meetings m
+                       WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                          OR EXISTS (SELECT 1 FROM notes n
+                                       LEFT JOIN folders f ON f.id = n.folder_id
+                                      WHERE n.meeting_id = m.id AND {m_visible})"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        // Documents + notes — gated by folder visibility, split by kind.
+        let d_visible = visibility_clause("f", unlocked);
+        let count_kind = |kind: &str| -> Result<i64> {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE d.kind = ?1 AND {d_visible}"
+                ),
+                rusqlite::params![kind],
+                |r| r.get(0),
+            )
+            .map_err(map_err)
+        };
+        let document_count = count_kind("document")?;
+        let note_count = count_kind("note")?;
+        // Chunks — purged on lock, so a bare total reflects only currently-indexed (visible) content.
+        let note_chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM note_chunks", [], |r| r.get(0))
+            .map_err(map_err)?;
+        let doc_chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM doc_chunks", [], |r| r.get(0))
+            .map_err(map_err)?;
+        Ok((meeting_count, document_count, note_count, note_chunks + doc_chunks))
     }
 
     /// Number of `doc_chunks` rows currently indexed for a document (0 when sealed/purged or never
@@ -5155,7 +5208,7 @@ mod tests {
     fn document_index_and_purge_round_trip() {
         let db = mem_db();
         seed_folder(&db, "f-open", "Project");
-        db.insert_document("d1", "f-open", "spec.md", "budget planning for the quarter", 100)
+        db.insert_document("d1", "f-open", "spec.md", "budget planning for the quarter", "document", 100)
             .unwrap();
         db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
 
@@ -5197,7 +5250,7 @@ mod tests {
     fn doc_chunk_search_is_gated_by_visibility() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", 100)
+        db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", "document", 100)
             .unwrap();
         db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
         // Query vector = the stub passage embedding of the doc's own chunk text → guaranteed nearest.
@@ -5252,7 +5305,7 @@ mod tests {
         let db = mem_db();
         seed_folder(&db, "f", "F");
         let original = "zażółć gęślą jaźń — DECISION: ship Friday";
-        db.insert_document("d1", "f", "n.md", original, 100).unwrap();
+        db.insert_document("d1", "f", "n.md", original, "document", 100).unwrap();
 
         let ck = crate::crypto::random_key().unwrap();
         // Encrypt + VERIFY decryptable BEFORE sealing (the command's verify-before-destroy rule).
@@ -5279,7 +5332,7 @@ mod tests {
     fn delete_document_drops_row_and_chunks() {
         let db = mem_db();
         seed_folder(&db, "f", "F");
-        db.insert_document("d1", "f", "n.md", "alpha bravo charlie", 100).unwrap();
+        db.insert_document("d1", "f", "n.md", "alpha bravo charlie", "document", 100).unwrap();
         db.index_document_chunks("d1", &crate::embed::StubEmbedder).unwrap();
         db.delete_document("d1").unwrap();
         assert!(db.get_document("d1").unwrap().is_none(), "document row deleted");
