@@ -109,7 +109,7 @@ git log -1 --format='%an <%ae>'  # MUST be QueaT <kgm004a@gmail.com>
 ### 7. PR to the `murmur` trunk (never direct push)
 ```bash
 git push -u origin feat/<slug>
-gh pr create -R JakubGawr/murmur --base murmur --head feat/<slug> \
+gh pr create -R murmur-io/murmur --base murmur --head feat/<slug> \
   --title "<type>(<scope>): <subject>" --body "<what + how verified>"
 ```
 `gh` active account MUST be `JakubGawr`. Base is `murmur` (the trunk) via PR — direct

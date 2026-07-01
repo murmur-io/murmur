@@ -8,7 +8,8 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BriefResult, BuiltinRecipe, CalendarContext,
+    ActionItem, Analytics, AskVaultResult, BrainOverview, BriefResult, BuiltinRecipe,
+    CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
     NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
@@ -369,6 +370,11 @@ pub async fn stop_recording(
         slot.take()
             .ok_or_else(|| AppError::Audio("not recording".into()))?
     };
+
+    // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
+    // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
+    // the just-recorded folder is sealed). The authoritative transcript is produced below.
+    crate::transcribe::live::clear_live_transcript(&state.live_transcript);
 
     let meeting_uuid = {
         let mut current = state
@@ -906,20 +912,6 @@ pub(crate) fn import_document_inner(
     path: &str,
     folder_id: &str,
 ) -> Result<String, AppError> {
-    // The folder must exist (so the FK holds + the meeting/document gating has an anchor).
-    let folder = state
-        .db
-        .folder_by_id(folder_id)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
-
-    // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused — never resurrect plaintext at
-    // rest behind a lock. (`folder.locked` + the session set, via `folder_is_unlocked`.)
-    if folder.locked && !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to add a document".into(),
-        ));
-    }
-
     // Extension allowlist (md/txt only). Lowercased; an extension-less path is rejected.
     let p = std::path::Path::new(path);
     let ext_ok = p
@@ -946,30 +938,86 @@ pub(crate) fn import_document_inner(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "document".to_string());
 
+    ingest_into_folder(state, folder_id, &name, &text, "document")
+}
+
+/// Ingest TYPED text as a brain `note` (the Brain page "+ Add note"). Same gated ingest path + seal
+/// + vector indexing as an uploaded document, just `kind="note"` and no file/extension step.
+#[tauri::command]
+pub fn import_text(
+    state: State<'_, AppState>,
+    name: String,
+    text: String,
+    folder_id: String,
+) -> Result<String, AppError> {
+    import_text_inner(state.inner(), &name, &text, &folder_id)
+}
+
+/// Inner of [`import_text`] taking `&AppState` (unit-testable gate). Empty text is refused.
+pub(crate) fn import_text_inner(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    folder_id: &str,
+) -> Result<String, AppError> {
+    if text.trim().is_empty() {
+        return Err(AppError::InvalidArg("note text is empty".into()));
+    }
+    let name = if name.trim().is_empty() { "note" } else { name.trim() };
+    ingest_into_folder(state, folder_id, name, text, "note")
+}
+
+/// The SINGLE gated ingest path for both an uploaded document (`kind="document"`) and a typed note
+/// (`kind="note"`): look up the folder, WRITE-GATE it (a sealed-not-unlocked folder is refused so
+/// content can never appear at rest behind a lock), insert the `documents` row, and index its chunks
+/// into the vector layer ONLY when the REAL e5 model is present (never stub vectors — mirrors
+/// `should_auto_index`). The row is sealed-and-restored + purged-on-lock identically regardless of
+/// kind. Returns the new id.
+fn ingest_into_folder(
+    state: &AppState,
+    folder_id: &str,
+    name: &str,
+    text: &str,
+    kind: &str,
+) -> Result<String, AppError> {
+    // The folder must exist (so the FK holds + the gating has an anchor).
+    let folder = state
+        .db
+        .folder_by_id(folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+
+    // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused (never resurrect plaintext at
+    // rest behind a lock). One gate for every ingest path.
+    if folder.locked && !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to add to the brain".into(),
+        ));
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().timestamp_millis();
     state
         .db
-        .insert_document(&id, folder_id, &name, &text, created_at)?;
+        .insert_document(&id, folder_id, name, text, kind, created_at)?;
 
-    // Index the document's text into the vector layer — ONLY when the REAL e5 model is present (never
-    // write stub vectors; mirrors `should_auto_index` / the pipeline's auto-index gate). Best-effort:
-    // a failure logs (no PII) and does NOT fail the import (the row + plaintext are already durable,
-    // and a later `reindex_embeddings`-equivalent / unlock re-embed recovers the index).
+    // Index ONLY when the REAL e5 model is present (never write stub vectors). Best-effort: a failure
+    // logs (no PII) and does NOT fail the ingest (the row + plaintext are durable; a later unlock
+    // re-embed / reindex recovers the vectors).
     if crate::embed::embed_model_present() {
         let embedder = crate::embed::active_embedder();
         if let Err(e) = state.db.index_document_chunks(&id, embedder.as_ref()) {
-            tracing::warn!(target: "rag", error = %e, "document import: chunk/embed failed (document stored)");
+            tracing::warn!(target: "rag", error = %e, "ingest: chunk/embed failed (content stored)");
         }
     }
 
-    // PII rule: log only the document id, the folder id, and byte/char counts — never the text/name.
+    // PII rule: log only ids, the kind, and byte/char counts — never the text/name.
     tracing::info!(
         target: "documents",
         document_id = %id,
         folder_id = %folder_id,
+        kind = %kind,
         bytes = text.len(),
-        "document imported"
+        "ingested into brain"
     );
     Ok(id)
 }
@@ -1012,6 +1060,34 @@ pub(crate) fn get_document_inner(state: &AppState, id: &str) -> Result<String, A
         return Ok(String::new()); // sealed-not-unlocked ⇒ masked, never the stored text.
     }
     Ok(text)
+}
+
+/// Headline counts + semantic flags for the Brain page ("what's in my brain"). All counts are over
+/// VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are never counted); carries
+/// NO text. The two flags drive the "vectorize your brain" nudge (semantic off / model absent).
+#[tauri::command]
+pub fn brain_overview(state: State<'_, AppState>) -> Result<BrainOverview, AppError> {
+    brain_overview_inner(state.inner())
+}
+
+/// Inner of [`brain_overview`] taking `&AppState` (unit-testable gate).
+pub(crate) fn brain_overview_inner(state: &AppState) -> Result<BrainOverview, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    let (meeting_count, document_count, note_count, indexed_chunk_count) =
+        state.db.brain_counts(&unlocked)?;
+    let semantic_enabled = state
+        .config
+        .lock()
+        .map(|c| c.semantic_search_enabled)
+        .unwrap_or(false);
+    Ok(BrainOverview {
+        meeting_count,
+        document_count,
+        note_count,
+        indexed_chunk_count,
+        semantic_enabled,
+        embed_model_present: crate::embed::embed_model_present(),
+    })
 }
 
 /// Permanently delete a document and cascade-delete its chunks + vectors. GATED: a
@@ -3882,7 +3958,19 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     for p in exported_paths {
         let _ = std::fs::remove_file(&p);
     }
+
+    // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer at
+    // the moment a folder seals (post clear-on-Stop it is normally already empty; idempotent).
+    clear_stale_live_transcript(state);
     Ok(())
+}
+
+/// Lock-surface RAM hygiene: clear the live-transcript buffer ONLY when no recording is active —
+/// never wipe an in-flight buffer (mid-recording egress correctness is owned by the visibility
+/// gate in `transcribe::live`). Fail-safe: a poisoned recorder lock is treated as "recording".
+fn clear_stale_live_transcript(state: &AppState) {
+    let recording = state.recorder.lock().map(|g| g.is_some()).unwrap_or(true);
+    crate::transcribe::live::clear_live_transcript_if_idle(&state.live_transcript, recording);
 }
 
 /// SESSION-unlock a sealed folder: KEK → unwrap CK → decrypt each note's `content_blob` back into
@@ -4091,6 +4179,10 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     if let Err(e) = state.db.checkpoint_truncate() {
         tracing::warn!(target: "lock", error = %e, "wal_checkpoint(TRUNCATE) on relock_all failed");
     }
+    // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer on
+    // relock-all (manual "Lock all", screen-share auto-relock, window-close, app-exit). Never
+    // clears mid-recording — the in-flight buffer stays, gated by visibility at injection time.
+    clear_stale_live_transcript(state);
     Ok(())
 }
 
@@ -5685,6 +5777,42 @@ mod lifecycle_tests {
         .unwrap();
     }
 
+    /// PR-A #3 belt-and-braces: sealing a folder while NO recording is active clears any stale
+    /// live-transcript buffer (post clear-on-Stop it is normally already empty — idempotent
+    /// hygiene so a stale tail can never outlive the folder it belongs to).
+    #[test]
+    fn lock_folder_clears_stale_live_transcript_when_not_recording() {
+        let state = build_state("lock-clears-live");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        *state.live_transcript.lock().unwrap() =
+            "stale tail of the just-recorded meeting".to_string();
+        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert!(
+            state.live_transcript.lock().unwrap().is_empty(),
+            "lock_folder with no active recording must clear the stale live-transcript buffer"
+        );
+    }
+
+    /// PR-A #3 belt-and-braces: `relock_all` (manual "Lock all" + the screen-share auto-relock via
+    /// `relock_all_inner`) clears the stale buffer too when no recording is active.
+    #[test]
+    fn relock_all_clears_stale_live_transcript_when_not_recording() {
+        let state = build_state("relock-clears-live");
+        *state.live_transcript.lock().unwrap() = "stale tail".to_string();
+        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+
+        relock_all_inner(&state).unwrap();
+
+        assert!(
+            state.live_transcript.lock().unwrap().is_empty(),
+            "relock_all with no active recording must clear the stale live-transcript buffer"
+        );
+    }
+
     /// brain2 realtime notes: with the meeting in an OPEN folder (or no folder) the gate is open, so
     /// `save`/`get` round-trip the buffer.
     #[test]
@@ -5913,6 +6041,84 @@ mod lifecycle_tests {
         );
         let md3 = write_temp_doc("seal3", "md", "after unlock");
         import_document_inner(&state, md3.to_str().unwrap(), "f-lock").unwrap();
+    }
+
+    /// IMPORT_TEXT round-trip: typed text is ingested as a kind='note' document — stored + readable,
+    /// listed with kind="note", and chunked WHEN the e5 model is present (0 chunks when absent, the
+    /// no-stub contract). Empty text is refused. Reuses the same gated ingest as `import_document`.
+    #[test]
+    fn import_text_round_trip_as_note() {
+        let state = build_state("text-import");
+        make_open_folder(&state.db, "f-open", "Project");
+
+        let id = import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open")
+            .unwrap();
+        assert_eq!(
+            get_document_inner(&state, &id).unwrap(),
+            "We ship the beta on Friday.",
+            "typed note text readable in an open folder"
+        );
+        let listed = list_documents_inner(&state, "f-open").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, "note", "import_text stores kind='note'");
+        assert_eq!(listed[0].name, "Decisions");
+        // Model-presence-gated chunk count (deterministic on a no-model CI machine).
+        if crate::embed::embed_model_present() {
+            assert!(state.db.doc_chunk_count(&id).unwrap() >= 1, "note chunked+embedded when model present");
+        } else {
+            assert_eq!(state.db.doc_chunk_count(&id).unwrap(), 0, "no stub vectors when model absent");
+        }
+        // Empty / whitespace-only text is refused.
+        assert!(matches!(
+            import_text_inner(&state, "n", "   ", "f-open").unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+    }
+
+    /// import_text is WRITE-GATED like import_document: a sealed-not-unlocked folder refuses it with
+    /// Locked, and a note in a sealed folder is masked from list/get.
+    #[test]
+    fn import_text_refused_when_folder_sealed() {
+        let state = build_state("text-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let note = import_text_inner(&state, "n", "the code is 4291", "f-lock").unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        assert!(matches!(
+            import_text_inner(&state, "n2", "another", "f-lock").unwrap_err(),
+            AppError::Locked(_)
+        ));
+        assert!(list_documents_inner(&state, "f-lock").unwrap().is_empty(), "sealed note list masked");
+        assert_eq!(get_document_inner(&state, &note).unwrap(), "", "sealed note get masked");
+    }
+
+    /// brain_overview counts ONLY visible content: a note in a SEALED-not-unlocked folder is NOT
+    /// counted; session-unlocking the folder makes it count. Flags reflect config + model presence.
+    #[test]
+    fn brain_overview_counts_only_visible() {
+        let state = build_state("brain-overview");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Locked");
+        import_text_inner(&state, "a", "open note one", "f-open").unwrap();
+        import_document_inner(
+            &state,
+            write_temp_doc("ov", "md", "an open document").to_str().unwrap(),
+            "f-open",
+        )
+        .unwrap();
+        let secret = import_text_inner(&state, "s", "secret note", "f-lock").unwrap();
+        assert!(!secret.is_empty());
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        // Sealed folder's note is excluded: 1 note (open) + 1 document (open), NOT 2 notes.
+        let ov = brain_overview_inner(&state).unwrap();
+        assert_eq!(ov.note_count, 1, "sealed folder's note not counted");
+        assert_eq!(ov.document_count, 1, "open document counted");
+        assert_eq!(ov.embed_model_present, crate::embed::embed_model_present());
+
+        // Session-unlock ⇒ the sealed note now counts.
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        assert_eq!(brain_overview_inner(&state).unwrap().note_count, 2, "unlocked note counted");
     }
 
     /// COUNTEREXAMPLE (verify-before-destroy): an uploaded document's TEXT survives a real lock→unlock
