@@ -20,6 +20,7 @@ import type {
   ReindexResult,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { ThemeService, type ThemeMode } from "../../services/theme.service";
 
 @Component({
   selector: "app-settings",
@@ -34,6 +35,46 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
           <span>Couldn't load settings: {{ err }}</span>
         </div>
       }
+
+      <!-- Appearance: Light / Dark / System theme (applies instantly) -->
+      <div class="card appearance-card">
+        <div class="appearance-copy">
+          <h3>Appearance</h3>
+          <p class="text-secondary">
+            Choose how Murmur looks. <b>System</b> follows your macOS
+            Light/Dark setting automatically.
+          </p>
+        </div>
+        <div class="theme-seg" role="group" aria-label="Theme">
+          <button
+            type="button"
+            [class.active]="themeMode() === 'light'"
+            [attr.aria-pressed]="themeMode() === 'light'"
+            (click)="setTheme('light')"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+            Light
+          </button>
+          <button
+            type="button"
+            [class.active]="themeMode() === 'dark'"
+            [attr.aria-pressed]="themeMode() === 'dark'"
+            (click)="setTheme('dark')"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" /></svg>
+            Dark
+          </button>
+          <button
+            type="button"
+            [class.active]="themeMode() === 'system'"
+            [attr.aria-pressed]="themeMode() === 'system'"
+            (click)="setTheme('system')"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
+            System
+          </button>
+        </div>
+      </div>
 
       <!-- Transcription model: language + quality + on-demand download -->
       <div class="card model-card">
@@ -1279,6 +1320,62 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
         animation: rise 380ms var(--transition) both;
       }
 
+      /* --- Appearance / theme --- */
+      .appearance-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .appearance-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .appearance-copy h3 {
+        margin: 0;
+      }
+      .appearance-copy p {
+        margin: 0;
+        font-size: 0.875rem;
+      }
+      .theme-seg {
+        display: inline-flex;
+        gap: var(--space-1);
+        padding: var(--space-1);
+        width: fit-content;
+        background: var(--surface-input);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-pill);
+      }
+      .theme-seg button {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        padding: var(--space-2) var(--space-4);
+        border: 0;
+        background: transparent;
+        color: var(--text-secondary);
+        border-radius: var(--radius-pill);
+        font: inherit;
+        font-weight: 600;
+        font-size: 0.875rem;
+        cursor: pointer;
+        transition:
+          background var(--transition-fast),
+          color var(--transition-fast);
+      }
+      .theme-seg button svg {
+        width: 16px;
+        height: 16px;
+      }
+      .theme-seg button:hover {
+        color: var(--text-primary);
+      }
+      .theme-seg button.active {
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
       /* --- Banner icon (matches the record screen) --- */
       .banner-icon {
         display: inline-flex;
@@ -2002,6 +2099,15 @@ export class SettingsComponent implements OnInit {
   private readonly fb = inject(FormBuilder);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly theme = inject(ThemeService);
+
+  /** Current theme choice (Light / Dark / System) — drives the Appearance control. */
+  readonly themeMode = this.theme.mode;
+
+  /** Apply a theme immediately (persisted in the service; no save() needed). */
+  setTheme(mode: ThemeMode): void {
+    this.theme.setMode(mode);
+  }
 
   /** Tracked so we can cancel the pending "Copied" reset on destroy (no leaks). */
   private copyResetTimer: ReturnType<typeof setTimeout> | null = null;
