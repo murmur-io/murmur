@@ -24,11 +24,21 @@ import { BrainSourceCardComponent } from "./brain-source-card.component";
 /** The hard cap the map applies — kept in sync with BrainMapComponent's MAX_NODES. */
 const MAP_NODE_CAP = 60;
 
+/**
+ * Sentinel id for the default "All folders" selector option — aggregate every
+ * visible folder's documents/notes into one whole-brain view (so the source
+ * cards match the whole-brain header counts). Never a real folder id (those are
+ * UUIDs), so it can't collide.
+ */
+const ALL_FOLDERS_ID = "__all__";
+
 /** A flattened folder option for the selector (indent reflects tree depth). */
 interface FolderOption {
   id: string;
   /** Display label with a depth-indent prefix + a lock glyph when sealed. */
   label: string;
+  /** Raw folder name (no indent / lock glyph) — for the "adding to X" hint. */
+  name: string;
   /** Sealed-and-NOT-session-unlocked → add/list/delete are blocked. */
   blocked: boolean;
 }
@@ -37,14 +47,18 @@ interface FolderOption {
  * The `/brain` page — "what's in my brain" (ClickUp-way knowledge sources).
  *
  * Top → bottom:
- *  1. STATUS HEADER — a one-line count bar (🧠 N meetings · N documents · N
- *     notes) + a semantic badge, a gentle Settings nudge when semantic search /
- *     the e5 model isn't set up, and an [Ask ↗] link. Data from `brainOverview()`.
+ *  1. STATUS HEADER — the whole-brain stat units (meetings / documents / notes),
+ *     a plain-language semantic-search status chip, a gentle Settings nudge when
+ *     semantic search / the on-device model isn't set up, and an [Ask ↗] link.
+ *     Data from `brainOverview()`.
  *  2. KNOWLEDGE SOURCES — three in-flow `.card`s (delegated to
  *     {@link BrainSourceCardComponent}): 🎙 Meetings (read-only, links to
  *     /library), 📄 Documents (upload `.md`/`.txt`), 📝 Notes (type text). A
- *     folder selector governs which folder's docs/notes are listed / added to;
- *     a sealed folder fails closed (add disabled + a note).
+ *     folder selector governs which folder's docs/notes are listed. It DEFAULTS
+ *     to "All folders" (aggregate every visible folder → matches the whole-brain
+ *     header counts); a specific folder narrows to just that one. Adds under
+ *     "All" target the first addable folder (surfaced as a subtle hint); a
+ *     sealed folder fails closed (add disabled + a note).
  *  3. CONNECTIONS — the entity graph ({@link BrainMapComponent}), DEMOTED into a
  *     collapsible section (fit-to-view so the nodes fill the canvas).
  *
@@ -67,50 +81,71 @@ interface FolderOption {
     <section class="brain">
       <!-- 1 — STATUS HEADER ------------------------------------------------- -->
       <header class="b-head card">
-        <div class="b-head-main">
-          <h2 class="b-title">Brain</h2>
+        <div class="b-head-top">
+          <div class="b-identity">
+            <span class="b-mark" aria-hidden="true">🧠</span>
+            <div class="b-identity-text">
+              <h2 class="b-title">Brain</h2>
+              <p class="b-tagline">Everything your assistant can reason over.</p>
+            </div>
+          </div>
+
           @if (overview(); as ov) {
-            <p class="b-counts">
-              <span class="b-brainmark" aria-hidden="true">🧠</span>
-              <span>{{ ov.meetingCount }} meetings</span>
-              <span class="b-dot" aria-hidden="true">·</span>
-              <span>{{ ov.documentCount }} documents</span>
-              <span class="b-dot" aria-hidden="true">·</span>
-              <span>{{ ov.noteCount }} notes</span>
-            </p>
+            <dl class="b-stats" aria-label="What’s in your brain">
+              <div class="b-stat">
+                <dd>{{ ov.meetingCount }}</dd>
+                <dt>Meetings</dt>
+              </div>
+              <span class="b-stat-sep" aria-hidden="true"></span>
+              <div class="b-stat">
+                <dd>{{ ov.documentCount }}</dd>
+                <dt>Documents</dt>
+              </div>
+              <span class="b-stat-sep" aria-hidden="true"></span>
+              <div class="b-stat">
+                <dd>{{ ov.noteCount }}</dd>
+                <dt>Notes</dt>
+              </div>
+            </dl>
           } @else if (overviewError()) {
-            <p class="b-counts b-counts-err">Couldn’t load the brain summary.</p>
+            <p class="b-summary-state b-summary-err">
+              Couldn’t load the brain summary.
+            </p>
           } @else {
-            <p class="b-counts b-counts-muted">Loading the brain summary…</p>
+            <p class="b-summary-state">Loading the brain summary…</p>
           }
+
+          <div class="b-head-side">
+            @if (modelMissing()) {
+              <a class="pill b-badge b-badge-action" routerLink="/settings">
+                <span class="b-badge-dot" aria-hidden="true"></span>
+                Enable AI search
+              </a>
+            } @else {
+              <span class="pill b-badge" [class.is-on]="semanticOn()">
+                <span class="b-badge-dot" aria-hidden="true"></span>
+                {{ semanticBadge() }}
+              </span>
+            }
+            <a class="btn btn-ghost b-ask" routerLink="/ask">
+              Ask
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+                <path
+                  d="M5.5 3.5h7v7M12.5 3.5 4 12"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </a>
+          </div>
         </div>
 
-        <div class="b-head-side">
-          <span class="pill b-badge" [class.is-on]="semanticOn()">
-            {{ semanticBadge() }}
-          </span>
-          <a class="btn btn-ghost b-ask" routerLink="/ask">
-            Ask
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-              <path
-                d="M5.5 3.5h7v7M12.5 3.5 4 12"
-                stroke="currentColor"
-                stroke-width="1.6"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </a>
-        </div>
-
-        @if (showNudge()) {
+        @if (nudge(); as msg) {
           <div class="banner is-accent b-nudge" role="status">
             <span class="b-nudge-glyph" aria-hidden="true"></span>
-            <span>
-              Turn on semantic search and download the e5 model in
-              <a routerLink="/settings">Settings</a> to vectorize your brain for
-              meaning-based recall.
-            </span>
+            <span>{{ msg }} <a routerLink="/settings">Open Settings</a></span>
           </div>
         }
       </header>
@@ -137,6 +172,9 @@ interface FolderOption {
                 <option [value]="o.id">{{ o.label }}</option>
               }
             </select>
+            @if (addHint(); as h) {
+              <span class="b-add-hint">{{ h }}</span>
+            }
           </label>
         </header>
 
@@ -153,7 +191,11 @@ interface FolderOption {
           <app-brain-source-card
             glyph="📄"
             title="Documents"
-            subtitle="Markdown / text files you’ve added to this folder."
+            [subtitle]="
+              isAll()
+                ? 'Markdown / text files across your brain.'
+                : 'Markdown / text files you’ve added to this folder.'
+            "
             [count]="documents().length"
             [items]="documents()"
             [expanded]="docsExpanded()"
@@ -162,7 +204,9 @@ interface FolderOption {
             [deletingId]="deletingId()"
             [blocked]="selectedBlocked()"
             addLabel="Add document"
-            emptyLabel="No documents in this folder yet."
+            [emptyLabel]="
+              isAll() ? 'No documents yet.' : 'No documents in this folder yet.'
+            "
             (add)="pickAndImportDocument()"
             (deleteItem)="removeItem($event)"
             (toggleList)="docsExpanded.set(!docsExpanded())"
@@ -171,7 +215,11 @@ interface FolderOption {
           <app-brain-source-card
             glyph="📝"
             title="Notes"
-            subtitle="Typed or pasted text you’ve added to this folder."
+            [subtitle]="
+              isAll()
+                ? 'Typed or pasted text across your brain.'
+                : 'Typed or pasted text you’ve added to this folder.'
+            "
             [count]="notes().length"
             [items]="notes()"
             [expanded]="notesExpanded()"
@@ -180,7 +228,9 @@ interface FolderOption {
             [deletingId]="deletingId()"
             [blocked]="selectedBlocked()"
             addLabel="Add note"
-            emptyLabel="No notes in this folder yet."
+            [emptyLabel]="
+              isAll() ? 'No notes yet.' : 'No notes in this folder yet.'
+            "
             (add)="openNoteEditor()"
             (deleteItem)="removeItem($event)"
             (toggleList)="notesExpanded.set(!notesExpanded())"
@@ -275,61 +325,169 @@ interface FolderOption {
       .brain {
         display: flex;
         flex-direction: column;
-        gap: var(--space-6);
+        gap: var(--space-5);
       }
 
-      /* — status header — */
+      /* — status header — a designed anchor bar, not a bare count line — */
       .b-head {
-        display: grid;
-        grid-template-columns: 1fr auto;
-        align-items: center;
-        gap: var(--space-3) var(--space-4);
-      }
-      .b-head-main {
+        position: relative;
         display: flex;
         flex-direction: column;
-        gap: var(--space-1);
+        gap: var(--space-4);
+        padding: var(--space-5) var(--space-5) var(--space-4);
+        overflow: hidden;
+      }
+      /* A faint accent wash gives the header intentional visual weight. */
+      .b-head::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(
+          130% 150% at 0% 0%,
+          rgba(110, 118, 255, 0.12),
+          transparent 55%
+        );
+      }
+      .b-head > * {
+        position: relative;
+        z-index: 1;
+      }
+      .b-head-top {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: var(--space-4) var(--space-5);
+      }
+      .b-identity {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        min-width: 0;
+      }
+      .b-mark {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 44px;
+        height: 44px;
+        border-radius: var(--radius-md);
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-ring);
+        font-size: 1.4rem;
+        line-height: 1;
+      }
+      .b-identity-text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
         min-width: 0;
       }
       .b-title {
         margin: 0;
+        font-size: 1.35rem;
+        letter-spacing: -0.01em;
       }
-      .b-counts {
+      .b-tagline {
         margin: 0;
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: var(--space-2);
         color: var(--text-secondary);
-        font-size: 0.9375rem;
+        font-size: 0.85rem;
       }
-      .b-brainmark {
-        font-size: 1.05rem;
-        line-height: 1;
+
+      /* Whole-brain stat units — number over label, divider-separated. */
+      .b-stats {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: var(--space-4);
+        margin: 0;
+        flex: 1 1 auto;
       }
-      .b-dot {
+      .b-stat {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 2px;
+      }
+      .b-stat dd {
+        margin: 0;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 1.5rem;
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.05;
+      }
+      .b-stat dt {
         color: var(--text-muted);
+        font-size: 0.6875rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
       }
-      .b-counts-muted {
+      .b-stat-sep {
+        flex: none;
+        width: 1px;
+        height: 30px;
+        background: var(--border-subtle);
+      }
+      .b-summary-state {
+        margin: 0;
+        flex: 1 1 auto;
+        text-align: center;
         color: var(--text-muted);
+        font-size: 0.9rem;
       }
-      .b-counts-err {
+      .b-summary-err {
         color: var(--danger);
       }
+
       .b-head-side {
         display: inline-flex;
         align-items: center;
         gap: var(--space-2);
-        justify-self: end;
+        flex: none;
+        margin-left: auto;
       }
       .b-badge {
-        border-color: var(--border-strong);
         color: var(--text-muted);
       }
+      .b-badge-dot {
+        flex: none;
+        width: 7px;
+        height: 7px;
+        border-radius: var(--radius-pill);
+        background: currentColor;
+        opacity: 0.55;
+      }
       .b-badge.is-on {
-        border-color: var(--accent-ring);
+        border-color: transparent;
+        color: var(--success);
+        background: var(--success-soft);
+      }
+      .b-badge.is-on .b-badge-dot {
+        opacity: 1;
+        box-shadow: 0 0 8px var(--success);
+      }
+      .b-badge-action {
+        border-color: transparent;
         color: var(--accent-hover);
         background: var(--accent-soft);
+        text-decoration: none;
+        transition:
+          filter var(--transition),
+          transform var(--transition-fast);
+      }
+      .b-badge-action:hover {
+        filter: brightness(1.12);
+      }
+      .b-badge-action:active {
+        transform: translateY(1px);
+      }
+      .b-badge-action:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
       }
       .b-ask {
         display: inline-flex;
@@ -337,7 +495,6 @@ interface FolderOption {
         gap: var(--space-2);
       }
       .b-nudge {
-        grid-column: 1 / -1;
         align-items: center;
       }
       .b-nudge-glyph {
@@ -393,6 +550,11 @@ interface FolderOption {
       .b-folder-select {
         width: 100%;
         height: 38px;
+      }
+      .b-add-hint {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        line-height: 1.3;
       }
       .b-cards {
         display: grid;
@@ -470,11 +632,13 @@ interface FolderOption {
       }
 
       @media (max-width: 640px) {
-        .b-head {
-          grid-template-columns: 1fr;
+        .b-stats {
+          justify-content: flex-start;
+          flex: 1 1 100%;
+          order: 3;
         }
         .b-head-side {
-          justify-self: start;
+          margin-left: 0;
         }
       }
     `,
@@ -494,36 +658,71 @@ export class BrainComponent {
     return !!ov && ov.semanticEnabled && ov.embedModelPresent;
   });
 
-  /** The semantic status badge text (on / off / model-missing). */
+  /** True when the on-device search model hasn't been downloaded yet. */
+  protected readonly modelMissing = computed(() => {
+    const ov = this.overview();
+    return !!ov && !ov.embedModelPresent;
+  });
+
+  /**
+   * Plain-language semantic-search status for the header chip — NEVER internal
+   * jargon (no "e5" embedder name). The model-missing case is handled by a
+   * separate actionable chip-link ({@link modelMissing}), so this only covers
+   * on / off.
+   */
   protected readonly semanticBadge = computed(() => {
     const ov = this.overview();
     if (!ov) {
-      return "Semantic…";
+      return "Checking search…";
     }
-    if (!ov.embedModelPresent) {
-      return "Model not downloaded";
-    }
-    return ov.semanticEnabled ? "Semantic on · e5 ✓" : "Semantic off";
+    return ov.semanticEnabled
+      ? "AI semantic search: on"
+      : "Semantic search: off";
   });
 
-  /** Show the Settings nudge when semantic search isn't fully set up. */
-  protected readonly showNudge = computed(() => {
+  /**
+   * Human explanation for the Settings nudge when semantic search isn't fully
+   * set up — model-missing vs turned-off get different, actionable copy; null
+   * when it's fully on (no nudge). Says WHAT it does ("search by meaning, not
+   * just keywords"), never the embedder's internal name.
+   */
+  protected readonly nudge = computed<string | null>(() => {
     const ov = this.overview();
-    return !!ov && (!ov.semanticEnabled || !ov.embedModelPresent);
+    if (!ov) {
+      return null;
+    }
+    if (!ov.embedModelPresent) {
+      return "Download the AI search model to search your brain by meaning, not just keywords.";
+    }
+    if (!ov.semanticEnabled) {
+      return "Turn on semantic search to find your notes by meaning, not just keywords.";
+    }
+    return null;
   });
 
   // ── folder selector ────────────────────────────────────────────────────
   readonly selectedFolderId = signal<string | null>(null);
 
+  /** True when the selector is on the default "All folders" aggregate view. */
+  protected readonly isAll = computed(
+    () => this.selectedFolderId() === ALL_FOLDERS_ID,
+  );
+
+  /**
+   * The selector options: a leading "All folders" aggregate (the DEFAULT) plus
+   * every folder in the tree, depth-indented + lock-glyphed. Empty when there
+   * are no folders at all (nothing to aggregate over or add to).
+   */
   protected readonly folderOptions = computed<FolderOption[]>(() => {
-    const out: FolderOption[] = [];
+    const real: FolderOption[] = [];
     const walk = (nodes: FolderNode[], depth: number): void => {
       for (const node of nodes) {
         const sealed = node.locked && !node.unlocked;
         const indent = depth > 0 ? "  ".repeat(depth) + "↳ " : "";
-        out.push({
+        real.push({
           id: node.id,
           label: `${indent}${node.name}${sealed ? " 🔒" : ""}`,
+          name: node.name,
           blocked: sealed,
         });
         if (node.children?.length) {
@@ -532,12 +731,62 @@ export class BrainComponent {
       }
     };
     walk(this.folders.tree(), 0);
-    return out;
+    if (real.length === 0) {
+      return [];
+    }
+    return [
+      {
+        id: ALL_FOLDERS_ID,
+        label: "All folders",
+        name: "All folders",
+        blocked: false,
+      },
+      ...real,
+    ];
   });
 
-  protected readonly selectedBlocked = computed(() => {
+  /** Every real (non-sentinel) folder option — the aggregation set for "All". */
+  private readonly realFolderOptions = computed(() =>
+    this.folderOptions().filter((o) => o.id !== ALL_FOLDERS_ID),
+  );
+
+  /**
+   * The folder an "Add" actually targets. A specific selection targets itself;
+   * you can't add to the "All" aggregate, so under "All" adds default to the
+   * first ADDABLE (unlocked) folder — falling back to the first folder (whose
+   * sealed state then disables the add). Null when there are no folders.
+   */
+  private readonly addTarget = computed<FolderOption | null>(() => {
+    const opts = this.realFolderOptions();
+    if (this.isAll()) {
+      return opts.find((o) => !o.blocked) ?? opts[0] ?? null;
+    }
     const id = this.selectedFolderId();
-    return this.folderOptions().some((o) => o.id === id && o.blocked);
+    return opts.find((o) => o.id === id) ?? null;
+  });
+
+  /** The id an "Add" targets (see {@link addTarget}); null when none. */
+  protected readonly addTargetId = computed(() => this.addTarget()?.id ?? null);
+
+  /** True when adds are blocked (no target, or the target folder is sealed). */
+  protected readonly selectedBlocked = computed(() => {
+    const target = this.addTarget();
+    return !target || target.blocked;
+  });
+
+  /**
+   * Subtle "adding to X" hint under the selector — only in the "All" view (where
+   * the add target isn't obvious) and only when adding is actually possible.
+   */
+  protected readonly addHint = computed<string | null>(() => {
+    if (!this.isAll()) {
+      return null;
+    }
+    const target = this.addTarget();
+    if (!target || target.blocked) {
+      return null;
+    }
+    return `New documents and notes are added to “${target.name}”.`;
   });
 
   // ── documents + notes (one list, split by kind) ────────────────────────
@@ -591,8 +840,10 @@ export class BrainComponent {
     // Ensure the folder tree is loaded so the selector has options.
     void this.folders.load();
 
-    // Default the selection to the first folder once options resolve, and keep
-    // it valid if the tree changes. Tracked effect that writes the selection.
+    // Default the selection to "All folders" once options resolve, and keep it
+    // valid if the tree changes (a removed folder falls back to "All"). Tracked
+    // effect that writes the selection (NG0600 guard). ALL_FOLDERS_ID is always
+    // present whenever there is at least one folder.
     effect(
       () => {
         const opts = this.folderOptions();
@@ -604,7 +855,7 @@ export class BrainComponent {
           return;
         }
         if (cur === null || !opts.some((o) => o.id === cur)) {
-          this.selectedFolderId.set(opts[0].id);
+          this.selectedFolderId.set(ALL_FOLDERS_ID);
         }
       },
       { allowSignalWrites: true },
@@ -623,7 +874,8 @@ export class BrainComponent {
     );
 
     // (Re)load the document/note LIST whenever the selected folder OR the lock
-    // state changes (a sealed folder masks to empty). Same NG0600 shape.
+    // state changes (a sealed folder masks to empty). Under "All" this aggregates
+    // across every visible folder. Same NG0600 shape.
     effect(
       () => {
         const id = this.selectedFolderId();
@@ -635,7 +887,11 @@ export class BrainComponent {
         }
         this.listLoading.set(true);
         this.listError.set(null);
-        void this.fetchItems(id);
+        if (id === ALL_FOLDERS_ID) {
+          void this.fetchAllItems();
+        } else {
+          void this.fetchItems(id);
+        }
       },
       { allowSignalWrites: true },
     );
@@ -682,6 +938,33 @@ export class BrainComponent {
     }
   }
 
+  /**
+   * Aggregate documents/notes across EVERY folder for the default "All folders"
+   * view (so the source cards match the whole-brain header counts). Each
+   * per-folder call is independently gated server-side — a sealed-not-unlocked
+   * folder returns an EMPTY list (never a name behind the lock) — and a
+   * per-folder failure degrades to [] rather than failing the whole aggregate.
+   * Stale-guarded: a response is dropped if the user has since left "All".
+   */
+  private async fetchAllItems(): Promise<void> {
+    const ids = this.realFolderOptions().map((o) => o.id);
+    try {
+      const perFolder = await Promise.all(
+        ids.map((id) =>
+          this.ipc.listDocuments(id).catch(() => [] as DocumentInfo[]),
+        ),
+      );
+      if (this.selectedFolderId() !== ALL_FOLDERS_ID) {
+        return;
+      }
+      this.items.set(perFolder.flat());
+    } finally {
+      if (this.selectedFolderId() === ALL_FOLDERS_ID) {
+        this.listLoading.set(false);
+      }
+    }
+  }
+
   private async fetchGraph(): Promise<void> {
     this.graphError.set(null);
     try {
@@ -700,7 +983,7 @@ export class BrainComponent {
 
   /** Open the native file dialog (md/txt) → import the chosen path as a document. */
   async pickAndImportDocument(): Promise<void> {
-    const folderId = this.selectedFolderId();
+    const folderId = this.addTargetId();
     if (!folderId || this.selectedBlocked() || this.importing()) {
       return;
     }
@@ -717,7 +1000,7 @@ export class BrainComponent {
       await this.ipc.importDocument(chosen, folderId);
       this.toast.success("Document added to the brain.");
       this.docsExpanded.set(true);
-      await this.afterMutation(folderId);
+      await this.afterMutation();
     } catch (e) {
       this.toast.danger(this.friendlyImportError(e));
     } finally {
@@ -741,7 +1024,7 @@ export class BrainComponent {
 
   /** Ingest a typed note → refresh + toast + close the editor. */
   async onSaveNote(payload: { name: string; text: string }): Promise<void> {
-    const folderId = this.selectedFolderId();
+    const folderId = this.addTargetId();
     if (!folderId || this.selectedBlocked() || this.savingNote()) {
       return;
     }
@@ -754,7 +1037,7 @@ export class BrainComponent {
       this.toast.success("Note added to the brain.");
       this.notesExpanded.set(true);
       this.noteEditorOpen.set(false);
-      await this.afterMutation(folderId);
+      await this.afterMutation();
     } catch (e) {
       this.toast.danger(this.friendlyImportError(e));
     } finally {
@@ -764,7 +1047,6 @@ export class BrainComponent {
 
   /** Permanently delete a document/note, then refresh the list + overview. */
   async removeItem(doc: DocumentInfo): Promise<void> {
-    const folderId = this.selectedFolderId();
     if (this.deletingId()) {
       return;
     }
@@ -772,9 +1054,7 @@ export class BrainComponent {
     try {
       await this.ipc.deleteDocument(doc.id);
       this.toast.info(`Removed “${doc.name}”.`);
-      if (folderId) {
-        await this.afterMutation(folderId);
-      }
+      await this.afterMutation();
     } catch (e) {
       this.toast.danger(this.friendlyDeleteError(e));
     } finally {
@@ -782,11 +1062,23 @@ export class BrainComponent {
     }
   }
 
-  /** Re-fetch the list (if still on the same folder) + the header counts. */
-  private async afterMutation(folderId: string): Promise<void> {
-    if (this.selectedFolderId() === folderId) {
-      await this.fetchItems(folderId);
+  /** Re-fetch the visible list for the CURRENT selection (a folder or "All"). */
+  private async refreshList(): Promise<void> {
+    const sel = this.selectedFolderId();
+    if (!sel) {
+      this.items.set([]);
+      return;
     }
+    if (sel === ALL_FOLDERS_ID) {
+      await this.fetchAllItems();
+    } else {
+      await this.fetchItems(sel);
+    }
+  }
+
+  /** Re-fetch the visible list + the whole-brain header counts after a change. */
+  private async afterMutation(): Promise<void> {
+    await this.refreshList();
     await this.fetchOverview();
   }
 

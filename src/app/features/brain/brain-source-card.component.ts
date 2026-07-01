@@ -29,14 +29,14 @@ import type { DocumentInfo } from "../../core/models";
   template: `
     <section class="sc card">
       <header class="sc-head">
-        <span class="sc-glyph" aria-hidden="true">{{ glyph() }}</span>
+        <span class="sc-tile" aria-hidden="true">{{ glyph() }}</span>
         <div class="sc-head-text">
           <h3 class="sc-title">{{ title() }}</h3>
           <p class="sc-sub">{{ subtitle() }}</p>
         </div>
-        <span class="count sc-count" [attr.title]="count() + ' items'">
-          {{ count() }}
-        </span>
+        <span class="sc-count" [attr.title]="count() + ' items'">{{
+          count()
+        }}</span>
       </header>
 
       @if (linkTo(); as href) {
@@ -146,15 +146,34 @@ import type { DocumentInfo } from "../../core/models";
         display: flex;
         flex-direction: column;
         gap: var(--space-4);
+        transition:
+          border-color var(--transition),
+          transform var(--transition-fast),
+          box-shadow var(--transition);
+      }
+      .sc:hover {
+        border-color: var(--border-strong);
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-md), var(--glass-highlight);
       }
       .sc-head {
         display: flex;
-        align-items: flex-start;
+        align-items: center;
         gap: var(--space-3);
+        padding-bottom: var(--space-4);
+        border-bottom: 1px solid var(--border-subtle);
       }
-      .sc-glyph {
+      .sc-tile {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         flex: none;
-        font-size: 1.5rem;
+        width: 42px;
+        height: 42px;
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        border: 1px solid var(--border);
+        font-size: 1.35rem;
         line-height: 1;
       }
       .sc-head-text {
@@ -172,9 +191,16 @@ import type { DocumentInfo } from "../../core/models";
         margin: 0;
         color: var(--text-secondary);
         font-size: 0.8125rem;
+        line-height: 1.4;
       }
       .sc-count {
         flex: none;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 1.5rem;
+        font-weight: 500;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
       }
 
       .sc-link {
@@ -267,6 +293,15 @@ import type { DocumentInfo } from "../../core/models";
       }
       .sc-del:hover {
         color: var(--danger);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .sc {
+          transition: none;
+        }
+        .sc:hover {
+          transform: none;
+        }
       }
     `,
   ],
