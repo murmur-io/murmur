@@ -134,11 +134,14 @@ fn register_vec_extension() {
 // hold a 1:1 mapping of these (camelCase on the wire). No content fields — counts/ids/labels only.
 
 /// Per-model token-usage roll-up within a time window.
+///
+/// Fields are `u64` (not `u32`) so an all-time SUM over a large egress history cannot
+/// silently overflow (a single meeting can use ~100 k tokens; 2^32 ≈ 4 M tokens total).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressModelUsage {
     pub model: String,
-    pub calls: u32,
-    pub tokens: u32,
+    pub calls: u64,
+    pub tokens: u64,
 }
 
 /// Per-day token-usage roll-up within a time window.
@@ -146,16 +149,19 @@ pub struct EgressModelUsage {
 pub struct EgressDayUsage {
     /// ISO-8601 date string ("YYYY-MM-DD") in UTC.
     pub day: String,
-    pub tokens: u32,
+    pub tokens: u64,
 }
 
 /// Summed redaction counts over all rows in the time window.
+///
+/// Fields are `u64` so a large corpus cannot truncate the aggregate (same rationale as the
+/// token totals above).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EgressRedactionTotals {
-    pub email: u32,
-    pub card: u32,
-    pub phone: u32,
-    pub name: u32,
+    pub email: u64,
+    pub card: u64,
+    pub phone: u64,
+    pub name: u64,
 }
 
 /// One recent row from `egress_log` (last ≤20, newest first), content-free.
@@ -173,8 +179,8 @@ pub struct EgressRecentRow {
 /// Handles an empty table gracefully — all totals are zero, all vecs are empty.
 #[derive(Debug, Clone)]
 pub struct EgressLedger {
-    pub total_calls: u32,
-    pub total_tokens: u32,
+    pub total_calls: u64,
+    pub total_tokens: u64,
     pub by_model: Vec<EgressModelUsage>,
     pub by_day: Vec<EgressDayUsage>,
     pub total_redactions: EgressRedactionTotals,
@@ -761,13 +767,14 @@ impl Db {
         let conn = self.lock();
 
         // ── total calls + total tokens ──────────────────────────────────────
-        let (total_calls, total_tokens): (u32, u32) = conn
+        // Cast to u64 so an all-time SUM cannot wrap (i64→u64 is safe for non-negative sums).
+        let (total_calls, total_tokens): (u64, u64) = conn
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(total_tokens),0)
                    FROM egress_log
                   WHERE ts >= ?1",
                 rusqlite::params![since],
-                |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
             )
             .map_err(map_err)?;
 
@@ -783,10 +790,10 @@ impl Db {
                 rusqlite::params![since],
                 |r| {
                     Ok(EgressRedactionTotals {
-                        email: r.get::<_, i64>(0)? as u32,
-                        card: r.get::<_, i64>(1)? as u32,
-                        phone: r.get::<_, i64>(2)? as u32,
-                        name: r.get::<_, i64>(3)? as u32,
+                        email: r.get::<_, i64>(0)? as u64,
+                        card: r.get::<_, i64>(1)? as u64,
+                        phone: r.get::<_, i64>(2)? as u64,
+                        name: r.get::<_, i64>(3)? as u64,
                     })
                 },
             )
@@ -796,7 +803,10 @@ impl Db {
         let by_model = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT COALESCE(model_served, model_requested, '(unknown)') AS model,
+                    // NULLIF guards: an empty string '' in model_served or model_requested
+                    // (the default when no model is sent by claude_code/anthropic) must bucket
+                    // under '(unknown)' rather than producing a blank label in the Settings UI.
+                    "SELECT COALESCE(NULLIF(model_served,''), NULLIF(model_requested,''), '(unknown)') AS model,
                             COUNT(*) AS calls,
                             COALESCE(SUM(total_tokens), 0) AS tokens
                        FROM egress_log
@@ -809,8 +819,8 @@ impl Db {
                 .query_map(rusqlite::params![since], |r| {
                     Ok(EgressModelUsage {
                         model: r.get(0)?,
-                        calls: r.get::<_, i64>(1)? as u32,
-                        tokens: r.get::<_, i64>(2)? as u32,
+                        calls: r.get::<_, i64>(1)? as u64,
+                        tokens: r.get::<_, i64>(2)? as u64,
                     })
                 })
                 .map_err(map_err)?;
@@ -837,7 +847,7 @@ impl Db {
                 .query_map(rusqlite::params![since], |r| {
                     Ok(EgressDayUsage {
                         day: r.get(0)?,
-                        tokens: r.get::<_, i64>(1)? as u32,
+                        tokens: r.get::<_, i64>(1)? as u64,
                     })
                 })
                 .map_err(map_err)?;
@@ -871,10 +881,10 @@ impl Db {
                             .get::<_, Option<i64>>(4)?
                             .map(|v| v as u32),
                         redactions: EgressRedactionTotals {
-                            email: r.get::<_, i64>(5)? as u32,
-                            card: r.get::<_, i64>(6)? as u32,
-                            phone: r.get::<_, i64>(7)? as u32,
-                            name: r.get::<_, i64>(8)? as u32,
+                            email: r.get::<_, i64>(5)? as u64,
+                            card: r.get::<_, i64>(6)? as u64,
+                            phone: r.get::<_, i64>(7)? as u64,
+                            name: r.get::<_, i64>(8)? as u64,
                         },
                     })
                 })
@@ -4714,6 +4724,46 @@ mod tests {
         assert_eq!(ledger.by_model[0].model, "new-model");
         // Redaction totals from the old row must NOT appear.
         assert_eq!(ledger.total_redactions.email, 0, "old row redactions must be excluded");
+    }
+
+    /// FIX 2: a row where BOTH `model_served` and `model_requested` are empty strings (the common
+    /// case for claude_code / anthropic default-model calls before the gateway provider was added)
+    /// must appear in `by_model` under the label `'(unknown)'`, not as a blank `""` string.
+    #[test]
+    fn egress_summary_blank_model_fields_bucket_under_unknown() {
+        use crate::summarize::egress_log::EgressEntry;
+        use crate::summarize::meta::{CallMeta, RedactionCounts};
+
+        let db = mem_db();
+
+        // Row with both model fields empty (default-model call; model_requested="" stored verbatim).
+        let entry_no_model = EgressEntry {
+            provider_id: "claude_code".to_string(),
+            destination: "claude_code (Anthropic CLI)".to_string(),
+            model_requested: String::new(), // "" — the real default
+            call_kind: "complete",
+            meta: CallMeta {
+                model_served: None, // stored as NULL
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                total_tokens: Some(15),
+                cached_tokens: None,
+            },
+            redactions: RedactionCounts::default(),
+            system_bytes: 0,
+            user_bytes: 0,
+            meeting_id: None,
+        };
+
+        db.insert_egress(0, &entry_no_model).unwrap();
+
+        let ledger = db.egress_summary(0).expect("egress_summary must not error");
+        assert_eq!(ledger.by_model.len(), 1, "must have one by_model entry");
+        assert_eq!(
+            ledger.by_model[0].model, "(unknown)",
+            "empty model_served + empty model_requested must bucket under '(unknown)', not ''"
+        );
+        assert_eq!(ledger.by_model[0].tokens, 15);
     }
 
     /// brain2 realtime notes: the `manual_notes` buffer round-trips (set → get), defaults to "" for a

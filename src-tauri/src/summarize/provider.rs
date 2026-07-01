@@ -80,26 +80,42 @@ pub trait SummarizerProvider: Send + Sync {
         Ok((self.complete(system, user).await?, CallMeta::default()))
     }
 
+    /// Structured-output completion returning the JSON value AND the provider's `CallMeta`
+    /// (token usage + served model).
+    ///
+    /// DEFAULT = schema-in-prompt + `parse_first_json`, with meta from `complete_with_meta`.
+    /// A provider that supports native constrained decoding (the OpenAI-compatible gateway)
+    /// OVERRIDES this to send `response_format: {"type":"json_schema", …}` and returns both
+    /// the parsed value and real token/model metadata directly.
+    async fn complete_json_with_meta(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<(Value, CallMeta)> {
+        // Default: embed the schema as a system-prompt instruction and call complete_with_meta
+        // so token usage is captured even on the free-text path.
+        let sys = format!(
+            "{system}\n\nRespond with ONLY a single JSON object matching this schema (no prose, no code fences):\n{}",
+            serde_json::to_string(schema).unwrap_or_default()
+        );
+        let (reply, meta) = self.complete_with_meta(&sys, user).await?;
+        let v = crate::reason::parse_first_json::<Value>(&reply)?;
+        Ok((v, meta))
+    }
+
     /// Structured-output completion: return a JSON value adhering to `schema`.
     ///
-    /// The DEFAULT implementation embeds the schema as a prompt instruction and extracts the first
-    /// balanced JSON object from a free-text reply — byte-identical to how the timeline and graph
-    /// side-tasks parse today. A provider that supports native constrained decoding (the
-    /// OpenAI-compatible gateway) OVERRIDES this to send
-    /// `response_format: {"type":"json_schema", …}` and returns the parsed object directly.
+    /// Delegates to [`complete_json_with_meta`] and drops the `CallMeta` so callers that
+    /// only need the value are unchanged. Providers that support native constrained decoding
+    /// override [`complete_json_with_meta`] instead; this default is then correct automatically.
     async fn complete_json(
         &self,
         system: &str,
         user: &str,
         schema: &Value,
     ) -> Result<Value> {
-        // Default: instruct via the system prompt, parse the first balanced object out of free text.
-        let sys = format!(
-            "{system}\n\nRespond with ONLY a single JSON object matching this schema (no prose, no code fences):\n{}",
-            serde_json::to_string(schema).unwrap_or_default()
-        );
-        let reply = self.complete(&sys, user).await?;
-        crate::reason::parse_first_json::<Value>(&reply)
+        Ok(self.complete_json_with_meta(system, user, schema).await?.0)
     }
 }
 
