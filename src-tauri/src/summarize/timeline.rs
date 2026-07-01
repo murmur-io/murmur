@@ -45,11 +45,54 @@ pub async fn generate(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let reply = provider.complete(SYSTEM, &transcript).await?;
-    parse(&reply)
+    // Minimal JSON schema for the timeline — passed to the gateway for native constrained decoding;
+    // the DEFAULT `complete_json` impl only stringifies it into the system prompt (same parse path
+    // as before). The schema covers the two required arrays so the gateway can enforce the shape.
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "speakers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "speaker": {"type": "string"},
+                        "startS":  {"type": "number"},
+                        "endS":    {"type": "number"}
+                    },
+                    "required": ["speaker", "startS", "endS"],
+                    "additionalProperties": false
+                }
+            },
+            "topics": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label":  {"type": "string"},
+                        "startS": {"type": "number"},
+                        "endS":   {"type": "number"}
+                    },
+                    "required": ["label", "startS", "endS"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["speakers", "topics"],
+        "additionalProperties": false
+    });
+    let v = provider.complete_json(SYSTEM, &transcript, &schema).await?;
+    serde_json::from_value(v).map_err(|e| {
+        crate::error::AppError::Summarize(format!("timeline: invalid JSON shape from provider: {e}"))
+    })
 }
 
 /// Extract the first balanced JSON object from a reply and parse it into a [`MeetingTimeline`].
+///
+/// Used directly in unit tests to validate the free-text extraction path (the same path the
+/// DEFAULT `complete_json` impl uses). Production code now calls `complete_json` which
+/// subsumes this step — so this function is compiled only in test mode.
+#[cfg(test)]
 fn parse(reply: &str) -> Result<MeetingTimeline> {
     // Recover the FIRST balanced top-level JSON object via the string/escape-aware extractor in
     // `reason.rs` instead of the brittle `find('{')..=rfind('}')` slice — the old slice swept up a
