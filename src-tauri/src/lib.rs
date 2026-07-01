@@ -97,6 +97,12 @@ pub fn run() {
             commands::consent_to_web_search,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
+            commands::set_gateway_key,
+            commands::has_gateway_key,
+            commands::clear_gateway_key,
+            commands::list_gateway_models,
+            commands::gateway_health,
+            commands::get_egress_ledger,
             commands::set_web_search_api_key,
             commands::has_web_search_key,
             commands::provider_statuses,
@@ -182,6 +188,16 @@ pub fn run() {
                 }
             };
             app.manage(state);
+
+            // Phase 2b — wire the content-free egress ledger. Done here, once, after a successful
+            // AppState::init() so the DB is guaranteed open. Every subsequent cloud provider call
+            // (routed through RedactingProvider) writes ONE content-free row to egress_log.
+            {
+                let state = app.state::<AppState>();
+                crate::summarize::egress_log::set_egress_sink(std::sync::Arc::new(
+                    crate::summarize::egress_log::DbEgressSink::new(state.db.clone()),
+                ));
+            }
 
             // Reclaim any capture scratch WAVs stranded by a previous crashed/stuck session
             // (a stuck VPIO/AEC helper once left a 91 GB temp file). Nothing records yet at setup.

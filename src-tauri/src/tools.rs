@@ -903,6 +903,9 @@ mod tests {
             markdown: String::new(), // blanked plaintext + a folder ⇒ sealed-not-unlocked for the gate.
             created_at: "2026-06-30T08:05:00Z".into(),
             exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(id, Some(folder)).unwrap();
