@@ -708,7 +708,7 @@ export interface RedactionCounts {
  * Mirrors Rust `EgressRow` (camelCase via `serde(rename_all = "camelCase")`).
  */
 export interface EgressRow {
-  /** Unix timestamp (milliseconds). */
+  /** Unix timestamp (seconds) — matches the Rust backend's `as_secs()`. */
   ts: number;
   /** Provider id (e.g. `"anthropic"`, `"gateway"`). */
   providerId: string;
