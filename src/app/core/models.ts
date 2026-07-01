@@ -499,7 +499,33 @@ export interface SearchHit {
 export interface DocumentInfo {
   id: string;
   name: string;
+  /**
+   * `"document"` (an uploaded `.md`/`.txt` file) or `"note"` (a typed brain
+   * note). Lets the Brain page split the two source kinds into their own cards.
+   * Both ride the SAME seal/gating path — this is presentation only. Mirrors the
+   * Rust `DocumentInfo.kind`. Empty when the folder is sealed (masked list).
+   */
+  kind: "document" | "note";
   createdAt: number;
+}
+
+/**
+ * brain2 — headline counts + semantic flags for the Brain page ("what's in my
+ * brain"). Mirrors the Rust `BrainOverview` (serde camelCase). Every count is
+ * over VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are
+ * never counted). Carries NO text — counts + the two flags, so it is leak-free.
+ * Re-fetch on a FoldersService lock-state change so a session unlock/relock
+ * shifts the counts live, like the graph.
+ */
+export interface BrainOverview {
+  meetingCount: number;
+  documentCount: number;
+  noteCount: number;
+  indexedChunkCount: number;
+  /** `config.semantic_search_enabled` — the semantic-search master flag. */
+  semanticEnabled: boolean;
+  /** The on-device e5 embedding model is present (so vectors can be built). */
+  embedModelPresent: boolean;
 }
 
 export interface ChatTurn {
