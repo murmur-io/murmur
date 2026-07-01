@@ -415,29 +415,15 @@ fn run_informational(
             proposed_note: std::sync::Mutex::new(None),
         };
         let sink = ToolEventSink { app: app.clone(), event: tool_event };
-        // Inject the LIVE transcript of the recording IN PROGRESS so the brain can answer questions
-        // about the CURRENT meeting (whose segments aren't persisted until Stop). It egresses through
-        // the SAME redaction firewall as every prompt (`RedactingProvider::complete` scrubs `system`
-        // + `user`), and only when cloud egress is consented (this branch is Cloud-only).
-        let live = state
-            .live_transcript
-            .lock()
-            .map(|t| t.clone())
-            .unwrap_or_default();
-        // brain2 realtime notes: ALSO inject the user's OWN typed notes for the CURRENT meeting so the
-        // brain weights their emphasis. GATED by `meeting_is_visible` on the LIVE per-turn `unlocked`
-        // set (fail-closed: a sealed-and-not-session-unlocked meeting injects NOTHING) — the in-progress
-        // recording has no note row yet, so it is trivially visible. This egresses through the SAME
-        // redaction firewall as `live`/`system` (`RedactingProvider::complete` scrubs `system` + `user`)
-        // and only on the Cloud branch (this whole block is Cloud-only, consent-gated) — NO new egress
-        // class. Best-effort: a read/gate error degrades to no typed-notes injection, never a failure.
-        let typed_notes = if !meeting_id.is_empty()
-            && state.db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false)
-        {
-            state.db.get_manual_notes(meeting_id).unwrap_or_default()
-        } else {
-            String::new()
-        };
+        // Inject the LIVE transcript of the recording IN PROGRESS + the user's OWN typed notes for
+        // the CURRENT meeting (segments aren't persisted until Stop, and typed notes carry the
+        // user's emphasis). Both are read through `gated_live_context` — gated by
+        // `meeting_is_visible` on the LIVE per-turn `unlocked` set (fail-closed) — and egress
+        // through the SAME redaction firewall as every prompt (`RedactingProvider::complete`
+        // scrubs `system` + `user`), only when cloud egress is consented (this branch is
+        // Cloud-only). NO new egress class.
+        let (live, typed_notes) =
+            gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
         let system = assistant_system_prompt(&live, &typed_notes);
         match crate::agent::run_agentic_loop(
             &*state.reasoner,
@@ -888,7 +874,7 @@ fn merge_live_caption(accumulated: &str, caption: &str) -> String {
         if acc_tail
             .iter()
             .zip(cap_head)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            .all(|(a, b)| caption_words_match(a, b))
         {
             overlap = k;
             break;
@@ -899,6 +885,21 @@ fn merge_live_caption(accumulated: &str, caption: &str) -> String {
         return acc.to_string();
     }
     format!("{acc} {new_part}")
+}
+
+/// Whether two caption words are the SAME word for overlap detection, tolerating the transcription
+/// variance Whisper shows between overlapping tails: Unicode case ("Że" vs "że" — ASCII-only
+/// folding misses Polish diacritics) and leading/trailing punctuation ("piątek." vs "piątek").
+/// COMPARISON ONLY — the appended text stays byte-original. Two punctuation-only tokens (both
+/// normalize to empty) count as a match: both are transcription noise, so skipping one is safe.
+fn caption_words_match(a: &str, b: &str) -> bool {
+    normalize_caption_word(a) == normalize_caption_word(b)
+}
+
+/// Normalize one word for the overlap compare: trim leading/trailing non-alphanumerics (Unicode-
+/// aware, so diacritics survive) and Unicode-lowercase the rest.
+fn normalize_caption_word(w: &str) -> String {
+    w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
 }
 
 /// Merge a caption into the shared live-transcript buffer (read-modify-write under its Mutex) and
@@ -917,6 +918,59 @@ fn accumulate_live_caption(state: &AppState, caption: &str) {
         } else {
             merged
         };
+    }
+}
+
+/// The in-flight context injected into the assistant's system prompt: the LIVE transcript tail of
+/// the recording in progress + the user's own typed notes for the CURRENT meeting. BOTH are gated
+/// by `meeting_is_visible` on the LIVE per-turn `unlocked` set, fail-closed: no current meeting
+/// (`meeting_id` empty), a sealed-and-not-session-unlocked meeting, or a gate error injects
+/// NOTHING. The live buffer only ever holds the CURRENT recording (cleared at recording start and
+/// at Stop), so gating on the current meeting's visibility covers a mid-recording folder relock
+/// (screen-share auto-relock included) WITHOUT wiping the user's in-flight buffer — a session
+/// re-unlock makes the context inject again. Best-effort: a read error degrades to no injection,
+/// never a failure.
+fn gated_live_context(
+    db: &crate::storage::Db,
+    live_transcript: &std::sync::Mutex<String>,
+    meeting_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> (String, String) {
+    let visible = !meeting_id.is_empty()
+        && db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false);
+    if !visible {
+        return (String::new(), String::new());
+    }
+    let live = live_transcript.lock().map(|t| t.clone()).unwrap_or_default();
+    let typed = db.get_manual_notes(meeting_id).unwrap_or_default();
+    (live, typed)
+}
+
+/// Clear the accumulated live-transcript buffer. Called when a recording STOPS
+/// (`commands::stop_recording`) so a stale tail can never be injected into assistant prompts after
+/// Stop — nor keep egressing once the just-recorded folder is sealed — and by the lock-surface
+/// hygiene below. PII rule (§8): logs only the cleared char COUNT, never the content. Best-effort:
+/// a poisoned lock is ignored (the buffer is re-cleared at the next recording start anyway).
+pub(crate) fn clear_live_transcript(live: &std::sync::Mutex<String>) {
+    if let Ok(mut buf) = live.lock() {
+        if !buf.is_empty() {
+            tracing::debug!(
+                target: "live",
+                chars = buf.chars().count(),
+                "cleared live-transcript buffer"
+            );
+            buf.clear();
+        }
+    }
+}
+
+/// Belt-and-braces RAM hygiene for the lock surface (`lock_folder` / `relock_all`): clear the
+/// buffer ONLY when no recording is active (post clear-on-Stop it is normally already empty —
+/// this is cheap idempotent hygiene). NEVER clears mid-recording: the user's in-flight buffer
+/// stays, and egress correctness there is owned by the `gated_live_context` visibility gate.
+pub(crate) fn clear_live_transcript_if_idle(live: &std::sync::Mutex<String>, is_recording: bool) {
+    if !is_recording {
+        clear_live_transcript(live);
     }
 }
 
@@ -956,11 +1010,15 @@ fn assistant_system_prompt(live_transcript: &str, typed_notes: &str) -> String {
         )
     } else {
         let tail = tail_chars(t, LIVE_TRANSCRIPT_INJECT_CHARS);
+        // HONESTY: the buffer is mic-stream-only and carries no speaker labels — the prompt must
+        // not invite "who said what" answers (any attribution from it would be hallucinated).
         format!(
-            "{base} You are CURRENTLY in a live meeting being recorded — use the LIVE TRANSCRIPT below \
-             to answer questions about THIS current meeting (its topic, decisions, who said what), and \
-             your gated tools for anything in the user's saved notes/vault.\n\nLIVE TRANSCRIPT (rough \
-             real-time captions, may be partial or slightly garbled):\n{tail}"
+            "{base} A meeting is being recorded RIGHT NOW — use the LIVE TRANSCRIPT below to answer \
+             questions about THIS current meeting (its topic and what has been said so far), and your \
+             gated tools for anything in the user's saved notes/vault.\n\nLIVE TRANSCRIPT — an \
+             UNATTRIBUTED, possibly-partial rolling capture of the recent portion of the meeting from \
+             the user's microphone side; it may be garbled and it does NOT indicate who said what, so \
+             never attribute a statement to a specific speaker:\n{tail}"
         )
     };
     // The user's OWN typed notes for this meeting — their explicit emphasis, so the brain should
@@ -1411,6 +1469,194 @@ mod tests {
             merge_live_caption("budget approved", "contract signed"),
             "budget approved contract signed"
         );
+    }
+
+    #[test]
+    fn merge_live_caption_folds_unicode_case_for_overlap() {
+        // PR-A #4a: Whisper re-transcribes the overlapping tail with varying capitalization —
+        // "że" vs "Że". `eq_ignore_ascii_case` does NOT fold non-ASCII (Polish diacritics), so the
+        // old compare missed the overlap and DUPLICATED the shared words. Unicode folding must
+        // detect it; the appended text stays byte-original.
+        let merged = merge_live_caption("mówił że projekt", "Że projekt ruszy w piątek");
+        assert_eq!(
+            merged, "mówił że projekt ruszy w piątek",
+            "a Unicode-case-only difference must still merge without duplication"
+        );
+    }
+
+    #[test]
+    fn merge_live_caption_ignores_edge_punctuation_for_overlap() {
+        // PR-A #4b: trailing-punctuation variance between overlapping tails ("piątek." vs
+        // "piątek") must not break overlap detection. The ACCUMULATED text keeps its original
+        // bytes (incl. the "."); only the comparison is normalized.
+        let merged = merge_live_caption("spotkamy się w piątek.", "w piątek omówimy budżet");
+        assert_eq!(
+            merged, "spotkamy się w piątek. omówimy budżet",
+            "punctuation-only variance must still dedup the shared overlap"
+        );
+    }
+
+    /// PR-A #5 HONESTY: the live buffer is a mic-side, unattributed rolling capture — the prompt
+    /// must SAY so, and must not claim the transcript can answer "who said what" (any speaker
+    /// attribution from it would be hallucinated).
+    #[test]
+    fn assistant_system_prompt_is_honest_about_attribution() {
+        let p = assistant_system_prompt("we shipped the beta", "");
+        let lower = p.to_lowercase();
+        assert!(lower.contains("unattributed"), "must state the transcript is unattributed: {p}");
+        assert!(lower.contains("microphone"), "must state the mic-side capture origin: {p}");
+        assert!(
+            !p.contains("its topic, decisions, who said what"),
+            "must not claim the transcript knows who said what: {p}"
+        );
+    }
+
+    // ── PR-A #2: the live-tail injection is GATED on meeting visibility (fail-closed) ─────────────
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tmp_db(tag: &str) -> crate::storage::Db {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-live-gate-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        crate::storage::Db::open_with_key(&p, TEST_DEK).unwrap()
+    }
+
+    /// Seed one summarized meeting with a note, foldered into `folder_id` when given.
+    fn seed_meeting(db: &crate::storage::Db, mid: &str, folder_id: Option<&str>) {
+        db.insert_meeting(&crate::storage::Meeting {
+            id: mid.to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Sync".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "# note".to_string(),
+            created_at: "2026-07-01T09:05:00Z".to_string(),
+            exported_path: None,
+        })
+        .unwrap();
+        db.set_meeting_folder(mid, folder_id).unwrap();
+    }
+
+    #[test]
+    fn gated_live_context_masks_live_tail_when_meeting_not_visible() {
+        // The mid-recording-relock window: the current meeting's folder is sealed and NOT
+        // session-unlocked → the live tail (still legitimately in RAM) must NOT be injected into
+        // the assistant's prompt. Fail-closed, exactly like the typed notes.
+        let db = tmp_db("masked");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "m1", Some("f1"));
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+
+        let live = std::sync::Mutex::new("sealed meeting tail still in RAM".to_string());
+        let unlocked = std::collections::HashSet::new();
+        let (tail, notes) = gated_live_context(&db, &live, "m1", &unlocked);
+        assert!(tail.is_empty(), "sealed-not-unlocked meeting must inject NO live tail");
+        assert!(notes.is_empty(), "sealed-not-unlocked meeting must inject NO typed notes");
+        let prompt = assistant_system_prompt(&tail, &notes);
+        assert!(!prompt.contains("LIVE TRANSCRIPT"), "no live section for a sealed meeting: {prompt}");
+        assert!(!prompt.contains("sealed meeting tail"), "the RAM buffer must not reach the prompt");
+        // The in-flight buffer itself is NOT wiped — a session re-unlock re-injects it.
+        assert_eq!(*live.lock().unwrap(), "sealed meeting tail still in RAM");
+    }
+
+    #[test]
+    fn gated_live_context_injects_for_visible_meeting_and_masks_without_one() {
+        let db = tmp_db("visible");
+        // An in-progress recording has no note rows yet ⇒ trivially visible: tail + notes inject.
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-rec".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: None,
+            duration_s: 0,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        db.set_manual_notes("m-rec", "ship Friday").unwrap();
+        let live = std::sync::Mutex::new("we agreed to ship friday".to_string());
+        let unlocked = std::collections::HashSet::new();
+        let (tail, notes) = gated_live_context(&db, &live, "m-rec", &unlocked);
+        assert_eq!(tail, "we agreed to ship friday", "a visible meeting injects the live tail");
+        assert_eq!(notes, "ship Friday", "a visible meeting injects the typed notes");
+
+        // NO current meeting (not recording) ⇒ fail-closed: nothing injects even if a stale
+        // buffer somehow survived.
+        let (tail, notes) = gated_live_context(&db, &live, "", &unlocked);
+        assert!(tail.is_empty(), "no current meeting must inject NO live tail");
+        assert!(notes.is_empty(), "no current meeting must inject NO typed notes");
+    }
+
+    #[test]
+    fn gated_live_context_reinjects_after_session_unlock() {
+        // A session unlock of the sealed folder makes the meeting visible again → the (unwiped)
+        // in-flight buffer injects once more. Proves the gate is reversible, not a wipe.
+        let db = tmp_db("reunlock");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "m1", Some("f1"));
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+
+        let live = std::sync::Mutex::new("tail".to_string());
+        let mut unlocked = std::collections::HashSet::new();
+        assert!(gated_live_context(&db, &live, "m1", &unlocked).0.is_empty());
+        unlocked.insert("f1".to_string());
+        assert_eq!(gated_live_context(&db, &live, "m1", &unlocked).0, "tail");
+    }
+
+    // ── PR-A #1/#3: clearing the buffer at Stop + lock-surface hygiene ─────────────────────────────
+
+    #[test]
+    fn clear_live_transcript_empties_the_buffer() {
+        let live = std::sync::Mutex::new("stale tail of the finished recording".to_string());
+        clear_live_transcript(&live);
+        assert!(live.lock().unwrap().is_empty(), "the buffer must be empty after Stop clears it");
+        // Idempotent on an already-empty buffer.
+        clear_live_transcript(&live);
+        assert!(live.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_live_transcript_if_idle_never_wipes_a_recording_in_flight() {
+        // Mid-recording the lock surface must NOT wipe the user's in-flight buffer (egress
+        // correctness there is the visibility gate's job); idle it clears.
+        let live = std::sync::Mutex::new("in-flight captions".to_string());
+        clear_live_transcript_if_idle(&live, true);
+        assert_eq!(*live.lock().unwrap(), "in-flight captions", "mid-recording buffer untouched");
+        clear_live_transcript_if_idle(&live, false);
+        assert!(live.lock().unwrap().is_empty(), "idle buffer cleared");
     }
 
     #[test]

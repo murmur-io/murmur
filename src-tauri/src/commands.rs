@@ -347,6 +347,11 @@ pub async fn stop_recording(
             .ok_or_else(|| AppError::Audio("not recording".into()))?
     };
 
+    // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
+    // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
+    // the just-recorded folder is sealed). The authoritative transcript is produced below.
+    crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+
     let meeting_uuid = {
         let mut current = state
             .current_meeting
@@ -3635,7 +3640,19 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     for p in exported_paths {
         let _ = std::fs::remove_file(&p);
     }
+
+    // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer at
+    // the moment a folder seals (post clear-on-Stop it is normally already empty; idempotent).
+    clear_stale_live_transcript(state);
     Ok(())
+}
+
+/// Lock-surface RAM hygiene: clear the live-transcript buffer ONLY when no recording is active —
+/// never wipe an in-flight buffer (mid-recording egress correctness is owned by the visibility
+/// gate in `transcribe::live`). Fail-safe: a poisoned recorder lock is treated as "recording".
+fn clear_stale_live_transcript(state: &AppState) {
+    let recording = state.recorder.lock().map(|g| g.is_some()).unwrap_or(true);
+    crate::transcribe::live::clear_live_transcript_if_idle(&state.live_transcript, recording);
 }
 
 /// SESSION-unlock a sealed folder: KEK → unwrap CK → decrypt each note's `content_blob` back into
@@ -3844,6 +3861,10 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     if let Err(e) = state.db.checkpoint_truncate() {
         tracing::warn!(target: "lock", error = %e, "wal_checkpoint(TRUNCATE) on relock_all failed");
     }
+    // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer on
+    // relock-all (manual "Lock all", screen-share auto-relock, window-close, app-exit). Never
+    // clears mid-recording — the in-flight buffer stays, gated by visibility at injection time.
+    clear_stale_live_transcript(state);
     Ok(())
 }
 
@@ -5412,6 +5433,42 @@ mod lifecycle_tests {
             created_at: "2026-06-27T08:00:00Z".to_string(),
         })
         .unwrap();
+    }
+
+    /// PR-A #3 belt-and-braces: sealing a folder while NO recording is active clears any stale
+    /// live-transcript buffer (post clear-on-Stop it is normally already empty — idempotent
+    /// hygiene so a stale tail can never outlive the folder it belongs to).
+    #[test]
+    fn lock_folder_clears_stale_live_transcript_when_not_recording() {
+        let state = build_state("lock-clears-live");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        *state.live_transcript.lock().unwrap() =
+            "stale tail of the just-recorded meeting".to_string();
+        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert!(
+            state.live_transcript.lock().unwrap().is_empty(),
+            "lock_folder with no active recording must clear the stale live-transcript buffer"
+        );
+    }
+
+    /// PR-A #3 belt-and-braces: `relock_all` (manual "Lock all" + the screen-share auto-relock via
+    /// `relock_all_inner`) clears the stale buffer too when no recording is active.
+    #[test]
+    fn relock_all_clears_stale_live_transcript_when_not_recording() {
+        let state = build_state("relock-clears-live");
+        *state.live_transcript.lock().unwrap() = "stale tail".to_string();
+        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+
+        relock_all_inner(&state).unwrap();
+
+        assert!(
+            state.live_transcript.lock().unwrap().is_empty(),
+            "relock_all with no active recording must clear the stale live-transcript buffer"
+        );
     }
 
     /// brain2 realtime notes: with the meeting in an OPEN folder (or no folder) the gate is open, so
