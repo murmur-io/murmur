@@ -477,19 +477,19 @@ impl SummarizerProvider for RedactingProvider {
         Ok((out, meta))
     }
 
-    /// Redact inputs, call the INNER provider's own `complete_json` (not the trait default), restore
-    /// PII in the returned `Value` via a JSON string round-trip, and record a content-free egress entry.
+    /// Redact inputs, call the INNER provider's own `complete_json_with_meta` (not the trait
+    /// default's free-text path), restore PII in the returned `Value` via a JSON string
+    /// round-trip, record a content-free egress entry with the REAL `CallMeta` (so token counts
+    /// for timeline/graph side-tasks are no longer zeroed in the ledger), and return both.
     ///
-    /// Without this override the trait default would fire: it calls `self.complete()` (free-text path)
-    /// which bypasses the inner's `complete_json` override entirely — so the gateway's native
-    /// `response_format: json_schema` mode would never be reached even though the gateway provider
-    /// correctly overrides `complete_json`. This override closes that gap.
-    async fn complete_json(
+    /// Callers that only need the value use the inherited `complete_json` default, which
+    /// delegates to this method and drops the meta — callers are unchanged.
+    async fn complete_json_with_meta(
         &self,
         system: &str,
         user: &str,
         schema: &Value,
-    ) -> Result<Value> {
+    ) -> Result<(Value, CallMeta)> {
         // Shared map so a value redacted in either prompt restores consistently in the reply.
         let mut map = HashMap::new();
         let mut rev = HashMap::new();
@@ -503,9 +503,9 @@ impl SummarizerProvider for RedactingProvider {
         let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
         let (ruser, more) = self.names.redact_names(&ruser);
         name_pairs.extend(more);
-        // Forward to the INNER's own complete_json — dispatches to the gateway's native
-        // json_schema override, or the trait default for anthropic/claude_code/ollama.
-        let value = self.inner.complete_json(&rsys, &ruser, schema).await?;
+        // Forward to the INNER's own complete_json_with_meta — dispatches to the gateway's native
+        // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
+        let (value, meta) = self.inner.complete_json_with_meta(&rsys, &ruser, schema).await?;
         // Restore PII in the returned Value via a JSON string round-trip. The ⟪TOKEN⟫ placeholders
         // are embedded verbatim in the JSON string values, so serialization preserves them and
         // the regex replacements find them correctly.
@@ -522,22 +522,24 @@ impl SummarizerProvider for RedactingProvider {
                 "complete_json: restore produced invalid JSON: {e}"
             ))
         })?;
-        // Record a content-free audit entry. `complete_json` returns no CallMeta (unlike
-        // `complete_with_meta`), so `CallMeta::default()` is the correct sentinel here.
+        // Record a content-free audit entry with the REAL meta so timeline/graph calls
+        // show actual token usage in the egress ledger (not the former CallMeta::default()).
         let redactions = count_redactions(&map, name_pairs.len());
         self.sink.record(EgressEntry {
             provider_id: self.provider_id.clone(),
             destination: self.destination.clone(),
             model_requested: self.model_requested.clone(),
             call_kind: "complete_json",
-            meta: CallMeta::default(),
+            meta: meta.clone(),
             redactions,
             system_bytes,
             user_bytes,
             meeting_id: None,
         });
-        Ok(out)
+        Ok((out, meta))
     }
+    // `complete_json` inherits the delegating default: calls `complete_json_with_meta` and
+    // drops the meta — callers that only need the value are unchanged.
 }
 
 #[cfg(test)]
@@ -948,9 +950,10 @@ mod tests {
         let captured_user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let complete_json_called = std::sync::Arc::new(AtomicBool::new(false));
 
-        /// Inner that (a) flags when its `complete_json` is called, (b) captures the user prompt
-        /// it received, and (c) echoes the ⟪EMAIL_1⟫ token back inside a JSON Value — so we can
-        /// verify the `RedactingProvider` restores it to the original email on the way out.
+        /// Inner that (a) flags when its `complete_json_with_meta` is called, (b) captures the
+        /// user prompt it received, and (c) echoes the ⟪EMAIL_1⟫ token back inside a JSON Value
+        /// paired with a KNOWN non-default `CallMeta` — so we can verify the `RedactingProvider`
+        /// restores the PII and forwards the REAL meta to the egress ledger.
         struct RecordingJsonProvider {
             captured_user: std::sync::Arc<std::sync::Mutex<String>>,
             called: std::sync::Arc<AtomicBool>,
@@ -962,20 +965,30 @@ mod tests {
             async fn availability(&self) -> Availability { Availability::Available }
             async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
             async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
-                // Must NOT be called when complete_json override is wired correctly.
+                // Must NOT be called when complete_json_with_meta override is wired correctly.
                 Ok(String::new())
             }
-            async fn complete_json(
+            async fn complete_json_with_meta(
                 &self,
                 _system: &str,
                 user: &str,
                 _schema: &serde_json::Value,
-            ) -> Result<serde_json::Value> {
+            ) -> Result<(serde_json::Value, crate::summarize::meta::CallMeta)> {
                 self.called.store(true, Ordering::SeqCst);
                 *self.captured_user.lock().unwrap() = user.to_string();
-                // Return a Value that embeds the ⟪EMAIL_1⟫ placeholder — proves the
-                // RedactingProvider restores it to `alice@corp.example` on the way out.
-                Ok(serde_json::json!({ "note": "contact \u{27ea}EMAIL_1\u{27eb}" }))
+                // Return a Value that embeds the ⟪EMAIL_1⟫ placeholder (proves the
+                // RedactingProvider restores it to `alice@corp.example`) together with a
+                // KNOWN non-default CallMeta (proves the meta reaches the egress ledger).
+                Ok((
+                    serde_json::json!({ "note": "contact \u{27ea}EMAIL_1\u{27eb}" }),
+                    crate::summarize::meta::CallMeta {
+                        model_served: Some("test-gateway-model".to_string()),
+                        prompt_tokens: Some(42),
+                        completion_tokens: Some(7),
+                        total_tokens: Some(49),
+                        cached_tokens: None,
+                    },
+                ))
             }
         }
 
@@ -1032,12 +1045,25 @@ mod tests {
             "⟪EMAIL_n⟫ token must be absent from the restored Value, note: {note}"
         );
 
-        // 4. Egress sink: one entry, correct call_kind, correct redaction count, content-free.
+        // 4. Egress sink: one entry, correct call_kind, correct redaction count, REAL meta,
+        //    and content-free.
         let entries = captured_entries.lock().unwrap();
         assert_eq!(entries.len(), 1, "exactly one egress entry per complete_json call");
         let entry = &entries[0];
         assert_eq!(entry.call_kind, "complete_json", "call_kind must be 'complete_json'");
         assert_eq!(entry.redactions.email, 1, "one email was redacted");
+
+        // 5. The REAL CallMeta propagated — no longer CallMeta::default().
+        assert_eq!(
+            entry.meta.prompt_tokens,
+            Some(42),
+            "real prompt_tokens from inner must be recorded in the egress entry (was CallMeta::default() before FIX 1)"
+        );
+        assert_eq!(
+            entry.meta.model_served.as_deref(),
+            Some("test-gateway-model"),
+            "real model_served from inner must be recorded in the egress entry"
+        );
 
         let debug = format!("{:?}", entry);
         assert!(

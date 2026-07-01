@@ -197,14 +197,15 @@ pub fn make_provider(
     ))
 }
 
-/// All three provider instances (for availability fan-out in the Settings UI).
+/// Provider instances for the Settings UI "Provider availability" fan-out.
 ///
 /// Availability-only: intentionally skips the consent gate and `RedactingProvider` wrap.
 /// MUST NOT be used to summarize content — use [`make_provider`] for that.
 ///
 /// Best-effort: a failure to read the Anthropic key from the Keychain degrades to a
 /// keyless `AnthropicProvider` (which then reports `Unavailable`) rather than failing the
-/// whole fan-out.
+/// whole fan-out. The gateway entry is included ONLY when `gateway_base_url` is non-empty
+/// AND the URL is valid; a bad URL degrades to omission (never panics).
 pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
     let anthropic_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)
         .ok()
@@ -215,7 +216,7 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
     } else {
         config.provider_model.clone()
     };
-    vec![
+    let mut providers: Vec<Arc<dyn SummarizerProvider>> = vec![
         Arc::new(
             ClaudeCodeProvider::with_binary(config.claude_binary.clone())
                 .with_model(config.provider_model.clone())
@@ -230,7 +231,19 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
             config.ollama_base_url.clone(),
             config.ollama_model.clone(),
         )),
-    ]
+    ];
+    // Gateway: include only when configured; a bad URL is omitted, never a panic.
+    if !config.gateway_base_url.trim().is_empty() {
+        let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+        if let Ok(gw) = crate::summarize::gateway::OpenAiCompatProvider::new(
+            config.gateway_base_url.clone(),
+            config.gateway_model.clone(),
+            api_key,
+        ) {
+            providers.push(Arc::new(gw));
+        }
+    }
+    providers
 }
 
 #[cfg(test)]
