@@ -257,6 +257,31 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: f64) -> Vec<(String, f64)> {
     fused
 }
 
+/// RRF-fuse the two gated document retrieval legs (vector KNN + keyword FTS) into one best-first,
+/// per-document-deduped hit list. Either leg may be empty (model absent ⇒ no KNN leg; punctuation
+/// query ⇒ no FTS leg) — RRF over the remaining list preserves its order. The snippet kept for a
+/// document is its first-seen one, KNN (nearest chunk) preferred over FTS (best-bm25 chunk). Pure
+/// fusion — both inputs were already visibility-gated by their Db readers.
+pub fn fuse_doc_hits(
+    knn: Vec<crate::storage::models::DocChunkHit>,
+    fts: Vec<crate::storage::models::DocChunkHit>,
+) -> Vec<crate::storage::models::DocChunkHit> {
+    if knn.is_empty() && fts.is_empty() {
+        return Vec::new();
+    }
+    let knn_ids: Vec<String> = knn.iter().map(|h| h.document_id.clone()).collect();
+    let fts_ids: Vec<String> = fts.iter().map(|h| h.document_id.clone()).collect();
+    let fused = rrf_fuse(&[knn_ids, fts_ids], RRF_K);
+    let mut by_id: HashMap<String, crate::storage::models::DocChunkHit> = HashMap::new();
+    for h in knn.into_iter().chain(fts) {
+        by_id.entry(h.document_id.clone()).or_insert(h);
+    }
+    fused
+        .into_iter()
+        .filter_map(|(id, _score)| by_id.remove(&id))
+        .collect()
+}
+
 /// Download the three e5 model files into [`embed_model_dir`], INBOUND-ONLY, with progress.
 ///
 /// Mirrors [`crate::reason::download_brain_model`]: each file streams to `<file>.part` then renames
