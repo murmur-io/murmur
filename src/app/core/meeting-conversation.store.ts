@@ -332,7 +332,15 @@ export class MeetingConversationStore {
       this._loaded.set(true);
       return;
     }
-    // A real meeting → block submission until `manual_notes` has hydrated.
+    // A genuinely NEW meeting id → start a fresh conversation: clear the in-memory
+    // flow so a PRIOR meeting's threads (which live only here, not in manual_notes)
+    // don't bleed into the new meeting, then hydrate this meeting's notes. The
+    // same-id case early-returned above, so switching tabs and returning DURING a
+    // recording preserves the conversation (this is the fix for the "threads vanish
+    // when I leave and come back" data-loss bug — the old per-component clear-on-
+    // record effect mis-fired on re-mount because its edge state reset to false).
+    this._notes.set([]);
+    this.voiceTargetNoteId = null;
     this._loaded.set(false);
     void this.loadNotes(id, token);
   }
