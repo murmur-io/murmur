@@ -10,16 +10,17 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.5.0-6e76ff?style=flat-square" alt="version">
+  <img src="https://img.shields.io/github/v/release/murmur-io/murmur?style=flat-square&color=6e76ff&label=version" alt="version">
   <img src="https://img.shields.io/badge/macOS-13.4%2B-0b0b0b?style=flat-square&logo=apple&logoColor=white" alt="macOS 13.4+">
   <img src="https://img.shields.io/badge/on--device_brain-Bielik%20%C2%B7%20Qwen-9d7bff?style=flat-square" alt="on-device brain">
   <img src="https://img.shields.io/badge/Tauri-2.11-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2.11">
   <img src="https://img.shields.io/badge/Rust-1.96-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.96">
   <img src="https://img.shields.io/badge/privacy-local--first-3fb950?style=flat-square" alt="local-first">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-8ca0ff?style=flat-square" alt="license AGPL-3.0"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/JakubGawr/murmur/releases/latest"><b>⬇️ Download</b></a> ·
+  <a href="https://github.com/murmur-io/murmur/releases/latest"><b>⬇️ Download</b></a> ·
   <a href="#-quick-start">Quick start</a> ·
   <a href="#-the-brain--talk-to-it-during-the-meeting">The brain</a> ·
   <a href="#-features">Features</a> ·
@@ -63,7 +64,7 @@ leaves the device.**
 
 > **Requires macOS 13.4+ (Apple Silicon or Intel).**
 
-**Just want to use it?** → [**Download the latest signed & notarized build**](https://github.com/JakubGawr/murmur/releases/latest),
+**Just want to use it?** → [**Download the latest signed & notarized build**](https://github.com/murmur-io/murmur/releases/latest),
 drag `Murmur.app` to Applications, and open it. A first-run wizard walks you through the Whisper model,
 an AI provider, and (optionally) a vault.
 
@@ -296,7 +297,7 @@ the same visibility gates (sealed meetings stay invisible), with a bearer token 
 </details>
 
 ```bash
-git clone https://github.com/JakubGawr/murmur.git && cd murmur
+git clone https://github.com/murmur-io/murmur.git && cd murmur
 npm install
 source ~/.cargo/env
 
@@ -345,7 +346,7 @@ murmur/
 
 ## 🗺️ Status
 
-Murmur ships at **v0.5.0** — a signed, notarized macOS app. The full record → transcribe → summarize
+Murmur ships at **v0.6.3** — a signed, notarized macOS app. The full record → transcribe → summarize
 pipeline, the in-meeting voice assistant, the on-device brain + semantic search, the per-folder Touch ID
 lock, the knowledge graph, Ask-Your-Vault, and the MCP server are all implemented. Some capabilities — live
 ScreenCaptureKit capture, the Touch ID prompt, and screen-share auto-relock — can only be *fully* exercised
@@ -353,6 +354,10 @@ on a signed build on a real Mac, and are documented as such.
 
 > Screenshots in this README are the real Angular UI rendered from the shipping code, populated with demo
 > data (no private meetings).
+
+## 📄 License
+
+Murmur is open source under the [GNU AGPL-3.0](LICENSE) license.
 
 ---
 
