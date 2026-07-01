@@ -1000,14 +1000,14 @@ fn ingest_into_folder(
         .db
         .insert_document(&id, folder_id, name, text, kind, created_at)?;
 
-    // Index ONLY when the REAL e5 model is present (never write stub vectors). Best-effort: a failure
-    // logs (no PII) and does NOT fail the ingest (the row + plaintext are durable; a later unlock
-    // re-embed / reindex recovers the vectors).
-    if crate::embed::embed_model_present() {
-        let embedder = crate::embed::active_embedder();
-        if let Err(e) = state.db.index_document_chunks(&id, embedder.as_ref()) {
-            tracing::warn!(target: "rag", error = %e, "ingest: chunk/embed failed (content stored)");
-        }
+    // ALWAYS chunk (doc_chunks + the fts_doc_chunks triggers) so keyword retrieval works on a
+    // DEFAULT install — an ingested document must never be write-only memory. Vectors ONLY when the
+    // REAL e5 model is present (never write stub vectors). Best-effort: a failure logs (no PII) and
+    // does NOT fail the ingest (the row + plaintext are durable; a later unlock re-chunk / reindex
+    // recovers the index).
+    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    if let Err(e) = state.db.index_document_chunks(&id, embedder.as_deref()) {
+        tracing::warn!(target: "rag", error = %e, "ingest: chunk/embed failed (content stored)");
     }
 
     // PII rule: log only ids, the kind, and byte/char counts — never the text/name.
@@ -3282,9 +3282,11 @@ pub struct ReindexResult {
 /// vectors are replaced with e5 ones. No new read path: every read routes through `visibility_clause`.
 ///
 /// MODEL GUARD: if the real e5 model is absent (`!embed_model_present()` ⇒ `active_embedder` is the
-/// stub), we DO NOTHING and return `{ status: "model_missing" }`. Re-indexing with garbage stub
-/// vectors is strictly worse than leaving the (old, possibly-stub) chunks alone — the FE prompts the
-/// user to download e5 first via `download_embed_model`.
+/// stub), MEETING indexing does nothing and the result is `{ status: "model_missing" }` — re-indexing
+/// with garbage stub vectors is strictly worse than leaving the (old, possibly-stub) chunks alone;
+/// the FE prompts the user to download e5 first via `download_embed_model`. DOCUMENT chunk/FTS
+/// backfill still runs (chunk-only, zero vectors) so keyword retrieval over documents works
+/// regardless of the model.
 ///
 /// Emits [`crate::events::EVENT_REINDEX`] `{ done, total }` progress (counts only, NO PII).
 /// EMBED_DIM stays 384 (e5 == stub width) ⇒ NO `vec_chunks` schema migration.
@@ -3354,9 +3356,11 @@ pub async fn related_meetings(
 /// visibility-gated loop are unit-testable headless. Takes the `Db`, the live `unlocked` session set,
 /// whether the REAL e5 model is present (`model_present`), the active embedder, and a progress sink.
 ///
-/// MODEL GUARD: `model_present == false` ⇒ return `{ status: "model_missing" }` and index NOTHING
-/// (re-indexing with the deterministic STUB embedder would poison the index with garbage vectors —
-/// strictly worse than leaving the old chunks alone).
+/// MODEL GUARD: `model_present == false` ⇒ return `{ status: "model_missing" }` and index NO
+/// meeting and NO vector (re-indexing with the deterministic STUB embedder would poison the index
+/// with garbage vectors — strictly worse than leaving the old chunks alone). Document CHUNK/FTS
+/// backfill (zero vectors) still runs for visible documents that have no chunks yet, so keyword
+/// retrieval covers the write-only legacy rows.
 ///
 /// GATING (lock-model): the corpus is exactly `list_meetings_visible(unlocked)` — a sealed-and-not-
 /// session-unlocked meeting is NEVER returned, so its plaintext is never chunked/embedded and its
@@ -3369,6 +3373,32 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
     embedder: &dyn crate::embed::Embedder,
     mut on_progress: F,
 ) -> Result<ReindexResult, AppError> {
+    // DOCUMENT backfill first — doc_chunks + the FTS index are model-INDEPENDENT (keyword retrieval
+    // must work on a default install), so this runs even when the e5 model is absent. Visible
+    // documents only (`visible_document_ids` applies `visibility_clause`; a sealed folder's docs
+    // stay purged). Model present ⇒ full purge-then-reinsert re-embed. Model ABSENT ⇒ chunk-only
+    // backfill of documents with NO chunks yet (the write-only legacy rows) — never a
+    // purge-then-reinsert of an already-chunked document, which would DESTROY its existing real
+    // vectors without replacing them.
+    let doc_embedder = model_present.then_some(embedder);
+    let mut docs_indexed = 0usize;
+    for did in db.visible_document_ids(unlocked)? {
+        let should_index = model_present || !db.document_has_chunks(&did)?;
+        if !should_index {
+            continue;
+        }
+        match db.index_document_chunks(&did, doc_embedder) {
+            Ok(()) => docs_indexed += 1,
+            Err(e) => {
+                // Never abort the whole backfill on one bad document — log (no PII) and continue.
+                tracing::warn!(target: "rag", error = %e, "reindex: indexing one document failed (skipped)");
+            }
+        }
+    }
+    if docs_indexed > 0 {
+        tracing::info!(target: "rag", docs_indexed, "reindex: document chunks backfilled");
+    }
+
     if !model_present {
         tracing::info!(target: "rag", "reindex_embeddings: e5 model missing; skipping (no stub indexing)");
         return Ok(ReindexResult {
@@ -5034,14 +5064,15 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
             restored_doc_ids.push(d.id.clone());
         }
     }
-    // Re-embed the restored documents — ONLY when the REAL e5 model is present (never write stub
-    // vectors; mirrors `import_document` / `should_auto_index`). Best-effort: an embed failure logs
-    // (no PII) and does NOT fail the unlock — the plaintext text is already restored.
-    if !restored_doc_ids.is_empty() && crate::embed::embed_model_present() {
-        let embedder = crate::embed::active_embedder();
+    // Re-index the restored documents: chunks + the FTS index come back UNCONDITIONALLY (keyword
+    // retrieval must survive a lock/unlock cycle on a model-less install); vectors ONLY when the
+    // REAL e5 model is present (never stub vectors; mirrors `import_document`). Best-effort: a
+    // failure logs (no PII) and does NOT fail the unlock — the plaintext text is already restored.
+    if !restored_doc_ids.is_empty() {
+        let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
         for did in &restored_doc_ids {
-            if let Err(e) = state.db.index_document_chunks(did, embedder.as_ref()) {
-                tracing::warn!(target: "rag", error = %e, "document re-embed on unlock failed (text restored)");
+            if let Err(e) = state.db.index_document_chunks(did, embedder.as_deref()) {
+                tracing::warn!(target: "rag", error = %e, "document re-index on unlock failed (text restored)");
             }
         }
     }
@@ -5168,8 +5199,8 @@ fn unseal_folder_extras_permanent(
     // Document ingestion: PERMANENTLY restore each document's plaintext from its blob (or keep the
     // in-memory plaintext if the folder was session-unlocked and the blob is absent), then clear the
     // blob. NEVER lose the document — the plaintext is back before the blob is dropped (mirrors the
-    // note / manual-notes permanent restore). Then re-embed (model-present-gated) so the now-open
-    // folder's documents are semantically searchable again.
+    // note / manual-notes permanent restore). Then re-index (chunks + FTS always; vectors
+    // model-present-gated) so the now-open folder's documents are searchable again.
     let mut restored_doc_ids: Vec<String> = Vec::new();
     for d in state.db.raw_documents_in_folder(folder_id)? {
         if let Some(blob) = &d.blob {
@@ -5182,11 +5213,13 @@ fn unseal_folder_extras_permanent(
         state.db.clear_document_blob(&d.id)?;
         restored_doc_ids.push(d.id.clone());
     }
-    if !restored_doc_ids.is_empty() && crate::embed::embed_model_present() {
-        let embedder = crate::embed::active_embedder();
+    if !restored_doc_ids.is_empty() {
+        // Chunks + FTS come back unconditionally (keyword retrieval works model-less); vectors only
+        // when the REAL e5 model is present (never stub vectors).
+        let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
         for did in &restored_doc_ids {
-            if let Err(e) = state.db.index_document_chunks(did, embedder.as_ref()) {
-                tracing::warn!(target: "rag", error = %e, "document re-embed on remove-lock failed (text restored)");
+            if let Err(e) = state.db.index_document_chunks(did, embedder.as_deref()) {
+                tracing::warn!(target: "rag", error = %e, "document re-index on remove-lock failed (text restored)");
             }
         }
     }
@@ -5956,21 +5989,24 @@ mod lifecycle_tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert!(listed[0].name.ends_with(".md"));
-        // Embedding is MODEL-PRESENCE-gated in `import_document_inner` (never write stub vectors —
-        // mirrors `should_auto_index`'s no-stub contract). So the chunk count is environment-dependent
-        // and MUST be asserted per branch, or this test goes RED on a no-model CI machine / fresh
-        // checkout (the merge gate provisions no e5 model):
-        //   - model present → real e5 vectors indexed → ≥1 doc_chunks row;
-        //   - model ABSENT  → NO embedding → exactly 0 doc_chunks rows.
-        // The assertions above (row stored, text retrievable, listed) are model-INDEPENDENT.
+        // CHUNKING is unconditional (keyword/FTS retrieval must work on a default install);
+        // only the VECTORS stay model-presence-gated (never write stub vectors — mirrors
+        // `should_auto_index`'s no-stub contract). So:
+        //   - always          → ≥1 doc_chunks row;
+        //   - model present   → matching real e5 vectors;
+        //   - model ABSENT    → exactly 0 doc_vec_chunks rows (no stub poisoning).
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "the document must be chunked regardless of model presence (always-chunk)"
+        );
         if crate::embed::embed_model_present() {
             assert!(
-                state.db.doc_chunk_count(&id).unwrap() >= 1,
-                "with the e5 model present, the document must be chunked + embedded"
+                state.db.doc_vec_count(&id).unwrap() >= 1,
+                "with the e5 model present, the chunks must carry real vectors"
             );
         } else {
             assert_eq!(
-                state.db.doc_chunk_count(&id).unwrap(),
+                state.db.doc_vec_count(&id).unwrap(),
                 0,
                 "with no e5 model, NO stub vectors are written (no-stub contract)"
             );
@@ -6219,6 +6255,197 @@ mod lifecycle_tests {
             state.db.doc_chunk_count(&id).unwrap(),
             0,
             "doc chunks cascade-deleted with the document"
+        );
+    }
+
+    /// PR B HEADLINE (write-only-memory bug): on a DEFAULT install (no e5 model, semantic flag OFF)
+    /// an ingested brain note/document MUST still be REACHABLE — chunked unconditionally, surfaced
+    /// by the FLAG-OFF Ask corpus builder, and surfaced through the advertised tool seam (which MCP
+    /// and the agentic loop share). RED on the old code: ingest skipped chunking without the model,
+    /// the flag-off corpus packed meetings only, and both search tools ignored documents.
+    #[test]
+    fn model_less_ingest_is_reachable_by_flag_off_ask_and_tools() {
+        let state = build_state("docs-default-reach");
+        make_open_folder(&state.db, "f-open", "Project");
+        let id = import_text_inner(
+            &state,
+            "Preferencje",
+            "Ulubiony kolor użytkownika to fioletowoszary.",
+            "f-open",
+        )
+        .unwrap();
+
+        // 1. ALWAYS-CHUNK: doc_chunks rows exist regardless of model presence (keyword retrieval
+        //    must work on a default install; vectors stay model-gated).
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "ingest must store doc_chunks rows even without the e5 model"
+        );
+
+        // 2. The FLAG-OFF Ask corpus (the default `ask_vault` path) surfaces the token.
+        let nothing = HashSet::new();
+        let (corpus, _) = crate::summarize::vault_context::build_vault_context_visible(
+            &state.db,
+            "fioletowoszary",
+            "anthropic",
+            &nothing,
+        )
+        .unwrap();
+        assert!(
+            // Assert on a CONTENT word absent from the query — sentinels echo the query itself
+            // ("No meetings match \"fioletowoszary\"."), so a query-token check can self-satisfy.
+            corpus.contains("Ulubiony") && corpus.contains("fioletowoszary"),
+            "flag-off Ask corpus must surface ingested document/note content; got: {corpus:?}"
+        );
+
+        // 3. The tool seam (default config: semantic OFF) surfaces the token through BOTH advertised
+        //    search tools — the same seam MCP and the agentic loop dispatch through.
+        let cfg = AppConfig::default();
+        let out = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchMeetings { query: "fioletowoszary".into() },
+            &state.db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Ulubiony"),
+            "search_meetings must surface document CONTENT (not just echo the query in an \
+             empty-result sentinel); got: {out:?}"
+        );
+        let out2 = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchSemantic { query: "fioletowoszary".into() },
+            &state.db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out2.contains("Ulubiony"),
+            "search_semantic (flag OFF) must fall back to gated keyword doc search and surface \
+             document CONTENT; got: {out2:?}"
+        );
+    }
+
+    /// SEAL/UNSEAL PARITY for the new keyword legs: locking a folder makes its document's unique
+    /// token INVISIBLE through EVERY read leg (the gated FTS helper, the flag-off Ask corpus, both
+    /// search tools), and a session unlock brings it back through the SAME legs — including on a
+    /// model-less install (the unlock re-chunk no longer requires the e5 model).
+    #[test]
+    fn sealed_folder_docs_invisible_through_every_leg_until_unlock() {
+        let state = build_state("docs-seal-legs");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let id = import_text_inner(
+            &state,
+            "plan",
+            "TAJNYTOKEN kwartalny raport przejęcia",
+            "f-lock",
+        )
+        .unwrap();
+        assert!(state.db.doc_chunk_count(&id).unwrap() >= 1, "precondition: chunked on ingest");
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let nothing = HashSet::new();
+        let cfg = AppConfig::default();
+        // Leak assertions check "przejęcia" — a CONTENT word absent from the query — because the
+        // empty-result sentinels honestly ECHO the query text ("No meetings or documents match
+        // \"TAJNYTOKEN\"."), which is not a content leak.
+        let assert_leg_visibility = |unlocked: &HashSet<String>, expected: bool, phase: &str| {
+            let fts_hit = state
+                .db
+                .search_doc_chunks_fts_visible("TAJNYTOKEN", 10, unlocked)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == id);
+            assert_eq!(fts_hit, expected, "FTS helper leg, {phase}");
+            let (corpus, _) = crate::summarize::vault_context::build_vault_context_visible(
+                &state.db,
+                "TAJNYTOKEN",
+                "anthropic",
+                unlocked,
+            )
+            .unwrap();
+            assert_eq!(corpus.contains("przejęcia"), expected, "Ask corpus leg, {phase}");
+            for call in [
+                crate::tools::ToolCall::SearchMeetings { query: "TAJNYTOKEN".into() },
+                crate::tools::ToolCall::SearchSemantic { query: "TAJNYTOKEN".into() },
+            ] {
+                let out = crate::tools::execute_tool(&call, &state.db, unlocked, &cfg).unwrap();
+                assert_eq!(out.contains("przejęcia"), expected, "tool leg {call:?}, {phase}");
+            }
+        };
+
+        // Sealed-and-not-unlocked: the token leaks through NO leg.
+        assert_leg_visibility(&nothing, false, "sealed");
+
+        // Session-unlock (mirror unlock_folder's internals: KEK → unwrap CK → unseal extras, which
+        // re-chunks model-lessly), then evaluate every leg against the live unlock set.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "unlock must re-chunk the document even without the e5 model"
+        );
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert_leg_visibility(&unlocked, true, "session-unlocked");
+    }
+
+    /// REINDEX BACKFILL (PR B): `reindex_embeddings_inner` covers documents. Model ABSENT →
+    /// write-only (chunkless) documents gain chunks + FTS reachability with ZERO vectors, while an
+    /// already-chunked document's existing vectors are NOT purged (no downgrade). Model PRESENT →
+    /// the chunkless document is re-embedded with vectors too.
+    #[test]
+    fn reindex_backfills_documents_regardless_of_model() {
+        let state = build_state("reindex-docs");
+        make_open_folder(&state.db, "f-open", "Project");
+        // A write-only legacy row: document stored, never chunked (the pre-PR-B model-less ingest).
+        state
+            .db
+            .insert_document("d-legacy", "f-open", "legacy.md", "szmaragdowy raport roczny", "document", 100)
+            .unwrap();
+        // An already-indexed document WITH vectors (stub-deterministic).
+        state
+            .db
+            .insert_document("d-vec", "f-open", "vec.md", "vectored content here", "document", 200)
+            .unwrap();
+        state.db.index_document_chunks("d-vec", Some(&crate::embed::StubEmbedder)).unwrap();
+        let vec_before = state.db.doc_vec_count("d-vec").unwrap();
+        assert!(vec_before >= 1, "precondition: d-vec has vectors");
+        assert_eq!(state.db.doc_chunk_count("d-legacy").unwrap(), 0, "precondition: d-legacy chunkless");
+
+        // Model ABSENT: chunk/FTS backfill only.
+        let nothing = HashSet::new();
+        let stub = crate::embed::StubEmbedder;
+        let res = reindex_embeddings_inner(&state.db, &nothing, false, &stub, |_, _| {}).unwrap();
+        assert_eq!(res.status, "model_missing", "meeting semantics unchanged");
+        assert!(state.db.doc_chunk_count("d-legacy").unwrap() >= 1, "legacy doc backfilled");
+        assert_eq!(state.db.doc_vec_count("d-legacy").unwrap(), 0, "no stub vectors on backfill");
+        assert_eq!(
+            state.db.doc_vec_count("d-vec").unwrap(),
+            vec_before,
+            "model-absent reindex must NOT purge an indexed document's vectors"
+        );
+        assert!(
+            state
+                .db
+                .search_doc_chunks_fts_visible("szmaragdowy", 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d-legacy"),
+            "backfilled document must be keyword-findable"
+        );
+
+        // Model PRESENT: the full purge-then-reinsert re-embed covers documents.
+        let res2 = reindex_embeddings_inner(&state.db, &nothing, true, &stub, |_, _| {}).unwrap();
+        assert_eq!(res2.status, "indexed");
+        assert!(
+            state.db.doc_vec_count("d-legacy").unwrap() >= 1,
+            "model-present reindex must (re)embed document chunks"
         );
     }
 
