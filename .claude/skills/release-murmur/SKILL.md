@@ -8,7 +8,7 @@ description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 
 You are cutting a distributable build of **Murmur** — a local-first macOS app
 (Tauri 2.11, Rust crate `murmur` / bin `Murmur` / lib `meetnotes_lib` + Angular 18
 zoneless). Output is a **universal (arm64 + x86_64), Developer-ID-signed,
-notarized, stapled `.dmg`** attached to a GitHub release on `JakubGawr/murmur`.
+notarized, stapled `.dmg`** attached to a GitHub release on `murmur-io/murmur`.
 
 This runbook is the proven v0.3.0 process. Follow it **in order** — do not skip a
 stage until the prior one is green. It **supersedes `docs/RELEASE-CHECKLIST.md`**
@@ -104,9 +104,9 @@ git log -1 --format='%an <%ae>%n%b'   # author QueaT, body has NO Co-Authored-By
 ```bash
 BR=$(git rev-parse --abbrev-ref HEAD)
 git push -u origin "$BR"                                  # push the FEATURE branch (allowed)
-gh pr create -R JakubGawr/murmur --base murmur --head "$BR" \
+gh pr create -R murmur-io/murmur --base murmur --head "$BR" \
   --title "chore(release): $NEW" --body "Version bump + release $NEW."
-gh pr merge <pr#|url> -R JakubGawr/murmur --merge          # merge commit onto murmur
+gh pr merge <pr#|url> -R murmur-io/murmur --merge          # merge commit onto murmur
 git checkout murmur && git pull origin murmur             # local trunk now has the bump
 ```
 
@@ -220,12 +220,12 @@ spctl -a -vvv -t open --context context:primary-signature "$DMG"
 ## Stage 11 — Publish the GitHub release
 
 ```bash
-gh release create "v$VER" -R JakubGawr/murmur --target murmur --latest \
+gh release create "v$VER" -R murmur-io/murmur --target murmur --latest \
   --title "Murmur $VER — <one-line>" \
   --notes "<changelog>" \
   "$DMG"
 # already-created release? upload/replace the asset:
-gh release upload "v$VER" -R JakubGawr/murmur "$DMG" --clobber
+gh release upload "v$VER" -R murmur-io/murmur "$DMG" --clobber
 ```
 
 If the DMG is signed but not yet notarized, add to `--notes`:
@@ -234,7 +234,7 @@ If the DMG is signed but not yet notarized, add to `--notes`:
 ## Post-release verification
 
 ```bash
-gh release view "v$VER" -R JakubGawr/murmur          # asset attached, marked Latest
+gh release view "v$VER" -R murmur-io/murmur          # asset attached, marked Latest
 git tag --list | tail -3                              # v$VER present
 spctl -a -vvv -t open --context context:primary-signature "$DMG"   # if notarized
 ```
