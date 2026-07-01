@@ -230,18 +230,73 @@ pub(crate) fn parse_models_response(body: &str) -> Result<Vec<String>> {
     Ok(parsed.data.into_iter().map(|m| m.id).collect())
 }
 
+/// Resolve the chat-completions endpoint URL from a validated base URL — pure, testable, no I/O.
+///
+/// Heuristic (base path after stripping any trailing `/`):
+///   - empty / root (`""`)  → `{scheme}://{host}/chat/completions`
+///   - `/v1`                → `{scheme}://{host}/v1/chat/completions`
+///   - anything else (e.g. `/test`, a Kong route, or already `/…/chat/completions`)
+///                          → use the base URL path AS-IS (it IS the full chat endpoint)
+///
+/// Preserves scheme, host, port, and query. Never fails.
+pub(crate) fn resolve_chat_endpoint(base: &reqwest::Url) -> reqwest::Url {
+    let trimmed = base.path().trim_end_matches('/');
+    let new_path = match trimmed {
+        "" => "/chat/completions",
+        "/v1" => "/v1/chat/completions",
+        p => p, // custom route or already-full endpoint — use as-is (trailing slash stripped)
+    };
+    let mut url = base.clone();
+    url.set_path(new_path);
+    url
+}
+
+/// Resolve the models-catalog endpoint URL from a validated base URL, if one exists — pure,
+/// testable, no I/O.
+///
+/// Heuristic (base path after stripping any trailing `/`):
+///   - empty / root (`""`)          → `Some({scheme}://{host}/models)`
+///   - `/v1`                         → `Some({scheme}://{host}/v1/models)`
+///   - ends with `/chat/completions` → `Some(sibling /models)` (replace last segment)
+///   - any other custom path         → `None` (custom routes have no catalog, e.g. Kong `/test`)
+///
+/// A `None` return means the caller skips the catalog fetch rather than returning an error.
+pub(crate) fn resolve_models_endpoint(base: &reqwest::Url) -> Option<reqwest::Url> {
+    let trimmed = base.path().trim_end_matches('/');
+    let new_path: String = match trimmed {
+        "" => "/models".to_string(),
+        "/v1" => "/v1/models".to_string(),
+        p if p.ends_with("/chat/completions") => {
+            // sibling endpoint: strip "/chat/completions", append "/models"
+            let prefix = &p[..p.len() - "/chat/completions".len()];
+            format!("{prefix}/models")
+        }
+        _ => return None, // custom route — no catalog
+    };
+    let mut url = base.clone();
+    url.set_path(&new_path);
+    Some(url)
+}
+
+/// Classify a transport outcome as reachable or not.
+/// Any HTTP response (regardless of status code) → `true`; a transport-layer failure
+/// (DNS, connect refused, timeout) → `false`. Factored out of `probe()` so the decision logic
+/// is unit-testable without a live server. The live GET in `probe()` is NOT unit-testable.
+pub(crate) fn classify_reachable(got_response: bool) -> bool {
+    got_response
+}
+
 /// An OpenAI-compatible AI Gateway provider (LiteLLM / Kong / Portkey / vLLM / local LiteLLM /
-/// LM Studio / …). Talks to `{base}/chat/completions` with an optional `Authorization: Bearer`
+/// LM Studio / …). Talks to the resolved chat endpoint with an optional `Authorization: Bearer`
 /// header.
 ///
 /// Always cloud-classified — even a localhost gateway can forward to the cloud — so it is:
 ///   • consent-gated by `make_provider` before construction,
 ///   • redaction-wrapped by `make_provider` after construction (R2).
 pub struct OpenAiCompatProvider {
-    /// Validated base URL with a trailing `/` ENSURED so that `join("chat/completions")` always
-    /// appends rather than replacing the last path segment (RFC 3986: a join on a base WITHOUT a
-    /// trailing slash replaces the final segment — `"http://h/v1".join("chat/completions")` →
-    /// `"http://h/chat/completions"`, dropping `/v1`). The trailing slash is added in `new()`.
+    /// Validated base URL stored as-is from construction. Endpoint resolution is handled by the
+    /// pure helpers `resolve_chat_endpoint` / `resolve_models_endpoint` at call time, so no
+    /// trailing-slash normalization is needed here.
     base: reqwest::Url,
     /// Model id sent in the request body. An empty string sends whatever the gateway defaults to.
     model: String,
@@ -255,16 +310,10 @@ impl OpenAiCompatProvider {
     /// Validate the base URL (R4) and construct the provider. `api_key` is optional (R3);
     /// if `None` no `Authorization` header is sent (useful for unauthenticated local gateways).
     ///
-    /// The base path is normalized to end with `/` so that `join("chat/completions")` always
-    /// APPENDS — never replaces the last segment (RFC 3986 trap, e.g. `/v1` → `/v1/`).
+    /// The base URL is stored as validated; `chat_endpoint()` / `models_endpoint()` apply the
+    /// path-resolution heuristic at call time so no trailing-slash forcing is needed here.
     pub fn new(base_url: String, model: String, api_key: Option<String>) -> Result<Self> {
-        let mut base = validate_gateway_url(&base_url)?; // enforces R1/R4 + no-creds at construction
-        // Ensure trailing slash so join("chat/completions") appends rather than replacing the last
-        // path segment. `http://host/v1` → `http://host/v1/`; `http://host/v1/` is a no-op.
-        if !base.path().ends_with('/') {
-            let p = format!("{}/", base.path());
-            base.set_path(&p);
-        }
+        let base = validate_gateway_url(&base_url)?; // enforces R1/R4 + no-creds at construction
         Ok(Self {
             base,
             model,
@@ -273,28 +322,33 @@ impl OpenAiCompatProvider {
         })
     }
 
-    /// Compose the `/chat/completions` endpoint URL from the normalized base. Exposed as
-    /// `pub(crate)` so unit tests can assert the composed URL without making a network call.
-    pub(crate) fn chat_endpoint(&self) -> Result<reqwest::Url> {
-        self.base
-            .join("chat/completions")
-            .map_err(|e| AppError::Summarize(format!("gateway URL join failed: {e}")))
+    /// Resolve the chat-completions endpoint URL. Delegates to the pure `resolve_chat_endpoint`
+    /// helper; `pub(crate)` so unit tests can assert the URL without making a network call.
+    pub(crate) fn chat_endpoint(&self) -> reqwest::Url {
+        resolve_chat_endpoint(&self.base)
     }
 
-    /// Compose the `/models` endpoint URL from the normalized base.
-    pub(crate) fn models_endpoint(&self) -> Result<reqwest::Url> {
-        self.base
-            .join("models")
-            .map_err(|e| AppError::Summarize(format!("gateway URL join failed: {e}")))
+    /// Resolve the models-catalog endpoint URL, if this base has one.
+    /// Returns `None` for custom route bases (e.g. `/test`) that have no catalog.
+    /// Delegates to the pure `resolve_models_endpoint` helper; `pub(crate)` for unit tests.
+    pub(crate) fn models_endpoint(&self) -> Option<reqwest::Url> {
+        resolve_models_endpoint(&self.base)
     }
 
     /// `GET {base}/models` → list of model ids from the gateway catalog.
+    ///
+    /// Returns `Ok(vec![])` immediately when the base URL has no models endpoint (i.e. a custom
+    /// route such as Kong `/test` — `resolve_models_endpoint` returns `None`). The FE model picker
+    /// handles an empty list gracefully by showing a manual entry field.
     ///
     /// Inbound-only: sends NO meeting content — only an optional `Authorization: Bearer` header.
     /// Therefore this path does NOT need the redaction firewall or the consent gate.
     /// A non-2xx response maps to `AppError::Unavailable` (the gateway is reachable but refused).
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let url = self.models_endpoint()?;
+        let url = match self.models_endpoint() {
+            None => return Ok(vec![]), // custom route — no catalog, not an error
+            Some(u) => u,
+        };
 
         let mut req = self.client.get(url);
 
@@ -325,6 +379,50 @@ impl OpenAiCompatProvider {
         parse_models_response(&body)
     }
 
+    /// Probe the gateway for reachability without sending any meeting content.
+    ///
+    /// Targets the models endpoint when one exists (`Some`), otherwise the chat endpoint
+    /// (a GET to a POST-only route returns 4xx but PROVES the server is reachable — no LLM call,
+    /// no cost). Returns `(reachable, model_count)` where:
+    ///   - `reachable`: `true` if ANY HTTP response arrived (any status code); `false` on a
+    ///     transport-layer failure (DNS, connection refused, timeout).
+    ///   - `model_count`: number of model ids returned ONLY when the models endpoint exists,
+    ///     responded with 200, and the body parses via `parse_models_response`; else `0`.
+    ///
+    /// Never returns an error — degrades to `(false, 0)` on any transport failure.
+    pub async fn probe(&self) -> (bool, u32) {
+        let (url, is_models) = match resolve_models_endpoint(&self.base) {
+            Some(u) => (u, true),
+            None => (resolve_chat_endpoint(&self.base), false),
+        };
+
+        let mut req = self.client.get(url);
+        // R3 — attach the gateway key when present; never fall back to another provider's key.
+        if let Some(ref key) = self.api_key {
+            if !key.trim().is_empty() {
+                req = req.header("authorization", format!("Bearer {key}"));
+            }
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let model_count = if is_models && status.is_success() {
+                    resp.text()
+                        .await
+                        .ok()
+                        .and_then(|b| parse_models_response(&b).ok())
+                        .map(|ids| ids.len() as u32)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (classify_reachable(true), model_count)
+            }
+            Err(_) => (classify_reachable(false), 0),
+        }
+    }
+
     /// POST `body` to `{base}/chat/completions`, set the `Authorization` header only when a key is
     /// present (R3), and return the raw response body text. Maps non-2xx responses to
     /// `AppError::Summarize`/`Unavailable` with the gateway's `error.message` when available.
@@ -333,7 +431,7 @@ impl OpenAiCompatProvider {
     /// (json_schema mode). Do NOT duplicate this code for new request variants — build the body
     /// with the appropriate `chat_body*` helper and call this.
     async fn post_chat_raw(&self, body: Value) -> Result<String> {
-        let url = self.chat_endpoint()?;
+        let url = self.chat_endpoint(); // pure resolution — never fails
 
         let mut req = self
             .client
@@ -610,11 +708,11 @@ mod tests {
         );
     }
 
-    /// Fix — the composed chat-completions URL must APPEND to the base path, not replace it.
-    /// `http://h:4000/v1` → `http://h:4000/v1/chat/completions` (the `/v1` must survive).
-    /// `http://h:4000` (no path) → `http://h:4000/chat/completions`.
+    /// `chat_endpoint` applies the path-resolution heuristic: root/`/v1` → append
+    /// `chat/completions`; any other path (custom Kong route, already-full endpoint) → as-is.
     #[test]
     fn chat_endpoint_preserves_base_path() {
+        // /v1 base — must append /chat/completions.
         let p = OpenAiCompatProvider::new(
             "http://localhost:4000/v1".to_string(),
             "gpt-4o".to_string(),
@@ -622,24 +720,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            p.chat_endpoint().unwrap().as_str(),
+            p.chat_endpoint().as_str(),
             "http://localhost:4000/v1/chat/completions",
-            "base path /v1 must be preserved (not replaced) in the join"
+            "base path /v1 must be preserved and chat/completions appended"
         );
 
-        // Base without any path: join → /chat/completions.
+        // No path (root) → /chat/completions.
         let p2 = OpenAiCompatProvider::new(
             "http://localhost:4000".to_string(),
             String::new(),
             None,
         )
         .unwrap();
-        assert_eq!(
-            p2.chat_endpoint().unwrap().as_str(),
-            "http://localhost:4000/chat/completions"
-        );
+        assert_eq!(p2.chat_endpoint().as_str(), "http://localhost:4000/chat/completions");
 
-        // HTTPS remote with /v1 path also preserved.
+        // HTTPS remote with /v1 — preserved.
         let p3 = OpenAiCompatProvider::new(
             "https://gw.example.com/v1".to_string(),
             String::new(),
@@ -647,11 +742,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            p3.chat_endpoint().unwrap().as_str(),
+            p3.chat_endpoint().as_str(),
             "https://gw.example.com/v1/chat/completions"
         );
 
-        // Trailing slash in the user-supplied URL is idempotent.
+        // Trailing slash on /v1 → idempotent.
         let p4 = OpenAiCompatProvider::new(
             "http://localhost:4000/v1/".to_string(),
             String::new(),
@@ -659,8 +754,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            p4.chat_endpoint().unwrap().as_str(),
+            p4.chat_endpoint().as_str(),
             "http://localhost:4000/v1/chat/completions"
+        );
+
+        // Custom Kong route /test → used AS-IS (it IS the full chat endpoint).
+        let p5 = OpenAiCompatProvider::new(
+            "https://gw.example.com/test".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p5.chat_endpoint().as_str(),
+            "https://gw.example.com/test",
+            "custom route /test must be used as-is (no appending)"
+        );
+
+        // Trailing slash on custom route → stripped.
+        let p6 = OpenAiCompatProvider::new(
+            "https://gw.example.com/test/".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p6.chat_endpoint().as_str(),
+            "https://gw.example.com/test",
+            "custom route /test/ trailing slash must be stripped"
+        );
+
+        // Already-full endpoint pasted by user → returned as-is.
+        let p7 = OpenAiCompatProvider::new(
+            "https://gw.example.com/v1/chat/completions".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p7.chat_endpoint().as_str(),
+            "https://gw.example.com/v1/chat/completions",
+            "already-full endpoint must be returned as-is"
         );
     }
 
@@ -821,10 +955,124 @@ mod tests {
         );
     }
 
-    /// Task 3.1 — models_endpoint appends to the base path (same RFC 3986 invariant as
-    /// chat_endpoint — the `/v1` must survive; join must APPEND, not replace).
+    // ─── resolve_chat_endpoint pure-function tests (RED → GREEN) ─────────────────────────────────
+
+    fn u(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn resolve_chat_endpoint_root() {
+        assert_eq!(
+            resolve_chat_endpoint(&u("https://h/")).as_str(),
+            "https://h/chat/completions"
+        );
+    }
+
+    #[test]
+    fn resolve_chat_endpoint_v1() {
+        assert_eq!(
+            resolve_chat_endpoint(&u("https://h/v1")).as_str(),
+            "https://h/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn resolve_chat_endpoint_v1_trailing_slash() {
+        assert_eq!(
+            resolve_chat_endpoint(&u("https://h/v1/")).as_str(),
+            "https://h/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn resolve_chat_endpoint_custom_path_as_is() {
+        assert_eq!(
+            resolve_chat_endpoint(&u("https://h/test")).as_str(),
+            "https://h/test",
+            "/test custom Kong route must be used as-is"
+        );
+    }
+
+    #[test]
+    fn resolve_chat_endpoint_custom_path_trailing_slash_stripped() {
+        assert_eq!(
+            resolve_chat_endpoint(&u("https://h/test/")).as_str(),
+            "https://h/test",
+            "/test/ trailing slash must be stripped"
+        );
+    }
+
+    #[test]
+    fn resolve_chat_endpoint_already_full() {
+        assert_eq!(
+            resolve_chat_endpoint(&u("https://h/v1/chat/completions")).as_str(),
+            "https://h/v1/chat/completions",
+            "already-full endpoint must be returned as-is"
+        );
+    }
+
+    // ─── resolve_models_endpoint pure-function tests (RED → GREEN) ───────────────────────────────
+
+    #[test]
+    fn resolve_models_endpoint_root_has_catalog() {
+        let r = resolve_models_endpoint(&u("https://h/"));
+        assert_eq!(r.unwrap().as_str(), "https://h/models");
+    }
+
+    #[test]
+    fn resolve_models_endpoint_v1_has_catalog() {
+        let r = resolve_models_endpoint(&u("https://h/v1"));
+        assert_eq!(r.unwrap().as_str(), "https://h/v1/models");
+    }
+
+    #[test]
+    fn resolve_models_endpoint_custom_path_is_none() {
+        let r = resolve_models_endpoint(&u("https://h/test"));
+        assert!(r.is_none(), "custom /test route must yield None");
+    }
+
+    #[test]
+    fn resolve_models_endpoint_full_chat_path_yields_sibling_models() {
+        let r = resolve_models_endpoint(&u("https://h/v1/chat/completions"));
+        assert_eq!(r.unwrap().as_str(), "https://h/v1/models");
+    }
+
+    // ─── classify_reachable pure helper tests (RED → GREEN) ──────────────────────────────────────
+
+    #[test]
+    fn classify_reachable_got_response_is_true() {
+        assert!(classify_reachable(true), "any HTTP response → reachable");
+    }
+
+    #[test]
+    fn classify_reachable_transport_failure_is_false() {
+        assert!(!classify_reachable(false), "transport failure → not reachable");
+    }
+
+    // ─── list_models with no catalog (None models endpoint) — async, no network ─────────────────
+
+    #[tokio::test]
+    async fn list_models_with_custom_route_returns_empty_without_network() {
+        // A custom-route base has no models endpoint; list_models must return Ok(vec![])
+        // immediately without attempting a network call.
+        let provider = OpenAiCompatProvider::new(
+            "https://gw.example.com/test".to_string(),
+            "llama-3".to_string(),
+            None,
+        )
+        .unwrap();
+        // models_endpoint() is None for /test — list_models must short-circuit.
+        assert!(provider.models_endpoint().is_none());
+        let ids = provider.list_models().await.unwrap();
+        assert!(ids.is_empty(), "custom route must yield empty model list without a network call");
+    }
+
+    /// `models_endpoint` applies the path-resolution heuristic: root/`/v1` → `Some(…/models)`;
+    /// a sibling of `/chat/completions` → `Some(…/models)`; custom routes → `None`.
     #[test]
     fn models_endpoint_preserves_base_path() {
+        // /v1 base → Some(/v1/models).
         let p = OpenAiCompatProvider::new(
             "http://localhost:4000/v1".to_string(),
             "gpt-4o".to_string(),
@@ -834,7 +1082,41 @@ mod tests {
         assert_eq!(
             p.models_endpoint().unwrap().as_str(),
             "http://localhost:4000/v1/models",
-            "base path /v1 must be preserved (not replaced) in the join"
+            "base path /v1 must be preserved in the models endpoint"
+        );
+
+        // Root base → Some(/models).
+        let p2 = OpenAiCompatProvider::new(
+            "http://localhost:4000".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(p2.models_endpoint().unwrap().as_str(), "http://localhost:4000/models");
+
+        // Custom Kong route /test → None (no catalog).
+        let p3 = OpenAiCompatProvider::new(
+            "https://gw.example.com/test".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            p3.models_endpoint().is_none(),
+            "custom route /test must yield None models endpoint"
+        );
+
+        // Already-full /v1/chat/completions → Some(sibling /v1/models).
+        let p4 = OpenAiCompatProvider::new(
+            "https://gw.example.com/v1/chat/completions".to_string(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p4.models_endpoint().unwrap().as_str(),
+            "https://gw.example.com/v1/models",
+            "full /v1/chat/completions base must produce sibling /v1/models"
         );
     }
 }
