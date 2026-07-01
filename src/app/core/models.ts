@@ -130,6 +130,19 @@ export interface AppConfigDto {
    * inherited. Mirrors Rust `AppConfigDto.claude_code_inherit_env`.
    */
   claudeCodeInheritEnv: boolean;
+  /**
+   * AI Gateway (Phase 1) — base URL of the user's OpenAI-compatible gateway
+   * (LiteLLM / Kong / Portkey / vLLM / …). Default `""` (unset). Required
+   * when `providerId === "gateway"`. Mirrors Rust `AppConfigDto.gateway_base_url`
+   * (camelCase via `#[serde(rename_all = "camelCase")]`).
+   */
+  gatewayBaseUrl: string;
+  /**
+   * AI Gateway (Phase 1) — model id forwarded to the gateway (e.g. `"gpt-4o"`,
+   * `"mistral/mistral-7b"`). An empty string lets the gateway use its own default.
+   * Mirrors Rust `AppConfigDto.gateway_model`.
+   */
+  gatewayModel: string;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
@@ -439,6 +452,20 @@ export interface MeetingDetail {
    * full unmasked content (`locked` then absent/false).
    */
   locked?: boolean;
+  /**
+   * Phase 5 — AI Gateway model provenance. Populated by the backend from the
+   * `egress_log` table (the recorded `provider_id` + `model_requested` /
+   * `model_served` from the note-generation call). All three are `null` when
+   * the meeting is locked, or when no provenance was recorded (legacy meetings
+   * pre-Phase 5, or providers that don't emit a `CallMeta`). The FE renders a
+   * small provenance badge in the Analysis section when any field is present.
+   */
+  aiProvider: string | null;
+  /** The model name that was REQUESTED when generating the note (e.g. "claude-opus-4-8"). */
+  aiModel: string | null;
+  /** The model name actually SERVED by the provider (may differ from requested when the
+   *  gateway/proxy remaps the id). Preferred over `aiModel` for display when present. */
+  modelServed: string | null;
 }
 
 export interface StatusCount {
@@ -676,4 +703,95 @@ export interface CalendarContext {
 export interface BriefResult {
   markdown: string;
   sources: VaultSource[];
+}
+
+/**
+ * AI Gateway (Phase 3) — one selectable model from the gateway's `/v1/models`
+ * catalog (`list_gateway_models`). Mirrors the Rust `GatewayModel` DTO (camelCase).
+ */
+export interface GatewayModel {
+  id: string;
+}
+
+/**
+ * AI Gateway (Phase 4) — result of `gateway_health`. The backend never errors
+ * on this command (unreachable → `reachable: false, modelCount: 0`), so the FE
+ * can safely `.catch(() => ({reachable:false, modelCount:0}))` as an extra guard.
+ * Mirrors Rust `GatewayHealth` (camelCase via `serde(rename_all = "camelCase")`).
+ */
+export interface GatewayHealth {
+  reachable: boolean;
+  modelCount: number;
+}
+
+// ── Phase 6 — Egress & Usage ledger ─────────────────────────────────────────
+
+/**
+ * PII redaction counts by kind. Each field is the number of items of that kind
+ * that were scrubbed before the content left the device.
+ */
+export interface RedactionCounts {
+  email: number;
+  card: number;
+  phone: number;
+  name: number;
+}
+
+/**
+ * One egress event row from the local content-free egress ledger
+ * (`get_egress_ledger`). Carries metadata only — NO transcript text.
+ * Mirrors Rust `EgressRow` (camelCase via `serde(rename_all = "camelCase")`).
+ */
+export interface EgressRow {
+  /** Unix timestamp (seconds) — matches the Rust backend's `as_secs()`. */
+  ts: number;
+  /** Provider id (e.g. `"anthropic"`, `"gateway"`). */
+  providerId: string;
+  /** Destination host / URL recorded at egress time. */
+  destination: string;
+  /** Model actually served by the remote (may be null when not parsed). */
+  modelServed: string | null;
+  /** Total tokens sent in this call (null when not reported). */
+  totalTokens: number | null;
+  /** PII item counts scrubbed before this call left the device. */
+  redactions: RedactionCounts;
+}
+
+/**
+ * Per-model aggregate (one row per distinct `modelServed` value seen in the
+ * ledger window). Used for the tokens-by-model bar chart.
+ */
+export interface EgressByModel {
+  model: string;
+  calls: number;
+  tokens: number;
+}
+
+/**
+ * Per-day aggregate (one row per calendar day that had ≥1 egress call).
+ * `day` is `"YYYY-MM-DD"`.
+ */
+export interface EgressByDay {
+  day: string;
+  tokens: number;
+}
+
+/**
+ * Egress ledger summary for a given time window (`get_egress_ledger`).
+ * Content-free — only metadata aggregates and row-level metadata.
+ * Mirrors Rust `EgressLedger` (camelCase).
+ */
+export interface EgressLedger {
+  /** Total cloud calls in the window. */
+  totalCalls: number;
+  /** Total tokens sent across all calls in the window. */
+  totalTokens: number;
+  /** Per-model token breakdown (sorted by tokens desc). */
+  byModel: EgressByModel[];
+  /** Per-day token totals (sorted by day asc). */
+  byDay: EgressByDay[];
+  /** Total PII items scrubbed across all calls in the window. */
+  totalRedactions: RedactionCounts;
+  /** Most-recent calls (newest first, capped server-side). */
+  recent: EgressRow[];
 }

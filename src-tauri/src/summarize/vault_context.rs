@@ -230,6 +230,9 @@ mod tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(meeting_id, folder_id).unwrap();

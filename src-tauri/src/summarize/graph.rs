@@ -28,10 +28,31 @@ pub async fn extract_entities(
 ) -> Result<GraphPayload> {
     let excerpt: String = markdown.chars().take(8000).collect();
     let user = format!("MEETING: {title}\n\nNOTE:\n{excerpt}");
-    let reply = provider.complete(SYSTEM, &user).await?;
-    parse(&reply)
+    // Minimal JSON schema for entity extraction — passed to the gateway for native constrained
+    // decoding; the DEFAULT `complete_json` impl only stringifies it into the system prompt.
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "people":   {"type": "array", "items": {"type": "string"}},
+            "projects": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["people", "projects"],
+        "additionalProperties": false
+    });
+    let v = provider.complete_json(SYSTEM, &user, &schema).await?;
+    let raw: GraphPayload = serde_json::from_value(v).map_err(|e| {
+        crate::error::AppError::Summarize(format!("graph: invalid JSON shape from provider: {e}"))
+    })?;
+    Ok(GraphPayload {
+        people: clean(raw.people),
+        projects: clean(raw.projects),
+    })
 }
 
+/// Used directly in unit tests to validate the free-text extraction path (the same path the
+/// DEFAULT `complete_json` impl uses). Production code now calls `complete_json` which
+/// subsumes this step — so this function is compiled only in test mode.
+#[cfg(test)]
 fn parse(reply: &str) -> Result<GraphPayload> {
     // Recover the FIRST balanced top-level JSON object via the string/escape-aware extractor in
     // `reason.rs` instead of the brittle `find('{')..=rfind('}')` slice — the old slice swept up a

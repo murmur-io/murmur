@@ -22,6 +22,10 @@ use tauri::Emitter;
 /// Keychain account for the Anthropic API key (matches `summarize::ANTHROPIC_KEY_ACCOUNT`).
 const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
 
+/// Keychain account for the AI Gateway API key (matches `summarize::GATEWAY_KEY_ACCOUNT`).
+/// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` — never a fallback to the Anthropic key (R3).
+const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
+
 // ── IPC DTOs (camelCase mirrors of PHASE0-PLAN §6) ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +164,14 @@ pub struct AppConfigDto {
     /// encryption keys are never inherited (see `AppConfig::claude_code_inherit_env`).
     #[serde(default)]
     pub claude_code_inherit_env: bool,
+    /// Base URL of the user's OpenAI-compatible AI gateway. Settable from the DTO (the Settings UI
+    /// owns the field). An omitted value deserializes to `""` (`#[serde(default)]`). A non-empty
+    /// value is validated at provider-construction time; `saveConfig` + `getConfig` persist it verbatim.
+    #[serde(default)]
+    pub gateway_base_url: String,
+    /// Model id to send to the gateway (e.g. `"gpt-4o"`). Settable from the DTO. Default `""`.
+    #[serde(default)]
+    pub gateway_model: String,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -199,6 +211,18 @@ pub struct MeetingDetailDto {
     /// renders a locked state (Touch-ID-to-unlock) instead of content; `note`/`segments` are
     /// empty in that case (the content is encrypted at rest, decrypted only on session-unlock).
     pub locked: bool,
+    /// Phase 5 provenance — the provider id used to generate the note (e.g. `"gateway"`/`"anthropic"`).
+    /// `None` when locked (masked) or when the note has no recorded provider beyond `provider_id`.
+    /// This mirrors `note.provider_id` but is surfaced here so the FE doesn't need to dig into `note`.
+    pub ai_provider: Option<String>,
+    /// Phase 5 provenance — the model id that was REQUESTED when generating the note (e.g.
+    /// `"gpt-4o"`, `"claude-opus-4-8"`). `None` when locked, unknown, or the provider uses its own
+    /// default (no explicit model was configured).
+    pub ai_model: Option<String>,
+    /// Phase 5 provenance — the model id ACTUALLY served by the gateway/API (from `CallMeta`).
+    /// May differ from `ai_model` when the gateway aliases, load-balances, or falls back. `None`
+    /// when locked, or when the provider did not return model metadata in the response.
+    pub model_served: Option<String>,
 }
 
 // ── Commands (PHASE0-PLAN §7) ──
@@ -780,6 +804,9 @@ pub fn update_note(
         markdown: markdown.clone(),
         created_at,
         exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
     })?;
 
     if let Some(path) = existing.exported_path.as_deref() {
@@ -1489,6 +1516,9 @@ pub fn patch_note_tasks(
         markdown: patched.clone(),
         created_at,
         exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
     })?;
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &patched)?;
@@ -1641,6 +1671,9 @@ pub fn pin_moment(
         markdown: new_md.clone(),
         created_at,
         exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
     })?;
     let url = match existing.exported_path.as_deref() {
         Some(path) => {
@@ -2255,22 +2288,34 @@ pub fn save_config(
     state: State<'_, AppState>,
     config: AppConfigDto,
 ) -> Result<(), AppError> {
+    save_config_inner(state.inner(), config)?;
+    // Reconcile the voice-trigger listener with the new config (AppHandle-dependent; runs after
+    // the config lock is released by `save_config_inner`).
+    restart_voice_listener(app);
+    Ok(())
+}
+
+/// Headless core of [`save_config`]: validate, merge, persist, and refresh the in-memory cache.
+/// No `AppHandle`/event emission here, so it is unit-testable without Tauri.
+pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Result<(), AppError> {
+    // Validate the gateway URL eagerly, before persisting, so a malformed or credential-bearing
+    // URL (`https://key:@host/v1`) is never stored in the plaintext settings row and never
+    // round-trips to the FE. An empty URL is allowed (no gateway configured).
+    if !config.gateway_base_url.trim().is_empty() {
+        crate::summarize::gateway::validate_gateway_url(&config.gateway_base_url)?;
+    }
+
     // Merge against the CURRENT config under the config lock so the security-sensitive flags that
     // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
     // from the live value, not the incoming payload. Holding the guard across the merge+save+swap
     // makes it atomic w.r.t. a concurrent `consent_to_cloud_egress`.
-    {
-        let mut cache = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        let new_config = dto_to_config(config, &cache);
-        new_config.save(&state.db)?;
-        *cache = new_config;
-    }
-    // Reconcile the voice-trigger listener with the new config (re-locks the guard internally, so
-    // it MUST run after the guard above is dropped).
-    restart_voice_listener(app);
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    let new_config = dto_to_config(config, &cache);
+    new_config.save(&state.db)?;
+    *cache = new_config;
     Ok(())
 }
 
@@ -2345,6 +2390,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // in `dto_to_config`).
         web_search_consented: c.web_search_consented,
         claude_code_inherit_env: c.claude_code_inherit_env,
+        gateway_base_url: c.gateway_base_url.clone(),
+        gateway_model: c.gateway_model.clone(),
     }
 }
 
@@ -2438,6 +2485,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // the toggle). Default OFF on the DTO (`#[serde(default)]`), so a partial/older save can never
         // silently enable it. Even ON, the DB keys are never inherited (claude_code.rs `harden_env`).
         claude_code_inherit_env: d.claude_code_inherit_env,
+        // AI Gateway fields ARE settable from the DTO (the Settings UI owns them). An omitted value
+        // deserializes to `""` (`#[serde(default)]`), which is a valid "unset" state.
+        gateway_base_url: d.gateway_base_url,
+        gateway_model: d.gateway_model,
     }
 }
 
@@ -2461,6 +2512,255 @@ pub fn set_anthropic_key(key: String) -> Result<(), AppError> {
 #[tauri::command]
 pub fn has_anthropic_key() -> Result<bool, AppError> {
     Ok(secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?.is_some())
+}
+
+/// Store/replace the AI Gateway API key in Keychain (account "gateway_api_key").
+/// An empty/blank key is rejected — call `clear_gateway_key` to remove an existing key.
+/// The key is NEVER logged and NEVER returned to the FE — only `has_gateway_key` reports presence.
+/// Uses a SEPARATE keychain account from the Anthropic key (R3 — no cross-provider fallback).
+#[tauri::command]
+pub fn set_gateway_key(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "gateway API key must not be empty; use clear_gateway_key to remove an existing key"
+                .into(),
+        ));
+    }
+    secrets::set_secret(GATEWAY_KEY_ACCOUNT, key.trim())
+}
+
+/// Whether an AI Gateway key is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_gateway_key() -> Result<bool, AppError> {
+    Ok(secrets::get_secret(GATEWAY_KEY_ACCOUNT)?
+        .filter(|k| !k.trim().is_empty())
+        .is_some())
+}
+
+/// Remove the stored AI Gateway API key from the Keychain.
+/// Idempotent — no error if no key is stored. Mirrors `set_anthropic_key("")` semantics.
+#[tauri::command]
+pub fn clear_gateway_key() -> Result<(), AppError> {
+    secrets::delete_secret(GATEWAY_KEY_ACCOUNT)
+}
+
+/// DTO for a single model returned by `list_gateway_models`.
+///
+/// Shape: `{ "id": "gpt-4o" }` (camelCase). The FE populates the model picker from this.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayModelDto {
+    pub id: String,
+}
+
+/// Fetch the model catalog from the configured AI Gateway (`GET {base}/v1/models`) and return
+/// the list of model ids the gateway exposes.
+///
+/// Inbound-only: this call sends NO meeting content — only an optional `Authorization: Bearer`
+/// header carrying the stored gateway key. It therefore does NOT need the redaction firewall or
+/// the cloud-egress consent gate.
+///
+/// Returns `AppError::InvalidArg` when no gateway base URL is configured.
+#[tauri::command]
+pub async fn list_gateway_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<GatewayModelDto>, AppError> {
+    let (base_url, model, api_key) = {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        let base_url = config.gateway_base_url.clone();
+        let model = config.gateway_model.clone();
+        // R3: resolve the gateway key; never falls back to the Anthropic key.
+        let api_key = secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+        (base_url, model, api_key)
+    };
+
+    if base_url.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "no gateway base URL configured — set it in Settings before fetching the model catalog"
+                .into(),
+        ));
+    }
+
+    let provider = crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key)?;
+    let ids = provider.list_models().await?;
+    Ok(ids.into_iter().map(|id| GatewayModelDto { id }).collect())
+}
+
+/// DTO returned by `gateway_health`.
+///
+/// Shape: `{ "reachable": true, "modelCount": 6 }` (camelCase, matches the FE `GatewayHealth`
+/// type). `reachable: false` with `model_count: 0` means the gateway is unreachable or not
+/// configured — the FE renders a red dot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHealthDto {
+    pub reachable: bool,
+    pub model_count: u32,
+}
+
+/// Probe the configured AI Gateway by fetching `GET {base}/models`.
+///
+/// Returns `GatewayHealthDto { reachable: true, model_count: N }` when the request succeeds, and
+/// `{ reachable: false, model_count: 0 }` on ANY failure (network error, auth error, empty URL) —
+/// this command NEVER returns an `Err` variant so the FE health dot always gets a clean value.
+///
+/// Inbound-only: sends NO meeting content, only an optional `Authorization: Bearer` header. Does
+/// NOT need the redaction firewall or the consent gate (same rationale as `list_gateway_models`).
+#[tauri::command]
+pub async fn gateway_health(
+    state: State<'_, AppState>,
+) -> Result<GatewayHealthDto, AppError> {
+    let (base_url, model, api_key) = {
+        let config = match state.config.lock() {
+            Ok(c) => c,
+            Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+        };
+        let base_url = config.gateway_base_url.clone();
+        let model = config.gateway_model.clone();
+        // R3: resolve the gateway key; never falls back to the Anthropic key.
+        let api_key = secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+        (base_url, model, api_key)
+    };
+
+    if base_url.trim().is_empty() {
+        // Not configured → degrade silently.
+        return Ok(GatewayHealthDto { reachable: false, model_count: 0 });
+    }
+
+    let provider = match crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key) {
+        Ok(p) => p,
+        Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+    };
+
+    match provider.list_models().await {
+        Ok(ids) => Ok(GatewayHealthDto {
+            reachable: true,
+            model_count: ids.len() as u32,
+        }),
+        Err(_) => Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+    }
+}
+
+// ── Egress ledger DTOs (Phase 6) ────────────────────────────────────────────────────────────────
+//
+// All structs are `camelCase` on the wire (matches the FE `EgressLedger` / `EgressRow` types in
+// `core/models.ts`). Carries ONLY counts, ids, labels, and token/byte numbers — no content (§8).
+
+/// Per-model token-usage roll-up for `EgressLedger.byModel`.
+///
+/// Fields are `u64` so a large all-time cumulative sum (mirroring `EgressModelUsage`) cannot
+/// silently wrap. JavaScript `number` (f64) handles these values without precision loss up to
+/// 2^53 (~9 petaTokens), which is far beyond any realistic usage window.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageDto {
+    pub model: String,
+    pub calls: u64,
+    pub tokens: u64,
+}
+
+/// Per-day token-usage roll-up for `EgressLedger.byDay`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayUsageDto {
+    /// ISO-8601 date string ("YYYY-MM-DD") in UTC.
+    pub day: String,
+    pub tokens: u64,
+}
+
+/// Redaction-count totals for the queried window.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactionTotalsDto {
+    pub email: u64,
+    pub card: u64,
+    pub phone: u64,
+    pub name: u64,
+}
+
+/// One row from the `egress_log` table (content-free: counts + ids only).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressRowDto {
+    /// Unix epoch (seconds) of the call.
+    pub ts: i64,
+    pub provider_id: String,
+    pub destination: String,
+    pub model_served: Option<String>,
+    pub total_tokens: Option<u32>,
+    pub redactions: RedactionTotalsDto,
+}
+
+/// Aggregated egress ledger for a rolling window (`days` days back from now).
+///
+/// Shape matches `EgressLedger` in `src/app/core/models.ts` (camelCase).
+/// Every aggregate handles an empty `egress_log` gracefully — totals are zero, vecs empty.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressLedgerDto {
+    pub total_calls: u64,
+    pub total_tokens: u64,
+    pub by_model: Vec<ModelUsageDto>,
+    pub by_day: Vec<DayUsageDto>,
+    pub total_redactions: RedactionTotalsDto,
+    /// Last ≤20 rows from `egress_log`, newest first.
+    pub recent: Vec<EgressRowDto>,
+}
+
+/// Aggregate the content-free `egress_log` table for the given rolling window and return the
+/// ledger for the "Egress & Usage" Analytics panel.
+///
+/// `days` is the window width; pass `30` for the default 30-day view. The window is computed as
+/// `ts >= (now_unix - days * 86400)`. An empty table (no cloud calls yet) returns all-zero totals
+/// and empty vecs — never an error.
+///
+/// Read-only: queries `egress_log` only. No content columns are touched.
+#[tauri::command]
+pub fn get_egress_ledger(
+    days: i64,
+    state: State<'_, AppState>,
+) -> Result<EgressLedgerDto, AppError> {
+    let ledger = state.db.egress_summary(days)?;
+    Ok(EgressLedgerDto {
+        total_calls: ledger.total_calls,
+        total_tokens: ledger.total_tokens,
+        by_model: ledger
+            .by_model
+            .into_iter()
+            .map(|m| ModelUsageDto { model: m.model, calls: m.calls, tokens: m.tokens })
+            .collect(),
+        by_day: ledger
+            .by_day
+            .into_iter()
+            .map(|d| DayUsageDto { day: d.day, tokens: d.tokens })
+            .collect(),
+        total_redactions: RedactionTotalsDto {
+            email: ledger.total_redactions.email,
+            card: ledger.total_redactions.card,
+            phone: ledger.total_redactions.phone,
+            name: ledger.total_redactions.name,
+        },
+        recent: ledger
+            .recent
+            .into_iter()
+            .map(|r| EgressRowDto {
+                ts: r.ts,
+                provider_id: r.provider_id,
+                destination: r.destination,
+                model_served: r.model_served,
+                total_tokens: r.total_tokens,
+                redactions: RedactionTotalsDto {
+                    email: r.redactions.email,
+                    card: r.redactions.card,
+                    phone: r.redactions.phone,
+                    name: r.redactions.name,
+                },
+            })
+            .collect(),
+    })
 }
 
 /// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
@@ -2661,15 +2961,25 @@ pub fn get_meeting_detail(
         return Ok(Some(masked_detail(meeting)));
     }
 
-    let note = state
-        .db
-        .get_latest_note_for_meeting(&meeting_id)?
-        .map(|n| NoteDto {
-            meeting_id: n.meeting_id,
-            provider_id: n.provider_id,
-            markdown: n.markdown,
-            exported_path: n.exported_path,
-        });
+    let note_row = state.db.get_latest_note_for_meeting(&meeting_id)?;
+    // Phase 5: capture provenance from the note row BEFORE converting to NoteDto (NoteDto is a
+    // subset and doesn't carry model fields). All three are None when the note is absent or when
+    // the provider did not record provenance (pre-Phase-5 notes).
+    let ai_provider = note_row
+        .as_ref()
+        .map(|n| n.provider_id.clone());
+    let ai_model = note_row
+        .as_ref()
+        .and_then(|n| n.model_requested.clone());
+    let model_served = note_row
+        .as_ref()
+        .and_then(|n| n.model_served.clone());
+    let note = note_row.map(|n| NoteDto {
+        meeting_id: n.meeting_id,
+        provider_id: n.provider_id,
+        markdown: n.markdown,
+        exported_path: n.exported_path,
+    });
     let segments = state.db.get_segments(&meeting_id)?;
     // GATED read: only past the `meeting_is_unlocked` gate above do we surface the persisted
     // assistant Q&A. The DB read is ALSO `visibility_clause`-gated (it returns empty for a sealed-
@@ -2688,6 +2998,9 @@ pub fn get_meeting_detail(
         segments,
         assistant_interactions,
         locked: false,
+        ai_provider,
+        ai_model,
+        model_served,
     }))
 }
 
@@ -2711,6 +3024,11 @@ fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
         // rest the rows were purged on seal anyway).
         assistant_interactions: Vec::new(),
         locked: true,
+        // Phase 5: provenance is gated alongside all other content — a locked meeting surfaces
+        // nothing (a model name could leak which AI service processed the content).
+        ai_provider: None,
+        ai_model: None,
+        model_served: None,
     }
 }
 
@@ -5154,6 +5472,27 @@ mod lock_read_gate_tests {
         assert!(masked.locked);
     }
 
+    /// Phase 5 — provenance lock-gate: a LOCKED (sealed-not-unlocked) meeting's masked DTO MUST
+    /// have ALL three provenance fields set to `None`. A model name / gateway host could reveal
+    /// which AI service processed the note content — the same sensitivity as the note text itself.
+    #[test]
+    fn masked_detail_nulls_all_provenance_fields() {
+        let masked = masked_detail(meeting_with_audio(None));
+        assert!(
+            masked.ai_provider.is_none(),
+            "masked detail must NULL ai_provider (provenance leak)"
+        );
+        assert!(
+            masked.ai_model.is_none(),
+            "masked detail must NULL ai_model (provenance leak)"
+        );
+        assert!(
+            masked.model_served.is_none(),
+            "masked detail must NULL model_served (provenance leak)"
+        );
+        assert!(masked.locked, "locked flag set");
+    }
+
     // ── D5 vault-containment (`assert_in_vault`) ────────────────────────────────────────────────
 
     fn tmp_vault(tag: &str) -> std::path::PathBuf {
@@ -5301,7 +5640,7 @@ mod lifecycle_tests {
     /// re-export, keeping the test filesystem-quiet).
     fn build_state(tag: &str) -> AppState {
         ensure_dev_kek();
-        let db = Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap();
+        let db = Arc::new(Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap());
         AppState {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
@@ -5409,6 +5748,9 @@ mod lifecycle_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-27T09:05:00Z".to_string(),
             exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.insert_segments(
@@ -6676,6 +7018,58 @@ mod lifecycle_tests {
             "model_missing guard must index NOTHING (no stub poisoning)"
         );
     }
+
+    // ── FIX 6 integration: save_config_inner → validate_gateway_url boundary ─────────────────
+
+    /// Drives the REAL `save_config_inner` (the headless core of `save_config`) to guard the
+    /// integration boundary: a future edit that removes the URL-validation guard from
+    /// `save_config_inner` would break this test, not just the unit-level `validate_gateway_url`
+    /// call-site tests.
+    ///
+    /// Three sub-cases:
+    ///   (a) credential-bearing URL → `InvalidArg`; persisted config IS NOT changed.
+    ///   (b) empty URL → `Ok`; empty round-trips.
+    ///   (c) valid https URL → `Ok`; value persists and is visible in the in-memory cache.
+    #[test]
+    fn save_config_inner_validates_gateway_url_at_the_integration_seam() {
+        let state = build_state("cfg-gw-url-integration");
+
+        // ── (a) credential-bearing URL → rejected before writing to DB ───────────────────────
+        let mut dto_bad = config_to_dto(&AppConfig::default());
+        dto_bad.gateway_base_url = "https://key:@gw.example.com/v1".to_string();
+        let err = save_config_inner(&state, dto_bad)
+            .expect_err("credential URL must be rejected by save_config_inner");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for credential URL, got: {err:?}"
+        );
+        // The bad URL must NOT have been written into the in-memory config cache.
+        let cached_url = state.config.lock().unwrap().gateway_base_url.clone();
+        assert_ne!(
+            cached_url, "https://key:@gw.example.com/v1",
+            "credential URL must not reach the config cache (save_config_inner must reject first)"
+        );
+
+        // ── (b) empty URL → Ok (no gateway configured) ───────────────────────────────────────
+        let mut dto_empty = config_to_dto(&AppConfig::default());
+        dto_empty.gateway_base_url = String::new();
+        save_config_inner(&state, dto_empty).expect("empty gateway URL must be accepted");
+        assert_eq!(
+            state.config.lock().unwrap().gateway_base_url,
+            "",
+            "empty gateway URL must persist and round-trip"
+        );
+
+        // ── (c) valid https URL → Ok + persisted in the cache ────────────────────────────────
+        let mut dto_ok = config_to_dto(&AppConfig::default());
+        dto_ok.gateway_base_url = "https://gw.example.com/v1".to_string();
+        save_config_inner(&state, dto_ok).expect("valid https gateway URL must be accepted");
+        assert_eq!(
+            state.config.lock().unwrap().gateway_base_url,
+            "https://gw.example.com/v1",
+            "valid URL must be persisted and visible in the in-memory config cache"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6759,5 +7153,61 @@ mod reminder_script_tests {
         );
         // Every embedded double-quote from the payload is backslash-escaped in the program.
         assert!(s.contains("\\\""), "payload quotes are escaped");
+    }
+}
+
+// ─── Task 1.4 — gateway key command argument validation ────────────────────────────────────────
+#[cfg(test)]
+mod gateway_key_tests {
+    use super::*;
+
+    /// `set_gateway_key("")` must return `InvalidArg`, not silently succeed.
+    #[test]
+    fn set_gateway_key_empty_is_invalid_arg() {
+        let err = set_gateway_key(String::new()).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "empty gateway key must be InvalidArg, got: {err:?}"
+        );
+    }
+
+    /// `set_gateway_key("   ")` (whitespace-only) is also invalid.
+    #[test]
+    fn set_gateway_key_whitespace_is_invalid_arg() {
+        let err = set_gateway_key("   ".to_string()).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "whitespace-only gateway key must be InvalidArg"
+        );
+    }
+
+    // ── FIX 6: gateway URL validated at save time ──────────────────────────────────────────────
+
+    /// `save_config` rejects a gateway URL that embeds credentials — the validation used by the
+    /// save path (`validate_gateway_url`) refuses `https://key:@host/v1` before it reaches the DB.
+    /// Empty URL (no gateway configured) and a valid https URL are both accepted.
+    #[test]
+    fn save_config_gateway_url_with_credentials_is_rejected() {
+        // Credential-bearing URL → InvalidArg (never stored).
+        let err = crate::summarize::gateway::validate_gateway_url("https://key:@host/v1")
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "URL with credentials must be InvalidArg, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn save_config_valid_gateway_url_is_accepted() {
+        // Valid https URL → Ok.
+        assert!(
+            crate::summarize::gateway::validate_gateway_url("https://gw.example.com/v1").is_ok(),
+            "valid https gateway URL must be accepted"
+        );
+        // Localhost http → Ok.
+        assert!(
+            crate::summarize::gateway::validate_gateway_url("http://127.0.0.1:4000/v1").is_ok(),
+            "loopback http gateway URL must be accepted"
+        );
     }
 }

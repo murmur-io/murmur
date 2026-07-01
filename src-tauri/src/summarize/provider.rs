@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::Result;
+use crate::summarize::meta::CallMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,4 +54,165 @@ pub trait SummarizerProvider: Send + Sync {
     /// Raw completion: run a system + user prompt and return the model's text verbatim
     /// (no formatting/validation). Used for structured side-tasks like the timeline.
     async fn complete(&self, system: &str, user: &str) -> Result<String>;
+
+    /// Like [`summarize`] but also returns token-usage and model metadata from the provider.
+    ///
+    /// Default implementation delegates to [`summarize`] and returns an empty [`CallMeta`].
+    /// Providers that capture `usage` + `model` from their API response override this
+    /// (and delegate [`summarize`] to this, stripping the meta) so the HTTP call is not
+    /// duplicated.
+    async fn summarize_with_meta(
+        &self,
+        req: &SummarizeRequest,
+    ) -> Result<(String, CallMeta)> {
+        Ok((self.summarize(req).await?, CallMeta::default()))
+    }
+
+    /// Like [`complete`] but also returns token-usage and model metadata from the provider.
+    ///
+    /// Default implementation delegates to [`complete`] and returns an empty [`CallMeta`].
+    /// Providers that capture `usage` + `model` override this.
+    async fn complete_with_meta(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> Result<(String, CallMeta)> {
+        Ok((self.complete(system, user).await?, CallMeta::default()))
+    }
+
+    /// Structured-output completion returning the JSON value AND the provider's `CallMeta`
+    /// (token usage + served model).
+    ///
+    /// DEFAULT = schema-in-prompt + `parse_first_json`, with meta from `complete_with_meta`.
+    /// A provider that supports native constrained decoding (the OpenAI-compatible gateway)
+    /// OVERRIDES this to send `response_format: {"type":"json_schema", …}` and returns both
+    /// the parsed value and real token/model metadata directly.
+    async fn complete_json_with_meta(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<(Value, CallMeta)> {
+        // Default: embed the schema as a system-prompt instruction and call complete_with_meta
+        // so token usage is captured even on the free-text path.
+        let sys = format!(
+            "{system}\n\nRespond with ONLY a single JSON object matching this schema (no prose, no code fences):\n{}",
+            serde_json::to_string(schema).unwrap_or_default()
+        );
+        let (reply, meta) = self.complete_with_meta(&sys, user).await?;
+        let v = crate::reason::parse_first_json::<Value>(&reply)?;
+        Ok((v, meta))
+    }
+
+    /// Structured-output completion: return a JSON value adhering to `schema`.
+    ///
+    /// Delegates to [`complete_json_with_meta`] and drops the `CallMeta` so callers that
+    /// only need the value are unchanged. Providers that support native constrained decoding
+    /// override [`complete_json_with_meta`] instead; this default is then correct automatically.
+    async fn complete_json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<Value> {
+        Ok(self.complete_json_with_meta(system, user, schema).await?.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 2.2 — a provider that does NOT override `*_with_meta` gets an empty `CallMeta`
+    /// from the default implementations. This proves the additive default is wired correctly
+    /// without touching any existing provider.
+    struct FixedProvider(&'static str);
+
+    #[async_trait]
+    impl SummarizerProvider for FixedProvider {
+        fn id(&self) -> &str {
+            "fixed"
+        }
+        async fn availability(&self) -> Availability {
+            Availability::Available
+        }
+        async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// `complete_with_meta` default returns the plain `complete` output paired with empty `CallMeta`.
+    #[tokio::test]
+    async fn default_complete_with_meta_returns_empty_call_meta() {
+        let p = FixedProvider("hello");
+        let (text, meta) = p.complete_with_meta("sys", "usr").await.unwrap();
+        assert_eq!(text, "hello");
+        assert_eq!(meta, CallMeta::default(), "default impl must return empty CallMeta");
+    }
+
+    /// Task 8.1 — `complete_json` default extracts the first JSON object from a prose-wrapped /
+    /// fenced reply (the free-text path). A provider that does NOT override `complete_json` gets
+    /// the schema embedded in the system prompt and the JSON extracted via `parse_first_json`.
+    #[tokio::test]
+    async fn default_complete_json_extracts_first_json_from_free_text() {
+        // FixedProvider returns whatever string was given as its inner &str — simulate a model
+        // that wraps the JSON in prose and a code fence (the worst-case free-text reply).
+        struct JsonFencedProvider;
+        #[async_trait]
+        impl SummarizerProvider for JsonFencedProvider {
+            fn id(&self) -> &str { "json-fenced" }
+            async fn availability(&self) -> Availability { Availability::Available }
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                // Simulate a chatty model that wraps output in prose + a code fence.
+                Ok("Sure! Here is the JSON:\n```json\n{\"people\":[\"Alice\"],\"projects\":[]}\n```\nLet me know if you need changes.".to_string())
+            }
+        }
+        let schema = serde_json::json!({"type":"object","properties":{"people":{"type":"array"},"projects":{"type":"array"}}});
+        let v = JsonFencedProvider.complete_json("SYS", "USER", &schema).await.unwrap();
+        assert_eq!(v["people"][0], "Alice", "default impl must extract JSON from fenced/prose reply");
+        assert!(v["projects"].as_array().unwrap().is_empty());
+    }
+
+    /// Task 8.1 — `complete_json` default returns an error when the reply contains no JSON object.
+    #[tokio::test]
+    async fn default_complete_json_errors_on_no_json() {
+        struct NoJsonProvider;
+        #[async_trait]
+        impl SummarizerProvider for NoJsonProvider {
+            fn id(&self) -> &str { "no-json" }
+            async fn availability(&self) -> Availability { Availability::Available }
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Ok("I'm sorry, I cannot produce JSON right now.".to_string())
+            }
+        }
+        let schema = serde_json::json!({});
+        let err = NoJsonProvider.complete_json("SYS", "USER", &schema).await;
+        assert!(err.is_err(), "no JSON in reply must yield an error from the default impl");
+    }
+
+    /// `summarize_with_meta` default returns the plain `summarize` output paired with empty `CallMeta`.
+    #[tokio::test]
+    async fn default_summarize_with_meta_returns_empty_call_meta() {
+        let p = FixedProvider("note body");
+        let req = SummarizeRequest {
+            transcript: "t".into(),
+            meta: MeetingMeta {
+                date_iso: "2026-06-30".into(),
+                title_hint: None,
+                duration_s: 60,
+                language: None,
+            },
+            template: String::new(),
+            vault_titles: vec![],
+            related_context: None,
+        };
+        let (text, meta) = p.summarize_with_meta(&req).await.unwrap();
+        assert_eq!(text, "note body");
+        assert_eq!(meta, CallMeta::default(), "default impl must return empty CallMeta");
+    }
 }
