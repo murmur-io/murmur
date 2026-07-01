@@ -1065,6 +1065,12 @@ import { ThemeService, type ThemeMode } from "../../services/theme.service";
                   Use https:// (http:// is allowed only for localhost).
                 </span>
               }
+              <span class="field-help text-muted">
+                Enter your gateway's OpenAI-compatible base URL (e.g.
+                https://…/v1) — or the full chat-completions endpoint if
+                your gateway uses a custom route (e.g. a Kong serverless
+                route like https://…/test).
+              </span>
             </label>
 
             <div class="field">
