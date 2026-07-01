@@ -128,6 +128,60 @@ fn register_vec_extension() {
     });
 }
 
+// ── Egress ledger summary types (Phase 6) ───────────────────────────────────────────────────────
+//
+// Internal aggregate types returned by `Db::egress_summary`. The IPC-facing DTOs in `commands.rs`
+// hold a 1:1 mapping of these (camelCase on the wire). No content fields — counts/ids/labels only.
+
+/// Per-model token-usage roll-up within a time window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressModelUsage {
+    pub model: String,
+    pub calls: u32,
+    pub tokens: u32,
+}
+
+/// Per-day token-usage roll-up within a time window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressDayUsage {
+    /// ISO-8601 date string ("YYYY-MM-DD") in UTC.
+    pub day: String,
+    pub tokens: u32,
+}
+
+/// Summed redaction counts over all rows in the time window.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EgressRedactionTotals {
+    pub email: u32,
+    pub card: u32,
+    pub phone: u32,
+    pub name: u32,
+}
+
+/// One recent row from `egress_log` (last ≤20, newest first), content-free.
+#[derive(Debug, Clone)]
+pub struct EgressRecentRow {
+    pub ts: i64,
+    pub provider_id: String,
+    pub destination: String,
+    pub model_served: Option<String>,
+    pub total_tokens: Option<u32>,
+    pub redactions: EgressRedactionTotals,
+}
+
+/// Full aggregated egress ledger for a rolling time window. Returned by `Db::egress_summary`.
+/// Handles an empty table gracefully — all totals are zero, all vecs are empty.
+#[derive(Debug, Clone)]
+pub struct EgressLedger {
+    pub total_calls: u32,
+    pub total_tokens: u32,
+    pub by_model: Vec<EgressModelUsage>,
+    pub by_day: Vec<EgressDayUsage>,
+    pub total_redactions: EgressRedactionTotals,
+    /// Last ≤20 rows, newest first.
+    pub recent: Vec<EgressRecentRow>,
+}
+
 /// Thread-safe SQLite wrapper (internal Mutex<rusqlite::Connection>).
 pub struct Db {
     conn: Mutex<Connection>,
@@ -685,6 +739,154 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Aggregate the `egress_log` table over the last `days` calendar days and return a rich
+    /// summary for the "Egress & Usage" Analytics panel.
+    ///
+    /// The time window is `[now_unix - days*86400, now_unix]`. A `days <= 0` value returns ALL
+    /// rows. An empty table (no cloud calls yet) returns all-zero totals and empty vecs — never
+    /// an error.
+    ///
+    /// Read-only: touches `egress_log` only; no content columns. (§6: egress_log has none.)
+    pub fn egress_summary(&self, days: i64) -> Result<EgressLedger> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let since = if days > 0 { now_unix - days * 86_400 } else { 0 };
+
+        let conn = self.lock();
+
+        // ── total calls + total tokens ──────────────────────────────────────
+        let (total_calls, total_tokens): (u32, u32) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(total_tokens),0)
+                   FROM egress_log
+                  WHERE ts >= ?1",
+                rusqlite::params![since],
+                |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
+            )
+            .map_err(map_err)?;
+
+        // ── total redactions ────────────────────────────────────────────────
+        let total_redactions: EgressRedactionTotals = conn
+            .query_row(
+                "SELECT COALESCE(SUM(redactions_email),0),
+                        COALESCE(SUM(redactions_card),0),
+                        COALESCE(SUM(redactions_phone),0),
+                        COALESCE(SUM(redactions_name),0)
+                   FROM egress_log
+                  WHERE ts >= ?1",
+                rusqlite::params![since],
+                |r| {
+                    Ok(EgressRedactionTotals {
+                        email: r.get::<_, i64>(0)? as u32,
+                        card: r.get::<_, i64>(1)? as u32,
+                        phone: r.get::<_, i64>(2)? as u32,
+                        name: r.get::<_, i64>(3)? as u32,
+                    })
+                },
+            )
+            .map_err(map_err)?;
+
+        // ── by_model (GROUP BY model label, tokens DESC) ────────────────────
+        let by_model = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT COALESCE(model_served, model_requested, '(unknown)') AS model,
+                            COUNT(*) AS calls,
+                            COALESCE(SUM(total_tokens), 0) AS tokens
+                       FROM egress_log
+                      WHERE ts >= ?1
+                      GROUP BY model
+                      ORDER BY tokens DESC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since], |r| {
+                    Ok(EgressModelUsage {
+                        model: r.get(0)?,
+                        calls: r.get::<_, i64>(1)? as u32,
+                        tokens: r.get::<_, i64>(2)? as u32,
+                    })
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+
+        // ── by_day (GROUP BY UTC date, ascending) ──────────────────────────
+        let by_day = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT date(ts, 'unixepoch') AS day,
+                            COALESCE(SUM(total_tokens), 0) AS tokens
+                       FROM egress_log
+                      WHERE ts >= ?1
+                      GROUP BY day
+                      ORDER BY day ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since], |r| {
+                    Ok(EgressDayUsage {
+                        day: r.get(0)?,
+                        tokens: r.get::<_, i64>(1)? as u32,
+                    })
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+
+        // ── recent rows (last ≤20, newest first) ───────────────────────────
+        let recent = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, provider_id, destination, model_served, total_tokens,
+                            redactions_email, redactions_card, redactions_phone, redactions_name
+                       FROM egress_log
+                      WHERE ts >= ?1
+                      ORDER BY ts DESC
+                      LIMIT 20",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![since], |r| {
+                    Ok(EgressRecentRow {
+                        ts: r.get(0)?,
+                        provider_id: r.get(1)?,
+                        destination: r.get(2)?,
+                        model_served: r.get(3)?,
+                        total_tokens: r
+                            .get::<_, Option<i64>>(4)?
+                            .map(|v| v as u32),
+                        redactions: EgressRedactionTotals {
+                            email: r.get::<_, i64>(5)? as u32,
+                            card: r.get::<_, i64>(6)? as u32,
+                            phone: r.get::<_, i64>(7)? as u32,
+                            name: r.get::<_, i64>(8)? as u32,
+                        },
+                    })
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+
+        Ok(EgressLedger { total_calls, total_tokens, by_model, by_day, total_redactions, recent })
     }
 
     // ── correction-log flywheel ──────────────────────────────────────────────
@@ -4361,6 +4563,157 @@ mod tests {
         assert_eq!(redactions_email, 1);
         assert_eq!(redactions_name, 2);
         assert_eq!(system_bytes, 512);
+    }
+
+    // ── Phase 6: egress_summary ───────────────────────────────────────────────
+
+    /// Helper: build an `EgressEntry` with the given model_served, total_tokens, and redaction
+    /// email count (other fields are stable across tests).
+    fn egress_entry_for_summary(
+        model_served: &str,
+        total_tokens: u32,
+        redaction_email: u32,
+        redaction_name: u32,
+    ) -> crate::summarize::egress_log::EgressEntry {
+        use crate::summarize::egress_log::EgressEntry;
+        use crate::summarize::meta::{CallMeta, RedactionCounts};
+        EgressEntry {
+            provider_id: "anthropic".to_string(),
+            destination: "api.anthropic.com".to_string(),
+            model_requested: model_served.to_string(),
+            call_kind: "complete",
+            meta: CallMeta {
+                model_served: Some(model_served.to_string()),
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: Some(total_tokens),
+                cached_tokens: None,
+            },
+            redactions: RedactionCounts {
+                email: redaction_email,
+                card: 0,
+                phone: 0,
+                name: redaction_name,
+            },
+            system_bytes: 0,
+            user_bytes: 0,
+            meeting_id: None,
+        }
+    }
+
+    /// `egress_summary(30)` on an EMPTY table returns all-zero totals and empty vecs — not an error.
+    /// RED → verify the function exists and handles the zero case before we insert any rows.
+    #[test]
+    fn egress_summary_empty_table_returns_zeros() {
+        let db = mem_db();
+        let ledger = db.egress_summary(30).expect("egress_summary must not error on empty table");
+        assert_eq!(ledger.total_calls, 0, "total_calls should be 0 on empty table");
+        assert_eq!(ledger.total_tokens, 0, "total_tokens should be 0 on empty table");
+        assert!(ledger.by_model.is_empty(), "by_model should be empty on empty table");
+        assert!(ledger.by_day.is_empty(), "by_day should be empty on empty table");
+        assert_eq!(ledger.total_redactions.email, 0);
+        assert_eq!(ledger.total_redactions.name, 0);
+        assert!(ledger.recent.is_empty(), "recent should be empty on empty table");
+    }
+
+    /// Insert 3 rows — 2 models ("claude-opus", "gpt-4o"), 2 distinct UTC dates, known redaction
+    /// counts — and assert `egress_summary(30)` aggregates them correctly.
+    ///
+    /// Row layout:
+    ///   ts=1_700_000_000 (2023-11-14 UTC) — claude-opus, 100 tokens, email=1, name=0
+    ///   ts=1_700_086_400 (2023-11-15 UTC) — gpt-4o,     200 tokens, email=0, name=1
+    ///   ts=1_700_086_401 (2023-11-15 UTC) — claude-opus,  50 tokens, email=2, name=1
+    #[test]
+    fn egress_summary_aggregates_correctly() {
+        let db = mem_db();
+
+        // Insert outside the 30-day window: ts=0 should be excluded once `since` is computed.
+        // (We use absolute timestamps well in the past — window uses `now - 30*86400` which will
+        // exclude ts=0. But we can't control "now" in tests so use days <= 0 for all-rows, or
+        // override the window. Here we use days=0 which means "all rows" per our implementation.)
+        let entry1 = egress_entry_for_summary("claude-opus", 100, 1, 0);
+        let entry2 = egress_entry_for_summary("gpt-4o", 200, 0, 1);
+        let entry3 = egress_entry_for_summary("claude-opus", 50, 2, 1);
+
+        // Use realistic timestamps on the same "relative past" — for the rolling window test we
+        // use days=0 (all-rows mode: since=0) to avoid clock skew in CI.
+        db.insert_egress(1_700_000_000, &entry1).unwrap();
+        db.insert_egress(1_700_086_400, &entry2).unwrap();
+        db.insert_egress(1_700_086_401, &entry3).unwrap();
+
+        let ledger = db.egress_summary(0).expect("egress_summary must not error");
+
+        // ── totals ────────────────────────────────────────────────────────
+        assert_eq!(ledger.total_calls, 3, "total_calls must be 3");
+        assert_eq!(ledger.total_tokens, 350, "total_tokens must be 100+200+50=350");
+
+        // ── by_model (ordered tokens DESC: gpt-4o=200, claude-opus=150) ──
+        assert_eq!(ledger.by_model.len(), 2, "by_model must have 2 entries");
+        let gpt = ledger
+            .by_model
+            .iter()
+            .find(|m| m.model == "gpt-4o")
+            .expect("gpt-4o entry must exist");
+        assert_eq!(gpt.calls, 1, "gpt-4o: 1 call");
+        assert_eq!(gpt.tokens, 200, "gpt-4o: 200 tokens");
+
+        let opus = ledger
+            .by_model
+            .iter()
+            .find(|m| m.model == "claude-opus")
+            .expect("claude-opus entry must exist");
+        assert_eq!(opus.calls, 2, "claude-opus: 2 calls");
+        assert_eq!(opus.tokens, 150, "claude-opus: 100+50=150 tokens");
+
+        // First entry is the one with more tokens (gpt-4o=200 > claude-opus=150)
+        assert_eq!(ledger.by_model[0].model, "gpt-4o", "by_model[0] must be gpt-4o (most tokens)");
+
+        // ── by_day (2 distinct UTC days, ascending) ───────────────────────
+        assert_eq!(ledger.by_day.len(), 2, "by_day must have 2 entries");
+        // 1_700_000_000 = 2023-11-14 UTC; 1_700_086_400/1_700_086_401 = 2023-11-15 UTC
+        assert_eq!(ledger.by_day[0].day, "2023-11-14", "by_day[0] must be 2023-11-14");
+        assert_eq!(ledger.by_day[0].tokens, 100, "2023-11-14: 100 tokens");
+        assert_eq!(ledger.by_day[1].day, "2023-11-15", "by_day[1] must be 2023-11-15");
+        assert_eq!(ledger.by_day[1].tokens, 250, "2023-11-15: 200+50=250 tokens");
+
+        // ── total_redactions: email=1+0+2=3, name=0+1+1=2 ────────────────
+        assert_eq!(ledger.total_redactions.email, 3, "total email redactions must be 3");
+        assert_eq!(ledger.total_redactions.card, 0);
+        assert_eq!(ledger.total_redactions.phone, 0);
+        assert_eq!(ledger.total_redactions.name, 2, "total name redactions must be 2");
+
+        // ── recent: 3 rows, newest first ─────────────────────────────────
+        assert_eq!(ledger.recent.len(), 3, "recent must have 3 rows");
+        assert_eq!(ledger.recent[0].ts, 1_700_086_401, "recent[0] must be the newest row");
+        assert_eq!(ledger.recent[2].ts, 1_700_000_000, "recent[2] must be the oldest row");
+    }
+
+    /// `egress_summary(30)` excludes rows outside the time window. Two rows in the past (ts≈0 =
+    /// 1970, well before any 30-day window); one row at `now_unix - 1` (inside the window).
+    /// We verify that only the in-window row is counted when days=30.
+    #[test]
+    fn egress_summary_respects_time_window() {
+        let db = mem_db();
+
+        // A row far in the past — should be excluded from any 30-day window.
+        let old = egress_entry_for_summary("old-model", 9999, 5, 5);
+        db.insert_egress(1_000, &old).unwrap(); // 1970, definitley outside 30d window
+
+        // A row "now" — should be included.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let recent = egress_entry_for_summary("new-model", 42, 0, 0);
+        db.insert_egress(now_unix, &recent).unwrap();
+
+        let ledger = db.egress_summary(30).expect("egress_summary must not error");
+        assert_eq!(ledger.total_calls, 1, "only 1 in-window row should be counted");
+        assert_eq!(ledger.total_tokens, 42, "only in-window tokens should be counted");
+        assert_eq!(ledger.by_model.len(), 1, "by_model should only contain new-model");
+        assert_eq!(ledger.by_model[0].model, "new-model");
+        // Redaction totals from the old row must NOT appear.
+        assert_eq!(ledger.total_redactions.email, 0, "old row redactions must be excluded");
     }
 
     /// brain2 realtime notes: the `manual_notes` buffer round-trips (set → get), defaults to "" for a
