@@ -231,7 +231,7 @@ fn tools_spec() -> Value {
     json!([
         {
             "name": "search_meetings",
-            "description": "Full-text search across your meeting titles, transcripts and notes. Returns matching meetings with snippets and ids.",
+            "description": "Full-text search across your meeting titles, transcripts, notes, and imported documents/brain notes. Returns matching meetings and documents with snippets and ids.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         },
         {
@@ -246,7 +246,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "search_semantic",
-            "description": "Semantic (meaning-based) search across your meeting notes, fused with full-text search. Finds relevant meetings even when they don't share the exact words. Requires semantic search to be enabled in Murmur settings.",
+            "description": "Semantic (meaning-based) search across your meeting notes and imported documents/brain notes, fused with full-text search. Finds relevant content even without the exact words. When semantic search is disabled in Murmur settings it falls back to keyword-only matching (the result says so).",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         },
         {
@@ -517,10 +517,12 @@ mod tests {
         db.set_note_folder(mid, folder).unwrap();
     }
 
-    /// Flag OFF (the default): `search_semantic` returns the explicit "disabled" result and does NOT
-    /// fall through to any vector read — the prod-safe default for the MCP surface.
+    /// Flag OFF (the default): `search_semantic` DEGRADES to gated keyword (FTS/BM25) matching —
+    /// no vector read ever runs — and the output is HONESTLY labelled as keyword matching, so the
+    /// MCP client is never told a semantic search happened. Content stays reachable on the default
+    /// install (the PR B write-only-memory fix).
     #[test]
-    fn search_semantic_disabled_when_flag_off() {
+    fn search_semantic_flag_off_degrades_to_labelled_keyword_match() {
         let (db, p) = temp_db();
         seed(&db, "m1", "Budget", "budget planning hiring quarter", None);
         // Flag defaults OFF (never written).
@@ -532,8 +534,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.contains("disabled"),
-            "flag-off semantic tool must report disabled, got: {out}"
+            out.contains("semantic search is off"),
+            "flag-off semantic tool must label its keyword degradation, got: {out}"
+        );
+        assert!(
+            out.contains("Budget"),
+            "flag-off fallback must still surface the gated keyword hit, got: {out}"
         );
         let _ = std::fs::remove_file(&p);
     }

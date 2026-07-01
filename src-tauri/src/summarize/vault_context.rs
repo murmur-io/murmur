@@ -71,7 +71,13 @@ pub fn build_vault_context_visible(
         meetings = db.list_meetings_visible(30, unlocked)?;
     }
 
-    pack_meetings(db, meetings, budget, unlocked)
+    let (mut corpus, sources) = pack_meetings(db, meetings, budget, unlocked)?;
+    // Documents/brain notes must be reachable WITHOUT the e5 model too (the default install):
+    // append the gated `## Documents` section from the keyword (FTS/BM25) leg alone — an empty
+    // `query_vec` means no KNN leg. Same `visibility_clause` gate as every meeting leg, so a
+    // sealed-not-unlocked folder's document chunks never enter the cloud-bound corpus.
+    pack_doc_chunks(db, query, &[], budget, &mut corpus, unlocked)?;
+    Ok((corpus, sources))
 }
 
 /// brain2 RAG Phase 2b — HYBRID candidate selection for Ask-My-Vault, GATED by the caller (only
@@ -102,29 +108,35 @@ pub fn build_vault_context_hybrid_visible(
     }
     let (mut corpus, sources) = pack_meetings(db, meetings, budget, unlocked)?;
     // Document ingestion: APPEND a gated `## Documents` section so the brain/Ask can also ground on
-    // uploaded md/txt. `search_doc_chunks_visible` re-applies the SAME `visibility_clause` against
-    // `unlocked` (joined doc_chunks → documents → folders), so a sealed-and-not-session-unlocked
-    // folder's document chunks are NEVER returned — identical gate to the meeting legs. Each hit
-    // contributes its document name + the nearest chunk snippet (no meeting citation — documents are
-    // not meetings, so they don't add a `VaultSource`). Capped by the same `budget`.
-    pack_doc_chunks(db, query_vec, budget, &mut corpus, unlocked)?;
+    // uploaded md/txt. Both retrieval legs (vector KNN + keyword FTS) re-apply the SAME
+    // `visibility_clause` against `unlocked` (joined doc_chunks → documents → folders), so a
+    // sealed-and-not-session-unlocked folder's document chunks are NEVER returned — identical gate
+    // to the meeting legs. Each hit contributes its document name + best chunk snippet (no meeting
+    // citation — documents are not meetings, so they don't add a `VaultSource`). Same `budget`.
+    pack_doc_chunks(db, query, query_vec, budget, &mut corpus, unlocked)?;
     Ok((corpus, sources))
 }
 
 /// Append a budget-capped `## Documents` section of gated document-chunk snippets to `corpus`. The
-/// retrieval is `search_doc_chunks_visible` (KNN gated by `visibility_clause`); a locked-and-not-
-/// unlocked folder's chunks are invisible there. Best-effort: an empty doc index simply adds nothing.
+/// retrieval is the RRF fusion of `search_doc_chunks_visible` (vector KNN — skipped when
+/// `query_vec` is empty, i.e. the flag-off / model-less path) and `search_doc_chunks_fts_visible`
+/// (keyword BM25), both gated by `visibility_clause`; a locked-and-not-unlocked folder's chunks are
+/// invisible in either leg. Best-effort: an empty doc index simply adds nothing.
 fn pack_doc_chunks(
     db: &Db,
+    query: &str,
     query_vec: &[f32],
     budget: usize,
     corpus: &mut String,
     unlocked: &HashSet<String>,
 ) -> Result<()> {
-    if query_vec.is_empty() {
-        return Ok(());
-    }
-    let hits = db.search_doc_chunks_visible(query_vec, 20, unlocked)?;
+    let knn = if query_vec.is_empty() {
+        Vec::new()
+    } else {
+        db.search_doc_chunks_visible(query_vec, 20, unlocked)?
+    };
+    let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked)?;
+    let hits = crate::embed::fuse_doc_hits(knn, fts);
     if hits.is_empty() {
         return Ok(());
     }
