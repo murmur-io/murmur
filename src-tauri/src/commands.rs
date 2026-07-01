@@ -210,6 +210,18 @@ pub struct MeetingDetailDto {
     /// renders a locked state (Touch-ID-to-unlock) instead of content; `note`/`segments` are
     /// empty in that case (the content is encrypted at rest, decrypted only on session-unlock).
     pub locked: bool,
+    /// Phase 5 provenance — the provider id used to generate the note (e.g. `"gateway"`/`"anthropic"`).
+    /// `None` when locked (masked) or when the note has no recorded provider beyond `provider_id`.
+    /// This mirrors `note.provider_id` but is surfaced here so the FE doesn't need to dig into `note`.
+    pub ai_provider: Option<String>,
+    /// Phase 5 provenance — the model id that was REQUESTED when generating the note (e.g.
+    /// `"gpt-4o"`, `"claude-opus-4-8"`). `None` when locked, unknown, or the provider uses its own
+    /// default (no explicit model was configured).
+    pub ai_model: Option<String>,
+    /// Phase 5 provenance — the model id ACTUALLY served by the gateway/API (from `CallMeta`).
+    /// May differ from `ai_model` when the gateway aliases, load-balances, or falls back. `None`
+    /// when locked, or when the provider did not return model metadata in the response.
+    pub model_served: Option<String>,
 }
 
 // ── Commands (PHASE0-PLAN §7) ──
@@ -786,6 +798,9 @@ pub fn update_note(
         markdown: markdown.clone(),
         created_at,
         exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
     })?;
 
     if let Some(path) = existing.exported_path.as_deref() {
@@ -1425,6 +1440,9 @@ pub fn patch_note_tasks(
         markdown: patched.clone(),
         created_at,
         exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
     })?;
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &patched)?;
@@ -1577,6 +1595,9 @@ pub fn pin_moment(
         markdown: new_md.clone(),
         created_at,
         exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
     })?;
     let url = match existing.exported_path.as_deref() {
         Some(path) => {
@@ -2733,15 +2754,25 @@ pub fn get_meeting_detail(
         return Ok(Some(masked_detail(meeting)));
     }
 
-    let note = state
-        .db
-        .get_latest_note_for_meeting(&meeting_id)?
-        .map(|n| NoteDto {
-            meeting_id: n.meeting_id,
-            provider_id: n.provider_id,
-            markdown: n.markdown,
-            exported_path: n.exported_path,
-        });
+    let note_row = state.db.get_latest_note_for_meeting(&meeting_id)?;
+    // Phase 5: capture provenance from the note row BEFORE converting to NoteDto (NoteDto is a
+    // subset and doesn't carry model fields). All three are None when the note is absent or when
+    // the provider did not record provenance (pre-Phase-5 notes).
+    let ai_provider = note_row
+        .as_ref()
+        .map(|n| n.provider_id.clone());
+    let ai_model = note_row
+        .as_ref()
+        .and_then(|n| n.model_requested.clone());
+    let model_served = note_row
+        .as_ref()
+        .and_then(|n| n.model_served.clone());
+    let note = note_row.map(|n| NoteDto {
+        meeting_id: n.meeting_id,
+        provider_id: n.provider_id,
+        markdown: n.markdown,
+        exported_path: n.exported_path,
+    });
     let segments = state.db.get_segments(&meeting_id)?;
     // GATED read: only past the `meeting_is_unlocked` gate above do we surface the persisted
     // assistant Q&A. The DB read is ALSO `visibility_clause`-gated (it returns empty for a sealed-
@@ -2760,6 +2791,9 @@ pub fn get_meeting_detail(
         segments,
         assistant_interactions,
         locked: false,
+        ai_provider,
+        ai_model,
+        model_served,
     }))
 }
 
@@ -2783,6 +2817,11 @@ fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
         // rest the rows were purged on seal anyway).
         assistant_interactions: Vec::new(),
         locked: true,
+        // Phase 5: provenance is gated alongside all other content — a locked meeting surfaces
+        // nothing (a model name could leak which AI service processed the content).
+        ai_provider: None,
+        ai_model: None,
+        model_served: None,
     }
 }
 
@@ -5210,6 +5249,27 @@ mod lock_read_gate_tests {
         assert!(masked.locked);
     }
 
+    /// Phase 5 — provenance lock-gate: a LOCKED (sealed-not-unlocked) meeting's masked DTO MUST
+    /// have ALL three provenance fields set to `None`. A model name / gateway host could reveal
+    /// which AI service processed the note content — the same sensitivity as the note text itself.
+    #[test]
+    fn masked_detail_nulls_all_provenance_fields() {
+        let masked = masked_detail(meeting_with_audio(None));
+        assert!(
+            masked.ai_provider.is_none(),
+            "masked detail must NULL ai_provider (provenance leak)"
+        );
+        assert!(
+            masked.ai_model.is_none(),
+            "masked detail must NULL ai_model (provenance leak)"
+        );
+        assert!(
+            masked.model_served.is_none(),
+            "masked detail must NULL model_served (provenance leak)"
+        );
+        assert!(masked.locked, "locked flag set");
+    }
+
     // ── D5 vault-containment (`assert_in_vault`) ────────────────────────────────────────────────
 
     fn tmp_vault(tag: &str) -> std::path::PathBuf {
@@ -5465,6 +5525,9 @@ mod lifecycle_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-27T09:05:00Z".to_string(),
             exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.insert_segments(

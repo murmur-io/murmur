@@ -359,6 +359,14 @@ impl Db {
         // read only via the gated commands.
         Self::add_column_if_missing(&conn, "meetings", "manual_notes", "TEXT")?;
         Self::add_column_if_missing(&conn, "meetings", "manual_notes_blob", "BLOB")?;
+        // Phase 5 — per-note model provenance. Three additive TEXT columns (NULL-safe: legacy notes
+        // that predate this migration read back as `None` via `row_to_note`; `upsert_note` persists
+        // them when the pipeline passes them in). Content-free: these are model IDs / host strings,
+        // never transcript or note text, so they are NOT sealed/blanked during folder-lock — they
+        // ride the SQLCipher-at-rest layer only.
+        Self::add_column_if_missing(&conn, "notes", "model_requested", "TEXT")?;
+        Self::add_column_if_missing(&conn, "notes", "model_served", "TEXT")?;
+        Self::add_column_if_missing(&conn, "notes", "gateway_host", "TEXT")?;
         // Phase 1 — FTS5/BM25 full-text retrieval over the three text sources
         // (meeting titles, transcript segments, note markdown). Replaces the prior
         // substring LIKE search so word-order/term retrieval works ("alpha beta" == "beta alpha")
@@ -1813,18 +1821,25 @@ impl Db {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO notes
-               (meeting_id, provider_id, markdown, created_at, exported_path)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+               (meeting_id, provider_id, markdown, created_at, exported_path,
+                model_requested, model_served, gateway_host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(meeting_id, provider_id) DO UPDATE SET
                markdown = excluded.markdown,
                created_at = excluded.created_at,
-               exported_path = excluded.exported_path",
+               exported_path = excluded.exported_path,
+               model_requested = excluded.model_requested,
+               model_served = excluded.model_served,
+               gateway_host = excluded.gateway_host",
             rusqlite::params![
                 note.meeting_id,
                 note.provider_id,
                 note.markdown,
                 note.created_at,
                 note.exported_path,
+                note.model_requested,
+                note.model_served,
+                note.gateway_host,
             ],
         )
         .map_err(map_err)?;
@@ -1834,7 +1849,8 @@ impl Db {
     pub fn get_note(&self, meeting_id: &str, provider_id: &str) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
+                    model_requested, model_served, gateway_host
                FROM notes WHERE meeting_id = ?1 AND provider_id = ?2",
             rusqlite::params![meeting_id, provider_id],
             row_to_note,
@@ -1846,7 +1862,8 @@ impl Db {
     pub fn latest_note(&self) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
+                    model_requested, model_served, gateway_host
                FROM notes ORDER BY created_at DESC LIMIT 1",
             [],
             row_to_note,
@@ -1862,7 +1879,8 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
-            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path
+            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
+                    n.model_requested, n.model_served, n.gateway_host
                FROM notes n
                LEFT JOIN folders f ON f.id = n.folder_id
               WHERE {visible}
@@ -1877,7 +1895,8 @@ impl Db {
     pub fn get_latest_note_for_meeting(&self, meeting_id: &str) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path
+            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
+                    model_requested, model_served, gateway_host
                FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
             rusqlite::params![meeting_id],
             row_to_note,
@@ -3077,7 +3096,8 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
-            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path
+            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
+                    n.model_requested, n.model_served, n.gateway_host
                FROM notes n
                LEFT JOIN folders f ON f.id = n.folder_id
               WHERE n.meeting_id = ?1 AND {visible}
@@ -4215,6 +4235,9 @@ fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {
         markdown: row.get(2)?,
         created_at: row.get(3)?,
         exported_path: row.get(4)?,
+        model_requested: row.get(5)?,
+        model_served: row.get(6)?,
+        gateway_host: row.get(7)?,
     })
 }
 
@@ -4867,6 +4890,9 @@ mod tests {
             markdown: "# v1".into(),
             created_at: "2026-06-24T10:31:00Z".into(),
             exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         };
         db.upsert_note(&note).unwrap();
 
@@ -4884,6 +4910,83 @@ mod tests {
 
         assert!(db.get_note("m1", "ollama").unwrap().is_none());
         assert_eq!(db.latest_note().unwrap().unwrap().markdown, "# v2");
+    }
+
+    /// Phase 5 — provenance round-trip: model_requested / model_served / gateway_host are
+    /// persisted via `upsert_note` and read back correctly by every note-fetch path.
+    #[test]
+    fn note_provenance_round_trips() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("prov1", "2026-06-30T10:00:00Z"))
+            .unwrap();
+
+        let note = NoteRecord {
+            meeting_id: "prov1".into(),
+            provider_id: "gateway".into(),
+            markdown: "---\ntitle: T\n---\nBody.".into(),
+            created_at: "2026-06-30T10:05:00Z".into(),
+            exported_path: None,
+            model_requested: Some("gpt-4o".into()),
+            model_served: Some("gpt-4o-2024-11-20".into()),
+            gateway_host: Some("gw.example.com".into()),
+        };
+        db.upsert_note(&note).unwrap();
+
+        let got = db.get_note("prov1", "gateway").unwrap().unwrap();
+        assert_eq!(got.model_requested.as_deref(), Some("gpt-4o"));
+        assert_eq!(got.model_served.as_deref(), Some("gpt-4o-2024-11-20"));
+        assert_eq!(got.gateway_host.as_deref(), Some("gw.example.com"));
+
+        let got2 = db.get_latest_note_for_meeting("prov1").unwrap().unwrap();
+        assert_eq!(got2.model_served.as_deref(), Some("gpt-4o-2024-11-20"));
+    }
+
+    /// Phase 5 — legacy notes (columns NULL) read back as `None` provenance fields.
+    #[test]
+    fn note_provenance_legacy_rows_read_as_none() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("leg1", "2026-06-30T10:00:00Z"))
+            .unwrap();
+        // A note with no provenance (as all pre-Phase-5 notes would be after migration).
+        db.upsert_note(&NoteRecord {
+            meeting_id: "leg1".into(),
+            provider_id: "claude_code".into(),
+            markdown: "# Legacy note".into(),
+            created_at: "2026-06-30T10:01:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        let got = db.get_note("leg1", "claude_code").unwrap().unwrap();
+        assert!(got.model_requested.is_none(), "legacy: model_requested is None");
+        assert!(got.model_served.is_none(), "legacy: model_served is None");
+        assert!(got.gateway_host.is_none(), "legacy: gateway_host is None");
+    }
+
+    /// Phase 5 — `migrate()` twice is still a no-op (idempotent migration covering the new columns).
+    /// The existing `migrate_is_idempotent` test covers the full table list; this one checks
+    /// specifically that the three provenance columns are present after `migrate()` runs once (they
+    /// would be absent in a real pre-Phase-5 DB and must be added by the first migrate).
+    #[test]
+    fn migrate_adds_provenance_columns_to_notes() {
+        let db = mem_db(); // mem_db() calls migrate() once during open_with_key
+        let conn = db.lock();
+        // PRAGMA table_info returns one row per column; verify all three are present.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(notes)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for col in &["model_requested", "model_served", "gateway_host"] {
+            assert!(
+                cols.iter().any(|c| c == col),
+                "column {col} must be present after migrate(); columns: {cols:?}"
+            );
+        }
     }
 
     #[test]
@@ -4927,6 +5030,9 @@ mod tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}-{provider_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
     }
@@ -5944,6 +6050,9 @@ mod lock_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(meeting_id, folder_id).unwrap();
@@ -5958,6 +6067,9 @@ mod lock_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:06:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}-{provider_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         // Keep the new row in the same folder as its siblings.
@@ -6760,6 +6872,9 @@ mod graph_tests {
             markdown: markdown.to_string(),
             created_at: "2026-06-26T09:05:00Z".to_string(),
             exported_path: Some(format!("/vault/{meeting_id}.md")),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
         })
         .unwrap();
         db.set_note_folder(meeting_id, folder_id).unwrap();

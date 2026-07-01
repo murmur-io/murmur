@@ -130,7 +130,7 @@ pub struct FolderNode {
     pub children: Vec<FolderNode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteRecord {
     pub meeting_id: String,
@@ -138,6 +138,17 @@ pub struct NoteRecord {
     pub markdown: String,
     pub created_at: String,
     pub exported_path: Option<String>,
+    /// Phase 5 provenance — the model id the pipeline REQUESTED (e.g. `"gpt-4o"`, `"claude-opus-4-8"`).
+    /// `None` for notes created before this column was added (additive migration; legacy rows read back
+    /// as `None`).
+    pub model_requested: Option<String>,
+    /// Phase 5 provenance — the model id the gateway/API ACTUALLY served (from `CallMeta.model_served`).
+    /// May differ from `model_requested` when the gateway aliases, falls back, or load-balances.
+    /// `None` when the provider did not return this in the response.
+    pub model_served: Option<String>,
+    /// Phase 5 provenance — the HOST portion of the gateway base URL, present only for the `gateway`
+    /// provider (e.g. `"gw.example.com"`, `"127.0.0.1:4000"`). `None` for all other providers.
+    pub gateway_host: Option<String>,
 }
 
 /// One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken command, the
