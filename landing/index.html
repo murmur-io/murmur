@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Murmur — meeting notes with a brain, on your Mac</title>
+  <meta name="description" content="Murmur records your meetings, transcribes and reasons over them entirely on your Mac, and lets you ask your AI live in the call. Local-first. Privacy is the architecture, not a setting." />
+  <link rel="icon" href="./assets/icon.svg" />
+  <meta property="og:title" content="Murmur — meeting notes with a brain, on your Mac" />
+  <meta property="og:description" content="On-device meeting notes for macOS. Nothing leaves your Mac. Privacy is the architecture." />
+  <meta property="og:type" content="website" />
+  <style>
+    /* ─────────────────────────────────────────────────────────────
+       Tokens — mirrored from the shipping app (src/styles.css) so the
+       site and the product read as one family.
+       ───────────────────────────────────────────────────────────── */
+    :root {
+      --surface-base: #07070b;
+      --surface-raised: rgba(255, 255, 255, 0.045);
+      --surface-solid: #111118;
+      --surface-hover: rgba(255, 255, 255, 0.06);
+
+      --text-primary: #f6f6fa;
+      --text-secondary: #a6a6b6;
+      --text-muted: #6c6c7d;
+
+      --accent: #6e76ff;
+      --accent-hover: #8a90ff;
+      --accent-soft: rgba(110, 118, 255, 0.16);
+      --accent-ring: rgba(110, 118, 255, 0.5);
+      --accent-gradient: linear-gradient(135deg, #6e76ff 0%, #9d7bff 100%);
+
+      --live: #ff7a5c;
+      --live-soft: rgba(255, 122, 92, 0.16);
+
+      --safe: #3fb950;
+      --safe-soft: rgba(63, 185, 80, 0.14);
+
+      --border: rgba(255, 255, 255, 0.09);
+      --border-strong: rgba(255, 255, 255, 0.16);
+
+      --radius-md: 13px;
+      --radius-lg: 18px;
+      --radius-xl: 24px;
+      --radius-pill: 999px;
+
+      --shadow-md: 0 16px 40px rgba(0, 0, 0, 0.42);
+      --shadow-lg: 0 28px 70px rgba(0, 0, 0, 0.55);
+      --shadow-accent: 0 10px 34px rgba(110, 118, 255, 0.42);
+
+      --font: -apple-system, "SF Pro Display", "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+      --maxw: 1120px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--text-primary);
+      background: var(--surface-base);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* Ambient background glow — the "voice orb" bleeding through the ground */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(680px 480px at 78% -6%, rgba(110, 118, 255, 0.22), transparent 60%),
+        radial-gradient(720px 520px at 6% 8%, rgba(157, 123, 255, 0.14), transparent 62%),
+        radial-gradient(900px 700px at 50% 118%, rgba(255, 122, 92, 0.08), transparent 60%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    a { color: inherit; text-decoration: none; }
+
+    .wrap { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+
+    h1, h2, h3 { margin: 0; text-wrap: balance; letter-spacing: -0.02em; font-weight: 600; }
+    p { margin: 0; }
+
+    .eyebrow {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent-hover);
+      font-family: var(--font-mono);
+    }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 9px;
+      font: inherit; font-weight: 600; font-size: 15px;
+      padding: 12px 20px;
+      border-radius: var(--radius-pill);
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: transform .18s ease, background .18s ease, border-color .18s ease, box-shadow .18s ease;
+      white-space: nowrap;
+    }
+    .btn svg { width: 18px; height: 18px; }
+    .btn-primary { background: var(--accent-gradient); color: #fff; box-shadow: var(--shadow-accent); }
+    .btn-primary:hover { transform: translateY(-2px); }
+    .btn-ghost { background: var(--surface-raised); color: var(--text-primary); border-color: var(--border-strong); }
+    .btn-ghost:hover { background: var(--surface-hover); border-color: var(--accent-ring); }
+    .btn-sm { padding: 9px 16px; font-size: 14px; }
+
+    /* ── Nav ─────────────────────────────────────────────────── */
+    header.nav {
+      position: sticky; top: 0; z-index: 40;
+      backdrop-filter: blur(14px);
+      background: rgba(7, 7, 11, 0.72);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 600; font-size: 18px; letter-spacing: -0.03em; }
+    .brand img { width: 30px; height: 30px; border-radius: 8px; }
+    .nav-links { display: flex; align-items: center; gap: 28px; }
+    .nav-links a.link { color: var(--text-secondary); font-size: 15px; font-weight: 500; transition: color .15s; }
+    .nav-links a.link:hover { color: var(--text-primary); }
+    .nav-cta { display: flex; align-items: center; gap: 12px; }
+    @media (max-width: 860px) { .nav-links .link { display: none; } }
+
+    /* ── Hero ────────────────────────────────────────────────── */
+    .hero { padding: 84px 0 40px; }
+    .hero-grid { display: grid; grid-template-columns: 1.02fr 1fr; gap: 56px; align-items: center; }
+    @media (max-width: 940px) { .hero-grid { grid-template-columns: 1fr; gap: 40px; } .hero { padding-top: 56px; } }
+
+    .badge-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 7px;
+      font-size: 12.5px; font-weight: 600;
+      padding: 6px 12px; border-radius: var(--radius-pill);
+      background: var(--accent-soft); color: var(--accent-hover);
+      border: 1px solid rgba(110, 118, 255, 0.28);
+    }
+    .badge.safe { background: var(--safe-soft); color: #6ee787; border-color: rgba(63, 185, 80, 0.3); }
+    .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+    h1.hero-title {
+      font-size: clamp(38px, 5.6vw, 62px);
+      line-height: 1.03;
+      letter-spacing: -0.035em;
+      margin-bottom: 22px;
+    }
+    h1.hero-title .grad {
+      background: linear-gradient(120deg, #9d7bff 10%, #6e76ff 55%, #8a90ff 100%);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .hero-sub { font-size: clamp(17px, 2vw, 20px); color: var(--text-secondary); max-width: 34em; margin-bottom: 30px; }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+    .hero-note { margin-top: 18px; font-size: 13.5px; color: var(--text-muted); display: flex; align-items: center; gap: 8px; }
+    .hero-note svg { width: 15px; height: 15px; color: var(--safe); flex: none; }
+
+    /* App-shot frame */
+    .shot {
+      position: relative; border-radius: var(--radius-xl);
+      border: 1px solid var(--border-strong);
+      background: var(--surface-solid);
+      box-shadow: var(--shadow-lg);
+      overflow: hidden;
+    }
+    .shot::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,0.06); pointer-events: none; }
+    .shot img { display: block; width: 100%; height: auto; }
+    .shot-glow { position: relative; }
+    .shot-glow::before {
+      content: ""; position: absolute; inset: -14% -8% -22% -8%;
+      background: var(--accent-gradient); filter: blur(60px); opacity: 0.28; border-radius: 50%;
+      z-index: -1;
+    }
+
+    /* ── Trust strip ─────────────────────────────────────────── */
+    .trust { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 26px 0; margin-top: 44px; }
+    .trust-inner { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 14px 34px; }
+    .trust-item { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-weight: 500; font-size: 14.5px; }
+    .trust-item svg { width: 19px; height: 19px; color: var(--accent-hover); flex: none; }
+
+    /* ── Sections ────────────────────────────────────────────── */
+    section { padding: 92px 0; position: relative; }
+    .section-head { max-width: 640px; margin: 0 auto 54px; text-align: center; }
+    .section-head.left { margin-left: 0; text-align: left; }
+    .section-head h2 { font-size: clamp(28px, 3.6vw, 42px); line-height: 1.1; margin: 14px 0 16px; }
+    .section-head p { color: var(--text-secondary); font-size: 17px; }
+
+    /* How it works — 3 steps */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+    @media (max-width: 820px) { .steps { grid-template-columns: 1fr; } }
+    .step { background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 28px; }
+    .step-n { font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--accent-hover); letter-spacing: 0.05em; }
+    .step h3 { font-size: 20px; margin: 12px 0 8px; }
+    .step p { color: var(--text-secondary); font-size: 15px; }
+
+    /* ── Privacy: the centerpiece ────────────────────────────── */
+    .privacy { background:
+        linear-gradient(180deg, rgba(110,118,255,0.05), transparent 30%),
+        radial-gradient(700px 400px at 50% 0%, rgba(63,185,80,0.06), transparent 60%);
+      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+    }
+    .privacy-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    @media (max-width: 920px) { .privacy-grid { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 620px) { .privacy-grid { grid-template-columns: 1fr; } }
+    .pcard { background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 26px; transition: border-color .2s, transform .2s; }
+    .pcard:hover { border-color: var(--accent-ring); transform: translateY(-3px); }
+    .pcard .ic { width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-hover); margin-bottom: 16px; }
+    .pcard.green .ic { background: var(--safe-soft); color: #6ee787; }
+    .pcard .ic svg { width: 22px; height: 22px; }
+    .pcard h3 { font-size: 18px; margin-bottom: 8px; }
+    .pcard p { color: var(--text-secondary); font-size: 14.5px; }
+
+    /* Egress table */
+    .egress { margin-top: 44px; border: 1px solid var(--border-strong); border-radius: var(--radius-lg); overflow: hidden; background: var(--surface-solid); }
+    .egress .scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 560px; }
+    thead th { text-align: left; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); font-weight: 700; padding: 16px 20px; background: rgba(255,255,255,0.02); }
+    tbody td { padding: 16px 20px; border-top: 1px solid var(--border); font-size: 14.5px; color: var(--text-secondary); }
+    tbody td:first-child { color: var(--text-primary); font-weight: 600; }
+    .tag { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 12.5px; font-weight: 600; padding: 4px 10px; border-radius: var(--radius-pill); }
+    .tag.no { background: var(--safe-soft); color: #6ee787; }
+    .tag.yes { background: var(--live-soft); color: #ff9c85; }
+    .egress-foot { padding: 14px 20px; border-top: 1px solid var(--border); font-size: 13px; color: var(--text-muted); }
+
+    /* ── Feature rows ────────────────────────────────────────── */
+    .feature { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; }
+    .feature + .feature { margin-top: 96px; }
+    .feature.flip .ftext { order: 2; }
+    @media (max-width: 900px) { .feature, .feature.flip { grid-template-columns: 1fr; gap: 32px; } .feature.flip .ftext { order: 0; } }
+    .ftext h3 { font-size: clamp(24px, 3vw, 32px); line-height: 1.12; margin: 14px 0 16px; }
+    .ftext p { color: var(--text-secondary); font-size: 16.5px; margin-bottom: 20px; }
+    .flist { display: flex; flex-direction: column; gap: 11px; }
+    .flist li { list-style: none; display: flex; gap: 11px; align-items: flex-start; color: var(--text-secondary); font-size: 15px; }
+    .flist svg { width: 19px; height: 19px; color: var(--accent-hover); flex: none; margin-top: 2px; }
+    ul.flist { margin: 0; padding: 0; }
+
+    /* ── Pricing ─────────────────────────────────────────────── */
+    .pricing { background: linear-gradient(180deg, transparent, rgba(110,118,255,0.04)); }
+    .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-items: stretch; }
+    @media (max-width: 920px) { .plans { grid-template-columns: 1fr; max-width: 460px; margin: 0 auto; } }
+    .plan { display: flex; flex-direction: column; background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 32px 28px; }
+    .plan.featured { border-color: var(--accent-ring); background: linear-gradient(180deg, rgba(110,118,255,0.10), var(--surface-raised)); box-shadow: var(--shadow-accent); position: relative; }
+    .plan.featured::before { content: "Most popular"; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: var(--accent-gradient); color: #fff; font-size: 12px; font-weight: 700; padding: 5px 14px; border-radius: var(--radius-pill); letter-spacing: 0.02em; }
+    .plan h3 { font-size: 20px; }
+    .plan .price { display: flex; align-items: baseline; gap: 4px; margin: 16px 0 4px; }
+    .plan .price .amt { font-size: 44px; font-weight: 700; letter-spacing: -0.04em; }
+    .plan .price .per { color: var(--text-muted); font-size: 15px; }
+    .plan .tagline { color: var(--text-secondary); font-size: 14.5px; min-height: 42px; }
+    .plan ul { list-style: none; margin: 22px 0 26px; padding: 0; display: flex; flex-direction: column; gap: 12px; flex: 1; }
+    .plan li { display: flex; gap: 10px; align-items: flex-start; font-size: 14.5px; color: var(--text-secondary); }
+    .plan li svg { width: 18px; height: 18px; flex: none; margin-top: 2px; color: var(--safe); }
+    .plan li.off { color: var(--text-muted); }
+    .plan li.off svg { color: var(--text-muted); }
+    .plan .btn { width: 100%; justify-content: center; }
+
+    /* ── Final CTA ───────────────────────────────────────────── */
+    .cta-final { text-align: center; }
+    .cta-card { background: linear-gradient(135deg, rgba(110,118,255,0.14), rgba(157,123,255,0.08)); border: 1px solid var(--accent-ring); border-radius: var(--radius-xl); padding: 60px 32px; box-shadow: var(--shadow-md); }
+    .cta-card h2 { font-size: clamp(28px, 4vw, 44px); line-height: 1.08; margin-bottom: 16px; }
+    .cta-card p { color: var(--text-secondary); font-size: 18px; max-width: 30em; margin: 0 auto 30px; }
+    .cta-actions { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+
+    /* ── Footer ──────────────────────────────────────────────── */
+    footer { border-top: 1px solid var(--border); padding: 44px 0 56px; }
+    .foot-inner { display: flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap; }
+    .foot-brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.02em; }
+    .foot-brand img { width: 26px; height: 26px; border-radius: 7px; }
+    .foot-links { display: flex; gap: 24px; flex-wrap: wrap; }
+    .foot-links a { color: var(--text-secondary); font-size: 14.5px; transition: color .15s; }
+    .foot-links a:hover { color: var(--text-primary); }
+    .foot-legal { color: var(--text-muted); font-size: 13px; margin-top: 24px; text-align: center; }
+
+    /* ── Scroll reveal ───────────────────────────────────────── */
+    .reveal { opacity: 0; transform: translateY(22px); transition: opacity .6s ease, transform .6s ease; }
+    .reveal.in { opacity: 1; transform: none; }
+    @media (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; transition: none; } }
+
+    :focus-visible { outline: 2px solid var(--accent-hover); outline-offset: 3px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Nav ─────────────────────────────────────────────────── -->
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top">
+        <img src="./assets/icon.svg" alt="Murmur" />
+        <span>Murmur</span>
+      </a>
+      <nav class="nav-links">
+        <a class="link" href="#product">Product</a>
+        <a class="link" href="#privacy">Privacy</a>
+        <a class="link" href="#features">Features</a>
+        <a class="link" href="#pricing">Pricing</a>
+        <a class="link" href="https://github.com/JakubGawr/murmur">GitHub</a>
+      </nav>
+      <div class="nav-cta">
+        <a class="btn btn-ghost btn-sm" href="https://github.com/JakubGawr/murmur" aria-label="Murmur on GitHub">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.56 2.36 1.11 2.94.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.35 9.35 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.6.69.49A10.04 10.04 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+          <span>Star</span>
+        </a>
+        <a class="btn btn-primary btn-sm" href="https://github.com/JakubGawr/murmur/releases/latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+          <span>Download</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Hero ────────────────────────────────────────────────── -->
+  <a id="top"></a>
+  <section class="hero" id="product">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <div class="badge-row">
+          <span class="badge safe"><span class="dot"></span> Local-first · macOS</span>
+          <span class="badge">On-device brain</span>
+        </div>
+        <h1 class="hero-title">Your meetings get a brain — <span class="grad">and it never leaves your Mac.</span></h1>
+        <p class="hero-sub">Murmur records your calls, transcribes and reasons over them <b>entirely on-device</b>, and lets you ask your AI a question <b>live, mid-meeting</b> — grounded in everything you've ever recorded. No cloud required.</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="https://github.com/JakubGawr/murmur/releases/latest">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+            Download for macOS
+          </a>
+          <a class="btn btn-ghost" href="#privacy">See how privacy works</a>
+        </div>
+        <p class="hero-note">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          Signed &amp; notarized · macOS 13.4+ · Apple Silicon &amp; Intel · your notes stay Markdown you own
+        </p>
+      </div>
+      <div class="shot-glow">
+        <div class="shot">
+          <img src="./assets/record-brain.png" alt="Asking Murmur's on-device assistant a question mid-meeting and getting a grounded answer with sources — while the recording keeps rolling" loading="eager" />
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Trust strip ─────────────────────────────────────────── -->
+  <div class="trust">
+    <div class="wrap trust-inner">
+      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> Everything on-device</div>
+      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg> Touch ID lock at rest</div>
+      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg> No cloud required</div>
+      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg> Plain Markdown you own</div>
+    </div>
+  </div>
+
+  <!-- ── How it works ────────────────────────────────────────── -->
+  <section>
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">How it works</span>
+        <h2>Record → understand → ask. All on your Mac.</h2>
+        <p>One local pipeline turns a live call into a searchable, queryable memory — with no round-trip to someone else's server.</p>
+      </div>
+      <div class="steps">
+        <div class="step reveal">
+          <div class="step-n">01 · Record</div>
+          <h3>Hears the whole call</h3>
+          <p>Your mic <b>and</b> the other side's system audio, captured and transcribed separately, then merged into a clean <b>Me / Others</b> transcript by on-device Whisper.</p>
+        </div>
+        <div class="step reveal">
+          <div class="step-n">02 · Understand</div>
+          <h3>An on-device brain</h3>
+          <p>A reasoning model runs locally over a semantic index of everything you've recorded — writing a structured note and keeping the memory searchable forever.</p>
+        </div>
+        <div class="step reveal">
+          <div class="step-n">03 · Ask</div>
+          <h3>Answers, live &amp; cited</h3>
+          <p>Say a wake phrase mid-meeting and get a grounded answer with <b>sources</b> — or ask across months of calls afterward. The recording never stops.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Privacy: the centerpiece ────────────────────────────── -->
+  <section class="privacy" id="privacy">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow" style="color:#6ee787">Security &amp; Privacy</span>
+        <h2>Privacy isn't a setting. It's the architecture.</h2>
+        <p>Most meeting tools ship your audio to someone else's cloud. Murmur is built the other way around: the brain, transcription, and search are designed to run <b>without a network at all</b>.</p>
+      </div>
+
+      <div class="privacy-grid">
+        <div class="pcard green reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg></div>
+          <h3>Nothing leaves the device</h3>
+          <p>With the bundled on-device model or Ollama, your audio and transcripts never touch a network. The reasoning happens on your Mac.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+          <h3>Two encryption layers at rest</h3>
+          <p>The whole database is SQLCipher-encrypted. On top, a per-folder <b>AES-256-GCM</b> lock adds content keys wrapped by a master key released only by <b>Touch ID</b>.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+          <h3>Every read is gated</h3>
+          <p>A sealed, locked folder leaks nothing — across the app, search, the graph, MCP, even the audio path. Locked meetings simply show as <b>🔒 Locked</b>.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8h16v-8"/><path d="M12 3v13m0 0 4-4m-4 4-4-4"/></svg></div>
+          <h3>Seals verify-before-destroy</h3>
+          <p>Murmur proves the ciphertext decrypts back <b>before</b> it ever blanks the plaintext — content is never lost, and locking is fully reversible.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h18v12H3z"/><path d="M8 21h8m-4-6v6"/><path d="m3 3 18 18" opacity=".5"/></svg></div>
+          <h3>Screen-share aware</h3>
+          <p>A watcher can auto-relock sealed folders and wipe the cached key the moment screen sharing is detected — so a shared screen can't spill private notes.</p>
+        </div>
+        <div class="pcard green reveal">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.5 8 8 11 4.5-3 8-6 8-11V5z"/><path d="M9 12h6M12 9v6" opacity=".5"/></svg></div>
+          <h3>Redaction firewall</h3>
+          <p>If you ever opt into a cloud summarizer, emails, phone and card-like numbers are scrubbed first — and cloud egress is <b>fail-closed</b> behind a one-time consent.</p>
+        </div>
+      </div>
+
+      <!-- Honest egress table -->
+      <div class="egress reveal">
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th>Brain / provider</th><th>Where it runs</th><th>Does meeting text leave your Mac?</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>On-device brain (Bielik / Qwen)</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
+              <tr><td>Ollama</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
+              <tr><td>Claude Code <span style="color:var(--text-muted);font-weight:400">(default summarizer)</span></td><td>Local CLI → cloud</td><td><span class="tag yes">Redacted only</span></td></tr>
+              <tr><td>Anthropic API <span style="color:var(--text-muted);font-weight:400">(bring your own key)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Redacted only</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="egress-foot">Murmur tells you, in plain language, exactly what leaves your Mac — and defaults to keeping it all on-device.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Features ────────────────────────────────────────────── -->
+  <section id="features">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">What you get</span>
+        <h2>A meeting tool that actually remembers.</h2>
+        <p>One encrypted store, three ways to use it — the app, a local MCP server, and your Obsidian vault.</p>
+      </div>
+
+      <!-- Feature 1 -->
+      <div class="feature reveal">
+        <div class="ftext">
+          <span class="eyebrow">The brain</span>
+          <h3>Talk to your AI — during the meeting.</h3>
+          <p>This is the part most note-takers don't have. Trigger it by wake phrase or a single tap; it answers out of your meeting memory, live, with citations you can open — and the recording never stops.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device reasoner (Bielik-11B, Qwen) via Metal</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Grounded, not hallucinated — retrieved from your own transcripts</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional consent-gated web — off by default</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="./assets/ask.png" alt="Ask Your Vault — grounded Q&A across months of meetings, every claim linked to its source" loading="lazy" /></div>
+      </div>
+
+      <!-- Feature 2 -->
+      <div class="feature flip reveal">
+        <div class="ftext">
+          <span class="eyebrow">Capture &amp; transcribe</span>
+          <h3>It hears both sides of the call.</h3>
+          <p>Dual-stream recording captures your mic and the other side's system audio, transcribes each independently on-device, and merges them by wall-clock into a clean Me / Others transcript with live captions as you speak.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device Whisper (large-v3) with live + accurate passes</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional speaker diarization &amp; voice activity detection</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A floating recorder bar — record from anywhere (⌘⇧R)</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="./assets/transcript.png" alt="The merged Me / Others transcript, time-indexed" loading="lazy" /></div>
+      </div>
+
+      <!-- Feature 3 -->
+      <div class="feature reveal">
+        <div class="ftext">
+          <span class="eyebrow">Notes &amp; memory</span>
+          <h3>Structured notes and a graph that builds itself.</h3>
+          <p>Every call becomes a clean note — summary, decisions, action items, quotes. People and projects are extracted automatically into a knowledge graph, and sealed folders stay hidden from it.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Ask across every meeting with hybrid semantic search</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Entity dossiers, related meetings, weekly digests</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Action items can push to Apple Reminders</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="./assets/graph.png" alt="People & Projects knowledge graph, extracted automatically" loading="lazy" /></div>
+      </div>
+
+      <!-- Feature 4 -->
+      <div class="feature flip reveal">
+        <div class="ftext">
+          <span class="eyebrow">Yours to keep</span>
+          <h3>Plain Markdown. No lock-in.</h3>
+          <p>Every note is also exported as atomic Obsidian Markdown — YAML front-matter, <code>[[wikilinks]]</code>, deep-links, and a canvas board option. Don't use Obsidian? They're still just files you own.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> An encrypted SQLite DB is the single source of truth</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A read-only local MCP server for Claude Desktop / Code</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> No proprietary format, ever</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="./assets/detail-note.png" alt="A structured note — summary, decisions, action items, quotes" loading="lazy" /></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Pricing ─────────────────────────────────────────────── -->
+  <section class="pricing" id="pricing">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Pricing</span>
+        <h2>Start free. Lock it down when you need to.</h2>
+        <p>The full local pipeline is free forever. Paid plans add the per-folder lock, sharing, and team management.</p>
+      </div>
+      <div class="plans">
+        <!-- Free -->
+        <div class="plan reveal">
+          <h3>Free</h3>
+          <div class="price"><span class="amt">$0</span><span class="per">/ forever</span></div>
+          <p class="tagline">Run Murmur locally, end to end.</p>
+          <ul>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Full record → transcribe → note pipeline</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device brain &amp; semantic search</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Obsidian Markdown export</li>
+            <li class="off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg> Per-folder app lock</li>
+          </ul>
+          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur/releases/latest">Download</a>
+        </div>
+
+        <!-- Pro -->
+        <div class="plan featured reveal">
+          <h3>Pro</h3>
+          <div class="price"><span class="amt">$3.99</span><span class="per">/ month</span></div>
+          <p class="tagline">Lock, encrypt, and share your work.</p>
+          <ul>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Free</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-folder Touch ID lock &amp; file encryption</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Auto-lock while sharing your screen</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Share projects</li>
+          </ul>
+          <a class="btn btn-primary" href="https://github.com/JakubGawr/murmur">Get Pro</a>
+        </div>
+
+        <!-- Enterprise -->
+        <div class="plan reveal">
+          <h3>Enterprise</h3>
+          <div class="price"><span class="amt">Contact</span></div>
+          <p class="tagline">For teams that manage access centrally.</p>
+          <ul>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Pro</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Create an organization &amp; invite users</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Centralized user management</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Priority support</li>
+          </ul>
+          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur">Contact us</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Final CTA ───────────────────────────────────────────── -->
+  <section class="cta-final">
+    <div class="wrap">
+      <div class="cta-card reveal">
+        <h2>Give your meetings a brain — keep it on your Mac.</h2>
+        <p>Free, local-first, and signed &amp; notarized for macOS. Your audio never has to leave the device.</p>
+        <div class="cta-actions">
+          <a class="btn btn-primary" href="https://github.com/JakubGawr/murmur/releases/latest">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+            Download for macOS
+          </a>
+          <a class="btn btn-ghost" href="https://github.com/JakubGawr/murmur">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.56 2.36 1.11 2.94.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.35 9.35 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.6.69.49A10.04 10.04 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+            View on GitHub
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Footer ──────────────────────────────────────────────── -->
+  <footer>
+    <div class="wrap">
+      <div class="foot-inner">
+        <a class="foot-brand" href="#top">
+          <img src="./assets/icon.svg" alt="Murmur" />
+          <span>Murmur</span>
+        </a>
+        <nav class="foot-links">
+          <a href="#product">Product</a>
+          <a href="#privacy">Privacy</a>
+          <a href="#features">Features</a>
+          <a href="#pricing">Pricing</a>
+          <a href="https://github.com/JakubGawr/murmur">GitHub</a>
+          <a href="https://github.com/JakubGawr/murmur/releases/latest">Download</a>
+        </nav>
+      </div>
+      <p class="foot-legal">🍎 macOS-first · 🧠 on-device brain · 🔒 local-first · built with Tauri + Angular + Rust</p>
+    </div>
+  </footer>
+
+  <script>
+    // Scroll reveal — progressive, and a no-op under reduced motion.
+    (function () {
+      var els = Array.prototype.slice.call(document.querySelectorAll('.reveal'));
+      var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce || !('IntersectionObserver' in window)) {
+        els.forEach(function (el) { el.classList.add('in'); });
+        return;
+      }
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+        });
+      }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
+      els.forEach(function (el) { io.observe(el); });
+    })();
+  </script>
+</body>
+</html>

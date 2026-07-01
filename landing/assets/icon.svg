@@ -1,0 +1,50 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="36%" r="78%">
+      <stop offset="0%" stop-color="#221f52"/>
+      <stop offset="52%" stop-color="#100f26"/>
+      <stop offset="100%" stop-color="#07070f"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="34%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#6e76ff" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#6e76ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orb" cx="40%" cy="32%" r="80%">
+      <stop offset="0%" stop-color="#cdc2ff"/>
+      <stop offset="44%" stop-color="#8079ff"/>
+      <stop offset="100%" stop-color="#5a4fe6"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a6abff"/>
+      <stop offset="100%" stop-color="#6e76ff"/>
+    </linearGradient>
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="232" ry="232"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+    <rect width="1024" height="1024" fill="url(#sheen)"/>
+
+    <!-- concentric "murmur" ripples emanating from the orb -->
+    <g fill="none" stroke="url(#ring)" stroke-linecap="round">
+      <circle cx="512" cy="512" r="358" stroke-opacity="0.12" stroke-width="13"/>
+      <circle cx="512" cy="512" r="256" stroke-opacity="0.28" stroke-width="15"/>
+      <circle cx="512" cy="512" r="162" stroke-opacity="0.5" stroke-width="16"/>
+    </g>
+
+    <!-- glowing voice orb -->
+    <circle cx="512" cy="512" r="214" fill="url(#glow)"/>
+    <circle cx="512" cy="512" r="98" fill="url(#orb)"/>
+    <ellipse cx="484" cy="478" rx="33" ry="25" fill="#ffffff" opacity="0.38"/>
+  </g>
+
+  <!-- crisp inner edge -->
+  <rect x="1.5" y="1.5" width="1021" height="1021" rx="231" ry="231"
+        fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="3"/>
+</svg>
