@@ -68,6 +68,28 @@ pub(crate) fn chat_body(model: &str, system: &str, user: &str) -> Value {
     })
 }
 
+/// Build a `/v1/chat/completions` body with `response_format: json_schema` so the gateway
+/// applies native constrained decoding (Task 8.2). The `strict: true` flag asks the model
+/// to guarantee the output matches `schema`.
+pub(crate) fn chat_body_json(model: &str, system: &str, user: &str, schema: &Value) -> Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        "stream": false,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "schema": schema,
+                "strict": true
+            }
+        }
+    })
+}
+
 /// Minimal mirror of the OpenAI `/v1/chat/completions` success response.
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
@@ -306,12 +328,15 @@ impl OpenAiCompatProvider {
         parse_models_response(&body)
     }
 
-    /// POST to `{base}/chat/completions`, set the `Authorization` header only when a key is
+    /// POST `body` to `{base}/chat/completions`, set the `Authorization` header only when a key is
     /// present (R3), and return the raw response body text. Maps non-2xx responses to
-    /// `AppError::Summarize` with the gateway's `error.message` when available.
-    async fn post_chat(&self, system: &str, user: &str) -> Result<String> {
+    /// `AppError::Summarize`/`Unavailable` with the gateway's `error.message` when available.
+    ///
+    /// This is the single HTTP path shared by `post_chat` (free-text) and `post_chat_json`
+    /// (json_schema mode). Do NOT duplicate this code for new request variants — build the body
+    /// with the appropriate `chat_body*` helper and call this.
+    async fn post_chat_raw(&self, body: Value) -> Result<String> {
         let url = self.chat_endpoint()?;
-        let body = chat_body(&self.model, system, user);
 
         let mut req = self
             .client
@@ -340,6 +365,11 @@ impl OpenAiCompatProvider {
         resp.text()
             .await
             .map_err(|e| AppError::Summarize(format!("failed to read gateway response body: {e}")))
+    }
+
+    /// POST to `{base}/chat/completions` with a free-text body (no `response_format`).
+    async fn post_chat(&self, system: &str, user: &str) -> Result<String> {
+        self.post_chat_raw(chat_body(&self.model, system, user)).await
     }
 
     /// Shared call path returning both the text and the `CallMeta`.
@@ -392,6 +422,25 @@ impl SummarizerProvider for OpenAiCompatProvider {
         user: &str,
     ) -> Result<(String, CallMeta)> {
         self.call_with_meta(system, user).await
+    }
+
+    /// Gateway override: use `response_format: json_schema` so the gateway enforces valid JSON
+    /// output natively (constrained decoding). The content field in the response is already a
+    /// JSON string — extract it via `parse_chat_response` then parse it as a `Value`.
+    async fn complete_json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<Value> {
+        let body = chat_body_json(&self.model, system, user, schema);
+        let raw = self.post_chat_raw(body).await?;
+        let (text, _meta) = parse_chat_response(&raw)?;
+        serde_json::from_str::<Value>(&text).map_err(|e| {
+            AppError::Summarize(format!(
+                "complete_json: gateway returned invalid JSON in content field: {e}"
+            ))
+        })
     }
 }
 
@@ -469,6 +518,40 @@ mod tests {
         assert!(validate_gateway_url("http://evil.example.com/v1").is_err()); // remote http rejected
         assert!(validate_gateway_url("file:///etc/passwd").is_err()); // scheme rejected
         assert!(validate_gateway_url("not a url").is_err());
+    }
+
+    // ─── Task 8.2 — chat_body_json builder test (RED → GREEN) ───────────────────────────────────
+
+    /// The JSON-schema body must carry `response_format.type == "json_schema"`, the caller-supplied
+    /// schema embedded under `response_format.json_schema.schema`, and `strict: true`.
+    #[test]
+    fn chat_body_json_carries_response_format_json_schema() {
+        let schema = serde_json::json!({"type":"object","properties":{"people":{"type":"array"}}});
+        let body = chat_body_json("gpt-4o", "SYS", "USER", &schema);
+        assert_eq!(body["model"], "gpt-4o", "model must be forwarded");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["stream"], false, "streaming must be disabled");
+        let rf = &body["response_format"];
+        assert_eq!(rf["type"], "json_schema", "response_format.type must be 'json_schema'");
+        let js = &rf["json_schema"];
+        assert_eq!(js["name"], "result", "json_schema.name must be 'result'");
+        assert_eq!(js["strict"], true, "strict must be true");
+        // The supplied schema appears verbatim under json_schema.schema.
+        assert_eq!(
+            js["schema"],
+            schema,
+            "caller-supplied schema must appear verbatim under json_schema.schema"
+        );
+    }
+
+    /// `chat_body_json` with an empty schema still produces a valid JSON-schema body.
+    #[test]
+    fn chat_body_json_with_empty_schema() {
+        let schema = serde_json::json!({});
+        let body = chat_body_json("llama-3", "S", "U", &schema);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
     }
 
     /// Task 1.2 — the chat body must be OpenAI-shaped with system/user roles and stream:false.

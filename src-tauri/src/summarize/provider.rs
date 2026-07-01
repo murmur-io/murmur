@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::Result;
 use crate::summarize::meta::CallMeta;
@@ -78,6 +79,28 @@ pub trait SummarizerProvider: Send + Sync {
     ) -> Result<(String, CallMeta)> {
         Ok((self.complete(system, user).await?, CallMeta::default()))
     }
+
+    /// Structured-output completion: return a JSON value adhering to `schema`.
+    ///
+    /// The DEFAULT implementation embeds the schema as a prompt instruction and extracts the first
+    /// balanced JSON object from a free-text reply — byte-identical to how the timeline and graph
+    /// side-tasks parse today. A provider that supports native constrained decoding (the
+    /// OpenAI-compatible gateway) OVERRIDES this to send
+    /// `response_format: {"type":"json_schema", …}` and returns the parsed object directly.
+    async fn complete_json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+    ) -> Result<Value> {
+        // Default: instruct via the system prompt, parse the first balanced object out of free text.
+        let sys = format!(
+            "{system}\n\nRespond with ONLY a single JSON object matching this schema (no prose, no code fences):\n{}",
+            serde_json::to_string(schema).unwrap_or_default()
+        );
+        let reply = self.complete(&sys, user).await?;
+        crate::reason::parse_first_json::<Value>(&reply)
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +135,48 @@ mod tests {
         let (text, meta) = p.complete_with_meta("sys", "usr").await.unwrap();
         assert_eq!(text, "hello");
         assert_eq!(meta, CallMeta::default(), "default impl must return empty CallMeta");
+    }
+
+    /// Task 8.1 — `complete_json` default extracts the first JSON object from a prose-wrapped /
+    /// fenced reply (the free-text path). A provider that does NOT override `complete_json` gets
+    /// the schema embedded in the system prompt and the JSON extracted via `parse_first_json`.
+    #[tokio::test]
+    async fn default_complete_json_extracts_first_json_from_free_text() {
+        // FixedProvider returns whatever string was given as its inner &str — simulate a model
+        // that wraps the JSON in prose and a code fence (the worst-case free-text reply).
+        struct JsonFencedProvider;
+        #[async_trait]
+        impl SummarizerProvider for JsonFencedProvider {
+            fn id(&self) -> &str { "json-fenced" }
+            async fn availability(&self) -> Availability { Availability::Available }
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                // Simulate a chatty model that wraps output in prose + a code fence.
+                Ok("Sure! Here is the JSON:\n```json\n{\"people\":[\"Alice\"],\"projects\":[]}\n```\nLet me know if you need changes.".to_string())
+            }
+        }
+        let schema = serde_json::json!({"type":"object","properties":{"people":{"type":"array"},"projects":{"type":"array"}}});
+        let v = JsonFencedProvider.complete_json("SYS", "USER", &schema).await.unwrap();
+        assert_eq!(v["people"][0], "Alice", "default impl must extract JSON from fenced/prose reply");
+        assert!(v["projects"].as_array().unwrap().is_empty());
+    }
+
+    /// Task 8.1 — `complete_json` default returns an error when the reply contains no JSON object.
+    #[tokio::test]
+    async fn default_complete_json_errors_on_no_json() {
+        struct NoJsonProvider;
+        #[async_trait]
+        impl SummarizerProvider for NoJsonProvider {
+            fn id(&self) -> &str { "no-json" }
+            async fn availability(&self) -> Availability { Availability::Available }
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Ok("I'm sorry, I cannot produce JSON right now.".to_string())
+            }
+        }
+        let schema = serde_json::json!({});
+        let err = NoJsonProvider.complete_json("SYS", "USER", &schema).await;
+        assert!(err.is_err(), "no JSON in reply must yield an error from the default impl");
     }
 
     /// `summarize_with_meta` default returns the plain `summarize` output paired with empty `CallMeta`.
