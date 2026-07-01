@@ -688,3 +688,75 @@ export interface GatewayHealth {
   reachable: boolean;
   modelCount: number;
 }
+
+// ── Phase 6 — Egress & Usage ledger ─────────────────────────────────────────
+
+/**
+ * PII redaction counts by kind. Each field is the number of items of that kind
+ * that were scrubbed before the content left the device.
+ */
+export interface RedactionCounts {
+  email: number;
+  card: number;
+  phone: number;
+  name: number;
+}
+
+/**
+ * One egress event row from the local content-free egress ledger
+ * (`get_egress_ledger`). Carries metadata only — NO transcript text.
+ * Mirrors Rust `EgressRow` (camelCase via `serde(rename_all = "camelCase")`).
+ */
+export interface EgressRow {
+  /** Unix timestamp (milliseconds). */
+  ts: number;
+  /** Provider id (e.g. `"anthropic"`, `"gateway"`). */
+  providerId: string;
+  /** Destination host / URL recorded at egress time. */
+  destination: string;
+  /** Model actually served by the remote (may be null when not parsed). */
+  modelServed: string | null;
+  /** Total tokens sent in this call (null when not reported). */
+  totalTokens: number | null;
+  /** PII item counts scrubbed before this call left the device. */
+  redactions: RedactionCounts;
+}
+
+/**
+ * Per-model aggregate (one row per distinct `modelServed` value seen in the
+ * ledger window). Used for the tokens-by-model bar chart.
+ */
+export interface EgressByModel {
+  model: string;
+  calls: number;
+  tokens: number;
+}
+
+/**
+ * Per-day aggregate (one row per calendar day that had ≥1 egress call).
+ * `day` is `"YYYY-MM-DD"`.
+ */
+export interface EgressByDay {
+  day: string;
+  tokens: number;
+}
+
+/**
+ * Egress ledger summary for a given time window (`get_egress_ledger`).
+ * Content-free — only metadata aggregates and row-level metadata.
+ * Mirrors Rust `EgressLedger` (camelCase).
+ */
+export interface EgressLedger {
+  /** Total cloud calls in the window. */
+  totalCalls: number;
+  /** Total tokens sent across all calls in the window. */
+  totalTokens: number;
+  /** Per-model token breakdown (sorted by tokens desc). */
+  byModel: EgressByModel[];
+  /** Per-day token totals (sorted by day asc). */
+  byDay: EgressByDay[];
+  /** Total PII items scrubbed across all calls in the window. */
+  totalRedactions: RedactionCounts;
+  /** Most-recent calls (newest first, capped server-side). */
+  recent: EgressRow[];
+}

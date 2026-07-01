@@ -8,6 +8,7 @@ import type {
   BrainDownloadProgress,
   BrainModelDto,
   EmbedDownloadProgress,
+  EgressLedger,
   GatewayHealth,
   GatewayModel,
   ReindexProgress,
@@ -202,6 +203,17 @@ export class IpcService {
    */
   gatewayHealth(): Promise<GatewayHealth> {
     return invoke<GatewayHealth>("gateway_health");
+  }
+
+  /**
+   * Phase 6 — content-free egress ledger summary for the given rolling window.
+   * Returns aggregate call + token counts, per-model and per-day breakdowns,
+   * total PII redaction counts, and the most-recent call rows — all metadata,
+   * NO transcript text. The command never errors (an empty ledger returns zero
+   * aggregates and empty arrays).
+   */
+  getEgressLedger(days: number): Promise<EgressLedger> {
+    return invoke<EgressLedger>("get_egress_ledger", { days });
   }
 
   /**
