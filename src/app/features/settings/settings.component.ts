@@ -9,6 +9,7 @@ import {
 import { toSignal } from "@angular/core/rxjs-interop";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { startWith } from "rxjs";
+import { NavHistoryService } from "../../core/nav-history.service";
 import { SettingsStore } from "./settings.store";
 import { SettingsAppearanceSectionComponent } from "./sections/settings-appearance-section.component";
 import { SettingsGeneralSectionComponent } from "./sections/settings-general-section.component";
@@ -58,6 +59,10 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   selector: "app-settings",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  // Esc in settings backs out ("← Murmur") — but NOT while you're typing: in the
+  // search box Esc clears/blurs it first, and it never hijacks another form field.
+  // Declarative host listener — Angular owns its lifecycle (no manual DOM listener).
+  host: { "(document:keydown.escape)": "onEscape()" },
   providers: [SettingsStore],
   imports: [
     ReactiveFormsModule,
@@ -74,8 +79,34 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   ],
   template: `
     <section class="settings-shell">
-      <!-- macOS-style left rail: search over sections, then the section list. -->
+      <!-- macOS-style left rail: Back, search over sections, then the section list. -->
       <aside class="settings-sidebar" aria-label="Settings">
+        <!-- Drag strip mirrors the primary rail so the overlay traffic lights
+             stay clear of the Back button when the rail is flush to the edge. -->
+        <div class="rail-drag" data-tauri-drag-region></div>
+
+        <!-- Drill-down "up": returns to the last non-settings route (or /record). -->
+        <button
+          type="button"
+          class="rail-back"
+          (click)="nav.back()"
+          aria-label="Back to Murmur"
+        >
+          <svg
+            class="rail-back-icon"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9.5 3.5 5 8l4.5 4.5" />
+          </svg>
+          <span class="rail-back-label">Murmur</span>
+        </button>
+
         <div class="sidebar-search">
           <svg
             class="sidebar-search-icon"
@@ -218,27 +249,99 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   `,
   styles: [
     `
-      /* ── macOS-style two-pane shell: sidebar + content ── */
-      .settings-shell {
-        display: grid;
-        grid-template-columns: 216px minmax(0, 1fr);
-        gap: var(--space-5);
-        align-items: start;
+      /* Settings is a full drill-down (L2): the primary app rail is hidden
+         (app-shell) and this host fills the whole window as a flush-left
+         [section rail | content] layout. Fixed so it ignores .app-main's
+         centered max-width + padding and hugs the viewport edges; below the
+         toast viewport (z-index 60). */
+      :host {
+        position: fixed;
+        inset: 0;
+        z-index: 5;
+        display: block;
+        background: var(--surface-base);
       }
 
-      /* Left rail — sticky under the app header, its own quiet frosted panel. */
+      /* ── Two-pane shell: full-height section rail + scrolling content ── */
+      .settings-shell {
+        display: grid;
+        grid-template-columns: 232px minmax(0, 1fr);
+        height: 100vh;
+        height: 100dvh;
+      }
+
+      /* Left rail — a first-class full-height column flush to the window edge,
+         same visual weight as the primary rail it replaces (frosted in-flow
+         chrome, right border, NOT a floating card). */
       .settings-sidebar {
-        position: sticky;
-        top: calc(var(--space-8) + var(--space-2));
         display: flex;
         flex-direction: column;
         gap: var(--space-3);
-        padding: var(--space-3);
-        border-radius: var(--radius-lg);
+        height: 100%;
+        padding: 0 var(--space-3) var(--space-4);
         background: var(--surface-raised);
-        border: 1px solid var(--glass-border);
+        -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+        border-right: 1px solid var(--border-subtle);
         box-shadow: var(--glass-highlight);
-        animation: rise 380ms var(--transition) both;
+        overflow: hidden;
+        animation: settings-rail-in 320ms var(--transition) both;
+      }
+
+      /* Slide-in when entering settings; disabled under reduced-motion below. */
+      @keyframes settings-rail-in {
+        from {
+          transform: translateX(-14px);
+          opacity: 0;
+        }
+        to {
+          transform: none;
+          opacity: 1;
+        }
+      }
+
+      /* Top drag strip — mirrors the primary rail so the overlay traffic lights
+         have somewhere to float and the window stays draggable up here. */
+      .rail-drag {
+        flex: none;
+        height: 30px;
+      }
+
+      /* "← Murmur" drill-down up-affordance. */
+      .rail-back {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        width: 100%;
+        height: 34px;
+        padding: 0 var(--space-2);
+        border: 0;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--text-secondary);
+        font: inherit;
+        font-size: 0.9rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          background var(--transition-fast),
+          color var(--transition-fast);
+      }
+      .rail-back:hover {
+        background: var(--surface-hover);
+        color: var(--text-primary);
+      }
+      .rail-back:focus-visible {
+        outline: none;
+        color: var(--text-primary);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .rail-back-icon {
+        flex: none;
+        width: 16px;
+        height: 16px;
       }
 
       .sidebar-search {
@@ -283,6 +386,9 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         display: flex;
         flex-direction: column;
         gap: 2px;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
       }
       .nav-item {
         display: flex;
@@ -340,6 +446,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         display: flex;
         align-items: center;
         gap: var(--space-2);
+        flex: none;
         flex-wrap: wrap;
         margin-top: var(--space-1);
         padding-top: var(--space-3);
@@ -352,12 +459,22 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         flex: none;
       }
 
-      /* Right pane — the section title + its stacked cards. */
+      /* Right pane — scrolls independently of the fixed rail. It provides its own
+         padding (the shell no longer sits inside .app-main's padded column). */
       .settings-content {
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
         min-width: 0;
+        height: 100%;
+        overflow-y: auto;
+        padding: var(--space-7) var(--space-6) var(--space-8);
+      }
+      /* Cap the reading width so cards don't stretch across an ultrawide window. */
+      .content-header,
+      .section-body {
+        width: 100%;
+        max-width: var(--content-max);
       }
       .content-header h2 {
         margin: 0;
@@ -372,20 +489,35 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         animation: rise 320ms var(--transition) both;
       }
 
-      /* Collapse to a single column on narrow widths (sidebar stacks on top). */
+      /* Narrow widths: stack the rail on top of the content (rows), each
+         scrolling within the fixed full-height shell. */
       @media (max-width: 640px) {
         .settings-shell {
           grid-template-columns: 1fr;
+          grid-template-rows: auto minmax(0, 1fr);
         }
         .settings-sidebar {
-          position: static;
+          border-right: 0;
+          border-bottom: 1px solid var(--border-subtle);
         }
         .sidebar-nav {
           flex-direction: row;
           flex-wrap: wrap;
+          overflow-y: visible;
         }
         .nav-item {
           width: auto;
+        }
+        .settings-content {
+          padding: var(--space-5) var(--space-4) var(--space-6);
+        }
+      }
+
+      /* Honor reduced-motion: no rail slide, no section rise. */
+      @media (prefers-reduced-motion: reduce) {
+        .settings-sidebar,
+        .section-body {
+          animation: none;
         }
       }
 
@@ -409,6 +541,31 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
 export class SettingsComponent implements OnInit {
   /** Shared settings state — provided on this component (see class JSDoc). */
   private readonly store = inject(SettingsStore);
+
+  /** Drill-down back navigation ("← Murmur" + Esc) — no settings state coupling. */
+  readonly nav = inject(NavHistoryService);
+
+  /**
+   * Esc while in settings. Backs out to where you came from — EXCEPT while you're
+   * typing: in the search box the first Esc clears it (or blurs when empty), and
+   * Esc is ignored inside any other form field, so it never ejects you mid-edit.
+   */
+  onEscape(): void {
+    const el = document.activeElement as HTMLElement | null;
+    if (el?.classList.contains("sidebar-search-input")) {
+      if (this.searchControl.value) {
+        this.searchControl.setValue("");
+      } else {
+        el.blur();
+      }
+      return;
+    }
+    const tag = el?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+      return;
+    }
+    this.nav.back();
+  }
 
   // ── macOS-style navigation: sidebar sections + search ───────────────────
 
