@@ -17,7 +17,9 @@
         "title": "Murmur",
         "width": 900,
         "height": 680,
-        "visible": false
+        "visible": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

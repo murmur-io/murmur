@@ -560,60 +560,76 @@ body.bar-shell::after { display: none !important; }
 @media print {
   body.murmur-printing::before,
   body.murmur-printing::after { display: none !important; }
-  body.murmur-printing .app-header { display: none !important; }
+  body.murmur-printing .app-sidebar { display: none !important; }
   body.murmur-printing .app-main { max-width: none; margin: 0; padding: 0; }
   body.murmur-printing { background: #fff !important; color: #000 !important; }
 }
 
-/* ── App shell chrome (brand header, nav, page frame, toasts) ───────────────
+/* ── App shell chrome (macOS sidebar, page frame, toasts) ───────────────────
    These live in the GLOBAL stylesheet ON PURPOSE. The shell is rendered by
    AppShellComponent (a lazy layout route). In Tauri's WKWebView, Angular's
    runtime-injected component <style> for the shell was NOT applied on cold
-   launch (header/nav rendered as raw unstyled HTML) — but this build-time
+   launch (chrome rendered as raw unstyled HTML) — but this build-time
    styles.css <link>, an active sheet from page load, reliably matches the
    shell DOM when the router inserts it (the same way .btn/.card global classes
    work everywhere). So the shell's CSS is global here, matched by class.
-   See app-shell.component.ts for the full FOUC rationale. */
+   See app-shell.component.ts for the full FOUC rationale.
+
+   Layout: a flex row — a fixed (collapsible) LEFT SIDEBAR + a centered
+   max-width main column. No top header; the window uses the Overlay title-bar
+   style, so the traffic lights float over `.sidebar-drag`. */
 app-shell {
-  display: block;
+  display: flex;
+  align-items: stretch;
   min-height: 100vh;
 }
-.app-header {
+
+/* --- Sidebar (frosted, in-flow chrome — NOT a floating overlay) ------------ */
+.app-sidebar {
   position: sticky;
   top: 0;
+  align-self: flex-start;
   z-index: 10;
-  background: rgba(7, 7, 11, 0.55);
-  backdrop-filter: saturate(150%) blur(22px);
-  -webkit-backdrop-filter: saturate(150%) blur(22px);
-  border-bottom: 1px solid var(--border-subtle);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  width: 232px;
+  height: 100vh;
+  padding: 0 var(--space-3) var(--space-4);
+  background: var(--surface-raised);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border-right: 1px solid var(--border-subtle);
+  box-shadow: var(--glass-highlight);
+  transition: width var(--transition);
 }
-.app-bar {
+.app-sidebar.collapsed { width: 68px; }
+
+/* Top strip that reserves room for the overlay traffic lights and moves the
+   window (data-tauri-drag-region on the element). */
+.sidebar-drag {
+  flex: none;
+  height: 30px;
+}
+
+.app-sidebar .brand {
   display: flex;
   align-items: center;
-  gap: var(--space-6);
-  max-width: var(--content-max);
-  margin: 0 auto;
-  padding: var(--space-3) var(--space-5);
-}
-.app-bar .brand {
-  display: inline-flex;
-  align-items: center;
   gap: 10px;
+  padding: var(--space-1) var(--space-2) var(--space-3);
   text-decoration: none;
   border-radius: var(--radius-md);
   transition: transform var(--transition-fast);
 }
-.app-bar .brand:hover {
-  transform: translateY(-1px);
-}
-.app-bar .brand:focus-visible {
+.app-sidebar .brand:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
+.app-sidebar.collapsed .brand { justify-content: center; padding-left: 0; padding-right: 0; }
 .brand-mark {
   display: grid;
   place-items: center;
+  flex: none;
   width: 30px;
   height: 30px;
   border-radius: 9px;
@@ -644,66 +660,136 @@ app-shell {
   font-size: 1.06rem;
   font-weight: 700;
   letter-spacing: -0.02em;
-  background: linear-gradient(180deg, #ffffff 0%, #b9bbe6 130%);
+  background: linear-gradient(180deg, var(--text-primary) 0%, var(--accent-hover) 160%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   color: var(--text-primary);
 }
-.app-nav {
+
+/* --- Sidebar nav + footer rows (shared row shape) -------------------------- */
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-top: var(--space-2);
+}
+.sidebar-nav a,
+.sidebar-settings,
+.sidebar-collapse {
   display: flex;
   align-items: center;
-  gap: var(--space-1);
-  margin-left: auto;
-}
-.app-nav a {
-  display: inline-flex;
-  align-items: center;
-  padding: var(--space-2) var(--space-3);
+  gap: var(--space-3);
+  width: 100%;
+  height: 38px;
+  padding: 0 var(--space-3);
+  border: none;
   border-radius: var(--radius-md);
+  background: transparent;
   color: var(--text-secondary);
+  font-family: inherit;
   font-size: 0.9rem;
   font-weight: 550;
   letter-spacing: -0.01em;
+  text-align: left;
   text-decoration: none;
+  cursor: pointer;
   transition: color var(--transition), background var(--transition);
 }
-.app-nav a:hover {
+.sidebar-nav a:hover,
+.sidebar-settings:hover,
+.sidebar-collapse:hover {
   color: var(--text-primary);
   background: var(--surface-hover);
 }
-.app-nav a:focus-visible {
+.sidebar-nav a:focus-visible,
+.sidebar-settings:focus-visible,
+.sidebar-collapse:focus-visible {
   outline: none;
   color: var(--text-primary);
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-.app-nav a.active {
+.sidebar-nav a.active,
+.sidebar-settings.active {
   color: var(--accent-hover);
   background: var(--accent-soft);
 }
+.nav-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+}
+.nav-icon svg { width: 20px; height: 20px; display: block; }
+.nav-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* Collapsed: icons only — hide every text label + centre the glyphs. */
+.app-sidebar.collapsed .nav-label,
+.app-sidebar.collapsed .brand-word { display: none; }
+.app-sidebar.collapsed .sidebar-nav a,
+.app-sidebar.collapsed .sidebar-settings,
+.app-sidebar.collapsed .sidebar-collapse {
+  justify-content: center;
+  gap: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+.collapse-chevron {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform var(--transition);
+}
+.app-sidebar.collapsed .collapse-chevron { transform: rotate(180deg); }
+
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* --- Session-privacy "N unlocked" indicator (footer) ----------------------- */
 .unlocked-pill {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: var(--space-1);
-  height: 26px;
-  padding: 0 var(--space-3) 0 var(--space-2);
+  gap: var(--space-2);
+  height: 32px;
+  margin-bottom: var(--space-1);
+  padding: 0 var(--space-3);
   border: 1px solid transparent;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-md);
   background: var(--accent-soft);
   color: var(--accent-hover);
-  font-size: 0.78rem;
+  font-size: 0.8rem;
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1;
   white-space: nowrap;
 }
+.app-sidebar.collapsed .unlocked-pill { justify-content: center; padding: 0; }
 .unlocked-glyph { display: block; flex: none; }
 .unlocked-count { font-variant-numeric: tabular-nums; }
 .unlocked-label { color: var(--accent-hover); opacity: 0.85; }
+
+/* --- Main content column: centered max-width, beside the sidebar ----------- */
 .app-main {
+  flex: 1 1 auto;
+  min-width: 0;
   max-width: var(--content-max);
   margin: 0 auto;
-  padding: var(--space-6) var(--space-5) var(--space-8);
+  padding: var(--space-7) var(--space-5) var(--space-8);
 }
 .toast-viewport {
   position: fixed;
@@ -761,5 +847,5 @@ app-shell {
 }
 @media (prefers-reduced-motion: reduce) {
   .brand-wave .bar { animation: none; }
-  .app-bar .brand:hover { transform: none; }
+  .app-sidebar { transition: none; }
 }
