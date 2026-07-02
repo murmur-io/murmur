@@ -165,6 +165,17 @@ export class IpcService {
     return invoke<void>("consent_to_cloud_egress");
   }
 
+  /**
+   * Revoke the cloud-egress consent granted via {@link consentToCloudEgress}.
+   * The backend persists `cloudEgressConsented = false` AND updates its
+   * in-memory config cache, so every cloud-classified provider fails closed
+   * again until the user re-allows. Idempotent. Mirrors
+   * {@link consentToCloudEgress} (same unit-return command shape).
+   */
+  revokeCloudEgress(): Promise<void> {
+    return invoke<void>("revoke_cloud_egress");
+  }
+
   setAnthropicKey(key: string): Promise<void> {
     return invoke<void>("set_anthropic_key", { key });
   }

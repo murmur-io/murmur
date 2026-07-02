@@ -17,16 +17,8 @@ import { SettingsStore } from "../settings.store";
               <div class="card">
                 <fieldset>
                   <legend>General</legend>
-
-                  <label class="field">
-                    <span class="field-label">Provider</span>
-                    <select formControlName="providerId">
-                      <option value="claude_code">Claude Code (default)</option>
-                      <option value="anthropic">Anthropic API</option>
-                      <option value="ollama">Ollama</option>
-                      <option value="gateway">AI Gateway (OpenAI-compatible)</option>
-                    </select>
-                  </label>
+                  <!-- The Provider select moved to Settings → AI & Models
+                       ("Default AI" — Stage-2 hub); same formControlName. -->
 
                   <label class="field">
                     <span class="field-label">Vault folder</span>

@@ -97,6 +97,7 @@ pub fn run() {
             commands::get_config,
             commands::save_config,
             commands::consent_to_cloud_egress,
+            commands::revoke_cloud_egress,
             commands::consent_to_web_search,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
