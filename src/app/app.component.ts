@@ -14,6 +14,7 @@ import { IpcService } from "./core/ipc.service";
 import { FoldersService } from "./services/folders.service";
 import { ScreenShareService } from "./services/screen-share.service";
 import { ThemeService } from "./services/theme.service";
+import { UpdateService } from "./services/update.service";
 
 @Component({
   selector: "app-root",
@@ -35,6 +36,7 @@ export class AppComponent implements OnInit {
   // Injected at bootstrap so the theme is applied (in the service constructor)
   // before the main window is revealed — no flash of the wrong theme.
   private readonly theme = inject(ThemeService);
+  private readonly updates = inject(UpdateService);
 
   /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
   readonly isBar = toSignal(
@@ -111,6 +113,10 @@ export class AppComponent implements OnInit {
     // user on a blank app, so each is fire-and-forget with its own catch.
     void this.screenShare.init();
     void this.folders.load();
+    // Best-effort GitHub-release update check — fire-and-forget, non-blocking.
+    // The service swallows any failure (a background check must never nag), so
+    // this never traps the user; a found update surfaces as a sticky toast.
+    void this.updates.checkOnStartup();
 
     try {
       const cfg = await this.ipc.getConfig();
