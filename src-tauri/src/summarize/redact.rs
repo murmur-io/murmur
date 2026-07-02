@@ -406,6 +406,13 @@ impl SummarizerProvider for RedactingProvider {
             .related_context
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
+        // ENHANCE-MY-NOTES: the typed notes ride the prompt in enhance mode — scrub them
+        // through the SAME shared map as the transcript so a value redacted anywhere
+        // restores consistently in the reply.
+        let red_notes = req
+            .user_notes
+            .as_ref()
+            .map(|c| redact_into(c, &mut map, &mut rev));
         // Name layer (default no-op → text unchanged, `name_pairs` empty → byte-identical egress).
         let (red_transcript, mut name_pairs) = self.names.redact_names(&red_transcript);
         let red_related = red_related.map(|c| {
@@ -413,12 +420,19 @@ impl SummarizerProvider for RedactingProvider {
             name_pairs.extend(more);
             c2
         });
+        let red_notes = red_notes.map(|c| {
+            let (c2, more) = self.names.redact_names(&c);
+            name_pairs.extend(more);
+            c2
+        });
         // Byte sizes of the REDACTED content (sizes, never the text itself).
         let user_bytes = red_transcript.len()
-            + red_related.as_ref().map(|c| c.len()).unwrap_or(0);
+            + red_related.as_ref().map(|c| c.len()).unwrap_or(0)
+            + red_notes.as_ref().map(|c| c.len()).unwrap_or(0);
         let mut r = req.clone();
         r.transcript = red_transcript;
         r.related_context = red_related;
+        r.user_notes = red_notes;
         let (out, meta) = self.inner.summarize_with_meta(&r).await?;
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
@@ -1074,6 +1088,53 @@ mod tests {
         assert!(
             !debug.contains("contact"),
             "response content must NOT appear in the egress entry debug output: {debug}"
+        );
+    }
+
+    // ── ENHANCE-MY-NOTES: user_notes redaction firewall ─────────────────────
+
+    /// Captures the exact SummarizeRequest the wrapped (i.e. EGRESSING) provider receives.
+    struct CapturingInner(std::sync::Mutex<Option<SummarizeRequest>>);
+
+    #[async_trait]
+    impl SummarizerProvider for CapturingInner {
+        fn id(&self) -> &str {
+            "capture-full"
+        }
+        async fn availability(&self) -> Availability {
+            Availability::Available
+        }
+        async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+            *self.0.lock().unwrap() = Some(req.clone());
+            Ok("---\ntitle: T\n---\n# T\n".to_string())
+        }
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// ENHANCE-MY-NOTES: user_notes EGRESSES in enhance mode, so it MUST pass the same
+    /// redaction firewall as the transcript — emails/phones never leave un-scrubbed.
+    ///
+    /// RED evidence (before fix): `r.user_notes = red_notes;` was absent; `req.clone()` forwarded
+    /// the raw `user_notes` verbatim to the inner provider → email present in egressed request.
+    /// GREEN after fix: the same shared map + name-layer pass applied, email replaced with token.
+    #[test]
+    fn user_notes_are_redacted_before_egress() {
+        let mut req = sample_req("no PII in transcript");
+        req.user_notes = Some("ping bob@corp.com about the deck".to_string());
+        let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
+        let provider = RedactingProvider::new(inner.clone());
+        block_on(provider.summarize(&req)).unwrap();
+        let egressed = inner.0.lock().unwrap().clone().expect("inner was called");
+        let notes = egressed.user_notes.expect("user_notes forwarded to inner");
+        assert!(
+            !notes.contains("bob@corp.com"),
+            "email must not egress un-redacted: {notes}"
+        );
+        assert!(
+            notes.contains("about the deck"),
+            "non-PII text must pass through: {notes}"
         );
     }
 }
