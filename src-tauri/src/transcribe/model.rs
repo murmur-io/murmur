@@ -120,11 +120,15 @@ pub fn resolve_model_path(
 ///
 /// This is `async` because the download uses `reqwest`; it must be called from within a
 /// Tokio runtime (the pipeline already runs on one).
-pub async fn ensure_model(
+pub async fn ensure_model<F>(
     configured: Option<&Path>,
     size: &str,
     language: &str,
-) -> Result<PathBuf> {
+    on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(u64, Option<u64>),
+{
     if let Some(found) = resolve_model_path(configured, size, language)? {
         return Ok(found);
     }
@@ -132,7 +136,7 @@ pub async fn ensure_model(
     let dir = models_dir()?;
     let file = model_filename(size, language);
     let dest = dir.join(&file);
-    download_model(&model_url(&file), &dest).await?;
+    download_model_streaming(&model_url(&file), &dest, on_progress).await?;
     Ok(dest)
 }
 
@@ -172,12 +176,21 @@ pub async fn ensure_diarization_models() -> Result<(PathBuf, PathBuf)> {
     Ok((seg, emb))
 }
 
-/// Download `url` to `dest` atomically (`dest.part` → rename). Overwrites any stale
-/// partial. Verifies a non-empty body. NO PII is logged (model id / sizes only).
-async fn download_model(url: &str, dest: &Path) -> Result<()> {
+/// Download `url` to `dest` atomically (`dest.part` → rename), invoking `on_progress(downloaded,
+/// total)` as bytes arrive (`total` is `None` when the server omits `Content-Length`). INBOUND
+/// ONLY: fetches a model file and sends NO request body / NO meeting content (no egress). Streams
+/// via `Response::chunk` (no extra stream-combinator dep) so a multi-GB whisper model reports live
+/// progress instead of buffering the whole body in memory. Overwrites any stale partial. Verifies a
+/// non-empty body before the rename. NO PII is logged (model id / byte counts only).
+async fn download_model_streaming<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    use tokio::io::AsyncWriteExt;
+
     tracing::info!(target: "transcribe", file = %dest.display(), "downloading whisper model");
 
-    let resp = reqwest::get(url)
+    let mut resp = reqwest::get(url)
         .await
         .map_err(|e| AppError::Transcribe(format!("model download request failed: {e}")))?;
     if !resp.status().is_success() {
@@ -186,18 +199,33 @@ async fn download_model(url: &str, dest: &Path) -> Result<()> {
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::Transcribe(format!("model download body failed: {e}")))?;
-    if bytes.is_empty() {
-        return Err(AppError::Transcribe("model download returned empty body".into()));
-    }
+    let total = resp.content_length();
 
     let part = dest.with_extension("part");
-    tokio::fs::write(&part, &bytes)
+    let mut file = tokio::fs::File::create(&part)
         .await
-        .map_err(|e| AppError::Transcribe(format!("write model temp file: {e}")))?;
+        .map_err(|e| AppError::Transcribe(format!("create model temp file: {e}")))?;
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AppError::Transcribe(format!("model download body failed: {e}")))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| AppError::Transcribe(format!("write model chunk: {e}")))?;
+        downloaded += chunk.len() as u64;
+        on_progress(downloaded, total);
+    }
+    file.flush()
+        .await
+        .map_err(|e| AppError::Transcribe(format!("flush model file: {e}")))?;
+    drop(file);
+
+    if downloaded == 0 {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(AppError::Transcribe("model download returned empty body".into()));
+    }
     tokio::fs::rename(&part, dest)
         .await
         .map_err(|e| AppError::Transcribe(format!("rename model file: {e}")))?;
@@ -205,10 +233,16 @@ async fn download_model(url: &str, dest: &Path) -> Result<()> {
     tracing::info!(
         target: "transcribe",
         file = %dest.display(),
-        bytes = bytes.len(),
+        bytes = downloaded,
         "whisper model ready"
     );
     Ok(())
+}
+
+/// Non-progress download for the VAD + diarization models (small, no UI progress bar). Delegates to
+/// [`download_model_streaming`] with a no-op callback so all model fetches share one atomic path.
+async fn download_model(url: &str, dest: &Path) -> Result<()> {
+    download_model_streaming(url, dest, |_, _| {}).await
 }
 
 #[cfg(test)]

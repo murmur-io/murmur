@@ -339,26 +339,37 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                       Stored on this Mac — used for every recording.
                     </span>
                   } @else if (modelPresent() === false) {
-                    <button
-                      type="button"
-                      class="btn btn-primary"
-                      (click)="downloadModel()"
-                      [disabled]="downloadingModel()"
-                    >
-                      @if (downloadingModel()) {
-                        <span class="spin-ring" aria-hidden="true"></span>
-                        Downloading…
-                      } @else {
-                        Download ({{ downloadHint() }})
-                      }
-                    </button>
-                    <span class="text-muted model-note">
-                      @if (downloadingModel()) {
+                    @if (downloadingModel()) {
+                      <div class="brain-progress" role="status">
+                        <div class="brain-progress-track" aria-hidden="true">
+                          <div
+                            class="brain-progress-fill"
+                            [style.width.%]="modelDownloadFrac() * 100"
+                          ></div>
+                        </div>
+                        <span class="brain-progress-label text-muted">
+                          @if (modelDownloadFrac() > 0) {
+                            Downloading… {{ modelPct() }}
+                          } @else {
+                            Downloading…
+                          }
+                        </span>
+                      </div>
+                      <span class="text-muted model-note">
                         Fetching the model — large models can take a few minutes.
-                      } @else {
+                      </span>
+                    } @else {
+                      <button
+                        type="button"
+                        class="btn btn-primary"
+                        (click)="downloadModel()"
+                      >
+                        Download ({{ downloadHint() }})
+                      </button>
+                      <span class="text-muted model-note">
                         {{ downloadHint() }}, one time, on-device.
-                      }
-                    </span>
+                      </span>
+                    }
                   } @else {
                     <span class="pill">
                       <span class="pill-dot"></span>
@@ -2811,6 +2822,15 @@ export class SettingsComponent implements OnInit {
   /** Surfaced if ipc.downloadModel() rejects. */
   readonly modelDownloadError = signal<string | null>(null);
 
+  /** 0..1 download progress for the in-flight Whisper model (best-effort from events). */
+  readonly modelDownloadFrac = signal(0);
+  /** Whole-percent label for the in-flight Whisper-model download. */
+  readonly modelPct = computed(
+    () => Math.round(this.modelDownloadFrac() * 100) + "%",
+  );
+  /** Release handle for the EVENT_MODEL_DOWNLOAD subscription. */
+  private unlistenModelDownload: UnlistenFn | null = null;
+
   /** Approx download size for the selected quality (shown on the Download button). */
   readonly downloadHint = signal("~3 GB");
 
@@ -3052,6 +3072,8 @@ export class SettingsComponent implements OnInit {
       this.hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
       this.hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
       this.modelPresent.set(await this.ipc.modelPresent());
+      // Whisper transcribe-model download-progress stream (best-effort).
+      await this.subscribeModelDownload();
       await this.refreshProviders();
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
@@ -3063,6 +3085,28 @@ export class SettingsComponent implements OnInit {
       );
     } catch (e) {
       this.loadError.set(String(e));
+    }
+  }
+
+  /**
+   * Subscribe ONCE to the Whisper model-download progress stream and store the
+   * unlisten so DestroyRef can release it (no leaked listener). Best-effort: a
+   * missing backend stream just leaves the progress bar inert (the download still
+   * resolves via the command promise).
+   */
+  private async subscribeModelDownload(): Promise<void> {
+    try {
+      this.unlistenModelDownload = await this.ipc.onModelDownload((p) => {
+        // Only meaningful while a download this component started is in-flight.
+        if (!this.downloadingModel()) return;
+        if (p.total && p.total > 0) {
+          this.modelDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+        }
+        if (p.done) this.modelDownloadFrac.set(1);
+      });
+      this.destroyRef.onDestroy(() => this.unlistenModelDownload?.());
+    } catch {
+      // No model-download stream available — progress stays inert.
     }
   }
 
@@ -3489,6 +3533,7 @@ export class SettingsComponent implements OnInit {
   /** Download the model for the chosen language + quality, then re-check presence. */
   async downloadModel(): Promise<void> {
     this.modelDownloadError.set(null);
+    this.modelDownloadFrac.set(0);
     this.downloadingModel.set(true);
     try {
       await this.save(); // ensure the chosen language + size are persisted first

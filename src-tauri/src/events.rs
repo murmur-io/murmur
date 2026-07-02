@@ -111,6 +111,21 @@ pub struct BrainDownloadPayload {
     pub done: bool,
 }
 
+/// Progress for the Whisper transcribe model (GGML) download. Carries byte counts only — NO PII.
+pub const EVENT_MODEL_DOWNLOAD: &str = "murmur://model-download";
+
+/// Payload for [`EVENT_MODEL_DOWNLOAD`]. `total` is `None` when the server omits `Content-Length`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadPayload {
+    /// Bytes written so far.
+    pub downloaded: u64,
+    /// Total bytes expected, when known.
+    pub total: Option<u64>,
+    /// True on the final event once the file is fully written + renamed into place.
+    pub done: bool,
+}
+
 /// Progress for the on-device EMBED model (multilingual-e5-small) download. Carries byte/file counts
 /// only — NO PII. The e5 model is three small files, so progress is reported per-file.
 pub const EVENT_EMBED_DOWNLOAD: &str = "murmur://embed-download";
