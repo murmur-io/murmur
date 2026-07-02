@@ -26,6 +26,9 @@ tauri-plugin-global-shortcut = "2"
 cpal = "0.16"
 hound = "3.5"
 rubato = "0.16"
+# Pure-Rust WebRTC audio processing (AEC3) — offline echo cancellation of the recorded mic
+# using the captured system-audio track as the far-end reference. No C++ toolchain.
+sonora = "0.1"
 
 # ── Transcription ──
 whisper-rs = { version = "0.16", features = ["metal"] }
