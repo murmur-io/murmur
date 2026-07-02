@@ -12,6 +12,7 @@ import {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import type { NoteDto, Stage, StatusPayload } from "./models";
+import { ToastService } from "../services/toast.service";
 
 /**
  * Signal-based recorder state: status stage, last note, and last error.
@@ -20,6 +21,7 @@ import type { NoteDto, Stage, StatusPayload } from "./models";
 @Injectable({ providedIn: "root" })
 export class RecorderStore {
   private readonly ipc = inject(IpcService);
+  private readonly toast = inject(ToastService);
 
   private readonly _stage = signal<Stage>("idle");
   private readonly _message = signal<string>("");
@@ -92,6 +94,7 @@ export class RecorderStore {
   private unlistenVoice: UnlistenFn | null = null;
   private unlistenToggle: UnlistenFn | null = null;
   private unlistenLive: UnlistenFn | null = null;
+  private unlistenEcho: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -108,6 +111,13 @@ export class RecorderStore {
     this.unlistenLive = await this.ipc.onLiveCaption((t) =>
       this._liveCaption.set(t),
     );
+    // Echo cleanup notice: recording was made on speakers; echoed lines were removed.
+    this.unlistenEcho = await this.ipc.onEchoSuppressed((p) => {
+      const s = p.suppressed;
+      this.toast.info(
+        `Removed ${s} echoed line${s === 1 ? "" : "s"} from the transcript — wear headphones for best results 🎧`,
+      );
+    });
     await this.refreshLastNote();
   }
 

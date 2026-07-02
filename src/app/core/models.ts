@@ -15,6 +15,12 @@ export interface StatusPayload {
   meetingId: string | null;
 }
 
+/** Payload of murmur://echo-suppressed — counts only, no content. */
+export interface EchoSuppressedPayload {
+  suppressed: number;
+  meetingId: string;
+}
+
 /**
  * GitHub-release update check (`check_for_update`). Mirrors the Rust `UpdateInfo`
  * (serde camelCase). `updateAvailable` is the sole "should we nudge" flag;
