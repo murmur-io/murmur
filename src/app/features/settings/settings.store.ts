@@ -20,6 +20,27 @@ import type {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 /**
+ * The four provider-backed connection ids — the ones `list_models` serves a
+ * catalog for and a per-role model select makes sense on. `local`/`off` are
+ * reasoner-only targets (no SummarizerProvider, no per-role model select — the
+ * local model is the global GGUF registry selection).
+ */
+const PROVIDER_CONNECTION_IDS: readonly string[] = [
+  "claude_code",
+  "anthropic",
+  "ollama",
+  "gateway",
+];
+
+/** Display names for the connection ids (matches the connection cards). */
+const CONNECTION_LABELS: Readonly<Record<string, string>> = {
+  claude_code: "Claude Code",
+  anthropic: "Anthropic API",
+  ollama: "Ollama",
+  gateway: "AI Gateway",
+};
+
+/**
  * Shared state + IPC orchestration for the Settings page (Stage-1 split of the
  * former settings.component.ts monolith — moved here VERBATIM, no behavior
  * change).
@@ -104,6 +125,21 @@ export class SettingsStore {
     // AI Gateway (Phase 1) — base URL and model, round-tripped on save.
     gatewayBaseUrl: "",
     gatewayModel: "",
+    // Stage 4 — per-feature model-role overrides ("" = inherit the legacy
+    // mapping). The connection key is the override switch: the backend ignores
+    // a lone model/effort when the connection is empty. Always in the group so
+    // every save() includes all 9 — the role keys are settable by design, and
+    // with the FE always sending them the stage-3 review's "an older FE could
+    // clear them" concern is moot going forward.
+    roleNotesConnection: "",
+    roleNotesModel: "",
+    roleNotesEffort: "",
+    roleAskConnection: "",
+    roleAskModel: "",
+    roleAskEffort: "",
+    roleLiveConnection: "",
+    roleLiveModel: "",
+    roleLiveEffort: "",
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
   /** BYO Brave Search API key input (web-search connector). Cleared after save. */
@@ -414,6 +450,239 @@ export class SettingsStore {
     },
   );
 
+  // ── Stage 4 — per-feature model roles (Notes / Ask / Live) ─────────────
+
+  /**
+   * Live signals of the role-connection controls + the model/effort context the
+   * role rows and the consent banner derive from — the same `valueChanges`
+   * bridge as `_gatewayBaseUrlValue` above, seeded with the form defaults.
+   */
+  readonly roleNotesConnValue = toSignal(
+    this.form.controls.roleNotesConnection.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  readonly roleAskConnValue = toSignal(
+    this.form.controls.roleAskConnection.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  readonly roleLiveConnValue = toSignal(
+    this.form.controls.roleLiveConnection.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  readonly roleNotesModelValue = toSignal(
+    this.form.controls.roleNotesModel.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  readonly roleAskModelValue = toSignal(
+    this.form.controls.roleAskModel.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  readonly roleLiveModelValue = toSignal(
+    this.form.controls.roleLiveModel.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  private readonly _providerModelValue = toSignal(
+    this.form.controls.providerModel.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  private readonly _ollamaModelValue = toSignal(
+    this.form.controls.ollamaModel.valueChanges.pipe(startWith("llama3.1")),
+    { initialValue: "llama3.1" },
+  );
+  private readonly _brainBackendValue = toSignal(
+    this.form.controls.brainBackend.valueChanges.pipe(
+      startWith("cloud" as BrainBackend),
+    ),
+    { initialValue: "cloud" as BrainBackend },
+  );
+  /**
+   * Public mirror of the legacy fallback value — the role rows need it to keep
+   * the shared GGUF registry reachable for a legacy `brainBackend=local`
+   * install that has no explicit role keys (its Notes pre-analysis + Ask/Live
+   * fallback still run on the local model).
+   */
+  readonly brainBackendValue = this._brainBackendValue;
+
+  /**
+   * `brainBackend` as last LOADED — restored when the Ask row returns to
+   * "Inherit" so Ask → anthropic → Inherit round-trips a legacy local/off
+   * fallback instead of ratcheting it to "cloud" (lock-security stage-4 nit).
+   */
+  private _loadedBrainBackend: BrainBackend = "cloud";
+
+  /**
+   * Per-connection model catalogs from `list_models` (backend constant for
+   * claude_code/anthropic, live endpoints for ollama/gateway). A key that is
+   * PRESENT with an empty array = "fetch tried, no catalog" → the pickers fall
+   * back to a free-text input (the gateway keep-manually-typed pattern).
+   */
+  private readonly _modelCatalogs = signal<
+    Readonly<Record<string, readonly string[]>>
+  >({});
+  readonly modelCatalogs = this._modelCatalogs.asReadonly();
+  /** Connections with a `list_models` fetch currently in flight. */
+  private readonly _modelsLoading = signal<ReadonlySet<string>>(new Set());
+  readonly modelsLoading = this._modelsLoading.asReadonly();
+
+  /** Fetch a connection's catalog once; later calls are no-ops (Refresh re-fetches). */
+  async ensureModels(connection: string): Promise<void> {
+    if (this._modelCatalogs()[connection] !== undefined) return;
+    await this.refreshModels(connection);
+  }
+
+  /**
+   * (Re-)fetch one connection's model catalog. A rejection (endpoint down, or
+   * a backend without `list_models` yet) records an EMPTY catalog so the UI
+   * shows the free-text fallback instead of a dead select — same contract as
+   * `refreshGatewayModels`. Button-driven or load-driven, never an effect.
+   */
+  async refreshModels(connection: string): Promise<void> {
+    if (!PROVIDER_CONNECTION_IDS.includes(connection)) return;
+    if (this._modelsLoading().has(connection)) return;
+    this._modelsLoading.set(new Set(this._modelsLoading()).add(connection));
+    let models: string[] = [];
+    try {
+      models = await this.ipc.listModels(connection);
+    } catch {
+      // Fall through with [] — free-text fallback.
+    }
+    this._modelCatalogs.set({ ...this._modelCatalogs(), [connection]: models });
+    const next = new Set(this._modelsLoading());
+    next.delete(connection);
+    this._modelsLoading.set(next);
+  }
+
+  /** The Default-model picker's catalog (claude_code/anthropic Default AI only). */
+  readonly defaultModelCatalog = computed(
+    () => this.modelCatalogs()[this._providerIdValue()] ?? [],
+  );
+  /** True while the Default-model picker's catalog fetch is in flight. */
+  readonly defaultModelsLoading = computed(() =>
+    this.modelsLoading().has(this._providerIdValue()),
+  );
+  /** Keep a manually-typed default model selectable when absent from the catalog. */
+  readonly defaultModelIsCustom = computed(() => {
+    const current = this._providerModelValue();
+    if (!current) return false;
+    return !this.defaultModelCatalog().includes(current);
+  });
+
+  /** "Claude Code · claude-opus-4-8"-style summary of the Default AI row. */
+  readonly defaultAiSummary = computed(() => {
+    const id = this._providerIdValue();
+    const label = CONNECTION_LABELS[id] ?? id;
+    let model: string;
+    switch (id) {
+      case "ollama":
+        model = this._ollamaModelValue() || "default model";
+        break;
+      case "gateway":
+        model = this._gatewayModelValue() || "gateway default";
+        break;
+      default:
+        model = this._providerModelValue() || "default model";
+    }
+    return `${label} · ${model}`;
+  });
+
+  /** Notes-row Inherit summary — Notes always falls back to the Default AI triple. */
+  readonly notesInheritSummary = computed(
+    () => `Follows Default AI: ${this.defaultAiSummary()}`,
+  );
+
+  /**
+   * Ask/Live-row Inherit summary — an honest mirror of the backend resolver:
+   * with the role key empty, Ask/Live fall back to the legacy `brainBackend`
+   * mapping, NOT unconditionally to the Default AI. Showing "Follows Default
+   * AI" to a legacy `brain_backend=local` install would be a lie.
+   */
+  readonly assistantInheritSummary = computed(() => {
+    switch (this._brainBackendValue()) {
+      case "local":
+        return "Follows the assistant fallback: Local model — on-device";
+      case "off":
+        return "Follows the assistant fallback: Off — retrieval only";
+      default:
+        return `Follows Default AI: ${this.defaultAiSummary()}`;
+    }
+  });
+
+  /**
+   * Whether the LIVE role's resolved connection is cloud-classified — the
+   * in-meeting-assistant consent banner keys on this (it egresses live meeting
+   * context to the LIVE target, which since Stage 4 need not be `brainBackend`).
+   * Mirrors the backend resolver: explicit role key wins; "" falls back to the
+   * `brainBackend` mapping (cloud → the default provider, local/off → no cloud).
+   */
+  readonly liveTargetIsCloud = computed(() => {
+    let conn = this.roleLiveConnValue();
+    if (!conn) {
+      const bb = this._brainBackendValue();
+      if (bb === "local" || bb === "off") return false;
+      conn = ""; // cloud → inherit the default provider
+    }
+    if (conn === "local" || conn === "off") return false;
+    if (conn === "") return this.providerIsCloud();
+    if (conn === "ollama") return this.ollamaIsRemote();
+    return true; // claude_code | anthropic | gateway | unknown → fail safe
+  });
+
+  /**
+   * Change one role's connection from the UI. Resets that role's model/effort
+   * ("" = connection default — a model id is meaningless across connections)
+   * and prefetches the new connection's catalog.
+   *
+   * COMPAT WRITE (Ask row only, REQUIRED): the Ask row is the successor of the
+   * old "Assistant backend" select, so it also writes the legacy `brainBackend`
+   * field — local→"local", off→"off", anything else (incl. Inherit)→"cloud".
+   * Rationale: note pre-analysis + fact extraction ride `reasoner_target(Notes)`,
+   * whose ONLY steering is the `brain_backend` fallback — without the compat
+   * write those paths would stay permanently stuck on the user's pre-stage-4
+   * value. Role keys win for Ask/Live; `brain_backend` remains the reasoner
+   * fallback for Notes. Deliberately a user-driven method, NOT a valueChanges
+   * subscription: load() must be able to patch role keys without clobbering a
+   * legacy `brainBackend`.
+   */
+  setRoleConnection(role: "notes" | "ask" | "live", connection: string): void {
+    switch (role) {
+      case "notes":
+        this.form.patchValue({
+          roleNotesConnection: connection,
+          roleNotesModel: "",
+          roleNotesEffort: "",
+        });
+        break;
+      case "ask":
+        this.form.patchValue({
+          roleAskConnection: connection,
+          roleAskModel: "",
+          roleAskEffort: "",
+          // "" (Inherit) restores the LOADED fallback rather than forcing
+          // "cloud" — a legacy local/off user who wanders to a cloud pick and
+          // back must round-trip, not ratchet (lock-security stage-4 nit).
+          brainBackend:
+            connection === "local"
+              ? "local"
+              : connection === "off"
+                ? "off"
+                : connection === ""
+                  ? this._loadedBrainBackend
+                  : "cloud",
+        });
+        break;
+      case "live":
+        this.form.patchValue({
+          roleLiveConnection: connection,
+          roleLiveModel: "",
+          roleLiveEffort: "",
+        });
+        break;
+    }
+    if (PROVIDER_CONNECTION_IDS.includes(connection)) {
+      void this.ensureModels(connection);
+    }
+  }
+
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
 
   /** The selectable local brain models (from list_brain_models). */
@@ -528,7 +797,42 @@ export class SettingsStore {
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
         gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
         gatewayModel: cfg.gatewayModel ?? "",
+        // Stage 4 — role overrides load verbatim ("" = inherit). Deliberately NOT
+        // seeded from a legacy brainBackend=local/off: materializing role keys on
+        // the next save would flip Ask from the legacy "provider floor ignores
+        // brain_backend" semantics to an explicit reasoner-only target (a real
+        // behavior change). Inherit rows instead show an honest resolver-mirror
+        // summary (assistantInheritSummary).
+        roleNotesConnection: cfg.roleNotesConnection ?? "",
+        roleNotesModel: cfg.roleNotesModel ?? "",
+        roleNotesEffort: cfg.roleNotesEffort ?? "",
+        roleAskConnection: cfg.roleAskConnection ?? "",
+        roleAskModel: cfg.roleAskModel ?? "",
+        roleAskEffort: cfg.roleAskEffort ?? "",
+        roleLiveConnection: cfg.roleLiveConnection ?? "",
+        roleLiveModel: cfg.roleLiveModel ?? "",
+        roleLiveEffort: cfg.roleLiveEffort ?? "",
       });
+      this._loadedBrainBackend = (cfg.brainBackend ?? "cloud") as BrainBackend;
+      // Prefetch the model catalogs the loaded config already renders selects
+      // for: the Default-model picker (claude_code/anthropic only — ollama/
+      // gateway keep their model on the connection card, so prefetching their
+      // REMOTE catalogs here would be network egress with zero UI payoff;
+      // lock-security stage-4 boundary condition) and any concrete per-role
+      // connection (those DO render a select). Best-effort: a failed fetch
+      // leaves an empty catalog and the pickers fall back to free-text inputs.
+      for (const conn of new Set(
+        [
+          cfg.providerId === "claude_code" || cfg.providerId === "anthropic"
+            ? cfg.providerId
+            : "",
+          cfg.roleNotesConnection ?? "",
+          cfg.roleAskConnection ?? "",
+          cfg.roleLiveConnection ?? "",
+        ].filter((c) => PROVIDER_CONNECTION_IDS.includes(c)),
+      )) {
+        void this.ensureModels(conn);
+      }
       this.updateDownloadHint();
       this._inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       this._hasKey.set(await this.ipc.hasAnthropicKey());
@@ -778,6 +1082,19 @@ export class SettingsStore {
       // AI Gateway (Phase 1) — base URL + model, round-tripped so a settings save preserves them.
       gatewayBaseUrl: v.gatewayBaseUrl,
       gatewayModel: v.gatewayModel,
+      // Stage 4 — ALL NINE role keys ride every save. They are settable by
+      // design ("" = inherit), and always including them makes the stage-3
+      // review's "an FE payload without the keys clears an override" concern
+      // moot going forward.
+      roleNotesConnection: v.roleNotesConnection,
+      roleNotesModel: v.roleNotesModel,
+      roleNotesEffort: v.roleNotesEffort,
+      roleAskConnection: v.roleAskConnection,
+      roleAskModel: v.roleAskModel,
+      roleAskEffort: v.roleAskEffort,
+      roleLiveConnection: v.roleLiveConnection,
+      roleLiveModel: v.roleLiveModel,
+      roleLiveEffort: v.roleLiveEffort,
     };
     try {
       await this.ipc.saveConfig(cfg);
