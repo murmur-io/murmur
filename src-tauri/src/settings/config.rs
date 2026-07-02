@@ -672,9 +672,15 @@ impl AppConfig {
     /// Tauri command before the first claude_code/anthropic run. Until the user confirms, the egress
     /// path returns `AppError::Unavailable("cloud egress not consented …")`, which the FE detects to
     /// surface the consent dialog.
+    ///
+    /// FAIL-CLOSED ORDERING — persist FIRST, flip the in-memory flag ONLY on a durable success. If
+    /// the write fails we return the error with the session still UNCONSENTED, so we never egress on
+    /// a consent that isn't durably recorded. (The inverse — `revoke_cloud_egress` — deliberately
+    /// flips first; see its doc.)
     pub fn grant_cloud_egress_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_CLOUD_EGRESS_CONSENTED, "true")?;
         self.cloud_egress_consented = true;
-        db.set_setting(K_CLOUD_EGRESS_CONSENTED, "true")
+        Ok(())
     }
 
     /// E10 — REVOKE the cloud-egress consent. Mirror of [`grant_cloud_egress_consent`]: flips the
@@ -683,6 +689,11 @@ impl AppConfig {
     /// revoke). After revoke, every cloud-classified provider build is refused fail-closed
     /// (`AppError::Unavailable`) again — the gate reads the live config per call, so the very next
     /// summarize/ask/reasoner call refuses without a restart.
+    ///
+    /// FAIL-CLOSED ORDERING (opposite of the grants) — flip the in-memory flag FIRST, THEN persist.
+    /// Revoke's safe-failure direction is "stop egressing immediately", so the session must go
+    /// unconsented even if the durable write then fails; persist-first would keep the session
+    /// egressing on a write error. Both grant and revoke thus fail toward NOT egressing.
     pub fn revoke_cloud_egress(&mut self, db: &Db) -> Result<()> {
         self.cloud_egress_consented = false;
         db.set_setting(K_CLOUD_EGRESS_CONSENTED, "false")
@@ -693,9 +704,13 @@ impl AppConfig {
     /// in-memory flag AND persists it. This is the ONLY supported mutator (deliberately separate from
     /// `save_config`), so web-search egress consent can never be granted as an incidental side effect
     /// of a settings write. Until granted, the web connector is absent from the brain's tool registry.
+    ///
+    /// FAIL-CLOSED ORDERING — persist FIRST, flip the in-memory flag ONLY on a durable success, so a
+    /// failed write leaves the session unconsented (no web egress on a consent that wasn't recorded).
     pub fn grant_web_search_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_WEB_SEARCH_CONSENTED, "true")?;
         self.web_search_consented = true;
-        db.set_setting(K_WEB_SEARCH_CONSENTED, "true")
+        Ok(())
     }
 }
 
@@ -710,15 +725,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_db() -> Db {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "meetnotes-config-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path("meetnotes-config-test", "sqlite");
         // Tests use an explicit key (NOT the Keychain) — Db::open would hit macOS Keychain and
         // prompt/block depending on the test-binary signature.
         Db::open_with_key(
@@ -917,6 +924,44 @@ mod tests {
         assert!(!cfg.cloud_egress_consented, "in-memory flag must flip immediately");
         // Survives a reload from the settings table.
         assert!(!AppConfig::load(&db).unwrap().cloud_egress_consented);
+    }
+
+    /// FAIL-CLOSED ORDERING (grants persist-then-flip). On the normal path the durable record and
+    /// the in-memory flag must AGREE after a grant — the durable write landed and only then did the
+    /// session flip. (The failure branch — a `set_setting` error leaving the flag false — is a
+    /// STRUCTURAL guarantee: the grant returns `?` before touching `self`, so a write error can never
+    /// flip the flag. We can't force a `set_setting` error without a Db mock the crate doesn't have,
+    /// so we pin the observable agreement of the two sides here.)
+    #[test]
+    fn cloud_egress_grant_durable_record_and_flag_agree() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        // Pre-grant: neither side consents.
+        assert!(!cfg.cloud_egress_consented);
+        assert_ne!(db.get_setting(K_CLOUD_EGRESS_CONSENTED).unwrap().as_deref(), Some("true"));
+        // Grant: the durable record is written FIRST, then the flag flips — both true afterwards.
+        cfg.grant_cloud_egress_consent(&db).unwrap();
+        assert!(cfg.cloud_egress_consented, "session flag flipped");
+        assert_eq!(
+            db.get_setting(K_CLOUD_EGRESS_CONSENTED).unwrap().as_deref(),
+            Some("true"),
+            "durable consent record persisted (persist-first)"
+        );
+    }
+
+    /// Same fail-closed agreement for the web-search grant.
+    #[test]
+    fn web_search_grant_durable_record_and_flag_agree() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.web_search_consented);
+        cfg.grant_web_search_consent(&db).unwrap();
+        assert!(cfg.web_search_consented);
+        assert_eq!(
+            db.get_setting(K_WEB_SEARCH_CONSENTED).unwrap().as_deref(),
+            Some("true"),
+            "durable web-search consent record persisted (persist-first)"
+        );
     }
 
     #[test]

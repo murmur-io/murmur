@@ -1145,15 +1145,7 @@ mod tests {
     /// rejecting the bogus id — i.e. a real provider would have egressed).
     #[test]
     fn summarize_egress_resolution_honors_revoke_landed_after_stop_snapshot() {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-pipeline-revoke-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path("murmur-pipeline-revoke", "sqlite");
         let state = AppState::init_at(
             &p,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -1300,17 +1292,7 @@ mod tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-pipeline-test-{}-{}-{}.sqlite",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        crate::storage::db::unique_temp_path(&format!("murmur-pipeline-test-{label}"), "sqlite")
     }
 
     /// REGRESSION (adversarial find, seal content-leak class): `summarize_and_export` upserts the

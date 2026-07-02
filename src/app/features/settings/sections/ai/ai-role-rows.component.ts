@@ -309,15 +309,24 @@ interface RoleRowVm {
                 }
               }
 
+              <!--
+                One shared input driving TWO mutually-exclusive controls
+                (brainModelPath for a file path, brainModelId for a registry id),
+                so it can't be a formControlName — it's a store-backed
+                [value]/(input) pair. A registry pick above clears the path.
+              -->
               <label class="field brain-custom">
                 <span class="field-label">Custom GGUF model</span>
                 <input
-                  formControlName="brainModelId"
+                  [value]="customGgufValue()"
+                  (input)="setCustomGguf($any($event.target).value)"
                   placeholder="/path/to/model.gguf or a registry id"
+                  autocomplete="off"
+                  spellcheck="false"
                 />
                 <span class="field-help text-muted">
-                  Advanced: point at your own GGUF file (or a registry id).
-                  Saved with your settings.
+                  Point at your own .gguf file, or type a registry id. Saved with
+                  your settings.
                 </span>
               </label>
 
@@ -553,6 +562,8 @@ export class AiRoleRowsComponent {
   private readonly store = inject(SettingsStore);
 
   readonly form = this.store.form;
+  /** The shared custom-GGUF input's value (path-or-id) — drives two controls. */
+  readonly customGgufValue = this.store.customGgufValue;
   readonly brainModels = this.store.brainModels;
   readonly brainModelsLoading = this.store.brainModelsLoading;
   readonly brainError = this.store.brainError;
@@ -686,6 +697,10 @@ export class AiRoleRowsComponent {
 
   useBrainModel(id: string): void {
     void this.store.useBrainModel(id);
+  }
+
+  setCustomGguf(v: string): void {
+    this.store.setCustomGguf(v);
   }
 
   downloadBrainModel(id: string): void {
