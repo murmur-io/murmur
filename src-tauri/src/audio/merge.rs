@@ -271,8 +271,7 @@ pub fn suppress_cross_stream_echo(
             let strict_hit = delta.abs() <= ECHO_STRICT_WINDOW_S
                 && jaccard(&me_tokens, &cand.tokens) >= ECHO_STRICT_JACCARD;
             let relaxed_hit = relaxed_armed
-                && delta >= -ECHO_RELAXED_BEFORE_S
-                && delta <= ECHO_RELAXED_AFTER_S
+                && (-ECHO_RELAXED_BEFORE_S..=ECHO_RELAXED_AFTER_S).contains(&delta)
                 && (me_norm == cand.text_norm
                     || cand.text_norm.contains(&me_norm)
                     || me_norm.contains(&cand.text_norm)

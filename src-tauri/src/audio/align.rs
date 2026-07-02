@@ -2,10 +2,12 @@
 //!
 //! When the user records a call on SPEAKERS, the remote voice bleeds acoustically into the
 //! mic. Cross-correlating the two tracks' 100 Hz RMS envelopes over a few windows yields:
-//!   - `offset_s`  — how much later system content appears in the mic (echo lag + capture-
-//!     start delta): the pad the archive mix needs, and the dedup window's center;
-//!   - `correlation` — the leak strength: the "speakers, not headphones" evidence that arms
-//!     the relaxed transcript-dedup tier. Headphones ⇒ no peak ⇒ `None` ⇒ dedup stays strict.
+//!
+//! - `offset_s` — how much later system content appears in the mic (echo lag + capture-start
+//!   delta): the pad the archive mix needs, and the dedup window's center;
+//! - `correlation` — the leak strength: the "speakers, not headphones" evidence that arms the
+//!   relaxed transcript-dedup tier. Headphones ⇒ no peak ⇒ `None` ⇒ dedup stays strict.
+//!
 //! Pure, deterministic, no deps — fully unit-testable headless. Cost: <100 ms per meeting.
 
 /// 16 kHz / 160 = 100 Hz envelope rate.
@@ -57,10 +59,10 @@ fn ncc_peak(mic_env: &[f32], sys_env: &[f32]) -> Option<(i64, f32)> {
     let mut best: Option<(i64, f32)> = None;
     for lag in -MAX_LAG_ENV..=MAX_LAG_ENV {
         let mut acc = 0.0f32;
-        for i in 0..n {
+        for (i, &sv) in sys_env[..n].iter().enumerate() {
             let j = i as i64 + lag;
             if j >= 0 && (j as usize) < n {
-                acc += (mic_env[j as usize] - mm) * (sys_env[i] - sm);
+                acc += (mic_env[j as usize] - mm) * (sv - sm);
             }
         }
         let ncc = acc / (md * sd);
