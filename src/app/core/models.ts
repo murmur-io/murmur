@@ -353,7 +353,9 @@ export interface VoiceCommandProcessingPayload {
  * Fired once per TOOL CALL the in-meeting brain makes during an agentic turn
  * (`EVENT_ASSISTANT_TOOL`), so the assistant card can render the live tool-trace
  * chips ("Searching notes… ✓", "Checking the web…"). NO PII — the tool NAME +
- * a coarse result-size count only (never args, results, or content).
+ * a coarse result-size count only (never args, results, or content). The same
+ * shape rides the chat panel's `EVENT_CHAT_TOOL` and the Ask page's
+ * `EVENT_ASK_TOOL` streams (each surface subscribes to its OWN stream).
  */
 export interface AssistantToolPayload {
   /** The tool name (search_meetings / search_semantic / web_search / calendar_lookup / …). */
@@ -764,6 +766,12 @@ export interface EntityDetail {
 export interface AskVaultResult {
   answer: string;
   sources: VaultSource[];
+  /**
+   * Agentic-loop grounding citations, verbatim ("[[Title]]" wikilinks from
+   * GATED tool output). Empty/absent on the deterministic floor path — the
+   * backend serializes it with a serde default, so older payloads parse fine.
+   */
+  citations?: string[];
 }
 
 export interface DigestResult {

@@ -954,6 +954,7 @@ mod tests {
             meeting_id: "",
             app: None,
             allow_writes: false,
+            note_drafts: true,
             proposed_note: std::sync::Mutex::new(None),
         };
 

@@ -420,6 +420,11 @@ pub struct VaultSource {
 pub struct AskVaultResult {
     pub answer: String,
     pub sources: Vec<VaultSource>,
+    /// ADDITIVE (PR G, ask-unify): the agentic loop's gated citation strings verbatim —
+    /// `[[Title]]` vault wikilinks plus loud `(web)` / `(calendar)` attributions the structured
+    /// `sources` chips can't carry. Empty on the corpus-floor path; FE may ignore it.
+    #[serde(default)]
+    pub citations: Vec<String>,
 }
 
 /// Result of generating a vault digest: the markdown + the path written into the vault.
