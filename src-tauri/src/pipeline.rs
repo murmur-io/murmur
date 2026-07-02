@@ -8,7 +8,8 @@ use crate::settings::AppConfig;
 use crate::state::AppState;
 use crate::storage::models::{MeetingStatus, NoteRecord};
 use crate::summarize::provider::{MeetingMeta, SummarizeRequest};
-use crate::summarize::{make_provider, template};
+use crate::summarize::roles::Role;
+use crate::summarize::{provider_for, template};
 use crate::transcribe::{self, Transcriber};
 use crate::{audio, export};
 
@@ -506,10 +507,15 @@ async fn summarize_and_export(
     date_iso: &str,
     when_iso: &str,
 ) -> Result<PipelineResult> {
+    // The NOTES-role provider target — with role keys absent this is EXACTLY the legacy
+    // (provider_id, provider_model, provider_effort) triple, so every use below is byte-identical
+    // to the pre-role code. Resolved ONCE so the status line, the corpus budget, and the
+    // provenance row all name the SAME connection the summarize call actually uses.
+    let notes_target = crate::summarize::roles::provider_target(Role::Notes, config);
     emit_status(
         app,
         "summarizing",
-        &format!("Summarizing with provider '{}'…", config.provider_id),
+        &format!("Summarizing with provider '{}'…", notes_target.connection),
         meeting_id,
     );
 
@@ -547,7 +553,7 @@ async fn summarize_and_export(
     // salient-query path stays the FALLBACK FLOOR. The reasoner call is synchronous, so this keeps
     // the existing inline shape (no extra await). Best-effort + GATED: same egress/consent envelope.
     let related_context = crate::orchestrate::orchestrate_context(
-        &*state.reasoner.current(),
+        &*state.reasoner.current_for(Role::Notes),
         &state.db,
         meeting_id,
         related_title.as_deref(),
@@ -569,7 +575,7 @@ async fn summarize_and_export(
         related_context,
     };
 
-    let provider = make_provider(&config.provider_id, config)?;
+    let provider = provider_for(Role::Notes, config)?;
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
 
     // brain2 realtime notes FOLD: append the user's OWN typed in-meeting notes to the generated note
@@ -588,29 +594,20 @@ async fn summarize_and_export(
 
     let created_at = chrono::Utc::now().to_rfc3339();
     // Phase 5 — model provenance: capture the requested model ID and (when available) the model
-    // actually served by the gateway/API. `model_requested` is derived from the config exactly like
-    // `make_provider` computes it for the egress ledger (same source-of-truth, different sink).
-    // `gateway_host` is present ONLY for the `gateway` provider so it's non-PII and identifies the
-    // endpoint (not the content). All three are optional and omitted for providers that don't return
-    // model metadata (the default `*_with_meta` falls back to empty `CallMeta`).
-    let model_requested = match config.provider_id.as_str() {
-        crate::summarize::PROVIDER_GATEWAY => {
-            let m = config.gateway_model.trim().to_string();
-            if m.is_empty() { None } else { Some(m) }
-        }
-        crate::summarize::PROVIDER_OLLAMA => {
-            let m = config.ollama_model.trim().to_string();
-            if m.is_empty() { None } else { Some(m) }
-        }
-        _ => {
-            // claude_code + anthropic: use provider_model override if set; anthropic falls back
-            // to anthropic_model. The pipeline doesn't distinguish them further here — both are
-            // logged as-is (a "" stays None so legacy notes don't get a blank string).
-            let m = config.provider_model.trim().to_string();
-            if m.is_empty() { None } else { Some(m) }
-        }
+    // actually served by the gateway/API. `model_requested` is the resolved EFFECTIVE model —
+    // shared source-of-truth with the egress ledger (`effective_model_requested`), which also
+    // fixes the anthropic gap: with `provider_model` empty the request carries `anthropic_model`,
+    // and that is now what gets recorded (previously None). `gateway_host` is present ONLY for the
+    // `gateway` provider so it's non-PII and identifies the endpoint (not the content). All three
+    // are optional and omitted for providers that don't return model metadata (the default
+    // `*_with_meta` falls back to empty `CallMeta`).
+    let model_requested = {
+        let m = crate::summarize::effective_model_requested(&notes_target, config);
+        let m = m.trim().to_string();
+        // A "" stays None so legacy notes don't get a blank string.
+        if m.is_empty() { None } else { Some(m) }
     };
-    let gateway_host = if config.provider_id == crate::summarize::PROVIDER_GATEWAY {
+    let gateway_host = if notes_target.connection == crate::summarize::PROVIDER_GATEWAY {
         reqwest::Url::parse(&config.gateway_base_url)
             .ok()
             .and_then(|u| u.host_str().map(|h| {
@@ -626,10 +623,12 @@ async fn summarize_and_export(
     // Save clones for frontmatter injection (the NoteRecord takes ownership below).
     let model_served_for_fm = call_meta.model_served.clone();
     let model_requested_for_fm = model_requested.clone();
-    let provider_id_for_fm = config.provider_id.clone();
+    // Provenance names the RESOLVED connection that actually served the note (identical to
+    // `provider_id` while role keys are absent).
+    let provider_id_for_fm = notes_target.connection.clone();
     state.db.upsert_note(&NoteRecord {
         meeting_id: meeting_id.to_string(),
-        provider_id: config.provider_id.clone(),
+        provider_id: notes_target.connection.clone(),
         markdown: markdown.clone(),
         created_at,
         exported_path: None,
@@ -728,11 +727,7 @@ async fn summarize_and_export(
         &markdown,
     )?;
 
-    state.db.set_note_exported_path(
-        meeting_id,
-        &config.provider_id,
-        &exported_path.to_string_lossy(),
-    )?;
+    persist_note_exported_path(&state.db, config, meeting_id, &exported_path)?;
     state.db.set_meeting_title(meeting_id, &title)?;
     state
         .db
@@ -766,6 +761,25 @@ async fn summarize_and_export(
         exported_path: Some(exported_path),
         meeting_id: meeting_id.to_string(),
     })
+}
+
+/// Point the note row `summarize_and_export` just upserted at its exported vault `.md`.
+///
+/// PAIRED-WRITE INVARIANT (seal-critical): the row key MUST be the RESOLVED notes connection —
+/// the SAME key the `upsert_note` above used (`provider_target(Role::Notes, …).connection`) —
+/// NEVER the raw `config.provider_id`. Under an explicit `role_notes_connection` override the two
+/// differ, the `UPDATE … WHERE meeting_id AND provider_id` matches 0 rows silently, and a NULL
+/// `exported_path` means the seal path (which collects its vault-`.md` deletion targets from
+/// `exported_path`) leaves the plaintext `.md` alive in the vault after a lock.
+/// Regression: `exported_path_lands_on_the_role_overridden_note_row`.
+fn persist_note_exported_path(
+    db: &crate::storage::Db,
+    config: &AppConfig,
+    meeting_id: &str,
+    exported_path: &Path,
+) -> Result<()> {
+    let connection = crate::summarize::roles::provider_target(Role::Notes, config).connection;
+    db.set_note_exported_path(meeting_id, &connection, &exported_path.to_string_lossy())
 }
 
 /// Finalize a summarized note when NO vault folder is configured. By this point the caller
@@ -1136,6 +1150,90 @@ mod tests {
                 .as_nanos()
         ));
         p
+    }
+
+    /// REGRESSION (adversarial find, seal content-leak class): `summarize_and_export` upserts the
+    /// note row keyed on the RESOLVED notes connection (`provider_target(Role::Notes, …)`), so the
+    /// export-path update MUST use the SAME key. The pre-fix code passed the raw
+    /// `config.provider_id`: under an explicit `role_notes_connection` override the keys differ,
+    /// the `UPDATE … WHERE meeting_id AND provider_id` matches 0 rows SILENTLY, `exported_path`
+    /// stays NULL — and the seal path (`seal_meeting_into_folder` / `lock_folder`) collects its
+    /// vault-`.md` deletion targets from `exported_path`, so the plaintext `.md` would SURVIVE a
+    /// seal. This drives the REAL paired write (`upsert_note` with the pipeline's key +
+    /// `persist_note_exported_path`) and asserts the path lands on the row AND that the seal
+    /// path's deletion-target view (`sealable_notes_for_meeting`) sees it.
+    #[test]
+    fn exported_path_lands_on_the_role_overridden_note_row() {
+        use crate::storage::models::Meeting;
+
+        let db = crate::storage::Db::open_with_key(&temp_db_path("role-export"), TEST_DEK).unwrap();
+        let meeting = |id: &str| Meeting {
+            id: id.to_string(),
+            started_at: "2026-07-02T09:00:00Z".to_string(),
+            ended_at: Some("2026-07-02T09:10:00Z".to_string()),
+            title: Some("Role export".to_string()),
+            duration_s: 600,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        };
+        let note_row = |id: &str, connection: &str| NoteRecord {
+            meeting_id: id.to_string(),
+            provider_id: connection.to_string(),
+            markdown: "# body".to_string(),
+            created_at: "2026-07-02T09:11:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        };
+
+        // (a) EXPLICIT role override: the pipeline's row key is the resolved connection
+        // ("anthropic"), NOT provider_id ("claude_code").
+        let config = AppConfig {
+            provider_id: "claude_code".to_string(),
+            role_notes_connection: "anthropic".to_string(),
+            ..AppConfig::default()
+        };
+        let notes_target = crate::summarize::roles::provider_target(Role::Notes, &config);
+        assert_eq!(notes_target.connection, "anthropic");
+        let mid = "m-role-export";
+        db.insert_meeting(&meeting(mid)).unwrap();
+        db.upsert_note(&note_row(mid, &notes_target.connection)).unwrap();
+
+        // The REAL production paired write.
+        persist_note_exported_path(&db, &config, mid, Path::new("/vault/Role export.md")).unwrap();
+
+        let note = db.get_latest_note_for_meeting(mid).unwrap().expect("note row");
+        assert_eq!(note.provider_id, "anthropic");
+        assert_eq!(
+            note.exported_path.as_deref(),
+            Some("/vault/Role export.md"),
+            "exported_path must land on the row the pipeline upserted — NULL here means the seal \
+             path never sees the vault .md and the plaintext survives a lock"
+        );
+        // The seal path's deletion-target collection view sees the .md.
+        assert!(
+            db.sealable_notes_for_meeting(mid)
+                .unwrap()
+                .iter()
+                .any(|n| n.exported_path.as_deref() == Some("/vault/Role export.md")),
+            "the seal deletion-target collection must see the exported .md"
+        );
+
+        // (b) LEGACY fallback (no role keys): the key is provider_id — unchanged behavior.
+        let legacy_cfg = AppConfig::default(); // provider_id = claude_code, keys absent
+        let mid2 = "m-legacy-export";
+        db.insert_meeting(&meeting(mid2)).unwrap();
+        db.upsert_note(&note_row(
+            mid2,
+            &crate::summarize::roles::provider_target(Role::Notes, &legacy_cfg).connection,
+        ))
+        .unwrap();
+        persist_note_exported_path(&db, &legacy_cfg, mid2, Path::new("/vault/Legacy.md")).unwrap();
+        let legacy_note = db.get_latest_note_for_meeting(mid2).unwrap().expect("note row");
+        assert_eq!(legacy_note.provider_id, "claude_code");
+        assert_eq!(legacy_note.exported_path.as_deref(), Some("/vault/Legacy.md"));
     }
 
     /// The no-vault branch of `summarize_and_export`: with no vault configured the note is saved
