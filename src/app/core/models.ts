@@ -86,6 +86,9 @@ export interface AppConfigDto {
   voiceTrigger: boolean;
   onboarded: boolean;
   noteStyle: string;
+  /** ENHANCE-MY-NOTES: how typed in-meeting notes shape the summary — "enhance" (they
+   *  become the skeleton of the note) | "append" (verbatim `## My notes` section). */
+  notesMode: string;
   autoOrganize: boolean;
   noteLanguage: string;
   /**

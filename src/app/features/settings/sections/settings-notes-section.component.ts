@@ -52,6 +52,32 @@ import { SettingsStore } from "../settings.store";
                 </label>
 
                 <label class="field">
+                  <span class="field-label">Your typed notes</span>
+                  <select formControlName="notesMode">
+                    <option value="enhance">
+                      Enhance — your notes become the outline (recommended)
+                    </option>
+                    <option value="append">Append — keep them verbatim below</option>
+                  </select>
+                  <span class="field-help text-muted">
+                    @switch (form.controls.notesMode.value) {
+                      @case ("append") {
+                        The summary is written from the transcript alone; your typed
+                        notes are added verbatim as a "My notes" section at the end.
+                      }
+                      @default {
+                        Your in-meeting bullets become the skeleton of the note — kept
+                        in your words and order, expanded with detail from the
+                        transcript, plus an "Also discussed" section for anything you
+                        didn't jot down. Notes pass the same redaction firewall as the
+                        transcript before any cloud call.
+                      }
+                    }
+                    Meetings where you typed nothing are identical in both modes.
+                  </span>
+                </label>
+
+                <label class="field">
                   <span class="field-label">Notes language</span>
                   <select formControlName="noteLanguage">
                     <option value="auto">Auto — match the meeting</option>
