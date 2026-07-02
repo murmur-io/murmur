@@ -11,6 +11,7 @@ import { NavigationEnd, Router, RouterOutlet } from "@angular/router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { filter, map } from "rxjs";
 import { IpcService } from "./core/ipc.service";
+import { NavHistoryService } from "./core/nav-history.service";
 import { FoldersService } from "./services/folders.service";
 import { ScreenShareService } from "./services/screen-share.service";
 import { ThemeService } from "./services/theme.service";
@@ -37,6 +38,11 @@ export class AppComponent implements OnInit {
   // before the main window is revealed — no flash of the wrong theme.
   private readonly theme = inject(ThemeService);
   private readonly updates = inject(UpdateService);
+  // Injected at bootstrap purely so it starts observing router events from the
+  // FIRST navigation — its "last non-settings route" (used by the settings
+  // drill-down "← Murmur" back button) must be recorded before the user reaches
+  // settings, so it cannot wait for lazy construction inside SettingsComponent.
+  private readonly navHistory = inject(NavHistoryService);
 
   /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
   readonly isBar = toSignal(
