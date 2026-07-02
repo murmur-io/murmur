@@ -176,6 +176,24 @@ export interface AppConfigDto {
    * Mirrors Rust `AppConfigDto.proactive_hints_enabled`.
    */
   proactiveHintsEnabled: boolean;
+  /**
+   * Stage 4 — per-feature model-role overrides (Notes / Ask / Live), mirroring
+   * Rust `AppConfigDto.role_*` (camelCase). `""` = inherit: the role follows
+   * the legacy mapping (Notes → the Default AI triple; Ask/Live → the
+   * `brainBackend` fallback). The CONNECTION key is the override switch — a
+   * lone model/effort with an empty connection is ignored by the backend
+   * resolver. All nine are settable and MUST ride every `save_config` payload
+   * (like the Stage E flags above) so a save never clears a role override.
+   */
+  roleNotesConnection: string;
+  roleNotesModel: string;
+  roleNotesEffort: string;
+  roleAskConnection: string;
+  roleAskModel: string;
+  roleAskEffort: string;
+  roleLiveConnection: string;
+  roleLiveModel: string;
+  roleLiveEffort: string;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */

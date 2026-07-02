@@ -219,6 +219,18 @@ export class IpcService {
   }
 
   /**
+   * Stage 4 — the model catalog for ONE connection: `claude_code`/`anthropic` →
+   * the backend's Claude-id constant (single source of truth — no more
+   * hardcoded ids in FE templates), `ollama` → the live `/api/tags` list,
+   * `gateway` → its `/v1/models`, `local` → the GGUF registry ids. Rejects when
+   * the connection's endpoint is unreachable — the FE falls back to a free-text
+   * model input (the {@link listGatewayModels} pattern).
+   */
+  listModels(connection: string): Promise<string[]> {
+    return invoke<string[]>("list_models", { connection });
+  }
+
+  /**
    * AI Gateway (Phase 4) — probe whether the configured gateway is reachable and
    * return the number of models in its catalog. The backend never errors on this
    * command (unreachable → `{ reachable: false, modelCount: 0 }`). The FE still
