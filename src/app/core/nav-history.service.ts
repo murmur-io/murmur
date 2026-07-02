@@ -7,14 +7,21 @@ import { filter, map, scan, startWith } from "rxjs";
 const DEFAULT_APP_ROUTE = "/record";
 
 /**
- * A "drill-down" is an L2 overlay route that HIDES the primary rail and owns the
- * full window with its own back-affordance (Settings and Meetings/Library both).
- * The "← Murmur" back target must be a NON-drill-down route, so both this service
- * and app-shell's rail-hide gate share this single predicate. Keep the two in
- * lockstep — a new drill-down route added here must also be hidden in app-shell.
+ * A "drill-down" is a route that HIDES the primary rail so the current flow owns
+ * the window with its own back-affordance: Settings, Meetings/Library, AND a
+ * meeting's detail (`/meeting/:id`) — opening a meeting stays "inside" the
+ * Meetings flow (its own "← Meetings" back), so the primary rail must NOT
+ * reappear there. The "← Murmur" back target must be a NON-drill-down route, so
+ * both this service and app-shell's rail-hide gate share this single predicate.
+ * Keep the two in lockstep — a new drill-down route added here is also hidden in
+ * app-shell.
  */
 export function isDrilldownRoute(url: string): boolean {
-  return url.startsWith("/settings") || url.startsWith("/library");
+  return (
+    url.startsWith("/settings") ||
+    url.startsWith("/library") ||
+    url.startsWith("/meeting")
+  );
 }
 
 /**
