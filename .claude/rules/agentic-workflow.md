@@ -33,6 +33,8 @@ A change is not done because it compiles. It is done when an independent agent *
 
 The hard-won lesson on this repo: **the docs were repeatedly wrong.** `docs/STATUS.md` and friends drift. When a claim is load-bearing, open the file (`file:line`) and confirm it against the current tree. Distrust your own first read, too.
 
+**Cite by SYMBOL, not line number.** `commands.rs` and `db.rs` are each >8k lines and grow every PR, so the `file:line` anchors sprinkled through these rules drift by thousands of lines — `grep` the symbol name (`fn meeting_is_unlocked`, `visibility_clause`), don't trust the number. A line citation is a hint to the right file, never a promise about the row. (The audit that surfaced this: `docs/research/2026-07-02-claude-setup-audit.md`.)
+
 ## Honesty bar
 
 Some things genuinely cannot be verified headless: real mic capture, live ScreenCaptureKit, the **Touch ID** prompt, lock-at-rest behavior, and whether screen-share auto-relock fires on a real Zoom/Meet share — these need a **signed build on a real Mac**. Say so plainly; don't claim a green unit test proves them. "Needs a signed build / a real Mac / recorded evidence" is the honest bar.
@@ -40,6 +42,6 @@ Some things genuinely cannot be verified headless: real mic capture, live Screen
 ## Constraints the fleet must respect
 
 - Commits/PRs authored **only** by `QueaT <kgm004a@gmail.com>`; **no Claude trailers**. `gh` active account = `JakubGawr`.
-- **Never push to the `murmur` trunk directly** (a `block-bash` hook forbids it) — merge via a PR (`gh pr create` → `gh pr merge`).
+- **Never push to the `murmur` trunk directly** (`.claude/hooks/block-bash.sh` refuses it with exit 2) — merge via a PR (`gh pr create` → `gh pr merge`).
 - `com.meetnotes.app` is immutable (TCC/Keychain continuity).
 - No new npm packages or crates without explicit user approval.
