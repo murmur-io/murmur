@@ -235,10 +235,10 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
             <div class="cloud-consent-copy">
               <strong>Cloud processing isn't enabled</strong>
               <span>
-                {{ providerLabel() }} sends your (redacted) transcript to
-                Anthropic's cloud to write the summary — your data leaves this
-                Mac. Allow it once to finish this note, or switch to Ollama in
-                Settings to stay fully on-device.
+                {{ providerLabel() }} sends your transcript (redacted first) to
+                {{ cloudDestination() }} to write the summary — your data leaves
+                this Mac. Allow it once to finish this note, or switch to a
+                local provider in Settings to stay fully on-device.
               </span>
             </div>
             <div class="cloud-consent-actions">
@@ -1107,8 +1107,33 @@ export class RecordComponent implements OnInit {
         return "The Anthropic API";
       case "claude_code":
         return "Claude Code";
+      case "gateway":
+        return "AI Gateway";
+      case "ollama":
+        return "Ollama";
       default:
         return "This provider";
+    }
+  });
+
+  /**
+   * Human name of the destination the redacted transcript goes to (for the
+   * consent copy). This banner only shows after the backend's fail-closed
+   * `egress_is_cloud` gate refused (`needsCloudConsent`), so the provider is
+   * cloud-classified by definition — for ollama that means the base URL is
+   * non-loopback, hence "your remote Ollama server" without re-parsing it here.
+   */
+  readonly cloudDestination = computed(() => {
+    switch (this.config()?.providerId) {
+      case "anthropic":
+      case "claude_code":
+        return "Anthropic's cloud";
+      case "gateway":
+        return "your AI gateway";
+      case "ollama":
+        return "your remote Ollama server";
+      default:
+        return "your provider's cloud";
     }
   });
 
