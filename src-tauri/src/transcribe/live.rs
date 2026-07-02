@@ -201,7 +201,8 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                                 crate::events::EVENT_VOICE_COMMAND_PROCESSING,
                                 crate::events::VoiceCommandProcessingPayload { active: true },
                             );
-                            spawn_assistant_turn(app.clone(), command);
+                            // No FE thread here (spoken turn) → the turn generates its own id.
+                            spawn_assistant_turn(app.clone(), command, None);
                         }
                         ManualCaptureDecision::NothingHeard => {
                             // Budget expired with nothing heard → graceful, NOT a confusing
@@ -262,7 +263,8 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                             "wake word detected in live caption"
                         );
                         if dispatch {
-                            spawn_assistant_turn(app.clone(), payload.command.clone());
+                            // No FE thread here (wake-word turn) → the turn generates its own id.
+                            spawn_assistant_turn(app.clone(), payload.command.clone(), None);
                         }
                         let _ = app.emit(crate::events::EVENT_WAKE_DETECTED, payload);
                     }
@@ -285,22 +287,42 @@ fn should_dispatch(config: &crate::settings::AppConfig) -> bool {
 /// Max agentic rounds on the cloud brain (decide → tool → … → answer). Bounded for live latency.
 const CLOUD_MAX_STEPS: usize = 4;
 
+/// Resolve the turn's THREAD id: the FE-supplied id when present (an @brain thread), else a fresh
+/// UUID v4 (the voice/wake path and the single-shot text composer send none), so EVERY persisted
+/// assistant exchange carries a thread identity going forward. Blank ids count as absent — an
+/// empty thread id must never be persisted. The id is OPAQUE — no PII (safe to log/emit).
+pub(crate) fn ensure_thread_id(explicit: Option<String>) -> String {
+    match explicit {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// Spawn ONE assistant turn on a DETACHED OS thread — the SINGLE entry to the in-meeting brain for the
 /// wake path, the manual button, AND the text composer (all three funnel here with a `command` string).
 /// The brain + tools can take seconds, so it MUST run off-thread; the whole body is best-effort +
 /// panic-free and runs on its own thread, so even an unexpected panic is contained and can never
 /// disrupt recording or the caption.
-pub fn spawn_assistant_turn(app: AppHandle, command: String) {
+pub fn spawn_assistant_turn(app: AppHandle, command: String, thread_id: Option<String>) {
     let _ = std::thread::Builder::new()
         .name("murmur-assistant-turn".into())
-        .spawn(move || run_assistant_turn(&app, command));
+        .spawn(move || run_assistant_turn(&app, command, thread_id));
 }
 
 /// The CARD path (wake / manual button / single-shot text composer): run the shared query core, then
 /// EMIT `EVENT_VOICE_ACTION_RESULT` so the assistant card resolves the pending row. The per-tool trace
-/// streams via `EVENT_ASSISTANT_TOOL`.
-fn run_assistant_turn(app: &AppHandle, command: String) {
-    let result = run_assistant_query(app, &command, &command, crate::events::EVENT_ASSISTANT_TOOL);
+/// streams via `EVENT_ASSISTANT_TOOL`. A missing `thread_id` (voice/wake) is backend-generated here,
+/// so the persisted row + every emitted payload of this turn carry the SAME thread identity.
+fn run_assistant_turn(app: &AppHandle, command: String, thread_id: Option<String>) {
+    let thread_id = ensure_thread_id(thread_id);
+    let result = run_assistant_query(
+        app,
+        &command,
+        &command,
+        crate::events::EVENT_ASSISTANT_TOOL,
+        &thread_id,
+        None,
+    );
     let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
 }
 
@@ -318,21 +340,36 @@ fn run_assistant_turn(app: &AppHandle, command: String) {
 ///    floor no longer owns write routing; it is the informational safety net (ZERO read regression).
 /// 4. PERSIST the interaction (gated, purged-on-seal) + RETURN the result; the per-tool trace streams
 ///    to `tool_event` (card vs chat). The CALLER delivers the result (emit for the card, return for chat).
+///
+/// `thread_id` is the RESOLVED thread identity of this turn (callers run [`ensure_thread_id`] first)
+/// — it is threaded onto every trace payload, the returned result, and the persisted row, so
+/// simultaneous threads never cross-attribute. `anchor_text` is the note text an @brain thread was
+/// anchored to (persisted with the row; `None` for voice/unanchored turns).
 pub fn run_assistant_query(
     app: &AppHandle,
     command: &str,
     loop_user: &str,
     tool_event: &'static str,
+    thread_id: &str,
+    anchor_text: Option<&str>,
 ) -> crate::voice_action::VoiceActionResult {
     let state = app.state::<AppState>();
     let config = match state.config.lock() {
         Ok(c) => c.clone(),
-        Err(_) => return crate::voice_action::VoiceActionResult::nothing_heard().with_command(command),
+        Err(_) => {
+            return crate::voice_action::VoiceActionResult::nothing_heard()
+                .with_command(command)
+                .with_thread_id(thread_id)
+        }
     };
     // C6: re-snapshot the LIVE unlocked set for THIS turn (never trust a snapshot taken before it).
     let unlocked = match state.unlocked_folders.lock() {
         Ok(u) => u.clone(),
-        Err(_) => return crate::voice_action::VoiceActionResult::nothing_heard().with_command(command),
+        Err(_) => {
+            return crate::voice_action::VoiceActionResult::nothing_heard()
+                .with_command(command)
+                .with_thread_id(thread_id)
+        }
     };
     let meeting_id = state
         .current_meeting
@@ -357,17 +394,21 @@ pub fn run_assistant_query(
         loop_user,
         &intent,
         tool_event,
+        thread_id,
     )
-    .with_command(command);
+    .with_command(command)
+    .with_thread_id(thread_id);
 
-    // PII rule: log only the coarse intent kind + status, never the command/summary text.
+    // PII rule: log only the coarse intent kind + status + the OPAQUE thread id, never the
+    // command/summary/anchor text.
     tracing::info!(
         target: "voice",
         intent = %result.intent_kind,
         status = %result.status,
+        thread_id,
         "assistant query dispatched"
     );
-    persist_interaction(state.inner(), &meeting_id, command, &result);
+    persist_interaction(state.inner(), &meeting_id, command, &result, thread_id, anchor_text);
     result
 }
 
@@ -393,6 +434,7 @@ fn run_informational(
     loop_user: &str,
     intent: &crate::audio::wake::VoiceIntent,
     tool_event: &'static str,
+    thread_id: &str,
 ) -> crate::voice_action::VoiceActionResult {
     // The agentic loop runs only on the CLOUD brain — local-GGUF multi-step tool-call reliability is
     // unproven (Q4 + the Bielik 32K-overflow lesson), so the local + stub backends use the
@@ -421,7 +463,11 @@ fn run_informational(
             // the loop to mark the reply as a NOTE PROPOSAL vs a plain ANSWER. The model decides which.
             proposed_note: std::sync::Mutex::new(None),
         };
-        let sink = ToolEventSink { app: app.clone(), event: tool_event };
+        let sink = ToolEventSink {
+            app: app.clone(),
+            event: tool_event,
+            thread_id: thread_id.to_string(),
+        };
         // Inject the LIVE transcript of the recording IN PROGRESS + the user's OWN typed notes for
         // the CURRENT meeting (segments aren't persisted until Stop, and typed notes carry the
         // user's emphasis). Both are read through `gated_live_context` — gated by
@@ -496,33 +542,44 @@ fn floor_intent_for(
 
 /// The live tool-trace sink: emits a per-tool-call event (`EVENT_ASSISTANT_TOOL` for the card,
 /// `EVENT_CHAT_TOOL` for the chat panel — chosen by `event`) so the FE can render the "Searching
-/// notes… ✓" chips. NO PII — tool NAME + a coarse result-size count only.
+/// notes… ✓" chips. NO PII — tool NAME + a coarse result-size count + the turn's OPAQUE thread id.
 struct ToolEventSink {
     app: AppHandle,
     event: &'static str,
+    /// The turn's thread identity — stamped on every chip so simultaneous threads never
+    /// cross-attribute their traces (the documented v1 gap this closes).
+    thread_id: String,
 }
 impl crate::agent::DeltaSink for ToolEventSink {
     fn tool_running(&self, tool: &str) {
-        let _ = self.app.emit(
-            self.event,
-            crate::events::AssistantToolPayload {
-                tool: tool.to_string(),
-                state: "running".into(),
-                ok: true,
-                count: None,
-            },
-        );
+        let _ = self
+            .app
+            .emit(self.event, tool_trace_payload(&self.thread_id, tool, "running", true, None));
     }
     fn tool_done(&self, tool: &str, ok: bool, result_chars: usize) {
         let _ = self.app.emit(
             self.event,
-            crate::events::AssistantToolPayload {
-                tool: tool.to_string(),
-                state: "done".into(),
-                ok,
-                count: Some(result_chars as u32),
-            },
+            tool_trace_payload(&self.thread_id, tool, "done", ok, Some(result_chars as u32)),
         );
+    }
+}
+
+/// Build one tool-trace payload — pure (no AppHandle), so the payload contract is headless-testable:
+/// tool NAME + state + coarse count + the turn's opaque `thread_id`. NO PII (never the tool args,
+/// results, or any content).
+fn tool_trace_payload(
+    thread_id: &str,
+    tool: &str,
+    state: &str,
+    ok: bool,
+    count: Option<u32>,
+) -> crate::events::AssistantToolPayload {
+    crate::events::AssistantToolPayload {
+        tool: tool.to_string(),
+        state: state.to_string(),
+        ok,
+        count,
+        thread_id: Some(thread_id.to_string()),
     }
 }
 
@@ -537,6 +594,8 @@ fn persist_interaction(
     meeting_id: &str,
     command: &str,
     result: &crate::voice_action::VoiceActionResult,
+    thread_id: &str,
+    anchor_text: Option<&str>,
 ) {
     if meeting_id.is_empty() {
         return; // no active recording → nothing to attach the interaction to.
@@ -549,6 +608,8 @@ fn persist_interaction(
         &result.citations,
         &result.status,
         Some(result.intent_kind.as_str()),
+        Some(thread_id),
+        anchor_text,
         &created_at,
     ) {
         Ok(_) => {}
@@ -1044,6 +1105,47 @@ fn assistant_system_prompt(live_transcript: &str, typed_notes: &str) -> String {
 mod tests {
     use super::*;
     use crate::audio::wake::VoiceIntent;
+
+    // ── PR D thread identity: backend UUID fallback + thread-stamped trace payloads ───────────────
+
+    /// The voice/wake path (and a thread-less text turn) has no FE-supplied thread id → the backend
+    /// GENERATES a UUID v4, so every persisted exchange carries a thread identity going forward; an
+    /// explicit @brain thread id passes through untouched, and a blank one counts as absent (an
+    /// empty thread id is never persisted). RED before PR D: `ensure_thread_id` did not exist —
+    /// voice rows persisted with no thread identity at all.
+    #[test]
+    fn ensure_thread_id_generates_uuid_when_absent() {
+        let generated = ensure_thread_id(None);
+        assert!(
+            uuid::Uuid::parse_str(&generated).is_ok(),
+            "a missing thread id must become a real UUID"
+        );
+        assert_eq!(ensure_thread_id(Some("t-7".into())), "t-7", "explicit id passes through");
+        assert!(
+            uuid::Uuid::parse_str(&ensure_thread_id(Some("   ".into()))).is_ok(),
+            "a blank id counts as absent and is regenerated"
+        );
+    }
+
+    /// Every tool-trace chip payload carries the turn's thread id (camelCase `threadId` over IPC),
+    /// so simultaneous threads attribute their chips without cross-bleed — the documented v1 gap.
+    /// The payload stays non-PII: tool NAME + state + coarse count + an opaque UUID only. RED
+    /// before PR D: `AssistantToolPayload` had no thread field (chips were unattributable).
+    #[test]
+    fn tool_trace_payload_carries_thread_id() {
+        let running = tool_trace_payload("t-9", "search_meetings", "running", true, None);
+        assert_eq!(running.thread_id.as_deref(), Some("t-9"));
+        assert_eq!(running.state, "running");
+        assert!(running.count.is_none());
+
+        let done = tool_trace_payload("t-9", "search_meetings", "done", true, Some(3));
+        assert_eq!(done.thread_id.as_deref(), Some("t-9"));
+        assert_eq!(done.count, Some(3));
+        // The FE reads camelCase — the serialized event must expose `threadId`.
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json.get("threadId").and_then(|v| v.as_str()), Some("t-9"));
+        assert_eq!(json.get("tool").and_then(|v| v.as_str()), Some("search_meetings"));
+    }
 
     #[test]
     fn wake_event_for_builds_payload_with_parsed_intent_on_hit() {
