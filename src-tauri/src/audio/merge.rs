@@ -158,29 +158,6 @@ fn jaccard(a: &[String], b: &[String]) -> f32 {
     }
 }
 
-/// Multiset token coverage normalized by the SHORTER side (garbled echo fragments still hit).
-fn coverage(a: &[String], b: &[String]) -> f32 {
-    use std::collections::HashMap;
-    let shorter = a.len().min(b.len());
-    if shorter == 0 {
-        return 0.0;
-    }
-    let mut counts: HashMap<&String, usize> = HashMap::new();
-    for t in b {
-        *counts.entry(t).or_default() += 1;
-    }
-    let mut hits = 0usize;
-    for t in a {
-        if let Some(c) = counts.get_mut(t) {
-            if *c > 0 {
-                *c -= 1;
-                hits += 1;
-            }
-        }
-    }
-    hits as f32 / shorter as f32
-}
-
 /// Token-level longest-common-subsequence ratio normalized by the shorter side (word-order
 /// sensitive — protects against shared-vocabulary false positives).
 fn token_lcs(a: &[String], b: &[String]) -> f32 {
@@ -270,13 +247,17 @@ pub fn suppress_cross_stream_echo(
             let delta = seg.start_s - cand.start_s;
             let strict_hit = delta.abs() <= ECHO_STRICT_WINDOW_S
                 && jaccard(&me_tokens, &cand.tokens) >= ECHO_STRICT_JACCARD;
+            // Relaxed tier uses ORDER-PRESERVING signals only (equality, contiguous substring,
+            // or token-LCS): acoustic echo is the SAME speech, so Whisper decodes it in the same
+            // word order. An order-INSENSITIVE metric (multiset coverage) was dropped because it
+            // eats a genuine `me` line whose words merely reappear — reordered — in a nearby
+            // `others` segment (lock-security finding). Content-loss beats garbled-echo recall.
             let relaxed_hit = relaxed_armed
                 && (-ECHO_RELAXED_BEFORE_S..=ECHO_RELAXED_AFTER_S).contains(&delta)
                 && (me_norm == cand.text_norm
                     || cand.text_norm.contains(&me_norm)
                     || me_norm.contains(&cand.text_norm)
-                    || coverage(&me_tokens, &cand.tokens).max(token_lcs(&me_tokens, &cand.tokens))
-                        >= ECHO_RELAXED_SIMILARITY);
+                    || token_lcs(&me_tokens, &cand.tokens) >= ECHO_RELAXED_SIMILARITY);
             if strict_hit || relaxed_hit {
                 drop[i] = true;
                 break;
@@ -619,5 +600,23 @@ mod tests {
         let (out, n) = suppress_cross_stream_echo(segs.clone(), Some(&leak(0.9)));
         assert_eq!(n, 0);
         assert_eq!(out.len(), 2);
+    }
+
+    /// CONTENT-LOSS REGRESSION (lock-security finding): a GENUINE `me` line that only shares
+    /// vocabulary — in a DIFFERENT order — with a nearby `others` segment must SURVIVE, even
+    /// under strong leak evidence within the relaxed window. The order-insensitive `coverage`
+    /// metric scored this 1.0 and ate it; order-preserving token-LCS scores 4/6 < 0.7 → kept.
+    /// (Real acoustic echo preserves word order, so this does not weaken echo removal.)
+    #[test]
+    fn genuine_paraphrase_with_shared_vocab_survives() {
+        let segs = vec![
+            seg_sp(5.0, 8.0, "we need to finalize the budget by monday i think", "others"),
+            // Same words, reordered — the user genuinely agreeing, NOT an echo copy.
+            seg_sp(6.0, 7.0, "i think we need the budget", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
+        assert_eq!(n, 0, "a reordered genuine paraphrase must not be dropped");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|s| s.speaker.as_deref() == Some("me")));
     }
 }
