@@ -299,8 +299,9 @@ async fn run_inner(
     // Runs only with a system stream, the flag on, and a measured leak (headphones ⇒ no echo
     // energy ⇒ skip entirely). On success the AEC'd buffer becomes BOTH the ASR feed and the
     // archive-mix input (feed == archive by construction, so the 51 s→8 s timeline-desync class
-    // is impossible), while the faithful raw mic is still archived via keep_hires_masters
-    // (`.mic.wav` is written from the pre-resample `samples`). Best-effort: any anomaly keeps raw.
+    // is impossible). NOTE: this makes the AEC'd mic the ONLY mic audio in the playback archive;
+    // the faithful RAW mic survives at rest ONLY when `keep_hires_masters` is on (the `.mic.wav`
+    // master, written from the pre-resample `samples` below). Best-effort: any anomaly keeps raw.
     if config.post_aec_enabled {
         if let (Some(sys), Some(l)) = (sys_16k.as_ref(), leak.as_ref()) {
             let sys_lead = (l.offset_s.max(0.0) * audio::TARGET_RATE_HZ as f64).round() as usize;
@@ -322,9 +323,9 @@ async fn run_inner(
     }
 
     // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
-    // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed —
-    // offset-aligned so the two streams line up on the wall clock (kills most of the audible
-    // double-hearing on speakers).
+    // `archive_src` = the AEC'd mic when offline AEC ran above (mic_16k_archive was cleared to
+    // None), else the raw cpal mic — mixed with system audio, offset-aligned so the two streams
+    // line up on the wall clock (kills most of the audible double-hearing on speakers).
     let archive_src = mic_16k_archive.as_ref().unwrap_or(&mic_16k);
     let archive_16k = match &sys_16k {
         Some(sys) => {
