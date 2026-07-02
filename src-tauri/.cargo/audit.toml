@@ -1,0 +1,13 @@
+# cargo-audit exceptions — keep in lockstep with the [advisories].ignore list in /deny.toml
+# (both gates run in scripts/ci.sh; cargo-audit does not read deny.toml).
+#
+# 2026-07-02 — quick-xml 0.39.4 DoS advisories (published 2026-06-29), fix = quick-xml >=0.41:
+# reachable ONLY via plist 1.9.0 (pins ^0.39; no fixed release yet) inside tauri/tauri-codegen;
+# plist parses only our own bundle/config metadata, never untrusted XML, and both advisories are
+# DoS-class on attacker-controlled input — not exploitable here. REMOVE as soon as a plist
+# release depends on quick-xml >=0.41.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

@@ -20,7 +20,18 @@ yanked = "deny"
 unmaintained = "workspace"
 # No blanket ignores — add a specific RUSTSEC id here ONLY with a written justification if a
 # fix is genuinely unavailable. An empty list means "no exceptions".
-ignore = []
+#
+# 2026-07-02 — quick-xml 0.39.4 DoS advisories (published 2026-06-29), fix = quick-xml >=0.41:
+# quick-xml is reachable ONLY via plist (Apple property-list parsing inside tauri/tauri-codegen);
+# plist 1.9.0 (latest) pins ^0.39, so no upgrade path exists yet. plist parses only OUR OWN
+# bundle/config metadata — never network- or user-supplied XML — and both advisories are
+# DoS-class (memory exhaustion / quadratic time) on attacker-controlled XML, so they are not
+# exploitable in this app. REMOVE both ids as soon as a plist release depends on quick-xml >=0.41
+# (`cargo update -p plist` then `cargo audit` clean).
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
