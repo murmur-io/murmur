@@ -26,1493 +26,1805 @@ import type {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { ThemeService, type ThemeMode } from "../../services/theme.service";
 
+/** One entry in the macOS-style Settings sidebar. `keywords` feeds the search box. */
+interface SettingsSection {
+  readonly id: string;
+  readonly label: string;
+  readonly keywords: string;
+}
+
+/**
+ * The sidebar sections, in display order. `keywords` are matched (alongside the
+ * label) by the search box so typing a setting's name surfaces its section.
+ */
+const SETTINGS_SECTIONS: readonly SettingsSection[] = [
+  { id: "appearance", label: "Appearance", keywords: "theme light dark system look colour color mode" },
+  { id: "general", label: "General", keywords: "provider vault folder subfolder whisper model path setup onboarding" },
+  { id: "transcription", label: "Transcription", keywords: "language quality whisper model download on-device size accuracy" },
+  { id: "audio", label: "Audio & Capture", keywords: "microphone input device system audio vad smart speech detection high fidelity masters diarization remote speakers echo cancellation aec voice trigger hands-free" },
+  { id: "notes", label: "Notes", keywords: "summary style brief detailed action language auto organize subfolders thematic" },
+  { id: "brain", label: "Brain & AI", keywords: "assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake" },
+  { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet" },
+  { id: "providers", label: "Providers", keywords: "anthropic ollama claude code gateway openai api key availability model binary" },
+  { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop" },
+  { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
+];
+
 @Component({
   selector: "app-settings",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   template: `
-    <section class="settings" [formGroup]="form">
-      @if (loadError(); as err) {
-        <div class="banner is-danger" role="alert">
-          <span class="banner-icon" aria-hidden="true">!</span>
-          <span>Couldn't load settings: {{ err }}</span>
-        </div>
-      }
-
-      <!-- Appearance: Light / Dark / System theme (applies instantly) -->
-      <div class="card appearance-card">
-        <div class="appearance-copy">
-          <h3>Appearance</h3>
-          <p class="text-secondary">
-            Choose how Murmur looks. <b>System</b> follows your macOS
-            Light/Dark setting automatically.
-          </p>
-        </div>
-        <div class="theme-seg" role="group" aria-label="Theme">
-          <button
-            type="button"
-            [class.active]="themeMode() === 'light'"
-            [attr.aria-pressed]="themeMode() === 'light'"
-            (click)="setTheme('light')"
+    <section class="settings-shell" [formGroup]="form">
+      <!-- macOS-style left rail: search over sections, then the section list. -->
+      <aside class="settings-sidebar" aria-label="Settings">
+        <div class="sidebar-search">
+          <svg
+            class="sidebar-search-icon"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            aria-hidden="true"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
-            Light
-          </button>
-          <button
-            type="button"
-            [class.active]="themeMode() === 'dark'"
-            [attr.aria-pressed]="themeMode() === 'dark'"
-            (click)="setTheme('dark')"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" /></svg>
-            Dark
-          </button>
-          <button
-            type="button"
-            [class.active]="themeMode() === 'system'"
-            [attr.aria-pressed]="themeMode() === 'system'"
-            (click)="setTheme('system')"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
-            System
-          </button>
-        </div>
-      </div>
-
-      <!-- Transcription model: language + quality + on-demand download -->
-      <div class="card model-card">
-        <div class="model-copy">
-          <h3>Transcription model</h3>
-          <p class="text-secondary model-sub">
-            Runs entirely on-device. Pick your language and quality — the
-            matching Whisper model is fetched once and reused for every
-            recording.
-          </p>
+            <circle cx="7" cy="7" r="4.5" />
+            <path d="M10.5 10.5 14 14" />
+          </svg>
+          <input
+            type="search"
+            class="sidebar-search-input"
+            [formControl]="searchControl"
+            placeholder="Search"
+            aria-label="Search settings"
+            autocomplete="off"
+            spellcheck="false"
+          />
         </div>
 
-        <div class="model-grid">
-          <label class="field">
-            <span class="field-label">Language</span>
-            <select formControlName="language" (change)="onModelChoiceChange()">
-              <option value="">Auto-detect</option>
-              <option value="pl">Polski</option>
-              <option value="en">English</option>
-              <option value="de">Deutsch</option>
-              <option value="es">Español</option>
-              <option value="fr">Français</option>
-              <option value="it">Italiano</option>
-              <option value="pt">Português</option>
-              <option value="uk">Українська</option>
-              <option value="nl">Nederlands</option>
-            </select>
-            <span class="field-help text-muted">
-              Force the transcription language. Polish recommended if you record
-              mostly in Polish (auto-detect can misfire on short clips).
-            </span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Quality</span>
-            <select
-              formControlName="modelSize"
-              (change)="onModelChoiceChange()"
-            >
-              <option value="tiny">Tiny — fastest (~75 MB)</option>
-              <option value="base">Base (~150 MB)</option>
-              <option value="small">Small (~470 MB)</option>
-              <option value="medium">Medium (~1.5 GB)</option>
-              <option value="large-v3-turbo">
-                Large v3 Turbo — fast &amp; accurate (~1.6 GB)
-              </option>
-              <option value="large-v3">
-                Large v3 — best accuracy, recommended (~3 GB)
-              </option>
-            </select>
-            <span class="field-help text-muted">
-              Large v3 is the most accurate and the default — it’s a one-time ~3
-              GB download. Turbo is nearly as good and much smaller.
-            </span>
-          </label>
-        </div>
-
-        <div class="model-status-row">
-          @if (modelPresent() === true) {
-            <span class="pill is-success">
-              <span class="pill-dot"></span>
-              Downloaded ✓
-            </span>
-            <span class="text-muted model-note">
-              Stored on this Mac — used for every recording.
-            </span>
-          } @else if (modelPresent() === false) {
+        <nav class="sidebar-nav" aria-label="Settings sections">
+          @for (s of visibleSections(); track s.id) {
             <button
               type="button"
-              class="btn btn-primary"
-              (click)="downloadModel()"
-              [disabled]="downloadingModel()"
+              class="nav-item"
+              [class.active]="activeSection() === s.id"
+              [attr.aria-current]="activeSection() === s.id ? 'page' : null"
+              (click)="selectSection(s.id)"
             >
-              @if (downloadingModel()) {
-                <span class="spin-ring" aria-hidden="true"></span>
-                Downloading…
-              } @else {
-                Download ({{ downloadHint() }})
-              }
-            </button>
-            <span class="text-muted model-note">
-              @if (downloadingModel()) {
-                Fetching the model — large models can take a few minutes.
-              } @else {
-                {{ downloadHint() }}, one time, on-device.
-              }
-            </span>
-          } @else {
-            <span class="pill">
-              <span class="pill-dot"></span>
-              Checking…
-            </span>
-          }
-        </div>
-        @if (modelDownloadError(); as derr) {
-          <p class="model-error text-danger">{{ derr }}</p>
-        }
-      </div>
-
-      <!-- General -->
-      <div class="card">
-        <fieldset>
-          <legend>General</legend>
-
-          <label class="field">
-            <span class="field-label">Provider</span>
-            <select formControlName="providerId">
-              <option value="claude_code">Claude Code (default)</option>
-              <option value="anthropic">Anthropic API</option>
-              <option value="ollama">Ollama</option>
-              <option value="gateway">AI Gateway (OpenAI-compatible)</option>
-            </select>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Vault folder</span>
-            <span class="row">
-              <input formControlName="vaultPath" placeholder="/path/to/vault" />
-              <button type="button" class="btn" (click)="pickVault()">
-                Browse…
-              </button>
-            </span>
-          </label>
-
-          <label class="field">
-            <span class="field-label">Vault subfolder</span>
-            <input formControlName="vaultSubfolder" placeholder="Meetings" />
-          </label>
-
-          <label class="field">
-            <span class="field-label"
-              >Whisper model path (optional override)</span
-            >
-            <span class="row">
-              <input
-                formControlName="whisperModelPath"
-                placeholder="leave blank — auto-managed in Transcription model above"
-              />
-              <button type="button" class="btn" (click)="pickModel()">
-                Browse…
-              </button>
-            </span>
-          </label>
-        </fieldset>
-      </div>
-
-      <!-- Notes: how Claude writes & files each meeting note -->
-      <div class="card notes-card">
-        <div class="notes-copy">
-          <h3>Notes</h3>
-          <p class="text-secondary notes-sub">
-            Shape how Claude writes each summary and where it lands in your
-            vault.
-          </p>
-        </div>
-
-        <label class="field">
-          <span class="field-label">Summary style</span>
-          <select formControlName="noteStyle">
-            <option value="standard">Standard (balanced)</option>
-            <option value="brief">Brief (TL;DR + actions)</option>
-            <option value="detailed">Detailed (full depth)</option>
-            <option value="action">Action-focused</option>
-          </select>
-          <span class="field-help text-muted">
-            @switch (form.controls.noteStyle.value) {
-              @case ("brief") {
-                A tight TL;DR up top, then just the decisions and action items.
-              }
-              @case ("detailed") {
-                The full picture — discussion, context, decisions and every
-                follow-up.
-              }
-              @case ("action") {
-                Front-loads who-does-what — owners, tasks and due dates first.
-              }
-              @default {
-                A balanced summary, key points and action items — good for most
-                meetings.
-              }
-            }
-          </span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">Notes language</span>
-          <select formControlName="noteLanguage">
-            <option value="auto">Auto — match the meeting</option>
-            <option value="en">English</option>
-            <option value="pl">Polski</option>
-            <option value="de">Deutsch</option>
-            <option value="es">Español</option>
-            <option value="fr">Français</option>
-            <option value="it">Italiano</option>
-            <option value="pt">Português</option>
-            <option value="uk">Українська</option>
-            <option value="nl">Nederlands</option>
-          </select>
-          <span class="field-help text-muted">
-            @if (form.controls.noteLanguage.value === "auto") {
-              The whole note (headings + content) is written in the meeting's
-              language.
-            } @else {
-              The whole note is written in this language, whatever was spoken.
-            }
-          </span>
-        </label>
-
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Organize into thematic subfolders</span>
-            <span class="text-secondary toggle-sub">
-              Claude files each note into a topic subfolder of your vault (e.g.
-              Standups, 1-1s, Acme Project).
-            </span>
-          </span>
-          <input type="checkbox" formControlName="autoOrganize" />
-        </label>
-      </div>
-
-      <!-- Brain / AI — the assistant backend + in-meeting voice assistant (Phase H) -->
-      <div class="card brain-card">
-        <div class="brain-copy">
-          <h3>Brain / AI</h3>
-          <p class="text-secondary brain-sub">
-            Powers grounded answers across your notes and the optional in-meeting
-            voice assistant. Claude (cloud) is fastest for live use; local models
-            keep everything on-device but are slower in real time.
-          </p>
-        </div>
-
-        <label class="field">
-          <span class="field-label">Assistant backend</span>
-          <select formControlName="brainBackend">
-            <option value="cloud">Claude (cloud) — recommended for live</option>
-            <option value="local">Local model — fully on-device</option>
-            <option value="off">Off</option>
-          </select>
-          <span class="field-help text-muted">
-            @switch (form.controls.brainBackend.value) {
-              @case ("local") {
-                Runs a local GGUF model on this Mac — private, but large models
-                are slow for realtime. Pick a model below.
-              }
-              @case ("off") {
-                The brain and the in-meeting voice assistant are disabled.
-              }
-              @default {
-                Sends your (redacted) text to Anthropic's cloud — lowest latency,
-                best for the live voice assistant.
-              }
-            }
-          </span>
-        </label>
-
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">In-meeting voice assistant</span>
-            <span class="text-secondary toggle-sub">
-              Listen for your wake phrase during a recording and answer grounded
-              questions live, with sources. Off by default — it adds listening
-              and (for cloud) sends audio-derived text mid-meeting.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="realtimeReactions" />
-        </label>
-
-        <!--
-          Proactive cloud-egress consent (issue 20). The in-meeting assistant
-          dispatches voice actions through the active provider. With a cloud
-          provider (claude_code or anthropic, mirroring the backend is_cloud
-          gate) it uploads mid-meeting context, and the dispatch is fail-closed
-          behind cloud_egress_consented. Surface the requirement at enable time.
-          Condition: realtime on, cloud provider, brain not off, not consented.
-          Reuses the existing consent flow (allowCloudProcessing). In-flow
-          warning, so the frosted banner is correct (no opaque overlay needed).
-        -->
-        @if (
-          form.controls.realtimeReactions.value &&
-          form.controls.brainBackend.value === "cloud" &&
-          (form.controls.providerId.value === "claude_code" ||
-            form.controls.providerId.value === "anthropic") &&
-          !cloudConsented()
-        ) {
-          <div class="banner is-warning realtime-consent">
-            <span class="realtime-consent-copy">
-              ⚠ Asystent w spotkaniu wysyła kontekst do chmury — zezwól na
-              przetwarzanie w chmurze, inaczej odpowiedzi na żywo nie zadziałają.
-            </span>
-            <div class="cloud-consent-row">
-              <button
-                type="button"
-                class="btn btn-primary"
-                (click)="allowCloudProcessing()"
-                [disabled]="consenting()"
-              >
-                @if (consenting()) {
-                  <span class="spin-ring" aria-hidden="true"></span>
-                  Enabling…
-                } @else {
-                  Allow
-                }
-              </button>
-              <span class="text-muted cloud-consent-hint">
-                One-time, redacted first. Same consent as cloud summaries.
-              </span>
-            </div>
-            @if (consentError(); as cerr) {
-              <p class="text-danger privacy-note">{{ cerr }}</p>
-            }
-          </div>
-        }
-
-        <!-- Model + reasoning-effort overrides for the active cloud provider. -->
-        <div class="brain-tuning">
-          <label class="field">
-            <span class="field-label">Model</span>
-            <select formControlName="providerModel">
-              <option value="">Default (provider's pick)</option>
-              <option value="claude-opus-4-8">Opus 4.8</option>
-              <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-              <option value="claude-haiku-4-5">Haiku 4.5</option>
-            </select>
-            <span class="field-help text-muted">
-              Overrides the model used for grounded answers — leave on Default to
-              let the provider choose.
-            </span>
-          </label>
-
-          @if (form.controls.providerId.value === "anthropic") {
-            <label class="field">
-              <span class="field-label">Reasoning effort</span>
-              <select formControlName="providerEffort">
-                <option value="">Default</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
-              <span class="field-help text-muted">
-                Applies to the Anthropic provider — higher effort spends more
-                thinking on harder questions.
-              </span>
-            </label>
-          }
-        </div>
-
-        <!-- Local model picker — only meaningful for the local backend. -->
-        @if (form.controls.brainBackend.value === "local") {
-          <div class="brain-models">
-            <div class="brain-models-head">
-              <span class="brain-models-label text-muted">Local models</span>
-              <button
-                type="button"
-                class="btn btn-sm"
-                (click)="refreshBrainModels()"
-                [disabled]="brainModelsLoading()"
-              >
-                {{ brainModelsLoading() ? "Loading…" : "Refresh" }}
-              </button>
-            </div>
-
-            <p class="brain-note text-muted">
-              Big local models are slow for the realtime voice assistant —
-              Claude (cloud) is recommended for live answers. Local is best for
-              private, non-time-critical analysis.
-            </p>
-
-            @if (brainModels(); as models) {
-              @if (models.length === 0 && !brainModelsLoading()) {
-                <p class="brain-empty text-muted">
-                  No local models available.
-                </p>
-              } @else {
-                <ul class="brain-model-list">
-                  @for (m of models; track m.id) {
-                    <li
-                      class="brain-model-row"
-                      [class.is-unfit]="!m.fitsRam"
-                      [class.is-selected]="m.selected"
-                    >
-                      <div class="brain-model-info">
-                        <span class="brain-model-name">
-                          {{ m.name }}
-                          @if (m.selected) {
-                            <span class="pill is-success brain-inline-pill">
-                              <span class="pill-dot"></span>
-                              In use
-                            </span>
-                          }
-                        </span>
-                        <span class="brain-model-meta text-muted">
-                          {{ m.sizeLabel }} · needs ≥{{ m.minRamGb }} GB RAM
-                          @if (m.languages.length > 0) {
-                            · {{ m.languages.join("/") }}
-                          }
-                        </span>
-                        @if (!m.fitsRam) {
-                          <span class="pill is-warning brain-fit-pill">
-                            <span class="pill-dot"></span>
-                            May not fit this Mac's RAM
-                          </span>
-                        }
-                      </div>
-
-                      <div class="brain-model-actions">
-                        @if (brainDownloadingId() === m.id) {
-                          <div class="brain-progress" role="status">
-                            <div class="brain-progress-track" aria-hidden="true">
-                              <div
-                                class="brain-progress-fill"
-                                [style.width.%]="brainDownloadFrac() * 100"
-                              ></div>
-                            </div>
-                            <span class="brain-progress-label text-muted">
-                              Downloading… {{ brainPct() }}
-                            </span>
-                          </div>
-                        } @else if (m.downloaded) {
-                          <button
-                            type="button"
-                            class="btn btn-sm"
-                            (click)="useBrainModel(m.id)"
-                            [disabled]="m.selected"
-                          >
-                            {{ m.selected ? "Selected" : "Use" }}
-                          </button>
-                        } @else {
-                          <button
-                            type="button"
-                            class="btn btn-primary btn-sm"
-                            (click)="downloadBrainModel(m.id)"
-                            [disabled]="brainDownloadingId() !== null"
-                          >
-                            Download
-                          </button>
-                        }
-                      </div>
-                    </li>
+              <span class="nav-icon" aria-hidden="true">
+                @switch (s.id) {
+                  @case ("appearance") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.6" /><path d="M8 1.5v1.6M8 12.9v1.6M2.4 2.4l1.1 1.1M12.5 12.5l1.1 1.1M1.5 8h1.6M12.9 8h1.6M2.4 13.6l1.1-1.1M12.5 3.5l1.1-1.1" /></svg>
                   }
-                </ul>
-              }
-            }
-
-            <label class="field brain-custom">
-              <span class="field-label">Custom GGUF model</span>
-              <input
-                formControlName="brainModelId"
-                placeholder="/path/to/model.gguf or a registry id"
-              />
-              <span class="field-help text-muted">
-                Advanced: point at your own GGUF file (or a registry id). Saved
-                with your settings.
+                  @case ("general") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 4.5h8M13 4.5h1M2 11.5h5M10 11.5h4" /><circle cx="11" cy="4.5" r="1.6" /><circle cx="8" cy="11.5" r="1.6" /></svg>
+                  }
+                  @case ("transcription") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 8h1.5M5 5v6M8 2.5v11M11 5v6M14 8h-1.5" /></svg>
+                  }
+                  @case ("audio") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="1.5" width="4" height="8" rx="2" /><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5" /></svg>
+                  }
+                  @case ("notes") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5l3 3v10H4z" /><path d="M9 1.5v3h3M5.8 8h4.4M5.8 10.6h4.4" /></svg>
+                  }
+                  @case ("brain") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 9 5l2.8 1L9 7l-1 2.8L7 7 4.2 6 7 5z" /><path d="M12 9.5l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5L9.4 11.6l1.5-.6z" /></svg>
+                  }
+                  @case ("connectors") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c1.8 1.7 2.8 3.9 2.8 6.2S9.8 12.5 8 14.2C6.2 12.5 5.2 10.3 5.2 8S6.2 3.5 8 1.8z" /></svg>
+                  }
+                  @case ("providers") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="4.5" rx="1.4" /><rect x="2" y="9" width="12" height="4.5" rx="1.4" /><path d="M4.4 4.75h.01M4.4 11.25h.01" /></svg>
+                  }
+                  @case ("privacy") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.6 3 3.5v3.4c0 3 2 5.3 5 6.1 3-.8 5-3.1 5-6.1V3.5L8 1.6z" /><path d="M6 7.7 7.4 9.1 10 6.3" /></svg>
+                  }
+                  @case ("obsidian") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.8 2.8 5.3 4.7 12 7 14l-.8-6z" /><path d="M6 1.8 6.2 8 7 14l3.4-2.6L12 5.4 9 2z" /></svg>
+                  }
+                }
               </span>
-            </label>
+              <span class="nav-label">{{ s.label }}</span>
+            </button>
+          } @empty {
+            <p class="nav-empty text-muted">
+              No settings match “{{ searchQuery() }}”.
+            </p>
+          }
+        </nav>
 
-            @if (brainError(); as berr) {
-              <p class="text-danger brain-error">{{ berr }}</p>
-            }
+        <!-- Save applies the whole form regardless of the visible section. -->
+        <div class="sidebar-footer">
+          <button type="button" class="btn btn-primary sidebar-save" (click)="save()">
+            Save settings
+          </button>
+          @if (saved()) {
+            <span class="pill is-success saved-pill">
+              <span class="pill-dot"></span>
+              Saved
+            </span>
+          }
+        </div>
+      </aside>
+
+      <!-- Right pane: the selected section's controls. -->
+      <div class="settings-content">
+        @if (loadError(); as err) {
+          <div class="banner is-danger" role="alert">
+            <span class="banner-icon" aria-hidden="true">!</span>
+            <span>Couldn't load settings: {{ err }}</span>
           </div>
         }
 
-        <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
-        <div class="semantic">
-          <label class="toggle-row">
-            <span class="toggle-copy">
-              <span class="toggle-title">Semantic search (multilingual)</span>
-              <span class="text-secondary toggle-sub">
-                Finds notes by meaning + across languages — needs the embedding
-                model.
-              </span>
-            </span>
-            <input type="checkbox" formControlName="semanticSearchEnabled" />
-          </label>
+        <header class="content-header">
+          <h2>{{ activeSectionLabel() }}</h2>
+        </header>
 
-          <!-- Embedding model: present pill, or a download control with progress -->
-          <div class="semantic-model-row">
-            @if (embedModelPresent() === true) {
-              <span class="pill is-success">
-                <span class="pill-dot"></span>
-                Embedding model ready ✓
-              </span>
-              <span class="text-muted semantic-note">
-                Stored on this Mac — used to index + search your notes.
-              </span>
-            } @else if (embedModelPresent() === false) {
-              @if (downloadingEmbedModel()) {
-                <div class="semantic-progress" role="status">
-                  <div class="semantic-progress-track" aria-hidden="true">
-                    <div
-                      class="semantic-progress-fill"
-                      [style.width.%]="embedDownloadFrac() * 100"
-                    ></div>
-                  </div>
-                  <span class="semantic-progress-label text-muted">
-                    Downloading embedding model… {{ embedPct() }}
+        <div class="section-body">
+          @switch (activeSection()) {
+            <!-- ── Appearance: Light / Dark / System theme (applies instantly) ── -->
+            @case ("appearance") {
+              <div class="card appearance-card">
+                <div class="appearance-copy">
+                  <h3>Appearance</h3>
+                  <p class="text-secondary">
+                    Choose how Murmur looks. <b>System</b> follows your macOS
+                    Light/Dark setting automatically.
+                  </p>
+                </div>
+                <div class="theme-seg" role="group" aria-label="Theme">
+                  <button
+                    type="button"
+                    [class.active]="themeMode() === 'light'"
+                    [attr.aria-pressed]="themeMode() === 'light'"
+                    (click)="setTheme('light')"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+                    Light
+                  </button>
+                  <button
+                    type="button"
+                    [class.active]="themeMode() === 'dark'"
+                    [attr.aria-pressed]="themeMode() === 'dark'"
+                    (click)="setTheme('dark')"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" /></svg>
+                    Dark
+                  </button>
+                  <button
+                    type="button"
+                    [class.active]="themeMode() === 'system'"
+                    [attr.aria-pressed]="themeMode() === 'system'"
+                    (click)="setTheme('system')"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
+                    System
+                  </button>
+                </div>
+              </div>
+            }
+
+            <!-- ── General ── -->
+            @case ("general") {
+              <div class="card">
+                <fieldset>
+                  <legend>General</legend>
+
+                  <label class="field">
+                    <span class="field-label">Provider</span>
+                    <select formControlName="providerId">
+                      <option value="claude_code">Claude Code (default)</option>
+                      <option value="anthropic">Anthropic API</option>
+                      <option value="ollama">Ollama</option>
+                      <option value="gateway">AI Gateway (OpenAI-compatible)</option>
+                    </select>
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">Vault folder</span>
+                    <span class="row">
+                      <input formControlName="vaultPath" placeholder="/path/to/vault" />
+                      <button type="button" class="btn" (click)="pickVault()">
+                        Browse…
+                      </button>
+                    </span>
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">Vault subfolder</span>
+                    <input formControlName="vaultSubfolder" placeholder="Meetings" />
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label"
+                      >Whisper model path (optional override)</span
+                    >
+                    <span class="row">
+                      <input
+                        formControlName="whisperModelPath"
+                        placeholder="leave blank — auto-managed in Transcription model above"
+                      />
+                      <button type="button" class="btn" (click)="pickModel()">
+                        Browse…
+                      </button>
+                    </span>
+                  </label>
+                </fieldset>
+              </div>
+
+              <div class="card setup-card">
+                <div class="setup-copy">
+                  <span class="setup-title">First-run setup</span>
+                  <span class="text-secondary setup-sub">
+                    Re-open the guided wizard. Your existing settings are preserved
+                    and prefilled.
                   </span>
                 </div>
-              } @else {
-                <button
-                  type="button"
-                  class="btn btn-primary btn-sm"
-                  (click)="downloadEmbedModel()"
-                >
-                  Download embedding model (~120 MB)
-                </button>
-                <span class="text-muted semantic-note">
-                  One time, on-device — required before semantic search can index.
-                </span>
-              }
-            } @else {
-              <span class="pill">
-                <span class="pill-dot"></span>
-                Checking…
-              </span>
-            }
-          </div>
-          @if (embedDownloadError(); as eerr) {
-            <p class="text-danger brain-error">{{ eerr }}</p>
-          }
-
-          <!-- Re-index notes: backfill the semantic vector index over all notes -->
-          <div class="semantic-reindex">
-            <button
-              type="button"
-              class="btn btn-sm"
-              (click)="reindexEmbeddings()"
-              [disabled]="reindexing()"
-            >
-              @if (reindexing()) {
-                <span class="spin-ring" aria-hidden="true"></span>
-                Re-indexing…
-              } @else {
-                Re-index notes
-              }
-            </button>
-            <span class="text-muted semantic-note">
-              Builds the semantic index over your notes — run it after turning
-              this on, or after downloading the model.
-            </span>
-          </div>
-          @if (reindexing()) {
-            <div class="semantic-progress" role="status">
-              <div class="semantic-progress-track" aria-hidden="true">
-                <div
-                  class="semantic-progress-fill"
-                  [style.width.%]="reindexFrac() * 100"
-                ></div>
-              </div>
-              <span class="semantic-progress-label text-muted">
-                Indexing notes… {{ reindexPct() }}
-              </span>
-            </div>
-          }
-          @if (reindexResult(); as rr) {
-            @if (rr.status === "model_missing") {
-              <p class="semantic-nudge text-secondary">
-                Download the embedding model above first — semantic search can't
-                index without it.
-              </p>
-            } @else {
-              <span class="pill is-success semantic-done-pill">
-                <span class="pill-dot"></span>
-                Indexed {{ rr.indexed }} of {{ rr.total }} notes
-              </span>
-            }
-          }
-          @if (reindexError(); as rerr) {
-            <p class="text-danger brain-error">{{ rerr }}</p>
-          }
-        </div>
-      </div>
-
-      <!-- Connectors — web search (NEW CLOUD EGRESS, surfaced loudly) -->
-      <div class="card connectors-card">
-        <div class="brain-copy">
-          <h3>Connectors</h3>
-          <p class="text-secondary brain-sub">
-            Let the brain reach beyond your notes. Connectors are
-            <strong>off by default</strong> — each one that leaves this Mac asks
-            for an explicit, one-time consent first.
-          </p>
-        </div>
-
-        <!-- Web search (Brave) connector -->
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Web search</span>
-            <span class="text-secondary toggle-sub">
-              When enabled (and allowed below, with a key), the assistant can
-              look facts up on the web and cite them. Answers stay grounded in
-              your notes first; web results are added as “via web” sources.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="webSearchEnabled" />
-        </label>
-
-        @if (form.controls.webSearchEnabled.value) {
-          <!-- Egress banner — make the new off-device path impossible to miss. -->
-          <p class="banner is-warning connector-egress" role="note">
-            <strong>This sends data off your Mac.</strong> When the brain runs a
-            web search, your (redacted) query leaves the device and goes to the
-            search provider (Brave). Only the query is sent — never your notes or
-            transcript. Disable this, or skip the consent below, to keep
-            everything local.
-          </p>
-
-          <!-- BYO API key (Brave) -->
-          <fieldset class="connector-fieldset">
-            <legend>Brave Search API key</legend>
-            <div class="key-status">
-              <span class="text-secondary">Status</span>
-              @if (hasWebKey()) {
-                <span class="pill is-success">
-                  <span class="pill-dot"></span>
-                  Key set ✓
-                </span>
-              } @else {
-                <span class="pill">
-                  <span class="pill-dot"></span>
-                  Not set
-                </span>
-              }
-            </div>
-            <span class="row">
-              <input
-                type="password"
-                [formControl]="webKeyControl"
-                placeholder="Brave Search API key"
-                autocomplete="off"
-              />
-              <button
-                type="button"
-                class="btn"
-                (click)="saveWebKey()"
-                [disabled]="savingWebKey()"
-              >
-                {{ savingWebKey() ? "Saving…" : "Save key" }}
-              </button>
-            </span>
-            <span class="field-help text-muted">
-              Bring your own key — it's stored in your macOS Keychain, never
-              logged, and never leaves with your notes.
-            </span>
-            @if (webKeyError(); as wkerr) {
-              <p class="text-danger brain-error">{{ wkerr }}</p>
-            }
-          </fieldset>
-
-          <!-- One-time egress consent (mirrors the Cloud-processing UX) -->
-          <div class="privacy-section connector-consent">
-            <span class="privacy-section-label text-muted"
-              >Allow web search</span
-            >
-            <p class="text-secondary privacy-note">
-              Your search query leaves this device for the search provider
-              (redacted first). Until you allow this once, web search stays off
-              and no query is ever sent.
-            </p>
-            @if (webConsented()) {
-              <span class="pill is-success cloud-consent-pill">
-                <span class="pill-dot"></span>
-                Web search allowed
-              </span>
-            } @else {
-              <div class="cloud-consent-row">
-                <button
-                  type="button"
-                  class="btn btn-primary"
-                  (click)="allowWebSearch()"
-                  [disabled]="webConsenting()"
-                >
-                  @if (webConsenting()) {
-                    <span class="spin-ring" aria-hidden="true"></span>
-                    Enabling…
-                  } @else {
-                    Allow web search
-                  }
-                </button>
-                <span class="text-muted cloud-consent-hint">
-                  One-time. The brain works fully offline on your notes without
-                  it.
-                </span>
-              </div>
-            }
-            @if (webConsentError(); as wcerr) {
-              <p class="text-danger privacy-note">{{ wcerr }}</p>
-            }
-          </div>
-        }
-      </div>
-
-      <!-- Works with Obsidian — optional vault companion -->
-      <div class="card obsidian-card">
-        <div class="obsidian-head">
-          <span class="obsidian-mark" aria-hidden="true">
-            <svg
-              viewBox="0 0 24 24"
-              width="30"
-              height="30"
-              fill="none"
-              role="img"
-              aria-label="Obsidian"
-            >
-              <defs>
-                <linearGradient
-                  id="obs-face-a"
-                  x1="3"
-                  y1="2"
-                  x2="20"
-                  y2="22"
-                  gradientUnits="userSpaceOnUse"
-                >
-                  <stop stop-color="var(--accent-hover)" />
-                  <stop offset="1" stop-color="var(--accent-active)" />
-                </linearGradient>
-                <linearGradient
-                  id="obs-face-b"
-                  x1="11"
-                  y1="2"
-                  x2="22"
-                  y2="20"
-                  gradientUnits="userSpaceOnUse"
-                >
-                  <stop stop-color="#b79bff" />
-                  <stop offset="1" stop-color="var(--accent)" />
-                </linearGradient>
-              </defs>
-              <path
-                d="M9.4 2.3 4 8.1l3.1 10.2L11 22l-1.3-9.5L9.4 2.3Z"
-                fill="url(#obs-face-a)"
-              />
-              <path
-                d="M9.4 2.3 9.7 12.5 11 22l5.6-4.2L20 8.4 14.6 2.6 9.4 2.3Z"
-                fill="url(#obs-face-b)"
-              />
-              <path
-                d="M9.7 12.5 9.4 2.3l5.2.3-.7 8 .9 1.9-5.1.0Z"
-                fill="#ffffff"
-                fill-opacity="0.16"
-              />
-            </svg>
-          </span>
-          <div class="obsidian-copy">
-            <h3>Works with Obsidian</h3>
-            <p class="text-secondary obsidian-sub">
-              Murmur saves each meeting as a Markdown note in your Obsidian
-              vault. Obsidian is <strong>optional</strong> — you can read every
-              recording, AI summary and transcript right here in Murmur (the
-              Meetings tab, with audio playback). Want the full vault
-              experience?
-            </p>
-          </div>
-        </div>
-
-        <div class="obsidian-get">
-          <span class="obsidian-get-label text-muted"
-            >Get Obsidian — it's free</span
-          >
-          <span class="obsidian-url-row">
-            <span class="obsidian-url" role="text">{{ obsidianUrl }}</span>
-            <button
-              type="button"
-              class="btn obsidian-copy-btn"
-              [class.is-copied]="urlCopied()"
-              (click)="copyObsidianUrl()"
-              [attr.aria-label]="
-                urlCopied() ? 'Copied' : 'Copy ' + obsidianUrl + ' to clipboard'
-              "
-            >
-              @if (urlCopied()) {
-                <svg
-                  class="obsidian-copy-icon"
-                  viewBox="0 0 16 16"
-                  width="14"
-                  height="14"
-                  aria-hidden="true"
-                >
-                  <path
-                    d="M3 8.5 6.2 12 13 4.5"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.8"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-                Copied
-              } @else {
-                <svg
-                  class="obsidian-copy-icon"
-                  viewBox="0 0 16 16"
-                  width="14"
-                  height="14"
-                  aria-hidden="true"
-                >
-                  <rect
-                    x="5.5"
-                    y="5.5"
-                    width="8"
-                    height="8"
-                    rx="2"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                  />
-                  <path
-                    d="M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-                Copy
-              }
-            </button>
-          </span>
-        </div>
-      </div>
-
-      <!-- Provider configuration -->
-      <div class="card">
-        <fieldset>
-          <legend>Provider configuration</legend>
-
-          <label class="field">
-            <span class="field-label">Anthropic model</span>
-            <input formControlName="anthropicModel" />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Ollama base URL</span>
-            <input formControlName="ollamaBaseUrl" />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Ollama model</span>
-            <input formControlName="ollamaModel" />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Claude binary</span>
-            <input formControlName="claudeBinary" />
-          </label>
-
-          <label class="toggle-row">
-            <span class="toggle-copy">
-              <span class="toggle-title">Pass shell environment to the Claude CLI</span>
-              <span class="text-secondary toggle-sub">
-                Restores older-version behavior: an ANTHROPIC_API_KEY (and proxy /
-                base-URL vars) set in your shell reach the claude CLI again, so it
-                can authenticate via your env key. Off by default for security — your
-                database encryption keys are never passed through.
-              </span>
-            </span>
-            <input type="checkbox" formControlName="claudeCodeInheritEnv" />
-          </label>
-        </fieldset>
-      </div>
-
-      <!-- Microphone input device -->
-      <div class="card">
-        <label class="field">
-          <span class="field-label">Microphone</span>
-          <select formControlName="inputDevice">
-            <option value="">System default</option>
-            @for (dev of inputDevices(); track dev.name) {
-              <option [value]="dev.name">
-                {{ dev.name }}{{ dev.isDefault ? " (default)" : "" }}
-              </option>
-            }
-          </select>
-          <span class="field-help text-muted">
-            Which microphone to record. “System default” follows your macOS input
-            selection; a chosen device falls back to the default if it’s unplugged.
-          </span>
-        </label>
-      </div>
-
-      <!-- Capture system audio — toggle row -->
-      <div class="card">
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Capture system audio</span>
-            <span class="text-secondary toggle-sub">
-              Records the other side of the call — needs the Screen Recording
-              permission on first use.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="captureSystemAudio" />
-        </label>
-      </div>
-
-      <!-- Smart transcription (VAD) — toggle row -->
-      <div class="card">
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Smart speech detection</span>
-            <span class="text-secondary toggle-sub">
-              Skips silence and resets context between pauses for cleaner, faster
-              transcripts (voice-activity detection). Recommended.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="vadEnabled" />
-        </label>
-      </div>
-
-      <!-- High-fidelity masters — toggle row -->
-      <div class="card">
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Keep high-fidelity masters</span>
-            <span class="text-secondary toggle-sub">
-              Archive faithful per-stream float32 recordings (mic + system)
-              alongside the standard mix. Best quality; roughly doubles audio disk
-              use per meeting.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="keepHiresMasters" />
-        </label>
-      </div>
-
-      <!-- Speaker diarization — toggle row -->
-      <div class="card">
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Identify remote speakers</span>
-            <span class="text-secondary toggle-sub">
-              Label individual people on the other side of the call (Speaker
-              1/2/3) instead of one “Others”. Needs system-audio capture;
-              downloads ~40 MB of models on first use.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="diarizeOthers" />
-        </label>
-      </div>
-
-      <!-- Echo cancellation (experimental) — toggle row -->
-      <div class="card">
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Cancel speaker echo (experimental)</span>
-            <span class="text-secondary toggle-sub">
-              When recording without headphones, apply system echo cancellation to
-              the microphone used for transcription. Experimental — headphones are
-              still the most reliable fix.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="aecEnabled" />
-        </label>
-      </div>
-
-      <!-- Voice trigger — toggle row -->
-      <div class="card">
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Voice trigger</span>
-            <span class="text-secondary toggle-sub">
-              Start recording hands-free when you say “start recording”. Listens
-              with your Whisper model while idle.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="voiceTrigger" />
-        </label>
-      </div>
-
-      <!-- AI Gateway configuration (shown only when "gateway" provider is selected) -->
-      @if (form.controls.providerId.value === 'gateway') {
-        <div class="card gateway-card">
-          <fieldset>
-            <legend>AI Gateway</legend>
-
-            <label class="field">
-              <span class="field-label">Base URL</span>
-              <input
-                formControlName="gatewayBaseUrl"
-                placeholder="http://localhost:4000/v1"
-                autocomplete="off"
-                spellcheck="false"
-              />
-              @if (gatewayUrlWarning()) {
-                <span class="field-help text-danger">
-                  Use https:// (http:// is allowed only for localhost).
-                </span>
-              }
-              <span class="field-help text-muted">
-                Enter your gateway's OpenAI-compatible base URL (e.g.
-                https://…/v1) — or the full chat-completions endpoint if
-                your gateway uses a custom route (e.g. a Kong serverless
-                route like https://…/test).
-              </span>
-            </label>
-
-            <div class="field">
-              <span class="field-label">Model</span>
-              <div class="gateway-model-row">
-                @if (gatewayModels().length > 0) {
-                  <select formControlName="gatewayModel" class="gateway-model-select">
-                    <option value="">Gateway default</option>
-                    @for (m of gatewayModels(); track m.id) {
-                      <option [value]="m.id">{{ m.id }}</option>
-                    }
-                    <!--
-                      If the currently-saved model is not in the catalog (e.g. the
-                      catalog changed), keep it selectable so a manually-typed value
-                      is never silently lost. gatewayModelIsCustom() is a computed
-                      to avoid arrow-function syntax in the template.
-                    -->
-                    @if (gatewayModelIsCustom()) {
-                      <option [value]="form.controls.gatewayModel.value">
-                        {{ form.controls.gatewayModel.value }} (custom)
-                      </option>
-                    }
-                  </select>
-                } @else {
-                  <input
-                    formControlName="gatewayModel"
-                    placeholder="gpt-4o (leave blank to use the gateway default)"
-                    autocomplete="off"
-                    spellcheck="false"
-                    class="gateway-model-input"
-                  />
-                }
-                <button
-                  type="button"
-                  class="btn btn-ghost gateway-model-refresh"
-                  (click)="refreshGatewayModels()"
-                  [disabled]="gatewayModelsLoading()"
-                  title="Fetch models from the gateway's /v1/models endpoint"
-                >
-                  @if (gatewayModelsLoading()) {
-                    Loading…
-                  } @else {
-                    ↻ Refresh models
-                  }
-                </button>
-              </div>
-              @if (gatewayModelError()) {
-                <span class="field-help text-muted">
-                  Couldn't load models — check the base URL and key, or type the
-                  model id manually.
-                </span>
-              } @else {
-                <span class="field-help text-muted">
-                  Sent as the <code>model</code> field in every request — leave
-                  blank to let the gateway choose.
-                </span>
-              }
-            </div>
-
-            <!-- AI Gateway (Phase 4) — health probe -->
-            <div class="gateway-health-row">
-              <span class="text-secondary">Gateway status</span>
-              <div class="gateway-health-status">
-                @if (gatewayHealth(); as h) {
-                  @if (h.reachable) {
-                    <span class="pill is-success">
-                      <span class="pill-dot"></span>
-                      {{ h.modelCount }} {{ h.modelCount === 1 ? 'model' : 'models' }} reachable
-                    </span>
-                  } @else {
-                    <span class="pill">
-                      <span class="pill-dot gateway-dot-unreachable"></span>
-                      Gateway unreachable
-                    </span>
-                  }
-                } @else {
-                  <span class="text-muted gateway-health-hint">Not checked</span>
-                }
-                <button
-                  type="button"
-                  class="btn btn-ghost gateway-health-btn"
-                  (click)="checkGatewayHealth()"
-                  [disabled]="gatewayHealthChecking()"
-                >
-                  @if (gatewayHealthChecking()) {
-                    Checking…
-                  } @else {
-                    Check
-                  }
-                </button>
-              </div>
-            </div>
-
-            <!-- Gateway API key (optional) -->
-            <div class="key-status">
-              <span class="text-secondary">
-                API key
-                <span class="text-muted">(optional)</span>
-              </span>
-              @if (hasGatewayKey()) {
-                <span class="pill is-success">
-                  <span class="pill-dot"></span>
-                  Set
-                </span>
-              } @else {
-                <span class="pill">
-                  <span class="pill-dot"></span>
-                  Not set
-                </span>
-              }
-            </div>
-            <span class="row">
-              <input
-                type="password"
-                [formControl]="gatewayKeyControl"
-                placeholder="sk-… or any bearer token"
-                autocomplete="new-password"
-              />
-              <button
-                type="button"
-                class="btn"
-                (click)="saveGatewayKey()"
-                [disabled]="!gatewayKeyControl.value.trim()"
-              >
-                Save key
-              </button>
-              @if (hasGatewayKey()) {
                 <button
                   type="button"
                   class="btn btn-ghost"
-                  (click)="removeGatewayKey()"
+                  (click)="rerunOnboarding()"
                 >
-                  Clear
+                  Run setup again
                 </button>
-              }
-            </span>
-            @if (gatewayKeyError()) {
-              <p class="text-danger gateway-key-error">{{ gatewayKeyError() }}</p>
-            }
-          </fieldset>
-
-          <!-- Destination banner: calmer note for localhost, warning for remote -->
-          @if (gatewayDestination(); as dest) {
-            @if (dest.isRemote) {
-              <div class="banner is-warning gateway-banner">
-                <span class="banner-icon" aria-hidden="true">!</span>
-                <span>
-                  Content will be sent to <strong>{{ dest.host }}</strong> over
-                  the network — always scrubbed by the redaction firewall first
-                  and requires cloud-egress consent.
-                </span>
-              </div>
-            } @else {
-              <div class="banner gateway-banner">
-                <span class="banner-icon" aria-hidden="true">i</span>
-                <span>
-                  Localhost gateway — a local gateway can still forward to the
-                  cloud, so content is still redacted and consent-gated.
-                </span>
               </div>
             }
-          }
-        </div>
-      }
 
-      <!-- Anthropic API key -->
-      <div class="card">
-        <fieldset>
-          <legend>Anthropic API key</legend>
-          <div class="key-status">
-            <span class="text-secondary">Status</span>
-            @if (hasKey()) {
-              <span class="pill is-success">
-                <span class="pill-dot"></span>
-                Set
-              </span>
-            } @else {
-              <span class="pill">
-                <span class="pill-dot"></span>
-                Not set
-              </span>
-            }
-          </div>
-          <span class="row">
-            <input
-              type="password"
-              [formControl]="keyControl"
-              placeholder="sk-ant-…"
-            />
-            <button type="button" class="btn" (click)="saveKey()">
-              Save key
-            </button>
-          </span>
-        </fieldset>
-      </div>
+            <!-- ── Transcription model: language + quality + on-demand download ── -->
+            @case ("transcription") {
+              <div class="card model-card">
+                <div class="model-copy">
+                  <h3>Transcription model</h3>
+                  <p class="text-secondary model-sub">
+                    Runs entirely on-device. Pick your language and quality — the
+                    matching Whisper model is fetched once and reused for every
+                    recording.
+                  </p>
+                </div>
 
-      <!-- Actions -->
-      <div class="actions">
-        <button type="button" class="btn btn-primary" (click)="save()">
-          Save settings
-        </button>
-        <button type="button" class="btn" (click)="refreshProviders()">
-          Check providers
-        </button>
-        @if (saved()) {
-          <span class="pill is-success saved-pill">
-            <span class="pill-dot"></span>
-            Saved
-          </span>
-        }
-        <button
-          type="button"
-          class="btn btn-ghost rerun-setup"
-          (click)="rerunOnboarding()"
-        >
-          Run setup again
-        </button>
-      </div>
+                <div class="model-grid">
+                  <label class="field">
+                    <span class="field-label">Language</span>
+                    <select formControlName="language" (change)="onModelChoiceChange()">
+                      <option value="">Auto-detect</option>
+                      <option value="pl">Polski</option>
+                      <option value="en">English</option>
+                      <option value="de">Deutsch</option>
+                      <option value="es">Español</option>
+                      <option value="fr">Français</option>
+                      <option value="it">Italiano</option>
+                      <option value="pt">Português</option>
+                      <option value="uk">Українська</option>
+                      <option value="nl">Nederlands</option>
+                    </select>
+                    <span class="field-help text-muted">
+                      Force the transcription language. Polish recommended if you record
+                      mostly in Polish (auto-detect can misfire on short clips).
+                    </span>
+                  </label>
 
-      <!-- Provider availability -->
-      <div class="card">
-        <h3>Provider availability</h3>
-        <ul class="provider-list">
-          @for (p of providers(); track p.id) {
-            <li class="provider-row">
-              <span class="provider-name">{{ p.id }}</span>
-              @if (p.available) {
-                <span class="pill is-success">
-                  <span class="pill-dot"></span>
-                  Available
-                </span>
-              } @else {
-                <span class="provider-unavailable">
-                  <span class="pill is-danger">
-                    <span class="pill-dot"></span>
-                    Unavailable
-                  </span>
-                  @if (p.reason) {
-                    <span class="text-muted provider-reason">{{
-                      p.reason
-                    }}</span>
+                  <label class="field">
+                    <span class="field-label">Quality</span>
+                    <select
+                      formControlName="modelSize"
+                      (change)="onModelChoiceChange()"
+                    >
+                      <option value="tiny">Tiny — fastest (~75 MB)</option>
+                      <option value="base">Base (~150 MB)</option>
+                      <option value="small">Small (~470 MB)</option>
+                      <option value="medium">Medium (~1.5 GB)</option>
+                      <option value="large-v3-turbo">
+                        Large v3 Turbo — fast &amp; accurate (~1.6 GB)
+                      </option>
+                      <option value="large-v3">
+                        Large v3 — best accuracy, recommended (~3 GB)
+                      </option>
+                    </select>
+                    <span class="field-help text-muted">
+                      Large v3 is the most accurate and the default — it’s a one-time ~3
+                      GB download. Turbo is nearly as good and much smaller.
+                    </span>
+                  </label>
+                </div>
+
+                <div class="model-status-row">
+                  @if (modelPresent() === true) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Downloaded ✓
+                    </span>
+                    <span class="text-muted model-note">
+                      Stored on this Mac — used for every recording.
+                    </span>
+                  } @else if (modelPresent() === false) {
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="downloadModel()"
+                      [disabled]="downloadingModel()"
+                    >
+                      @if (downloadingModel()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Downloading…
+                      } @else {
+                        Download ({{ downloadHint() }})
+                      }
+                    </button>
+                    <span class="text-muted model-note">
+                      @if (downloadingModel()) {
+                        Fetching the model — large models can take a few minutes.
+                      } @else {
+                        {{ downloadHint() }}, one time, on-device.
+                      }
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Checking…
+                    </span>
                   }
-                </span>
+                </div>
+                @if (modelDownloadError(); as derr) {
+                  <p class="model-error text-danger">{{ derr }}</p>
+                }
+              </div>
+            }
+
+            <!-- ── Audio & Capture: mic + system audio + capture-quality toggles ── -->
+            @case ("audio") {
+              <!-- Microphone input device -->
+              <div class="card">
+                <label class="field">
+                  <span class="field-label">Microphone</span>
+                  <select formControlName="inputDevice">
+                    <option value="">System default</option>
+                    @for (dev of inputDevices(); track dev.name) {
+                      <option [value]="dev.name">
+                        {{ dev.name }}{{ dev.isDefault ? " (default)" : "" }}
+                      </option>
+                    }
+                  </select>
+                  <span class="field-help text-muted">
+                    Which microphone to record. “System default” follows your macOS input
+                    selection; a chosen device falls back to the default if it’s unplugged.
+                  </span>
+                </label>
+              </div>
+
+              <!-- Capture system audio — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Capture system audio</span>
+                    <span class="text-secondary toggle-sub">
+                      Records the other side of the call — needs the Screen Recording
+                      permission on first use.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="captureSystemAudio" />
+                </label>
+              </div>
+
+              <!-- Smart transcription (VAD) — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Smart speech detection</span>
+                    <span class="text-secondary toggle-sub">
+                      Skips silence and resets context between pauses for cleaner, faster
+                      transcripts (voice-activity detection). Recommended.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="vadEnabled" />
+                </label>
+              </div>
+
+              <!-- High-fidelity masters — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Keep high-fidelity masters</span>
+                    <span class="text-secondary toggle-sub">
+                      Archive faithful per-stream float32 recordings (mic + system)
+                      alongside the standard mix. Best quality; roughly doubles audio disk
+                      use per meeting.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="keepHiresMasters" />
+                </label>
+              </div>
+
+              <!-- Speaker diarization — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Identify remote speakers</span>
+                    <span class="text-secondary toggle-sub">
+                      Label individual people on the other side of the call (Speaker
+                      1/2/3) instead of one “Others”. Needs system-audio capture;
+                      downloads ~40 MB of models on first use.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="diarizeOthers" />
+                </label>
+              </div>
+
+              <!-- Echo cancellation (experimental) — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Cancel speaker echo (experimental)</span>
+                    <span class="text-secondary toggle-sub">
+                      When recording without headphones, apply system echo cancellation to
+                      the microphone used for transcription. Experimental — headphones are
+                      still the most reliable fix.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="aecEnabled" />
+                </label>
+              </div>
+
+              <!-- Voice trigger — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Voice trigger</span>
+                    <span class="text-secondary toggle-sub">
+                      Start recording hands-free when you say “start recording”. Listens
+                      with your Whisper model while idle.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="voiceTrigger" />
+                </label>
+              </div>
+            }
+
+            <!-- ── Notes: how Claude writes & files each meeting note ── -->
+            @case ("notes") {
+              <div class="card notes-card">
+                <div class="notes-copy">
+                  <h3>Notes</h3>
+                  <p class="text-secondary notes-sub">
+                    Shape how Claude writes each summary and where it lands in your
+                    vault.
+                  </p>
+                </div>
+
+                <label class="field">
+                  <span class="field-label">Summary style</span>
+                  <select formControlName="noteStyle">
+                    <option value="standard">Standard (balanced)</option>
+                    <option value="brief">Brief (TL;DR + actions)</option>
+                    <option value="detailed">Detailed (full depth)</option>
+                    <option value="action">Action-focused</option>
+                  </select>
+                  <span class="field-help text-muted">
+                    @switch (form.controls.noteStyle.value) {
+                      @case ("brief") {
+                        A tight TL;DR up top, then just the decisions and action items.
+                      }
+                      @case ("detailed") {
+                        The full picture — discussion, context, decisions and every
+                        follow-up.
+                      }
+                      @case ("action") {
+                        Front-loads who-does-what — owners, tasks and due dates first.
+                      }
+                      @default {
+                        A balanced summary, key points and action items — good for most
+                        meetings.
+                      }
+                    }
+                  </span>
+                </label>
+
+                <label class="field">
+                  <span class="field-label">Notes language</span>
+                  <select formControlName="noteLanguage">
+                    <option value="auto">Auto — match the meeting</option>
+                    <option value="en">English</option>
+                    <option value="pl">Polski</option>
+                    <option value="de">Deutsch</option>
+                    <option value="es">Español</option>
+                    <option value="fr">Français</option>
+                    <option value="it">Italiano</option>
+                    <option value="pt">Português</option>
+                    <option value="uk">Українська</option>
+                    <option value="nl">Nederlands</option>
+                  </select>
+                  <span class="field-help text-muted">
+                    @if (form.controls.noteLanguage.value === "auto") {
+                      The whole note (headings + content) is written in the meeting's
+                      language.
+                    } @else {
+                      The whole note is written in this language, whatever was spoken.
+                    }
+                  </span>
+                </label>
+
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Organize into thematic subfolders</span>
+                    <span class="text-secondary toggle-sub">
+                      Claude files each note into a topic subfolder of your vault (e.g.
+                      Standups, 1-1s, Acme Project).
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="autoOrganize" />
+                </label>
+              </div>
+            }
+
+            <!-- ── Brain / AI — the assistant backend + in-meeting voice assistant ── -->
+            @case ("brain") {
+              <div class="card brain-card">
+                <div class="brain-copy">
+                  <h3>Brain / AI</h3>
+                  <p class="text-secondary brain-sub">
+                    Powers grounded answers across your notes and the optional in-meeting
+                    voice assistant. Claude (cloud) is fastest for live use; local models
+                    keep everything on-device but are slower in real time.
+                  </p>
+                </div>
+
+                <label class="field">
+                  <span class="field-label">Assistant backend</span>
+                  <select formControlName="brainBackend">
+                    <option value="cloud">Claude (cloud) — recommended for live</option>
+                    <option value="local">Local model — fully on-device</option>
+                    <option value="off">Off</option>
+                  </select>
+                  <span class="field-help text-muted">
+                    @switch (form.controls.brainBackend.value) {
+                      @case ("local") {
+                        Runs a local GGUF model on this Mac — private, but large models
+                        are slow for realtime. Pick a model below.
+                      }
+                      @case ("off") {
+                        The brain and the in-meeting voice assistant are disabled.
+                      }
+                      @default {
+                        Sends your (redacted) text to Anthropic's cloud — lowest latency,
+                        best for the live voice assistant.
+                      }
+                    }
+                  </span>
+                </label>
+
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">In-meeting voice assistant</span>
+                    <span class="text-secondary toggle-sub">
+                      Listen for your wake phrase during a recording and answer grounded
+                      questions live, with sources. Off by default — it adds listening
+                      and (for cloud) sends audio-derived text mid-meeting.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="realtimeReactions" />
+                </label>
+
+                <!--
+                  Proactive cloud-egress consent (issue 20). The in-meeting assistant
+                  dispatches voice actions through the active provider. With a cloud
+                  provider (claude_code or anthropic, mirroring the backend is_cloud
+                  gate) it uploads mid-meeting context, and the dispatch is fail-closed
+                  behind cloud_egress_consented. Surface the requirement at enable time.
+                  Condition: realtime on, cloud provider, brain not off, not consented.
+                  Reuses the existing consent flow (allowCloudProcessing). In-flow
+                  warning, so the frosted banner is correct (no opaque overlay needed).
+                -->
+                @if (
+                  form.controls.realtimeReactions.value &&
+                  form.controls.brainBackend.value === "cloud" &&
+                  (form.controls.providerId.value === "claude_code" ||
+                    form.controls.providerId.value === "anthropic") &&
+                  !cloudConsented()
+                ) {
+                  <div class="banner is-warning realtime-consent">
+                    <span class="realtime-consent-copy">
+                      ⚠ Asystent w spotkaniu wysyła kontekst do chmury — zezwól na
+                      przetwarzanie w chmurze, inaczej odpowiedzi na żywo nie zadziałają.
+                    </span>
+                    <div class="cloud-consent-row">
+                      <button
+                        type="button"
+                        class="btn btn-primary"
+                        (click)="allowCloudProcessing()"
+                        [disabled]="consenting()"
+                      >
+                        @if (consenting()) {
+                          <span class="spin-ring" aria-hidden="true"></span>
+                          Enabling…
+                        } @else {
+                          Allow
+                        }
+                      </button>
+                      <span class="text-muted cloud-consent-hint">
+                        One-time, redacted first. Same consent as cloud summaries.
+                      </span>
+                    </div>
+                    @if (consentError(); as cerr) {
+                      <p class="text-danger privacy-note">{{ cerr }}</p>
+                    }
+                  </div>
+                }
+
+                <!-- Model + reasoning-effort overrides for the active cloud provider. -->
+                <div class="brain-tuning">
+                  <label class="field">
+                    <span class="field-label">Model</span>
+                    <select formControlName="providerModel">
+                      <option value="">Default (provider's pick)</option>
+                      <option value="claude-opus-4-8">Opus 4.8</option>
+                      <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                      <option value="claude-haiku-4-5">Haiku 4.5</option>
+                    </select>
+                    <span class="field-help text-muted">
+                      Overrides the model used for grounded answers — leave on Default to
+                      let the provider choose.
+                    </span>
+                  </label>
+
+                  @if (form.controls.providerId.value === "anthropic") {
+                    <label class="field">
+                      <span class="field-label">Reasoning effort</span>
+                      <select formControlName="providerEffort">
+                        <option value="">Default</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                      <span class="field-help text-muted">
+                        Applies to the Anthropic provider — higher effort spends more
+                        thinking on harder questions.
+                      </span>
+                    </label>
+                  }
+                </div>
+
+                <!-- Local model picker — only meaningful for the local backend. -->
+                @if (form.controls.brainBackend.value === "local") {
+                  <div class="brain-models">
+                    <div class="brain-models-head">
+                      <span class="brain-models-label text-muted">Local models</span>
+                      <button
+                        type="button"
+                        class="btn btn-sm"
+                        (click)="refreshBrainModels()"
+                        [disabled]="brainModelsLoading()"
+                      >
+                        {{ brainModelsLoading() ? "Loading…" : "Refresh" }}
+                      </button>
+                    </div>
+
+                    <p class="brain-note text-muted">
+                      Big local models are slow for the realtime voice assistant —
+                      Claude (cloud) is recommended for live answers. Local is best for
+                      private, non-time-critical analysis.
+                    </p>
+
+                    @if (brainModels(); as models) {
+                      @if (models.length === 0 && !brainModelsLoading()) {
+                        <p class="brain-empty text-muted">
+                          No local models available.
+                        </p>
+                      } @else {
+                        <ul class="brain-model-list">
+                          @for (m of models; track m.id) {
+                            <li
+                              class="brain-model-row"
+                              [class.is-unfit]="!m.fitsRam"
+                              [class.is-selected]="m.selected"
+                            >
+                              <div class="brain-model-info">
+                                <span class="brain-model-name">
+                                  {{ m.name }}
+                                  @if (m.selected) {
+                                    <span class="pill is-success brain-inline-pill">
+                                      <span class="pill-dot"></span>
+                                      In use
+                                    </span>
+                                  }
+                                </span>
+                                <span class="brain-model-meta text-muted">
+                                  {{ m.sizeLabel }} · needs ≥{{ m.minRamGb }} GB RAM
+                                  @if (m.languages.length > 0) {
+                                    · {{ m.languages.join("/") }}
+                                  }
+                                </span>
+                                @if (!m.fitsRam) {
+                                  <span class="pill is-warning brain-fit-pill">
+                                    <span class="pill-dot"></span>
+                                    May not fit this Mac's RAM
+                                  </span>
+                                }
+                              </div>
+
+                              <div class="brain-model-actions">
+                                @if (brainDownloadingId() === m.id) {
+                                  <div class="brain-progress" role="status">
+                                    <div class="brain-progress-track" aria-hidden="true">
+                                      <div
+                                        class="brain-progress-fill"
+                                        [style.width.%]="brainDownloadFrac() * 100"
+                                      ></div>
+                                    </div>
+                                    <span class="brain-progress-label text-muted">
+                                      Downloading… {{ brainPct() }}
+                                    </span>
+                                  </div>
+                                } @else if (m.downloaded) {
+                                  <button
+                                    type="button"
+                                    class="btn btn-sm"
+                                    (click)="useBrainModel(m.id)"
+                                    [disabled]="m.selected"
+                                  >
+                                    {{ m.selected ? "Selected" : "Use" }}
+                                  </button>
+                                } @else {
+                                  <button
+                                    type="button"
+                                    class="btn btn-primary btn-sm"
+                                    (click)="downloadBrainModel(m.id)"
+                                    [disabled]="brainDownloadingId() !== null"
+                                  >
+                                    Download
+                                  </button>
+                                }
+                              </div>
+                            </li>
+                          }
+                        </ul>
+                      }
+                    }
+
+                    <label class="field brain-custom">
+                      <span class="field-label">Custom GGUF model</span>
+                      <input
+                        formControlName="brainModelId"
+                        placeholder="/path/to/model.gguf or a registry id"
+                      />
+                      <span class="field-help text-muted">
+                        Advanced: point at your own GGUF file (or a registry id). Saved
+                        with your settings.
+                      </span>
+                    </label>
+
+                    @if (brainError(); as berr) {
+                      <p class="text-danger brain-error">{{ berr }}</p>
+                    }
+                  </div>
+                }
+
+                <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
+                <div class="semantic">
+                  <label class="toggle-row">
+                    <span class="toggle-copy">
+                      <span class="toggle-title">Semantic search (multilingual)</span>
+                      <span class="text-secondary toggle-sub">
+                        Finds notes by meaning + across languages — needs the embedding
+                        model.
+                      </span>
+                    </span>
+                    <input type="checkbox" formControlName="semanticSearchEnabled" />
+                  </label>
+
+                  <!-- Embedding model: present pill, or a download control with progress -->
+                  <div class="semantic-model-row">
+                    @if (embedModelPresent() === true) {
+                      <span class="pill is-success">
+                        <span class="pill-dot"></span>
+                        Embedding model ready ✓
+                      </span>
+                      <span class="text-muted semantic-note">
+                        Stored on this Mac — used to index + search your notes.
+                      </span>
+                    } @else if (embedModelPresent() === false) {
+                      @if (downloadingEmbedModel()) {
+                        <div class="semantic-progress" role="status">
+                          <div class="semantic-progress-track" aria-hidden="true">
+                            <div
+                              class="semantic-progress-fill"
+                              [style.width.%]="embedDownloadFrac() * 100"
+                            ></div>
+                          </div>
+                          <span class="semantic-progress-label text-muted">
+                            Downloading embedding model… {{ embedPct() }}
+                          </span>
+                        </div>
+                      } @else {
+                        <button
+                          type="button"
+                          class="btn btn-primary btn-sm"
+                          (click)="downloadEmbedModel()"
+                        >
+                          Download embedding model (~120 MB)
+                        </button>
+                        <span class="text-muted semantic-note">
+                          One time, on-device — required before semantic search can index.
+                        </span>
+                      }
+                    } @else {
+                      <span class="pill">
+                        <span class="pill-dot"></span>
+                        Checking…
+                      </span>
+                    }
+                  </div>
+                  @if (embedDownloadError(); as eerr) {
+                    <p class="text-danger brain-error">{{ eerr }}</p>
+                  }
+
+                  <!-- Re-index notes: backfill the semantic vector index over all notes -->
+                  <div class="semantic-reindex">
+                    <button
+                      type="button"
+                      class="btn btn-sm"
+                      (click)="reindexEmbeddings()"
+                      [disabled]="reindexing()"
+                    >
+                      @if (reindexing()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Re-indexing…
+                      } @else {
+                        Re-index notes
+                      }
+                    </button>
+                    <span class="text-muted semantic-note">
+                      Builds the semantic index over your notes — run it after turning
+                      this on, or after downloading the model.
+                    </span>
+                  </div>
+                  @if (reindexing()) {
+                    <div class="semantic-progress" role="status">
+                      <div class="semantic-progress-track" aria-hidden="true">
+                        <div
+                          class="semantic-progress-fill"
+                          [style.width.%]="reindexFrac() * 100"
+                        ></div>
+                      </div>
+                      <span class="semantic-progress-label text-muted">
+                        Indexing notes… {{ reindexPct() }}
+                      </span>
+                    </div>
+                  }
+                  @if (reindexResult(); as rr) {
+                    @if (rr.status === "model_missing") {
+                      <p class="semantic-nudge text-secondary">
+                        Download the embedding model above first — semantic search can't
+                        index without it.
+                      </p>
+                    } @else {
+                      <span class="pill is-success semantic-done-pill">
+                        <span class="pill-dot"></span>
+                        Indexed {{ rr.indexed }} of {{ rr.total }} notes
+                      </span>
+                    }
+                  }
+                  @if (reindexError(); as rerr) {
+                    <p class="text-danger brain-error">{{ rerr }}</p>
+                  }
+                </div>
+              </div>
+            }
+
+            <!-- ── Connectors — web search (NEW CLOUD EGRESS, surfaced loudly) ── -->
+            @case ("connectors") {
+              <div class="card connectors-card">
+                <div class="brain-copy">
+                  <h3>Connectors</h3>
+                  <p class="text-secondary brain-sub">
+                    Let the brain reach beyond your notes. Connectors are
+                    <strong>off by default</strong> — each one that leaves this Mac asks
+                    for an explicit, one-time consent first.
+                  </p>
+                </div>
+
+                <!-- Web search (Brave) connector -->
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Web search</span>
+                    <span class="text-secondary toggle-sub">
+                      When enabled (and allowed below, with a key), the assistant can
+                      look facts up on the web and cite them. Answers stay grounded in
+                      your notes first; web results are added as “via web” sources.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="webSearchEnabled" />
+                </label>
+
+                @if (form.controls.webSearchEnabled.value) {
+                  <!-- Egress banner — make the new off-device path impossible to miss. -->
+                  <p class="banner is-warning connector-egress" role="note">
+                    <strong>This sends data off your Mac.</strong> When the brain runs a
+                    web search, your (redacted) query leaves the device and goes to the
+                    search provider (Brave). Only the query is sent — never your notes or
+                    transcript. Disable this, or skip the consent below, to keep
+                    everything local.
+                  </p>
+
+                  <!-- BYO API key (Brave) -->
+                  <fieldset class="connector-fieldset">
+                    <legend>Brave Search API key</legend>
+                    <div class="key-status">
+                      <span class="text-secondary">Status</span>
+                      @if (hasWebKey()) {
+                        <span class="pill is-success">
+                          <span class="pill-dot"></span>
+                          Key set ✓
+                        </span>
+                      } @else {
+                        <span class="pill">
+                          <span class="pill-dot"></span>
+                          Not set
+                        </span>
+                      }
+                    </div>
+                    <span class="row">
+                      <input
+                        type="password"
+                        [formControl]="webKeyControl"
+                        placeholder="Brave Search API key"
+                        autocomplete="off"
+                      />
+                      <button
+                        type="button"
+                        class="btn"
+                        (click)="saveWebKey()"
+                        [disabled]="savingWebKey()"
+                      >
+                        {{ savingWebKey() ? "Saving…" : "Save key" }}
+                      </button>
+                    </span>
+                    <span class="field-help text-muted">
+                      Bring your own key — it's stored in your macOS Keychain, never
+                      logged, and never leaves with your notes.
+                    </span>
+                    @if (webKeyError(); as wkerr) {
+                      <p class="text-danger brain-error">{{ wkerr }}</p>
+                    }
+                  </fieldset>
+
+                  <!-- One-time egress consent (mirrors the Cloud-processing UX) -->
+                  <div class="privacy-section connector-consent">
+                    <span class="privacy-section-label text-muted"
+                      >Allow web search</span
+                    >
+                    <p class="text-secondary privacy-note">
+                      Your search query leaves this device for the search provider
+                      (redacted first). Until you allow this once, web search stays off
+                      and no query is ever sent.
+                    </p>
+                    @if (webConsented()) {
+                      <span class="pill is-success cloud-consent-pill">
+                        <span class="pill-dot"></span>
+                        Web search allowed
+                      </span>
+                    } @else {
+                      <div class="cloud-consent-row">
+                        <button
+                          type="button"
+                          class="btn btn-primary"
+                          (click)="allowWebSearch()"
+                          [disabled]="webConsenting()"
+                        >
+                          @if (webConsenting()) {
+                            <span class="spin-ring" aria-hidden="true"></span>
+                            Enabling…
+                          } @else {
+                            Allow web search
+                          }
+                        </button>
+                        <span class="text-muted cloud-consent-hint">
+                          One-time. The brain works fully offline on your notes without
+                          it.
+                        </span>
+                      </div>
+                    }
+                    @if (webConsentError(); as wcerr) {
+                      <p class="text-danger privacy-note">{{ wcerr }}</p>
+                    }
+                  </div>
+                }
+              </div>
+            }
+
+            <!-- ── Providers — provider config, gateway, keys, availability ── -->
+            @case ("providers") {
+              <!-- Provider configuration -->
+              <div class="card">
+                <fieldset>
+                  <legend>Provider configuration</legend>
+
+                  <label class="field">
+                    <span class="field-label">Anthropic model</span>
+                    <input formControlName="anthropicModel" />
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">Ollama base URL</span>
+                    <input formControlName="ollamaBaseUrl" />
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">Ollama model</span>
+                    <input formControlName="ollamaModel" />
+                  </label>
+
+                  <label class="field">
+                    <span class="field-label">Claude binary</span>
+                    <input formControlName="claudeBinary" />
+                  </label>
+
+                  <label class="toggle-row">
+                    <span class="toggle-copy">
+                      <span class="toggle-title">Pass shell environment to the Claude CLI</span>
+                      <span class="text-secondary toggle-sub">
+                        Restores older-version behavior: an ANTHROPIC_API_KEY (and proxy /
+                        base-URL vars) set in your shell reach the claude CLI again, so it
+                        can authenticate via your env key. Off by default for security — your
+                        database encryption keys are never passed through.
+                      </span>
+                    </span>
+                    <input type="checkbox" formControlName="claudeCodeInheritEnv" />
+                  </label>
+                </fieldset>
+              </div>
+
+              <!-- AI Gateway configuration (shown only when "gateway" provider is selected) -->
+              @if (form.controls.providerId.value === 'gateway') {
+                <div class="card gateway-card">
+                  <fieldset>
+                    <legend>AI Gateway</legend>
+
+                    <label class="field">
+                      <span class="field-label">Base URL</span>
+                      <input
+                        formControlName="gatewayBaseUrl"
+                        placeholder="http://localhost:4000/v1"
+                        autocomplete="off"
+                        spellcheck="false"
+                      />
+                      @if (gatewayUrlWarning()) {
+                        <span class="field-help text-danger">
+                          Use https:// (http:// is allowed only for localhost).
+                        </span>
+                      }
+                      <span class="field-help text-muted">
+                        Enter your gateway's OpenAI-compatible base URL (e.g.
+                        https://…/v1) — or the full chat-completions endpoint if
+                        your gateway uses a custom route (e.g. a Kong serverless
+                        route like https://…/test).
+                      </span>
+                    </label>
+
+                    <div class="field">
+                      <span class="field-label">Model</span>
+                      <div class="gateway-model-row">
+                        @if (gatewayModels().length > 0) {
+                          <select formControlName="gatewayModel" class="gateway-model-select">
+                            <option value="">Gateway default</option>
+                            @for (m of gatewayModels(); track m.id) {
+                              <option [value]="m.id">{{ m.id }}</option>
+                            }
+                            <!--
+                              If the currently-saved model is not in the catalog (e.g. the
+                              catalog changed), keep it selectable so a manually-typed value
+                              is never silently lost. gatewayModelIsCustom() is a computed
+                              to avoid arrow-function syntax in the template.
+                            -->
+                            @if (gatewayModelIsCustom()) {
+                              <option [value]="form.controls.gatewayModel.value">
+                                {{ form.controls.gatewayModel.value }} (custom)
+                              </option>
+                            }
+                          </select>
+                        } @else {
+                          <input
+                            formControlName="gatewayModel"
+                            placeholder="gpt-4o (leave blank to use the gateway default)"
+                            autocomplete="off"
+                            spellcheck="false"
+                            class="gateway-model-input"
+                          />
+                        }
+                        <button
+                          type="button"
+                          class="btn btn-ghost gateway-model-refresh"
+                          (click)="refreshGatewayModels()"
+                          [disabled]="gatewayModelsLoading()"
+                          title="Fetch models from the gateway's /v1/models endpoint"
+                        >
+                          @if (gatewayModelsLoading()) {
+                            Loading…
+                          } @else {
+                            ↻ Refresh models
+                          }
+                        </button>
+                      </div>
+                      @if (gatewayModelError()) {
+                        <span class="field-help text-muted">
+                          Couldn't load models — check the base URL and key, or type the
+                          model id manually.
+                        </span>
+                      } @else {
+                        <span class="field-help text-muted">
+                          Sent as the <code>model</code> field in every request — leave
+                          blank to let the gateway choose.
+                        </span>
+                      }
+                    </div>
+
+                    <!-- AI Gateway (Phase 4) — health probe -->
+                    <div class="gateway-health-row">
+                      <span class="text-secondary">Gateway status</span>
+                      <div class="gateway-health-status">
+                        @if (gatewayHealth(); as h) {
+                          @if (h.reachable) {
+                            <span class="pill is-success">
+                              <span class="pill-dot"></span>
+                              {{ h.modelCount }} {{ h.modelCount === 1 ? 'model' : 'models' }} reachable
+                            </span>
+                          } @else {
+                            <span class="pill">
+                              <span class="pill-dot gateway-dot-unreachable"></span>
+                              Gateway unreachable
+                            </span>
+                          }
+                        } @else {
+                          <span class="text-muted gateway-health-hint">Not checked</span>
+                        }
+                        <button
+                          type="button"
+                          class="btn btn-ghost gateway-health-btn"
+                          (click)="checkGatewayHealth()"
+                          [disabled]="gatewayHealthChecking()"
+                        >
+                          @if (gatewayHealthChecking()) {
+                            Checking…
+                          } @else {
+                            Check
+                          }
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Gateway API key (optional) -->
+                    <div class="key-status">
+                      <span class="text-secondary">
+                        API key
+                        <span class="text-muted">(optional)</span>
+                      </span>
+                      @if (hasGatewayKey()) {
+                        <span class="pill is-success">
+                          <span class="pill-dot"></span>
+                          Set
+                        </span>
+                      } @else {
+                        <span class="pill">
+                          <span class="pill-dot"></span>
+                          Not set
+                        </span>
+                      }
+                    </div>
+                    <span class="row">
+                      <input
+                        type="password"
+                        [formControl]="gatewayKeyControl"
+                        placeholder="sk-… or any bearer token"
+                        autocomplete="new-password"
+                      />
+                      <button
+                        type="button"
+                        class="btn"
+                        (click)="saveGatewayKey()"
+                        [disabled]="!gatewayKeyControl.value.trim()"
+                      >
+                        Save key
+                      </button>
+                      @if (hasGatewayKey()) {
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="removeGatewayKey()"
+                        >
+                          Clear
+                        </button>
+                      }
+                    </span>
+                    @if (gatewayKeyError()) {
+                      <p class="text-danger gateway-key-error">{{ gatewayKeyError() }}</p>
+                    }
+                  </fieldset>
+
+                  <!-- Destination banner: calmer note for localhost, warning for remote -->
+                  @if (gatewayDestination(); as dest) {
+                    @if (dest.isRemote) {
+                      <div class="banner is-warning gateway-banner">
+                        <span class="banner-icon" aria-hidden="true">!</span>
+                        <span>
+                          Content will be sent to <strong>{{ dest.host }}</strong> over
+                          the network — always scrubbed by the redaction firewall first
+                          and requires cloud-egress consent.
+                        </span>
+                      </div>
+                    } @else {
+                      <div class="banner gateway-banner">
+                        <span class="banner-icon" aria-hidden="true">i</span>
+                        <span>
+                          Localhost gateway — a local gateway can still forward to the
+                          cloud, so content is still redacted and consent-gated.
+                        </span>
+                      </div>
+                    }
+                  }
+                </div>
               }
-            </li>
-          }
-        </ul>
-      </div>
 
-      <!-- Privacy & integrations: redaction firewall + local MCP server -->
-      <div class="card privacy-card">
-        <div class="privacy-head">
-          <span class="privacy-mark" aria-hidden="true">
-            <svg
-              viewBox="0 0 24 24"
-              width="26"
-              height="26"
-              fill="none"
-              role="img"
-              aria-label="Privacy"
-            >
-              <path
-                d="M12 2.5 4.5 5.5v5.2c0 4.6 3.1 8.1 7.5 9.3 4.4-1.2 7.5-4.7 7.5-9.3V5.5L12 2.5Z"
-                fill="var(--accent-soft)"
-                stroke="var(--accent-hover)"
-                stroke-width="1.3"
-                stroke-linejoin="round"
-              />
-              <path
-                d="M9.4 11.8 11.2 13.6 14.8 9.8"
-                fill="none"
-                stroke="var(--accent-hover)"
-                stroke-width="1.6"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </span>
-          <div class="privacy-copy">
-            <h3>Privacy &amp; integrations</h3>
-            <p class="text-secondary privacy-sub">
-              How Murmur protects your text and connects to your tools.
-            </p>
-          </div>
-        </div>
+              <!-- Anthropic API key -->
+              <div class="card">
+                <fieldset>
+                  <legend>Anthropic API key</legend>
+                  <div class="key-status">
+                    <span class="text-secondary">Status</span>
+                    @if (hasKey()) {
+                      <span class="pill is-success">
+                        <span class="pill-dot"></span>
+                        Set
+                      </span>
+                    } @else {
+                      <span class="pill">
+                        <span class="pill-dot"></span>
+                        Not set
+                      </span>
+                    }
+                  </div>
+                  <span class="row">
+                    <input
+                      type="password"
+                      [formControl]="keyControl"
+                      placeholder="sk-ant-…"
+                    />
+                    <button type="button" class="btn" (click)="saveKey()">
+                      Save key
+                    </button>
+                  </span>
+                </fieldset>
+              </div>
 
-        <!-- (1) Redaction firewall -->
-        <div class="privacy-section">
-          <span class="privacy-section-label text-muted"
-            >Redaction firewall</span
-          >
-          <p class="text-secondary privacy-note">
-            Emails, card numbers and phone numbers are automatically scrubbed
-            before any text is sent to a cloud model — that's both the Anthropic
-            API and Claude Code (the <code>claude</code> CLI uploads your
-            transcript to Anthropic too), then restored in your notes. Only
-            Ollama runs fully on-device and sends nothing to the cloud.
-          </p>
-          <p class="text-secondary privacy-note">
-            Heads up: names are <strong>not</strong> redacted — the firewall is
-            regex-only (emails, cards, phone numbers), so people's names can
-            leave your device alongside the transcript when you use a cloud
-            provider.
-          </p>
-        </div>
+              <!-- Provider availability -->
+              <div class="card">
+                <div class="provider-avail-head">
+                  <h3>Provider availability</h3>
+                  <button type="button" class="btn btn-sm" (click)="refreshProviders()">
+                    Check providers
+                  </button>
+                </div>
+                <ul class="provider-list">
+                  @for (p of providers(); track p.id) {
+                    <li class="provider-row">
+                      <span class="provider-name">{{ p.id }}</span>
+                      @if (p.available) {
+                        <span class="pill is-success">
+                          <span class="pill-dot"></span>
+                          Available
+                        </span>
+                      } @else {
+                        <span class="provider-unavailable">
+                          <span class="pill is-danger">
+                            <span class="pill-dot"></span>
+                            Unavailable
+                          </span>
+                          @if (p.reason) {
+                            <span class="text-muted provider-reason">{{
+                              p.reason
+                            }}</span>
+                          }
+                        </span>
+                      }
+                    </li>
+                  }
+                </ul>
+              </div>
+            }
 
-        <!-- (1b) Cloud processing consent (E10) -->
-        <div class="privacy-section">
-          <span class="privacy-section-label text-muted">Cloud processing</span>
-          <p class="text-secondary privacy-note">
-            Claude Code and the Anthropic API send your (redacted) transcript to
-            Anthropic's cloud to write each summary — your data leaves this Mac.
-            Ollama stays fully on-device. Until you allow this once, cloud
-            summaries are turned off and won't run.
-          </p>
-          @if (cloudConsented()) {
-            <span class="pill is-success cloud-consent-pill">
-              <span class="pill-dot"></span>
-              Cloud processing allowed
-            </span>
-          } @else {
-            <div class="cloud-consent-row">
-              <button
-                type="button"
-                class="btn btn-primary"
-                (click)="allowCloudProcessing()"
-                [disabled]="consenting()"
-              >
-                @if (consenting()) {
-                  <span class="spin-ring" aria-hidden="true"></span>
-                  Enabling…
-                } @else {
-                  Allow cloud processing
-                }
-              </button>
-              <span class="text-muted cloud-consent-hint">
-                One-time. You can keep using Ollama with no cloud at all.
-              </span>
-            </div>
-          }
-          @if (consentError(); as cerr) {
-            <p class="text-danger privacy-note">{{ cerr }}</p>
-          }
-        </div>
+            <!-- ── Privacy & integrations: redaction firewall + local MCP server ── -->
+            @case ("privacy") {
+              <div class="card privacy-card">
+                <div class="privacy-head">
+                  <span class="privacy-mark" aria-hidden="true">
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="26"
+                      height="26"
+                      fill="none"
+                      role="img"
+                      aria-label="Privacy"
+                    >
+                      <path
+                        d="M12 2.5 4.5 5.5v5.2c0 4.6 3.1 8.1 7.5 9.3 4.4-1.2 7.5-4.7 7.5-9.3V5.5L12 2.5Z"
+                        fill="var(--accent-soft)"
+                        stroke="var(--accent-hover)"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                      <path
+                        d="M9.4 11.8 11.2 13.6 14.8 9.8"
+                        fill="none"
+                        stroke="var(--accent-hover)"
+                        stroke-width="1.6"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </span>
+                  <div class="privacy-copy">
+                    <h3>Privacy &amp; integrations</h3>
+                    <p class="text-secondary privacy-sub">
+                      How Murmur protects your text and connects to your tools.
+                    </p>
+                  </div>
+                </div>
 
-        <!-- (2) Locked folders (honest encryption boundary) -->
-        <div class="privacy-section">
-          <span class="privacy-section-label text-muted">Locked folders</span>
-          <p class="text-secondary privacy-note">
-            Locked folders are encrypted and pulled out of your Obsidian vault;
-            open notes remain plaintext .md files Obsidian can read.
-          </p>
-        </div>
-
-        <!-- (3) Local MCP server -->
-        <div class="privacy-section">
-          <span class="privacy-section-label text-muted">Local MCP server</span>
-          <p class="text-secondary privacy-note">
-            Murmur runs a localhost MCP server that exposes your meetings
-            (read-only) to Claude Desktop and Claude Code at
-            <span class="privacy-inline-url">{{ mcpUrl }}</span
-            >.
-          </p>
-
-          <div class="mcp-config">
-            <div class="mcp-config-head">
-              <span class="mcp-config-label text-muted">Config</span>
-              <button
-                type="button"
-                class="btn mcp-copy-btn"
-                [class.is-copied]="configCopied()"
-                (click)="copyMcpConfig()"
-                [attr.aria-label]="
-                  configCopied() ? 'Copied' : 'Copy config to clipboard'
-                "
-              >
-                @if (configCopied()) {
-                  <svg
-                    class="mcp-copy-icon"
-                    viewBox="0 0 16 16"
-                    width="14"
-                    height="14"
-                    aria-hidden="true"
+                <!-- (1) Redaction firewall -->
+                <div class="privacy-section">
+                  <span class="privacy-section-label text-muted"
+                    >Redaction firewall</span
                   >
-                    <path
-                      d="M3 8.5 6.2 12 13 4.5"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.8"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                  Copied
-                } @else {
-                  <svg
-                    class="mcp-copy-icon"
-                    viewBox="0 0 16 16"
-                    width="14"
-                    height="14"
-                    aria-hidden="true"
-                  >
-                    <rect
-                      x="5.5"
-                      y="5.5"
-                      width="8"
-                      height="8"
-                      rx="2"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.5"
-                    />
-                    <path
-                      d="M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.5"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                  Copy config
-                }
-              </button>
-            </div>
-            <pre class="mcp-config-block" role="text">{{ mcpConfig }}</pre>
-          </div>
+                  <p class="text-secondary privacy-note">
+                    Emails, card numbers and phone numbers are automatically scrubbed
+                    before any text is sent to a cloud model — that's both the Anthropic
+                    API and Claude Code (the <code>claude</code> CLI uploads your
+                    transcript to Anthropic too), then restored in your notes. Only
+                    Ollama runs fully on-device and sends nothing to the cloud.
+                  </p>
+                  <p class="text-secondary privacy-note">
+                    Heads up: names are <strong>not</strong> redacted — the firewall is
+                    regex-only (emails, cards, phone numbers), so people's names can
+                    leave your device alongside the transcript when you use a cloud
+                    provider.
+                  </p>
+                </div>
 
-          <span class="mcp-hint text-muted">
-            Add this to your Claude Desktop config, then restart Claude Desktop.
-          </span>
+                <!-- (1b) Cloud processing consent (E10) -->
+                <div class="privacy-section">
+                  <span class="privacy-section-label text-muted">Cloud processing</span>
+                  <p class="text-secondary privacy-note">
+                    Claude Code and the Anthropic API send your (redacted) transcript to
+                    Anthropic's cloud to write each summary — your data leaves this Mac.
+                    Ollama stays fully on-device. Until you allow this once, cloud
+                    summaries are turned off and won't run.
+                  </p>
+                  @if (cloudConsented()) {
+                    <span class="pill is-success cloud-consent-pill">
+                      <span class="pill-dot"></span>
+                      Cloud processing allowed
+                    </span>
+                  } @else {
+                    <div class="cloud-consent-row">
+                      <button
+                        type="button"
+                        class="btn btn-primary"
+                        (click)="allowCloudProcessing()"
+                        [disabled]="consenting()"
+                      >
+                        @if (consenting()) {
+                          <span class="spin-ring" aria-hidden="true"></span>
+                          Enabling…
+                        } @else {
+                          Allow cloud processing
+                        }
+                      </button>
+                      <span class="text-muted cloud-consent-hint">
+                        One-time. You can keep using Ollama with no cloud at all.
+                      </span>
+                    </div>
+                  }
+                  @if (consentError(); as cerr) {
+                    <p class="text-danger privacy-note">{{ cerr }}</p>
+                  }
+                </div>
+
+                <!-- (2) Locked folders (honest encryption boundary) -->
+                <div class="privacy-section">
+                  <span class="privacy-section-label text-muted">Locked folders</span>
+                  <p class="text-secondary privacy-note">
+                    Locked folders are encrypted and pulled out of your Obsidian vault;
+                    open notes remain plaintext .md files Obsidian can read.
+                  </p>
+                </div>
+
+                <!-- (3) Local MCP server -->
+                <div class="privacy-section">
+                  <span class="privacy-section-label text-muted">Local MCP server</span>
+                  <p class="text-secondary privacy-note">
+                    Murmur runs a localhost MCP server that exposes your meetings
+                    (read-only) to Claude Desktop and Claude Code at
+                    <span class="privacy-inline-url">{{ mcpUrl }}</span
+                    >.
+                  </p>
+
+                  <div class="mcp-config">
+                    <div class="mcp-config-head">
+                      <span class="mcp-config-label text-muted">Config</span>
+                      <button
+                        type="button"
+                        class="btn mcp-copy-btn"
+                        [class.is-copied]="configCopied()"
+                        (click)="copyMcpConfig()"
+                        [attr.aria-label]="
+                          configCopied() ? 'Copied' : 'Copy config to clipboard'
+                        "
+                      >
+                        @if (configCopied()) {
+                          <svg
+                            class="mcp-copy-icon"
+                            viewBox="0 0 16 16"
+                            width="14"
+                            height="14"
+                            aria-hidden="true"
+                          >
+                            <path
+                              d="M3 8.5 6.2 12 13 4.5"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.8"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                            />
+                          </svg>
+                          Copied
+                        } @else {
+                          <svg
+                            class="mcp-copy-icon"
+                            viewBox="0 0 16 16"
+                            width="14"
+                            height="14"
+                            aria-hidden="true"
+                          >
+                            <rect
+                              x="5.5"
+                              y="5.5"
+                              width="8"
+                              height="8"
+                              rx="2"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.5"
+                            />
+                            <path
+                              d="M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.5"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                            />
+                          </svg>
+                          Copy config
+                        }
+                      </button>
+                    </div>
+                    <pre class="mcp-config-block" role="text">{{ mcpConfig }}</pre>
+                  </div>
+
+                  <span class="mcp-hint text-muted">
+                    Add this to your Claude Desktop config, then restart Claude Desktop.
+                  </span>
+                </div>
+              </div>
+            }
+
+            <!-- ── Works with Obsidian — optional vault companion ── -->
+            @case ("obsidian") {
+              <div class="card obsidian-card">
+                <div class="obsidian-head">
+                  <span class="obsidian-mark" aria-hidden="true">
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="30"
+                      height="30"
+                      fill="none"
+                      role="img"
+                      aria-label="Obsidian"
+                    >
+                      <defs>
+                        <linearGradient
+                          id="obs-face-a"
+                          x1="3"
+                          y1="2"
+                          x2="20"
+                          y2="22"
+                          gradientUnits="userSpaceOnUse"
+                        >
+                          <stop stop-color="var(--accent-hover)" />
+                          <stop offset="1" stop-color="var(--accent-active)" />
+                        </linearGradient>
+                        <linearGradient
+                          id="obs-face-b"
+                          x1="11"
+                          y1="2"
+                          x2="22"
+                          y2="20"
+                          gradientUnits="userSpaceOnUse"
+                        >
+                          <stop stop-color="#b79bff" />
+                          <stop offset="1" stop-color="var(--accent)" />
+                        </linearGradient>
+                      </defs>
+                      <path
+                        d="M9.4 2.3 4 8.1l3.1 10.2L11 22l-1.3-9.5L9.4 2.3Z"
+                        fill="url(#obs-face-a)"
+                      />
+                      <path
+                        d="M9.4 2.3 9.7 12.5 11 22l5.6-4.2L20 8.4 14.6 2.6 9.4 2.3Z"
+                        fill="url(#obs-face-b)"
+                      />
+                      <path
+                        d="M9.7 12.5 9.4 2.3l5.2.3-.7 8 .9 1.9-5.1.0Z"
+                        fill="#ffffff"
+                        fill-opacity="0.16"
+                      />
+                    </svg>
+                  </span>
+                  <div class="obsidian-copy">
+                    <h3>Works with Obsidian</h3>
+                    <p class="text-secondary obsidian-sub">
+                      Murmur saves each meeting as a Markdown note in your Obsidian
+                      vault. Obsidian is <strong>optional</strong> — you can read every
+                      recording, AI summary and transcript right here in Murmur (the
+                      Meetings tab, with audio playback). Want the full vault
+                      experience?
+                    </p>
+                  </div>
+                </div>
+
+                <div class="obsidian-get">
+                  <span class="obsidian-get-label text-muted"
+                    >Get Obsidian — it's free</span
+                  >
+                  <span class="obsidian-url-row">
+                    <span class="obsidian-url" role="text">{{ obsidianUrl }}</span>
+                    <button
+                      type="button"
+                      class="btn obsidian-copy-btn"
+                      [class.is-copied]="urlCopied()"
+                      (click)="copyObsidianUrl()"
+                      [attr.aria-label]="
+                        urlCopied() ? 'Copied' : 'Copy ' + obsidianUrl + ' to clipboard'
+                      "
+                    >
+                      @if (urlCopied()) {
+                        <svg
+                          class="obsidian-copy-icon"
+                          viewBox="0 0 16 16"
+                          width="14"
+                          height="14"
+                          aria-hidden="true"
+                        >
+                          <path
+                            d="M3 8.5 6.2 12 13 4.5"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.8"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                          />
+                        </svg>
+                        Copied
+                      } @else {
+                        <svg
+                          class="obsidian-copy-icon"
+                          viewBox="0 0 16 16"
+                          width="14"
+                          height="14"
+                          aria-hidden="true"
+                        >
+                          <rect
+                            x="5.5"
+                            y="5.5"
+                            width="8"
+                            height="8"
+                            rx="2"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                          />
+                          <path
+                            d="M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                          />
+                        </svg>
+                        Copy
+                      }
+                    </button>
+                  </span>
+                </div>
+              </div>
+            }
+          }
         </div>
       </div>
     </section>
   `,
   styles: [
     `
-      .settings {
+      /* ── macOS-style two-pane shell: sidebar + content ── */
+      .settings-shell {
+        display: grid;
+        grid-template-columns: 216px minmax(0, 1fr);
+        gap: var(--space-5);
+        align-items: start;
+      }
+
+      /* Left rail — sticky under the app header, its own quiet frosted panel. */
+      .settings-sidebar {
+        position: sticky;
+        top: calc(var(--space-8) + var(--space-2));
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+        padding: var(--space-3);
+        border-radius: var(--radius-lg);
+        background: var(--surface-raised);
+        border: 1px solid var(--glass-border);
+        box-shadow: var(--glass-highlight);
+        animation: rise 380ms var(--transition) both;
+      }
+
+      .sidebar-search {
+        position: relative;
+        display: flex;
+        align-items: center;
+      }
+      .sidebar-search-icon {
+        position: absolute;
+        left: var(--space-3);
+        width: 15px;
+        height: 15px;
+        color: var(--text-muted);
+        pointer-events: none;
+      }
+      .sidebar-search-input {
+        width: 100%;
+        height: 34px;
+        padding: 0 var(--space-3) 0 calc(var(--space-6) + var(--space-1));
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text-primary);
+        font: inherit;
+        font-size: 0.875rem;
+      }
+      .sidebar-search-input::placeholder {
+        color: var(--text-muted);
+      }
+      .sidebar-search-input:focus-visible {
+        outline: none;
+        border-color: var(--accent-hover);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      /* Hide the native WebKit search clear affordance for a clean rail. */
+      .sidebar-search-input::-webkit-search-decoration,
+      .sidebar-search-input::-webkit-search-cancel-button {
+        -webkit-appearance: none;
+      }
+
+      .sidebar-nav {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .nav-item {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        width: 100%;
+        padding: var(--space-2) var(--space-3);
+        border: 0;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--text-secondary);
+        font: inherit;
+        font-size: 0.9rem;
+        font-weight: 550;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          background var(--transition-fast),
+          color var(--transition-fast);
+      }
+      .nav-item:hover {
+        background: var(--surface-input);
+        color: var(--text-primary);
+      }
+      .nav-item.active {
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+      .nav-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        flex: none;
+        color: currentColor;
+      }
+      .nav-icon svg {
+        width: 17px;
+        height: 17px;
+      }
+      .nav-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .nav-empty {
+        margin: var(--space-2) var(--space-1);
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+
+      .sidebar-footer {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+        margin-top: var(--space-1);
+        padding-top: var(--space-3);
+        border-top: 1px solid var(--border-subtle);
+      }
+      .sidebar-save {
+        flex: 1 1 auto;
+      }
+      .saved-pill {
+        flex: none;
+      }
+
+      /* Right pane — the section title + its stacked cards. */
+      .settings-content {
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
-        animation: rise 380ms var(--transition) both;
+        min-width: 0;
+      }
+      .content-header h2 {
+        margin: 0;
+        font-size: 1.35rem;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+      .section-body {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-5);
+        animation: rise 320ms var(--transition) both;
+      }
+
+      /* Collapse to a single column on narrow widths (sidebar stacks on top). */
+      @media (max-width: 640px) {
+        .settings-shell {
+          grid-template-columns: 1fr;
+        }
+        .settings-sidebar {
+          position: static;
+        }
+        .sidebar-nav {
+          flex-direction: row;
+          flex-wrap: wrap;
+        }
+        .nav-item {
+          width: auto;
+        }
       }
 
       /* --- Appearance / theme --- */
@@ -1587,13 +1899,6 @@ import { ThemeService, type ThemeMode } from "../../services/theme.service";
       }
 
       /* --- Whisper model status card --- */
-      .model-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-4);
-        flex-wrap: wrap;
-      }
       .model-copy {
         display: flex;
         flex-direction: column;
@@ -1656,6 +1961,30 @@ import { ThemeService, type ThemeMode } from "../../services/theme.service";
         .spin-ring {
           animation: none;
         }
+      }
+
+      /* --- General: re-run setup call-out --- */
+      .setup-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-4);
+        flex-wrap: wrap;
+      }
+      .setup-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+        min-width: 0;
+      }
+      .setup-title {
+        color: var(--text-primary);
+        font-size: 0.95rem;
+        font-weight: 550;
+      }
+      .setup-sub {
+        font-size: 0.85rem;
+        line-height: 1.5;
       }
 
       /* --- Notes card (summary style + auto-organize) --- */
@@ -2072,24 +2401,17 @@ import { ThemeService, type ThemeMode } from "../../services/theme.service";
         margin-bottom: var(--space-2);
       }
 
-      /* --- Actions --- */
-      .actions {
+      /* --- Provider availability list --- */
+      .provider-avail-head {
         display: flex;
         align-items: center;
+        justify-content: space-between;
         gap: var(--space-3);
-        flex-wrap: wrap;
+        margin-bottom: var(--space-2);
       }
-      .saved-pill {
-        margin-left: var(--space-1);
+      .provider-avail-head h3 {
+        margin: 0;
       }
-      /* Quiet escape hatch to re-run the first-run wizard — pushed to the edge. */
-      .rerun-setup {
-        margin-left: auto;
-        font-size: 0.875rem;
-        color: var(--text-muted);
-      }
-
-      /* --- Provider availability list --- */
       .provider-list {
         list-style: none;
         margin: 0;
@@ -2349,6 +2671,50 @@ export class SettingsComponent implements OnInit {
   /** Apply a theme immediately (persisted in the service; no save() needed). */
   setTheme(mode: ThemeMode): void {
     this.theme.setMode(mode);
+  }
+
+  // ── macOS-style navigation: sidebar sections + search ───────────────────
+
+  /** The sidebar sections (icons rendered in the template by id). */
+  readonly sections = SETTINGS_SECTIONS;
+
+  /** The currently-shown section (right pane). Defaults to Appearance. */
+  readonly activeSection = signal<string>(SETTINGS_SECTIONS[0].id);
+
+  /** Search box for filtering the sidebar section list. Not part of the config form. */
+  readonly searchControl = new FormControl("", { nonNullable: true });
+
+  /** Live signal of the (raw) search text, seeded so `computed`s track it. */
+  private readonly _search = toSignal(
+    this.searchControl.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+
+  /** Trimmed query — shown in the "no results" message. */
+  readonly searchQuery = computed(() => this._search().trim());
+
+  /**
+   * Sections that match the search query (by label + keywords). With no query,
+   * every section is shown. Filtering the sidebar only — the visible content
+   * pane is driven by `activeSection` and is never changed by a search.
+   */
+  readonly visibleSections = computed(() => {
+    const q = this.searchQuery().toLowerCase();
+    if (!q) return this.sections;
+    return this.sections.filter((s) =>
+      (s.label + " " + s.keywords).toLowerCase().includes(q),
+    );
+  });
+
+  /** Human label for the active section (right-pane header). */
+  readonly activeSectionLabel = computed(
+    () =>
+      this.sections.find((s) => s.id === this.activeSection())?.label ?? "",
+  );
+
+  /** Switch the visible section (sidebar click). */
+  selectSection(id: string): void {
+    this.activeSection.set(id);
   }
 
   /** Tracked so we can cancel the pending "Copied" reset on destroy (no leaks). */
