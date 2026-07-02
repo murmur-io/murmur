@@ -206,6 +206,9 @@ final class TapCapturer {
         lock.lock()
         defer { lock.unlock() }
         if file == nil {
+            // Anchor line for the Rust wall-clock merge (true capture start). Fires once per
+            // file; a watchdog rebuild re-enters with file != nil, so no duplicate line.
+            FileHandle.standardError.write(Data("audiocap: first-frame\n".utf8))
             file = try? AVAudioFile(
                 forWriting: outURL, settings: format.settings,
                 commonFormat: .pcmFormatFloat32, interleaved: format.isInterleaved)

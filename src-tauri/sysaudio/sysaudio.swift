@@ -100,6 +100,9 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
             lock.lock()
             defer { lock.unlock() }
             if file == nil {
+                // Anchor line for the Rust wall-clock merge: the true capture start (vs the
+                // process-spawn instant, which precedes SCK setup by hundreds of ms).
+                FileHandle.standardError.write(Data("sysaudio: first-frame\n".utf8))
                 file = try? AVAudioFile(
                     forWriting: outURL, settings: format.settings,
                     commonFormat: .pcmFormatFloat32, interleaved: false)
