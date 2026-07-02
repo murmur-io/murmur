@@ -33,6 +33,7 @@ import type {
   Meeting,
   MeetingDetail,
   MeetingTimeline,
+  ModelDownloadProgress,
   NoteDto,
   PinResult,
   ProviderStatus,
@@ -64,6 +65,8 @@ export const EVENT_VOICE_COMMAND_PROCESSING =
 export const EVENT_ASSISTANT_TOOL = "murmur://assistant-tool";
 // The chat panel's own tool-trace stream (kept separate from the assistant card's).
 export const EVENT_CHAT_TOOL = "murmur://chat-tool";
+// Whisper transcribe-model download progress stream.
+export const EVENT_MODEL_DOWNLOAD = "murmur://model-download";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
@@ -885,6 +888,15 @@ export class IpcService {
   /** The CHAT panel's own live tool-trace (separate from the assistant card's). */
   onChatTool(cb: (p: AssistantToolPayload) => void): Promise<UnlistenFn> {
     return listen<AssistantToolPayload>(EVENT_CHAT_TOOL, (e) => cb(e.payload));
+  }
+
+  /** Fires with progress for the in-flight Whisper transcribe-model download. */
+  onModelDownload(
+    cb: (p: ModelDownloadProgress) => void,
+  ): Promise<UnlistenFn> {
+    return listen<ModelDownloadProgress>(EVENT_MODEL_DOWNLOAD, (e) =>
+      cb(e.payload),
+    );
   }
 
   /** Fires with progress for an in-flight local brain-model download. */
