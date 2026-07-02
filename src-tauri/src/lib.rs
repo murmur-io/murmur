@@ -105,6 +105,7 @@ pub fn run() {
             commands::has_gateway_key,
             commands::clear_gateway_key,
             commands::list_gateway_models,
+            commands::list_models,
             commands::gateway_health,
             commands::get_egress_ledger,
             commands::set_web_search_api_key,
