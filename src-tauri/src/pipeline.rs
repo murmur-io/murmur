@@ -476,10 +476,11 @@ async fn run_inner(
     }
 
     // ── 4 + 5. Summarize with the configured provider, then export ───────────
+    // NOTE: no config is passed — the summarize step re-reads the LIVE config (consent may have
+    // been revoked during the minutes of transcription above; see `resolve_summarize_egress`).
     summarize_and_export(
         app,
         state,
-        &config,
         meeting_id,
         &full_text,
         lang.map(str::to_string),
@@ -490,16 +491,41 @@ async fn run_inner(
     .await
 }
 
+/// Resolve the summarize step's (config, NOTES provider) from the LIVE state — the egress
+/// decision of the pipeline.
+///
+/// STALE-CONSENT LEAK FIX: `run_inner` snapshots the config at Stop and then transcribes for
+/// potentially MINUTES before summarizing. A cloud-egress consent REVOKE (`revoke_cloud_egress`)
+/// or provider switch landing in that window MUST be honored, so the config is RE-READ here, at
+/// the moment of egress — never taken from the caller. `summarize_and_export` deliberately has NO
+/// config parameter anymore: the only config in its scope is this fresh snapshot, so feeding the
+/// fail-closed `provider_for` gate a stale `cloud_egress_consented` is unrepresentable.
+/// Regression: `summarize_egress_resolution_honors_revoke_landed_after_stop_snapshot`.
+fn resolve_summarize_egress(
+    state: &AppState,
+) -> Result<(AppConfig, std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>)> {
+    let config: AppConfig = {
+        let guard = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        guard.clone()
+    };
+    let provider = provider_for(Role::Notes, &config)?;
+    Ok((config, provider))
+}
+
 /// Summarize a transcript with the configured provider, persist the note to the canonical
 /// DB, and — when a vault folder is configured — export it to the Obsidian vault and update
 /// the meeting status/title. When NO vault is configured the note is still fully saved
 /// (DB + title), `exported_path` is `None`, and the meeting finishes in `Summarized` (NOT
 /// `Error`): the vault is export-only. Shared by the full pipeline and `resummarize_existing`.
+/// The provider/consent config is re-read from the live state at entry (see
+/// [`resolve_summarize_egress`]) — callers must NOT pass their own snapshot.
 #[allow(clippy::too_many_arguments)]
 async fn summarize_and_export(
     app: &AppHandle,
     state: &AppState,
-    config: &AppConfig,
     meeting_id: &str,
     transcript_text: &str,
     language: Option<String>,
@@ -507,6 +533,12 @@ async fn summarize_and_export(
     date_iso: &str,
     when_iso: &str,
 ) -> Result<PipelineResult> {
+    // Egress gate FIRST, on the LIVE config: a consent revoke that landed during transcription
+    // refuses here (fail-closed), before any status/corpus work. The provider is pure
+    // construction (no I/O), and every config read below uses this same fresh snapshot.
+    let (config, provider) = resolve_summarize_egress(state)?;
+    let config = &config;
+
     // The NOTES-role provider target — with role keys absent this is EXACTLY the legacy
     // (provider_id, provider_model, provider_effort) triple, so every use below is byte-identical
     // to the pre-role code. Resolved ONCE so the status line, the corpus budget, and the
@@ -575,7 +607,6 @@ async fn summarize_and_export(
         related_context,
     };
 
-    let provider = provider_for(Role::Notes, config)?;
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
 
     // brain2 realtime notes FOLD: append the user's OWN typed in-meeting notes to the generated note
@@ -957,7 +988,6 @@ pub async fn resummarize_existing(
     match summarize_and_export(
         app,
         state,
-        &config,
         meeting_id,
         &full_text,
         config.language.clone(),
@@ -1031,6 +1061,63 @@ fn should_auto_index(semantic_enabled: bool, embed_model_present: bool) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LEAK regression (lock-security review 2026-07-02): a cloud-egress consent REVOKE landing
+    /// DURING transcription — between `run_inner`'s Stop-time config snapshot and the summarize
+    /// step — must be honored. The pre-fix code fed the STALE consented snapshot to
+    /// `provider_for`, so the redacted transcript still egressed. Discrimination is the
+    /// established gate-probe pattern (bogus provider id, zero network / keychain / CLI):
+    /// `Unavailable` = refused AT the consent gate; `InvalidArg` = PAST the gate (the factory
+    /// rejecting the bogus id — i.e. a real provider would have egressed).
+    #[test]
+    fn summarize_egress_resolution_honors_revoke_landed_after_stop_snapshot() {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-pipeline-revoke-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = AppState::init_at(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        {
+            let mut c = state.config.lock().unwrap();
+            c.provider_id = "no_such_provider_for_gate_probe".into();
+            c.grant_cloud_egress_consent(&state.db).unwrap();
+        }
+
+        // run_inner's Stop-time snapshot (consented) — exactly what the pre-fix code carried
+        // across the minutes of transcription and fed to `provider_for`.
+        let stop_snapshot = state.config.lock().unwrap().clone();
+
+        // The user revokes WHILE transcription runs (the real `revoke_cloud_egress` mutator,
+        // as the Tauri command performs it).
+        state.config.lock().unwrap().revoke_cloud_egress(&state.db).unwrap();
+
+        // FIXED: the summarize step resolves config + provider through the LIVE state → the
+        // fail-closed consent gate refuses.
+        match resolve_summarize_egress(&state) {
+            Err(AppError::Unavailable(_)) => {}
+            Err(other) => panic!("summarize egress must refuse AT the consent gate, got {other:?}"),
+            Ok(_) => panic!("summarize egress must refuse AT the consent gate, got Ok"),
+        }
+
+        // THE LEAK the fix closes (kept as the RED half): the stale Stop-time snapshot sails
+        // PAST the gate — `InvalidArg` is the factory rejecting the bogus id, proving a real
+        // provider id would have been built and egressed.
+        match provider_for(Role::Notes, &stop_snapshot) {
+            Err(AppError::InvalidArg(_)) => {}
+            Err(other) => panic!("stale snapshot should pass the gate (the leak), got {other:?}"),
+            Ok(_) => panic!("bogus provider id must not construct"),
+        }
+
+        let _ = std::fs::remove_file(&p);
+    }
 
     #[test]
     fn auto_index_requires_both_flag_and_model() {
