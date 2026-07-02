@@ -668,6 +668,14 @@ async fn summarize_and_export(
         config,
     );
 
+    // ENHANCE-MY-NOTES: fetch the typed-notes buffer BEFORE building the request — in
+    // "enhance" mode the notes ride INSIDE the prompt as the skeleton (a NEW, deliberate,
+    // REDACTED egress of user-typed content — see summarize/redact.rs); in "append" mode
+    // (or with an empty buffer) they stay out of the prompt exactly as before. The buffer
+    // read is ungated by design here (the pipeline is the producer of the note plaintext;
+    // resummarize is gated upstream by meeting_is_unlocked).
+    let manual_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
+
     let request = SummarizeRequest {
         transcript: transcript_text.to_string(),
         meta: MeetingMeta {
@@ -679,19 +687,20 @@ async fn summarize_and_export(
         template: template::build_template(&config.note_style, &config.note_language),
         vault_titles,
         related_context,
+        user_notes: if config.notes_mode == "enhance" && !manual_notes.trim().is_empty() {
+            Some(manual_notes.clone())
+        } else {
+            None
+        },
     };
 
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
 
-    // brain2 realtime notes FOLD: append the user's OWN typed in-meeting notes to the generated note
-    // under a `## My notes` section, BEFORE the note is persisted/exported/sealed. The `manual_notes`
-    // buffer is the DURABLE CANONICAL store of the typed notes — it is NOT blanked here, so this fold
-    // re-runs on EVERY (re)summarize: a regenerated note (which has no `## My notes` yet) gets one
-    // clean append, and a Resummarize can never drop the typed notes. Empty buffer ⇒ `markdown` is
-    // byte-identical to the generated note (no behavior change). The buffer's at-rest protection on a
-    // locked folder is the seal-and-restore lifecycle (`seal_manual_notes` + unseal), not blanking.
-    let manual_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
-    let markdown = fold_manual_notes(&generated, &manual_notes);
+    // brain2 realtime notes FINALIZE: `finalize_note_markdown` either stamps the enhance
+    // marker (notes were in the prompt) or appends `## My notes` verbatim (append mode).
+    // The `manual_notes` buffer stays the DURABLE CANONICAL store — never blanked here, so
+    // every (re)summarize re-reads it fresh in EITHER mode; empty buffer ⇒ byte-identical.
+    let markdown = finalize_note_markdown(&generated, &manual_notes, &config.notes_mode);
 
     state
         .db
@@ -916,6 +925,35 @@ fn fold_manual_notes(markdown: &str, manual_notes: &str) -> String {
         return markdown.to_string();
     }
     format!("{markdown}\n\n## My notes\n\n{notes}\n")
+}
+
+/// ENHANCE-MY-NOTES finalize: decide how the typed notes reach the stored note.
+/// - "enhance" + non-blank notes ⇒ the notes were already IN the prompt as the skeleton
+///   (Task: user_notes on SummarizeRequest); do NOT append them again — stamp the
+///   `murmur_enhanced: true` front-matter marker instead (the FE badge + honest provenance).
+/// - anything else (append mode, empty buffer, unknown mode) ⇒ the legacy verbatim fold,
+///   whose empty case is byte-identical passthrough. Pure + Db-free (unit-testable).
+fn finalize_note_markdown(generated: &str, manual_notes: &str, notes_mode: &str) -> String {
+    if notes_mode == "enhance" && !manual_notes.trim().is_empty() {
+        mark_enhanced(generated)
+    } else {
+        fold_manual_notes(generated, manual_notes)
+    }
+}
+
+/// Insert `murmur_enhanced: true` as the first YAML front-matter line — a DETERMINISTIC
+/// backend stamp (never model-generated, so it can't be forgotten or hallucinated).
+/// No/unterminated front-matter ⇒ returned unchanged; already stamped ⇒ unchanged.
+fn mark_enhanced(markdown: &str) -> String {
+    if markdown.contains("murmur_enhanced:") {
+        return markdown.to_string();
+    }
+    match markdown.strip_prefix("---\n") {
+        Some(rest) if rest.contains("\n---") => {
+            format!("---\nmurmur_enhanced: true\n{rest}")
+        }
+        _ => markdown.to_string(),
+    }
 }
 
 /// brain2 RAG Phase 2b — the GATED entry point for indexing a note into the vector layer. Pure +
@@ -1458,6 +1496,50 @@ mod tests {
         assert!(folded.starts_with(note), "preserves the generated note");
         assert!(folded.contains("## My notes"), "adds the My notes heading: {folded}");
         assert!(folded.contains("ship Friday; Anna owns QA"), "embeds the typed notes verbatim");
+    }
+
+    /// ENHANCE-MY-NOTES: the mode switch. Empty notes ⇒ byte-identical in BOTH modes (the hard
+    /// invariant); append + notes ⇒ exactly today's verbatim fold; enhance + notes ⇒ the
+    /// front-matter marker is stamped, NO verbatim `## My notes` section, body preserved;
+    /// unknown mode ⇒ defensive fall-back to the legacy fold.
+    #[test]
+    fn finalize_note_markdown_switches_between_enhance_and_append() {
+        let note = "---\ntitle: Sync\n---\n# Sync\n\n- decided X";
+        assert_eq!(finalize_note_markdown(note, "", "enhance"), note);
+        assert_eq!(finalize_note_markdown(note, "", "append"), note);
+        assert_eq!(finalize_note_markdown(note, "   \n\t ", "enhance"), note);
+        assert_eq!(
+            finalize_note_markdown(note, "ship Friday", "append"),
+            fold_manual_notes(note, "ship Friday"),
+            "append mode is byte-identical to today's fold"
+        );
+        let enhanced = finalize_note_markdown(note, "ship Friday", "enhance");
+        assert!(enhanced.contains("murmur_enhanced: true"), "marker stamped: {enhanced}");
+        assert!(!enhanced.contains("## My notes"), "no verbatim section in enhance mode");
+        assert!(enhanced.contains("# Sync"), "generated body preserved");
+        assert_eq!(
+            finalize_note_markdown(note, "x", "banana"),
+            fold_manual_notes(note, "x"),
+            "unknown mode falls back to the legacy fold"
+        );
+    }
+
+    /// The marker is a deterministic backend stamp: inserted as the first front-matter line,
+    /// idempotent, and a no-op when the provider output has no front-matter (defensive —
+    /// ollama output may lack it).
+    #[test]
+    fn mark_enhanced_stamps_front_matter_idempotently() {
+        let note = "---\ntitle: T\n---\n# T";
+        let stamped = mark_enhanced(note);
+        assert!(
+            stamped.starts_with("---\nmurmur_enhanced: true\ntitle: T\n"),
+            "marker is the first front-matter line: {stamped}"
+        );
+        assert_eq!(mark_enhanced(&stamped), stamped, "idempotent");
+        let bare = "# No front matter";
+        assert_eq!(mark_enhanced(bare), bare, "no front-matter ⇒ unchanged");
+        let unterminated = "---\ntitle: broken";
+        assert_eq!(mark_enhanced(unterminated), unterminated, "unterminated fm ⇒ unchanged");
     }
 
     /// brain2 realtime notes FOLD + COUNTEREXAMPLE B (the seam `summarize_and_export` runs, minus

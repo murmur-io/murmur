@@ -214,6 +214,33 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
         }
     }
 
+    // ENHANCE-MY-NOTES: the user's typed notes become the SKELETON of the note. The block is
+    // instruction + verbatim notes; absent/blank ⇒ byte-identical output (mirrors
+    // related_context above). Each raw line = one user item (the buffer is \n-joined lines).
+    if let Some(notes) = &req.user_notes {
+        if !notes.trim().is_empty() {
+            out.push_str(
+                "\n## The user's own in-meeting notes (SKELETON — build the note around these)\n\
+                 The user typed these during the meeting, one item per line, in order. They are \
+                 the strongest signal of what mattered. Requirements:\n\
+                 - Use them as the outline: cover EVERY item, in the user's order, keeping the \
+                 user's wording (fix only obvious typos).\n\
+                 - Expand each item with concrete detail from the transcript — decisions, owners, \
+                 dates, numbers.\n\
+                 - After covering every item, add one section headed exactly `## Also discussed` \
+                 for significant transcript topics the notes missed; omit it when nothing \
+                 significant remains.\n\
+                 - Never invent content that is not grounded in the transcript or these notes.\n\
+                 - Never output a section titled `My notes`.\n\
+                 - Never repeat a section heading; keep every formatting requirement from the \
+                 instructions above (front-matter first, section structure, wikilinks).\n\
+                 USER NOTES:\n",
+            );
+            out.push_str(notes.trim());
+            out.push('\n');
+        }
+    }
+
     out.push_str("\nTRANSCRIPT\n");
     out.push_str(&req.transcript);
     out.push('\n');
@@ -238,6 +265,7 @@ mod tests {
             template: "TEMPLATE".to_string(),
             vault_titles: vec!["Roadmap".to_string()],
             related_context: related,
+            user_notes: None,
         }
     }
 
@@ -276,5 +304,39 @@ mod tests {
             render_user_content(&req(Some("   \n".to_string()))),
             render_user_content(&req(None))
         );
+    }
+
+    /// ENHANCE-MY-NOTES: `user_notes: None` (and blank) render a prompt byte-identical to the
+    /// pre-field behavior — the same contract `related_context` established.
+    #[test]
+    fn user_notes_none_or_blank_renders_without_skeleton_block() {
+        let base = render_user_content(&req(None));
+        assert!(
+            !base.contains("SKELETON"),
+            "no skeleton block without notes: {base}"
+        );
+        let mut blank = req(None);
+        blank.user_notes = Some("   \n\t ".to_string());
+        assert_eq!(
+            render_user_content(&blank),
+            base,
+            "blank notes must be byte-identical to None"
+        );
+    }
+
+    /// The skeleton block lands AFTER the related-notes block and BEFORE the transcript,
+    /// carries the notes verbatim, and instructs the `## Also discussed` / no-`My notes` contract.
+    #[test]
+    fn user_notes_block_renders_between_related_and_transcript() {
+        let mut r = req(Some("### [[Prior]] · 2026-06-01 · id:x\nprior body".to_string()));
+        r.user_notes = Some("ship Friday\nAnna owns QA".to_string());
+        let s = render_user_content(&r);
+        let related_at = s.find("## Related prior notes").expect("related block present");
+        let notes_at = s.find("ship Friday\nAnna owns QA").expect("notes verbatim");
+        let transcript_at = s.find("\nTRANSCRIPT\n").expect("transcript section");
+        assert!(related_at < notes_at, "skeleton after related notes");
+        assert!(notes_at < transcript_at, "skeleton before transcript");
+        assert!(s.contains("## Also discussed"), "instructs the Also discussed section");
+        assert!(s.contains("Never output a section titled"), "forbids a My notes section");
     }
 }
