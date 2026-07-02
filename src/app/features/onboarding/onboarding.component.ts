@@ -1351,6 +1351,8 @@ export class OnboardingComponent implements OnInit {
       brainBackend: base?.brainBackend ?? "cloud",
       realtimeReactions: base?.realtimeReactions ?? false,
       brainModelId: base?.brainModelId ?? null,
+      // Proactive brain hints — round-trip the snapshot, default ON (fresh install).
+      proactiveHintsEnabled: base?.proactiveHintsEnabled ?? true,
       // brain2 RAG — semantic-search master flag; round-trip the snapshot, default off.
       semanticSearchEnabled: base?.semanticSearchEnabled ?? false,
       // brain2 connectors — web-search toggle + its preserve-only consent; round-trip

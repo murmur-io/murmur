@@ -48,6 +48,7 @@ import type {
   VoiceCommandProcessingPayload,
   AssistantToolPayload,
   ChatMsg,
+  ProactiveHintPayload,
   WakeDetectedPayload,
 } from "./models";
 
@@ -67,6 +68,8 @@ export const EVENT_ASSISTANT_TOOL = "murmur://assistant-tool";
 export const EVENT_CHAT_TOOL = "murmur://chat-tool";
 // Whisper transcribe-model download progress stream.
 export const EVENT_MODEL_DOWNLOAD = "murmur://model-download";
+// Proactive brain (P2) — one zero-egress recall hint from the live-loop matcher.
+export const EVENT_PROACTIVE_HINT = "murmur://proactive-hint";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
@@ -895,6 +898,17 @@ export class IpcService {
     cb: (p: ModelDownloadProgress) => void,
   ): Promise<UnlistenFn> {
     return listen<ModelDownloadProgress>(EVENT_MODEL_DOWNLOAD, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /**
+   * Fires when the proactive-brain matcher surfaces a recall hint during a
+   * recording (≤1 per cooldown window — throttled + deduped + visibility-gated
+   * in the backend). IDs + a display title only, never content bodies.
+   */
+  onProactiveHint(cb: (p: ProactiveHintPayload) => void): Promise<UnlistenFn> {
+    return listen<ProactiveHintPayload>(EVENT_PROACTIVE_HINT, (e) =>
       cb(e.payload),
     );
   }

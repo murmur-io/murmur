@@ -211,6 +211,21 @@ pub struct AppConfig {
     /// configs load as `""`.
     #[serde(default)]
     pub gateway_model: String,
+    /// Proactive brain P1 — while recording, the deterministic ZERO-EGRESS matcher
+    /// (`crate::proactive`) surfaces dismissible recall cards ("you discussed this on … →
+    /// [[meeting]]", "open commitment: …") from the live-caption tail. Default ON (spec D2: the
+    /// conservative threshold + the hard ≥120 s cooldown keep the default quiet); flipping it OFF
+    /// mutes the scanner IN THE BACKEND — the matcher never runs, not just UI hiding. No egress
+    /// either way: this path never touches a provider or a consent gate.
+    /// `#[serde(default = "default_true")]` ⇒ a config persisted before this field existed loads
+    /// as `true`.
+    #[serde(default = "default_true")]
+    pub proactive_hints_enabled: bool,
+}
+
+/// serde default for flags that default ON (mirrors `commands::default_true` for the DTO side).
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -253,6 +268,7 @@ impl Default for AppConfig {
             claude_code_inherit_env: false,
             gateway_base_url: String::new(),
             gateway_model: String::new(),
+            proactive_hints_enabled: true,
         }
     }
 }
@@ -295,6 +311,7 @@ const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
+const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -422,6 +439,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_GATEWAY_MODEL)? {
             cfg.gateway_model = v;
         }
+        if let Some(v) = db.get_setting(K_PROACTIVE_HINTS_ENABLED)? {
+            cfg.proactive_hints_enabled = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -526,6 +546,10 @@ impl AppConfig {
         )?;
         db.set_setting(K_GATEWAY_BASE_URL, &self.gateway_base_url)?;
         db.set_setting(K_GATEWAY_MODEL, &self.gateway_model)?;
+        db.set_setting(
+            K_PROACTIVE_HINTS_ENABLED,
+            if self.proactive_hints_enabled { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -869,6 +893,37 @@ mod tests {
         let reloaded = AppConfig::load(&db).unwrap();
         assert_eq!(reloaded.gateway_base_url, "");
         assert_eq!(reloaded.gateway_model, "");
+    }
+
+    /// Proactive brain P1 — the mute flag defaults ON (spec D2: default-on with conservative
+    /// thresholds), for fresh installs AND for configs persisted before the field existed (both
+    /// the settings-table path and the serde path), and an explicit OFF round-trips (the backend
+    /// mute is a real, persistable choice — not a one-way latch).
+    #[test]
+    fn proactive_hints_defaults_on_and_round_trips() {
+        // In-memory default + empty settings table (key never written) ⇒ ON.
+        assert!(AppConfig::default().proactive_hints_enabled);
+        let db = temp_db();
+        assert!(AppConfig::load(&db).unwrap().proactive_hints_enabled);
+
+        // serde path: a JSON payload omitting the field entirely loads ON (default_true).
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.proactive_hints_enabled, "an omitted key must default ON");
+
+        // Explicit OFF persists + reloads OFF (the backend-side mute).
+        let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
+        cfg.save(&db).unwrap();
+        assert!(!AppConfig::load(&db).unwrap().proactive_hints_enabled);
     }
 
     /// Task 1.1 — serde: a payload omitting the gateway fields loads with empty defaults.

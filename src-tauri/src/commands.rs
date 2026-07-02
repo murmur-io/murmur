@@ -172,6 +172,11 @@ pub struct AppConfigDto {
     /// Model id to send to the gateway (e.g. `"gpt-4o"`). Settable from the DTO. Default `""`.
     #[serde(default)]
     pub gateway_model: String,
+    /// Proactive brain P1 — the recall-card mute toggle (`crate::proactive`). Settable from the
+    /// DTO (the Settings UI owns it). Defaults ON when omitted (`default_true`), matching
+    /// `AppConfig::default` — an older FE payload must not silently flip the backend mute.
+    #[serde(default = "default_true")]
+    pub proactive_hints_enabled: bool,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -2434,6 +2439,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         claude_code_inherit_env: c.claude_code_inherit_env,
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
+        proactive_hints_enabled: c.proactive_hints_enabled,
     }
 }
 
@@ -2531,6 +2537,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // deserializes to `""` (`#[serde(default)]`), which is a valid "unset" state.
         gateway_base_url: d.gateway_base_url,
         gateway_model: d.gateway_model,
+        // Proactive brain P1: the recall-card mute IS settable from the DTO (Settings owns the
+        // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default —
+        // the backend mute is an explicit user choice, never a partial-save side effect.
+        proactive_hints_enabled: d.proactive_hints_enabled,
     }
 }
 
@@ -6726,6 +6736,29 @@ mod lifecycle_tests {
         assert!(dto.lock_require_biometric, "Stage-E flags default ON");
         assert!(dto.relock_on_screenshare, "Stage-E flags default ON");
         assert!(!dto.cloud_egress_consented, "consent defaults OFF (fail-closed)");
+        assert!(
+            dto.proactive_hints_enabled,
+            "omitted proactiveHintsEnabled defaults ON (matches AppConfig::default)"
+        );
+    }
+
+    /// Proactive brain P1 — the mute toggle round-trips through the settings DTO: `config_to_dto`
+    /// carries it OUT (the FE reads `proactiveHintsEnabled`) and `dto_to_config` takes it IN (the
+    /// FE sets it), so Settings can actually mute the backend scanner.
+    #[test]
+    fn dto_round_trips_proactive_hints_toggle() {
+        // OUT: the DTO reflects the live value.
+        let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
+        assert!(!config_to_dto(&cfg).proactive_hints_enabled);
+
+        // IN: the DTO value lands in the merged config (proven from a differing `current`).
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.proactive_hints_enabled = false;
+        let current = AppConfig::default(); // ON
+        assert!(
+            !dto_to_config(dto, &current).proactive_hints_enabled,
+            "a settings save must be able to mute the backend scanner"
+        );
     }
 
     /// BLK-4: `save_config`'s merge (`dto_to_config`) NEVER lets the DTO set cloud-egress consent —

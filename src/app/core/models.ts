@@ -143,6 +143,15 @@ export interface AppConfigDto {
    * Mirrors Rust `AppConfigDto.gateway_model`.
    */
   gatewayModel: string;
+  /**
+   * Proactive brain (P2) — the GLOBAL MUTE for in-meeting recall hints
+   * (`EVENT_PROACTIVE_HINT` cards). Off silences the event source in the
+   * BACKEND (the live-loop matcher never runs), and the FE additionally never
+   * renders a card (belt and braces). Settable flag, round-tripped on every
+   * `save_config` like the other flags. Default TRUE (conservative thresholds).
+   * Mirrors Rust `AppConfigDto.proactive_hints_enabled`.
+   */
+  proactiveHintsEnabled: boolean;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
@@ -338,6 +347,29 @@ export interface AssistantToolPayload {
    * threads are in flight simultaneously.
    */
   threadId?: string | null;
+}
+
+/** Proactive brain — what a recall hint points at (drives the card's icon + label). */
+export type ProactiveHintKind = "past_meeting" | "open_commitment" | "fact";
+
+/**
+ * Proactive brain (P2) — one zero-egress recall hint surfaced by the live-loop
+ * matcher (`EVENT_PROACTIVE_HINT`). IDs + a display title only — never content
+ * bodies (the matcher reads only visibility-gated sources, and the payload
+ * carries no more than a card must show). The backend enforces the throttle
+ * (≤1 per 120 s cooldown + session dedup by kind/targetId + a relevance
+ * threshold) — the FE renders at most ONE card, newest replacing the previous.
+ */
+export interface ProactiveHintPayload {
+  kind: ProactiveHintKind;
+  /** The card's display line (a meeting title / commitment / fact headline). */
+  title: string;
+  /** Stable id of the surfaced item (dedup key together with `kind`). */
+  targetId: string;
+  /** The meeting to open on click-through; absent/null → no navigation. */
+  meetingId?: string | null;
+  /** The matcher's relevance score (already ≥ the backend threshold). */
+  score: number;
 }
 
 /**

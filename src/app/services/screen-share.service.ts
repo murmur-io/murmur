@@ -1,5 +1,6 @@
 import { DestroyRef, Injectable, inject } from "@angular/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { MeetingConversationStore } from "../core/meeting-conversation.store";
 import { FoldersService } from "./folders.service";
 import { ToastService } from "./toast.service";
 
@@ -20,6 +21,7 @@ export const EVENT_SCREEN_SHARE_STARTED = "murmur://screen-share-started";
 export class ScreenShareService {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly conversation = inject(MeetingConversationStore);
   private readonly destroyRef = inject(DestroyRef);
 
   /** Live event-listener handle (null when not yet initialised / torn down). */
@@ -59,6 +61,11 @@ export class ScreenShareService {
    * security action happened in the backend before this event fired.
    */
   private async onScreenShareStarted(): Promise<void> {
+    // Drop the proactive recall card FIRST (synchronously): its title can come
+    // from a meeting the backend just re-sealed, and the record screen is
+    // exactly the surface now being shared. Not a dismissal — the backend
+    // re-gates visibility, so the hint may legitimately resurface later.
+    this.conversation.clearHint();
     await this.folders.load();
     this.toast.info("Locked your private folders — screen sharing started");
   }
