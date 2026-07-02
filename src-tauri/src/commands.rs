@@ -356,25 +356,15 @@ pub async fn start_recording(
         }
     }
 
-    // Optionally capture an echo-cancelled (VPIO) mic in PARALLEL with cpal — the AEC'd WAV becomes
-    // the ASR mic feed; cpal stays the archive + fallback. Best-effort + opt-in (aec_enabled).
-    {
-        let enabled = state.config.lock().map(|c| c.aec_enabled).unwrap_or(false);
-        if enabled && crate::audio::aec::is_available(&app) {
-            let aec_wav = std::env::temp_dir().join(format!("meetnotes-aec-{meeting_id}.wav"));
-            match crate::audio::aec::AecRecorder::start(&app, aec_wav) {
-                Ok(rec) => {
-                    if let Ok(mut slot) = state.aec_recorder.lock() {
-                        *slot = Some(rec);
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    target: "audio", error = %e,
-                    "AEC capture unavailable; recording the raw mic only"
-                ),
-            }
-        }
-    }
+    // NOTE: the live VPIO echo-cancel helper (aeccap) is intentionally NEVER spawned anymore.
+    // It is superseded by the OFFLINE AEC pass (`post_aec_enabled`, default on) which cancels
+    // echo after Stop using the captured system track as a perfect far-end reference — with zero
+    // effect on the live call. On a real Mac VPIO (a) cancelled ~nothing (macOS gives an input-
+    // only voice-processing unit no downlink reference) and (b) DUCKED all other apps' audio
+    // system-wide, so starting a recording heavily quieted whatever was playing (e.g. YouTube).
+    // The `aec_enabled` flag + the `aeccap` helper stay in the tree but dormant; the ASR feed +
+    // archive get their echo removed offline instead. See
+    // docs/research/2026-07-02-audio-echo-full-remediation.md.
 
     // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
     // during recording (see transcribe::live). Never affects the recording or final note.
