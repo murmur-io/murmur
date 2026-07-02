@@ -5,6 +5,7 @@ import { startWith } from "rxjs";
 import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
+import { hostIsLoopback } from "../../core/loopback";
 import type {
   AppConfigDto,
   AppInfo,
@@ -62,6 +63,12 @@ export class SettingsStore {
     vaultSubfolder: "",
     whisperModelPath: "",
     language: "",
+    // UNRENDERED on purpose (Stage 2): the "Anthropic model" free-text control was
+    // removed from the UI — the Default model picker (providerModel) is THE model
+    // control now. The FormControl MUST stay in the group anyway: it is loaded from
+    // config and round-tripped on save; dropping it would make save() wipe the
+    // user's stored anthropic_model fallback (mod.rs reads it when providerModel
+    // is empty).
     anthropicModel: "claude-opus-4-8",
     // Brain/AI model + reasoning-effort overrides ("" = provider default). Effort is
     // honored only by the anthropic provider; the picker is gated on providerId below.
@@ -186,6 +193,12 @@ export class SettingsStore {
   /** Surfaced if granting consent rejects. */
   private readonly _consentError = signal<string | null>(null);
   readonly consentError = this._consentError.asReadonly();
+  /** True while the revoke-consent command is in flight. */
+  private readonly _revoking = signal(false);
+  readonly revoking = this._revoking.asReadonly();
+  /** Surfaced if revoking consent rejects. */
+  private readonly _revokeError = signal<string | null>(null);
+  readonly revokeError = this._revokeError.asReadonly();
 
   // ── brain2 connectors — web search (NEW EGRESS) ────────────────────────
 
@@ -277,16 +290,22 @@ export class SettingsStore {
   );
 
   /**
-   * Computed URL validation warning: true when the URL is non-empty AND is not a
-   * valid https:// URL AND is not an http:// loopback (localhost / 127.0.0.1 / [::1]).
-   * Derived from `_gatewayBaseUrlValue` so it updates on every keystroke.
+   * Computed URL validation warning: true when the URL is non-empty AND is not
+   * a valid https:// URL AND is not an http:// loopback (`hostIsLoopback` —
+   * the backend-parity classification). Derived from `_gatewayBaseUrlValue`
+   * so it updates on every keystroke.
    */
   readonly gatewayUrlWarning = computed(() => {
     const url = this._gatewayBaseUrlValue();
     if (!url) return false;
     if (url.startsWith("https://")) return false;
-    if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(url))
-      return false;
+    if (url.startsWith("http://")) {
+      try {
+        return !hostIsLoopback(new URL(url).hostname);
+      } catch {
+        return true; // unparseable → warn
+      }
+    }
     return true;
   });
 
@@ -301,13 +320,7 @@ export class SettingsStore {
     if (!url) return null;
     try {
       const parsed = new URL(url);
-      const host = parsed.hostname;
-      const isLoopback =
-        host === "localhost" ||
-        host === "127.0.0.1" ||
-        host === "[::1]" ||
-        host === "::1";
-      return { isRemote: !isLoopback, host: parsed.host };
+      return { isRemote: !hostIsLoopback(parsed.hostname), host: parsed.host };
     } catch {
       return null;
     }
@@ -330,30 +343,76 @@ export class SettingsStore {
   );
 
   /**
+   * Whether the Ollama connection points off this Mac — true when its base URL
+   * host is NOT loopback per `hostIsLoopback` (backend parity: localhost
+   * case-insensitive, [::1]/::1, the full 127.0.0.0/8 range), or is
+   * unparseable (failing safe as remote/cloud). The per-connection half of
+   * the egress classification: drives both the Local-vs-Cloud grouping of the
+   * Ollama card in AI & Models and `providerIsCloud` below, so the two can't
+   * diverge.
+   */
+  readonly ollamaIsRemote = computed(() => {
+    try {
+      return !hostIsLoopback(new URL(this._ollamaBaseUrlValue()).hostname);
+    } catch {
+      return true; // unparseable → fail safe (treat as remote/cloud)
+    }
+  });
+
+  /**
    * FE mirror of the backend's egress classification (`egress_is_cloud`,
    * summarize/mod.rs): claude_code / anthropic / gateway always send content
    * off-device (gateway even on loopback — it can forward to the cloud);
-   * ollama is local ONLY when its base URL host is loopback; anything
-   * unknown or unparseable fails safe as cloud. Reuse this wherever the FE
-   * decides "is this cloud" so the two classifications can't diverge.
+   * ollama is local ONLY when its base URL host is loopback (see
+   * `ollamaIsRemote`). Reuse this wherever the FE decides "is this cloud" so
+   * the two classifications can't diverge.
    */
   readonly providerIsCloud = computed(() => {
     const id = this._providerIdValue();
-    if (id === "ollama") {
-      try {
-        const host = new URL(this._ollamaBaseUrlValue()).hostname;
-        return !(
-          host === "localhost" ||
-          host === "127.0.0.1" ||
-          host === "[::1]" ||
-          host === "::1"
-        );
-      } catch {
-        return true; // unparseable → fail safe (treat as cloud)
-      }
-    }
+    if (id === "ollama") return this.ollamaIsRemote();
     return true; // claude_code | anthropic | gateway | any future id
   });
+
+  /**
+   * Where the DEFAULT provider sends text, for the "Where your text goes"
+   * privacy strip: `null` when the default is a local (loopback) Ollama —
+   * nothing leaves, the line is hidden — otherwise the connection's display
+   * name and its destination host/service.
+   */
+  readonly defaultEgressDestination = computed(
+    (): { connection: string; destination: string } | null => {
+      const id = this._providerIdValue();
+      switch (id) {
+        case "claude_code":
+          return {
+            connection: "Claude Code",
+            destination: "Anthropic (via the claude CLI)",
+          };
+        case "anthropic":
+          return { connection: "Anthropic API", destination: "api.anthropic.com" };
+        case "gateway": {
+          const dest = this.gatewayDestination();
+          return {
+            connection: "AI Gateway",
+            destination: dest ? dest.host : "your gateway (base URL not set)",
+          };
+        }
+        case "ollama": {
+          if (!this.ollamaIsRemote()) return null; // local — nothing leaves
+          let host = this._ollamaBaseUrlValue();
+          try {
+            host = new URL(host).host;
+          } catch {
+            // unparseable → show the raw value rather than nothing
+          }
+          return { connection: "Ollama (remote)", destination: host };
+        }
+        default:
+          // Unknown id — fail safe: cloud, destination unknown.
+          return { connection: id, destination: "unknown destination" };
+      }
+    },
+  );
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
 
@@ -749,8 +808,8 @@ export class SettingsStore {
    * E10 — grant the one-time cloud-egress consent via the dedicated command (an
    * explicit, auditable user act — NOT a side effect of a normal settings save).
    * After it resolves, cloud providers (Claude Code / Anthropic) can summarize, so
-   * we re-probe provider availability. There is no FE "revoke": consent is granted
-   * once; save() simply carries the current value back so it isn't cleared.
+   * we re-probe provider availability. save() simply carries the current value
+   * back so it isn't cleared; the only way to clear it is `revokeCloudProcessing`.
    */
   async allowCloudProcessing(): Promise<void> {
     this._consentError.set(null);
@@ -763,6 +822,27 @@ export class SettingsStore {
       this._consentError.set(String(e));
     } finally {
       this._consenting.set(false);
+    }
+  }
+
+  /**
+   * Stage 2 — revoke the cloud-egress consent via the dedicated command (the
+   * explicit inverse of `allowCloudProcessing`; NOT a side effect of a normal
+   * save). On success the consent signal flips false — so save() round-trips
+   * the revoked state — and providers are re-probed since cloud ones now
+   * fail closed.
+   */
+  async revokeCloudProcessing(): Promise<void> {
+    this._revokeError.set(null);
+    this._revoking.set(true);
+    try {
+      await this.ipc.revokeCloudEgress();
+      this._cloudConsented.set(false);
+      await this.refreshProviders();
+    } catch (e) {
+      this._revokeError.set(String(e));
+    } finally {
+      this._revoking.set(false);
     }
   }
 

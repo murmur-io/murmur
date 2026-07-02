@@ -15,9 +15,8 @@ import { SettingsGeneralSectionComponent } from "./sections/settings-general-sec
 import { SettingsTranscriptionSectionComponent } from "./sections/settings-transcription-section.component";
 import { SettingsAudioSectionComponent } from "./sections/settings-audio-section.component";
 import { SettingsNotesSectionComponent } from "./sections/settings-notes-section.component";
-import { SettingsBrainSectionComponent } from "./sections/settings-brain-section.component";
+import { SettingsAiSectionComponent } from "./sections/settings-ai-section.component";
 import { SettingsConnectorsSectionComponent } from "./sections/settings-connectors-section.component";
-import { SettingsProvidersSectionComponent } from "./sections/settings-providers-section.component";
 import { SettingsPrivacySectionComponent } from "./sections/settings-privacy-section.component";
 import { SettingsObsidianSectionComponent } from "./sections/settings-obsidian-section.component";
 import { SettingsAboutSectionComponent } from "./sections/settings-about-section.component";
@@ -35,13 +34,13 @@ interface SettingsSection {
  */
 const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "appearance", label: "Appearance", keywords: "theme light dark system look colour color mode" },
-  { id: "general", label: "General", keywords: "provider vault folder subfolder whisper model path setup onboarding" },
+  { id: "general", label: "General", keywords: "vault folder subfolder whisper model path setup onboarding" },
   { id: "transcription", label: "Transcription", keywords: "language quality whisper model download on-device size accuracy" },
   { id: "audio", label: "Audio & Capture", keywords: "microphone input device system audio vad smart speech detection high fidelity masters diarization remote speakers echo cancellation aec voice trigger hands-free" },
   { id: "notes", label: "Notes", keywords: "summary style brief detailed action language auto organize subfolders thematic" },
-  { id: "brain", label: "Brain & AI", keywords: "assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake" },
+  // Stage-2 hub: Brain & AI + Providers collapsed into ONE section (keywords merged).
+  { id: "ai", label: "AI & Models", keywords: "provider assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake anthropic ollama claude code gateway openai api key availability binary default consent revoke privacy egress" },
   { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet" },
-  { id: "providers", label: "Providers", keywords: "anthropic ollama claude code gateway openai api key availability model binary" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
@@ -67,9 +66,8 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     SettingsTranscriptionSectionComponent,
     SettingsAudioSectionComponent,
     SettingsNotesSectionComponent,
-    SettingsBrainSectionComponent,
+    SettingsAiSectionComponent,
     SettingsConnectorsSectionComponent,
-    SettingsProvidersSectionComponent,
     SettingsPrivacySectionComponent,
     SettingsObsidianSectionComponent,
     SettingsAboutSectionComponent,
@@ -128,14 +126,11 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   @case ("notes") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5l3 3v10H4z" /><path d="M9 1.5v3h3M5.8 8h4.4M5.8 10.6h4.4" /></svg>
                   }
-                  @case ("brain") {
+                  @case ("ai") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.2 9 5l2.8 1L9 7l-1 2.8L7 7 4.2 6 7 5z" /><path d="M12 9.5l.6 1.5 1.5.6-1.5.6-.6 1.5-.6-1.5L9.4 11.6l1.5-.6z" /></svg>
                   }
                   @case ("connectors") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c1.8 1.7 2.8 3.9 2.8 6.2S9.8 12.5 8 14.2C6.2 12.5 5.2 10.3 5.2 8S6.2 3.5 8 1.8z" /></svg>
-                  }
-                  @case ("providers") {
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="4.5" rx="1.4" /><rect x="2" y="9" width="12" height="4.5" rx="1.4" /><path d="M4.4 4.75h.01M4.4 11.25h.01" /></svg>
                   }
                   @case ("privacy") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.6 3 3.5v3.4c0 3 2 5.3 5 6.1 3-.8 5-3.1 5-6.1V3.5L8 1.6z" /><path d="M6 7.7 7.4 9.1 10 6.3" /></svg>
@@ -201,14 +196,11 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
             @case ("notes") {
               <app-settings-notes-section />
             }
-            @case ("brain") {
-              <app-settings-brain-section />
+            @case ("ai") {
+              <app-settings-ai-section />
             }
             @case ("connectors") {
               <app-settings-connectors-section />
-            }
-            @case ("providers") {
-              <app-settings-providers-section />
             }
             @case ("privacy") {
               <app-settings-privacy-section />

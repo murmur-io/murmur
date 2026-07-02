@@ -131,8 +131,8 @@ pub struct AppConfig {
     /// current value out for the FE to DISPLAY consent status), but `dto_to_config`/`save_config`
     /// IGNORE the incoming DTO value and PRESERVE whatever is already stored — the FE cannot set,
     /// clear, or clobber it as a side effect of a normal settings save (BLK-4). It is mutated ONLY
-    /// by the purpose-built `consent_to_cloud_egress` command, so flipping it is an explicit,
-    /// auditable user act.
+    /// by the purpose-built `consent_to_cloud_egress` / `revoke_cloud_egress` commands, so flipping
+    /// it either way is an explicit, auditable user act.
     pub cloud_egress_consented: bool,
     /// brain2 RAG Phase 2b — master gate for the on-device semantic (vector) retrieval layer.
     /// Default OFF (`#[serde(default)]` ⇒ a config persisted before this field existed loads as
@@ -660,6 +660,17 @@ impl AppConfig {
         db.set_setting(K_CLOUD_EGRESS_CONSENTED, "true")
     }
 
+    /// E10 — REVOKE the cloud-egress consent. Mirror of [`grant_cloud_egress_consent`]: flips the
+    /// in-memory flag AND persists the single key, and is the ONLY supported way to clear consent
+    /// (the DTO stays preserve-only in both directions, so a settings save can neither grant nor
+    /// revoke). After revoke, every cloud-classified provider build is refused fail-closed
+    /// (`AppError::Unavailable`) again — the gate reads the live config per call, so the very next
+    /// summarize/ask/reasoner call refuses without a restart.
+    pub fn revoke_cloud_egress(&mut self, db: &Db) -> Result<()> {
+        self.cloud_egress_consented = false;
+        db.set_setting(K_CLOUD_EGRESS_CONSENTED, "false")
+    }
+
     /// brain2 connector framework — record the user's one-time consent to send the (redacted) web
     /// search query to an EXTERNAL search service. Mirrors [`grant_cloud_egress_consent`]: flips the
     /// in-memory flag AND persists it. This is the ONLY supported mutator (deliberately separate from
@@ -875,6 +886,20 @@ mod tests {
         // Survives a reload from the settings table.
         let reloaded = AppConfig::load(&db).unwrap();
         assert!(reloaded.cloud_egress_consented);
+    }
+
+    /// E10 revoke — `revoke_cloud_egress` mirrors the grant: it flips the in-memory flag AND
+    /// persists the key, so the revocation is fail-closed across a reload/restart too.
+    #[test]
+    fn cloud_egress_consent_revoke_persists() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        cfg.grant_cloud_egress_consent(&db).unwrap();
+        assert!(AppConfig::load(&db).unwrap().cloud_egress_consented);
+        cfg.revoke_cloud_egress(&db).unwrap();
+        assert!(!cfg.cloud_egress_consented, "in-memory flag must flip immediately");
+        // Survives a reload from the settings table.
+        assert!(!AppConfig::load(&db).unwrap().cloud_egress_consented);
     }
 
     #[test]

@@ -1297,6 +1297,29 @@ mod tests {
             Err(AppError::InvalidArg(_)) => {} // past the gate — the bogus id is now the error
             other => panic!("consented role-keyed call must reach the factory, got {other:?}"),
         }
+
+        // REVOKE mid-session through the REAL mutator (`revoke_cloud_egress`, persisted): the
+        // provider factory reads the live config per call, so the very NEXT call is refused
+        // fail-closed again — no restart, no cached grant.
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "meetnotes-reason-revoke-test-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = crate::storage::Db::open_with_key(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        cfg.lock().unwrap().revoke_cloud_egress(&db).unwrap();
+        match r.reason("s", "u") {
+            Err(AppError::Unavailable(_)) => {} // back behind the gate
+            other => panic!("revoked role-keyed call must be consent-gated again, got {other:?}"),
+        }
     }
 
     // ---- active_reasoner backend selection --------------------------------------------------

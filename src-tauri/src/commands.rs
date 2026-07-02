@@ -114,9 +114,10 @@ pub struct AppConfigDto {
     pub relock_on_screenshare: bool,
     /// E10: one-time cloud-egress consent. DISPLAY-ONLY on this DTO: `get_config` carries the
     /// current value OUT so the FE can show consent status, but `dto_to_config` IGNORES whatever
-    /// the FE sends back and PRESERVES the value already in `AppConfig` (BLK-4). The ONLY mutator
-    /// is the dedicated `consent_to_cloud_egress` command, so a settings save can neither grant nor
-    /// clear consent — even a partial/omitting payload (`#[serde(default)]` = false) is inert here.
+    /// the FE sends back and PRESERVES the value already in `AppConfig` (BLK-4). The ONLY mutators
+    /// are the dedicated `consent_to_cloud_egress` / `revoke_cloud_egress` commands, so a settings
+    /// save can neither grant nor clear consent — even a partial/omitting payload
+    /// (`#[serde(default)]` = false) is inert here.
     #[serde(default)]
     pub cloud_egress_consented: bool,
     /// Phase H — which reasoner powers the on-device "brain" pre-analysis (Flow A): `cloud` |
@@ -3047,6 +3048,22 @@ pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppErro
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     cache.grant_cloud_egress_consent(&state.db)?;
+    Ok(())
+}
+
+/// E10 — REVOKE the cloud-egress consent (the AI-settings privacy strip). Mirror of
+/// [`consent_to_cloud_egress`] and the ONLY supported way to flip `cloud_egress_consented` false:
+/// it persists the flag AND updates the in-memory config cache, so the NEXT
+/// `make_provider(claude_code|anthropic|gateway)` / cloud-reasoner call is refused fail-closed
+/// (`AppError::Unavailable`) — the gate re-reads the live config per call, no restart needed.
+/// Idempotent; a settings save can still neither grant nor revoke (the DTO stays preserve-only).
+#[tauri::command]
+pub fn revoke_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.revoke_cloud_egress(&state.db)?;
     Ok(())
 }
 
