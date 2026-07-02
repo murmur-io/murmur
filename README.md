@@ -13,6 +13,7 @@
   <img src="https://img.shields.io/github/v/release/murmur-io/murmur?style=flat-square&color=6e76ff&label=version" alt="version">
   <img src="https://img.shields.io/badge/macOS-13.4%2B-0b0b0b?style=flat-square&logo=apple&logoColor=white" alt="macOS 13.4+">
   <img src="https://img.shields.io/badge/on--device_brain-Bielik%20%C2%B7%20Qwen-9d7bff?style=flat-square" alt="on-device brain">
+  <img src="https://img.shields.io/badge/MCP-127.0.0.1%3A8765-24C8DB?style=flat-square" alt="MCP server">
   <img src="https://img.shields.io/badge/Tauri-2.11-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2.11">
   <img src="https://img.shields.io/badge/Rust-1.96-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.96">
   <img src="https://img.shields.io/badge/privacy-local--first-3fb950?style=flat-square" alt="local-first">
@@ -22,32 +23,38 @@
 <p align="center">
   <a href="https://github.com/murmur-io/murmur/releases/latest"><b>⬇️ Download</b></a> ·
   <a href="#-quick-start">Quick start</a> ·
-  <a href="#-the-brain--talk-to-it-during-the-meeting">The brain</a> ·
+  <a href="#-the-brain--your-meeting-memory-you-can-talk-to">The brain</a> ·
   <a href="#-features">Features</a> ·
+  <a href="#-architecture">Architecture</a> ·
+  <a href="#-the-mcp-server">MCP</a> ·
   <a href="#-privacy--the-lock-model">Privacy</a>
 </p>
 
 ---
 
 Most meeting tools just transcribe and ship your audio to someone else's cloud. **Murmur gives your
-meetings a brain — and keeps it on your Mac.** While you're still in the call you can ask it a
-question out loud and get a **grounded answer with sources**, drawn from everything you've recorded
-before. After the call it writes a clean structured note and remembers it forever — searchable,
-linkable, and queryable by your own AI. With Ollama or the bundled on-device model, **none of it ever
-leaves the device.**
+meetings a brain — and keeps it on your Mac.** While you're still in the call you can jot a note, drop
+`@brain` in front of a question, and get a **grounded answer with sources** drawn from everything
+you've recorded before — the recording never stops. After the call it writes a clean structured note
+and remembers it forever: searchable, linkable, and queryable by your own AI. With Ollama or the
+bundled on-device model, **none of it ever leaves the device.**
 
-> 🎙️ **Record** → 🧠 **transcribe & reason on-device** → 💬 **ask your AI — live in the meeting** →
+> 🎙️ **Record** → 🧠 **transcribe & reason on-device** → 💬 **ask your brain — live in the meeting** →
 > 🔎 **and across your whole history.** _(And yes — every note is plain Markdown you own.)_
 
 <p align="center">
-  <img src="docs/screenshots/record-brain.png" alt="Asking the on-device assistant a question mid-meeting and getting a grounded answer with sources" width="840">
-  <br/><em>Mid-meeting: say the wake phrase, ask a question, and the on-device brain answers — <b>grounded, with sources</b> — without ever pausing the recording.</em>
+  <img src="docs/screenshots/record-brain.png" alt="The conversation-first record screen: take notes while recording, drop @brain to open a thread, and the on-device brain answers with sources" width="860">
+  <br/><em>Mid-meeting: take notes as you go, type <code>@brain</code> + a question to open a thread, and the
+  on-device brain answers — <b>grounded, with sources</b> — without ever pausing the recording.</em>
 </p>
 
 ## ✨ Why Murmur is different
 
-- 🧠 **A brain you can talk to — mid-meeting.** Say a wake phrase (or tap **Ask AI**) and the on-device
-  assistant answers out of your meeting history, **live, with citations**, while the recording keeps rolling.
+- 🧠 **A brain you can talk to — mid-meeting.** Type `@brain` in your notes (or tap the mic) and the
+  on-device assistant answers out of your meeting history, **live, with citations**, in a Slack-style
+  thread — while the recording keeps rolling.
+- 🤝 **The agent proposes, you accept.** The brain never writes to your notes on its own. When it drafts
+  something useful it offers a quiet **"✓ Add to notes"** — nothing enters your notes unless you say so.
 - 🔒 **Truly local-first.** The brain, transcription, and search all run on your Mac. Pick a fully-local
   stack (Ollama or the bundled GGUF model) and **nothing ever leaves the device.**
 - 🔎 **Memory across every meeting.** Ask one question and get an answer synthesized from months of calls,
@@ -55,7 +62,7 @@ leaves the device.**
 - 🎧 **It hears the whole call.** Your mic *and* the other side's system audio are captured and transcribed
   separately, then merged into a **Me / Others** transcript.
 - 🧩 **One store, three surfaces.** An encrypted SQLite DB is the single source of truth; the app, a
-  read-only **MCP server**, and your vault are thin readers — never diverging copies.
+  read-only **MCP server**, and your Obsidian vault are thin readers — never diverging copies.
 - 📁 **You own the output.** Notes are plain Markdown (and Obsidian-friendly) — no proprietary format, no lock-in.
 
 ---
@@ -66,7 +73,7 @@ leaves the device.**
 
 **Just want to use it?** → [**Download the latest signed & notarized build**](https://github.com/murmur-io/murmur/releases/latest),
 drag `Murmur.app` to Applications, and open it. A first-run wizard walks you through the Whisper model,
-an AI provider, and (optionally) a vault.
+an AI provider, and (optionally) an Obsidian vault.
 
 <p align="center">
   <img src="docs/screenshots/onboarding.png" alt="First-run onboarding wizard" width="720">
@@ -78,37 +85,55 @@ Building from source? Jump to [Development](#-development).
 
 ---
 
-## 🧠 The brain — talk to it during the meeting
+## 🧠 The brain — your meeting memory you can talk to
 
-This is the part most note-takers don't have. Murmur runs a reasoning model **on your Mac** and keeps a
-semantic index of everything you've recorded — so it can answer questions *in the moment*.
+This is the part most note-takers don't have. Murmur treats **everything you record as one brain**:
+your transcripts and notes are the memory, an on-device (or cloud) model is the reasoning, and internal
+retrieval + consent-gated connectors are the tools. You talk to it live in the meeting, ask it across
+your whole history, and browse what it knows — all over the same store.
+
+### 💬 Live, in the meeting
 
 <p align="center">
-  <img src="docs/screenshots/assistant-card.png" alt="In-meeting assistant: heard the question, answered with sources" width="720">
+  <img src="docs/screenshots/record-brain.png" alt="An @brain thread answered live with vault citations, on the conversation-first record screen" width="820">
 </p>
 
-- 💬 **In-meeting voice assistant.** Trigger it by **wake phrase** or a single **Ask AI** click
-  (click-to-stop, so it captures your whole question). It answers from your meeting memory **live**, the
-  answer and its `[[sources]]` appearing right in the recording view — the recording never stops.
-- 🧠 **On-device reasoner.** A curated GGUF brain (**Bielik-11B**, **Qwen3-14B**, **Qwen2.5-3B**) runs
-  locally via `mistralrs` (Metal). It's always compiled in and activates the moment a model is downloaded.
-- 🎯 **Grounded, not hallucinated.** Every answer is retrieved from your own transcripts and notes first,
+- **Notes-first, thread-native.** The record screen is a calm notes surface. Jot as you go; drop a
+  standalone **`@brain`** to open an anchored, multi-turn **thread** where the assistant answers — the
+  recording bar stays out of the way at the top.
+- **Voice *or* text, one loop.** Ask by voice (wake phrase or a single **Ask AI** click, click-to-stop
+  so it catches your whole question) or by typing `@brain` — both funnel through the **same model-driven
+  agentic loop** that decides which gated tools to call. A live tool-trace ("Searching notes… ✓") shows
+  its work.
+- **Grounded, not hallucinated.** Every answer is retrieved from your own transcripts and notes first,
   then summarized — with the source meetings cited as chips you can open.
-- 🌐 **Optional live web** (off by default). A consent-gated **Brave** connector (BYO key) lets the brain
-  reach the web when you ask it to; web hits are shown distinctly as “via web”, and queries are redacted
-  before they leave.
-- 🔌 **Your call on where it runs.** Local model = nothing leaves your Mac; or point the brain at Claude
-  for lower live latency. Off by default — it's a power feature you opt into.
+- **✨ Ask brain on any note.** Hover a note and hit **✨ ask brain** to open a thread seeded from that
+  line — the note stays a note; the thread just hangs under it.
 
-## 🔎 Ask across every meeting
+### 🗂️ The `/brain` hub — what it knows
 
 <p align="center">
-  <img src="docs/screenshots/ask.png" alt="Ask Your Vault — grounded Q&A with source citations" width="840">
+  <img src="docs/screenshots/brain.png" alt="The /brain page: status header with counts, three knowledge-source cards, and a connections graph" width="860">
+  <br/><em>Everything the assistant can reason over, in one place — meetings, imported documents, and typed notes.</em>
+</p>
+
+- **One page for your whole brain.** A status header counts your (visible) **meetings**, **documents**,
+  and **notes**, shows whether semantic search is on, and links straight to Ask.
+- **Expand it with your own sources.** Drop in Markdown/text **documents**, or paste a quick **note** —
+  each is chunked and (when the on-device embedding model is present) vector-indexed into the same brain,
+  gated by the same per-folder lock.
+- **See the connections.** A collapsible graph shows how people and projects link across everything.
+
+### 🔎 Ask across every meeting
+
+<p align="center">
+  <img src="docs/screenshots/ask.png" alt="Ask Your Vault — grounded Q&A with source citations across all meetings" width="860">
   <br/><em>Ask Your Vault — one question, answered across months of meetings, every claim linked to its source.</em>
 </p>
 
-- **Ask Your Vault** — full-page grounded chat across all your (visible) meetings, every answer linked back
-  to the meetings it came from. Single-meeting chat cites time-indexed transcript segments.
+- **Ask Your Vault** — full-page grounded chat across all your (visible) meetings, answered by the same
+  agentic loop, every answer linked back to the meetings it came from. Single-meeting chat cites
+  time-indexed transcript segments.
 - **Hybrid retrieval** — keyword search (FTS) fused with on-device **semantic vectors**
   (`multilingual-e5-small`, 384-dim, `sqlite-vec` KNN, Reciprocal Rank Fusion). On-device, off by default,
   one-time backfill to enable.
@@ -116,7 +141,7 @@ semantic index of everything you've recorded — so it can answer questions *in 
   across everything they touched.
 
 <p align="center">
-  <img src="docs/screenshots/graph.png" alt="People & Projects knowledge graph" width="840">
+  <img src="docs/screenshots/graph.png" alt="People & Projects knowledge graph, automatically extracted and counted" width="860">
   <br/><em>People & Projects, extracted automatically and counted — sealed folders stay hidden.</em>
 </p>
 
@@ -127,7 +152,7 @@ semantic index of everything you've recorded — so it can answer questions *in 
 ### 🎙️ Capture & transcribe
 
 <p align="center">
-  <img src="docs/screenshots/hero-record.png" alt="Live recording with on-device transcription, waveform, and live captions" width="840">
+  <img src="docs/screenshots/hero-record.png" alt="Live recording with on-device transcription, waveform, and live captions" width="860">
 </p>
 
 - **Dual-stream recording** — microphone (`cpal`) **plus** the other side's system audio (a Swift
@@ -136,13 +161,14 @@ semantic index of everything you've recorded — so it can answer questions *in 
 - **On-device Whisper** (`whisper.cpp` via `whisper-rs`, **Metal**). A *Fast* pass drives ~3-second live
   captions while you record; an *Accurate* beam-search pass (anti-hallucination gates) runs once after you stop.
 - **Best-effort extras, graceful by default** — Silero **VAD**, optional **speaker diarization** of the
-  others stream, and opt-in hi-fidelity native-rate masters; each degrades cleanly when its model is absent.
+  others stream, **offline echo cancellation**, and opt-in hi-fidelity native-rate masters; each degrades
+  cleanly when its model is absent.
 - **Guardrails** — a 4-hour cap, live mic-mute that preserves sync, an input-device picker, and detection
   of a running meeting app (Zoom / Teams / Webex). Whisper sizes `tiny`…`large-v3` (default **large-v3**)
   download once from Settings.
 
 <p align="center">
-  <img src="docs/screenshots/bar.png" alt="Floating always-on-top recorder bar" width="600">
+  <img src="docs/screenshots/bar.png" alt="Floating always-on-top recorder bar" width="560">
   <br/><em>The signature floating recorder bar (<code>⌘⇧R</code>) — record (and ask) from anywhere.</em>
 </p>
 
@@ -167,7 +193,7 @@ semantic index of everything you've recorded — so it can answer questions *in 
   (on-device EventKit, zero-OAuth).
 
 <p align="center">
-  <img src="docs/screenshots/detail-timeline.png" alt="Interactive speaker + topic timeline" width="840">
+  <img src="docs/screenshots/detail-timeline.png" alt="Interactive speaker + topic timeline" width="860">
 </p>
 
 <table>
@@ -176,7 +202,7 @@ semantic index of everything you've recorded — so it can answer questions *in 
     <td width="50%"><img src="docs/screenshots/analytics.png" alt="Analytics dashboard"></td>
   </tr>
   <tr>
-    <td align="center"><em>Library — folders, tags, and lock-aware rows.</em></td>
+    <td align="center"><em>Library — folders, tags, and lock-aware rows (🔒 sealed folders).</em></td>
     <td align="center"><em>Totals, a 30-day activity chart, and a status breakdown.</em></td>
   </tr>
 </table>
@@ -196,8 +222,8 @@ Murmur is a **Tauri 2.11** desktop app: a **Rust** core (crate `murmur`, lib `me
 talks to an **Angular 18 zoneless** frontend over Tauri IPC. There's no NgRx — every screen is a standalone
 *signals* component calling a single `IpcService`. The Rust side captures, transcribes, summarizes, and
 persists everything to **one SQLCipher-encrypted SQLite database** — the canonical store. Over it sit the
-**on-device brain** (reasoning + RAG that power the in-meeting assistant and Ask), plus three read surfaces:
-the app UI, a read-only **MCP server**, and your Obsidian vault.
+**on-device brain** (an agentic reasoning + RAG loop that powers the in-meeting assistant and Ask), plus
+three read surfaces: the app UI, a read-only **MCP server**, and your Obsidian vault.
 
 ```mermaid
 flowchart LR
@@ -207,10 +233,10 @@ flowchart LR
   merge["⏱️ Wall-clock merge → Me / Others"] --> db
   merge --> redact
   redact["🛡️ Redaction firewall"] --> prov
-  prov["✍️ Summarizer<br/>claude_code · anthropic · ollama"] --> db
+  prov["✍️ Summarizer<br/>claude_code · anthropic · ollama · gateway"] --> db
   db[("🗄️ SQLite + SQLCipher<br/>per-folder AES-256-GCM lock")]
-  db --> brain["🧠 On-device brain + RAG<br/>GGUF reasoner · e5 vectors"]
-  brain --> live["💬 In-meeting assistant"]
+  db --> brain["🧠 On-device brain<br/>agentic loop · GGUF reasoner · e5 vectors"]
+  brain --> live["💬 In-meeting @brain threads"]
   brain --> ask["🔎 Ask across all meetings"]
   db --> mcp["🧩 MCP server · 127.0.0.1:8765"]
   db --> vault["📁 Obsidian vault (.md · .canvas)"]
@@ -223,13 +249,38 @@ the UI at each stage.
 
 ---
 
+## 🧩 The MCP server
+
+Murmur runs a **read-only [Model Context Protocol](https://modelcontextprotocol.io) server** on
+`127.0.0.1:8765` so **Claude Desktop / Claude Code** (or any MCP client) can query your meeting memory
+**with zero egress** — your notes stay on your Mac, and the client reads them locally.
+
+- **Six tools** — `search_meetings`, `get_meeting`, `list_recent_meetings`, `search_semantic`,
+  `get_open_commitments`, `get_entity_dossier`.
+- **Same visibility gates as the app** — sealed-and-not-unlocked meetings are **invisible** here too, routed
+  through the exact `visibility_clause` the UI uses.
+- **Token-protected by default** — a bearer token is **required** unless you turn it off.
+
+```jsonc
+// ~/Library/Application Support/Claude/claude_desktop_config.json
+{
+  "mcpServers": {
+    "murmur": { "url": "http://127.0.0.1:8765" }
+  }
+}
+```
+
+The MCP config is shown (with a copy button) in **Settings → Privacy & Integrations**.
+
+---
+
 ## 🔒 Privacy & the lock model
 
 Privacy isn't a setting in Murmur — it's the architecture. The brain, transcription, and search are designed
 to run **without a network**.
 
 <p align="center">
-  <img src="docs/screenshots/settings-privacy.png" alt="Privacy & integrations settings — honest about what leaves the device" width="840">
+  <img src="docs/screenshots/settings-privacy.png" alt="Privacy & integrations settings — honest about what leaves the device, plus the MCP config" width="860">
   <br/><em>Murmur tells you, in plain language, exactly what leaves your Mac.</em>
 </p>
 
@@ -241,6 +292,7 @@ to run **without a network**.
 | **Ollama** | Fully local | **No.** Nothing leaves the device. |
 | **Claude Code** (default summarizer) | Local CLI → Anthropic's cloud | **Yes** — the *redacted* transcript is sent to Anthropic. |
 | **Anthropic API** (BYO key) | Direct HTTPS → Anthropic | **Yes** — the *redacted* transcript is sent to Anthropic. |
+| **AI Gateway** (BYO OpenAI-compatible) | HTTPS → your gateway | **Yes** — the *redacted* transcript is sent to your endpoint. |
 
 - 🧱 **Two encryption layers at rest.** The **whole** SQLite DB is **SQLCipher**-encrypted (key in the
   macOS Keychain). On top, a **per-folder lock** adds **AES-256-GCM** content keys wrapped by a master KEK
@@ -251,8 +303,10 @@ to run **without a network**.
   plaintext — content is never lost — and re-locking is fully reversible.
 - 🛡️ **Redaction firewall.** Emails, card-like numbers, and phone numbers are *always* scrubbed before any
   cloud call; **person-name** redaction kicks in when the on-device NER model is installed.
-- ✅ **Cloud egress is fail-closed.** No meeting text reaches a cloud provider until you grant a one-time
-  consent — a flag a normal settings save can't flip.
+- ✅ **Cloud egress is fail-closed.** No meeting text reaches a cloud provider until you grant a one-time,
+  revocable consent — a flag a normal settings save can't flip.
+- 📊 **Content-free egress ledger.** A local ledger records *metadata only* — call counts, tokens, and how
+  many PII items were scrubbed — never the text that left.
 - 📺 **Screen-share aware.** A best-effort watcher can auto-relock sealed folders and zeroize the cached key
   the moment screen sharing is detected.
 
@@ -266,23 +320,27 @@ to run **without a network**.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/settings-brain.png" alt="On-device brain model registry"></td>
-    <td width="50%"><img src="docs/screenshots/settings.png" alt="Provider & transcription settings"></td>
+    <td width="50%"><img src="docs/screenshots/settings.png" alt="Provider seam — on-device and redacted-first cloud connections"></td>
+    <td width="50%"><img src="docs/screenshots/settings-brain.png" alt="On-device brain model registry — Bielik / Qwen download cards"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>One provider seam — set a connection up once, then pick per feature.</em></td>
+    <td align="center"><em>The on-device brain registry + on-device intelligence toggles.</em></td>
   </tr>
 </table>
 
-The **summarizer** is one `SummarizerProvider` trait with three swappable backends — **`claude_code`**
-(default), **`anthropic`** (BYO Keychain key), and **`ollama`** (local). Separately, the heavy on-device ML —
-the **mistralrs** GGUF brain, the **candle** e5 embedder, and the **candle** DeBERTa NER redactor — is
-**always compiled in** (no cargo feature flags) and activates at runtime **only when its model files are
-present**, otherwise degrading to a clean no-op.
+The **summarizer** is one `SummarizerProvider` trait with swappable backends — **`claude_code`**
+(default), **`anthropic`** (BYO Keychain key), **`ollama`** (local), and a BYO **OpenAI-compatible gateway**
+(LiteLLM / Kong / Portkey / vLLM). Per-feature **roles** (Notes / Ask / Live) can each point at a different
+connection. Separately, the heavy on-device ML — the **mistralrs** GGUF brain, the **candle** e5 embedder,
+and the **candle** DeBERTa NER redactor — is **always compiled in** (no cargo feature flags) and activates at
+runtime **only when its model files are present**, otherwise degrading to a clean no-op.
 
-### 🧩 The MCP server
-
-Murmur runs a **read-only Model Context Protocol** server on `127.0.0.1:8765` so Claude Desktop / Claude Code
-can query your meeting memory **with zero egress**. Six tools — `search_meetings`, `get_meeting`,
-`list_recent_meetings`, `search_semantic`, `get_open_commitments`, `get_entity_dossier` — all routed through
-the same visibility gates (sealed meetings stay invisible), with a bearer token **required by default**.
+- 🧠 **On-device reasoners.** A curated GGUF registry — **Bielik-11B**, **Qwen3-14B**, **Qwen2.5-3B** — runs
+  locally via `mistralrs` (Metal). Download one and the brain activates; nothing leaves your Mac.
+- 🌐 **Optional live web** (off by default). A consent-gated **Brave** connector (BYO key) lets the brain
+  reach the web when you ask it to; web hits are shown distinctly as "via web", and queries are redacted
+  before they leave.
 
 ---
 
@@ -319,13 +377,17 @@ npx ng build
 bash scripts/ci.sh                      # full gate: clippy -D warnings + tests + lint + build + headless E2E
 ```
 
+> **Screenshots** in this README are the real Angular UI rendered from the shipping code, populated with a
+> privacy-safe demo dataset (no private meetings). Regenerate them with
+> [`scripts/screenshots`](scripts/screenshots/README.md).
+
 ### 🧱 Tech stack
 
 | Layer | Tech |
 | --- | --- |
 | **Shell** | Tauri 2.11 · Rust (edition 2021, toolchain 1.96) · macOS-first, universal (arm64 + x86_64), min macOS 13.4 |
 | **Frontend** | Angular 18.2 **zoneless** · standalone + signals · TypeScript 5.5 · `marked` + `DOMPurify` · **no NgRx** |
-| **Audio** | `cpal` · `whisper-rs` (Metal) · ScreenCaptureKit / Core Audio tap · `sherpa-onnx` diarization |
+| **Audio** | `cpal` · `whisper-rs` (Metal) · ScreenCaptureKit / Core Audio tap · `sherpa-onnx` diarization · offline AEC |
 | **On-device brain** | `mistralrs` (GGUF reasoner) · `candle` (e5 embeddings + DeBERTa NER) · `sqlite-vec` |
 | **Storage / crypto** | `rusqlite` + **SQLCipher** · `aes-gcm` + `zeroize` · macOS Keychain · Touch ID (`LAContext`) |
 
@@ -335,8 +397,8 @@ bash scripts/ci.sh                      # full gate: clippy -D warnings + tests 
 murmur/
 ├─ src/             Angular 18 frontend (standalone, zoneless, signals)
 │  └─ app/
-│     ├─ core/        ipc.service.ts · models.ts · recorder.store.ts · assistant.store.ts
-│     └─ features/    record · library · detail · folders · graph · ask · analytics · settings · onboarding · bar
+│     ├─ core/        ipc.service.ts · models.ts · recorder.store.ts · meeting-conversation.store.ts
+│     └─ features/    record · library · detail · folders · graph · ask · brain · analytics · settings · onboarding · bar
 ├─ src-tauri/       Rust core (Tauri 2)
 │  └─ src/           commands.rs · pipeline.rs · reason.rs · embed.rs · mcp.rs · crypto.rs · audio/ · transcribe/ · summarize/ · storage/ · secrets/ · export/
 └─ docs/            design notes, research, branding, screenshots
@@ -347,13 +409,11 @@ murmur/
 ## 🗺️ Status
 
 Murmur ships at **v0.6.3** — a signed, notarized macOS app. The full record → transcribe → summarize
-pipeline, the in-meeting voice assistant, the on-device brain + semantic search, the per-folder Touch ID
-lock, the knowledge graph, Ask-Your-Vault, and the MCP server are all implemented. Some capabilities — live
-ScreenCaptureKit capture, the Touch ID prompt, and screen-share auto-relock — can only be *fully* exercised
-on a signed build on a real Mac, and are documented as such.
-
-> Screenshots in this README are the real Angular UI rendered from the shipping code, populated with demo
-> data (no private meetings).
+pipeline, the conversation-first record screen with in-meeting `@brain` threads, the on-device brain +
+semantic search, the `/brain` knowledge hub, the per-folder Touch ID lock, the knowledge graph,
+Ask-Your-Vault, and the MCP server are all implemented. Some capabilities — live ScreenCaptureKit capture,
+the Touch ID prompt, and screen-share auto-relock — can only be *fully* exercised on a signed build on a
+real Mac, and are documented as such.
 
 ## 📄 License
 
@@ -361,4 +421,4 @@ Murmur is open source under the [GNU AGPL-3.0](LICENSE) license.
 
 ---
 
-<p align="center"><sub>🍎 macOS-first · 🧠 on-device brain · 🔒 local-first · built with Tauri + Angular + Rust</sub></p>
+<p align="center"><sub>🍎 macOS-first · 🧠 on-device brain · 🔒 local-first · 🧩 MCP-native · built with Tauri + Angular + Rust</sub></p>
