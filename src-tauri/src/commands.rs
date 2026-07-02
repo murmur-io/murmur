@@ -3093,9 +3093,10 @@ pub fn model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
 
 /// Download the Whisper model matching the chosen size + language (multilingual unless
 /// English is selected) from the whisper.cpp HuggingFace mirror into the app models dir if
-/// missing; returns its path. No-op (returns the existing path) when already present.
+/// missing; returns its path. No-op (returns the existing path) when already present. Emits
+/// [`crate::events::EVENT_MODEL_DOWNLOAD`] progress (throttled) so the FE can show a progress bar.
 #[tauri::command]
-pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppError> {
+pub async fn download_model(app: AppHandle, state: State<'_, AppState>) -> Result<String, AppError> {
     let (configured, size, language) = {
         let c = state
             .config
@@ -3108,7 +3109,33 @@ pub async fn download_model(state: State<'_, AppState>) -> Result<String, AppErr
         )
     };
     let p = configured.as_deref().map(std::path::Path::new);
-    let path = crate::transcribe::ensure_model(p, &size, &language).await?;
+
+    // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
+    const EMIT_EVERY: u64 = 8 * 1024 * 1024;
+    let mut last_emit: u64 = 0;
+    let path = crate::transcribe::ensure_model(p, &size, &language, |downloaded, total| {
+        if downloaded - last_emit >= EMIT_EVERY {
+            last_emit = downloaded;
+            let _ = app.emit(
+                crate::events::EVENT_MODEL_DOWNLOAD,
+                crate::events::ModelDownloadPayload {
+                    downloaded,
+                    total,
+                    done: false,
+                },
+            );
+        }
+    })
+    .await?;
+
+    let _ = app.emit(
+        crate::events::EVENT_MODEL_DOWNLOAD,
+        crate::events::ModelDownloadPayload {
+            downloaded: 0,
+            total: None,
+            done: true,
+        },
+    );
     Ok(path.to_string_lossy().to_string())
 }
 
