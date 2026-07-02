@@ -1,11 +1,20 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  computed,
   effect,
   inject,
   signal,
 } from "@angular/core";
-import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
+import { toSignal } from "@angular/core/rxjs-interop";
+import {
+  NavigationEnd,
+  Router,
+  RouterLink,
+  RouterLinkActive,
+  RouterOutlet,
+} from "@angular/router";
+import { filter, map } from "rxjs";
 import { FoldersService } from "./services/folders.service";
 import { ToastService, type Toast } from "./services/toast.service";
 
@@ -43,6 +52,10 @@ interface NavItem {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterOutlet, RouterLink, RouterLinkActive],
   template: `
+    <!-- Primary rail is HIDDEN under /settings: settings drills down to its own
+         two-column [section rail | content] layout (see settings.component). The
+         @if removes the aside from the DOM so the outlet's flex row fills. -->
+    @if (!inSettings()) {
     <aside class="app-sidebar" [class.collapsed]="collapsed()">
       <!-- Top drag strip: reserves room for the overlay traffic lights and lets
            the user move the window (data-tauri-drag-region). Empty on purpose so
@@ -198,6 +211,7 @@ interface NavItem {
         </button>
       </div>
     </aside>
+    }
 
     <main class="app-main">
       <router-outlet></router-outlet>
@@ -257,6 +271,28 @@ interface NavItem {
 export class AppShellComponent {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly router = inject(Router);
+
+  /**
+   * The current URL, updated on every completed navigation. Seeded from
+   * `router.url` so `inSettings` is correct on a cold deep-link to `/settings`
+   * (before the first `NavigationEnd`). The subscription is framework-managed by
+   * `toSignal` — no hand-rolled `.subscribe()`.
+   */
+  private readonly currentUrl = toSignal(
+    this.router.events.pipe(
+      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
+      map(() => this.router.url),
+    ),
+    { initialValue: this.router.url },
+  );
+
+  /**
+   * True while on any `/settings*` route. When true the primary rail is removed
+   * from the DOM so the settings drill-down owns the full width with its own
+   * two-column layout.
+   */
+  readonly inSettings = computed(() => this.currentUrl().startsWith("/settings"));
 
   /** Primary sidebar destinations (Settings lives in the footer as its own icon). */
   readonly navItems: readonly NavItem[] = [
