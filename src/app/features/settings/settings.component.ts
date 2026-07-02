@@ -285,18 +285,22 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         border-right: 1px solid var(--border-subtle);
         box-shadow: var(--glass-highlight);
         overflow: hidden;
-        animation: settings-rail-in 320ms var(--transition) both;
+        animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
       }
 
-      /* Slide-in when entering settings; disabled under reduced-motion below. */
-      @keyframes settings-rail-in {
+      /* Enter transition — the rail and the content pane share ONE cohesive,
+         smoothly-eased glide (content lags 40ms for a touch of depth). It is
+         TRANSFORM ONLY, never opacity: the position:fixed :host is opaque and
+         near-black (--surface-base), so any opacity fade shows through as a
+         "black background, then the UI jumps in" flash (the reported bug). Staying
+         opaque means the settings surface is painted from the very first frame and
+         simply settles into place. Disabled under reduced-motion below. */
+      @keyframes settings-enter {
         from {
-          transform: translateX(-14px);
-          opacity: 0;
+          transform: translateY(8px);
         }
         to {
           transform: none;
-          opacity: 1;
         }
       }
 
@@ -486,7 +490,10 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
-        animation: rise 320ms var(--transition) both;
+        /* Shares the rail's cohesive transform-only glide (NOT the global 'rise',
+           which fades opacity 0→1 and would flash near-black over the :host — on
+           entry AND on every section switch). 40ms lag for a subtle stagger. */
+        animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) 40ms both;
       }
 
       /* Narrow widths: stack the rail on top of the content (rows), each
