@@ -11,6 +11,7 @@ import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../core/ipc.service";
+import { hostIsLoopback } from "../../core/loopback";
 import type { AppConfigDto, ProviderStatus } from "../../core/models";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
@@ -28,7 +29,20 @@ const PROVIDER_LABELS: Record<string, string> = {
   claude_code: "Claude Code",
   anthropic: "Anthropic API",
   ollama: "Ollama",
+  gateway: "AI Gateway (OpenAI-compatible)",
 };
+
+/**
+ * The four selectable providers, in display order. The tile list is FE-pinned
+ * because `provider_statuses` omits the gateway until a base URL is
+ * configured — the wizard must still offer it (with a setup well below).
+ */
+const PROVIDER_IDS: readonly string[] = [
+  "claude_code",
+  "anthropic",
+  "ollama",
+  "gateway",
+];
 
 /** Approx download size per Whisper quality (mirrors Settings). */
 const SIZE_HINTS: Record<string, string> = {
@@ -220,7 +234,7 @@ const SIZE_HINTS: Record<string, string> = {
               </div>
 
               <div class="providers">
-                @for (p of providers(); track p.id) {
+                @for (p of providerTiles(); track p.id) {
                   <button
                     type="button"
                     class="provider"
@@ -352,6 +366,55 @@ const SIZE_HINTS: Record<string, string> = {
                     </div>
                   }
                 }
+                @case ("gateway") {
+                  <div class="setup-well">
+                    <p class="setup-title">Connect your AI gateway</p>
+                    <p class="setup-text text-secondary">
+                      Enter your gateway's OpenAI-compatible base URL (e.g.
+                      https://…/v1). An API key can be added later in
+                      Settings → AI &amp; Models.
+                    </p>
+                    <div class="row">
+                      <input
+                        placeholder="https://gateway.example.com/v1"
+                        [value]="gatewayBaseUrl()"
+                        (input)="onGatewayUrl($event)"
+                        (change)="persistGatewayUrl()"
+                        autocomplete="off"
+                        spellcheck="false"
+                      />
+                      <button
+                        type="button"
+                        class="btn"
+                        (click)="persistGatewayUrl()"
+                        [disabled]="checking()"
+                      >
+                        {{ checking() ? "Checking…" : "Re-check" }}
+                      </button>
+                    </div>
+                  </div>
+                }
+              }
+
+              <!--
+                Consent-at-selection (research trap 11): a cloud-classified pick
+                (mirrors the backend's egress_is_cloud — claude_code / anthropic /
+                gateway, plus ollama on a non-loopback URL) needs the one-time
+                cloud-egress consent, or the FIRST note fails by design. Say so
+                here; finishing the wizard grants it — unless the choice was
+                deferred via skip (then no grant, and this line hides so
+                "Finishing setup allows this once" is never a false promise).
+              -->
+              @if (pickIsCloud() && !cloudConsented() && !skippedProvider()) {
+                <div class="banner consent-note">
+                  <span class="banner-icon" aria-hidden="true">i</span>
+                  <span>
+                    {{ labelFor(provider()) }} runs in the cloud — your
+                    transcript is redacted first, then sent to write each note.
+                    Finishing setup allows this once; you can revoke it anytime
+                    in Settings → AI &amp; Models.
+                  </span>
+                </div>
               }
             }
 
@@ -482,7 +545,7 @@ const SIZE_HINTS: Record<string, string> = {
               <button
                 type="button"
                 class="btn btn-ghost ob-skip"
-                (click)="next()"
+                (click)="skipProvider()"
               >
                 I’ll set this up later
               </button>
@@ -941,6 +1004,26 @@ const SIZE_HINTS: Record<string, string> = {
         white-space: nowrap;
       }
 
+      /* Consent-at-selection note for a cloud-classified pick (in-flow banner). */
+      .consent-note {
+        font-size: 0.875rem;
+        line-height: 1.55;
+        animation: rise 320ms var(--transition) both;
+      }
+      .banner-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        min-width: 24px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.08);
+        font-weight: 700;
+        font-size: 0.85rem;
+        line-height: 1;
+      }
+
       /* ── Vault step ───────────────────────────────────────────────────── */
       .vault-pick {
         display: flex;
@@ -1127,6 +1210,56 @@ export class OnboardingComponent implements OnInit {
   readonly apiKey = signal("");
   readonly savingKey = signal(false);
   readonly keyError = signal<string | null>(null);
+  /** Gateway base URL (editable on the gateway tile; round-tripped on save). */
+  readonly gatewayBaseUrl = signal("");
+  /** Ollama base URL from the loaded config — read-only here, drives pickIsCloud. */
+  private readonly ollamaBaseUrl = signal("http://localhost:11434");
+  /** Whether cloud egress is already consented (from config; flips on finish). */
+  readonly cloudConsented = signal(false);
+  /**
+   * True after "I'll set this up later" — the user explicitly DEFERRED the
+   * provider choice, so finish() must NOT grant cloud consent for the
+   * still-selected default (deferring is not consenting; lock-security
+   * review). Cleared by an explicit tile pick.
+   */
+  readonly skippedProvider = signal(false);
+
+  /**
+   * The 4 selectable tiles, FE-pinned (see PROVIDER_IDS) and merged with the
+   * availability fan-out — an unconfigured gateway has NO status row, so it
+   * renders as needing setup instead of vanishing.
+   */
+  readonly providerTiles = computed<ProviderStatus[]>(() => {
+    const statuses = this.providers();
+    return PROVIDER_IDS.map(
+      (id) =>
+        statuses.find((p) => p.id === id) ?? {
+          id,
+          available: false,
+          reason:
+            id === "gateway" ? "Add your gateway's base URL below" : undefined,
+        },
+    );
+  });
+
+  /**
+   * FE mirror of the backend's egress classification for the picked provider
+   * (same rules as SettingsStore.providerIsCloud / egress_is_cloud):
+   * claude_code / anthropic / gateway are cloud; ollama only when its base
+   * URL host is non-loopback (`hostIsLoopback` — backend-parity, incl. the
+   * full 127.0.0.0/8 range); unparseable fails safe as cloud.
+   */
+  readonly pickIsCloud = computed(() => {
+    const id = this.provider();
+    if (id === "ollama") {
+      try {
+        return !hostIsLoopback(new URL(this.ollamaBaseUrl()).hostname);
+      } catch {
+        return true; // unparseable → fail safe (treat as cloud)
+      }
+    }
+    return true;
+  });
 
   /** Vault step. */
   readonly vaultPath = signal<string | null>(null);
@@ -1141,6 +1274,12 @@ export class OnboardingComponent implements OnInit {
         // Must have a ready model before transcription can work.
         return this.modelPresent() === true;
       case "provider":
+        // A gateway pick needs its base URL (the explicit "I'll set this up
+        // later" skip stays available as the escape hatch).
+        return (
+          this.provider() !== "gateway" ||
+          this.gatewayBaseUrl().trim().length > 0
+        );
       case "vault":
       default:
         return true;
@@ -1168,6 +1307,9 @@ export class OnboardingComponent implements OnInit {
       this.modelSize.set(cfg.modelSize ?? "small");
       this.provider.set(cfg.providerId ?? "claude_code");
       this.vaultPath.set(cfg.vaultPath ?? null);
+      this.gatewayBaseUrl.set(cfg.gatewayBaseUrl ?? "");
+      this.ollamaBaseUrl.set(cfg.ollamaBaseUrl ?? "http://localhost:11434");
+      this.cloudConsented.set(cfg.cloudEgressConsented ?? false);
     } catch {
       // Fresh install with no config yet — defaults already cover us.
     }
@@ -1247,9 +1389,23 @@ export class OnboardingComponent implements OnInit {
   // ── Provider step ───────────────────────────────────────────────────────
 
   selectProvider(id: string): void {
+    // An explicit pick supersedes an earlier "set this up later" — consent
+    // may be granted for it on finish again.
+    this.skippedProvider.set(false);
     this.provider.set(id);
     this.keyError.set(null);
     void this.persistConfig();
+  }
+
+  /**
+   * "I'll set this up later" — the user explicitly DEFERRED the provider
+   * choice, so finish() must not grant cloud consent for the still-selected
+   * default (lock-security review): deferring is not consenting. The
+   * record-screen consent banner remains the recovery path.
+   */
+  skipProvider(): void {
+    this.skippedProvider.set(true);
+    void this.next();
   }
 
   async recheckProviders(): Promise<void> {
@@ -1263,6 +1419,24 @@ export class OnboardingComponent implements OnInit {
 
   onApiKey(event: Event): void {
     this.apiKey.set((event.target as HTMLInputElement).value);
+  }
+
+  onGatewayUrl(event: Event): void {
+    this.gatewayBaseUrl.set((event.target as HTMLInputElement).value);
+  }
+
+  /**
+   * Persist the typed gateway base URL, then re-probe: once the URL is saved
+   * the backend's fan-out includes the gateway, so the tile's pill goes live.
+   */
+  async persistGatewayUrl(): Promise<void> {
+    this.checking.set(true);
+    try {
+      await this.persistConfig();
+      this.providers.set(await this.ipc.providerStatuses());
+    } finally {
+      this.checking.set(false);
+    }
   }
 
   async saveAnthropicKey(): Promise<void> {
@@ -1298,6 +1472,30 @@ export class OnboardingComponent implements OnInit {
     this.finishing.set(true);
     try {
       await this.persistConfig(true);
+      // Consent-at-selection (research trap 11): an EXPLICIT cloud-classified
+      // pick grants the one-time cloud-egress consent HERE so the first note
+      // doesn't fail by design — but never for a deferred choice
+      // (skippedProvider): deferring is not consenting. Ordered after
+      // persistConfig for save-then-grant clarity; NOTE the ordering is not
+      // load-bearing — the backend's save merge preserves consent regardless
+      // of the DTO value (dto_to_config, commands.rs; test
+      // save_config_merge_never_clobbers_or_grants_consent). Best-effort: if
+      // the grant rejects, the record screen's consent banner remains the
+      // recovery path — never trap the user in the wizard for it.
+      if (this.pickIsCloud() && !this.cloudConsented() && !this.skippedProvider()) {
+        try {
+          await this.ipc.consentToCloudEgress();
+          this.cloudConsented.set(true);
+          if (this.loadedConfig) {
+            this.loadedConfig = {
+              ...this.loadedConfig,
+              cloudEgressConsented: true,
+            };
+          }
+        } catch {
+          // Grant failed — recoverable post-wizard; don't block finishing.
+        }
+      }
       await this.router.navigate(["/record"]);
     } catch {
       // If saving the final flag fails, let them retry rather than trap them.
@@ -1323,7 +1521,7 @@ export class OnboardingComponent implements OnInit {
       // the pickers); send the snapshot back unchanged so onboarding never clobbers them.
       providerModel: base?.providerModel ?? "",
       providerEffort: base?.providerEffort ?? "",
-      ollamaBaseUrl: base?.ollamaBaseUrl ?? "http://localhost:11434",
+      ollamaBaseUrl: this.ollamaBaseUrl(),
       ollamaModel: base?.ollamaModel ?? "llama3.1",
       claudeBinary: base?.claudeBinary ?? "claude",
       inputDevice: base?.inputDevice ?? null,
@@ -1345,7 +1543,9 @@ export class OnboardingComponent implements OnInit {
       mcpRequireToken: base?.mcpRequireToken ?? true,
       lockRequireBiometric: base?.lockRequireBiometric ?? true,
       relockOnScreenshare: base?.relockOnScreenshare ?? true,
-      cloudEgressConsented: base?.cloudEgressConsented ?? false,
+      // The consent signal is seeded from the snapshot and flips true only via
+      // the dedicated grant in finish() — carrying it back preserves it.
+      cloudEgressConsented: this.cloudConsented(),
       // Phase H — brain / in-meeting voice assistant. Round-trip the snapshot so
       // onboarding never resets a user's brain choices; defaults mirror a fresh install.
       brainBackend: base?.brainBackend ?? "cloud",
@@ -1361,8 +1561,9 @@ export class OnboardingComponent implements OnInit {
       webSearchConsented: base?.webSearchConsented ?? false,
       // Opt-in claude-CLI env inheritance — round-trip the snapshot so onboarding never resets it.
       claudeCodeInheritEnv: base?.claudeCodeInheritEnv ?? false,
-      // AI Gateway (Phase 1) — round-trip the snapshot so onboarding never resets the URL / model.
-      gatewayBaseUrl: base?.gatewayBaseUrl ?? "",
+      // AI Gateway — the base URL is now wizard-editable (the gateway tile);
+      // the model still round-trips from the snapshot untouched.
+      gatewayBaseUrl: this.gatewayBaseUrl().trim(),
       gatewayModel: base?.gatewayModel ?? "",
     };
     await this.ipc.saveConfig(cfg);
