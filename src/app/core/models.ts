@@ -81,6 +81,7 @@ export interface AppConfigDto {
   keepHiresMasters: boolean;
   diarizeOthers: boolean;
   aecEnabled: boolean;
+  postAecEnabled: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;
