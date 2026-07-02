@@ -15,9 +15,10 @@
 //! `create_reminder`) live on [`GatedToolExecutor`] (NOT [`execute_tool`]): they run only when the
 //! executor was built with `allow_writes`, and `save_note` re-checks `meeting_is_visible` against the
 //! live `unlocked` set BEFORE it appends to `manual_notes` — a sealed-not-unlocked meeting refuses.
-//! The `propose_note` tool (always advertised) writes NO DB AT ALL — it only records a note DRAFT in
-//! interior-mutable scratch for the FE to offer "Add to notes"; the user commits it on Accept. So it
-//! needs no gate (it touches no content store) and carries no leak surface.
+//! The `propose_note` tool (advertised on note-capable surfaces via `note_drafts`) writes NO DB AT
+//! ALL — it only records a note DRAFT in interior-mutable scratch for the FE to offer "Add to
+//! notes"; the user commits it on Accept. So it needs no gate (it touches no content store) and
+//! carries no leak surface.
 //!
 //! ## Egress
 //! [`execute_tool`] EGRESSES NOTHING — it only reads the local SQLite DB and (for semantic search)
@@ -82,9 +83,11 @@ pub struct ToolSpec {
 }
 
 /// The model-facing tool catalog. Built per call (cheap; ~11 entries). The read tools map 1:1 onto
-/// gated `execute_tool` / connector dispatchers. `propose_note` is `write: false` (ALWAYS advertised):
-/// it has NO DB side effect — it only RECORDS a note DRAFT for the user to review/accept via the FE,
-/// so it is the model-driven "the user asked for a note" signal that needs no write capability. The two
+/// gated `execute_tool` / connector dispatchers. `propose_note` is `write: false` (advertised on
+/// surfaces built with `note_drafts` — the in-meeting loops; NOT the vault-wide Ask page, which has
+/// no Accept affordance): it has NO DB side effect — it only RECORDS a note DRAFT for the user to
+/// review/accept via the FE, so it is the model-driven "the user asked for a note" signal that
+/// needs no write capability. The two
 /// `write: true` entries (`save_note`, `create_reminder`) map onto the gated write arms of
 /// `GatedToolExecutor::run` and are advertised ONLY when the executor was built with `allow_writes`.
 pub fn tool_specs() -> Vec<ToolSpec> {
@@ -567,6 +570,11 @@ pub struct GatedToolExecutor<'a> {
     pub meeting_id: &'a str,
     pub app: Option<&'a tauri::AppHandle>,
     pub allow_writes: bool,
+    /// Advertise the DB-free `propose_note` DRAFT tool on this surface. TRUE for the in-meeting
+    /// surfaces (they have a notes flow + an "Add to notes" Accept affordance); FALSE for surfaces
+    /// with no notes flow (the vault-wide Ask page), where a drafted note could never be accepted.
+    /// The tool stays implemented either way — un-advertised, the `run()` allowlist refuses it.
+    pub note_drafts: bool,
     /// The note draft the model proposed this turn (via `propose_note`), if any. `None` ⇒ the reply
     /// is a plain ANSWER; `Some(content)` ⇒ a NOTE PROPOSAL the FE should offer to add. No DB effect.
     pub proposed_note: std::sync::Mutex<Option<String>>,
@@ -581,6 +589,9 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             .filter(|s| match s.name {
                 // Connectors require the AppHandle (async sidecar / consent path).
                 "web_search" | "calendar_lookup" => has_app,
+                // The draft tool is advertised only on surfaces with a notes flow / Accept
+                // affordance (in-meeting yes, the vault-wide Ask page no).
+                "propose_note" => self.note_drafts,
                 // Write actions require explicit allow_writes (off in the v1 loop).
                 _ if s.write => allow_writes,
                 _ => true,
@@ -956,6 +967,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: true,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         let names: Vec<&str> = writeable.specs().iter().map(|s| s.name).collect();
@@ -974,6 +986,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: false,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         let ro_names: Vec<&str> = readonly.specs().iter().map(|s| s.name).collect();
@@ -1005,6 +1018,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: true,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
 
@@ -1054,6 +1068,7 @@ mod tests {
             meeting_id: "sealed1",
             app: None,
             allow_writes: true,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "secret note" }));
@@ -1083,6 +1098,7 @@ mod tests {
             meeting_id: "", // no active recording
             app: None,
             allow_writes: true,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "orphan note" }));
@@ -1107,6 +1123,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: false, // read-only — write tools not advertised
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "should not run" }));
@@ -1137,6 +1154,7 @@ mod tests {
                 meeting_id: "live1",
                 app: None,
                 allow_writes,
+                note_drafts: true,
                 proposed_note: Mutex::new(None),
             };
             let names: Vec<&str> = exec.specs().iter().map(|s| s.name).collect();
@@ -1166,6 +1184,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: false, // propose works even read-only
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
 
@@ -1210,6 +1229,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: false,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         // A plain read tool (the kind a question would use) does NOT set a proposal.
@@ -1234,6 +1254,7 @@ mod tests {
             meeting_id: "live1",
             app: None,
             allow_writes: false,
+            note_drafts: true,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("propose_note", &serde_json::json!({ "content": "   " }));

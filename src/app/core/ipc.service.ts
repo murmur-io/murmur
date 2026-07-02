@@ -66,6 +66,8 @@ export const EVENT_VOICE_COMMAND_PROCESSING =
 export const EVENT_ASSISTANT_TOOL = "murmur://assistant-tool";
 // The chat panel's own tool-trace stream (kept separate from the assistant card's).
 export const EVENT_CHAT_TOOL = "murmur://chat-tool";
+// The Ask page's own tool-trace stream (separate from the record-screen streams).
+export const EVENT_ASK_TOOL = "murmur://ask-tool";
 // Whisper transcribe-model download progress stream.
 export const EVENT_MODEL_DOWNLOAD = "murmur://model-download";
 // Proactive brain (P2) — one zero-egress recall hint from the live-loop matcher.
@@ -434,9 +436,25 @@ export class IpcService {
     return invoke<void>("delete_document", { id });
   }
 
-  /** Ask-My-Vault: grounded Q&A across ALL meetings, with source meetings. */
-  askVault(question: string, history: ChatTurn[]): Promise<AskVaultResult> {
-    return invoke<AskVaultResult>("ask_vault", { question, history });
+  /**
+   * Ask-My-Vault: grounded Q&A across ALL meetings, with source meetings.
+   * `askThreadId` (optional, FE-minted per question) keys this turn's live
+   * tool-trace: the backend stamps it onto the `murmur://ask-tool` events it
+   * emits while answering, so the Ask page routes chips to the in-flight
+   * question only. NOTE: the backend caps the effective history at the LAST
+   * 12 messages — send the full conversation and let it truncate; do NOT
+   * trim FE-side.
+   */
+  askVault(
+    question: string,
+    history: ChatTurn[],
+    askThreadId?: string,
+  ): Promise<AskVaultResult> {
+    return invoke<AskVaultResult>("ask_vault", {
+      question,
+      history,
+      askThreadId,
+    });
   }
 
   /** Generate a Weekly Vault Digest over the last `days` days (writes to vault Digests/). */
@@ -891,6 +909,15 @@ export class IpcService {
   /** The CHAT panel's own live tool-trace (separate from the assistant card's). */
   onChatTool(cb: (p: AssistantToolPayload) => void): Promise<UnlistenFn> {
     return listen<AssistantToolPayload>(EVENT_CHAT_TOOL, (e) => cb(e.payload));
+  }
+
+  /**
+   * The ASK page's own live tool-trace (separate from the record-screen
+   * streams): one event per tool call the `ask_vault` agentic loop makes,
+   * stamped with the `askThreadId` the FE passed to {@link askVault}.
+   */
+  onAskTool(cb: (p: AssistantToolPayload) => void): Promise<UnlistenFn> {
+    return listen<AssistantToolPayload>(EVENT_ASK_TOOL, (e) => cb(e.payload));
   }
 
   /** Fires with progress for the in-flight Whisper transcribe-model download. */
