@@ -27,6 +27,7 @@ pub mod provider;
 pub mod recipes;
 pub mod redact;
 pub mod related_context;
+pub mod roles;
 pub mod template;
 pub mod threads;
 pub mod timeline;
@@ -75,10 +76,81 @@ pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
 /// in [`RedactingProvider`] so high-confidence PII is scrubbed before any content leaves the
 /// device, and is refused entirely until the user has granted one-time cloud-egress consent.
 /// `ollama` is local-only and bypasses both.
+///
+/// Thin wrapper: delegates to [`make_provider_resolved`] with the LEGACY (model, effort) for `id`
+/// — `provider_model`/`provider_effort` for the arms that historically read them, the
+/// connection's own default otherwise — so every remaining direct caller is byte-identical to the
+/// pre-role factory. Role-aware call sites use [`provider_for`] instead.
 pub fn make_provider(
     id: &str,
     config: &AppConfig,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    // The legacy per-arm model semantics: only claude_code/anthropic ever read `provider_model`;
+    // ollama/gateway resolve from ollama_model/gateway_model ("" = inherit below).
+    let model = match id {
+        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC => config.provider_model.clone(),
+        _ => String::new(),
+    };
+    let target = roles::RoleTarget {
+        connection: id.to_string(),
+        model,
+        effort: config.provider_effort.clone(),
+    };
+    make_provider_resolved(&target, config)
+}
+
+/// Build the `SummarizerProvider` serving `role`, resolved through the role layer
+/// ([`roles::provider_target`] — with role keys absent this is EXACTLY the legacy default
+/// provider, so pre-role installs are byte-identical).
+///
+/// The consent gate, `egress_is_cloud` classification, `RedactingProvider` wrap, and the egress
+/// ledger all live INSIDE [`make_provider_resolved`], keyed off the RESOLVED connection — a role
+/// can never bypass them. An EXPLICIT reasoner-only target (`local`/`off` role keys) is refused
+/// with `Unavailable`: those are `LocalReasoner` dispatch targets, never SummarizerProviders.
+pub fn provider_for(
+    role: roles::Role,
+    config: &AppConfig,
+) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    let target = roles::provider_target(role, config);
+    if target.is_reasoner_only() {
+        return Err(crate::error::AppError::Unavailable(format!(
+            "the {} role targets the on-device reasoner ({}); no summarizer provider is available \
+             for it",
+            role.as_str(),
+            target.connection
+        )));
+    }
+    make_provider_resolved(&target, config)
+}
+
+/// The EFFECTIVE model id a resolved target sends: the target's own model, or — when empty —
+/// the connection's default (`anthropic_model` / `ollama_model` / `gateway_model`). For
+/// `claude_code` an empty model stays `""` (the CLI's own default is unknowable here). This is
+/// the single source of truth for provenance: the egress-ledger `model_requested` AND the note's
+/// provenance row both derive from it, fixing the gap where anthropic-with-empty-`provider_model`
+/// recorded an empty model even though the request carried `anthropic_model`.
+pub(crate) fn effective_model_requested(target: &roles::RoleTarget, config: &AppConfig) -> String {
+    let m = target.model.trim();
+    if !m.is_empty() {
+        return m.to_string();
+    }
+    match target.connection.as_str() {
+        PROVIDER_ANTHROPIC => config.anthropic_model.clone(),
+        PROVIDER_OLLAMA => config.ollama_model.clone(),
+        PROVIDER_GATEWAY => config.gateway_model.clone(),
+        _ => String::new(),
+    }
+}
+
+/// The parameterized factory core: build a provider for a RESOLVED (connection, model, effort)
+/// triple. ALL egress invariants live here, keyed off the resolved connection:
+/// the fail-closed consent gate, the [`egress_is_cloud`] classification, the
+/// [`RedactingProvider`] wrap, and the egress-ledger fields.
+fn make_provider_resolved(
+    target: &roles::RoleTarget,
+    config: &AppConfig,
+) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    let id = target.connection.as_str();
     // E10 — fail-closed consent gate, now classification-aware: no cloud provider is built (so no
     // content can be sent) until the user has explicitly consented once. ollama is gated ONLY when
     // its base URL is non-loopback (remote) — closing the gap where a remote ollama_base_url would
@@ -94,33 +166,35 @@ pub fn make_provider(
     let inner: Arc<dyn SummarizerProvider> = match id {
         PROVIDER_CLAUDE_CODE => Arc::new(
             ClaudeCodeProvider::with_binary(config.claude_binary.clone())
-                // Brain/AI model picker: a chosen model is passed as `--model`; an empty value
-                // (the default) lets the CLI use its own default. Effort is N/A for the CLI.
-                .with_model(config.provider_model.clone())
+                // A resolved model is passed as `--model`; an empty value (the default) lets the
+                // CLI use its own default. Effort is N/A for the CLI.
+                .with_model(target.model.clone())
                 // Opt-in: inherit the shell env (restores env ANTHROPIC_API_KEY); DB keys stay stripped.
                 .with_inherit_env(config.claude_code_inherit_env),
         ),
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
             let api_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?;
-            // Brain/AI model picker takes precedence over the legacy `anthropic_model`; effort is
+            // A resolved model takes precedence over the legacy `anthropic_model`; effort is
             // the adaptive-thinking tier (provider default when empty).
-            let model = if config.provider_model.trim().is_empty() {
+            let model = if target.model.trim().is_empty() {
                 config.anthropic_model.clone()
             } else {
-                config.provider_model.clone()
+                target.model.clone()
             };
             Arc::new(AnthropicProvider::with_effort(
                 api_key,
                 model,
-                config.provider_effort.clone(),
+                target.effort.clone(),
             ))
         }
         PROVIDER_OLLAMA => {
-            let ollama = Arc::new(OllamaProvider::new(
-                config.ollama_base_url.clone(),
-                config.ollama_model.clone(),
-            ));
+            let model = if target.model.trim().is_empty() {
+                config.ollama_model.clone()
+            } else {
+                target.model.clone()
+            };
+            let ollama = Arc::new(OllamaProvider::new(config.ollama_base_url.clone(), model));
             if !egress_is_cloud(id, config) {
                 return Ok(ollama); // LOCAL ollama: unwrapped, unchanged behavior
             }
@@ -134,14 +208,17 @@ pub fn make_provider(
             }
             // R3 — resolve the GATEWAY key only; NEVER falls back to the Anthropic key.
             let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+            let model = if target.model.trim().is_empty() {
+                config.gateway_model.clone()
+            } else {
+                target.model.clone()
+            };
             // R1/R4 enforced at construction via `validate_gateway_url` inside `new()`.
-            Arc::new(
-                crate::summarize::gateway::OpenAiCompatProvider::new(
-                    config.gateway_base_url.clone(),
-                    config.gateway_model.clone(),
-                    api_key,
-                )?,
-            )
+            Arc::new(crate::summarize::gateway::OpenAiCompatProvider::new(
+                config.gateway_base_url.clone(),
+                model,
+                api_key,
+            )?)
             // Falls through to the RedactingProvider wrap below (R2).
         }
         other => {
@@ -179,12 +256,9 @@ pub fn make_provider(
             .unwrap_or_else(|| "ollama".to_string()),
         _ => id.to_string(),
     };
-    let model_requested = match id {
-        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC => config.provider_model.clone(),
-        PROVIDER_GATEWAY => config.gateway_model.clone(),
-        PROVIDER_OLLAMA => config.ollama_model.clone(),
-        _ => String::new(),
-    };
+    // Provenance fix: record the EFFECTIVE model — for anthropic with an empty resolved model
+    // that is `anthropic_model` (previously recorded as empty even though the request carried it).
+    let model_requested = effective_model_requested(target, config);
     Ok(Arc::new(
         crate::summarize::redact::RedactingProvider::with_name_redactor_and_sink(
             inner,
@@ -420,6 +494,137 @@ mod tests {
             matches!(err, crate::error::AppError::InvalidArg(_)),
             "expected InvalidArg for empty URL, got: {err}"
         );
+    }
+
+    // ─── Model roles — provider_for keeps every factory invariant, keyed off the RESOLVED
+    //     connection, and is byte-identical to make_provider under the legacy fallback ─────────
+
+    /// FALLBACK IDENTITY at the factory level: with role keys absent, `provider_for` builds the
+    /// SAME default provider as `make_provider(&provider_id, …)` for EVERY role and EVERY
+    /// `brain_backend` — including Local/Off, where the legacy Ask provider paths (meeting chat,
+    /// the ask_vault floor) always ignored `brain_backend`.
+    #[test]
+    fn provider_for_matches_legacy_factory_under_fallback() {
+        use crate::settings::BrainBackend;
+        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            let cfg = AppConfig {
+                cloud_egress_consented: true,
+                brain_backend: backend,
+                ..AppConfig::default()
+            };
+            for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
+                let p = provider_for(role, &cfg)
+                    .unwrap_or_else(|e| panic!("{role:?}/{backend:?} must build: {e}"));
+                assert_eq!(p.id(), PROVIDER_CLAUDE_CODE, "{role:?}/{backend:?}");
+            }
+        }
+    }
+
+    /// CONSENT INVARIANCE across roles: every cloud-classified resolution — explicit role keys
+    /// included — is refused fail-closed without consent, exactly like `make_provider`. The gate
+    /// keys off the RESOLVED connection inside the factory, so a role can never bypass it.
+    #[test]
+    fn provider_for_is_consent_gated_for_every_cloud_resolution() {
+        // (a) fallback (default claude_code), all roles.
+        let cfg = AppConfig::default(); // consent OFF
+        for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
+            assert!(
+                matches!(provider_for(role, &cfg), Err(crate::error::AppError::Unavailable(_))),
+                "fallback {role:?} must be consent-gated"
+            );
+        }
+        // (b) explicit role keys onto each cloud connection (incl. REMOTE ollama).
+        type ConfigTweak = fn(&mut AppConfig);
+        let cases: [(&str, ConfigTweak); 4] = [
+            ("claude_code", |_| {}),
+            ("anthropic", |_| {}),
+            ("gateway", |c| c.gateway_base_url = "http://127.0.0.1:4000/v1".into()),
+            ("ollama", |c| c.ollama_base_url = "https://ollama.remote.example/api".into()),
+        ];
+        for (conn, extra) in cases {
+            let mut cfg = AppConfig {
+                role_ask_connection: conn.to_string(),
+                cloud_egress_consented: false,
+                ..AppConfig::default()
+            };
+            extra(&mut cfg);
+            assert!(
+                matches!(
+                    provider_for(roles::Role::Ask, &cfg),
+                    Err(crate::error::AppError::Unavailable(_))
+                ),
+                "explicit Ask→{conn} must be consent-gated"
+            );
+            // With consent granted the SAME resolution builds (and the RedactingProvider wrap is
+            // transparent to id(), which reports the inner connection — the wrap itself is proven
+            // by the redact.rs tests, exactly like the legacy factory tests above).
+            cfg.cloud_egress_consented = true;
+            let p = provider_for(roles::Role::Ask, &cfg)
+                .unwrap_or_else(|e| panic!("consented Ask→{conn} must build: {e}"));
+            assert_eq!(p.id(), conn);
+        }
+    }
+
+    /// A LOOPBACK ollama role target stays consent-exempt and unwrapped — the classification is
+    /// on the resolved connection + its URL, identical to the legacy factory.
+    #[test]
+    fn provider_for_local_ollama_role_is_ungated() {
+        let cfg = AppConfig {
+            role_ask_connection: "ollama".to_string(),
+            ollama_base_url: "http://localhost:11434".into(),
+            cloud_egress_consented: false,
+            ..AppConfig::default()
+        };
+        let p = provider_for(roles::Role::Ask, &cfg).expect("loopback ollama needs no consent");
+        assert_eq!(p.id(), PROVIDER_OLLAMA);
+    }
+
+    /// EXPLICIT reasoner-only role keys (`local`/`off`) can never build a SummarizerProvider —
+    /// `provider_for` refuses with `Unavailable` (they are LocalReasoner dispatch targets). Only
+    /// the LEGACY brain_backend fallback defers to the default provider (the floor nuance above).
+    #[test]
+    fn provider_for_refuses_explicit_reasoner_only_targets() {
+        for conn in [roles::CONN_LOCAL, roles::CONN_OFF] {
+            let cfg = AppConfig {
+                role_ask_connection: conn.to_string(),
+                cloud_egress_consented: true,
+                ..AppConfig::default()
+            };
+            let err = provider_for(roles::Role::Ask, &cfg)
+                .map(|_| ())
+                .expect_err("explicit reasoner-only target must not build a provider");
+            assert!(
+                matches!(err, crate::error::AppError::Unavailable(_)),
+                "expected Unavailable for explicit {conn}, got: {err}"
+            );
+        }
+    }
+
+    /// PROVENANCE — `effective_model_requested` names the model the request actually carries:
+    /// the resolved model when set, else the CONNECTION's own default. This is the anthropic
+    /// provenance fix: an empty resolved model records `anthropic_model` (previously empty).
+    #[test]
+    fn effective_model_requested_resolves_connection_defaults() {
+        let cfg = AppConfig {
+            anthropic_model: "claude-opus-4-8".to_string(),
+            ollama_model: "llama3.1".to_string(),
+            gateway_model: "gpt-4o".to_string(),
+            ..AppConfig::default()
+        };
+        let t = |conn: &str, model: &str| roles::RoleTarget {
+            connection: conn.to_string(),
+            model: model.to_string(),
+            effort: String::new(),
+        };
+        // An explicit resolved model always wins.
+        assert_eq!(effective_model_requested(&t("anthropic", "claude-sonnet-4-6"), &cfg), "claude-sonnet-4-6");
+        // Empty model → the connection's own default (THE anthropic fix).
+        assert_eq!(effective_model_requested(&t("anthropic", ""), &cfg), "claude-opus-4-8");
+        assert_eq!(effective_model_requested(&t("ollama", ""), &cfg), "llama3.1");
+        assert_eq!(effective_model_requested(&t("gateway", ""), &cfg), "gpt-4o");
+        // claude_code's default is the CLI's own — unknowable here, stays "".
+        assert_eq!(effective_model_requested(&t("claude_code", ""), &cfg), "");
+        assert_eq!(effective_model_requested(&t("claude_code", "claude-haiku-4-5"), &cfg), "claude-haiku-4-5");
     }
 
     /// Task 1.3 — `egress_is_cloud` explicitly classifies `PROVIDER_GATEWAY` as cloud.
