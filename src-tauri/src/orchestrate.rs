@@ -175,7 +175,10 @@ fn deterministic(
         meeting_id,
         title,
         transcript,
-        &config.provider_id,
+        // The corpus egresses to the NOTES-role provider — budget on its RESOLVED connection
+        // (identical to `provider_id` while role keys are absent).
+        &crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, config)
+            .connection,
     )
 }
 
@@ -244,7 +247,12 @@ fn assemble_brain_corpus(
     unlocked: &HashSet<String>,
     config: &AppConfig,
 ) -> String {
-    let budget = crate::summarize::related_context::budget_for(&config.provider_id);
+    // Budget on the NOTES-role provider's RESOLVED connection — the corpus rides in ITS prompt
+    // (identical to `provider_id` while role keys are absent).
+    let budget = crate::summarize::related_context::budget_for(
+        &crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, config)
+            .connection,
+    );
     // The self id appears in tool payloads as `[id:<id>]` (hits) or `id:<id>` (lists); matching the
     // `id:<id>` token covers both, so a note is never grounded in its own prior self.
     let self_tag = format!("id:{meeting_id}");

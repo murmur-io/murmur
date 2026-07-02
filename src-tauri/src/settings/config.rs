@@ -221,6 +221,43 @@ pub struct AppConfig {
     /// as `true`.
     #[serde(default = "default_true")]
     pub proactive_hints_enabled: bool,
+    /// Model-role override — the CONNECTION serving the **Notes** role (everything Murmur writes).
+    /// `""` (the default, and every pre-role install) = inherit the legacy mapping EXACTLY — see
+    /// [`crate::summarize::roles::resolve`]. Values: `claude_code`/`anthropic`/`ollama`/`gateway`
+    /// (or `local`/`off` for the reasoner-only roles). ADDITIVE: the legacy keys are never
+    /// rewritten; `#[serde(default)]` ⇒ pre-existing configs load as `""` (zero behavior change).
+    #[serde(default)]
+    pub role_notes_connection: String,
+    /// Model-role override — the MODEL for the Notes role. `""` = the connection's own default.
+    /// Consulted only when `role_notes_connection` is set (the connection key is the override
+    /// switch). `#[serde(default)]` ⇒ `""`.
+    #[serde(default)]
+    pub role_notes_model: String,
+    /// Model-role override — the reasoning EFFORT for the Notes role (`""`/`low`/`medium`/`high`;
+    /// honored by the `anthropic` provider only, like `provider_effort`). Consulted only when
+    /// `role_notes_connection` is set. `#[serde(default)]` ⇒ `""`.
+    #[serde(default)]
+    pub role_notes_effort: String,
+    /// Model-role override — the CONNECTION serving the **Ask** role (vault Q&A + meeting chat).
+    /// Same semantics as `role_notes_connection`.
+    #[serde(default)]
+    pub role_ask_connection: String,
+    /// Model-role override — the MODEL for the Ask role. Same semantics as `role_notes_model`.
+    #[serde(default)]
+    pub role_ask_model: String,
+    /// Model-role override — the EFFORT for the Ask role. Same semantics as `role_notes_effort`.
+    #[serde(default)]
+    pub role_ask_effort: String,
+    /// Model-role override — the CONNECTION serving the **Live** role (the in-meeting assistant,
+    /// @brain threads, voice). Same semantics as `role_notes_connection`.
+    #[serde(default)]
+    pub role_live_connection: String,
+    /// Model-role override — the MODEL for the Live role. Same semantics as `role_notes_model`.
+    #[serde(default)]
+    pub role_live_model: String,
+    /// Model-role override — the EFFORT for the Live role. Same semantics as `role_notes_effort`.
+    #[serde(default)]
+    pub role_live_effort: String,
 }
 
 /// serde default for flags that default ON (mirrors `commands::default_true` for the DTO side).
@@ -269,6 +306,15 @@ impl Default for AppConfig {
             gateway_base_url: String::new(),
             gateway_model: String::new(),
             proactive_hints_enabled: true,
+            role_notes_connection: String::new(),
+            role_notes_model: String::new(),
+            role_notes_effort: String::new(),
+            role_ask_connection: String::new(),
+            role_ask_model: String::new(),
+            role_ask_effort: String::new(),
+            role_live_connection: String::new(),
+            role_live_model: String::new(),
+            role_live_effort: String::new(),
         }
     }
 }
@@ -312,6 +358,15 @@ const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
 const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
+const K_ROLE_NOTES_CONNECTION: &str = "role_notes_connection";
+const K_ROLE_NOTES_MODEL: &str = "role_notes_model";
+const K_ROLE_NOTES_EFFORT: &str = "role_notes_effort";
+const K_ROLE_ASK_CONNECTION: &str = "role_ask_connection";
+const K_ROLE_ASK_MODEL: &str = "role_ask_model";
+const K_ROLE_ASK_EFFORT: &str = "role_ask_effort";
+const K_ROLE_LIVE_CONNECTION: &str = "role_live_connection";
+const K_ROLE_LIVE_MODEL: &str = "role_live_model";
+const K_ROLE_LIVE_EFFORT: &str = "role_live_effort";
 
 impl AppConfig {
     /// Read all known keys from the settings table, falling back to `Default` for any
@@ -442,6 +497,35 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_PROACTIVE_HINTS_ENABLED)? {
             cfg.proactive_hints_enabled = v == "true";
         }
+        // Model-role keys: `""` is a VALID value (= inherit legacy) and also the default, so the
+        // stored value is taken verbatim (mirrors `provider_model`, not `anthropic_model`).
+        if let Some(v) = db.get_setting(K_ROLE_NOTES_CONNECTION)? {
+            cfg.role_notes_connection = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_NOTES_MODEL)? {
+            cfg.role_notes_model = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_NOTES_EFFORT)? {
+            cfg.role_notes_effort = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_ASK_CONNECTION)? {
+            cfg.role_ask_connection = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_ASK_MODEL)? {
+            cfg.role_ask_model = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_ASK_EFFORT)? {
+            cfg.role_ask_effort = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_LIVE_CONNECTION)? {
+            cfg.role_live_connection = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_LIVE_MODEL)? {
+            cfg.role_live_model = v;
+        }
+        if let Some(v) = db.get_setting(K_ROLE_LIVE_EFFORT)? {
+            cfg.role_live_effort = v;
+        }
 
         Ok(cfg)
     }
@@ -550,6 +634,15 @@ impl AppConfig {
             K_PROACTIVE_HINTS_ENABLED,
             if self.proactive_hints_enabled { "true" } else { "false" },
         )?;
+        db.set_setting(K_ROLE_NOTES_CONNECTION, &self.role_notes_connection)?;
+        db.set_setting(K_ROLE_NOTES_MODEL, &self.role_notes_model)?;
+        db.set_setting(K_ROLE_NOTES_EFFORT, &self.role_notes_effort)?;
+        db.set_setting(K_ROLE_ASK_CONNECTION, &self.role_ask_connection)?;
+        db.set_setting(K_ROLE_ASK_MODEL, &self.role_ask_model)?;
+        db.set_setting(K_ROLE_ASK_EFFORT, &self.role_ask_effort)?;
+        db.set_setting(K_ROLE_LIVE_CONNECTION, &self.role_live_connection)?;
+        db.set_setting(K_ROLE_LIVE_MODEL, &self.role_live_model)?;
+        db.set_setting(K_ROLE_LIVE_EFFORT, &self.role_live_effort)?;
         Ok(())
     }
 
@@ -924,6 +1017,72 @@ mod tests {
         let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().proactive_hints_enabled);
+    }
+
+    /// Model roles — the 9 role keys default `""` (inherit-legacy) for fresh installs AND for
+    /// configs persisted before the keys existed (both the settings-table path and the serde
+    /// path), and set values round-trip — including clearing back to `""` (not a one-way latch).
+    /// `""`-on-absent is the ZERO-BEHAVIOR-CHANGE guarantee for existing installs.
+    #[test]
+    fn role_keys_default_empty_and_round_trip() {
+        // In-memory struct default + empty settings table (keys never written) ⇒ "" everywhere.
+        let d = AppConfig::default();
+        let db = temp_db();
+        let fresh = AppConfig::load(&db).unwrap();
+        for cfg in [&d, &fresh] {
+            assert_eq!(cfg.role_notes_connection, "");
+            assert_eq!(cfg.role_notes_model, "");
+            assert_eq!(cfg.role_notes_effort, "");
+            assert_eq!(cfg.role_ask_connection, "");
+            assert_eq!(cfg.role_ask_model, "");
+            assert_eq!(cfg.role_ask_effort, "");
+            assert_eq!(cfg.role_live_connection, "");
+            assert_eq!(cfg.role_live_model, "");
+            assert_eq!(cfg.role_live_effort, "");
+        }
+
+        // serde path: a pre-role JSON payload (fields omitted) loads "" (#[serde(default)]).
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.role_notes_connection, "");
+        assert_eq!(cfg.role_ask_connection, "");
+        assert_eq!(cfg.role_live_connection, "");
+
+        // Set values persist + reload verbatim.
+        let cfg = AppConfig {
+            role_notes_connection: "anthropic".to_string(),
+            role_notes_model: "claude-opus-4-8".to_string(),
+            role_notes_effort: "high".to_string(),
+            role_ask_connection: "ollama".to_string(),
+            role_ask_model: "mistral-small".to_string(),
+            role_live_connection: "off".to_string(),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.role_notes_connection, "anthropic");
+        assert_eq!(loaded.role_notes_model, "claude-opus-4-8");
+        assert_eq!(loaded.role_notes_effort, "high");
+        assert_eq!(loaded.role_ask_connection, "ollama");
+        assert_eq!(loaded.role_ask_model, "mistral-small");
+        assert_eq!(loaded.role_ask_effort, "");
+        assert_eq!(loaded.role_live_connection, "off");
+
+        // Clearing back to "" (inherit legacy) also round-trips.
+        AppConfig::default().save(&db).unwrap();
+        let cleared = AppConfig::load(&db).unwrap();
+        assert_eq!(cleared.role_notes_connection, "");
+        assert_eq!(cleared.role_ask_connection, "");
+        assert_eq!(cleared.role_live_connection, "");
     }
 
     /// Task 1.1 — serde: a payload omitting the gateway fields loads with empty defaults.
