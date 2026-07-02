@@ -271,6 +271,13 @@ export interface VoiceActionResultPayload {
    * auto-writes; accept is the only path content enters the notes.
    */
   proposedNote: string | null;
+  /**
+   * The persistent thread this result belongs to, when the backend stamps one
+   * (a turn initiated with a `threadId`, or one the backend generated). Absent /
+   * null on an older backend — the FE then falls back to its voice-target
+   * routing. Lets the FE resolve the RIGHT thread when several are in flight.
+   */
+  threadId?: string | null;
 }
 
 /**
@@ -311,6 +318,13 @@ export interface AssistantToolPayload {
   ok: boolean;
   /** Coarse result-size signal for the "✓ N" badge — never the content. */
   count: number | null;
+  /**
+   * The thread whose agentic turn made this tool call, when the backend stamps
+   * one. Absent / null on an older backend — the FE then falls back to the
+   * most-recently-opened pending turn. Fixes cross-attribution when two
+   * threads are in flight simultaneously.
+   */
+  threadId?: string | null;
 }
 
 /**
@@ -321,6 +335,31 @@ export interface AssistantToolPayload {
 export interface ChatMsg {
   role: "user" | "assistant";
   text: string;
+}
+
+/**
+ * One persisted `@brain` thread EXCHANGE (`list_assistant_threads`): the user's
+ * `command` + the brain's `answer` for one turn of a thread, keyed by the
+ * FE-generated `threadId`. Rows arrive oldest → newest and ONLY for turns that
+ * carry a threadId; a sealed-and-not-session-unlocked meeting returns an EMPTY
+ * array (gated server-side — never a question or answer behind the lock). The
+ * record screen groups rows by `threadId` to rebuild the Slack-style threads
+ * when a meeting is reopened.
+ */
+export interface AssistantThreadRow {
+  threadId: string;
+  /** The note line the thread hangs under (null for an anchorless/voice thread). */
+  anchorText: string | null;
+  /** The user's question for this exchange. */
+  command: string;
+  /** The brain's reply markdown. */
+  answer: string;
+  /** Flat citation strings (same shape as `VoiceActionResultPayload.citations`). */
+  citations: string[];
+  /** The turn's terminal status (a `VoiceActionStatus` string). */
+  status: string;
+  /** ISO-8601 creation timestamp (ordering is already oldest → newest). */
+  createdAt: string;
 }
 
 /** A selectable microphone input device (from `list_input_devices`). */

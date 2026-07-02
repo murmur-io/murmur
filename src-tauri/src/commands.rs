@@ -637,8 +637,15 @@ pub(crate) fn end_voice_command_inner(
 /// `EVENT_VOICE_ACTION_RESULT` with the live tool-trace on `EVENT_ASSISTANT_TOOL`. Runs OFF-thread
 /// (the brain can take seconds). The text is the user's OWN words — the SAME egress class as a
 /// dictated voice command (no new egress). Emits the "thinking…" processing affordance immediately.
+/// `thread_id` is OPTIONAL: the FE passes an @brain thread's id to keep the exchange in that
+/// thread; when absent (the voice/wake twin sends none) the backend GENERATES a UUID v4 inside the
+/// turn, so every persisted exchange carries a thread identity going forward.
 #[tauri::command]
-pub fn ask_assistant_text(app: AppHandle, text: String) -> Result<(), AppError> {
+pub fn ask_assistant_text(
+    app: AppHandle,
+    text: String,
+    thread_id: Option<String>,
+) -> Result<(), AppError> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err(AppError::InvalidArg("empty question".into()));
@@ -647,7 +654,7 @@ pub fn ask_assistant_text(app: AppHandle, text: String) -> Result<(), AppError> 
         crate::events::EVENT_VOICE_COMMAND_PROCESSING,
         crate::events::VoiceCommandProcessingPayload { active: true },
     );
-    crate::transcribe::live::spawn_assistant_turn(app, text);
+    crate::transcribe::live::spawn_assistant_turn(app, text, thread_id);
     Ok(())
 }
 
@@ -696,22 +703,52 @@ fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
 /// The FE sends the FULL conversation each turn, so the brain has multi-turn memory. The heavy agentic
 /// work runs on a blocking thread (it can take seconds) so the async runtime stays free. SAME gated +
 /// consent-gated + redacting brain as voice (no new egress class).
+/// `thread_id`/`anchor_text` are OPTIONAL thread identity (FE camelCase: `threadId`/`anchorText`):
+/// the @brain thread this exchange belongs to, and the note text the thread was anchored to. A
+/// missing `thread_id` is backend-generated (UUID v4) so every persisted exchange carries one. The
+/// PERSISTED row's `command` is `latest` — the user's newest message, never the rendered history.
 #[tauri::command]
 pub async fn ask_assistant_chat(
     app: AppHandle,
     messages: Vec<ChatMsg>,
+    thread_id: Option<String>,
+    anchor_text: Option<String>,
 ) -> Result<crate::voice_action::VoiceActionResult, AppError> {
     let (latest, conversation) = format_chat(&messages)?;
+    let thread_id = crate::transcribe::live::ensure_thread_id(thread_id);
     tokio::task::spawn_blocking(move || {
         crate::transcribe::live::run_assistant_query(
             &app,
             &latest,
             &conversation,
             crate::events::EVENT_CHAT_TOOL,
+            &thread_id,
+            anchor_text.as_deref(),
         )
     })
     .await
     .map_err(|e| AppError::Other(anyhow::anyhow!("chat task join failed: {e}")))
+}
+
+/// List the PERSISTED @brain thread exchanges for a meeting (only rows carrying a `thread_id`),
+/// oldest first — the durable substrate the FE rebuilds its thread panels from across meeting
+/// switches / restarts. GATED read: it routes through `list_assistant_threads_visible`
+/// (`visibility_clause`-backed), so a sealed-and-not-session-unlocked meeting returns EMPTY —
+/// never an error that leaks existence. On seal the rows are purged anyway
+/// (`purge_assistant_interactions_tx`); the gate is defense-in-depth.
+#[tauri::command]
+pub fn list_assistant_threads(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::storage::models::AssistantThreadRow>, AppError> {
+    // Poisoned lock ⇒ empty unlock set ⇒ fail CLOSED (sealed meetings stay invisible) — the same
+    // posture as the `get_meeting_detail` interactions read.
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    state.db.list_assistant_threads_visible(&meeting_id, &unlocked)
 }
 
 #[cfg(test)]

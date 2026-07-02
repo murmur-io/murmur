@@ -90,6 +90,10 @@ pub struct AssistantToolPayload {
     pub ok: bool,
     /// Coarse result-size signal for the done badge — NOT the content.
     pub count: Option<u32>,
+    /// Opaque id of the conversation THREAD this tool call belongs to (an @brain thread id or the
+    /// backend-generated voice-turn UUID), so simultaneous threads attribute their trace chips
+    /// without cross-bleed. `None` only for legacy emitters. NOT PII (an opaque UUID).
+    pub thread_id: Option<String>,
 }
 
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.

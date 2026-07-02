@@ -15,6 +15,7 @@ import type {
   ReindexResult,
   InputDeviceInfo,
   AskVaultResult,
+  AssistantThreadRow,
   BrainOverview,
   BriefResult,
   BuiltinRecipe,
@@ -667,9 +668,12 @@ export class IpcService {
    * trace streams via {@link onAssistantTool}, and the answer arrives via
    * {@link onVoiceActionResult}. Resolves once the turn is dispatched (not when
    * the answer is ready). Rejects (InvalidArg) on an empty question.
+   *
+   * Pass `threadId` to persist the exchange under that thread (the result +
+   * tool-trace events come back stamped with it); omit it for an anchorless ask.
    */
-  askAssistantText(text: string): Promise<void> {
-    return invoke<void>("ask_assistant_text", { text });
+  askAssistantText(text: string, threadId?: string): Promise<void> {
+    return invoke<void>("ask_assistant_text", { text, threadId });
   }
 
   /**
@@ -678,9 +682,37 @@ export class IpcService {
    * the brain has multi-turn memory, and RESOLVES with the reply (summary +
    * citations + status) so the panel can resolve the in-flight assistant bubble.
    * The live tool-trace streams via {@link onChatTool}.
+   *
+   * Pass `threadId` (the FE-generated thread key) + `anchorText` (the note line
+   * the thread hangs under) so the exchange persists under THIS thread and
+   * rehydrates attached to its anchor via {@link listAssistantThreads}. Both
+   * optional — but an omitted `threadId` is NOT ephemeral: the backend generates
+   * a UUID itself and the exchange STILL persists (it then rehydrates as a
+   * standalone anchorless thread). Always pass the thread's own id so its
+   * exchanges stay grouped.
    */
-  askAssistantChat(messages: ChatMsg[]): Promise<VoiceActionResultPayload> {
-    return invoke<VoiceActionResultPayload>("ask_assistant_chat", { messages });
+  askAssistantChat(
+    messages: ChatMsg[],
+    threadId?: string,
+    anchorText?: string,
+  ): Promise<VoiceActionResultPayload> {
+    return invoke<VoiceActionResultPayload>("ask_assistant_chat", {
+      messages,
+      threadId,
+      anchorText,
+    });
+  }
+
+  /**
+   * A meeting's PERSISTED `@brain` thread exchanges, oldest → newest, ONLY rows
+   * that carry a threadId. GATED server-side: a sealed-and-not-session-unlocked
+   * meeting returns an EMPTY array (masked — never a question/answer behind the
+   * lock). The record screen groups rows by `threadId` to rebuild its threads.
+   */
+  listAssistantThreads(meetingId: string): Promise<AssistantThreadRow[]> {
+    return invoke<AssistantThreadRow[]>("list_assistant_threads", {
+      meetingId,
+    });
   }
 
   // ── brain2 realtime typed @brain notes (record screen "My notes") ──────
