@@ -225,6 +225,9 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
           class="conversation"
           [meetingId]="store.meetingId()"
           [hintsEnabled]="hintsEnabled()"
+          [enhancing]="enhancingNotes()"
+          [settled]="enhanceSettled()"
+          [enhanceAware]="enhanceMode()"
         />
       }
 
@@ -1050,6 +1053,25 @@ export class RecordComponent implements OnInit {
     () => this.config()?.proactiveHintsEnabled ?? true,
   );
 
+  /** ENHANCE-MY-NOTES: mode from config; missing/empty ⇒ enhance (the backend default). */
+  readonly enhanceMode = computed(
+    () => (this.config()?.notesMode ?? "enhance") === "enhance",
+  );
+  /** The hero trigger: summarizing a meeting whose notes will be the skeleton. */
+  readonly enhancingNotes = computed(
+    () =>
+      this.enhanceMode() &&
+      this.assistant.hasPersistedNotes() &&
+      this.store.stage() === "summarizing",
+  );
+  /** Settled: done + the notes were enhanced — keeps the surface up through "Saved ✓". */
+  readonly enhanceSettled = computed(
+    () =>
+      this.enhanceMode() &&
+      this.assistant.hasPersistedNotes() &&
+      this.store.stage() === "done",
+  );
+
   /**
    * Show the conversation thread — the full-height main surface of the
    * conversation-first record screen. It is the home for BOTH note-taking AND
@@ -1071,7 +1093,11 @@ export class RecordComponent implements OnInit {
       this.store.isRecording() ||
       this.assistant.listening() ||
       this.assistant.processing() ||
-      this.assistant.manualAskInFlight()
+      this.assistant.manualAskInFlight() ||
+      (this.enhanceMode() &&
+        this.isProcessing() &&
+        this.assistant.hasPersistedNotes()) ||
+      this.enhanceSettled()
     );
   });
 
@@ -1199,12 +1225,20 @@ export class RecordComponent implements OnInit {
         return "Mic muted — still capturing others. Press ⌘R or Stop when done.";
       return "Recording — press ⌘R or Stop when done.";
     }
-    if (this.isProcessing()) return "Transcribing on-device, then summarizing…";
+    if (this.isProcessing())
+      return this.enhanceMode() && this.assistant.hasPersistedNotes()
+        ? "Transcribing on-device, then enhancing your notes…"
+        : "Transcribing on-device, then summarizing…";
     if (this.modelPresent() === false) return "Download the model to start.";
-    if (this.store.stage() === "done")
+    if (this.store.stage() === "done") {
+      if (this.enhanceSettled())
+        return this.vaultMissing()
+          ? "Saved ✓ — your enhanced note is in Murmur."
+          : "Saved ✓ — your enhanced note is in the vault.";
       return this.vaultMissing()
         ? "Saved ✓ — your note is in Murmur."
         : "Saved ✓ — your note is in the vault.";
+    }
     return "On-device transcription · your audio never leaves this Mac.";
   });
 
