@@ -222,7 +222,9 @@ pub fn run() {
                     .config
                     .lock()
                     .map(|c| c.mcp_require_token)
-                    .unwrap_or(false);
+                    // Poisoned config ⇒ fail CLOSED (require the token) — aligned with the
+                    // reasoner-dispatch poison posture (unreadable config never relaxes auth).
+                    .unwrap_or(true);
                 crate::mcp::spawn(db_path, unlocked, require_token);
             }
             // Screen-share auto-relock watcher: on capture START, relock all session-unlocked
