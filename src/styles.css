@@ -445,6 +445,8 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
 .pill.is-danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
 .pill.is-warning { background: var(--warning-soft); border-color: transparent; color: var(--warning); }
 .pill.is-live { background: var(--live-soft); border-color: transparent; color: var(--live-hover); }
+/* ENHANCE-MY-NOTES provenance badge (detail header). */
+.pill.pill-enhanced { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 
 /* --- Banner ---------------------------------------------------------------- */
 .banner {
