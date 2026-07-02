@@ -1033,9 +1033,12 @@ export class RecordComponent implements OnInit {
   /** Latest settings snapshot, refreshed on entry — used for the readiness guard. */
   private readonly config = signal<AppConfigDto | null>(null);
 
-  /** Headphones hint: capturing system audio through speakers echoes into the mic (rec #5). */
+  /** Best-effort: is the default output the built-in speakers? null/undetermined ⇒ assume yes. */
+  private readonly onSpeakers = signal<boolean>(true);
+
+  /** Headphones hint: system-audio capture + built-in speakers = echo into the mic (rec #5). */
   readonly headphonesHint = computed(
-    () => this.config()?.captureSystemAudio ?? false,
+    () => (this.config()?.captureSystemAudio ?? false) && this.onSpeakers(),
   );
 
   /**
@@ -1240,6 +1243,7 @@ export class RecordComponent implements OnInit {
     // events fired before it renders (or while the config snapshot is stale) drop.
     void this.assistant.init();
     this.config.set(await this.ipc.getConfig());
+    void this.ipc.outputIsBuiltinSpeakers().then((v) => this.onSpeakers.set(v ?? true));
     this.modelPresent.set(await this.ipc.modelPresent());
     // Stats are secondary — never let a failure here block the record screen.
     try {
