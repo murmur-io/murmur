@@ -3259,6 +3259,13 @@ pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppErr
     Ok(crate::audio::list_input_devices())
 }
 
+/// Whether the CURRENT default audio output is the built-in speakers (echo risk while
+/// capturing system audio). Best-effort introspection — `None` when undeterminable.
+#[tauri::command]
+pub fn output_is_builtin_speakers() -> Result<Option<bool>, AppError> {
+    Ok(crate::audio::output::default_output_is_builtin_speakers())
+}
+
 /// Store/replace the Anthropic API key in Keychain (account "anthropic_api_key").
 #[tauri::command]
 pub fn set_anthropic_key(key: String) -> Result<(), AppError> {

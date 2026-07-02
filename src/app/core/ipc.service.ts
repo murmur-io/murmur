@@ -136,6 +136,11 @@ export class IpcService {
     return invoke<InputDeviceInfo[]>("list_input_devices");
   }
 
+  /** Is the default audio output the built-in speakers (echo risk)? null = undeterminable. */
+  outputIsBuiltinSpeakers(): Promise<boolean | null> {
+    return invoke<boolean | null>("output_is_builtin_speakers");
+  }
+
   getLastNote(): Promise<NoteDto | null> {
     return invoke<NoteDto | null>("get_last_note");
   }
