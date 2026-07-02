@@ -1,0 +1,956 @@
+import { DestroyRef, Injectable, computed, inject, signal } from "@angular/core";
+import { toSignal } from "@angular/core/rxjs-interop";
+import { FormBuilder, FormControl } from "@angular/forms";
+import { startWith } from "rxjs";
+import { Router } from "@angular/router";
+import { open } from "@tauri-apps/plugin-dialog";
+import { IpcService } from "../../core/ipc.service";
+import type {
+  AppConfigDto,
+  AppInfo,
+  BrainBackend,
+  BrainModelDto,
+  GatewayHealth,
+  GatewayModel,
+  InputDeviceInfo,
+  ProviderStatus,
+  ReindexResult,
+} from "../../core/models";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+
+/**
+ * Shared state + IPC orchestration for the Settings page (Stage-1 split of the
+ * former settings.component.ts monolith — moved here VERBATIM, no behavior
+ * change).
+ *
+ * Provided BY THE SHELL (`SettingsComponent`'s `providers`), NOT in root, so
+ * its lifetime is exactly the settings route's — created on enter, destroyed
+ * on leave (DestroyRef releases the event-stream unlistens then, same as the
+ * pre-split component). The single reactive `form` and every cross-section
+ * signal live here, so switching sidebar sections (which destroys/recreates
+ * the section child) never loses unsaved edits or in-flight download/consent
+ * state. Writable signals are private (`_x`) and published `.asReadonly()`
+ * (RecorderStore pattern); section children mutate state only through the
+ * store's methods.
+ */
+@Injectable()
+export class SettingsStore {
+  private readonly ipc = inject(IpcService);
+  private readonly fb = inject(FormBuilder);
+  private readonly router = inject(Router);
+  private readonly destroyRef = inject(DestroyRef);
+
+  // ── About — product identity + shared update-check state ────────────────
+
+  /** Static product identity (name/version/description), loaded once in load(). */
+  private readonly _appInfo = signal<AppInfo | null>(null);
+  readonly appInfo = this._appInfo.asReadonly();
+
+  /** Tracked so we can cancel the pending "Copied" reset on destroy (no leaks). */
+  private copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Same as copyResetTimer, but for the MCP "Copied" flash — cancelled on destroy. */
+  private mcpCopyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Built eagerly with defaults so the panel always renders (no "stuck on loading"),
+   * then `patchValue`d from the loaded config in load(). SF-6: reactive forms.
+   */
+  readonly form = this.fb.nonNullable.group({
+    providerId: "claude_code",
+    vaultPath: "",
+    vaultSubfolder: "",
+    whisperModelPath: "",
+    language: "",
+    anthropicModel: "claude-opus-4-8",
+    // Brain/AI model + reasoning-effort overrides ("" = provider default). Effort is
+    // honored only by the anthropic provider; the picker is gated on providerId below.
+    providerModel: "",
+    providerEffort: "",
+    ollamaBaseUrl: "http://localhost:11434",
+    ollamaModel: "llama3.1",
+    claudeBinary: "claude",
+    // Opt-in: pass the shell env to the `claude` CLI (restores env ANTHROPIC_API_KEY auth).
+    claudeCodeInheritEnv: false,
+    inputDevice: "",
+    captureSystemAudio: false,
+    vadEnabled: true,
+    keepHiresMasters: false,
+    diarizeOthers: false,
+    aecEnabled: false,
+    modelSize: "large-v3",
+    voiceTrigger: false,
+    noteStyle: "standard",
+    autoOrganize: false,
+    noteLanguage: "auto",
+    // Phase H — brain / in-meeting voice assistant.
+    brainBackend: "cloud" as BrainBackend,
+    realtimeReactions: false,
+    // Proactive brain (P2) — zero-egress recall cards while recording; default ON.
+    proactiveHintsEnabled: true,
+    /** Custom GGUF model path (or registry id). Empty → null on save. */
+    brainModelId: "",
+    // brain2 RAG — semantic-search master flag (round-tripped on save).
+    semanticSearchEnabled: false,
+    // brain2 connectors — web-search master toggle (NEW EGRESS; round-tripped).
+    webSearchEnabled: false,
+    // AI Gateway (Phase 1) — base URL and model, round-tripped on save.
+    gatewayBaseUrl: "",
+    gatewayModel: "",
+  });
+  readonly keyControl = new FormControl("", { nonNullable: true });
+  /** BYO Brave Search API key input (web-search connector). Cleared after save. */
+  readonly webKeyControl = new FormControl("", { nonNullable: true });
+
+  private readonly _providers = signal<ProviderStatus[]>([]);
+  readonly providers = this._providers.asReadonly();
+  /** Available mic input devices for the picker (loaded best-effort in load()). */
+  private readonly _inputDevices = signal<InputDeviceInfo[]>([]);
+  readonly inputDevices = this._inputDevices.asReadonly();
+  private readonly _hasKey = signal(false);
+  readonly hasKey = this._hasKey.asReadonly();
+  private readonly _saved = signal(false);
+  readonly saved = this._saved.asReadonly();
+  private readonly _loadError = signal<string | null>(null);
+  readonly loadError = this._loadError.asReadonly();
+
+  /** The Obsidian homepage — shown as copyable text (no in-webview navigation). */
+  readonly obsidianUrl = "obsidian.md";
+
+  /** Flips true for ~1.6s after copying the Obsidian URL — drives the button's confirmed state. */
+  private readonly _urlCopied = signal(false);
+  readonly urlCopied = this._urlCopied.asReadonly();
+
+  /** The localhost MCP server address — shown inline and embedded in the config. */
+  readonly mcpUrl = "http://127.0.0.1:8765";
+
+  /** Exact JSON to drop into the Claude Desktop config — copied verbatim. */
+  readonly mcpConfig = `{
+  "mcpServers": {
+    "murmur": {
+      "url": "${this.mcpUrl}"
+    }
+  }
+}`;
+
+  /** Flips true for ~1.6s after copying the MCP config — drives the button's confirmed state. */
+  private readonly _configCopied = signal(false);
+  readonly configCopied = this._configCopied.asReadonly();
+
+  /**
+   * Real Whisper-model presence (same UX as the record screen).
+   * `null` = not yet checked, `true`/`false` = detected via ipc.modelPresent().
+   */
+  private readonly _modelPresent = signal<boolean | null>(null);
+  readonly modelPresent = this._modelPresent.asReadonly();
+
+  /** True while a download is in-flight — disables the download button. */
+  private readonly _downloadingModel = signal(false);
+  readonly downloadingModel = this._downloadingModel.asReadonly();
+
+  /** Surfaced if ipc.downloadModel() rejects. */
+  private readonly _modelDownloadError = signal<string | null>(null);
+  readonly modelDownloadError = this._modelDownloadError.asReadonly();
+
+  /** 0..1 download progress for the in-flight Whisper model (best-effort from events). */
+  private readonly _modelDownloadFrac = signal(0);
+  readonly modelDownloadFrac = this._modelDownloadFrac.asReadonly();
+  /** Whole-percent label for the in-flight Whisper-model download. */
+  readonly modelPct = computed(
+    () => Math.round(this.modelDownloadFrac() * 100) + "%",
+  );
+  /** Release handle for the EVENT_MODEL_DOWNLOAD subscription. */
+  private unlistenModelDownload: UnlistenFn | null = null;
+
+  /** Approx download size for the selected quality (shown on the Download button). */
+  private readonly _downloadHint = signal("~3 GB");
+  readonly downloadHint = this._downloadHint.asReadonly();
+
+  /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
+  private loadedOnboarded = true;
+
+  /**
+   * Stage E security flags — preserved from the loaded config (not form-edited)
+   * so save() round-trips them instead of letting the backend default them off.
+   */
+  private loadedMcpRequireToken = true;
+  private loadedLockRequireBiometric = true;
+  private loadedRelockOnScreenshare = true;
+
+  /** Cloud-egress consent state — drives the "Cloud processing" section; round-tripped on save. */
+  private readonly _cloudConsented = signal(false);
+  readonly cloudConsented = this._cloudConsented.asReadonly();
+  /** True while the one-time consent command is in flight. */
+  private readonly _consenting = signal(false);
+  readonly consenting = this._consenting.asReadonly();
+  /** Surfaced if granting consent rejects. */
+  private readonly _consentError = signal<string | null>(null);
+  readonly consentError = this._consentError.asReadonly();
+
+  // ── brain2 connectors — web search (NEW EGRESS) ────────────────────────
+
+  /** Web-search egress consent state — drives the "Allow web search" section; round-tripped on save. */
+  private readonly _webConsented = signal(false);
+  readonly webConsented = this._webConsented.asReadonly();
+  /** True while the one-time web-search consent command is in flight. */
+  private readonly _webConsenting = signal(false);
+  readonly webConsenting = this._webConsenting.asReadonly();
+  /** Surfaced if granting web-search consent rejects. */
+  private readonly _webConsentError = signal<string | null>(null);
+  readonly webConsentError = this._webConsentError.asReadonly();
+  /** Whether a Brave Search API key is stored (has-key check; never the value). */
+  private readonly _hasWebKey = signal(false);
+  readonly hasWebKey = this._hasWebKey.asReadonly();
+  /** True while the BYO key is being saved. */
+  private readonly _savingWebKey = signal(false);
+  readonly savingWebKey = this._savingWebKey.asReadonly();
+  /** Surfaced if storing the web-search key rejects. */
+  private readonly _webKeyError = signal<string | null>(null);
+  readonly webKeyError = this._webKeyError.asReadonly();
+
+  // ── AI Gateway (Phase 1) — key management + destination computed signals ──
+
+  /** Gateway API key input. Cleared after save; value never sent back. */
+  readonly gatewayKeyControl = new FormControl("", { nonNullable: true });
+  /** Whether a gateway API key is currently stored (has-key probe; never the value). */
+  private readonly _hasGatewayKey = signal(false);
+  readonly hasGatewayKey = this._hasGatewayKey.asReadonly();
+  /** Surfaced if storing or clearing the gateway key rejects. */
+  private readonly _gatewayKeyError = signal<string | null>(null);
+  readonly gatewayKeyError = this._gatewayKeyError.asReadonly();
+
+  // ── AI Gateway (Phase 3) — live model picker ────────────────────────────
+
+  /** Models fetched from the gateway's `/v1/models` endpoint. Empty = use text fallback. */
+  private readonly _gatewayModels = signal<GatewayModel[]>([]);
+  readonly gatewayModels = this._gatewayModels.asReadonly();
+  /** True while list_gateway_models is in-flight — disables the Refresh button. */
+  private readonly _gatewayModelsLoading = signal(false);
+  readonly gatewayModelsLoading = this._gatewayModelsLoading.asReadonly();
+  /** Non-null when the last refreshGatewayModels() call failed — surfaces a fallback hint. */
+  private readonly _gatewayModelError = signal<string | null>(null);
+  readonly gatewayModelError = this._gatewayModelError.asReadonly();
+
+  // ── AI Gateway (Phase 4) — health probe ─────────────────────────────────
+
+  /** Last health-probe result; null = not yet checked. */
+  private readonly _gatewayHealth = signal<GatewayHealth | null>(null);
+  readonly gatewayHealth = this._gatewayHealth.asReadonly();
+  /** True while gateway_health is in-flight — disables the Check button. */
+  private readonly _gatewayHealthChecking = signal(false);
+  readonly gatewayHealthChecking = this._gatewayHealthChecking.asReadonly();
+
+  /**
+   * Live signal of the gatewayModel form control's value. Mirrors the pattern used
+   * for `_gatewayBaseUrlValue` below so `gatewayModelIsCustom` is reactive.
+   */
+  private readonly _gatewayModelValue = toSignal(
+    this.form.controls.gatewayModel.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+
+  /**
+   * True when a model is currently saved in the form AND that model is NOT present
+   * in the fetched `gatewayModels` catalog. In that case the template adds it as a
+   * "(custom)" option so the manually-typed value is never silently lost.
+   *
+   * Implemented as a `computed` rather than an inline arrow function in the template
+   * to satisfy the Angular template parser (arrow functions are banned in expressions).
+   */
+  readonly gatewayModelIsCustom = computed(() => {
+    const current = this._gatewayModelValue();
+    if (!current) return false;
+    return !this.gatewayModels().some((m) => m.id === current);
+  });
+
+  /**
+   * Live signal of the gatewayBaseUrl form control's value — built from
+   * `valueChanges` so computed() signals can track it reactively. `startWith`
+   * seeds the initial value (the form control starts as `""`).
+   */
+  private readonly _gatewayBaseUrlValue = toSignal(
+    // valueChanges not available until the form is fully constructed, but because
+    // this field initialiser runs after the `form` field above, the form group
+    // (and its controls) already exist at this point.
+    this.form.controls.gatewayBaseUrl.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+
+  /**
+   * Computed URL validation warning: true when the URL is non-empty AND is not a
+   * valid https:// URL AND is not an http:// loopback (localhost / 127.0.0.1 / [::1]).
+   * Derived from `_gatewayBaseUrlValue` so it updates on every keystroke.
+   */
+  readonly gatewayUrlWarning = computed(() => {
+    const url = this._gatewayBaseUrlValue();
+    if (!url) return false;
+    if (url.startsWith("https://")) return false;
+    if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(url))
+      return false;
+    return true;
+  });
+
+  /**
+   * Computed destination info from the gateway base URL:
+   * - `null` when the URL is empty or unparseable (no banner shown)
+   * - `{ isRemote: true, host }` for https:// non-loopback → shows the warning banner
+   * - `{ isRemote: false, host }` for loopback http:// → shows the calmer note
+   */
+  readonly gatewayDestination = computed((): { isRemote: boolean; host: string } | null => {
+    const url = this._gatewayBaseUrlValue();
+    if (!url) return null;
+    try {
+      const parsed = new URL(url);
+      const host = parsed.hostname;
+      const isLoopback =
+        host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "[::1]" ||
+        host === "::1";
+      return { isRemote: !isLoopback, host: parsed.host };
+    } catch {
+      return null;
+    }
+  });
+
+  /**
+   * Live signals of the providerId / ollamaBaseUrl form controls — same
+   * `valueChanges` bridge as `_gatewayBaseUrlValue` above, seeded with the
+   * form defaults so `providerIsCloud` is correct before the config loads.
+   */
+  private readonly _providerIdValue = toSignal(
+    this.form.controls.providerId.valueChanges.pipe(startWith("claude_code")),
+    { initialValue: "claude_code" },
+  );
+  private readonly _ollamaBaseUrlValue = toSignal(
+    this.form.controls.ollamaBaseUrl.valueChanges.pipe(
+      startWith("http://localhost:11434"),
+    ),
+    { initialValue: "http://localhost:11434" },
+  );
+
+  /**
+   * FE mirror of the backend's egress classification (`egress_is_cloud`,
+   * summarize/mod.rs): claude_code / anthropic / gateway always send content
+   * off-device (gateway even on loopback — it can forward to the cloud);
+   * ollama is local ONLY when its base URL host is loopback; anything
+   * unknown or unparseable fails safe as cloud. Reuse this wherever the FE
+   * decides "is this cloud" so the two classifications can't diverge.
+   */
+  readonly providerIsCloud = computed(() => {
+    const id = this._providerIdValue();
+    if (id === "ollama") {
+      try {
+        const host = new URL(this._ollamaBaseUrlValue()).hostname;
+        return !(
+          host === "localhost" ||
+          host === "127.0.0.1" ||
+          host === "[::1]" ||
+          host === "::1"
+        );
+      } catch {
+        return true; // unparseable → fail safe (treat as cloud)
+      }
+    }
+    return true; // claude_code | anthropic | gateway | any future id
+  });
+
+  // ── Phase H — brain (AI assistant) model registry ──────────────────────
+
+  /** The selectable local brain models (from list_brain_models). */
+  private readonly _brainModels = signal<BrainModelDto[]>([]);
+  readonly brainModels = this._brainModels.asReadonly();
+  /** True while the model list is loading (best-effort). */
+  private readonly _brainModelsLoading = signal(false);
+  readonly brainModelsLoading = this._brainModelsLoading.asReadonly();
+  /** Surfaced if loading / selecting / downloading a brain model rejects. */
+  private readonly _brainError = signal<string | null>(null);
+  readonly brainError = this._brainError.asReadonly();
+  /** Model id currently downloading, or null. Drives the per-row progress UI. */
+  private readonly _brainDownloadingId = signal<string | null>(null);
+  readonly brainDownloadingId = this._brainDownloadingId.asReadonly();
+  /** 0..1 download progress for the in-flight model (best-effort from events). */
+  private readonly _brainDownloadFrac = signal(0);
+  readonly brainDownloadFrac = this._brainDownloadFrac.asReadonly();
+  /** Whole-percent label for the in-flight brain-model download. */
+  readonly brainPct = computed(
+    () => Math.round(this.brainDownloadFrac() * 100) + "%",
+  );
+  /** Release handle for the EVENT_BRAIN_DOWNLOAD subscription. */
+  private unlistenBrainDownload: UnlistenFn | null = null;
+
+  // ── brain2 RAG — semantic search (embedding model + reindex) ────────────
+
+  /**
+   * Whether the on-device embedding model is present.
+   * `null` = not yet checked, `true`/`false` = detected via ipc.embedModelPresent().
+   */
+  private readonly _embedModelPresent = signal<boolean | null>(null);
+  readonly embedModelPresent = this._embedModelPresent.asReadonly();
+  /** True while the embedding model is downloading — disables its button. */
+  private readonly _downloadingEmbedModel = signal(false);
+  readonly downloadingEmbedModel = this._downloadingEmbedModel.asReadonly();
+  /** 0..1 download progress for the in-flight embed-model download. */
+  private readonly _embedDownloadFrac = signal(0);
+  readonly embedDownloadFrac = this._embedDownloadFrac.asReadonly();
+  /** Whole-percent label for the in-flight embed-model download. */
+  readonly embedPct = computed(
+    () => Math.round(this.embedDownloadFrac() * 100) + "%",
+  );
+  /** Surfaced if ipc.downloadEmbedModel() rejects. */
+  private readonly _embedDownloadError = signal<string | null>(null);
+  readonly embedDownloadError = this._embedDownloadError.asReadonly();
+
+  /** True while a reindex backfill is running — disables the button + shows progress. */
+  private readonly _reindexing = signal(false);
+  readonly reindexing = this._reindexing.asReadonly();
+  /** 0..1 progress for the in-flight reindex backfill. */
+  private readonly _reindexFrac = signal(0);
+  readonly reindexFrac = this._reindexFrac.asReadonly();
+  /** Whole-percent label for the in-flight reindex backfill. */
+  readonly reindexPct = computed(
+    () => Math.round(this.reindexFrac() * 100) + "%",
+  );
+  /** Last reindex outcome — drives the "model_missing" nudge / "indexed" confirmation. */
+  private readonly _reindexResult = signal<ReindexResult | null>(null);
+  readonly reindexResult = this._reindexResult.asReadonly();
+  /** Surfaced if ipc.reindexEmbeddings() rejects. */
+  private readonly _reindexError = signal<string | null>(null);
+  readonly reindexError = this._reindexError.asReadonly();
+
+  /** Release handles for the embed-download + reindex event streams. */
+  private unlistenEmbedDownload: UnlistenFn | null = null;
+  private unlistenReindex: UnlistenFn | null = null;
+
+  async load(): Promise<void> {
+    try {
+      const cfg = await this.ipc.getConfig();
+      this.loadedOnboarded = cfg.onboarded ?? true;
+      // Stage E security flags are not form-edited here — snapshot them so save()
+      // round-trips them instead of letting the backend's serde defaults clobber
+      // them (mcpRequireToken / cloudEgressConsented would otherwise reset to false).
+      this.loadedMcpRequireToken = cfg.mcpRequireToken ?? true;
+      this.loadedLockRequireBiometric = cfg.lockRequireBiometric ?? true;
+      this.loadedRelockOnScreenshare = cfg.relockOnScreenshare ?? true;
+      this._cloudConsented.set(cfg.cloudEgressConsented ?? false);
+      // brain2 connectors — web-search consent is preserve-only (granted only via
+      // consent_to_web_search); snapshot it so save() round-trips it unchanged.
+      this._webConsented.set(cfg.webSearchConsented ?? false);
+      this.form.patchValue({
+        providerId: cfg.providerId,
+        vaultPath: cfg.vaultPath ?? "",
+        vaultSubfolder: cfg.vaultSubfolder ?? "",
+        whisperModelPath: cfg.whisperModelPath ?? "",
+        language: cfg.language ?? "",
+        anthropicModel: cfg.anthropicModel,
+        providerModel: cfg.providerModel ?? "",
+        providerEffort: cfg.providerEffort ?? "",
+        ollamaBaseUrl: cfg.ollamaBaseUrl,
+        ollamaModel: cfg.ollamaModel,
+        claudeBinary: cfg.claudeBinary,
+        claudeCodeInheritEnv: cfg.claudeCodeInheritEnv ?? false,
+        inputDevice: cfg.inputDevice ?? "",
+        captureSystemAudio: cfg.captureSystemAudio ?? false,
+        vadEnabled: cfg.vadEnabled ?? true,
+        keepHiresMasters: cfg.keepHiresMasters ?? false,
+        diarizeOthers: cfg.diarizeOthers ?? false,
+        aecEnabled: cfg.aecEnabled ?? false,
+        modelSize: cfg.modelSize ?? "large-v3",
+        voiceTrigger: cfg.voiceTrigger ?? false,
+        noteStyle: cfg.noteStyle ?? "standard",
+        autoOrganize: cfg.autoOrganize ?? false,
+        noteLanguage: cfg.noteLanguage ?? "auto",
+        brainBackend: cfg.brainBackend ?? "cloud",
+        realtimeReactions: cfg.realtimeReactions ?? false,
+        proactiveHintsEnabled: cfg.proactiveHintsEnabled ?? true,
+        brainModelId: cfg.brainModelId ?? "",
+        semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
+        webSearchEnabled: cfg.webSearchEnabled ?? false,
+        // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
+        gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
+        gatewayModel: cfg.gatewayModel ?? "",
+      });
+      this.updateDownloadHint();
+      this._inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
+      this._hasKey.set(await this.ipc.hasAnthropicKey());
+      this._hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
+      this._hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
+      this._modelPresent.set(await this.ipc.modelPresent());
+      // Whisper transcribe-model download-progress stream (best-effort).
+      await this.subscribeModelDownload();
+      await this.refreshProviders();
+      // Phase H — brain model registry + download-progress stream (best-effort).
+      await this.subscribeBrainDownload();
+      await this.refreshBrainModels();
+      // brain2 RAG — embedding-model presence + reindex/download progress streams.
+      await this.subscribeSemanticStreams();
+      this._embedModelPresent.set(
+        await this.ipc.embedModelPresent().catch(() => false),
+      );
+      // About section — product identity (best-effort; null leaves a "loading" line).
+      this._appInfo.set(await this.ipc.appInfo().catch(() => null));
+    } catch (e) {
+      this._loadError.set(String(e));
+    }
+  }
+
+  /**
+   * Subscribe ONCE to the Whisper model-download progress stream and store the
+   * unlisten so DestroyRef can release it (no leaked listener). Best-effort: a
+   * missing backend stream just leaves the progress bar inert (the download still
+   * resolves via the command promise).
+   */
+  private async subscribeModelDownload(): Promise<void> {
+    try {
+      this.unlistenModelDownload = await this.ipc.onModelDownload((p) => {
+        // Only meaningful while a download this component started is in-flight.
+        if (!this.downloadingModel()) return;
+        if (p.total && p.total > 0) {
+          this._modelDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+        }
+        if (p.done) this._modelDownloadFrac.set(1);
+      });
+      this.destroyRef.onDestroy(() => this.unlistenModelDownload?.());
+    } catch {
+      // No model-download stream available — progress stays inert.
+    }
+  }
+
+  /**
+   * Subscribe ONCE to the brain-download progress stream and store the unlisten
+   * so DestroyRef can release it (no leaked listener). Best-effort: a missing
+   * backend command just leaves the progress bar inert.
+   */
+  private async subscribeBrainDownload(): Promise<void> {
+    try {
+      this.unlistenBrainDownload = await this.ipc.onBrainDownload((p) => {
+        // The backend emits one download at a time and the component already
+        // tracks which model it started (brainDownloadingId), so every progress
+        // event applies to it. (Download errors surface via the command promise.)
+        if (this.brainDownloadingId() === null) return;
+        if (p.total && p.total > 0) {
+          this._brainDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+        }
+        if (p.done) {
+          this._brainDownloadingId.set(null);
+          void this.refreshBrainModels();
+        }
+      });
+      this.destroyRef.onDestroy(() => this.unlistenBrainDownload?.());
+    } catch {
+      // No brain-download stream available — progress stays inert; downloads
+      // still resolve via the command promise.
+    }
+  }
+
+  /** Reload the brain model registry (downloaded / fits-RAM / selected state). */
+  async refreshBrainModels(): Promise<void> {
+    this._brainModelsLoading.set(true);
+    this._brainError.set(null);
+    try {
+      this._brainModels.set(await this.ipc.listBrainModels());
+    } catch (e) {
+      this._brainError.set(String(e));
+    } finally {
+      this._brainModelsLoading.set(false);
+    }
+  }
+
+  /** Make a registry model the active local brain model, then refresh the list. */
+  async useBrainModel(id: string): Promise<void> {
+    this._brainError.set(null);
+    try {
+      await this.ipc.selectBrainModel(id);
+      this.form.patchValue({ brainModelId: id });
+      await this.refreshBrainModels();
+    } catch (e) {
+      this._brainError.set(String(e));
+    }
+  }
+
+  /**
+   * Download a registry model. The promise resolves on completion; live
+   * progress (when available) rides the EVENT_BRAIN_DOWNLOAD stream.
+   */
+  async downloadBrainModel(id: string): Promise<void> {
+    this._brainError.set(null);
+    this._brainDownloadFrac.set(0);
+    this._brainDownloadingId.set(id);
+    try {
+      await this.ipc.downloadBrainModel(id);
+      await this.refreshBrainModels();
+    } catch (e) {
+      this._brainError.set(String(e));
+    } finally {
+      this._brainDownloadingId.set(null);
+    }
+  }
+
+  // ── brain2 RAG — semantic search (embedding model + reindex backfill) ───
+
+  /**
+   * Subscribe ONCE to the embed-download + reindex progress streams and store the
+   * unlisten handles so DestroyRef can release them (no leaked listeners).
+   * Best-effort: a missing backend stream just leaves the relevant bar inert.
+   */
+  private async subscribeSemanticStreams(): Promise<void> {
+    try {
+      this.unlistenEmbedDownload = await this.ipc.onEmbedDownload((p) => {
+        // Per-file progress: blend the completed files + the current file's fraction
+        // across the whole set so the single bar advances smoothly.
+        if (p.fileCount > 0) {
+          const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
+          this._embedDownloadFrac.set(
+            Math.min(1, (p.fileIndex + cur) / p.fileCount),
+          );
+        }
+        if (p.done) this._embedDownloadFrac.set(1);
+      });
+      this.unlistenReindex = await this.ipc.onReindex((p) => {
+        if (p.total > 0) {
+          this._reindexFrac.set(Math.min(1, p.done / p.total));
+        }
+      });
+      this.destroyRef.onDestroy(() => {
+        this.unlistenEmbedDownload?.();
+        this.unlistenReindex?.();
+      });
+    } catch {
+      // No stream available — progress bars stay inert; commands still resolve.
+    }
+  }
+
+  /** Download the on-device embedding model, then re-check presence. */
+  async downloadEmbedModel(): Promise<void> {
+    this._embedDownloadError.set(null);
+    this._embedDownloadFrac.set(0);
+    this._downloadingEmbedModel.set(true);
+    try {
+      await this.ipc.downloadEmbedModel();
+      this._embedModelPresent.set(await this.ipc.embedModelPresent());
+    } catch (e) {
+      this._embedDownloadError.set(String(e));
+    } finally {
+      this._downloadingEmbedModel.set(false);
+    }
+  }
+
+  /**
+   * Backfill the semantic vector index over all visible meetings. A
+   * `"model_missing"` result means the e5 model isn't installed yet — surfaced as
+   * a nudge to download it first (no indexing was attempted).
+   */
+  async reindexEmbeddings(): Promise<void> {
+    this._reindexError.set(null);
+    this._reindexResult.set(null);
+    this._reindexFrac.set(0);
+    this._reindexing.set(true);
+    try {
+      const res = await this.ipc.reindexEmbeddings();
+      this._reindexResult.set(res);
+      // The model could have been (un)installed between the presence probe and now.
+      if (res.status === "model_missing") this._embedModelPresent.set(false);
+    } catch (e) {
+      this._reindexError.set(String(e));
+    } finally {
+      this._reindexing.set(false);
+    }
+  }
+
+  async pickVault(): Promise<void> {
+    const dir = await open({ directory: true, multiple: false });
+    if (typeof dir === "string") this.form.patchValue({ vaultPath: dir });
+  }
+
+  async pickModel(): Promise<void> {
+    const file = await open({ directory: false, multiple: false });
+    if (typeof file === "string")
+      this.form.patchValue({ whisperModelPath: file });
+  }
+
+  async save(): Promise<void> {
+    const v = this.form.getRawValue();
+    const cfg: AppConfigDto = {
+      providerId: v.providerId,
+      vaultPath: v.vaultPath || null,
+      vaultSubfolder: v.vaultSubfolder || null,
+      whisperModelPath: v.whisperModelPath || null,
+      language: v.language || null,
+      anthropicModel: v.anthropicModel,
+      providerModel: v.providerModel,
+      providerEffort: v.providerEffort,
+      ollamaBaseUrl: v.ollamaBaseUrl,
+      ollamaModel: v.ollamaModel,
+      claudeBinary: v.claudeBinary,
+      inputDevice: v.inputDevice || null,
+      captureSystemAudio: v.captureSystemAudio,
+      vadEnabled: v.vadEnabled,
+      keepHiresMasters: v.keepHiresMasters,
+      diarizeOthers: v.diarizeOthers,
+      aecEnabled: v.aecEnabled,
+      modelSize: v.modelSize,
+      voiceTrigger: v.voiceTrigger,
+      onboarded: this.loadedOnboarded,
+      noteStyle: v.noteStyle,
+      autoOrganize: v.autoOrganize,
+      noteLanguage: v.noteLanguage,
+      // Phase H — brain / in-meeting voice assistant.
+      brainBackend: v.brainBackend,
+      realtimeReactions: v.realtimeReactions,
+      // Proactive brain hints — round-tripped so a save preserves the mute.
+      proactiveHintsEnabled: v.proactiveHintsEnabled,
+      brainModelId: v.brainModelId || null,
+      // brain2 RAG — semantic-search master flag (round-tripped so a save preserves it).
+      semanticSearchEnabled: v.semanticSearchEnabled,
+      // brain2 connectors — web-search toggle is settable from the form; its consent
+      // is PRESERVE-ONLY (granted via allowWebSearch's dedicated command), so a save
+      // just carries the current value back instead of letting the backend default it.
+      webSearchEnabled: v.webSearchEnabled,
+      webSearchConsented: this.webConsented(),
+      // Round-trip the Stage E security flags so a settings save never silently
+      // resets them. Cloud-egress consent is GRANTED only via the dedicated
+      // command (allowCloudProcessing) — here we just carry the current value back.
+      mcpRequireToken: this.loadedMcpRequireToken,
+      lockRequireBiometric: this.loadedLockRequireBiometric,
+      relockOnScreenshare: this.loadedRelockOnScreenshare,
+      cloudEgressConsented: this.cloudConsented(),
+      // Opt-in: pass the shell env to the `claude` CLI (restores env ANTHROPIC_API_KEY auth).
+      claudeCodeInheritEnv: v.claudeCodeInheritEnv,
+      // AI Gateway (Phase 1) — base URL + model, round-tripped so a settings save preserves them.
+      gatewayBaseUrl: v.gatewayBaseUrl,
+      gatewayModel: v.gatewayModel,
+    };
+    try {
+      await this.ipc.saveConfig(cfg);
+      this._saved.set(true);
+    } catch (e) {
+      this._loadError.set("Save failed: " + String(e));
+    }
+  }
+
+  async saveKey(): Promise<void> {
+    const key = this.keyControl.value;
+    if (!key) return;
+    await this.ipc.setAnthropicKey(key);
+    this.keyControl.setValue("");
+    this._hasKey.set(await this.ipc.hasAnthropicKey());
+  }
+
+  /** Re-open the first-run wizard. Existing settings are preserved and prefilled. */
+  rerunOnboarding(): void {
+    void this.router.navigate(["/onboarding"]);
+  }
+
+  async refreshProviders(): Promise<void> {
+    this._providers.set(await this.ipc.providerStatuses());
+  }
+
+  /**
+   * E10 — grant the one-time cloud-egress consent via the dedicated command (an
+   * explicit, auditable user act — NOT a side effect of a normal settings save).
+   * After it resolves, cloud providers (Claude Code / Anthropic) can summarize, so
+   * we re-probe provider availability. There is no FE "revoke": consent is granted
+   * once; save() simply carries the current value back so it isn't cleared.
+   */
+  async allowCloudProcessing(): Promise<void> {
+    this._consentError.set(null);
+    this._consenting.set(true);
+    try {
+      await this.ipc.consentToCloudEgress();
+      this._cloudConsented.set(true);
+      await this.refreshProviders();
+    } catch (e) {
+      this._consentError.set(String(e));
+    } finally {
+      this._consenting.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Brave Search API key in the
+   * Keychain, then re-probe presence so the "Key set ✓" pill flips. The value is
+   * cleared from the input after saving (it's never shown back). Mirrors saveKey().
+   */
+  async saveWebKey(): Promise<void> {
+    const key = this.webKeyControl.value;
+    if (!key.trim()) return;
+    this._webKeyError.set(null);
+    this._savingWebKey.set(true);
+    try {
+      await this.ipc.setWebSearchApiKey(key);
+      this.webKeyControl.setValue("");
+      this._hasWebKey.set(await this.ipc.hasWebSearchKey());
+    } catch (e) {
+      this._webKeyError.set(String(e));
+    } finally {
+      this._savingWebKey.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — grant the one-time web-search egress consent via the
+   * dedicated command (an explicit, auditable user act — NOT a side effect of a
+   * normal settings save). After it resolves the brain may expose the web
+   * connector (when web search is enabled AND a key is stored). There is no FE
+   * "revoke": save() simply carries the current value back so it isn't cleared.
+   * Mirrors allowCloudProcessing().
+   */
+  async allowWebSearch(): Promise<void> {
+    this._webConsentError.set(null);
+    this._webConsenting.set(true);
+    try {
+      await this.ipc.consentToWebSearch();
+      this._webConsented.set(true);
+    } catch (e) {
+      this._webConsentError.set(String(e));
+    } finally {
+      this._webConsenting.set(false);
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 1) — store/replace the gateway API key in Keychain, then
+   * re-probe presence so the pill flips. The value is cleared from the input after
+   * saving (it's never shown back). Mirrors saveKey() / saveWebKey().
+   */
+  async saveGatewayKey(): Promise<void> {
+    const key = this.gatewayKeyControl.value;
+    if (!key.trim()) return;
+    this._gatewayKeyError.set(null);
+    try {
+      await this.ipc.setGatewayKey(key);
+      this.gatewayKeyControl.setValue("");
+      this._hasGatewayKey.set(await this.ipc.hasGatewayKey());
+    } catch (e) {
+      this._gatewayKeyError.set(String(e));
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 1) — remove the stored gateway API key from Keychain.
+   * Updates the pill afterward. No-op when no key is stored.
+   */
+  async removeGatewayKey(): Promise<void> {
+    this._gatewayKeyError.set(null);
+    try {
+      await this.ipc.clearGatewayKey();
+      this._hasGatewayKey.set(await this.ipc.hasGatewayKey());
+    } catch (e) {
+      this._gatewayKeyError.set(String(e));
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 3) — fetch the model catalog from the configured gateway's
+   * `/v1/models` endpoint and populate the model picker. Leaves the list empty on
+   * error so the text-input fallback is shown instead — the user can still type the
+   * model id manually. Not an effect: driven by the explicit "↻ Refresh models"
+   * button click (no NG0600 risk, no unwanted network call on load).
+   */
+  async refreshGatewayModels(): Promise<void> {
+    this._gatewayModelError.set(null);
+    this._gatewayModelsLoading.set(true);
+    try {
+      this._gatewayModels.set(await this.ipc.listGatewayModels());
+    } catch (e) {
+      // Leave the existing list (may be empty) and show the fallback hint.
+      this._gatewayModels.set([]);
+      this._gatewayModelError.set(String(e));
+    } finally {
+      this._gatewayModelsLoading.set(false);
+    }
+  }
+
+  /**
+   * AI Gateway (Phase 4) — probe the configured gateway and update the health
+   * indicator. Driven by the explicit "Check" button click (no NG0600 risk, no
+   * unwanted network call on load). The backend never errors on this command but
+   * we catch for safety.
+   */
+  async checkGatewayHealth(): Promise<void> {
+    this._gatewayHealthChecking.set(true);
+    try {
+      this._gatewayHealth.set(
+        await this.ipc
+          .gatewayHealth()
+          .catch(() => ({ reachable: false, modelCount: 0 })),
+      );
+    } finally {
+      this._gatewayHealthChecking.set(false);
+    }
+  }
+
+  /** Persist the chosen language + quality, then re-check which model is present. */
+  async onModelChoiceChange(): Promise<void> {
+    this.updateDownloadHint();
+    await this.save();
+    this._modelPresent.set(await this.ipc.modelPresent());
+  }
+
+  private updateDownloadHint(): void {
+    const hints: Record<string, string> = {
+      tiny: "~75 MB",
+      base: "~150 MB",
+      small: "~470 MB",
+      medium: "~1.5 GB",
+      "large-v3-turbo": "~1.6 GB",
+      "large-v3": "~3 GB",
+    };
+    this._downloadHint.set(hints[this.form.getRawValue().modelSize] ?? "");
+  }
+
+  /**
+   * Copy the Obsidian URL to the clipboard and briefly confirm.
+   * No <a href> — opening an external URL would navigate the webview away.
+   */
+  async copyObsidianUrl(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(this.obsidianUrl);
+      this._urlCopied.set(true);
+      if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
+      this.copyResetTimer = setTimeout(() => this._urlCopied.set(false), 1600);
+      this.destroyRef.onDestroy(() => {
+        if (this.copyResetTimer) clearTimeout(this.copyResetTimer);
+      });
+    } catch {
+      // Clipboard unavailable — the URL stays visible and selectable as a fallback.
+    }
+  }
+
+  /**
+   * Copy the MCP server config JSON to the clipboard and briefly confirm.
+   * The <pre> block stays selectable as a fallback if the clipboard is blocked.
+   */
+  async copyMcpConfig(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(this.mcpConfig);
+      this._configCopied.set(true);
+      if (this.mcpCopyResetTimer) clearTimeout(this.mcpCopyResetTimer);
+      this.mcpCopyResetTimer = setTimeout(
+        () => this._configCopied.set(false),
+        1600,
+      );
+      this.destroyRef.onDestroy(() => {
+        if (this.mcpCopyResetTimer) clearTimeout(this.mcpCopyResetTimer);
+      });
+    } catch {
+      // Clipboard unavailable — the config stays visible and selectable as a fallback.
+    }
+  }
+
+  /** Download the model for the chosen language + quality, then re-check presence. */
+  async downloadModel(): Promise<void> {
+    this._modelDownloadError.set(null);
+    this._modelDownloadFrac.set(0);
+    this._downloadingModel.set(true);
+    try {
+      await this.save(); // ensure the chosen language + size are persisted first
+      await this.ipc.downloadModel();
+      this._modelPresent.set(await this.ipc.modelPresent());
+    } catch (e) {
+      this._modelDownloadError.set(String(e));
+    } finally {
+      this._downloadingModel.set(false);
+    }
+  }
+}
