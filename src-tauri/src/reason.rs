@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::error::{AppError, Result};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::summarize::provider::SummarizerProvider;
+use crate::summarize::roles::{self, Role};
 
 /// The REAL on-device reasoner (mistral.rs / GGUF). ALWAYS compiled; the real impl is selected at
 /// runtime by [`local_reasoner`] when a GGUF resolves on disk, else the dependency-free stub.
@@ -303,7 +304,9 @@ pub struct ReasonerCell {
     local: Mutex<CachedLocalReasoner>,
     /// TEST-ONLY pinned reasoner (mirrors `CloudReasoner::provider_override`): `Some` makes
     /// `current()` always return this instance, so command tests keep a deterministic stub.
-    /// `None` in every production path (the only non-test constructor is [`new`]).
+    /// `#[cfg(test)]` makes "no fixed reasoner in production" STRUCTURAL — the field does not
+    /// exist in a release build, so no production path can ever pin a dispatch.
+    #[cfg(test)]
     fixed: Option<Arc<dyn LocalReasoner>>,
 }
 
@@ -311,7 +314,12 @@ impl ReasonerCell {
     /// Build the live dispatch over the shared config handle. Cheap: nothing is resolved until the
     /// first [`current`](Self::current) call.
     pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
-        Self { config, local: Mutex::new(None), fixed: None }
+        Self {
+            config,
+            local: Mutex::new(None),
+            #[cfg(test)]
+            fixed: None,
+        }
     }
 
     /// TEST-ONLY: pin `current()` to a fixed reasoner instance (the old `Box<StubReasoner>` test
@@ -326,7 +334,18 @@ impl ReasonerCell {
     }
 
     /// The reasoner for THIS call, resolved from the CURRENT config — never a startup snapshot.
+    /// Legacy shape: dispatches the NOTES role (whose fallback is exactly the pre-role
+    /// `brain_backend` mapping). Role-aware call sites use [`current_for`](Self::current_for).
     pub fn current(&self) -> Arc<dyn LocalReasoner> {
+        self.current_for(Role::Notes)
+    }
+
+    /// The reasoner serving `role` for THIS call, resolved from the CURRENT config — never a
+    /// startup snapshot. Dispatch keys on [`roles::reasoner_target`]: with role keys absent it is
+    /// the EXACT legacy `brain_backend` mapping for every role (byte-identical dispatch); with a
+    /// role's connection key set, that role dispatches its own target.
+    pub fn current_for(&self, role: Role) -> Arc<dyn LocalReasoner> {
+        #[cfg(test)]
         if let Some(f) = &self.fixed {
             return Arc::clone(f);
         }
@@ -339,21 +358,30 @@ impl ReasonerCell {
                 return Arc::new(StubReasoner);
             }
         };
-        match cfg.brain_backend {
+        let target = roles::reasoner_target(role, &cfg);
+        match target.connection.as_str() {
+            roles::CONN_OFF => Arc::new(StubReasoner),
+            roles::CONN_LOCAL => self.local_cached(&cfg, &target),
             // Cheap per call: the provider (+ consent gate) is built lazily inside, from a fresh
             // config read, so this instance can never pin a stale provider/consent state.
-            BrainBackend::Cloud => Arc::new(CloudReasoner::new(Arc::clone(&self.config))),
-            BrainBackend::Local => self.local_cached(&cfg),
-            BrainBackend::Off => Arc::new(StubReasoner),
+            _ => Arc::new(CloudReasoner::for_role(Arc::clone(&self.config), role)),
         }
     }
 
     /// The LOCAL dispatch: reuse the cached instance while the resolved GGUF path is unchanged;
     /// rebuild (inside the cache lock, so concurrent callers never double-load a model) only when
     /// it changes. Resolution is a cheap filesystem probe per call — never a model load.
-    fn local_cached(&self, cfg: &AppConfig) -> Arc<dyn LocalReasoner> {
+    /// The effective model id comes from the resolved role target (`""` = the persisted
+    /// `brain_model_id`, exactly the legacy resolution), so the cache stays keyed on the resolved
+    /// GGUF path even when a role key names a different registry model.
+    fn local_cached(&self, cfg: &AppConfig, target: &roles::RoleTarget) -> Arc<dyn LocalReasoner> {
         let configured = cfg.brain_model_path.as_deref().map(Path::new);
-        let key = resolve_brain_model(configured, cfg.brain_model_id.as_deref())
+        let model_id = if target.model.trim().is_empty() {
+            cfg.brain_model_id.clone()
+        } else {
+            Some(target.model.clone())
+        };
+        let key = resolve_brain_model(configured, model_id.as_deref())
             .ok()
             .flatten();
         let mut cache = match self.local.lock() {
@@ -367,7 +395,8 @@ impl ReasonerCell {
                 return Arc::clone(cached);
             }
         }
-        let built: Arc<dyn LocalReasoner> = Arc::from(local_reasoner(cfg));
+        let built: Arc<dyn LocalReasoner> =
+            Arc::from(local_reasoner_resolved(configured, model_id.as_deref()));
         *cache = Some((key, Arc::clone(&built)));
         built
     }
@@ -378,8 +407,20 @@ impl ReasonerCell {
 /// [`StubReasoner`]. Used only for [`BrainBackend::Local`]; with no model present it always yields
 /// the stub (selection keys ONLY on model presence — mistralrs is always compiled).
 fn local_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
-    let configured = config.brain_model_path.as_deref().map(Path::new);
-    match resolve_brain_model(configured, config.brain_model_id.as_deref()) {
+    local_reasoner_resolved(
+        config.brain_model_path.as_deref().map(Path::new),
+        config.brain_model_id.as_deref(),
+    )
+}
+
+/// The parameterized core of [`local_reasoner`]: build from an explicit custom path override +
+/// registry model id (the role layer supplies the effective id; the legacy path passes
+/// `brain_model_path`/`brain_model_id` verbatim).
+fn local_reasoner_resolved(
+    configured: Option<&Path>,
+    model_id: Option<&str>,
+) -> Box<dyn LocalReasoner> {
+    match resolve_brain_model(configured, model_id) {
         Ok(Some(path)) => match mistral::MistralReasoner::new(path) {
             Ok(r) => {
                 tracing::info!(target: "reason", id = r.id(), "local brain ready (lazy model load)");
@@ -534,45 +575,58 @@ pub struct CloudReasoner {
     /// consent grant/revocation or a provider switch applies to the very next provider call —
     /// even on a held instance mid-turn. Never snapshotted.
     config: Arc<Mutex<AppConfig>>,
+    /// The model ROLE this reasoner serves — `build_provider` resolves the provider FOR THIS ROLE
+    /// (with role keys absent that is exactly the legacy default provider, byte-identical).
+    role: Role,
     /// TEST-ONLY injected provider. When `Some`, `build_provider` returns it instead of calling
-    /// `make_provider`, so the wiring/parse can be exercised with a mock — NO real Claude/network.
-    /// `None` in every production path (the only constructor reachable in release is [`new`]).
+    /// the factory, so the wiring/parse can be exercised with a mock — NO real Claude/network.
+    /// `None` in every production path (the only constructors reachable in release are [`new`] /
+    /// [`for_role`](Self::for_role)).
     provider_override: Option<Arc<dyn SummarizerProvider>>,
 }
 
 impl CloudReasoner {
-    /// Build the cloud brain over the shared live config handle. Cheap + infallible: the provider
+    /// Build the cloud brain over the shared live config handle for the legacy default role
+    /// (Notes — whose fallback is the default provider triple). Cheap + infallible: the provider
     /// (and thus the consent gate) is constructed lazily, per call, from the config AS IT IS THEN.
     pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
-        let provider_id = config
+        Self::for_role(config, Role::Notes)
+    }
+
+    /// Build the cloud brain serving `role`. The id names the connection the role RESOLVES to
+    /// (`cloud:<connection>`) — under the legacy fallback that is `provider_id`, unchanged.
+    pub fn for_role(config: Arc<Mutex<AppConfig>>, role: Role) -> Self {
+        let connection = config
             .lock()
-            .map(|c| c.provider_id.clone())
-            .unwrap_or_else(|p| p.into_inner().provider_id.clone());
+            .map(|c| roles::provider_target(role, &c).connection)
+            .unwrap_or_else(|p| roles::provider_target(role, &p.into_inner()).connection);
         Self {
-            id: format!("cloud:{provider_id}"),
+            id: format!("cloud:{connection}"),
             config,
+            role,
             provider_override: None,
         }
     }
 
     /// TEST-ONLY: build a CloudReasoner that delegates to an injected provider instead of the real
-    /// `make_provider`, so `reason`/`structured` can be asserted without a network/CLI call. NOT
+    /// factory, so `reason`/`structured` can be asserted without a network/CLI call. NOT
     /// compiled in non-test builds, so production can never inject a provider that skips the gate.
     #[cfg(test)]
     fn with_provider(config: AppConfig, provider: Arc<dyn SummarizerProvider>) -> Self {
         Self {
             id: format!("cloud:{}", config.provider_id),
             config: Arc::new(Mutex::new(config)),
+            role: Role::Notes,
             provider_override: Some(provider),
         }
     }
 
     /// Resolve the provider for this call. THE egress seam: in production this is ALWAYS
-    /// `make_provider` (consent gate + RedactingProvider) over a FRESH read of the shared config —
-    /// never a construction-time snapshot — so a consent grant unblocks, and a consent REVOCATION
-    /// refuses, on the very next call (fail-closed both directions, no restart). A poisoned config
-    /// mutex makes the consent state unknowable, so it refuses too. A test override short-circuits
-    /// only under `#[cfg(test)]`.
+    /// `provider_for(self.role, …)` (role resolution → the same consent gate + RedactingProvider
+    /// as every factory build) over a FRESH read of the shared config — never a construction-time
+    /// snapshot — so a consent grant unblocks, and a consent REVOCATION refuses, on the very next
+    /// call (fail-closed both directions, no restart). A poisoned config mutex makes the consent
+    /// state unknowable, so it refuses too. A test override short-circuits only under `#[cfg(test)]`.
     fn build_provider(&self) -> Result<Arc<dyn SummarizerProvider>> {
         if let Some(p) = &self.provider_override {
             return Ok(p.clone());
@@ -582,7 +636,7 @@ impl CloudReasoner {
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone();
-        crate::summarize::make_provider(&cfg.provider_id, &cfg)
+        crate::summarize::provider_for(self.role, &cfg)
     }
 }
 
@@ -1145,6 +1199,104 @@ mod tests {
             Arc::ptr_eq(&a, &c),
             "the cached local instance must survive a backend excursion (same resolved path)"
         );
+    }
+
+    // ---- model roles: current_for / CloudReasoner::for_role ----------------------------------
+
+    /// FALLBACK IDENTITY at the dispatch level: with role keys absent, `current_for(role)`
+    /// dispatches EXACTLY like the legacy `current()` — the `brain_backend` mapping — for EVERY
+    /// role, Notes included (a Notes reasoner resolved from `provider_id` instead would
+    /// cloud-dispatch an Off/Local install's pre-analysis: an egress change).
+    #[test]
+    fn current_for_matches_legacy_dispatch_under_fallback() {
+        use crate::summarize::roles::Role;
+        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            let cfg = shared(AppConfig {
+                brain_backend: backend,
+                // Local resolves nothing on a clean machine (absent custom path, no selection)
+                // ⇒ the stub — same shape as the legacy Local tests above.
+                brain_model_path: Some(
+                    std::env::temp_dir()
+                        .join("murmur-rolecell-absent-model-xyz.gguf")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                brain_model_id: None,
+                ..Default::default()
+            });
+            let cell = ReasonerCell::new(Arc::clone(&cfg));
+            let legacy = cell.current().id().to_string();
+            for role in [Role::Notes, Role::Ask, Role::Live] {
+                assert_eq!(
+                    cell.current_for(role).id(),
+                    legacy,
+                    "{backend:?}/{role:?} must dispatch identically to the legacy current()"
+                );
+            }
+            match backend {
+                BrainBackend::Cloud => assert!(legacy.starts_with("cloud:"), "got {legacy}"),
+                _ => assert_eq!(legacy, "stub"),
+            }
+        }
+    }
+
+    /// EXPLICIT role keys re-route ONLY their role: Ask→off dispatches the stub while Notes (no
+    /// key) keeps the legacy Cloud dispatch — per-role steering without a restart.
+    #[test]
+    fn current_for_dispatches_explicit_role_targets_independently() {
+        use crate::summarize::roles::Role;
+        let cfg = shared(AppConfig {
+            brain_backend: BrainBackend::Cloud,
+            provider_id: "claude_code".to_string(),
+            role_ask_connection: "off".to_string(),
+            ..Default::default()
+        });
+        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        assert_eq!(cell.current_for(Role::Ask).id(), "stub", "explicit Ask→off is the stub");
+        assert_eq!(cell.current_for(Role::Notes).id(), "cloud:claude_code");
+        assert_eq!(cell.current_for(Role::Live).id(), "cloud:claude_code");
+
+        // Clearing the key mid-session restores the legacy dispatch on the next call.
+        cfg.lock().unwrap().role_ask_connection = String::new();
+        assert_eq!(cell.current_for(Role::Ask).id(), "cloud:claude_code");
+    }
+
+    /// A role key pointing at a DIFFERENT cloud connection names it in the reasoner id (and
+    /// `build_provider` resolves THAT role — proven by the gate-probe test below).
+    #[test]
+    fn cloud_reasoner_for_role_names_the_resolved_connection() {
+        use crate::summarize::roles::Role;
+        let cfg = AppConfig {
+            provider_id: "claude_code".to_string(),
+            role_ask_connection: "anthropic".to_string(),
+            ..Default::default()
+        };
+        let r = CloudReasoner::for_role(shared(cfg), Role::Ask);
+        assert_eq!(r.id(), "cloud:anthropic");
+    }
+
+    /// EGRESS POSTURE per role (by construction): a role-keyed CloudReasoner builds its provider
+    /// through `provider_for(role)` → the SAME fail-closed consent gate. Discriminated exactly
+    /// like the legacy gate probes: no consent ⇒ `Unavailable` (the gate), consent ⇒ `InvalidArg`
+    /// (past the gate, the bogus connection id fails construction).
+    #[test]
+    fn cloud_reasoner_role_target_rides_the_same_consent_gate() {
+        use crate::summarize::roles::Role;
+        let cfg = shared(AppConfig {
+            role_live_connection: BOGUS_PROVIDER.to_string(),
+            cloud_egress_consented: false,
+            ..Default::default()
+        });
+        let r = CloudReasoner::for_role(Arc::clone(&cfg), Role::Live);
+        match r.reason("s", "u") {
+            Err(AppError::Unavailable(_)) => {}
+            other => panic!("role-keyed cloud call must be consent-gated, got {other:?}"),
+        }
+        cfg.lock().unwrap().cloud_egress_consented = true;
+        match r.reason("s", "u") {
+            Err(AppError::InvalidArg(_)) => {} // past the gate — the bogus id is now the error
+            other => panic!("consented role-keyed call must reach the factory, got {other:?}"),
+        }
     }
 
     // ---- active_reasoner backend selection --------------------------------------------------
