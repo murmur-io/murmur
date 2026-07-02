@@ -84,6 +84,7 @@ pub fn run() {
             commands::ask_assistant_chat,
             commands::list_assistant_threads,
             commands::list_input_devices,
+            commands::output_is_builtin_speakers,
             commands::get_last_note,
             commands::update_note,
             commands::save_manual_notes,

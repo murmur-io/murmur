@@ -94,6 +94,8 @@ pub struct AppConfigDto {
     pub diarize_others: bool,
     #[serde(default)]
     pub aec_enabled: bool,
+    #[serde(default = "default_true")]
+    pub post_aec_enabled: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -3102,6 +3104,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         keep_hires_masters: c.keep_hires_masters,
         diarize_others: c.diarize_others,
         aec_enabled: c.aec_enabled,
+        post_aec_enabled: c.post_aec_enabled,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -3164,6 +3167,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         keep_hires_masters: d.keep_hires_masters,
         diarize_others: d.diarize_others,
         aec_enabled: d.aec_enabled,
+        post_aec_enabled: d.post_aec_enabled,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a
@@ -3253,6 +3257,13 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
 #[tauri::command]
 pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppError> {
     Ok(crate::audio::list_input_devices())
+}
+
+/// Whether the CURRENT default audio output is the built-in speakers (echo risk while
+/// capturing system audio). Best-effort introspection — `None` when undeterminable.
+#[tauri::command]
+pub fn output_is_builtin_speakers() -> Result<Option<bool>, AppError> {
+    Ok(crate::audio::output::default_output_is_builtin_speakers())
 }
 
 /// Store/replace the Anthropic API key in Keychain (account "anthropic_api_key").

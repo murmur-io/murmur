@@ -91,15 +91,31 @@ import { SettingsStore } from "../settings.store";
                 </label>
               </div>
 
+              <!-- On-device echo removal (post-processing) — toggle row -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Remove speaker echo from recordings</span>
+                    <span class="text-secondary toggle-sub">
+                      After each recording, cancel the other participants' voices out of your
+                      microphone track using the captured system audio — fixes the doubled
+                      voice when recording on speakers. Runs fully on-device.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="postAecEnabled" />
+                </label>
+              </div>
+
               <!-- Echo cancellation (experimental) — toggle row -->
               <div class="card">
                 <label class="toggle-row">
                   <span class="toggle-copy">
                     <span class="toggle-title">Cancel speaker echo (experimental)</span>
                     <span class="text-secondary toggle-sub">
-                      When recording without headphones, apply system echo cancellation to
-                      the microphone used for transcription. Experimental — headphones are
-                      still the most reliable fix.
+                      Experimental Apple voice processing on the transcription mic. May not
+                      remove echo on all setups (macOS gives it no reference signal) — echoed
+                      lines are also removed automatically after each recording. Headphones
+                      remain the most reliable fix.
                     </span>
                   </span>
                   <input type="checkbox" formControlName="aecEnabled" />

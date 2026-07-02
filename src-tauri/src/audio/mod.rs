@@ -1,7 +1,10 @@
 pub mod aec;
+pub mod aec_offline;
+pub mod align;
 pub mod listener;
 pub mod merge;
 pub mod mixer;
+pub mod output;
 pub mod recorder;
 pub mod system;
 pub mod tap;
