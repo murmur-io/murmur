@@ -3311,17 +3311,14 @@ pub struct GatewayModelDto {
 }
 
 /// Fetch the model catalog from the configured AI Gateway (`GET {base}/v1/models`) and return
-/// the list of model ids the gateway exposes.
+/// the raw list of model ids. Shared core of `list_gateway_models` and `list_models("gateway")`.
 ///
 /// Inbound-only: this call sends NO meeting content — only an optional `Authorization: Bearer`
 /// header carrying the stored gateway key. It therefore does NOT need the redaction firewall or
 /// the cloud-egress consent gate.
 ///
 /// Returns `AppError::InvalidArg` when no gateway base URL is configured.
-#[tauri::command]
-pub async fn list_gateway_models(
-    state: State<'_, AppState>,
-) -> Result<Vec<GatewayModelDto>, AppError> {
+async fn gateway_model_ids(state: &AppState) -> Result<Vec<String>, AppError> {
     let (base_url, model, api_key) = {
         let config = state
             .config
@@ -3342,8 +3339,78 @@ pub async fn list_gateway_models(
     }
 
     let provider = crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key)?;
-    let ids = provider.list_models().await?;
+    provider.list_models().await
+}
+
+/// Fetch the model catalog from the configured AI Gateway (`GET {base}/v1/models`) and return
+/// the list of model ids the gateway exposes. Thin DTO wrapper over [`gateway_model_ids`] —
+/// kept until the FE swaps to the unified `list_models("gateway")`.
+#[tauri::command]
+pub async fn list_gateway_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<GatewayModelDto>, AppError> {
+    let ids = gateway_model_ids(&state).await?;
     Ok(ids.into_iter().map(|id| GatewayModelDto { id }).collect())
+}
+
+/// Model ids for the connections whose catalog is static, compile-time data — pure so it is
+/// unit-testable without state or network. `None`-network connections only:
+///   - `"claude_code"` / `"anthropic"` → the curated [`crate::summarize::provider::CLAUDE_MODELS`],
+///   - `"local"` → the on-device `reason::BRAIN_MODELS` registry ids,
+///   - `"off"` → empty (a valid connection that runs no models),
+///   - anything else → `AppError::InvalidArg`.
+fn static_connection_models(connection: &str) -> Result<Vec<String>, AppError> {
+    match connection {
+        "claude_code" | "anthropic" => Ok(crate::summarize::provider::CLAUDE_MODELS
+            .iter()
+            .map(|id| id.to_string())
+            .collect()),
+        "local" => Ok(crate::reason::BRAIN_MODELS
+            .iter()
+            .map(|m| m.id.to_string())
+            .collect()),
+        "off" => Ok(vec![]),
+        other => Err(AppError::InvalidArg(format!(
+            "unknown connection '{other}' — expected claude_code, anthropic, ollama, gateway, local, or off"
+        ))),
+    }
+}
+
+/// Unified model catalog for a connection — the ONE source of truth behind the FE per-role
+/// model dropdowns. Dispatch by `connection`:
+///   - `"gateway"` → `GET {gateway_base_url}/v1/models` (shares [`gateway_model_ids`] with
+///     `list_gateway_models`),
+///   - `"ollama"` → `GET {ollama_base_url}/api/tags`, model names only,
+///   - `"claude_code"` / `"anthropic"` / `"local"` / `"off"` → static lists
+///     (see [`static_connection_models`]),
+///   - anything else → `AppError::InvalidArg`.
+///
+/// Inbound-only on every arm: NO meeting content is sent — at most an `Authorization: Bearer`
+/// header to the configured gateway — so no redaction firewall / consent gate is needed (the
+/// `list_gateway_models` precedent). No content read → no lock-model surface.
+#[tauri::command]
+pub async fn list_models(
+    state: State<'_, AppState>,
+    connection: String,
+) -> Result<Vec<String>, AppError> {
+    match connection.as_str() {
+        "gateway" => gateway_model_ids(&state).await,
+        "ollama" => {
+            let base_url = {
+                let config = state
+                    .config
+                    .lock()
+                    .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+                config.ollama_base_url.clone()
+            };
+            // OllamaProvider::new normalizes an empty base URL to the localhost default and
+            // trims trailing slashes; the model arg is unused for a catalog fetch.
+            crate::summarize::ollama::OllamaProvider::new(base_url, String::new())
+                .list_models()
+                .await
+        }
+        other => static_connection_models(other),
+    }
 }
 
 /// DTO returned by `gateway_health`.
@@ -8164,6 +8231,59 @@ mod lifecycle_tests {
             "https://gw.example.com/v1",
             "valid URL must be persisted and visible in the in-memory config cache"
         );
+    }
+
+    // ─── list_models — static connection catalogs (pure, no network) ─────────────────────────
+
+    /// `claude_code` and `anthropic` both serve the curated CLAUDE_MODELS constant — the single
+    /// source of truth that replaced the FE-hardcoded dropdown list.
+    #[test]
+    fn list_models_claude_connections_return_curated_constant() {
+        for conn in ["claude_code", "anthropic"] {
+            let ids = static_connection_models(conn)
+                .unwrap_or_else(|e| panic!("{conn} must resolve statically: {e:?}"));
+            let want: Vec<String> = crate::summarize::provider::CLAUDE_MODELS
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+            assert_eq!(ids, want, "{conn} must serve CLAUDE_MODELS verbatim");
+            assert!(
+                ids.contains(&"claude-opus-4-8".to_string()),
+                "curated list must include the default Opus id"
+            );
+        }
+    }
+
+    /// `local` serves exactly the BRAIN_MODELS registry ids, in registry order.
+    #[test]
+    fn list_models_local_matches_brain_registry_ids() {
+        let ids = static_connection_models("local").expect("local must resolve statically");
+        let want: Vec<String> = crate::reason::BRAIN_MODELS
+            .iter()
+            .map(|m| m.id.to_string())
+            .collect();
+        assert_eq!(ids, want, "local must mirror the BRAIN_MODELS registry ids");
+        assert!(!ids.is_empty(), "the brain registry is never empty");
+    }
+
+    /// `off` is a valid connection with no models — empty list, not an error.
+    #[test]
+    fn list_models_off_returns_empty() {
+        let ids = static_connection_models("off").expect("off must resolve statically");
+        assert!(ids.is_empty(), "off runs no models");
+    }
+
+    /// An unknown connection id refuses with `InvalidArg` — never a panic, never an empty Ok.
+    #[test]
+    fn list_models_unknown_connection_refuses() {
+        for conn in ["", "openai", "GATEWAY", "claude"] {
+            let err = static_connection_models(conn)
+                .expect_err("unknown connection must be refused");
+            assert!(
+                matches!(err, AppError::InvalidArg(_)),
+                "expected InvalidArg for '{conn}', got: {err:?}"
+            );
+        }
     }
 }
 

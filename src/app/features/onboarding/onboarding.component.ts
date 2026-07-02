@@ -1565,6 +1565,18 @@ export class OnboardingComponent implements OnInit {
       // the model still round-trips from the snapshot untouched.
       gatewayBaseUrl: this.gatewayBaseUrl().trim(),
       gatewayModel: base?.gatewayModel ?? "",
+      // Stage 4 — per-feature role overrides are preserve-only here (the
+      // AI & Models hub owns the rows); round-trip the snapshot so onboarding
+      // never clears an override, "" (inherit) on a fresh install.
+      roleNotesConnection: base?.roleNotesConnection ?? "",
+      roleNotesModel: base?.roleNotesModel ?? "",
+      roleNotesEffort: base?.roleNotesEffort ?? "",
+      roleAskConnection: base?.roleAskConnection ?? "",
+      roleAskModel: base?.roleAskModel ?? "",
+      roleAskEffort: base?.roleAskEffort ?? "",
+      roleLiveConnection: base?.roleLiveConnection ?? "",
+      roleLiveModel: base?.roleLiveModel ?? "",
+      roleLiveEffort: base?.roleLiveEffort ?? "",
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.

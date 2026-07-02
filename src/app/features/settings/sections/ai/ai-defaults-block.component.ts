@@ -1,34 +1,37 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
+import { AiRoleRowsComponent } from "./ai-role-rows.component";
 
 /**
- * AI & Models → Block B: WHAT MURMUR USES. The "Default AI" row is the
- * Provider select moved from General (same control, same option labels),
- * followed by the stage-0 Default-model picker + reasoning effort, then the
- * old Brain & AI controls regrouped under "Ask & assistant" /
- * "Live during meetings" / "On-device intelligence" — copy kept verbatim
- * except pointers to the dissolved Providers/General sections, which now
- * point at the connection cards / Default AI row instead.
+ * AI & Models → Block B: WHAT MURMUR USES. The "Default AI" row (the Provider
+ * select moved from General) + the Default-model picker (options fetched via
+ * `list_models` — the backend constant is the single source of truth, no more
+ * hardcoded Claude ids) + reasoning effort, then the Stage-4 "Customize per
+ * feature" override rows (AiRoleRowsComponent — the Ask row SUPERSEDES the old
+ * "Assistant backend" select, and the GGUF registry lives there now), then
+ * "Live during meetings" (the voice-assistant + proactive toggles, unchanged)
+ * and "On-device intelligence" (fixed always-on-device badges + semantic
+ * search).
  */
 @Component({
   selector: "app-ai-defaults-block",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, AiRoleRowsComponent],
   template: `
     <div class="card defaults-card" [formGroup]="form">
       <div class="defaults-head">
         <h3>What Murmur uses</h3>
         <p class="text-secondary defaults-sub">
-          One default AI powers everything Murmur writes; Ask and live answers
+          One default AI powers everything Murmur writes; individual features
           can run differently below.
         </p>
       </div>
 
       <label class="field">
         <span class="field-label">Default AI</span>
-        <select formControlName="providerId">
+        <select formControlName="providerId" (change)="onDefaultAiChanged($event)">
           <option value="claude_code">Claude Code (default)</option>
           <option value="anthropic">Anthropic API</option>
           <option value="ollama">Ollama</option>
@@ -61,19 +64,61 @@ import { SettingsStore } from "../../settings.store";
             </p>
           }
           @default {
-            <label class="field">
+            <!-- div.field (not label) — the control sits in a nested row div,
+                 same as the gateway card's Model field. -->
+            <div class="field">
               <span class="field-label">Default model</span>
-              <select formControlName="providerModel">
-                <option value="">Default (provider's pick)</option>
-                <option value="claude-opus-4-8">Opus 4.8</option>
-                <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-                <option value="claude-haiku-4-5">Haiku 4.5</option>
-              </select>
+              <!--
+                Options come from list_models (the backend Claude-id constant —
+                single source of truth, no hardcoded ids here). Empty catalog
+                (fetch failed / older backend) → free-text fallback; a saved
+                model missing from the catalog stays selectable as "(custom)"
+                — the gateway picker's keep-manually-typed pattern.
+              -->
+              <div class="default-model-row">
+                @if (defaultModelCatalog().length > 0) {
+                  <select
+                    formControlName="providerModel"
+                    class="default-model-select"
+                  >
+                    <option value="">Default (provider's pick)</option>
+                    @for (id of defaultModelCatalog(); track id) {
+                      <option [value]="id">{{ id }}</option>
+                    }
+                    @if (defaultModelIsCustom()) {
+                      <option [value]="form.controls.providerModel.value">
+                        {{ form.controls.providerModel.value }} (custom)
+                      </option>
+                    }
+                  </select>
+                } @else {
+                  <input
+                    formControlName="providerModel"
+                    placeholder="Model id (blank = provider's pick)"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="default-model-input"
+                  />
+                }
+                <button
+                  type="button"
+                  class="btn btn-ghost default-model-refresh"
+                  (click)="refreshDefaultModels()"
+                  [disabled]="defaultModelsLoading()"
+                  title="Fetch this provider's model list"
+                >
+                  @if (defaultModelsLoading()) {
+                    Loading…
+                  } @else {
+                    ↻ Refresh
+                  }
+                </button>
+              </div>
               <span class="field-help text-muted">
                 Used for everything Murmur writes with AI: meeting notes,
                 answers, digests and briefs. Default lets the provider choose.
               </span>
-            </label>
+            </div>
           }
         }
 
@@ -94,149 +139,13 @@ import { SettingsStore } from "../../settings.store";
         }
       </div>
 
-      <!-- ── Ask & assistant ─────────────────────────────────────────── -->
-      <div class="use-group">
-        <span class="use-group-label text-muted">Ask &amp; assistant</span>
-
-        <label class="field">
-          <span class="field-label">Assistant backend</span>
-          <select formControlName="brainBackend">
-            <option value="cloud">My default AI — recommended for live</option>
-            <option value="local">Local model — assistant reasoning on-device</option>
-            <option value="off">Off</option>
-          </select>
-          <span class="field-help text-muted">
-            @switch (form.controls.brainBackend.value) {
-              @case ("local") {
-                Runs assistant reasoning and note pre-analysis on-device (pick
-                a model below). Note summaries and Ask fallback still use your
-                default AI above.
-              }
-              @case ("off") {
-                Assistant answers become retrieval-only (no AI model). The
-                in-meeting voice assistant toggle below stays independent.
-              }
-              @default {
-                Uses your default AI above (redacted before any cloud call) —
-                lowest latency, best for the live voice assistant.
-              }
-            }
-          </span>
-        </label>
-
-        <!-- Local model picker — only meaningful for the local backend. -->
-        @if (form.controls.brainBackend.value === "local") {
-          <div class="brain-models">
-            <div class="brain-models-head">
-              <span class="brain-models-label text-muted">Local models</span>
-              <button
-                type="button"
-                class="btn btn-sm"
-                (click)="refreshBrainModels()"
-                [disabled]="brainModelsLoading()"
-              >
-                {{ brainModelsLoading() ? "Loading…" : "Refresh" }}
-              </button>
-            </div>
-
-            <p class="brain-note text-muted">
-              Big local models are slow for the realtime voice assistant —
-              your default AI is recommended for live answers. Local is best
-              for private, non-time-critical analysis.
-            </p>
-
-            @if (brainModels(); as models) {
-              @if (models.length === 0 && !brainModelsLoading()) {
-                <p class="brain-empty text-muted">No local models available.</p>
-              } @else {
-                <ul class="brain-model-list">
-                  @for (m of models; track m.id) {
-                    <li
-                      class="brain-model-row"
-                      [class.is-unfit]="!m.fitsRam"
-                      [class.is-selected]="m.selected"
-                    >
-                      <div class="brain-model-info">
-                        <span class="brain-model-name">
-                          {{ m.name }}
-                          @if (m.selected) {
-                            <span class="pill is-success brain-inline-pill">
-                              <span class="pill-dot"></span>
-                              In use
-                            </span>
-                          }
-                        </span>
-                        <span class="brain-model-meta text-muted">
-                          {{ m.sizeLabel }} · needs ≥{{ m.minRamGb }} GB RAM
-                          @if (m.languages.length > 0) {
-                            · {{ m.languages.join("/") }}
-                          }
-                        </span>
-                        @if (!m.fitsRam) {
-                          <span class="pill is-warning brain-fit-pill">
-                            <span class="pill-dot"></span>
-                            May not fit this Mac's RAM
-                          </span>
-                        }
-                      </div>
-
-                      <div class="brain-model-actions">
-                        @if (brainDownloadingId() === m.id) {
-                          <div class="brain-progress" role="status">
-                            <div class="brain-progress-track" aria-hidden="true">
-                              <div
-                                class="brain-progress-fill"
-                                [style.width.%]="brainDownloadFrac() * 100"
-                              ></div>
-                            </div>
-                            <span class="brain-progress-label text-muted">
-                              Downloading… {{ brainPct() }}
-                            </span>
-                          </div>
-                        } @else if (m.downloaded) {
-                          <button
-                            type="button"
-                            class="btn btn-sm"
-                            (click)="useBrainModel(m.id)"
-                            [disabled]="m.selected"
-                          >
-                            {{ m.selected ? "Selected" : "Use" }}
-                          </button>
-                        } @else {
-                          <button
-                            type="button"
-                            class="btn btn-primary btn-sm"
-                            (click)="downloadBrainModel(m.id)"
-                            [disabled]="brainDownloadingId() !== null"
-                          >
-                            Download
-                          </button>
-                        }
-                      </div>
-                    </li>
-                  }
-                </ul>
-              }
-            }
-
-            <label class="field brain-custom">
-              <span class="field-label">Custom GGUF model</span>
-              <input
-                formControlName="brainModelId"
-                placeholder="/path/to/model.gguf or a registry id"
-              />
-              <span class="field-help text-muted">
-                Advanced: point at your own GGUF file (or a registry id). Saved
-                with your settings.
-              </span>
-            </label>
-
-            @if (brainError(); as berr) {
-              <p class="text-danger brain-error">{{ berr }}</p>
-            }
-          </div>
-        }
-      </div>
+      <!--
+        Stage 4 — per-feature overrides (Notes / Ask / Live). The Ask row is
+        the SUCCESSOR of the old "Assistant backend" select (removed from this
+        block): Local/Off are selectable targets there, and the GGUF registry
+        renders inside the rows block when a row picks Local.
+      -->
+      <app-ai-role-rows />
 
       <!-- ── Live during meetings ────────────────────────────────────── -->
       <div class="use-group">
@@ -269,20 +178,19 @@ import { SettingsStore } from "../../settings.store";
 
         <!--
           Proactive cloud-egress consent (issue 20). The in-meeting assistant
-          dispatches voice actions through the active provider. With a
-          cloud-classified provider (providerIsCloud mirrors the backend's
-          egress_is_cloud: claude_code/anthropic/gateway, plus ollama on a
-          non-loopback base URL) it uploads mid-meeting context, and the
-          dispatch is fail-closed behind cloud_egress_consented. Surface the
-          requirement at enable time. Condition: realtime on, cloud-classified
-          provider, brain not off, not consented. Reuses the existing consent
-          flow (allowCloudProcessing). In-flow warning, so the frosted banner
-          is correct (no opaque overlay needed).
+          dispatches voice actions through the LIVE role's resolved target —
+          since Stage 4 that need not be brainBackend/the default provider, so
+          the condition keys on liveTargetIsCloud (the store's resolver
+          mirror: explicit roleLiveConnection wins, "" falls back to the
+          brainBackend mapping, ollama is cloud only off-loopback). Surface
+          the requirement at enable time: realtime on, live target
+          cloud-classified, not consented. Reuses the existing consent flow
+          (allowCloudProcessing). In-flow warning, so the frosted banner is
+          correct (no opaque overlay needed).
         -->
         @if (
           form.controls.realtimeReactions.value &&
-          form.controls.brainBackend.value === "cloud" &&
-          providerIsCloud() &&
+          liveTargetIsCloud() &&
           !cloudConsented()
         ) {
           <div class="banner is-warning realtime-consent">
@@ -319,6 +227,29 @@ import { SettingsStore } from "../../settings.store";
       <!-- ── On-device intelligence ──────────────────────────────────── -->
       <div class="use-group">
         <span class="use-group-label text-muted">On-device intelligence</span>
+
+        <!--
+          Fixed "always on-device" badges — these stages are NOT routable to
+          any provider (they activate on local model presence), so they stay
+          out of every picker above. Honesty line, not controls.
+        -->
+        <div class="ondevice-badges">
+          <span class="pill">
+            <span class="pill-dot"></span>
+            Embeddings
+          </span>
+          <span class="pill">
+            <span class="pill-dot"></span>
+            Name redaction
+          </span>
+          <span class="pill">
+            <span class="pill-dot"></span>
+            Transcription
+          </span>
+          <span class="text-muted ondevice-note">
+            Always run on this Mac — never sent to any provider.
+          </span>
+        </div>
 
         <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
         <div class="semantic">
@@ -486,118 +417,43 @@ import { SettingsStore } from "../../settings.store";
       .realtime-consent-copy {
         line-height: 1.55;
       }
-      .brain-models {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
-        padding: var(--space-4);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        border: 1px solid var(--border-subtle);
-      }
-      .brain-models-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-3);
-      }
-      .brain-models-label {
-        font-size: 0.8125rem;
-        font-weight: 550;
-        letter-spacing: 0.01em;
-        text-transform: uppercase;
-      }
       .brain-note {
         margin: 0;
         font-size: 0.8125rem;
         line-height: 1.5;
       }
-      .brain-empty {
-        margin: 0;
-        font-size: 0.875rem;
-      }
-      .brain-model-list {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-      }
-      .brain-model-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-3);
-        padding: var(--space-3);
-        border-radius: var(--radius-md);
-        background: var(--surface-raised);
-        border: 1px solid var(--glass-border);
-      }
-      .brain-model-row.is-selected {
-        border-color: var(--accent-hover);
-      }
-      .brain-model-row.is-unfit {
-        opacity: 0.78;
-      }
-      .brain-model-info {
-        display: flex;
-        flex-direction: column;
-        gap: 3px;
-        min-width: 0;
-      }
-      .brain-model-name {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-2);
-        color: var(--text-primary);
-        font-weight: 550;
-        font-size: 0.9rem;
-        flex-wrap: wrap;
-      }
-      .brain-model-meta {
-        font-size: 0.8125rem;
-      }
-      .brain-inline-pill,
-      .brain-fit-pill {
-        align-self: flex-start;
-      }
-      .brain-fit-pill {
-        margin-top: 2px;
-      }
-      .brain-model-actions {
-        flex: none;
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-      }
-      .brain-progress {
-        display: flex;
-        flex-direction: column;
-        gap: 3px;
-        min-width: 120px;
-      }
-      .brain-progress-track {
-        height: 6px;
-        border-radius: 3px;
-        background: var(--surface-input);
-        overflow: hidden;
-      }
-      .brain-progress-fill {
-        height: 100%;
-        background: var(--accent);
-        border-radius: 3px;
-        transition: width var(--transition);
-      }
-      .brain-progress-label {
-        font-size: 0.75rem;
-      }
-      .brain-custom {
-        margin-top: var(--space-1);
-      }
       .brain-error {
         margin: 0;
         font-size: 0.85rem;
+      }
+
+      /* Default-model picker — select-or-input + the catalog refresh. */
+      .default-model-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+      }
+      .default-model-select,
+      .default-model-input {
+        flex: 1 1 220px;
+        min-width: 0;
+      }
+      .default-model-refresh {
+        flex: none;
+        white-space: nowrap;
+      }
+
+      /* Fixed always-on-device badges (not controls). */
+      .ondevice-badges {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+      }
+      .ondevice-note {
+        font-size: 0.8125rem;
+        line-height: 1.5;
       }
       .defaults-card .btn-sm {
         height: 32px;
@@ -750,16 +606,13 @@ export class AiDefaultsBlockComponent {
   private readonly store = inject(SettingsStore);
 
   readonly form = this.store.form;
-  readonly providerIsCloud = this.store.providerIsCloud;
   readonly cloudConsented = this.store.cloudConsented;
   readonly consenting = this.store.consenting;
   readonly consentError = this.store.consentError;
-  readonly brainModels = this.store.brainModels;
-  readonly brainModelsLoading = this.store.brainModelsLoading;
-  readonly brainError = this.store.brainError;
-  readonly brainDownloadingId = this.store.brainDownloadingId;
-  readonly brainDownloadFrac = this.store.brainDownloadFrac;
-  readonly brainPct = this.store.brainPct;
+  readonly liveTargetIsCloud = this.store.liveTargetIsCloud;
+  readonly defaultModelCatalog = this.store.defaultModelCatalog;
+  readonly defaultModelsLoading = this.store.defaultModelsLoading;
+  readonly defaultModelIsCustom = this.store.defaultModelIsCustom;
   readonly embedModelPresent = this.store.embedModelPresent;
   readonly downloadingEmbedModel = this.store.downloadingEmbedModel;
   readonly embedDownloadFrac = this.store.embedDownloadFrac;
@@ -775,16 +628,17 @@ export class AiDefaultsBlockComponent {
     void this.store.allowCloudProcessing();
   }
 
-  refreshBrainModels(): void {
-    void this.store.refreshBrainModels();
+  /** Prefetch the newly-picked Default AI's model catalog (claude_code/anthropic only). */
+  onDefaultAiChanged(e: Event): void {
+    const id = (e.target as HTMLSelectElement).value;
+    if (id === "claude_code" || id === "anthropic") {
+      void this.store.ensureModels(id);
+    }
   }
 
-  useBrainModel(id: string): void {
-    void this.store.useBrainModel(id);
-  }
-
-  downloadBrainModel(id: string): void {
-    void this.store.downloadBrainModel(id);
+  /** Re-fetch the Default-model catalog for the current provider. */
+  refreshDefaultModels(): void {
+    void this.store.refreshModels(this.form.controls.providerId.value);
   }
 
   downloadEmbedModel(): void {
