@@ -17,7 +17,8 @@ pub(crate) fn classify_output(transport: Option<u32>, data_source: Option<u32>) 
         None => None,
         Some(TRANSPORT_BUILTIN) => match data_source {
             Some(SOURCE_HEADPHONES) => Some(false),
-            // 'ispk' or unreadable: the built-in output without headphone routing is speakers.
+            Some(SOURCE_INTERNAL_SPEAKER) => Some(true),
+            // Unreadable / unknown source on the built-in output ⇒ conservatively speakers.
             _ => Some(true),
         },
         // Bluetooth / USB / HDMI / AirPlay / anything else ⇒ not the built-in speakers.
