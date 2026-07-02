@@ -11,12 +11,12 @@ import type { DocumentInfo } from "../../core/models";
  * One "knowledge source" card on the Brain page (in-flow `.card`, NOT floating).
  *
  * Two shapes, chosen by inputs:
- *  - a READ-ONLY source (Meetings): an emoji + title + count + a link to its
- *    page — no list, no add.
- *  - an EDITABLE source (Documents / Notes): an emoji + title + count, a "+ Add"
- *    button (emitting {@link add}), and an expandable list of items (name +
- *    date + delete) fed by {@link items}. A sealed-selected folder disables the
- *    add + shows a locked note (owned by the parent via {@link blocked}).
+ *  - a READ-ONLY source (Meetings): an accent icon-tile + title + count + a link
+ *    to its page — no list, no add.
+ *  - an EDITABLE source (Documents / Notes): an accent icon-tile + title + count,
+ *    a "+ Add" button (emitting {@link add}), and an expandable list of items
+ *    (name + date + delete) fed by {@link items}. A sealed-selected folder
+ *    disables the add + shows a locked note (owned by the parent via {@link blocked}).
  *
  * Pure/presentational: all IPC + folder-state lives in the parent
  * `BrainComponent`; this card only renders + emits `add`/`remove`/`toggle`.
@@ -29,15 +29,38 @@ import type { DocumentInfo } from "../../core/models";
   template: `
     <section class="sc card">
       <header class="sc-head">
-        <span class="sc-tile" aria-hidden="true">{{ glyph() }}</span>
-        <div class="sc-head-text">
-          <h3 class="sc-title">{{ title() }}</h3>
-          <p class="sc-sub">{{ subtitle() }}</p>
-        </div>
+        <span class="sc-tile" aria-hidden="true">
+          @switch (icon()) {
+            @case ("meetings") {
+              <svg viewBox="0 0 20 20" fill="none" width="22" height="22">
+                <rect x="7.5" y="2.5" width="5" height="9" rx="2.5" stroke="currentColor" stroke-width="1.5" />
+                <path d="M5.25 9.25a4.75 4.75 0 0 0 9.5 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                <path d="M10 14v3M7.5 17h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              </svg>
+            }
+            @case ("documents") {
+              <svg viewBox="0 0 20 20" fill="none" width="22" height="22">
+                <path d="M11.25 2.75H6.25A1.75 1.75 0 0 0 4.5 4.5v11A1.75 1.75 0 0 0 6.25 17.25h7.5A1.75 1.75 0 0 0 15.5 15.5V7z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                <path d="M11.25 2.75V7h4.25" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+                <path d="M7.75 10.5h4.5M7.75 13.25h4.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              </svg>
+            }
+            @case ("notes") {
+              <svg viewBox="0 0 20 20" fill="none" width="22" height="22">
+                <path d="M10.5 4.25H5.75A1.75 1.75 0 0 0 4 6v8.25A1.75 1.75 0 0 0 5.75 16h8.25A1.75 1.75 0 0 0 15.75 14.25V9.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M14 3.25l2.75 2.75-6.5 6.5-3.25.5.5-3.25z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+              </svg>
+            }
+          }
+        </span>
         <span class="sc-count" [attr.title]="count() + ' items'">{{
           count()
         }}</span>
       </header>
+      <div class="sc-head-text">
+        <h3 class="sc-title">{{ title() }}</h3>
+        <p class="sc-sub">{{ subtitle() }}</p>
+      </div>
 
       @if (linkTo(); as href) {
         <!-- Read-only source: just a link to its own page. -->
@@ -107,7 +130,17 @@ import type { DocumentInfo } from "../../core/models";
             <ul class="sc-list" role="list">
               @for (doc of items(); track doc.id) {
                 <li class="sc-item">
-                  <span class="sc-item-glyph" aria-hidden="true">{{ glyph() }}</span>
+                  <span class="sc-item-glyph" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
+                      <path
+                        d="M9 1.75H4.5A1.25 1.25 0 0 0 3.25 3v10A1.25 1.25 0 0 0 4.5 14.25h7A1.25 1.25 0 0 0 12.75 13V5.5z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                      <path d="M9 1.75V5.5h3.75" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                    </svg>
+                  </span>
                   <span class="sc-item-text">
                     <span class="sc-item-name">{{ doc.name }}</span>
                     <span class="sc-item-date">{{ formatDate(doc.createdAt) }}</span>
@@ -141,11 +174,14 @@ import type { DocumentInfo } from "../../core/models";
     `
       :host {
         display: block;
+        height: 100%;
       }
       .sc {
         display: flex;
         flex-direction: column;
         gap: var(--space-4);
+        /* Fill the stretched grid cell so peer cards share a height. */
+        height: 100%;
         transition:
           border-color var(--transition),
           transform var(--transition-fast),
@@ -159,10 +195,12 @@ import type { DocumentInfo } from "../../core/models";
       .sc-head {
         display: flex;
         align-items: center;
+        justify-content: space-between;
         gap: var(--space-3);
-        padding-bottom: var(--space-4);
-        border-bottom: 1px solid var(--border-subtle);
       }
+      /* Accent-tinted icon tile — the same visual family as the header's brain
+         mark (.b-mark) and the record Ask button, so the sources read as native
+         Murmur chrome rather than generic cards. */
       .sc-tile {
         display: inline-flex;
         align-items: center;
@@ -171,17 +209,26 @@ import type { DocumentInfo } from "../../core/models";
         width: 42px;
         height: 42px;
         border-radius: var(--radius-md);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-        font-size: 1.35rem;
+        background: var(--accent-soft);
+        border: 1px solid var(--accent-ring);
+        color: var(--accent-hover);
         line-height: 1;
+        transition:
+          background var(--transition),
+          border-color var(--transition);
+      }
+      .sc:hover .sc-tile {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--text-on-accent);
       }
       .sc-head-text {
         display: flex;
         flex-direction: column;
         gap: 2px;
         min-width: 0;
-        flex: 1 1 auto;
+        padding-bottom: var(--space-4);
+        border-bottom: 1px solid var(--border-subtle);
       }
       .sc-title {
         margin: 0;
@@ -205,6 +252,8 @@ import type { DocumentInfo } from "../../core/models";
 
       .sc-link {
         align-self: flex-start;
+        /* Pin to the card's bottom so the link/add rows align across sources. */
+        margin-top: auto;
         display: inline-flex;
         align-items: center;
         gap: var(--space-2);
@@ -215,6 +264,12 @@ import type { DocumentInfo } from "../../core/models";
         align-items: center;
         gap: var(--space-2);
         flex-wrap: wrap;
+      }
+      /* Pin the add-row to the bottom ONLY when it's the trailing content (the
+         collapsed, unblocked case) so peer cards' add-rows align. When a locked
+         note or an expanded list follows, it flows normally (no gap). */
+      .sc-actions:last-child {
+        margin-top: auto;
       }
       .sc-add {
         display: inline-flex;
@@ -261,8 +316,9 @@ import type { DocumentInfo } from "../../core/models";
         border-color: var(--border-strong);
       }
       .sc-item-glyph {
+        display: inline-flex;
         flex: none;
-        font-size: 1rem;
+        color: var(--text-muted);
         line-height: 1;
       }
       .sc-item-text {
@@ -307,8 +363,8 @@ import type { DocumentInfo } from "../../core/models";
   ],
 })
 export class BrainSourceCardComponent {
-  /** The leading emoji glyph (🎙 / 📄 / 📝). */
-  readonly glyph = input.required<string>();
+  /** Which line-art source icon to render in the accent tile. */
+  readonly icon = input.required<"meetings" | "documents" | "notes">();
   readonly title = input.required<string>();
   readonly subtitle = input.required<string>();
   readonly count = input.required<number>();

@@ -83,7 +83,17 @@ interface FolderOption {
       <header class="b-head card">
         <div class="b-head-top">
           <div class="b-identity">
-            <span class="b-mark" aria-hidden="true">🧠</span>
+            <span class="b-mark" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="none" width="24" height="24">
+                <path
+                  d="M10 4.2c-1.9-1.6-5-.6-5 1.9 0 .5-1.2.9-1.2 2.6 0 1.1.8 1.6.8 2.3 0 1.9 2.1 3 4 2.3M10 4.2c1.9-1.6 5-.6 5 1.9 0 .5 1.2.9 1.2 2.6 0 1.1-.8 1.6-.8 2.3 0 1.9-2.1 3-4 2.3M10 4.2v11.4"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
             <div class="b-identity-text">
               <h2 class="b-title">Brain</h2>
               <p class="b-tagline">Everything your assistant can reason over.</p>
@@ -180,7 +190,7 @@ interface FolderOption {
 
         <div class="b-cards">
           <app-brain-source-card
-            glyph="🎙"
+            icon="meetings"
             title="Meetings"
             subtitle="Recorded and transcribed — added by recording."
             [count]="overview()?.meetingCount ?? 0"
@@ -189,7 +199,7 @@ interface FolderOption {
           />
 
           <app-brain-source-card
-            glyph="📄"
+            icon="documents"
             title="Documents"
             [subtitle]="
               isAll()
@@ -213,7 +223,7 @@ interface FolderOption {
           />
 
           <app-brain-source-card
-            glyph="📝"
+            icon="notes"
             title="Notes"
             [subtitle]="
               isAll()
@@ -375,7 +385,7 @@ interface FolderOption {
         border-radius: var(--radius-md);
         background: var(--accent-soft);
         border: 1px solid var(--accent-ring);
-        font-size: 1.4rem;
+        color: var(--accent-hover);
         line-height: 1;
       }
       .b-identity-text {
@@ -558,9 +568,11 @@ interface FolderOption {
       }
       .b-cards {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
         gap: var(--space-4);
-        align-items: start;
+        /* Stretch so peer cards in a row share one height — no ragged bottoms,
+           and the bottom-pinned action rows line up across the three sources. */
+        align-items: stretch;
       }
       .b-list-err {
         margin: 0;
