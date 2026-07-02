@@ -80,6 +80,7 @@ pub fn run() {
             commands::end_voice_command,
             commands::ask_assistant_text,
             commands::ask_assistant_chat,
+            commands::list_assistant_threads,
             commands::list_input_devices,
             commands::get_last_note,
             commands::update_note,

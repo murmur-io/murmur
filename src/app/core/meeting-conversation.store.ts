@@ -2,6 +2,7 @@ import { Injectable, computed, inject, signal } from "@angular/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import type {
+  AssistantThreadRow,
   AssistantToolPayload,
   ChatMsg,
   VoiceActionResultPayload,
@@ -109,6 +110,12 @@ export interface ThreadTurn {
  *                      `manual_notes` buffer. A thread-anchor question is NOT a
  *                      note until the user accepts an agent reply into the notes,
  *                      so it stays `false` (it doesn't pollute the saved buffer).
+ *   - `threadId`     — the PERSISTENT key of this line's thread (an FE-generated
+ *                      UUID, minted when the thread opens and shipped with every
+ *                      `ask_assistant_chat` call so the backend persists the
+ *                      exchanges). Null for a plain note line, and for a voice
+ *                      thread until the result payload stamps one. Also routes
+ *                      threadId-carrying tool/result events to the RIGHT thread.
  */
 export interface NoteItem {
   /** Stable id for `@for` tracking (never key on $index). */
@@ -118,6 +125,7 @@ export interface NoteItem {
   threadOpen: boolean;
   threadPending: boolean;
   persisted: boolean;
+  threadId: string | null;
 }
 
 /**
@@ -145,6 +153,28 @@ export function parseCitations(raw: string[]): AssistantCitation[] {
     const label = s.replace(/^\[\[/, "").replace(/\]\]$/, "");
     return { kind: "vault", label };
   });
+}
+
+/** The terminal statuses a persisted thread row may carry (mirrors VoiceActionStatus). */
+const VOICE_ACTION_STATUSES: ReadonlySet<string> = new Set([
+  "ok",
+  "needs_consent",
+  "unavailable",
+  "unrecognized",
+  "nothing_heard",
+  "error",
+]);
+
+/**
+ * Narrow a persisted thread row's `status` string (serialized loosely as
+ * `string`) back to a {@link VoiceActionStatus}. An unknown value (a future
+ * backend adding a status) degrades to "ok" — the turn still renders as a
+ * plain resolved answer rather than breaking the thread.
+ */
+function coerceStatus(s: string): VoiceActionStatus {
+  return (
+    VOICE_ACTION_STATUSES.has(s) ? s : "ok"
+  ) as VoiceActionStatus;
 }
 
 /**
@@ -342,7 +372,20 @@ export class MeetingConversationStore {
     this._notes.set([]);
     this.voiceTargetNoteId = null;
     this._loaded.set(false);
-    void this.loadNotes(id, token);
+    void this.hydrate(id, token);
+  }
+
+  /**
+   * Hydrate a genuinely-new meeting: the notes buffer FIRST (it seeds the note
+   * lines + re-enables the composer — timing unchanged), THEN the persisted
+   * `@brain` threads, which attach to the seeded lines by anchor text. Same-id
+   * re-entry never reaches here (RAM wins — see {@link setMeetingId}), so an
+   * in-progress conversation is never clobbered by its own persisted copy.
+   */
+  private async hydrate(id: string, token: number): Promise<void> {
+    await this.loadNotes(id, token);
+    if (token !== this.notesLoadToken) return;
+    await this.loadThreads(id, token);
   }
 
   /**
@@ -369,6 +412,7 @@ export class MeetingConversationStore {
             threadOpen: false,
             threadPending: false,
             persisted: true,
+            threadId: null,
           })),
         );
       }
@@ -382,6 +426,107 @@ export class MeetingConversationStore {
         this._loaded.set(true);
       }
     }
+  }
+
+  /**
+   * Rebuild the persisted `@brain` threads for a reopened meeting: fetch the
+   * meeting's thread rows (oldest → newest; a sealed-not-unlocked meeting
+   * returns [] — gated server-side), group them by `threadId` (insertion
+   * order), turn each row into a resolved user + agent turn pair, then ATTACH
+   * each group to the FIRST note line whose text equals the group's anchor and
+   * which has no thread yet (the ✨-ask-brain / anchored case). A group with no
+   * matching line (anchorless voice thread, an edited/deleted note, or an
+   * anchor another group already claimed) APPENDS as a standalone collapsed
+   * thread line at the end — never lost, never mis-attached.
+   *
+   * Hydrated turns are terminal history: `proposedNote: null` (no Add-to-notes
+   * affordance resurrects — an accepted draft already lives in `manual_notes`),
+   * empty trace, `accepted`/`dismissed` false. Threads stay CONTINUABLE: a
+   * follow-up ships the rebuilt RAM turn list + the SAME `threadId`, so new
+   * exchanges append as new rows backend-side. Stale-guarded like
+   * {@link loadNotes}: a response for a meeting we've since left is dropped.
+   * Failure (old backend without the command / transient) leaves the notes
+   * flow as-is — threads simply don't rehydrate.
+   */
+  private async loadThreads(id: string, token: number): Promise<void> {
+    let rows: AssistantThreadRow[];
+    try {
+      rows = await this.ipc.listAssistantThreads(id);
+    } catch {
+      return;
+    }
+    if (token !== this.notesLoadToken || rows.length === 0) return;
+
+    // Group rows by threadId, preserving first-seen (insertion) order.
+    const groups = new Map<string, AssistantThreadRow[]>();
+    for (const row of rows) {
+      if (!row.threadId) continue; // backend contract: never happens; stay safe
+      const group = groups.get(row.threadId);
+      if (group) group.push(row);
+      else groups.set(row.threadId, [row]);
+    }
+
+    this._notes.update((ns) => {
+      let next = ns.slice();
+      for (const [threadId, group] of groups) {
+        // A thread already in RAM under this id must not hydrate twice (can't
+        // happen off the fresh-id path, but the guard is cheap).
+        if (next.some((n) => n.threadId === threadId)) continue;
+        const thread: ThreadTurn[] = [];
+        for (const row of group) {
+          thread.push({
+            id: this.nextTurnId++,
+            role: "user",
+            text: row.command,
+            status: "ok",
+            trace: [],
+            citations: [],
+            proposedNote: null,
+            accepted: false,
+            dismissed: false,
+          });
+          thread.push({
+            id: this.nextTurnId++,
+            role: "agent",
+            text: row.answer,
+            status: coerceStatus(row.status),
+            trace: [],
+            citations: parseCitations(row.citations),
+            proposedNote: null,
+            accepted: false,
+            dismissed: false,
+          });
+        }
+        const anchorText = group[0].anchorText;
+        const anchorIdx =
+          anchorText === null
+            ? -1
+            : next.findIndex((n) => n.text === anchorText && !n.thread);
+        if (anchorIdx !== -1) {
+          next[anchorIdx] = {
+            ...next[anchorIdx],
+            thread,
+            threadOpen: false,
+            threadPending: false,
+            threadId,
+          };
+        } else {
+          next = [
+            ...next,
+            {
+              id: this.nextNoteId++,
+              text: group[0].command,
+              thread,
+              threadOpen: false,
+              threadPending: false,
+              persisted: false,
+              threadId,
+            },
+          ];
+        }
+      }
+      return next;
+    });
   }
 
   /**
@@ -420,6 +565,7 @@ export class MeetingConversationStore {
         threadOpen: false,
         threadPending: false,
         persisted: true,
+        threadId: null,
       },
     ]);
     this.persistNotes();
@@ -437,6 +583,9 @@ export class MeetingConversationStore {
     const q = question.trim();
     if (!q) return;
     const noteId = this.nextNoteId++;
+    // Mint the PERSISTENT thread key up front — every ask_assistant_chat call
+    // for this thread ships it, so the backend persists the exchanges under it.
+    const threadId = crypto.randomUUID();
     const userTurn: ThreadTurn = {
       id: this.nextTurnId++,
       role: "user",
@@ -468,6 +617,7 @@ export class MeetingConversationStore {
         threadOpen: true,
         threadPending: true,
         persisted: false,
+        threadId,
       },
     ]);
     await this.runAgentTurn(noteId, agentTurn.id);
@@ -490,6 +640,9 @@ export class MeetingConversationStore {
     if (!note || note.thread) return; // only notes WITHOUT a thread yet
     const subject = note.text.trim();
     if (!subject) return;
+    // A retroactive thread is a NEW thread → mint its persistent key. The note's
+    // text is the anchor, so hydration can re-attach the thread to this line.
+    const threadId = crypto.randomUUID();
     const userTurn: ThreadTurn = {
       id: this.nextTurnId++,
       role: "user",
@@ -525,6 +678,7 @@ export class MeetingConversationStore {
               thread: [userTurn, agentTurn],
               threadOpen: true,
               threadPending: true,
+              threadId,
             }
           : n,
       ),
@@ -543,6 +697,10 @@ export class MeetingConversationStore {
     if (!t) return;
     const note = this._notes().find((n) => n.id === noteId);
     if (!note || !note.thread || note.threadPending) return;
+    // A thread that somehow lacks a persistent key (a voice thread whose result
+    // never stamped one / pre-persistence RAM state) gets one NOW, so this and
+    // every later exchange persist under the same thread.
+    const threadId = note.threadId ?? crypto.randomUUID();
     const userTurn: ThreadTurn = {
       id: this.nextTurnId++,
       role: "user",
@@ -573,6 +731,7 @@ export class MeetingConversationStore {
               thread: [...(n.thread ?? []), userTurn, agentTurn],
               threadOpen: true,
               threadPending: true,
+              threadId,
             }
           : n,
       ),
@@ -583,8 +742,11 @@ export class MeetingConversationStore {
   /**
    * Ship a thread's OWN turns (its history) to `ask_assistant_chat` (multi-turn
    * memory scoped to THIS thread) and resolve the given pending agent turn with
-   * the reply. The live tool-trace lands via {@link onTool} (the most recent
-   * pending agent turn). Always clears the thread's `threadPending` flag.
+   * the reply. Ships the note's `threadId` + its anchor text (the note line) so
+   * the backend PERSISTS the exchange under the thread — a reopened meeting
+   * rebuilds it via `list_assistant_threads`. The live tool-trace lands via
+   * {@link onTool} (routed by the payload's threadId when stamped, else the most
+   * recent pending agent turn). Always clears the thread's `threadPending` flag.
    */
   private async runAgentTurn(noteId: number, agentTurnId: number): Promise<void> {
     const note = this._notes().find((n) => n.id === noteId);
@@ -607,7 +769,11 @@ export class MeetingConversationStore {
       }));
 
     try {
-      const reply = await this.ipc.askAssistantChat(payload);
+      const reply = await this.ipc.askAssistantChat(
+        payload,
+        note?.threadId ?? undefined,
+        note?.text.trim() || undefined,
+      );
       this.resolveTurn(noteId, agentTurnId, {
         status: reply.status,
         text: reply.summary || "(no answer)",
@@ -704,6 +870,7 @@ export class MeetingConversationStore {
           threadOpen: false,
           threadPending: false,
           persisted: true,
+          threadId: null,
         },
       ];
     });
@@ -768,6 +935,8 @@ export class MeetingConversationStore {
       dismissed: false,
     };
     this.voiceTargetNoteId = noteId;
+    // A voice thread starts WITHOUT a persistent key (begin_voice_command takes
+    // none) — the result payload's threadId is adopted when the answer lands.
     this._notes.update((ns) => [
       ...ns,
       {
@@ -777,6 +946,7 @@ export class MeetingConversationStore {
         threadOpen: true,
         threadPending: true,
         persisted: false,
+        threadId: null,
       },
     ]);
     try {
@@ -851,70 +1021,122 @@ export class MeetingConversationStore {
         threadOpen: true,
         threadPending: true,
         persisted: false,
+        threadId: null,
       },
     ]);
   }
 
   /**
-   * Attach a LIVE tool-trace chip to the in-flight (last pending) agent turn,
-   * across ALL threads. A "running" event pushes a new chip; a "done" event
-   * resolves the most recent matching running chip (or appends one). No pending
-   * agent turn → ignore. Pure immutable signal updates — no NG0600. Shared by the
-   * voice (EVENT_ASSISTANT_TOOL) + text (EVENT_CHAT_TOOL) tool-trace streams.
-   *
-   * KNOWN LIMITATION (v1, acceptable): the EVENT_CHAT_TOOL payload carries NO
-   * thread id, so when TWO text threads are pending SIMULTANEOUSLY a chip lands on
-   * the most-recently-opened pending agent turn — which may not be the one that
-   * actually made the call. This is non-PII + purely cosmetic (the trace chip is a
-   * coarse "Searching notes…" badge, never content) and is acceptable for v1;
-   * fixing it would need the backend to stamp a thread id on the tool event.
+   * Attach a LIVE tool-trace chip to the in-flight agent turn. When the payload
+   * carries a `threadId` (the backend now stamps the originating thread on both
+   * tool streams) the chip lands ONLY on that thread's pending agent turn — two
+   * simultaneously-pending threads no longer cross-attribute. A stamped id that
+   * matches NO thread is a VOICE/wake turn: the backend generates the UUID
+   * itself, so the FE-side voice thread still has `threadId: null` while the
+   * chips stream (the result hasn't landed yet). That chip ADOPTS: it lands on
+   * the pending voice-target thread (else the newest pending thread whose
+   * threadId is null — only voice threads qualify; text threads always carry an
+   * FE-minted id) and stamps the payload's id onto the note, so later chips +
+   * the result match it directly. Only when no null-threadId pending thread
+   * exists is a stamped chip DROPPED (never mis-filed onto a text thread).
+   * Without a threadId (old backend) the previous fallback applies: the most
+   * recent pending agent turn across the flow. A "running" event pushes a new
+   * chip; a "done" event resolves the most recent matching running chip (or
+   * appends one). No pending agent turn → ignore. Pure immutable signal updates
+   * — no NG0600. Shared by the voice (EVENT_ASSISTANT_TOOL) + text
+   * (EVENT_CHAT_TOOL) tool-trace streams.
    */
   private onTool(p: AssistantToolPayload): void {
+    const payloadThreadId = p.threadId ?? null;
+    const voiceTargetId = this.voiceTargetNoteId;
     this._notes.update((ns) => {
-      // Find the most recent pending agent turn across the flow (newest note first).
-      for (let ni = ns.length - 1; ni >= 0; ni--) {
-        const note = ns[ni];
-        if (!note.thread) continue;
-        for (let ti = note.thread.length - 1; ti >= 0; ti--) {
-          const turn = note.thread[ti];
-          if (turn.role === "agent" && turn.status === "pending") {
-            const trace = turn.trace.slice();
-            if (p.state === "running") {
-              trace.push({
-                id: this.nextTraceId++,
-                tool: p.tool,
-                state: "running",
-                ok: true,
-                count: p.count,
-              });
-            } else {
-              let resolved = false;
-              for (let i = trace.length - 1; i >= 0; i--) {
-                if (trace[i].tool === p.tool && trace[i].state === "running") {
-                  trace[i] = { ...trace[i], state: "done", ok: p.ok, count: p.count };
-                  resolved = true;
-                  break;
-                }
-              }
-              if (!resolved) {
-                trace.push({
-                  id: this.nextTraceId++,
-                  tool: p.tool,
-                  state: "done",
-                  ok: p.ok,
-                  count: p.count,
-                });
+      const hasPending = (n: NoteItem): boolean =>
+        n.thread?.some((t) => t.role === "agent" && t.status === "pending") ??
+        false;
+
+      // Phase 1 — pick the target note (and whether it adopts the payload id).
+      let ni = -1;
+      let adopt = false;
+      if (payloadThreadId !== null) {
+        ni = ns.findIndex(
+          (n) => n.threadId === payloadThreadId && hasPending(n),
+        );
+        if (ni === -1) {
+          // Voice/wake adoption: prefer the voice-target thread, else the
+          // newest pending thread still without a persistent key.
+          ni = ns.findIndex(
+            (n) =>
+              n.id === voiceTargetId && n.threadId === null && hasPending(n),
+          );
+          if (ni === -1) {
+            for (let i = ns.length - 1; i >= 0; i--) {
+              if (ns[i].threadId === null && hasPending(ns[i])) {
+                ni = i;
+                break;
               }
             }
-            const nextThread = note.thread.slice();
-            nextThread[ti] = { ...turn, trace };
-            const next = ns.slice();
-            next[ni] = { ...note, thread: nextThread };
-            return next;
+          }
+          if (ni !== -1) adopt = true;
+        }
+      } else {
+        for (let i = ns.length - 1; i >= 0; i--) {
+          if (hasPending(ns[i])) {
+            ni = i;
+            break;
           }
         }
       }
-      return ns;
+      if (ni === -1) return ns; // nothing eligible — drop, never mis-file
+
+      // Phase 2 — attach the chip to the note's last pending agent turn.
+      const note = ns[ni];
+      const thread = note.thread!;
+      let ti = -1;
+      for (let i = thread.length - 1; i >= 0; i--) {
+        if (thread[i].role === "agent" && thread[i].status === "pending") {
+          ti = i;
+          break;
+        }
+      }
+      if (ti === -1) return ns; // unreachable (hasPending guaranteed a turn)
+      const turn = thread[ti];
+      const trace = turn.trace.slice();
+      if (p.state === "running") {
+        trace.push({
+          id: this.nextTraceId++,
+          tool: p.tool,
+          state: "running",
+          ok: true,
+          count: p.count,
+        });
+      } else {
+        let resolved = false;
+        for (let i = trace.length - 1; i >= 0; i--) {
+          if (trace[i].tool === p.tool && trace[i].state === "running") {
+            trace[i] = { ...trace[i], state: "done", ok: p.ok, count: p.count };
+            resolved = true;
+            break;
+          }
+        }
+        if (!resolved) {
+          trace.push({
+            id: this.nextTraceId++,
+            tool: p.tool,
+            state: "done",
+            ok: p.ok,
+            count: p.count,
+          });
+        }
+      }
+      const nextThread = thread.slice();
+      nextThread[ti] = { ...turn, trace };
+      const next = ns.slice();
+      next[ni] = {
+        ...note,
+        thread: nextThread,
+        threadId: adopt ? payloadThreadId : note.threadId,
+      };
+      return next;
     });
   }
 
@@ -933,19 +1155,45 @@ export class MeetingConversationStore {
    * resolve the VOICE target thread's pending agent turn (summary + citations) +
    * backfill the heard command onto its (possibly empty) user turn / anchor line.
    *
-   * A voice result resolves ONLY the voice-originated thread (`voiceTargetNoteId`).
-   * If that target is gone (null — e.g. cleared by a new recording, or a race),
-   * we APPEND a fresh anchorless thread for the voice Q&A rather than STEALING the
-   * newest pending TEXT thread — clobbering a typed thread's anchor with the heard
-   * command would corrupt an unrelated `@brain` conversation.
+   * When the payload carries a `threadId` that matches a thread with a pending
+   * agent turn, the result routes THERE (a text ask fired with a threadId — e.g.
+   * `ask_assistant_text` — resolves its own thread even with a voice ask also in
+   * flight; a voice thread whose streamed chips already ADOPTED the backend's id
+   * in {@link onTool} matches here too). Otherwise it resolves ONLY the
+   * voice-originated thread (`voiceTargetNoteId`) — a fresh voice thread whose
+   * turn used no tools still has `threadId: null`, lands via that fallback, and
+   * ADOPTS the payload's stamped key — a later follow-up then continues the SAME
+   * persisted thread. If the target is gone
+   * (null — e.g. cleared by a new recording, or a race), we APPEND a fresh
+   * anchorless thread for the voice Q&A rather than STEALING the newest pending
+   * TEXT thread — clobbering a typed thread's anchor with the heard command would
+   * corrupt an unrelated `@brain` conversation.
    */
   private onResult(p: VoiceActionResultPayload): void {
     this._manualAskInFlight.set(false);
     this._listening.set(false);
     this._processing.set(false);
-    const targetId = this.voiceTargetNoteId;
-    this.voiceTargetNoteId = null;
+    const payloadThreadId = p.threadId ?? null;
     const heard = p.command.trim();
+
+    let targetId: number | null = null;
+    if (payloadThreadId !== null) {
+      const match = this._notes().find(
+        (n) =>
+          n.threadId === payloadThreadId &&
+          (n.thread?.some(
+            (t) => t.role === "agent" && t.status === "pending",
+          ) ??
+            false),
+      );
+      if (match) targetId = match.id;
+    }
+    if (targetId === null) {
+      targetId = this.voiceTargetNoteId;
+      this.voiceTargetNoteId = null;
+    } else if (targetId === this.voiceTargetNoteId) {
+      this.voiceTargetNoteId = null;
+    }
 
     if (targetId === null) {
       // No voice thread to resolve → append a fresh, already-resolved thread so
@@ -984,6 +1232,7 @@ export class MeetingConversationStore {
           threadOpen: true,
           threadPending: false,
           persisted: false,
+          threadId: payloadThreadId,
         },
       ]);
       return;
@@ -1022,6 +1271,9 @@ export class MeetingConversationStore {
             ? heard
             : n.text,
           thread,
+          // Adopt the backend-stamped persistent key (a voice thread starts with
+          // null) so a follow-up continues the SAME persisted thread.
+          threadId: n.threadId ?? payloadThreadId,
         };
       }),
     );
