@@ -629,6 +629,7 @@ mod tests {
             template: String::new(),
             vault_titles: Vec::new(),
             related_context: None,
+            user_notes: None,
         }
     }
 
