@@ -38,6 +38,13 @@ pub struct SummarizeRequest {
     /// (not sealed-not-unlocked) prior notes — see `summarize::related_context::build_related_context`.
     /// It is redacted by `RedactingProvider` alongside the transcript before egress.
     pub related_context: Option<String>,
+    /// ENHANCE-MY-NOTES: the user's own typed in-meeting notes (the `manual_notes` buffer —
+    /// raw `\n`-joined lines, NOT markdown bullets), present ONLY when `notes_mode == "enhance"`
+    /// AND the buffer is non-blank. `None` ⇒ `render_user_content` is byte-identical to before
+    /// this field existed (same contract as `related_context`). SECURITY: this string EGRESSES
+    /// to the provider in the prompt — `RedactingProvider` MUST scrub it alongside the
+    /// transcript (summarize/redact.rs) before egress. Today's append mode never egresses it.
+    pub user_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,6 +224,7 @@ mod tests {
             template: String::new(),
             vault_titles: vec![],
             related_context: None,
+            user_notes: None,
         };
         let (text, meta) = p.summarize_with_meta(&req).await.unwrap();
         assert_eq!(text, "note body");

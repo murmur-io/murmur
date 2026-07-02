@@ -679,6 +679,7 @@ async fn summarize_and_export(
         template: template::build_template(&config.note_style, &config.note_language),
         vault_titles,
         related_context,
+        user_notes: None, // ENHANCE-MY-NOTES: Task 4 replaces this with the conditional wiring
     };
 
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
