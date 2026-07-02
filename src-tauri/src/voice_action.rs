@@ -770,18 +770,7 @@ mod tests {
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn tmp_db() -> Db {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-voiceaction-{}-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-        ));
+        let p = crate::storage::db::unique_temp_path("murmur-voiceaction", "sqlite");
         let _ = std::fs::remove_file(&p);
         Db::open_with_key(&p, KEY).unwrap()
     }
