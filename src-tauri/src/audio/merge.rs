@@ -112,6 +112,191 @@ pub fn merge_streams(streams: Vec<StreamInput>) -> Vec<Segment> {
     merged
 }
 
+/// ── Cross-stream echo suppression (speakers → mic bleed) ────────────────────────────────
+///
+/// On speakers, the remote voice is captured twice: clean on the system stream and, tens of
+/// ms to ~1 s later, as acoustic bleed on the mic — so the same sentence lands as `others`
+/// AND `me`. This pass drops the `me` echo copies. Thresholds follow prod-proven values
+/// (screenpipe PR #4440 strict tier; OpenWhispr relaxed tier) — see
+/// docs/research/2026-07-02-audio-echo-full-remediation.md.
+///
+/// CONTENT-LOSS GUARDS (load-bearing):
+///   - only `me` segments are ever dropped; the clean `others*` copy ALWAYS survives;
+///   - both sides need ≥ 4 tokens (short real acks — "okay", "yes ship it" — are immune);
+///   - the relaxed tier fires ONLY under measured acoustic leak evidence (headphones ⇒
+///     no evidence ⇒ strict tier only);
+///   - identical text outside the echo window is genuine repetition and survives.
+const ECHO_MIN_TOKENS: usize = 4;
+const ECHO_STRICT_WINDOW_S: f64 = 2.0;
+const ECHO_STRICT_JACCARD: f32 = 0.85;
+const ECHO_RELAXED_BEFORE_S: f64 = 1.5;
+const ECHO_RELAXED_AFTER_S: f64 = 4.0;
+const ECHO_RELAXED_SIMILARITY: f32 = 0.7;
+const ECHO_CONCAT_MAX: usize = 3;
+const ECHO_CONCAT_MAX_GAP_S: f64 = 1.0;
+
+/// Lowercased Unicode-alphanumeric tokens ("Zamknijmy budżet!" → ["zamknijmy","budżet"]).
+fn norm_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Word-set Jaccard: |A∩B| / |A∪B| over unique tokens.
+fn jaccard(a: &[String], b: &[String]) -> f32 {
+    use std::collections::HashSet;
+    let sa: HashSet<&String> = a.iter().collect();
+    let sb: HashSet<&String> = b.iter().collect();
+    let inter = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        0.0
+    } else {
+        inter as f32 / union as f32
+    }
+}
+
+/// Multiset token coverage normalized by the SHORTER side (garbled echo fragments still hit).
+fn coverage(a: &[String], b: &[String]) -> f32 {
+    use std::collections::HashMap;
+    let shorter = a.len().min(b.len());
+    if shorter == 0 {
+        return 0.0;
+    }
+    let mut counts: HashMap<&String, usize> = HashMap::new();
+    for t in b {
+        *counts.entry(t).or_default() += 1;
+    }
+    let mut hits = 0usize;
+    for t in a {
+        if let Some(c) = counts.get_mut(t) {
+            if *c > 0 {
+                *c -= 1;
+                hits += 1;
+            }
+        }
+    }
+    hits as f32 / shorter as f32
+}
+
+/// Token-level longest-common-subsequence ratio normalized by the shorter side (word-order
+/// sensitive — protects against shared-vocabulary false positives).
+fn token_lcs(a: &[String], b: &[String]) -> f32 {
+    let shorter = a.len().min(b.len());
+    if shorter == 0 {
+        return 0.0;
+    }
+    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in 0..a.len() {
+        for j in 0..b.len() {
+            dp[i + 1][j + 1] = if a[i] == b[j] {
+                dp[i][j] + 1
+            } else {
+                dp[i][j + 1].max(dp[i + 1][j])
+            };
+        }
+    }
+    dp[a.len()][b.len()] as f32 / shorter as f32
+}
+
+/// Is this segment on the clean (system) side? Diarization may have relabelled to others-N.
+fn is_others(seg: &Segment) -> bool {
+    seg.speaker.as_deref().map(|s| s != SPEAKER_ME).unwrap_or(false)
+}
+
+/// One candidate = a run of 1..=ECHO_CONCAT_MAX consecutive `others` segments (close in time).
+struct Candidate {
+    start_s: f64,
+    tokens: Vec<String>,
+    text_norm: String,
+}
+
+fn build_candidates(others: &[&Segment]) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for i in 0..others.len() {
+        let mut tokens = Vec::new();
+        let mut text = String::new();
+        for k in 0..ECHO_CONCAT_MAX.min(others.len() - i) {
+            if k > 0 {
+                let gap = others[i + k].start_s - others[i + k - 1].end_s;
+                if gap > ECHO_CONCAT_MAX_GAP_S {
+                    break;
+                }
+                text.push(' ');
+            }
+            tokens.extend(norm_tokens(&others[i + k].text));
+            text.push_str(&others[i + k].text.to_lowercase());
+            out.push(Candidate {
+                start_s: others[i].start_s,
+                tokens: tokens.clone(),
+                text_norm: norm_tokens(&text).join(" "),
+            });
+        }
+    }
+    out
+}
+
+/// Drop `me` segments that are echo copies of `others` speech. Returns the cleaned,
+/// re-indexed segments + the suppressed count. See the tier rules in the header comment.
+pub fn suppress_cross_stream_echo(
+    segments: Vec<Segment>,
+    leak: Option<&crate::audio::align::EchoLeak>,
+) -> (Vec<Segment>, usize) {
+    let relaxed_armed = leak
+        .map(|l| l.correlation >= crate::audio::align::MIN_CORR)
+        .unwrap_or(false);
+    let others_refs: Vec<&Segment> = segments.iter().filter(|s| is_others(s)).collect();
+    if others_refs.is_empty() {
+        return (segments, 0);
+    }
+    let candidates = build_candidates(&others_refs);
+
+    let mut drop = vec![false; segments.len()];
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.speaker.as_deref() != Some(SPEAKER_ME) {
+            continue;
+        }
+        let me_tokens = norm_tokens(&seg.text);
+        if me_tokens.len() < ECHO_MIN_TOKENS {
+            continue;
+        }
+        let me_norm = me_tokens.join(" ");
+        for cand in &candidates {
+            if cand.tokens.len() < ECHO_MIN_TOKENS {
+                continue;
+            }
+            let delta = seg.start_s - cand.start_s;
+            let strict_hit = delta.abs() <= ECHO_STRICT_WINDOW_S
+                && jaccard(&me_tokens, &cand.tokens) >= ECHO_STRICT_JACCARD;
+            let relaxed_hit = relaxed_armed
+                && delta >= -ECHO_RELAXED_BEFORE_S
+                && delta <= ECHO_RELAXED_AFTER_S
+                && (me_norm == cand.text_norm
+                    || cand.text_norm.contains(&me_norm)
+                    || me_norm.contains(&cand.text_norm)
+                    || coverage(&me_tokens, &cand.tokens).max(token_lcs(&me_tokens, &cand.tokens))
+                        >= ECHO_RELAXED_SIMILARITY);
+            if strict_hit || relaxed_hit {
+                drop[i] = true;
+                break;
+            }
+        }
+    }
+
+    let suppressed = drop.iter().filter(|d| **d).count();
+    let mut out: Vec<Segment> = segments
+        .into_iter()
+        .zip(drop)
+        .filter_map(|(s, d)| if d { None } else { Some(s) })
+        .collect();
+    for (i, seg) in out.iter_mut().enumerate() {
+        seg.idx = i as i64;
+    }
+    (out, suppressed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +494,131 @@ mod tests {
         );
         // Re-indexed over the merged order.
         assert_eq!(out.iter().map(|s| s.idx).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    // ── Cross-stream echo dedup ───────────────────────────────────────────────────────────
+
+    use crate::audio::align::EchoLeak;
+
+    fn seg_sp(start_s: f64, end_s: f64, text: &str, speaker: &str) -> Segment {
+        Segment { idx: 0, start_s, end_s, text: text.into(), speaker: Some(speaker.into()) }
+    }
+    fn leak(corr: f32) -> EchoLeak {
+        EchoLeak { offset_s: 0.3, correlation: corr }
+    }
+
+    /// STRICT tier (no leak evidence needed): a ≥4-token near-identical "me" copy shortly
+    /// after the clean "others" original is echo — the "me" copy is dropped.
+    #[test]
+    fn strict_echo_pair_drops_the_me_copy() {
+        let segs = vec![
+            seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
+            seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, None);
+        assert_eq!(n, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].speaker.as_deref(), Some("others"), "the clean copy survives");
+        assert_eq!(out[0].idx, 0, "re-indexed");
+    }
+
+    /// Genuine short agreement ("yes ship it", 3 tokens) must SURVIVE even with strong
+    /// leak evidence — the ≥4-token floor protects real speech.
+    #[test]
+    fn short_genuine_agreement_survives() {
+        let segs = vec![
+            seg_sp(5.0, 6.5, "let's ship it on friday", "others"),
+            seg_sp(6.6, 7.2, "yes ship it", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
+        assert_eq!(n, 0);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Identical text 10 s apart is a real repetition, not echo — both survive.
+    #[test]
+    fn identical_text_far_apart_survives() {
+        let segs = vec![
+            seg_sp(5.0, 6.0, "we need to finalize the budget today", "others"),
+            seg_sp(15.0, 16.0, "we need to finalize the budget today", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
+        assert_eq!(n, 0);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Two simultaneous short acks ("okay") are two people agreeing — both survive.
+    #[test]
+    fn simultaneous_short_acks_survive() {
+        let segs = vec![
+            seg_sp(5.0, 5.4, "okay", "others"),
+            seg_sp(5.1, 5.5, "okay", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
+        assert_eq!(n, 0);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// RELAXED tier: with leak evidence, a garbled echo (Whisper decodes the distorted mic
+    /// copy differently) still matches by token coverage/LCS ≥ 0.7 and is dropped.
+    /// Without leak evidence the relaxed tier is DISARMED and the segment survives.
+    #[test]
+    fn relaxed_tier_is_gated_on_leak_evidence() {
+        let make = || vec![
+            seg_sp(5.0, 7.0, "we should finalize the budget proposal by monday", "others"),
+            seg_sp(5.6, 7.4, "we should finalize the budget proposal monday", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(make(), Some(&leak(0.9)));
+        assert_eq!(n, 1, "garbled echo dropped under leak evidence");
+        assert_eq!(out.len(), 1);
+        // Force a relaxed-only pair (Jaccard < 0.85, coverage ≥ 0.7) to prove the gate:
+        let relaxed_only = || vec![
+            seg_sp(5.0, 7.0, "we should finalize the annual budget proposal by monday morning", "others"),
+            seg_sp(5.6, 7.4, "finalize the annual budget proposal monday", "me"),
+        ];
+        let (_, n_gated) = suppress_cross_stream_echo(relaxed_only(), Some(&leak(0.9)));
+        assert_eq!(n_gated, 1, "relaxed tier fires with evidence");
+        let (out2, n2) = suppress_cross_stream_echo(relaxed_only(), None);
+        assert_eq!(n2, 0, "no leak evidence ⇒ relaxed tier disarmed");
+        assert_eq!(out2.len(), 2);
+    }
+
+    /// Diarized labels ("others-2") count as the clean side.
+    #[test]
+    fn diarized_others_labels_count_as_others() {
+        let segs = vec![
+            seg_sp(5.0, 7.0, "the migration plan looks good to me", "others-2"),
+            seg_sp(5.3, 7.2, "the migration plan looks good to me", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, None);
+        assert_eq!(n, 1);
+        assert_eq!(out[0].speaker.as_deref(), Some("others-2"));
+    }
+
+    /// Segmentation mismatch: the echo lands as ONE "me" segment while the system pass split
+    /// it into two adjacent segments — the concatenated candidate still matches.
+    #[test]
+    fn concatenated_adjacent_others_match_the_echo() {
+        let segs = vec![
+            seg_sp(5.0, 6.0, "we need to finalize", "others"),
+            seg_sp(6.1, 7.2, "the budget by monday", "others"),
+            seg_sp(5.4, 7.5, "we need to finalize the budget by monday", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, None);
+        assert_eq!(n, 1);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| s.speaker.as_deref() != Some("me")));
+    }
+
+    /// Mic-only meetings (no others segments) are untouched.
+    #[test]
+    fn mic_only_is_untouched() {
+        let segs = vec![
+            seg_sp(1.0, 2.0, "just me talking to myself here", "me"),
+            seg_sp(3.0, 4.0, "still me talking", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs.clone(), Some(&leak(0.9)));
+        assert_eq!(n, 0);
+        assert_eq!(out.len(), 2);
     }
 }
