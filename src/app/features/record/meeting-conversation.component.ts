@@ -15,6 +15,7 @@ import {
 import { MeetingConversationStore } from "../../core/meeting-conversation.store";
 import { AiOrbComponent } from "./ai-orb.component";
 import { NoteItemComponent } from "./note-item.component";
+import { ProactiveHintCardComponent } from "./proactive-hint-card.component";
 
 /** The inline mention marker that turns a composer line into a `@brain` thread. */
 const BRAIN_MARKER = "@brain";
@@ -74,7 +75,7 @@ export function parseBrainLine(text: string): string | null {
   selector: "app-meeting-conversation",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AiOrbComponent, NoteItemComponent],
+  imports: [AiOrbComponent, NoteItemComponent, ProactiveHintCardComponent],
   template: `
     <div class="card surface" role="group" aria-label="In-meeting notes">
       <div class="surface-head">
@@ -84,6 +85,14 @@ export function parseBrainLine(text: string): string | null {
           Type <span class="kbd">&#64;brain</span> to ask in a thread
         </span>
       </div>
+
+      <!-- Proactive recall card — PINNED above the notes flow (not inside the
+           scroller, so it can't scroll away mid-meeting). At most ONE: the store
+           keeps only the newest; hintsEnabled is the FE half of the global mute
+           (the backend silences the event source too — belt and braces). -->
+      @if (hintsEnabled() && store.hint(); as h) {
+        <app-proactive-hint-card [hint]="h" (dismissed)="store.dismissHint()" />
+      }
 
       <div class="flow" #flow>
         @if (!store.hasNotes()) {
@@ -418,6 +427,14 @@ export class MeetingConversationComponent implements OnInit {
    * into the store so a note line appends to THIS meeting's `manual_notes`.
    */
   readonly meetingId = input<string | null>(null);
+
+  /**
+   * The `proactiveHintsEnabled` config flag (the record screen passes its config
+   * snapshot down). False ⇒ the recall card NEVER renders, even if an event
+   * slips through before the backend mute takes effect. Defaults true, matching
+   * the backend default.
+   */
+  readonly hintsEnabled = input<boolean>(true);
 
   /** The composer draft (signal-backed — zoneless). */
   protected readonly draft = signal("");

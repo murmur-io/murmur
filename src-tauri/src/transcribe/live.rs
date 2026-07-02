@@ -121,10 +121,30 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
     // so without this the same spoken wake re-fires every tick it stays visible. Lives across ticks.
     let mut wake_dedup = WakeDedup::default();
 
+    // PROACTIVE brain P1 state — FRESH per recording (its cooldown, session dedup, and scan
+    // offset must never leak across recordings). See `crate::proactive` for the D1-D4 contract.
+    let mut proactive = crate::proactive::ProactiveState::default();
+
     loop {
         std::thread::sleep(TICK);
         // Age out an expired wake-suppression window once per tick (before this tick's wake check).
         wake_dedup.tick();
+
+        // PROACTIVE HINTS (zero-egress): advance the per-recording throttle every tick; on every
+        // K-th tick — only while `proactive_hints_enabled` is ON — the deterministic matcher scans
+        // the NEW live-tail delta against the gated local substrates (entities / commitments /
+        // facts / FTS) and surfaces AT MOST one recall card. Fully local: no provider, no consent,
+        // no egress. Best-effort — it can never disrupt the caption or the recording.
+        if let Some(hint) = crate::proactive::scan_tick(&app, &mut proactive) {
+            // PII rule (§8): log the kind + score only — never the title or any content.
+            tracing::info!(
+                target: "proactive",
+                kind = %hint.kind,
+                score = hint.score,
+                "proactive hint emitted"
+            );
+            let _ = app.emit(crate::events::EVENT_PROACTIVE_HINT, hint);
+        }
 
         // Snapshot the recent tail; stop as soon as the recording is gone.
         let snapshot = {

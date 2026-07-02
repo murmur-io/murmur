@@ -12,6 +12,7 @@ pub mod facts;
 pub mod mcp;
 pub mod orchestrate;
 pub mod pipeline;
+pub mod proactive;
 pub mod reason;
 pub mod screenshare;
 pub mod secrets;
