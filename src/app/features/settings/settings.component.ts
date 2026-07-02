@@ -250,7 +250,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                     <span class="row">
                       <input
                         formControlName="whisperModelPath"
-                        placeholder="leave blank — auto-managed in Transcription model above"
+                        placeholder="leave blank — auto-managed by the model chosen in Settings → Transcription"
                       />
                       <button type="button" class="btn" (click)="pickModel()">
                         Browse…
@@ -498,14 +498,14 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
               </div>
             }
 
-            <!-- ── Notes: how Claude writes & files each meeting note ── -->
+            <!-- ── Notes: how the AI provider writes & files each meeting note ── -->
             @case ("notes") {
               <div class="card notes-card">
                 <div class="notes-copy">
                   <h3>Notes</h3>
                   <p class="text-secondary notes-sub">
-                    Shape how Claude writes each summary and where it lands in your
-                    vault.
+                    Shape how your AI provider writes each summary and where it lands
+                    in your vault.
                   </p>
                 </div>
 
@@ -565,8 +565,8 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   <span class="toggle-copy">
                     <span class="toggle-title">Organize into thematic subfolders</span>
                     <span class="text-secondary toggle-sub">
-                      Claude files each note into a topic subfolder of your vault (e.g.
-                      Standups, 1-1s, Acme Project).
+                      Your AI provider files each note into a topic subfolder of your
+                      vault (e.g. Standups, 1-1s, Acme Project).
                     </span>
                   </span>
                   <input type="checkbox" formControlName="autoOrganize" />
@@ -581,30 +581,32 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   <h3>Brain / AI</h3>
                   <p class="text-secondary brain-sub">
                     Powers grounded answers across your notes and the optional in-meeting
-                    voice assistant. Claude (cloud) is fastest for live use; local models
-                    keep everything on-device but are slower in real time.
+                    voice assistant. Your default AI is fastest for live use; a local
+                    model keeps assistant reasoning on-device but is slower in real time.
                   </p>
                 </div>
 
                 <label class="field">
                   <span class="field-label">Assistant backend</span>
                   <select formControlName="brainBackend">
-                    <option value="cloud">Claude (cloud) — recommended for live</option>
-                    <option value="local">Local model — fully on-device</option>
+                    <option value="cloud">My default AI — recommended for live</option>
+                    <option value="local">Local model — assistant reasoning on-device</option>
                     <option value="off">Off</option>
                   </select>
                   <span class="field-help text-muted">
                     @switch (form.controls.brainBackend.value) {
                       @case ("local") {
-                        Runs a local GGUF model on this Mac — private, but large models
-                        are slow for realtime. Pick a model below.
+                        Runs assistant reasoning and note pre-analysis on-device (pick a
+                        model below). Note summaries and Ask fallback still use your
+                        provider from General.
                       }
                       @case ("off") {
-                        The brain and the in-meeting voice assistant are disabled.
+                        Assistant answers become retrieval-only (no AI model). The
+                        in-meeting voice assistant toggle below stays independent.
                       }
                       @default {
-                        Sends your (redacted) text to Anthropic's cloud — lowest latency,
-                        best for the live voice assistant.
+                        Uses the provider selected in General (redacted before any cloud
+                        call) — lowest latency, best for the live voice assistant.
                       }
                     }
                   </span>
@@ -637,25 +639,27 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
 
                 <!--
                   Proactive cloud-egress consent (issue 20). The in-meeting assistant
-                  dispatches voice actions through the active provider. With a cloud
-                  provider (claude_code or anthropic, mirroring the backend is_cloud
-                  gate) it uploads mid-meeting context, and the dispatch is fail-closed
-                  behind cloud_egress_consented. Surface the requirement at enable time.
-                  Condition: realtime on, cloud provider, brain not off, not consented.
-                  Reuses the existing consent flow (allowCloudProcessing). In-flow
-                  warning, so the frosted banner is correct (no opaque overlay needed).
+                  dispatches voice actions through the active provider. With a
+                  cloud-classified provider (providerIsCloud mirrors the backend's
+                  egress_is_cloud: claude_code/anthropic/gateway, plus ollama on a
+                  non-loopback base URL) it uploads mid-meeting context, and the
+                  dispatch is fail-closed behind cloud_egress_consented. Surface the
+                  requirement at enable time. Condition: realtime on, cloud-classified
+                  provider, brain not off, not consented. Reuses the existing consent
+                  flow (allowCloudProcessing). In-flow warning, so the frosted banner
+                  is correct (no opaque overlay needed).
                 -->
                 @if (
                   form.controls.realtimeReactions.value &&
                   form.controls.brainBackend.value === "cloud" &&
-                  (form.controls.providerId.value === "claude_code" ||
-                    form.controls.providerId.value === "anthropic") &&
+                  providerIsCloud() &&
                   !cloudConsented()
                 ) {
                   <div class="banner is-warning realtime-consent">
                     <span class="realtime-consent-copy">
-                      ⚠ Asystent w spotkaniu wysyła kontekst do chmury — zezwól na
-                      przetwarzanie w chmurze, inaczej odpowiedzi na żywo nie zadziałają.
+                      ⚠ The in-meeting assistant sends live meeting context to your
+                      provider's cloud (redacted first). Allow cloud processing once,
+                      or live answers stay off.
                     </span>
                     <div class="cloud-consent-row">
                       <button
@@ -681,21 +685,42 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   </div>
                 }
 
-                <!-- Model + reasoning-effort overrides for the active cloud provider. -->
+                <!--
+                  Model + reasoning-effort overrides. providerModel steers ONLY the
+                  claude_code/anthropic arms (gateway/ollama read gateway_model /
+                  ollama_model instead), so the dropdown renders only for those two —
+                  for gateway/ollama we point at the provider card that actually holds
+                  the model. The hidden control keeps its value and round-trips on save.
+                -->
                 <div class="brain-tuning">
-                  <label class="field">
-                    <span class="field-label">Model</span>
-                    <select formControlName="providerModel">
-                      <option value="">Default (provider's pick)</option>
-                      <option value="claude-opus-4-8">Opus 4.8</option>
-                      <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-                      <option value="claude-haiku-4-5">Haiku 4.5</option>
-                    </select>
-                    <span class="field-help text-muted">
-                      Overrides the model used for grounded answers — leave on Default to
-                      let the provider choose.
-                    </span>
-                  </label>
+                  @switch (form.controls.providerId.value) {
+                    @case ("gateway") {
+                      <p class="brain-note text-muted">
+                        The model for AI Gateway is set in Settings → Providers → AI
+                        Gateway.
+                      </p>
+                    }
+                    @case ("ollama") {
+                      <p class="brain-note text-muted">
+                        The model for Ollama is set in Settings → Providers.
+                      </p>
+                    }
+                    @default {
+                      <label class="field">
+                        <span class="field-label">Default model</span>
+                        <select formControlName="providerModel">
+                          <option value="">Default (provider's pick)</option>
+                          <option value="claude-opus-4-8">Opus 4.8</option>
+                          <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                          <option value="claude-haiku-4-5">Haiku 4.5</option>
+                        </select>
+                        <span class="field-help text-muted">
+                          Used for everything Murmur writes with AI: meeting notes,
+                          answers, digests and briefs. Default lets the provider choose.
+                        </span>
+                      </label>
+                    }
+                  }
 
                   @if (form.controls.providerId.value === "anthropic") {
                     <label class="field">
@@ -731,7 +756,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
 
                     <p class="brain-note text-muted">
                       Big local models are slow for the realtime voice assistant —
-                      Claude (cloud) is recommended for live answers. Local is best for
+                      your default AI is recommended for live answers. Local is best for
                       private, non-time-critical analysis.
                     </p>
 
@@ -1405,15 +1430,17 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                     >Redaction firewall</span
                   >
                   <p class="text-secondary privacy-note">
-                    Emails, card numbers and phone numbers are automatically scrubbed
-                    before any text is sent to a cloud model — that's both the Anthropic
-                    API and Claude Code (the <code>claude</code> CLI uploads your
-                    transcript to Anthropic too), then restored in your notes. Only
-                    Ollama runs fully on-device and sends nothing to the cloud.
+                    Emails, card numbers and phone numbers are automatically
+                    scrubbed before any text leaves this Mac — that covers the Anthropic
+                    API, Claude Code (the <code>claude</code> CLI uploads your
+                    transcript to Anthropic too), an AI Gateway, and a remote Ollama
+                    server — then restored in your notes. Only Ollama running on this
+                    Mac keeps everything on-device.
                   </p>
                   <p class="text-secondary privacy-note">
-                    Heads up: names are <strong>not</strong> redacted — the firewall is
-                    regex-only (emails, cards, phone numbers), so people's names can
+                    Names: the pattern firewall alone does not catch them, but an
+                    on-device name-redaction layer additionally masks people's names
+                    when its local model is present. Without that model, names can
                     leave your device alongside the transcript when you use a cloud
                     provider.
                   </p>
@@ -1423,10 +1450,11 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                 <div class="privacy-section">
                   <span class="privacy-section-label text-muted">Cloud processing</span>
                   <p class="text-secondary privacy-note">
-                    Claude Code and the Anthropic API send your (redacted) transcript to
-                    Anthropic's cloud to write each summary — your data leaves this Mac.
-                    Ollama stays fully on-device. Until you allow this once, cloud
-                    summaries are turned off and won't run.
+                    Cloud providers — Claude Code, the Anthropic API, an AI Gateway, or
+                    a remote Ollama server — send your (redacted) transcript off this
+                    Mac to write each summary. Only Ollama running on this Mac stays
+                    fully on-device. Until you allow this once, cloud summaries are
+                    turned off and won't run.
                   </p>
                   @if (cloudConsented()) {
                     <span class="pill is-success cloud-consent-pill">
@@ -1449,7 +1477,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                         }
                       </button>
                       <span class="text-muted cloud-consent-hint">
-                        One-time. You can keep using Ollama with no cloud at all.
+                        One-time. You can keep using a local Ollama with no cloud at all.
                       </span>
                     </div>
                   }
@@ -3123,6 +3151,48 @@ export class SettingsComponent implements OnInit {
     } catch {
       return null;
     }
+  });
+
+  /**
+   * Live signals of the providerId / ollamaBaseUrl form controls — same
+   * `valueChanges` bridge as `_gatewayBaseUrlValue` above, seeded with the
+   * form defaults so `providerIsCloud` is correct before the config loads.
+   */
+  private readonly _providerIdValue = toSignal(
+    this.form.controls.providerId.valueChanges.pipe(startWith("claude_code")),
+    { initialValue: "claude_code" },
+  );
+  private readonly _ollamaBaseUrlValue = toSignal(
+    this.form.controls.ollamaBaseUrl.valueChanges.pipe(
+      startWith("http://localhost:11434"),
+    ),
+    { initialValue: "http://localhost:11434" },
+  );
+
+  /**
+   * FE mirror of the backend's egress classification (`egress_is_cloud`,
+   * summarize/mod.rs): claude_code / anthropic / gateway always send content
+   * off-device (gateway even on loopback — it can forward to the cloud);
+   * ollama is local ONLY when its base URL host is loopback; anything
+   * unknown or unparseable fails safe as cloud. Reuse this wherever the FE
+   * decides "is this cloud" so the two classifications can't diverge.
+   */
+  readonly providerIsCloud = computed(() => {
+    const id = this._providerIdValue();
+    if (id === "ollama") {
+      try {
+        const host = new URL(this._ollamaBaseUrlValue()).hostname;
+        return !(
+          host === "localhost" ||
+          host === "127.0.0.1" ||
+          host === "[::1]" ||
+          host === "::1"
+        );
+      } catch {
+        return true; // unparseable → fail safe (treat as cloud)
+      }
+    }
+    return true; // claude_code | anthropic | gateway | any future id
   });
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
