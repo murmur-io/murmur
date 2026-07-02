@@ -50,6 +50,8 @@ import type {
   ChatMsg,
   ProactiveHintPayload,
   WakeDetectedPayload,
+  UpdateInfo,
+  AppInfo,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -801,6 +803,27 @@ export class IpcService {
   /** Permanently remove a folder's lock: decrypt to plaintext + re-export to the vault. */
   removeLock(folderId: string): Promise<void> {
     return invoke<void>("remove_lock", { folderId });
+  }
+
+  // ── Update check + product info (GitHub-release update flow) ────────────
+
+  /**
+   * Check GitHub for a newer release. Resolves with an {@link UpdateInfo}; the
+   * command REJECTS on network failure / rate-limit, so a thrown error means
+   * "couldn't check" (never treat it as "up to date").
+   */
+  checkForUpdate(): Promise<UpdateInfo> {
+    return invoke<UpdateInfo>("check_for_update");
+  }
+
+  /** Static product identity (name / version / description / repository) for About. */
+  appInfo(): Promise<AppInfo> {
+    return invoke<AppInfo>("app_info");
+  }
+
+  /** Open a GitHub release page in the user's default browser. */
+  openReleasePage(url: string): Promise<void> {
+    return invoke<void>("open_release_page", { url });
   }
 
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {

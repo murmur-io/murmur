@@ -6,11 +6,24 @@ import {
   signal,
 } from "@angular/core";
 
+/**
+ * An optional inline action button on a toast (rendered before the ✕ close).
+ * `run` fires on click; the host then dismisses the toast. A toast carrying an
+ * action is typically sticky (`ttlMs: 0`) so it doesn't vanish before the user
+ * can act — but that is the caller's choice, not enforced here.
+ */
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 /** A single live toast. `kind` tints the strip; `id` keys the @for + dismissal. */
 export interface Toast {
   id: number;
   message: string;
   kind: "info" | "success" | "danger";
+  /** Optional inline action button (e.g. "Download"); absent = message-only. */
+  action?: ToastAction;
 }
 
 /** How long a toast lingers before it auto-dismisses (ms). */
@@ -52,14 +65,18 @@ export class ToastService {
     });
   }
 
-  /** Push a toast; returns its id. Auto-dismisses after `ttlMs` (0 = sticky). */
+  /**
+   * Push a toast; returns its id. Auto-dismisses after `ttlMs` (0 = sticky).
+   * Pass `action` to render an inline action button (usually with `ttlMs: 0`).
+   */
   push(
     message: string,
     kind: Toast["kind"] = "info",
     ttlMs: number = DEFAULT_TTL_MS,
+    action?: ToastAction,
   ): number {
     const id = this.nextId++;
-    this._toasts.update((list) => [...list, { id, message, kind }]);
+    this._toasts.update((list) => [...list, { id, message, kind, action }]);
     if (ttlMs > 0) {
       const handle = setTimeout(() => this.dismiss(id), ttlMs);
       this.timers.set(id, handle);
