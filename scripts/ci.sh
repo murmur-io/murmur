@@ -14,6 +14,14 @@ cd "$REPO"
 # below fail at link time. Safe to always set (it only changes WHEN shaders compile, not whether).
 export MISTRALRS_METAL_PRECOMPILE=0
 
+# ── .claude guardrail hooks: self-test (fast, first). Proves the deterministic guardrails still
+#    BLOCK what they must (trunk push, security CLI, clippy --all-targets, codesign --deep, staged
+#    secrets). This is the meta-test that stops a guardrail from silently going phantom. ──
+if [ -x .claude/hooks/selftest.sh ]; then
+  echo "── .claude guardrail hooks: self-test ──"
+  bash .claude/hooks/selftest.sh
+fi
+
 echo "── swiftc: system-audio sidecar typecheck ──"
 if command -v swiftc >/dev/null 2>&1; then
   swiftc -typecheck src-tauri/sysaudio/sysaudio.swift \
