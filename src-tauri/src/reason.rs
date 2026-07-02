@@ -275,6 +275,10 @@ pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
 /// The LIVE reasoner dispatch held in `AppState` — resolves which brain handles each call from the
 /// CURRENT config, not a startup snapshot.
 ///
+/// The LOCAL-reasoner cache slot: the resolved GGUF path it was built from (`None` = nothing
+/// resolved ⇒ the stub) paired with the loaded instance. Factored out per clippy::type_complexity.
+type CachedLocalReasoner = Option<(Option<PathBuf>, Arc<dyn LocalReasoner>)>;
+
 /// `AppState.reasoner` used to be a `Box<dyn LocalReasoner>` resolved ONCE at startup, which made
 /// consent grants, consent revocations, provider switches, and `brain_backend` flips require an app
 /// restart (and kept a REVOKED consent egressing — the privacy-critical direction). `ReasonerCell`
@@ -296,7 +300,7 @@ pub struct ReasonerCell {
     /// the stub). The loaded model is expensive, so the instance is reused across calls and rebuilt
     /// only when the resolved path changes — which also means a model downloaded or selected
     /// mid-session activates on the next call.
-    local: Mutex<Option<(Option<PathBuf>, Arc<dyn LocalReasoner>)>>,
+    local: Mutex<CachedLocalReasoner>,
     /// TEST-ONLY pinned reasoner (mirrors `CloudReasoner::provider_override`): `Some` makes
     /// `current()` always return this instance, so command tests keep a deterministic stub.
     /// `None` in every production path (the only non-test constructor is [`new`]).
