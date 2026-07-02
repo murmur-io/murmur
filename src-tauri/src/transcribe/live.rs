@@ -401,8 +401,11 @@ pub fn run_assistant_query(
     // Resolve an intent for the FLOOR only (its read fan-out + surfaced kind) — it NO LONGER routes
     // writes. The agentic loop (with writes) is the single executive path; the agent DECIDES.
     // The reasoner is re-resolved for THIS turn (never a startup snapshot), so a consent /
-    // provider / backend change since the last turn is already in effect.
-    let reasoner = state.reasoner.current();
+    // provider / backend change since the last turn is already in effect. LIVE role — the whole
+    // in-meeting assistant (wake/voice turns AND typed @brain threads funnel through this core).
+    let reasoner = state
+        .reasoner
+        .current_for(crate::summarize::roles::Role::Live);
     let intent = resolve_command_intent(&*reasoner, command);
     let result = run_informational(
         app,
@@ -456,14 +459,20 @@ fn run_informational(
     tool_event: &'static str,
     thread_id: &str,
 ) -> crate::voice_action::VoiceActionResult {
-    // The agentic loop runs only on the CLOUD brain — local-GGUF multi-step tool-call reliability is
-    // unproven (Q4 + the Bielik 32K-overflow lesson), so the local + stub backends use the
-    // deterministic floor: honest, fast, and a strict no-regression vs today.
+    // The agentic loop runs only on CLOUD-connection targets — local-GGUF multi-step tool-call
+    // reliability is unproven (Q4 + the Bielik 32K-overflow lesson), so the local + stub targets
+    // use the deterministic floor: honest, fast, and a strict no-regression vs today.
     // Resolve the reasoner for THIS request from the LIVE config — a consent/provider/backend
     // change since the branch snapshot above dispatches correctly on the next turn either way
     // (the consent gate itself re-checks fresh config on every provider call inside).
-    let reasoner = state.reasoner.current();
-    if config.brain_backend == crate::settings::BrainBackend::Cloud {
+    // The eligibility gate keys on the LIVE role's resolved target: with role keys absent,
+    // `!is_reasoner_only()` is EXACTLY the legacy `brain_backend == Cloud` predicate.
+    let reasoner = state
+        .reasoner
+        .current_for(crate::summarize::roles::Role::Live);
+    if !crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config)
+        .is_reasoner_only()
+    {
         let executor = crate::tools::GatedToolExecutor {
             db: &state.db,
             // The LIVE set behind its Mutex — re-read per tool call (C6), so a mid-loop relock is gated

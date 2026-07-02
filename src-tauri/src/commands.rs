@@ -177,6 +177,36 @@ pub struct AppConfigDto {
     /// `AppConfig::default` — an older FE payload must not silently flip the backend mute.
     #[serde(default = "default_true")]
     pub proactive_hints_enabled: bool,
+    /// Model-role override — the connection serving the NOTES role (see
+    /// `crate::summarize::roles`). Settable from the DTO (a future Settings UI owns the rows).
+    /// `""` (and an omitted key, `#[serde(default)]`) = inherit the legacy mapping — so an older
+    /// FE payload can never flip a role.
+    #[serde(default)]
+    pub role_notes_connection: String,
+    /// Model-role override — the model for the Notes role (`""` = connection default).
+    #[serde(default)]
+    pub role_notes_model: String,
+    /// Model-role override — the effort for the Notes role (`""` = provider default).
+    #[serde(default)]
+    pub role_notes_effort: String,
+    /// Model-role override — the connection serving the ASK role. Same semantics as the Notes keys.
+    #[serde(default)]
+    pub role_ask_connection: String,
+    /// Model-role override — the model for the Ask role.
+    #[serde(default)]
+    pub role_ask_model: String,
+    /// Model-role override — the effort for the Ask role.
+    #[serde(default)]
+    pub role_ask_effort: String,
+    /// Model-role override — the connection serving the LIVE role. Same semantics as the Notes keys.
+    #[serde(default)]
+    pub role_live_connection: String,
+    /// Model-role override — the model for the Live role.
+    #[serde(default)]
+    pub role_live_model: String,
+    /// Model-role override — the effort for the Live role.
+    #[serde(default)]
+    pub role_live_effort: String,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -1244,7 +1274,9 @@ pub async fn chat_meeting(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
+    // default provider as before (the legacy chat path always ignored `brain_backend`).
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Ask, &config)?;
     let (system, user) = crate::summarize::chat::build(&transcript, &history, &question);
     provider.complete(&system, &user).await
 }
@@ -1487,7 +1519,7 @@ pub async fn run_recipe(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
     let (system, user) = crate::summarize::recipes::build_recipe_prompt(
         &transcript,
         &prompt,
@@ -1772,7 +1804,7 @@ pub async fn build_and_persist_entities(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
     let payload =
         crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
 
@@ -1854,7 +1886,7 @@ fn persist_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner
     //    is re-resolved from the LIVE config, so a consent/backend change applies without restart.
     let candidates = crate::facts::extract_fact_candidates(
-        &*state.reasoner.current(),
+        &*state.reasoner.current_for(crate::summarize::roles::Role::Notes),
         title,
         markdown,
         entity_refs,
@@ -1966,10 +1998,15 @@ pub async fn ask_vault(
     // cloud egress on BOTH paths. The LATEST question still drives retrieval either way.
     let history: Vec<ChatTurn> = capped_ask_history(&history).to_vec();
 
-    // Agentic path — CLOUD backend only (the same rule as the in-meeting brain: local-GGUF
-    // multi-step tool-call reliability is unproven). The loop is blocking (scoped-thread
-    // connectors), so it runs on a blocking thread like `ask_assistant_chat`.
-    if config.brain_backend == BrainBackend::Cloud {
+    // Agentic path — CLOUD-connection roles only (the same rule as the in-meeting brain:
+    // local-GGUF multi-step tool-call reliability is unproven). The eligibility gate keys on the
+    // ASK role's resolved target: with role keys absent, `!is_reasoner_only()` is EXACTLY the
+    // legacy `brain_backend == Cloud` predicate (Cloud → provider connection, Local → "local",
+    // Off → "off"). The loop is blocking (scoped-thread connectors), so it runs on a blocking
+    // thread like `ask_assistant_chat`.
+    if !crate::summarize::roles::resolve(crate::summarize::roles::Role::Ask, &config)
+        .is_reasoner_only()
+    {
         let thread_id = crate::transcribe::live::ensure_thread_id(ask_thread_id);
         let handle = app.clone();
         let q = question.clone();
@@ -2019,7 +2056,8 @@ fn ask_vault_agentic_attempt(
         Err(_) => return None, // poisoned config ⇒ floor (which will surface its own error)
     };
     // Re-resolved per turn (never a startup snapshot): consent/provider/backend changes apply.
-    let reasoner = state.reasoner.current();
+    // ASK role — under the legacy fallback this dispatches exactly like the pre-role `current()`.
+    let reasoner = state.reasoner.current_for(crate::summarize::roles::Role::Ask);
     // VAULT-SCOPED executor: no live meeting, READ-ONLY, and NO note drafts (the Ask page has no
     // notes flow / Accept affordance, so `propose_note` is not advertised on this surface). The
     // AppHandle is present so web_search / calendar_lookup participate under their existing
@@ -2146,6 +2184,12 @@ fn build_ask_vault_floor_prompt(
     // is empty, this falls back to the existing FTS-only path UNCHANGED (the hybrid query
     // degenerates to FTS when no vectors exist; the flag-off branch is byte-for-byte the prior
     // behavior).
+    // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
+    // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
+    // floor always ignored `brain_backend`), so the packed corpus is byte-identical.
+    let ask_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
+            .connection;
     let (corpus, sources) = if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
@@ -2157,7 +2201,7 @@ fn build_ask_vault_floor_prompt(
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
             db,
             question,
-            &config.provider_id,
+            &ask_conn,
             &query_vec,
             unlocked,
         )?
@@ -2165,7 +2209,7 @@ fn build_ask_vault_floor_prompt(
         crate::summarize::vault_context::build_vault_context_visible(
             db,
             question,
-            &config.provider_id,
+            &ask_conn,
             unlocked,
         )?
     };
@@ -2195,7 +2239,10 @@ async fn ask_vault_floor(
     match build_ask_vault_floor_prompt(db, config, unlocked, question, history)? {
         AskFloorPrompt::Empty(result) => Ok(result),
         AskFloorPrompt::Ready { system, user, sources } => {
-            let provider = crate::summarize::make_provider(&config.provider_id, config)?;
+            // ASK role. With role keys absent this builds the legacy default provider for EVERY
+            // brain_backend (the pre-role floor ignored it) — original error/consent semantics.
+            let provider =
+                crate::summarize::provider_for(crate::summarize::roles::Role::Ask, config)?;
             let answer = provider.complete(&system, &user).await?;
             Ok(AskVaultResult { answer, sources, citations: Vec::new() })
         }
@@ -2633,11 +2680,15 @@ pub async fn entity_dossier(
         .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching \"{entity}\"")))?;
     let data = crate::summarize::dossier::build_dossier_data(&state.db, &entity_id, &unlocked)?
         .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching \"{entity}\"")))?;
-    // Build the provider (firewall + consent gate) BEFORE synthesizing — make_provider refuses a
-    // cloud provider until the user has consented to egress.
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    // Build the provider (firewall + consent gate) BEFORE synthesizing — the factory refuses a
+    // cloud provider until the user has consented to egress. NOTES role (the dossier is a
+    // written synthesis); the corpus budget keys on the same resolved connection.
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let notes_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
+            .connection;
     let system = crate::summarize::dossier::dossier_system_prompt(&config.note_language);
-    let user = crate::summarize::dossier::render_dossier_user(&data, &config.provider_id);
+    let user = crate::summarize::dossier::render_dossier_user(&data, &notes_conn);
     provider.complete(&system, &user).await
 }
 
@@ -2657,11 +2708,12 @@ pub async fn generate_digest(
             .clone()
     };
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-    let budget = if config.provider_id == "ollama" {
-        4_000
-    } else {
-        80_000
-    };
+    // Budget on the NOTES-role provider's RESOLVED connection — the corpus egresses to it
+    // (identical to `provider_id` while role keys are absent).
+    let notes_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
+            .connection;
+    let budget = if notes_conn == "ollama" { 4_000 } else { 80_000 };
     // Finding 2 + BLK-2b: build the cloud corpus from VISIBLE meetings + VISIBLE notes only, so a
     // sealed-and-not-unlocked meeting's TITLE (the `### [[title]]` header) AND markdown never leave
     // the device. `list_meetings_visible` + `get_note_if_visible` push the session unlock set
@@ -2696,7 +2748,7 @@ pub async fn generate_digest(
         )));
     }
     let range_label = format!("the last {days} days");
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
     let (system, user) =
         crate::summarize::digest::build_digest_prompt(&corpus, &range_label, &config.note_language);
     let markdown = provider.complete(&system, &user).await?;
@@ -2845,13 +2897,18 @@ pub async fn pre_meeting_brief(
     // Pass the LIVE session unlock set (E9), same as ask_vault: session-unlocked folders included,
     // sealed-and-not-unlocked excluded.
     let unlocked = unlocked_snapshot(state.inner())?;
+    // NOTES role (a written brief); the corpus budget keys on the same resolved connection the
+    // corpus egresses to (identical to `provider_id` while role keys are absent).
+    let notes_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
+            .connection;
     let (corpus, sources) = crate::summarize::vault_context::build_vault_context_visible(
         &state.db,
         &subject,
-        &config.provider_id,
+        &notes_conn,
         &unlocked,
     )?;
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
     let (system, user) =
         crate::summarize::brief::build_brief_prompt(&corpus, &subject, &config.note_language);
     let markdown = provider.complete(&system, &user).await?;
@@ -3050,6 +3107,15 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
         proactive_hints_enabled: c.proactive_hints_enabled,
+        role_notes_connection: c.role_notes_connection.clone(),
+        role_notes_model: c.role_notes_model.clone(),
+        role_notes_effort: c.role_notes_effort.clone(),
+        role_ask_connection: c.role_ask_connection.clone(),
+        role_ask_model: c.role_ask_model.clone(),
+        role_ask_effort: c.role_ask_effort.clone(),
+        role_live_connection: c.role_live_connection.clone(),
+        role_live_model: c.role_live_model.clone(),
+        role_live_effort: c.role_live_effort.clone(),
     }
 }
 
@@ -3151,6 +3217,18 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default —
         // the backend mute is an explicit user choice, never a partial-save side effect.
         proactive_hints_enabled: d.proactive_hints_enabled,
+        // Model-role keys ARE settable from the DTO (a future Settings UI owns the rows), like
+        // `gateway_model` — plain strings, `""` = inherit legacy. An omitted key deserializes to
+        // `""` (`#[serde(default)]`), so an older FE payload can never flip a role.
+        role_notes_connection: d.role_notes_connection,
+        role_notes_model: d.role_notes_model,
+        role_notes_effort: d.role_notes_effort,
+        role_ask_connection: d.role_ask_connection,
+        role_ask_model: d.role_ask_model,
+        role_ask_effort: d.role_ask_effort,
+        role_live_connection: d.role_live_connection,
+        role_live_model: d.role_live_model,
+        role_live_effort: d.role_live_effort,
     }
 }
 
@@ -3584,7 +3662,7 @@ pub async fn get_timeline(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         c.clone()
     };
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
     let timeline =
         crate::summarize::timeline::generate(provider.as_ref(), &segments, duration_s).await?;
     if let Ok(json) = serde_json::to_string(&timeline) {
@@ -7544,6 +7622,68 @@ mod lifecycle_tests {
         let merged2 = dto_to_config(dto_clear, &current2);
         assert_eq!(merged2.provider_model, "");
         assert_eq!(merged2.provider_effort, "");
+    }
+
+    /// Model roles: the 9 role keys round-trip through the settings DTO BOTH ways (settable, like
+    /// `gateway_model` — NOT preserve-only), and an OLDER FE payload that omits them entirely
+    /// deserializes to `""` (inherit-legacy) — a partial save can never flip a role.
+    #[test]
+    fn dto_round_trips_role_keys_and_omitted_keys_default_empty() {
+        // OUT: config_to_dto carries the live values.
+        let cfg = AppConfig {
+            role_notes_connection: "anthropic".to_string(),
+            role_notes_model: "claude-opus-4-8".to_string(),
+            role_notes_effort: "high".to_string(),
+            role_ask_connection: "ollama".to_string(),
+            role_ask_model: "mistral-small".to_string(),
+            role_live_connection: "off".to_string(),
+            ..AppConfig::default()
+        };
+        let dto = config_to_dto(&cfg);
+        assert_eq!(dto.role_notes_connection, "anthropic");
+        assert_eq!(dto.role_notes_model, "claude-opus-4-8");
+        assert_eq!(dto.role_notes_effort, "high");
+        assert_eq!(dto.role_ask_connection, "ollama");
+        assert_eq!(dto.role_ask_model, "mistral-small");
+        assert_eq!(dto.role_ask_effort, "");
+        assert_eq!(dto.role_live_connection, "off");
+
+        // IN: dto_to_config takes them from the DTO (start from a DIFFERENT current to prove the
+        // value comes from the DTO, not preservation) — including clearing back to "".
+        let current = AppConfig {
+            role_notes_connection: "gateway".to_string(),
+            role_ask_connection: "claude_code".to_string(),
+            role_live_connection: "local".to_string(),
+            role_live_model: "bielik-11b-v3".to_string(),
+            ..AppConfig::default()
+        };
+        let merged = dto_to_config(dto, &current);
+        assert_eq!(merged.role_notes_connection, "anthropic");
+        assert_eq!(merged.role_ask_connection, "ollama");
+        assert_eq!(merged.role_live_connection, "off");
+        assert_eq!(merged.role_live_model, "", "a \"\" role key from the DTO clears the override");
+
+        // An older FE payload OMITTING the role keys deserializes them to "" (#[serde(default)]).
+        let json = serde_json::to_string(&config_to_dto(&AppConfig::default())).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for k in [
+            "roleNotesConnection",
+            "roleNotesModel",
+            "roleNotesEffort",
+            "roleAskConnection",
+            "roleAskModel",
+            "roleAskEffort",
+            "roleLiveConnection",
+            "roleLiveModel",
+            "roleLiveEffort",
+        ] {
+            assert!(obj.remove(k).is_some(), "DTO must serialize {k}");
+        }
+        let dto_old: AppConfigDto = serde_json::from_value(v).unwrap();
+        assert_eq!(dto_old.role_notes_connection, "");
+        assert_eq!(dto_old.role_ask_connection, "");
+        assert_eq!(dto_old.role_live_connection, "");
     }
 
     /// Phase H graceful degradation: a DTO carrying an UNKNOWN `brain_model_id` must NOT be stored —
