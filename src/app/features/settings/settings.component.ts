@@ -616,6 +616,19 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   <input type="checkbox" formControlName="realtimeReactions" />
                 </label>
 
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Proactive brain hints</span>
+                    <span class="text-secondary toggle-sub">
+                      While recording, surface a dismissible recall card when the
+                      conversation touches a past meeting, an open commitment, or a
+                      known fact. 100% on-device — no cloud calls; at most one card
+                      every two minutes.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="proactiveHintsEnabled" />
+                </label>
+
                 <!--
                   Proactive cloud-egress consent (issue 20). The in-meeting assistant
                   dispatches voice actions through the active provider. With a cloud
@@ -2768,6 +2781,8 @@ export class SettingsComponent implements OnInit {
     // Phase H — brain / in-meeting voice assistant.
     brainBackend: "cloud" as BrainBackend,
     realtimeReactions: false,
+    // Proactive brain (P2) — zero-egress recall cards while recording; default ON.
+    proactiveHintsEnabled: true,
     /** Custom GGUF model path (or registry id). Empty → null on save. */
     brainModelId: "",
     // brain2 RAG — semantic-search master flag (round-tripped on save).
@@ -3059,6 +3074,7 @@ export class SettingsComponent implements OnInit {
         noteLanguage: cfg.noteLanguage ?? "auto",
         brainBackend: cfg.brainBackend ?? "cloud",
         realtimeReactions: cfg.realtimeReactions ?? false,
+        proactiveHintsEnabled: cfg.proactiveHintsEnabled ?? true,
         brainModelId: cfg.brainModelId ?? "",
         semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
         webSearchEnabled: cfg.webSearchEnabled ?? false,
@@ -3291,6 +3307,8 @@ export class SettingsComponent implements OnInit {
       // Phase H — brain / in-meeting voice assistant.
       brainBackend: v.brainBackend,
       realtimeReactions: v.realtimeReactions,
+      // Proactive brain hints — round-tripped so a save preserves the mute.
+      proactiveHintsEnabled: v.proactiveHintsEnabled,
       brainModelId: v.brainModelId || null,
       // brain2 RAG — semantic-search master flag (round-tripped so a save preserves it).
       semanticSearchEnabled: v.semanticSearchEnabled,
