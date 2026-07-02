@@ -1935,11 +1935,22 @@ pub fn get_entity_detail(
 }
 
 /// Ask-My-Vault: answer a question across ALL past meetings' notes (grounded, with sources).
+///
+/// PR G (ask-unify): on the CLOUD brain backend this routes through the SAME model-driven agentic
+/// loop as the in-meeting assistant — a VAULT-SCOPED gated executor (no meeting, read-only, NO
+/// `propose_note`; web/calendar participate under their existing consent/availability gates) with
+/// the live tool-trace on `EVENT_ASK_TOOL`. On the local/off backend, loop non-convergence, or ANY
+/// loop error (incl. `Unavailable` = no cloud consent) it falls through to THE FLOOR
+/// ([`ask_vault_floor`]) — exactly the pre-agentic corpus-pack + one-completion path with its
+/// original error/consent semantics. `ask_thread_id` (FE camelCase `askThreadId`) is the OPTIONAL
+/// thread identity stamped on every trace chip; absent ⇒ backend-generated (UUID v4).
 #[tauri::command]
 pub async fn ask_vault(
+    app: AppHandle,
     state: State<'_, AppState>,
     question: String,
     history: Vec<ChatTurn>,
+    ask_thread_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -1951,48 +1962,645 @@ pub async fn ask_vault(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
+    // The same 12-message discipline as the chat panel (CHAT_CONTEXT_TURNS): bounds prompt growth +
+    // cloud egress on BOTH paths. The LATEST question still drives retrieval either way.
+    let history: Vec<ChatTurn> = capped_ask_history(&history).to_vec();
+
+    // Agentic path — CLOUD backend only (the same rule as the in-meeting brain: local-GGUF
+    // multi-step tool-call reliability is unproven). The loop is blocking (scoped-thread
+    // connectors), so it runs on a blocking thread like `ask_assistant_chat`.
+    if config.brain_backend == BrainBackend::Cloud {
+        let thread_id = crate::transcribe::live::ensure_thread_id(ask_thread_id);
+        let handle = app.clone();
+        let q = question.clone();
+        let h = history.clone();
+        let attempt = tokio::task::spawn_blocking(move || {
+            ask_vault_agentic_attempt(&handle, &q, &h, &thread_id)
+        })
+        .await
+        .map_err(|e| AppError::Other(anyhow::anyhow!("ask task join failed: {e}")))?;
+        if let Some(result) = attempt {
+            return Ok(result);
+        }
+    }
+
+    // THE FLOOR — the pre-agentic behavior, unchanged (RED-first equivalence-tested).
     // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
     // again, while sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
     let unlocked = unlocked_snapshot(state.inner())?;
-    // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪ vector
-    // KNN, RRF-fused) — embedding the query with the active embedder — then pack with the SAME
-    // budget/citation logic and the SAME visibility gate. When OFF (the default) OR the index is
-    // empty, this falls back to the existing FTS-only path UNCHANGED (the hybrid query degenerates to
-    // FTS when no vectors exist, and the flag-off branch is byte-for-byte the prior behavior).
+    ask_vault_floor(&state.db, &config, &unlocked, &question, &history).await
+}
+
+/// Max agentic rounds for the Ask surface. Not live-latency-bound like the in-meeting loop
+/// (`CLOUD_MAX_STEPS` = 4), so it gets a little more room to search + read before answering —
+/// still strictly bounded.
+const ASK_MAX_STEPS: usize = 6;
+
+/// Cap the incoming Ask history to the last [`CHAT_CONTEXT_TURNS`] turns — the same discipline as
+/// the in-meeting chat panel, closing the unbounded-prompt-growth gap the pre-agentic `ask_vault`
+/// had (it rendered the whole history uncapped).
+fn capped_ask_history(history: &[ChatTurn]) -> &[ChatTurn] {
+    let start = history.len().saturating_sub(CHAT_CONTEXT_TURNS);
+    &history[start..]
+}
+
+/// Run the vault-scoped agentic attempt for [`ask_vault`]. Returns `Some(result)` ONLY when the
+/// loop CONVERGED; `None` on non-convergence or ANY loop error — incl. `Unavailable` (no cloud
+/// consent) — so the caller floors to the pre-agentic path with its original semantics.
+fn ask_vault_agentic_attempt(
+    app: &AppHandle,
+    question: &str,
+    history: &[ChatTurn],
+    thread_id: &str,
+) -> Option<AskVaultResult> {
+    let state = app.state::<AppState>();
+    let config = match state.config.lock() {
+        Ok(c) => c.clone(),
+        Err(_) => return None, // poisoned config ⇒ floor (which will surface its own error)
+    };
+    // Re-resolved per turn (never a startup snapshot): consent/provider/backend changes apply.
+    let reasoner = state.reasoner.current();
+    // VAULT-SCOPED executor: no live meeting, READ-ONLY, and NO note drafts (the Ask page has no
+    // notes flow / Accept affordance, so `propose_note` is not advertised on this surface). The
+    // AppHandle is present so web_search / calendar_lookup participate under their existing
+    // consent/availability gates. Every read re-checks the LIVE unlocked set per call (C6).
+    let executor = crate::tools::GatedToolExecutor {
+        db: &state.db,
+        unlocked: &state.unlocked_folders,
+        config: &config,
+        meeting_id: "",
+        app: Some(app),
+        allow_writes: false,
+        note_drafts: false,
+        proposed_note: std::sync::Mutex::new(None),
+    };
+    let sink = crate::transcribe::live::ToolEventSink {
+        app: app.clone(),
+        event: crate::events::EVENT_ASK_TOOL,
+        thread_id: thread_id.to_string(),
+    };
+    match ask_vault_loop(
+        &*reasoner,
+        &executor,
+        &state.db,
+        &state.unlocked_folders,
+        question,
+        history,
+        Some(&sink as &dyn crate::agent::DeltaSink),
+    ) {
+        Ok(converged) => converged,
+        Err(e) => {
+            // PII rule: the error only — never the question/history text.
+            tracing::debug!(
+                target: "ask",
+                error = %e,
+                "ask agentic loop unavailable/failed; flooring to corpus completion"
+            );
+            None
+        }
+    }
+}
+
+/// The testable core of the agentic Ask path: drive [`crate::agent::run_agentic_loop`] with the
+/// vault-QA persona over the rendered conversation, then map a converged outcome onto the Ask DTO.
+/// `Ok(None)` = non-convergence (caller floors); `Err` propagates (caller floors) — the loop
+/// contract of `run_informational`, applied to the Ask surface.
+fn ask_vault_loop(
+    reasoner: &dyn crate::reason::LocalReasoner,
+    executor: &dyn crate::agent::ToolExecutor,
+    db: &crate::storage::Db,
+    unlocked: &std::sync::Mutex<std::collections::HashSet<String>>,
+    question: &str,
+    history: &[ChatTurn],
+    sink: Option<&dyn crate::agent::DeltaSink>,
+) -> Result<Option<AskVaultResult>, AppError> {
+    let system = crate::summarize::vault_chat::agentic_system();
+    let user = crate::summarize::vault_chat::render_conversation(history, question);
+    let Some(outcome) =
+        crate::agent::run_agentic_loop(reasoner, &system, &user, executor, ASK_MAX_STEPS, sink)?
+    else {
+        return Ok(None);
+    };
+    // Resolve sources against the LIVE unlocked set (fail-closed on a poisoned lock: no source
+    // chips rather than an ungated resolution).
+    let unlocked_now = unlocked.lock().map(|g| g.clone()).unwrap_or_default();
+    Ok(Some(agent_outcome_to_ask_result(db, &unlocked_now, outcome)))
+}
+
+/// Map a converged [`crate::agent::AgentOutcome`] onto the Ask DTO. `citations` carries the loop's
+/// gated citation strings verbatim (`[[Title]]` / `(web) …`); `sources` additionally resolves each
+/// `[[Title]]` to its VISIBLE meeting (id + date) so the existing source chips keep working. A
+/// title that doesn't resolve to a visible meeting simply contributes no source — never an error,
+/// never an ungated read (`meeting_by_title_visible` applies the same visibility predicate as
+/// every gated reader).
+fn agent_outcome_to_ask_result(
+    db: &crate::storage::Db,
+    unlocked: &std::collections::HashSet<String>,
+    outcome: crate::agent::AgentOutcome,
+) -> AskVaultResult {
+    let mut sources: Vec<crate::storage::models::VaultSource> = Vec::new();
+    for cite in &outcome.citations {
+        let Some(title) = cite.strip_prefix("[[").and_then(|c| c.strip_suffix("]]")) else {
+            continue; // "(web) …" / "(calendar) …" attributions have no meeting to resolve.
+        };
+        match db.meeting_by_title_visible(title, unlocked) {
+            Ok(Some(m)) if !sources.iter().any(|s| s.meeting_id == m.id) => {
+                sources.push(crate::storage::models::VaultSource {
+                    meeting_id: m.id,
+                    title: m.title.unwrap_or_else(|| title.to_string()),
+                    started_at: m.started_at,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(target: "ask", error = %e, "citation source resolution failed")
+            }
+        }
+    }
+    AskVaultResult { answer: outcome.answer, sources, citations: outcome.citations }
+}
+
+/// The floor's prompt assembly, split from the provider call so the floor-equivalence test can
+/// prove it byte-identical to the pre-agentic implementation without a live provider.
+enum AskFloorPrompt {
+    /// Nothing to search — the canned early-return result (identical to the pre-change string).
+    Empty(AskVaultResult),
+    /// The assembled corpus prompt, ready for ONE provider completion.
+    Ready { system: String, user: String, sources: Vec<crate::storage::models::VaultSource> },
+}
+
+/// Everything the pre-agentic `ask_vault` did BEFORE its provider call, verbatim: gated corpus
+/// assembly (hybrid when semantic search is ON, FTS otherwise — Phase 2b semantics unchanged), the
+/// empty-corpus early return, and the corpus prompt build. The floor-equivalence test binds this
+/// to the original statement sequence.
+fn build_ask_vault_floor_prompt(
+    db: &crate::storage::Db,
+    config: &AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+    question: &str,
+    history: &[ChatTurn],
+) -> Result<AskFloorPrompt, AppError> {
+    // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪
+    // vector KNN, RRF-fused) — embedding the query with the active embedder — then pack with the
+    // SAME budget/citation logic and the SAME visibility gate. When OFF (the default) OR the index
+    // is empty, this falls back to the existing FTS-only path UNCHANGED (the hybrid query
+    // degenerates to FTS when no vectors exist; the flag-off branch is byte-for-byte the prior
+    // behavior).
     let (corpus, sources) = if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
         let query_vec = embedder
-            .embed_query(std::slice::from_ref(&question))?
+            .embed_query(std::slice::from_ref(&question.to_string()))?
             .into_iter()
             .next()
             .unwrap_or_default();
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            &state.db,
-            &question,
+            db,
+            question,
             &config.provider_id,
             &query_vec,
-            &unlocked,
+            unlocked,
         )?
     } else {
         crate::summarize::vault_context::build_vault_context_visible(
-            &state.db,
-            &question,
+            db,
+            question,
             &config.provider_id,
-            &unlocked,
+            unlocked,
         )?
     };
     if corpus.trim().is_empty() {
-        return Ok(AskVaultResult {
+        return Ok(AskFloorPrompt::Empty(AskVaultResult {
             answer: "No meeting notes to search yet — record and summarize a meeting first."
                 .to_string(),
             sources: Vec::new(),
-        });
+            citations: Vec::new(),
+        }));
     }
-    let provider = crate::summarize::make_provider(&config.provider_id, &config)?;
-    let (system, user) = crate::summarize::vault_chat::build(&corpus, &history, &question);
-    let answer = provider.complete(&system, &user).await?;
-    Ok(AskVaultResult { answer, sources })
+    let (system, user) = crate::summarize::vault_chat::build(&corpus, history, question);
+    Ok(AskFloorPrompt::Ready { system, user, sources })
+}
+
+/// THE FLOOR — the pre-agentic Ask-My-Vault implementation: gated corpus pack + ONE provider
+/// completion, with the original error/consent semantics (`make_provider`'s fail-closed consent
+/// gate errors exactly as before). Runs on the local/off brain backend and whenever the agentic
+/// attempt did not converge or errored.
+async fn ask_vault_floor(
+    db: &crate::storage::Db,
+    config: &AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+    question: &str,
+    history: &[ChatTurn],
+) -> Result<AskVaultResult, AppError> {
+    match build_ask_vault_floor_prompt(db, config, unlocked, question, history)? {
+        AskFloorPrompt::Empty(result) => Ok(result),
+        AskFloorPrompt::Ready { system, user, sources } => {
+            let provider = crate::summarize::make_provider(&config.provider_id, config)?;
+            let answer = provider.complete(&system, &user).await?;
+            Ok(AskVaultResult { answer, sources, citations: Vec::new() })
+        }
+    }
+}
+
+#[cfg(test)]
+mod ask_vault_tests {
+    use super::*;
+    use crate::agent::ToolExecutor;
+    use crate::reason::LocalReasoner;
+    use crate::storage::models::{Folder, Meeting, MeetingStatus, NoteRecord};
+    use crate::storage::Db;
+    use serde_json::Value;
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Mutex;
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tmp_db() -> Db {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-askvault-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        Db::open_with_key(&p, TEST_DEK).unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn seed_note(db: &Db, id: &str, title: &str, markdown: &str, folder: Option<&str>) {
+        db.insert_meeting(&Meeting {
+            id: id.into(),
+            started_at: "2026-06-26T09:00:00Z".into(),
+            ended_at: None,
+            title: Some(title.into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: id.into(),
+            provider_id: "claude_code".into(),
+            markdown: markdown.into(),
+            created_at: "2026-06-26T09:05:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_note_folder(id, folder).unwrap();
+    }
+
+    /// A LOCKED folder + a blanked-note meeting inside it — the sealed-and-not-unlocked at-rest
+    /// shape (title still indexed; the visibility gate is what must hide it).
+    fn seed_sealed(db: &Db, meeting_id: &str, folder_id: &str, title: &str) {
+        db.insert_folder(&Folder {
+            id: folder_id.into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-26T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_note(db, meeting_id, title, "", Some(folder_id));
+    }
+
+    /// A reasoner whose `structured()` returns canned JSON in sequence (a test double — the
+    /// production loop drives the real ReasonerCell dispatch). Exhaustion yields an empty answer,
+    /// which the loop treats as non-convergence.
+    struct ScriptReasoner {
+        script: Mutex<VecDeque<crate::error::Result<Value>>>,
+    }
+    impl ScriptReasoner {
+        fn ok(steps: Vec<Value>) -> Self {
+            Self { script: Mutex::new(steps.into_iter().map(Ok).collect()) }
+        }
+    }
+    impl LocalReasoner for ScriptReasoner {
+        fn id(&self) -> &str {
+            "script"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            Ok("unused".into())
+        }
+        fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> crate::error::Result<Value> {
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(serde_json::json!({ "answer": "" })))
+        }
+    }
+
+    /// The VAULT-SCOPED executor exactly as `ask_vault_agentic_attempt` builds it (no meeting,
+    /// read-only, NO note drafts), minus the AppHandle (headless: connectors unavailable).
+    fn ask_executor<'a>(
+        db: &'a Db,
+        unlocked: &'a Mutex<HashSet<String>>,
+        cfg: &'a AppConfig,
+    ) -> crate::tools::GatedToolExecutor<'a> {
+        crate::tools::GatedToolExecutor {
+            db,
+            unlocked,
+            config: cfg,
+            meeting_id: "",
+            app: None,
+            allow_writes: false,
+            note_drafts: false,
+            proposed_note: Mutex::new(None),
+        }
+    }
+
+    /// RED-first floor equivalence (the binding test of "the floor is today's behavior"): the
+    /// extracted floor prompt must be BYTE-IDENTICAL to the pre-change statement sequence —
+    /// `build_vault_context_visible` → `vault_chat::build` — for the same inputs, and the
+    /// empty-corpus early return must keep the exact canned string. RED-proven: perturbing the
+    /// floor (e.g. swapping the corpus builder for the fail-closed shim, or reordering sections)
+    /// fails the byte equality here.
+    #[test]
+    fn ask_floor_prompt_matches_pre_change_implementation() {
+        let db = tmp_db();
+        seed_note(&db, "m1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
+        seed_note(&db, "m2", "Weekly Sync", "Anna owns QA for atlas.", None);
+        let cfg = AppConfig::default(); // semantic_search_enabled = false → the FTS floor branch
+        let unlocked = HashSet::new();
+        let history = vec![
+            ChatTurn { role: "user".into(), content: "earlier question".into() },
+            ChatTurn { role: "assistant".into(), content: "earlier answer".into() },
+        ];
+        let q = "what did we decide about atlas?";
+
+        // The PRE-CHANGE implementation, replicated statement-for-statement.
+        let (corpus, want_sources) = crate::summarize::vault_context::build_vault_context_visible(
+            &db,
+            q,
+            &cfg.provider_id,
+            &unlocked,
+        )
+        .unwrap();
+        assert!(!corpus.trim().is_empty(), "fixture must produce a non-empty corpus");
+        let (want_system, want_user) = crate::summarize::vault_chat::build(&corpus, &history, q);
+
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history).unwrap() {
+            AskFloorPrompt::Ready { system, user, sources } => {
+                assert_eq!(system, want_system, "floor system prompt diverged from pre-change");
+                assert_eq!(user, want_user, "floor user prompt diverged from pre-change");
+                assert_eq!(
+                    sources.iter().map(|s| s.meeting_id.as_str()).collect::<Vec<_>>(),
+                    want_sources.iter().map(|s| s.meeting_id.as_str()).collect::<Vec<_>>(),
+                    "floor sources diverged from pre-change"
+                );
+            }
+            AskFloorPrompt::Empty(_) => panic!("a non-empty corpus must yield Ready"),
+        }
+
+        // The empty-vault early return keeps the EXACT pre-change canned answer.
+        let empty = tmp_db();
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[]).unwrap() {
+            AskFloorPrompt::Empty(r) => {
+                assert_eq!(
+                    r.answer,
+                    "No meeting notes to search yet — record and summarize a meeting first."
+                );
+                assert!(r.sources.is_empty() && r.citations.is_empty());
+            }
+            AskFloorPrompt::Ready { .. } => panic!("an empty vault must yield the canned Empty"),
+        }
+    }
+
+    /// The floor's ERROR/CONSENT semantics are untouched: an unconsented cloud provider is refused
+    /// by `make_provider`'s fail-closed gate with `AppError::Unavailable` — exactly the pre-change
+    /// behavior the FE consent flow keys on.
+    #[test]
+    fn ask_floor_preserves_no_consent_error_semantics() {
+        let db = tmp_db();
+        seed_note(&db, "m1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
+        let mut cfg = AppConfig::default();
+        cfg.provider_id = "anthropic".into();
+        assert!(!cfg.cloud_egress_consented, "fresh config defaults to consent OFF");
+        let res = block_on(ask_vault_floor(&db, &cfg, &HashSet::new(), "atlas?", &[]));
+        assert!(
+            matches!(res, Err(AppError::Unavailable(_))),
+            "no-consent floor must keep the Unavailable refusal: {res:?}"
+        );
+    }
+
+    /// The Cloud loop path: a scripted brain calls a GATED tool, answers, and the tool-derived
+    /// `[[Title]]` citations flow into the DTO — verbatim in `citations` AND resolved (gated) into
+    /// the structured `sources` chips.
+    #[test]
+    fn ask_loop_tool_citations_flow_into_dto() {
+        let db = tmp_db();
+        seed_note(
+            &db,
+            "m1",
+            "Atlas Kickoff",
+            "## Action items\n- [ ] Anna — ship the deck 2026-07-10\n",
+            None,
+        );
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = ask_executor(&db, &unlocked, &cfg);
+        let brain = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "get_open_commitments", "args": {} }),
+            serde_json::json!({ "answer": "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]]." }),
+        ]);
+        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "who owns the deck?", &[], None)
+            .unwrap()
+            .expect("scripted brain converged");
+        assert_eq!(out.answer, "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]].");
+        assert!(
+            out.citations.contains(&"[[Atlas Kickoff]]".to_string()),
+            "tool-derived citation must reach the DTO verbatim: {:?}",
+            out.citations
+        );
+        assert_eq!(out.sources.len(), 1, "the citation resolves to ONE source chip");
+        assert_eq!(out.sources[0].meeting_id, "m1");
+        assert_eq!(out.sources[0].title, "Atlas Kickoff");
+        assert_eq!(out.sources[0].started_at, "2026-06-26T09:00:00Z");
+    }
+
+    /// The loop contract at this surface: non-convergence → `Ok(None)` (the command floors); a
+    /// reasoner error — the no-consent `Unavailable` — PROPAGATES (the command's attempt wrapper
+    /// converts it to a floor, whose semantics `ask_floor_preserves_no_consent_error_semantics`
+    /// pins).
+    #[test]
+    fn ask_loop_non_convergence_floors_and_errors_propagate() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = ask_executor(&db, &unlocked, &cfg);
+
+        // Script exhaustion yields an empty answer → the loop bails without converging.
+        let stuck = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "a" } }),
+        ]);
+        let out = ask_vault_loop(&stuck, &exec, &db, &unlocked, "q", &[], None).unwrap();
+        assert!(out.is_none(), "non-convergence must return Ok(None) for the command to floor");
+
+        struct Refuses;
+        impl LocalReasoner for Refuses {
+            fn id(&self) -> &str {
+                "refuses"
+            }
+            fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+                Ok("unused".into())
+            }
+            fn structured(
+                &self,
+                _s: &str,
+                _u: &str,
+                _schema: &Value,
+            ) -> crate::error::Result<Value> {
+                Err(AppError::Unavailable("no consent".into()))
+            }
+        }
+        let res = ask_vault_loop(&Refuses, &exec, &db, &unlocked, "q", &[], None);
+        assert!(
+            matches!(res, Err(AppError::Unavailable(_))),
+            "a loop error must propagate so the attempt wrapper can floor: {res:?}"
+        );
+    }
+
+    /// The 12-message history discipline (CHAT_CONTEXT_TURNS) now applies to Ask: a 13th message
+    /// is dropped from both the capped slice and the rendered conversation. RED vs the pre-change
+    /// code, which rendered the history uncapped.
+    #[test]
+    fn ask_history_cap_enforced() {
+        let msgs: Vec<ChatTurn> = (0..13)
+            .map(|i| ChatTurn { role: "user".into(), content: format!("turn-{i}-text") })
+            .collect();
+        let capped = capped_ask_history(&msgs);
+        assert_eq!(capped.len(), CHAT_CONTEXT_TURNS);
+        assert_eq!(capped[0].content, "turn-1-text", "the oldest message beyond the cap is dropped");
+        let rendered = crate::summarize::vault_chat::render_conversation(capped, "final question");
+        assert!(!rendered.contains("turn-0-text"), "turn beyond the cap must not render");
+        assert!(rendered.contains("turn-12-text"), "the newest capped turn renders");
+        assert!(rendered.trim_end().ends_with("Assistant:"), "render keeps the completion cue");
+
+        // A short history passes through untouched.
+        assert_eq!(capped_ask_history(&msgs[..3]).len(), 3);
+    }
+
+    /// SURFACE SPLIT: the vault executor must NOT advertise `propose_note` (the Ask page has no
+    /// notes flow / Accept affordance) and must REFUSE to run it (the allowlist fails closed);
+    /// the in-meeting executor (note_drafts: true) still advertises it. RED-able: drop the
+    /// `"propose_note" => self.note_drafts` filter arm and the first assertion fails.
+    #[test]
+    fn propose_note_hidden_on_ask_surface_but_kept_in_meeting() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+
+        let vault = ask_executor(&db, &unlocked, &cfg);
+        let names: Vec<&str> = vault.specs().iter().map(|s| s.name).collect();
+        assert!(
+            !names.contains(&"propose_note"),
+            "the Ask surface must not advertise propose_note: {names:?}"
+        );
+        let res = vault.run("propose_note", &serde_json::json!({ "content": "draft" }));
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "an un-advertised propose_note must be refused by the allowlist: {res:?}"
+        );
+
+        let in_meeting = crate::tools::GatedToolExecutor {
+            db: &db,
+            unlocked: &unlocked,
+            config: &cfg,
+            meeting_id: "live1",
+            app: None,
+            allow_writes: false,
+            note_drafts: true,
+            proposed_note: Mutex::new(None),
+        };
+        assert!(
+            in_meeting.specs().iter().any(|s| s.name == "propose_note"),
+            "the in-meeting surface keeps propose_note advertised"
+        );
+    }
+
+    /// LOCK INVARIANT at the Ask surface: a scripted brain that tries to exfiltrate a
+    /// sealed-not-unlocked meeting through the vault executor surfaces NOTHING sealed — not in the
+    /// direct tool reads, not in the DTO's citations, not in the resolved `sources` (the
+    /// citation→source resolver applies the same visibility predicate and only resolves once the
+    /// folder is session-unlocked).
+    #[test]
+    fn ask_loop_never_surfaces_sealed_content() {
+        let db = tmp_db();
+        seed_note(&db, "open1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
+        seed_sealed(&db, "sealed1", "fsec", "Atlas Secret Terms");
+
+        // Seed self-check: the fixture must be sealed-not-unlocked BEFORE we prove the gate.
+        let nothing = HashSet::new();
+        assert!(db.meeting_is_visible("open1", &nothing).unwrap());
+        assert!(
+            !db.meeting_is_visible("sealed1", &nothing).unwrap(),
+            "seed fixture: sealed1 must be gated"
+        );
+
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = ask_executor(&db, &unlocked, &cfg);
+
+        // Direct gate proof on THIS surface's executor shape.
+        let got = exec.run("get_meeting", &serde_json::json!({ "meetingId": "sealed1" })).unwrap();
+        assert!(got.starts_with("No data"), "sealed fetch must be gated: {got}");
+
+        // The full loop, driven by an exfiltrating script.
+        let brain = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "sealed1" } }),
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "Atlas Secret Terms" } }),
+            serde_json::json!({ "answer": "Here is what I found." }),
+        ]);
+        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "the secret terms?", &[], None)
+            .unwrap()
+            .expect("converged");
+        assert!(
+            out.citations.iter().all(|c| !c.contains("Secret")),
+            "sealed title must never be cited: {:?}",
+            out.citations
+        );
+        assert!(
+            out.sources.iter().all(|s| s.meeting_id != "sealed1"),
+            "sealed meeting must never resolve into sources: {:?}",
+            out.sources
+        );
+
+        // The resolver itself is gated: the sealed title resolves ONLY once session-unlocked.
+        assert!(
+            db.meeting_by_title_visible("Atlas Secret Terms", &nothing).unwrap().is_none(),
+            "sealed-not-unlocked title must not resolve"
+        );
+        let mut open = HashSet::new();
+        open.insert("fsec".to_string());
+        assert_eq!(
+            db.meeting_by_title_visible("Atlas Secret Terms", &open)
+                .unwrap()
+                .expect("session-unlocked title resolves")
+                .id,
+            "sealed1"
+        );
+    }
+
+    /// The Ask trace stream is its OWN event — record-screen stores must never see Ask chips.
+    #[test]
+    fn ask_tool_event_is_distinct() {
+        assert_ne!(crate::events::EVENT_ASK_TOOL, crate::events::EVENT_ASSISTANT_TOOL);
+        assert_ne!(crate::events::EVENT_ASK_TOOL, crate::events::EVENT_CHAT_TOOL);
+    }
 }
 
 /// Entity DOSSIER (brain2 Phase 5b): synthesize the "state of [[entity]]" across all meetings —
