@@ -97,9 +97,10 @@ import { SettingsStore } from "../settings.store";
                   <span class="toggle-copy">
                     <span class="toggle-title">Cancel speaker echo (experimental)</span>
                     <span class="text-secondary toggle-sub">
-                      When recording without headphones, apply system echo cancellation to
-                      the microphone used for transcription. Experimental — headphones are
-                      still the most reliable fix.
+                      Experimental Apple voice processing on the transcription mic. May not
+                      remove echo on all setups (macOS gives it no reference signal) — echoed
+                      lines are also removed automatically after each recording. Headphones
+                      remain the most reliable fix.
                     </span>
                   </span>
                   <input type="checkbox" formControlName="aecEnabled" />
