@@ -343,7 +343,10 @@ pub fn run_assistant_query(
 
     // Resolve an intent for the FLOOR only (its read fan-out + surfaced kind) — it NO LONGER routes
     // writes. The agentic loop (with writes) is the single executive path; the agent DECIDES.
-    let intent = resolve_command_intent(&*state.reasoner, command);
+    // The reasoner is re-resolved for THIS turn (never a startup snapshot), so a consent /
+    // provider / backend change since the last turn is already in effect.
+    let reasoner = state.reasoner.current();
+    let intent = resolve_command_intent(&*reasoner, command);
     let result = run_informational(
         app,
         state.inner(),
@@ -394,6 +397,10 @@ fn run_informational(
     // The agentic loop runs only on the CLOUD brain — local-GGUF multi-step tool-call reliability is
     // unproven (Q4 + the Bielik 32K-overflow lesson), so the local + stub backends use the
     // deterministic floor: honest, fast, and a strict no-regression vs today.
+    // Resolve the reasoner for THIS request from the LIVE config — a consent/provider/backend
+    // change since the branch snapshot above dispatches correctly on the next turn either way
+    // (the consent gate itself re-checks fresh config on every provider call inside).
+    let reasoner = state.reasoner.current();
     if config.brain_backend == crate::settings::BrainBackend::Cloud {
         let executor = crate::tools::GatedToolExecutor {
             db: &state.db,
@@ -426,7 +433,7 @@ fn run_informational(
             gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
         let system = assistant_system_prompt(&live, &typed_notes);
         match crate::agent::run_agentic_loop(
-            &*state.reasoner,
+            &*reasoner,
             &system,
             loop_user,
             &executor,
@@ -458,7 +465,7 @@ fn run_informational(
     let floor_intent = floor_intent_for(intent, command);
     crate::voice_action::handle_voice_action(
         &floor_intent,
-        &*state.reasoner,
+        &*reasoner,
         &state.db,
         unlocked,
         config,

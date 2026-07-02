@@ -547,7 +547,7 @@ async fn summarize_and_export(
     // salient-query path stays the FALLBACK FLOOR. The reasoner call is synchronous, so this keeps
     // the existing inline shape (no extra await). Best-effort + GATED: same egress/consent envelope.
     let related_context = crate::orchestrate::orchestrate_context(
-        &*state.reasoner,
+        &*state.reasoner.current(),
         &state.db,
         meeting_id,
         related_title.as_deref(),
