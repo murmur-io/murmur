@@ -477,15 +477,7 @@ mod tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn temp_db() -> (Db, PathBuf) {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-mcp-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path("murmur-mcp-test", "sqlite");
         let db = Db::open_with_key(&p, TEST_DEK).unwrap();
         (db, p)
     }

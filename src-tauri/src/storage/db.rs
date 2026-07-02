@@ -4482,6 +4482,26 @@ impl Db {
     }
 }
 
+/// Collision-proof unique temp path for file-backed tests.
+///
+/// `cargo test` runs the tests in ONE process as parallel THREADS, so `process::id()` is identical
+/// across every test and `SystemTime::now().as_nanos()` can repeat within a single OS clock tick —
+/// two tests then build the SAME `.sqlite` path and race `migrate()` on one file
+/// (`Storage("database is locked")` / `duplicate column name`). The process-unique monotone
+/// `COUNTER` guarantees no two calls in this process ever collide, regardless of the clock.
+#[cfg(test)]
+pub(crate) fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{n}.{ext}"))
+}
+
 /// One note row needed to seal/unseal a folder.
 #[derive(Debug, Clone)]
 pub struct SealableNote {
@@ -7017,17 +7037,7 @@ mod lock_tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "meetnotes-lock-test-{}-{}-{}.sqlite",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        super::unique_temp_path(&format!("meetnotes-lock-test-{label}"), "sqlite")
     }
 
     fn file_db(label: &str) -> Db {
@@ -7823,17 +7833,7 @@ mod graph_tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "meetnotes-graph-test-{}-{}-{}.sqlite",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        super::unique_temp_path(&format!("meetnotes-graph-test-{label}"), "sqlite")
     }
 
     fn file_db(label: &str) -> Db {
