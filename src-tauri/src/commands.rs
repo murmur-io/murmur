@@ -1809,9 +1809,14 @@ fn persist_facts_for_meeting(
     if entity_refs.is_empty() {
         return Ok(());
     }
-    // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure).
-    let candidates =
-        crate::facts::extract_fact_candidates(&*state.reasoner, title, markdown, entity_refs);
+    // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner
+    //    is re-resolved from the LIVE config, so a consent/backend change applies without restart.
+    let candidates = crate::facts::extract_fact_candidates(
+        &*state.reasoner.current(),
+        title,
+        markdown,
+        entity_refs,
+    );
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
     }
@@ -3127,8 +3132,9 @@ pub fn list_brain_models(
 }
 
 /// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
-/// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the next `active_reasoner` build
-/// resolves this model when its GGUF is present. Does NOT download — the FE calls
+/// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the reasoner dispatch
+/// (`ReasonerCell`) re-resolves per call, so the model takes effect on the next reasoning call
+/// once its GGUF is present — no restart. Does NOT download — the FE calls
 /// `download_brain_model(model_id)` for that.
 #[tauri::command]
 pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Result<(), AppError> {
@@ -5679,8 +5685,8 @@ mod lifecycle_tests {
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
             db,
-            config: Mutex::new(AppConfig::default()),
-            reasoner: Box::new(crate::reason::StubReasoner),
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),

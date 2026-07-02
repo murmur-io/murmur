@@ -12,7 +12,7 @@
 //! recover-JSON-from-noisy-text path is exercised and testable.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -236,7 +236,9 @@ where
     Ok(())
 }
 
-/// The single active reasoning backend, used wherever the app needs local on-device reasoning.
+/// Resolve the reasoning backend for ONE config value — a point-in-time resolution. The live app
+/// dispatches through [`ReasonerCell`] (which re-resolves per call over the shared config handle);
+/// this function is the shared resolution logic plus the seam for one-shot/test use.
 ///
 /// Graceful degradation, in priority order:
 /// - a GGUF is present at the resolved [`resolve_brain_model`] → the real
@@ -260,13 +262,110 @@ pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
             // Cheap: just clones the config; the provider (+ consent gate + RedactingProvider) is
             // built per-call inside CloudReasoner via the same `make_provider` the summary uses.
             tracing::info!(target: "reason", "brain backend = cloud; reasoning via the summarizer-provider seam");
-            Box::new(CloudReasoner::new(config.clone()))
+            Box::new(CloudReasoner::new(Arc::new(Mutex::new(config.clone()))))
         }
         BrainBackend::Local => local_reasoner(config),
         BrainBackend::Off => {
             tracing::info!(target: "reason", "brain backend = off; using stub reasoner");
             Box::new(StubReasoner)
         }
+    }
+}
+
+/// The LIVE reasoner dispatch held in `AppState` — resolves which brain handles each call from the
+/// CURRENT config, not a startup snapshot.
+///
+/// `AppState.reasoner` used to be a `Box<dyn LocalReasoner>` resolved ONCE at startup, which made
+/// consent grants, consent revocations, provider switches, and `brain_backend` flips require an app
+/// restart (and kept a REVOKED consent egressing — the privacy-critical direction). `ReasonerCell`
+/// instead holds the SAME `Arc<Mutex<AppConfig>>` the settings/consent commands write and
+/// re-resolves the dispatch on every [`ReasonerCell::current`] call:
+/// - **Cloud** → a fresh [`CloudReasoner`] over the shared handle (construction is cheap — the
+///   provider + consent gate are built per call inside it);
+/// - **Local** → the CACHED model instance, keyed by the resolved GGUF path — the loaded model is
+///   expensive and must NOT reload per call; it is rebuilt only when the resolved path changes
+///   (e.g. the user selects or downloads a different model mid-session);
+/// - **Off** → the deterministic [`StubReasoner`].
+///
+/// Fail-closed: a poisoned config mutex means the consent/provider state is unknowable, so dispatch
+/// degrades to the no-egress stub rather than risk a cloud call under stale consent.
+pub struct ReasonerCell {
+    /// The SAME shared handle the settings/consent commands write (`AppState.config`).
+    config: Arc<Mutex<AppConfig>>,
+    /// Cached LOCAL reasoner keyed by the GGUF path it resolved from (`None` = nothing resolved ⇒
+    /// the stub). The loaded model is expensive, so the instance is reused across calls and rebuilt
+    /// only when the resolved path changes — which also means a model downloaded or selected
+    /// mid-session activates on the next call.
+    local: Mutex<Option<(Option<PathBuf>, Arc<dyn LocalReasoner>)>>,
+    /// TEST-ONLY pinned reasoner (mirrors `CloudReasoner::provider_override`): `Some` makes
+    /// `current()` always return this instance, so command tests keep a deterministic stub.
+    /// `None` in every production path (the only non-test constructor is [`new`]).
+    fixed: Option<Arc<dyn LocalReasoner>>,
+}
+
+impl ReasonerCell {
+    /// Build the live dispatch over the shared config handle. Cheap: nothing is resolved until the
+    /// first [`current`](Self::current) call.
+    pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
+        Self { config, local: Mutex::new(None), fixed: None }
+    }
+
+    /// TEST-ONLY: pin `current()` to a fixed reasoner instance (the old `Box<StubReasoner>` test
+    /// shape). Production dispatch always goes through [`new`] + live config resolution.
+    #[cfg(test)]
+    pub(crate) fn fixed(reasoner: Arc<dyn LocalReasoner>) -> Self {
+        Self {
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            local: Mutex::new(None),
+            fixed: Some(reasoner),
+        }
+    }
+
+    /// The reasoner for THIS call, resolved from the CURRENT config — never a startup snapshot.
+    pub fn current(&self) -> Arc<dyn LocalReasoner> {
+        if let Some(f) = &self.fixed {
+            return Arc::clone(f);
+        }
+        // Fail-closed: a poisoned config mutex makes the consent/provider state unknowable —
+        // dispatch the no-egress stub rather than risk a cloud call under stale consent.
+        let cfg = match self.config.lock() {
+            Ok(c) => c.clone(),
+            Err(_) => {
+                tracing::warn!(target: "reason", "config mutex poisoned; dispatching the stub (fail-closed)");
+                return Arc::new(StubReasoner);
+            }
+        };
+        match cfg.brain_backend {
+            // Cheap per call: the provider (+ consent gate) is built lazily inside, from a fresh
+            // config read, so this instance can never pin a stale provider/consent state.
+            BrainBackend::Cloud => Arc::new(CloudReasoner::new(Arc::clone(&self.config))),
+            BrainBackend::Local => self.local_cached(&cfg),
+            BrainBackend::Off => Arc::new(StubReasoner),
+        }
+    }
+
+    /// The LOCAL dispatch: reuse the cached instance while the resolved GGUF path is unchanged;
+    /// rebuild (inside the cache lock, so concurrent callers never double-load a model) only when
+    /// it changes. Resolution is a cheap filesystem probe per call — never a model load.
+    fn local_cached(&self, cfg: &AppConfig) -> Arc<dyn LocalReasoner> {
+        let configured = cfg.brain_model_path.as_deref().map(Path::new);
+        let key = resolve_brain_model(configured, cfg.brain_model_id.as_deref())
+            .ok()
+            .flatten();
+        let mut cache = match self.local.lock() {
+            Ok(g) => g,
+            // A pure cache slot carries no invalid state — recover the data instead of poisoning
+            // every future local dispatch.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((cached_key, cached)) = cache.as_ref() {
+            if *cached_key == key {
+                return Arc::clone(cached);
+            }
+        }
+        let built: Arc<dyn LocalReasoner> = Arc::from(local_reasoner(cfg));
+        *cache = Some((key, Arc::clone(&built)));
+        built
     }
 }
 
@@ -426,9 +525,11 @@ pub struct CloudReasoner {
     /// Stable id, e.g. `cloud:claude_code` — computed once so [`LocalReasoner::id`] can return a
     /// borrow.
     id: String,
-    /// A snapshot of the config used to build the provider per call (provider id + the
-    /// consent-relevant bits). Clone is cheap (a handful of strings/bools).
-    config: AppConfig,
+    /// The SHARED live config handle — the SAME `Arc<Mutex<AppConfig>>` the settings/consent
+    /// commands write (`AppState.config`). `build_provider` reads it FRESH on every call, so a
+    /// consent grant/revocation or a provider switch applies to the very next provider call —
+    /// even on a held instance mid-turn. Never snapshotted.
+    config: Arc<Mutex<AppConfig>>,
     /// TEST-ONLY injected provider. When `Some`, `build_provider` returns it instead of calling
     /// `make_provider`, so the wiring/parse can be exercised with a mock — NO real Claude/network.
     /// `None` in every production path (the only constructor reachable in release is [`new`]).
@@ -436,11 +537,15 @@ pub struct CloudReasoner {
 }
 
 impl CloudReasoner {
-    /// Build the cloud brain from a config snapshot. Cheap + infallible: the provider (and thus the
-    /// consent gate) is constructed lazily, per call.
-    pub fn new(config: AppConfig) -> Self {
+    /// Build the cloud brain over the shared live config handle. Cheap + infallible: the provider
+    /// (and thus the consent gate) is constructed lazily, per call, from the config AS IT IS THEN.
+    pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
+        let provider_id = config
+            .lock()
+            .map(|c| c.provider_id.clone())
+            .unwrap_or_else(|p| p.into_inner().provider_id.clone());
         Self {
-            id: format!("cloud:{}", config.provider_id),
+            id: format!("cloud:{provider_id}"),
             config,
             provider_override: None,
         }
@@ -453,19 +558,27 @@ impl CloudReasoner {
     fn with_provider(config: AppConfig, provider: Arc<dyn SummarizerProvider>) -> Self {
         Self {
             id: format!("cloud:{}", config.provider_id),
-            config,
+            config: Arc::new(Mutex::new(config)),
             provider_override: Some(provider),
         }
     }
 
     /// Resolve the provider for this call. THE egress seam: in production this is ALWAYS
-    /// `make_provider` (consent gate + RedactingProvider). A test override short-circuits only under
-    /// `#[cfg(test)]`.
+    /// `make_provider` (consent gate + RedactingProvider) over a FRESH read of the shared config —
+    /// never a construction-time snapshot — so a consent grant unblocks, and a consent REVOCATION
+    /// refuses, on the very next call (fail-closed both directions, no restart). A poisoned config
+    /// mutex makes the consent state unknowable, so it refuses too. A test override short-circuits
+    /// only under `#[cfg(test)]`.
     fn build_provider(&self) -> Result<Arc<dyn SummarizerProvider>> {
         if let Some(p) = &self.provider_override {
             return Ok(p.clone());
         }
-        crate::summarize::make_provider(&self.config.provider_id, &self.config)
+        let cfg = self
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
+        crate::summarize::make_provider(&cfg.provider_id, &cfg)
     }
 }
 
@@ -790,13 +903,19 @@ mod tests {
         }
     }
 
+    /// Wrap a config in the shared-handle shape `AppState.config` uses, so tests can mutate it
+    /// after construction exactly like the settings/consent commands do.
+    fn shared(cfg: AppConfig) -> Arc<Mutex<AppConfig>> {
+        Arc::new(Mutex::new(cfg))
+    }
+
     #[test]
     fn cloud_reasoner_id_is_namespaced_by_provider() {
         let cfg = AppConfig {
             provider_id: "claude_code".to_string(),
             ..Default::default()
         };
-        assert_eq!(CloudReasoner::new(cfg).id(), "cloud:claude_code");
+        assert_eq!(CloudReasoner::new(shared(cfg)).id(), "cloud:claude_code");
     }
 
     #[test]
@@ -870,11 +989,158 @@ mod tests {
             cloud_egress_consented: false,
             ..Default::default()
         };
-        let r = CloudReasoner::new(cfg);
+        let r = CloudReasoner::new(shared(cfg));
         match r.reason("s", "u") {
             Err(AppError::Unavailable(_)) => {}
             other => panic!("expected the make_provider consent gate to refuse, got {other:?}"),
         }
+    }
+
+    // ---- config freshness: consent / provider / backend changes apply WITHOUT a restart --------
+    //
+    // These tests discriminate "refused by the consent gate" from "got PAST the gate" by the error
+    // VARIANT `make_provider` returns for a deliberately-unknown provider id: the fail-closed gate
+    // fires FIRST (`Unavailable("cloud egress not consented …")`); past it, the unknown id yields
+    // `InvalidArg("unknown provider id: …")`. No network, no keychain, no CLI is ever touched.
+
+    /// An unknown provider id: classified as CLOUD by `egress_is_cloud` (fail-safe default), so it
+    /// hits the consent gate first, and can never construct a real provider after it.
+    const BOGUS_PROVIDER: &str = "no_such_provider_for_gate_probe";
+
+    fn gate_probe_cfg(consented: bool) -> AppConfig {
+        AppConfig {
+            brain_backend: BrainBackend::Cloud,
+            provider_id: BOGUS_PROVIDER.to_string(),
+            cloud_egress_consented: consented,
+            ..Default::default()
+        }
+    }
+
+    /// Granting cloud consent mid-session must unblock the VERY NEXT call on an already-held
+    /// CloudReasoner — no app restart, no reconstruction. Before the grant the consent gate
+    /// refuses (`Unavailable`); after flipping the SAME shared config cache the consent command
+    /// writes, the call must get PAST the gate (here: `InvalidArg` for the bogus id).
+    #[test]
+    fn cloud_reasoner_sees_consent_granted_after_construction() {
+        let cfg = shared(gate_probe_cfg(false));
+        let r = CloudReasoner::new(Arc::clone(&cfg));
+        match r.reason("s", "u") {
+            Err(AppError::Unavailable(_)) => {}
+            other => panic!("pre-grant call must be refused by the consent gate, got {other:?}"),
+        }
+
+        cfg.lock().unwrap().cloud_egress_consented = true;
+        match r.reason("s", "u") {
+            Err(AppError::InvalidArg(_)) => {} // past the gate — the unknown id is now the error
+            other => panic!(
+                "post-grant call must reach the provider path without a rebuild, got {other:?}"
+            ),
+        }
+    }
+
+    /// PRIVACY-CRITICAL direction: REVOKING consent must make the very next cloud-bound call on the
+    /// SAME held instance refuse (`Unavailable`) — a stale construction-time snapshot would keep
+    /// egressing after the user withdrew consent.
+    #[test]
+    fn cloud_reasoner_refuses_next_call_after_consent_revoked() {
+        let cfg = shared(gate_probe_cfg(true));
+        let r = CloudReasoner::new(Arc::clone(&cfg));
+        match r.reason("s", "u") {
+            Err(AppError::InvalidArg(_)) => {} // consented: past the gate
+            other => panic!("pre-revoke call must pass the consent gate, got {other:?}"),
+        }
+
+        cfg.lock().unwrap().cloud_egress_consented = false;
+        match r.reason("s", "u") {
+            Err(AppError::Unavailable(_)) => {} // fail-closed: the revocation applies NOW
+            other => panic!(
+                "post-revoke call must be refused by the consent gate (fail-closed), got {other:?}"
+            ),
+        }
+    }
+
+    /// Flipping `brain_backend` mid-session redirects the NEXT `current()` dispatch — Off→Cloud→Off
+    /// without rebuilding the cell (i.e. without an app restart).
+    #[test]
+    fn reasoner_cell_dispatches_backend_flips_mid_session() {
+        let cfg = shared(AppConfig {
+            brain_backend: BrainBackend::Off,
+            ..Default::default()
+        });
+        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        assert_eq!(cell.current().id(), "stub", "Off backend dispatches the stub");
+
+        cfg.lock().unwrap().brain_backend = BrainBackend::Cloud;
+        let id = cell.current().id().to_string();
+        assert!(
+            id.starts_with("cloud:"),
+            "flipping to Cloud must dispatch the cloud brain on the next call, got {id}"
+        );
+
+        cfg.lock().unwrap().brain_backend = BrainBackend::Off;
+        assert_eq!(
+            cell.current().id(),
+            "stub",
+            "flipping back to Off must dispatch the stub on the next call"
+        );
+    }
+
+    /// Switching the summarizer provider mid-session re-targets the cloud brain on the NEXT call.
+    #[test]
+    fn reasoner_cell_sees_provider_switch_mid_session() {
+        let cfg = shared(AppConfig {
+            brain_backend: BrainBackend::Cloud,
+            provider_id: "claude_code".to_string(),
+            ..Default::default()
+        });
+        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        assert_eq!(cell.current().id(), "cloud:claude_code");
+
+        cfg.lock().unwrap().provider_id = "anthropic".to_string();
+        assert_eq!(
+            cell.current().id(),
+            "cloud:anthropic",
+            "a provider switch must re-target the cloud brain without a restart"
+        );
+    }
+
+    /// The no-reload constraint: under the LOCAL backend the resolved instance is CACHED across
+    /// `current()` calls (a loaded GGUF is expensive) — and survives a Cloud excursion; only the
+    /// resolved model path changing may rebuild it. Cloud dispatch mid-flip still works.
+    #[test]
+    fn reasoner_cell_caches_local_instance_across_calls_and_backend_flips() {
+        let cfg = shared(AppConfig {
+            brain_backend: BrainBackend::Local,
+            brain_model_path: Some(
+                std::env::temp_dir()
+                    .join("murmur-cell-absent-model-xyz.gguf")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            brain_model_id: None,
+            ..Default::default()
+        });
+        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let a = cell.current();
+        let b = cell.current();
+        assert_eq!(a.id(), "stub", "no GGUF resolves ⇒ the local dispatch is the stub");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the local instance must be reused across calls, never rebuilt per call"
+        );
+
+        cfg.lock().unwrap().brain_backend = BrainBackend::Cloud;
+        assert!(
+            cell.current().id().starts_with("cloud:"),
+            "the Local→Cloud flip must dispatch the cloud brain"
+        );
+
+        cfg.lock().unwrap().brain_backend = BrainBackend::Local;
+        let c = cell.current();
+        assert!(
+            Arc::ptr_eq(&a, &c),
+            "the cached local instance must survive a backend excursion (same resolved path)"
+        );
     }
 
     // ---- active_reasoner backend selection --------------------------------------------------

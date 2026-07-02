@@ -113,13 +113,16 @@ pub struct AppState {
     /// the same non-reentrant Mutex<Connection> inside `DbEgressSink::record`; holding it across
     /// any provider `await` point would self-deadlock.
     pub db: Arc<Db>,
-    /// In-memory cache of the settings table.
-    pub config: Mutex<AppConfig>,
-    /// The active on-device reasoning backend (Phase B). Resolved ONCE at startup by
-    /// [`crate::reason::active_reasoner`]: the real `MistralReasoner` when a GGUF is present on disk
-    /// (mistralrs is always compiled), else the dependency-free `StubReasoner`. The trait is `Send +
-    /// Sync` and all methods take `&self`, so no `Mutex` is needed.
-    pub reasoner: Box<dyn crate::reason::LocalReasoner>,
+    /// In-memory cache of the settings table. `Arc` because [`AppState::reasoner`] holds the SAME
+    /// handle: every settings/consent write here is what the per-call reasoner dispatch reads, so
+    /// consent grants/revocations, provider switches, and `brain_backend` flips take effect on the
+    /// next reasoning call without an app restart.
+    pub config: Arc<Mutex<AppConfig>>,
+    /// The LIVE reasoning dispatch ([`crate::reason::ReasonerCell`]): each `current()` call
+    /// re-resolves Cloud/Local/Off from the CURRENT config (it shares [`AppState::config`]'s
+    /// handle), caching only the expensive local GGUF instance. Consumers call
+    /// `state.reasoner.current()` per turn — never hold a resolved reasoner across turns.
+    pub reasoner: crate::reason::ReasonerCell,
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
     /// Accumulated rough transcript of the recording IN PROGRESS, built from the live captions
     /// (`transcribe::live`). Segments aren't persisted until Stop, so this is the ONLY in-flight
@@ -182,12 +185,13 @@ impl AppState {
             crate::storage::migration::encrypt_in_place(db_path, dek)?;
         }
         let db = Arc::new(Db::open_with_key(db_path, dek)?);
-        let config = AppConfig::load(&db)?;
+        let config = Arc::new(Mutex::new(AppConfig::load(&db)?));
 
-        // Phase B: resolve the on-device reasoning backend once. Cheap + panic-free: the real brain
-        // (if the feature is on AND a model is present) loads its GGUF LAZILY on first use, so this
-        // never blocks or aborts startup — a missing/failed model degrades to the StubReasoner.
-        let reasoner = crate::reason::active_reasoner(&config);
+        // The live reasoner dispatch shares the config handle, so consent/provider/backend changes
+        // written by the settings commands reach the very next reasoning call — no restart. Cheap +
+        // panic-free: backends resolve lazily per call; a missing/failed local model degrades to
+        // the StubReasoner.
+        let reasoner = crate::reason::ReasonerCell::new(Arc::clone(&config));
 
         // SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of every locked
         // folder. If the app crashed (or was force-quit) WHILE a folder was session-unlocked, the
@@ -206,7 +210,7 @@ impl AppState {
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
             db,
-            config: Mutex::new(config),
+            config,
             reasoner,
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
@@ -524,6 +528,52 @@ mod tests {
             .query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "rows intact after the failed wrong-key open");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The PRODUCTION wiring of the stale-reasoner fix: `init_at` gives `state.config` and
+    /// `state.reasoner` ONE shared live handle, so the exact mutations the settings/consent
+    /// commands perform (under `state.config.lock()`) reach the very next `current()` dispatch —
+    /// consent grant unblocks, backend flip re-routes, all without a restart. Uses a bogus
+    /// provider id so "past the consent gate" is observable as `InvalidArg` (vs the gate's
+    /// `Unavailable`) with zero network/keychain/CLI.
+    #[test]
+    fn reasoner_dispatch_follows_live_config_changes_without_restart() {
+        let p = tmp_path("live-reasoner");
+        let state = AppState::init_at(&p, GOOD_KEY).unwrap();
+
+        // Fresh install defaults: Cloud backend, consent OFF (fail-closed). Point at a bogus
+        // provider id through the SAME lock the settings commands write.
+        {
+            let mut c = state.config.lock().unwrap();
+            assert!(!c.cloud_egress_consented, "fresh DB defaults to consent OFF");
+            c.provider_id = "no_such_provider_for_gate_probe".into();
+        }
+        match state.reasoner.current().reason("s", "u") {
+            Err(AppError::Unavailable(_)) => {} // the consent gate refuses (fail-closed)
+            other => panic!("no-consent call must be refused by the gate, got {other:?}"),
+        }
+
+        // Grant consent EXACTLY as `consent_to_cloud_egress` does (persist + in-memory cache).
+        state
+            .config
+            .lock()
+            .unwrap()
+            .grant_cloud_egress_consent(&state.db)
+            .unwrap();
+        match state.reasoner.current().reason("s", "u") {
+            Err(AppError::InvalidArg(_)) => {} // past the gate — the bogus id is now the error
+            other => panic!("post-grant call must pass the consent gate without restart, got {other:?}"),
+        }
+
+        // Flip the brain off (as a settings save would): the next dispatch is the stub.
+        state.config.lock().unwrap().brain_backend = crate::settings::BrainBackend::Off;
+        assert_eq!(
+            state.reasoner.current().id(),
+            "stub",
+            "a backend flip must re-route the next dispatch without restart"
+        );
 
         let _ = std::fs::remove_file(&p);
     }
