@@ -187,6 +187,19 @@ export interface BrainDownloadProgress {
 }
 
 /**
+ * Progress for the Whisper transcribe-model (GGML) download (`EVENT_MODEL_DOWNLOAD`).
+ * Mirrors the backend `ModelDownloadPayload`. `total` is null when the server omits
+ * Content-Length; `done` fires once the file is written + renamed into place. The
+ * backend downloads one model at a time, so the component tracks WHICH size it started
+ * locally (errors surface via the download command's promise).
+ */
+export interface ModelDownloadProgress {
+  downloaded: number;
+  total: number | null;
+  done: boolean;
+}
+
+/**
  * brain2 RAG — progress for the on-device embedding-model (multilingual-e5-small)
  * download (`EVENT_EMBED_DOWNLOAD`). Mirrors the backend `EmbedDownloadPayload`:
  * the e5 model is 3 small files, so progress is reported per-file (`fileIndex` /
