@@ -295,6 +295,32 @@ async fn run_inner(
         );
     }
 
+    // Post-hoc AEC (on-device, offline): cancel the system-audio reference out of the RAW mic.
+    // Runs only with a system stream, the flag on, and a measured leak (headphones ⇒ no echo
+    // energy ⇒ skip entirely). On success the AEC'd buffer becomes BOTH the ASR feed and the
+    // archive-mix input (feed == archive by construction, so the 51 s→8 s timeline-desync class
+    // is impossible), while the faithful raw mic is still archived via keep_hires_masters
+    // (`.mic.wav` is written from the pre-resample `samples`). Best-effort: any anomaly keeps raw.
+    if config.post_aec_enabled {
+        if let (Some(sys), Some(l)) = (sys_16k.as_ref(), leak.as_ref()) {
+            let sys_lead = (l.offset_s.max(0.0) * audio::TARGET_RATE_HZ as f64).round() as usize;
+            let raw_len = mic_16k_archive.as_ref().unwrap_or(&mic_16k).len();
+            let aec_result = {
+                let raw_mic: &[f32] = mic_16k_archive.as_ref().unwrap_or(&mic_16k);
+                audio::aec_offline::cancel_echo_offline(raw_mic, sys, sys_lead)
+            };
+            match aec_result {
+                Ok(clean) if clean.len() == raw_len => {
+                    mic_16k = clean;
+                    mic_16k_archive = None; // feed and archive now share the AEC'd buffer
+                    tracing::info!(target: "audio", "offline AEC applied to the mic track");
+                }
+                Ok(_) => tracing::warn!(target: "audio", "offline AEC length mismatch; raw mic kept"),
+                Err(e) => tracing::warn!(target: "audio", error = %e, "offline AEC failed; raw mic kept"),
+            }
+        }
+    }
+
     // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
     // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed —
     // offset-aligned so the two streams line up on the wall clock (kills most of the audible
