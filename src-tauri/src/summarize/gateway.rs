@@ -236,7 +236,7 @@ pub(crate) fn parse_models_response(body: &str) -> Result<Vec<String>> {
 ///   - empty / root (`""`)  → `{scheme}://{host}/chat/completions`
 ///   - `/v1`                → `{scheme}://{host}/v1/chat/completions`
 ///   - anything else (e.g. `/test`, a Kong route, or already `/…/chat/completions`)
-///                          → use the base URL path AS-IS (it IS the full chat endpoint)
+///     → use the base URL path AS-IS (it IS the full chat endpoint)
 ///
 /// Preserves scheme, host, port, and query. Never fails.
 pub(crate) fn resolve_chat_endpoint(base: &reqwest::Url) -> reqwest::Url {
@@ -688,8 +688,7 @@ mod tests {
             String::new(),
             None,
         )
-        .err()
-        .expect("expected InvalidArg for remote http URL");
+        .map(|_| ()).expect_err("expected InvalidArg for remote http URL");
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg, got: {err}"
@@ -700,8 +699,7 @@ mod tests {
             String::new(),
             None,
         )
-        .err()
-        .expect("expected InvalidArg for file:// URL");
+        .map(|_| ()).expect_err("expected InvalidArg for file:// URL");
         assert!(
             matches!(err2, AppError::InvalidArg(_)),
             "expected InvalidArg for bad scheme, got: {err2}"
@@ -804,16 +802,14 @@ mod tests {
     fn validate_gateway_url_rejects_embedded_credentials() {
         // username + empty password (common key-in-URL pattern).
         let err = validate_gateway_url("https://mykey:@gw.example.com/v1")
-            .err()
-            .expect("embedded creds must be rejected");
+            .expect_err("embedded creds must be rejected");
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg for embedded creds, got: {err}"
         );
         // username + password.
         let err2 = validate_gateway_url("https://user:pass@gw.example.com/v1")
-            .err()
-            .expect("embedded user:pass must be rejected");
+            .expect_err("embedded user:pass must be rejected");
         assert!(matches!(err2, AppError::InvalidArg(_)));
         // No credentials → still valid.
         assert!(validate_gateway_url("https://gw.example.com/v1").is_ok());
