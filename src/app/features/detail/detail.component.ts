@@ -91,6 +91,9 @@ interface ParsedNote {
   sections: NoteSection[];
   /** Set only when the body contained no `## ` sections — raw fallback. */
   raw: string | null;
+  /** ENHANCE-MY-NOTES: true when the backend stamped `murmur_enhanced: true` (the note's
+   *  skeleton was the user's typed notes). Derived ONLY from note.markdown — lock-safe. */
+  enhanced: boolean;
 }
 
 @Component({
@@ -180,6 +183,17 @@ interface ParsedNote {
                   <app-lock-badge [exposure]="fb.exposure" />
                   {{ fb.name }}
                 </span>
+              }
+              <!-- ENHANCE-MY-NOTES: provenance badge — shown only when the backend
+                   stamped murmur_enhanced: true in the front-matter. Derives from
+                   the note() computed (parseNote over markdown) — nil for locked/
+                   masked meetings where markdown is null, so no leak. -->
+              @if (note()?.enhanced) {
+                <span class="meta-sep" aria-hidden="true">·</span>
+                <span
+                  class="pill pill-enhanced"
+                  title="Your typed notes were used as the skeleton of this summary"
+                >✨ Enhanced from your notes</span>
               }
             </div>
 
@@ -631,7 +645,7 @@ interface ParsedNote {
           }
 
           <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
-          <section class="block print-keep">
+          <section class="block print-keep" [class.is-resummarizing]="busy()">
             <div class="block-head">
               <h3>Analysis</h3>
               @if (!editing() && note()?.tags?.length) {
@@ -1844,6 +1858,13 @@ interface ParsedNote {
           animation: none !important;
         }
       }
+
+      /* ── ENHANCE-MY-NOTES: re-summarize working overlay ── */
+      .is-resummarizing {
+        opacity: .55;
+        pointer-events: none;
+        transition: opacity var(--transition);
+      }
     `,
   ],
 })
@@ -2373,7 +2394,12 @@ export class DetailComponent implements OnInit {
     this.msg.set("Re-summarizing…");
     try {
       await this.ipc.resummarize(id);
-      this.detail.set(await this.ipc.getMeetingDetail(id));
+      const fresh = await this.ipc.getMeetingDetail(id);
+      // Drop late responses: the user may have navigated (openRelated) mid-flight —
+      // never clobber a different meeting's detail with this closure's re-fetch.
+      if (this.detail()?.meeting?.id === id) {
+        this.detail.set(fresh);
+      }
       this.msg.set("Done.");
     } catch (e) {
       this.msg.set("Error: " + String(e));
@@ -3022,6 +3048,7 @@ export class DetailComponent implements OnInit {
 
     let tags: string[] = [];
     let participants: string[] = [];
+    let enhanced = false;
     let bodyStart = 0;
 
     // Front-matter must be the very first non-empty content.
@@ -3031,6 +3058,7 @@ export class DetailComponent implements OnInit {
         const fm = lines.slice(1, end);
         tags = this.readFrontMatterList(fm, "tags");
         participants = this.readFrontMatterList(fm, "participants");
+        enhanced = fm.some((l) => /^murmur_enhanced\s*:\s*true\b/i.test(l.trim()));
         bodyStart = end + 1;
       }
     }
@@ -3057,10 +3085,10 @@ export class DetailComponent implements OnInit {
     if (sections.length === 0) {
       // No structured sections — surface the body (sans front-matter) raw.
       const raw = body.join("\n").trim();
-      return { tags, participants, sections: [], raw: raw || markdown.trim() };
+      return { tags, participants, sections: [], raw: raw || markdown.trim(), enhanced };
     }
 
-    return { tags, participants, sections, raw: null };
+    return { tags, participants, sections, raw: null, enhanced };
   }
 
   /** Classify a section by its heading + content, then shape its data. */

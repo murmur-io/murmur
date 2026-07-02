@@ -114,6 +114,14 @@ pub struct AppConfig {
     pub onboarded: bool,
     /// Summary style preset: "standard" | "brief" | "detailed" | "action".
     pub note_style: String,
+    /// ENHANCE-MY-NOTES: how the user's typed in-meeting notes shape the summary.
+    /// "enhance" (default) — the notes become the SKELETON of the generated note (they ride
+    /// INSIDE the redacted provider prompt — a deliberate, loud, consent-riding egress);
+    /// "append" — legacy: transcript-only summary + verbatim `## My notes` section.
+    /// Empty/unknown values fall back to "enhance".
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `"enhance"`.
+    #[serde(default)]
+    pub notes_mode: String,
     /// When true, Claude files each note into a thematic subfolder of the vault.
     pub auto_organize: bool,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
@@ -298,6 +306,7 @@ impl Default for AppConfig {
             voice_trigger: false,
             onboarded: false,
             note_style: "standard".to_string(),
+            notes_mode: "enhance".to_string(),
             auto_organize: false,
             note_language: "auto".to_string(),
             mcp_require_token: true,
@@ -351,6 +360,7 @@ const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
 const K_NOTE_STYLE: &str = "note_style";
+const K_NOTES_MODE: &str = "notes_mode";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
@@ -455,6 +465,11 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_NOTE_STYLE)? {
             if !v.is_empty() {
                 cfg.note_style = v;
+            }
+        }
+        if let Some(v) = db.get_setting(K_NOTES_MODE)? {
+            if !v.is_empty() {
+                cfg.notes_mode = v;
             }
         }
         if let Some(v) = db.get_setting(K_AUTO_ORGANIZE)? {
@@ -595,6 +610,7 @@ impl AppConfig {
         )?;
         db.set_setting(K_ONBOARDED, if self.onboarded { "true" } else { "false" })?;
         db.set_setting(K_NOTE_STYLE, &self.note_style)?;
+        db.set_setting(K_NOTES_MODE, &self.notes_mode)?;
         db.set_setting(
             K_AUTO_ORGANIZE,
             if self.auto_organize { "true" } else { "false" },
@@ -733,6 +749,13 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
         .unwrap()
+    }
+
+    /// ENHANCE-MY-NOTES: the mode defaults to "enhance" for fresh installs AND for existing
+    /// users (AppConfig::load falls back to Default for a never-written key).
+    #[test]
+    fn notes_mode_defaults_to_enhance() {
+        assert_eq!(AppConfig::default().notes_mode, "enhance");
     }
 
     #[test]
