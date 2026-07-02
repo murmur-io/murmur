@@ -1,205 +1,138 @@
 import {
   ChangeDetectionStrategy,
   Component,
-  ElementRef,
-  Injector,
-  afterNextRender,
   computed,
-  effect,
-  inject,
   input,
   signal,
   viewChild,
 } from "@angular/core";
-import type { GraphData, GraphNode } from "../../core/models";
+import type { GraphData } from "../../core/models";
+import {
+  NeuralSceneDirective,
+  type SceneEdge,
+  type SceneNode,
+} from "./neural-scene.directive";
 
-/** A node placed by the deterministic layout (SVG user-space coordinates). */
-interface PlacedNode {
-  id: string;
-  name: string;
-  kind: GraphNode["kind"];
-  mentionCount: number;
-  x: number;
-  y: number;
-  /** Node radius ∝ mention count (clamped). */
-  r: number;
-}
-
-/** An edge resolved to its two endpoints' placed coordinates. */
-interface PlacedEdge {
-  /** `${source}::${target}` — stable @for track key. */
-  key: string;
-  source: string;
-  target: string;
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-  /** Stroke width ∝ co-occurrence weight (clamped). */
-  width: number;
-  /** Stroke opacity ∝ weight (clamped). */
-  opacity: number;
-}
-
-/** The current pan/zoom window, mapped straight to the SVG `viewBox`. */
-interface ViewBox {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-/** Logical layout canvas (user units). The viewBox pans/zooms over this. */
-const WORLD = 1000;
 /** Cap on rendered nodes — the strongest top-K by mention count. Big graphs
- *  cluster down to this so the layout + DOM stay bounded. */
+ *  cluster down to this so the layout + draw calls stay bounded. */
 const MAX_NODES = 60;
 /** Fixed force-directed iteration count — run ONCE, synchronously, no loop. */
 const ITERATIONS = 240;
-/** Zoom clamp (× the world size visible). */
-const MIN_W = WORLD * 0.18;
-const MAX_W = WORLD * 1.6;
+/** Logical world scale (world units). The camera fits to the laid-out cloud. */
+const WORLD = 1000;
+/** The laid-out cloud is kept inside this radius so zoom clamps stay sane. */
+const MAX_CLOUD_R = 470;
 
 /**
- * The interactive BRAIN MAP — `get_graph()` rendered as a hand-rolled node-link
- * SVG (no graph library, no new dependency).
+ * The NEURAL BRAIN MAP — `get_graph()` rendered as a living neural scene:
+ * glowing neuron somas with dendrites, curved firing synapses, a 3-D orbit
+ * camera (default) with a flat 2-D mode. No graph library, no new dependency.
  *
- * LAYOUT (deterministic, one-shot, zoneless-safe): nodes are SEEDED on a
- * golden-angle spiral keyed by their sort index (stable across renders), then a
- * fixed {@link ITERATIONS}-iteration Fruchterman-Reingold-style force pass runs
- * SYNCHRONOUSLY inside a `computed()` — pairwise repulsion + per-edge spring
- * attraction + a gentle pull to centre, with a cooling schedule. There is NO
- * `requestAnimationFrame`, NO `setInterval`, NO animation loop: positions are a
- * pure, cached function of the (capped) graph data, so the same data always
- * lays out identically. Large graphs cluster to the top-{@link MAX_NODES} by
- * mention count (with a `has-hidden`/`capped` disclosure surfaced by the parent).
+ * SPLIT OF RESPONSIBILITY (zoneless):
+ * - THIS COMPONENT owns the pure data derivations — the top-{@link MAX_NODES}
+ *   cap, the DETERMINISTIC one-shot 3-D layout (a `computed()`, no simulation
+ *   loop, no `Math.random`), selection state + keyboard a11y, and the DOM
+ *   toolbar chrome.
+ * - {@link NeuralSceneDirective} owns every DOM-loop concern (rAF loop,
+ *   ResizeObserver, reduced-motion + visibility listeners) per
+ *   `.claude/rules/angular-zoneless.md` §5 — such loops are banned in a
+ *   component, so the renderer is a directive on the `<canvas>`.
  *
- * PAN/ZOOM is a single {@link ViewBox} signal bound to the SVG `viewBox`: wheel
- * zooms toward the cursor, pointer-drag pans. Clicking a node highlights its
- * one-hop neighbourhood (dimming the rest); clicking empty space clears it.
- *
- * HONESTY: a polished ANIMATED force graph (live tick simulation, drag-to-reflow
- * individual nodes, WebGL for thousands of nodes) would want a real graph lib
- * (d3-force / cytoscape / sigma) — a new npm dependency, which is forbidden here
- * without approval. This is the best STATIC, no-dep, one-shot-layout version.
+ * LAYOUT: nodes are seeded on a Fibonacci sphere keyed by their sort index
+ * (most-mentioned first, name tiebreak — identical ordering to the old SVG
+ * map), then a fixed {@link ITERATIONS}-iteration 3-D Fruchterman-Reingold
+ * pass runs synchronously (pairwise repulsion + log-weighted edge springs +
+ * a gentle centre pull), then the cloud is recentred and NORMALISED onto a
+ * brain-ish world ellipsoid (x widest, y×0.72, z×0.85 — so the layout always
+ * fills the frame), followed by an overlap-relaxation pass so somas never
+ * fuse. Same data → identical layout, every render.
  */
 @Component({
   selector: "app-brain-map",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [NeuralSceneDirective],
   template: `
     <div class="bm">
-      <div class="bm-toolbar" role="toolbar" aria-label="Map controls">
-        <div class="bm-legend" aria-hidden="true">
-          <span class="bm-legend-item">
-            <span class="bm-dot is-person"></span>People
-          </span>
-          <span class="bm-legend-item">
-            <span class="bm-dot is-project"></span>Projects
-          </span>
-        </div>
-        <div class="bm-zoom">
-          <button
-            type="button"
-            class="btn btn-ghost bm-zbtn"
-            aria-label="Zoom in"
-            (click)="zoomBy(0.8)"
-          >
-            +
-          </button>
-          <button
-            type="button"
-            class="btn btn-ghost bm-zbtn"
-            aria-label="Zoom out"
-            (click)="zoomBy(1.25)"
-          >
-            −
-          </button>
-          <button
-            type="button"
-            class="btn btn-ghost bm-zbtn bm-zreset"
-            aria-label="Reset view"
-            (click)="resetView()"
-          >
-            Reset
-          </button>
+      <div class="bm-frame">
+        <canvas
+          appNeuralScene
+          class="bm-canvas"
+          tabindex="0"
+          role="img"
+          [attr.aria-label]="ariaLabel()"
+          [sceneNodes]="sceneNodes()"
+          [sceneEdges]="sceneEdges()"
+          [selectedId]="selectedId()"
+          [mode]="mode()"
+          (nodePick)="onPick($event)"
+          (nodeHover)="hoverId.set($event)"
+          (keydown)="onCanvasKeydown($event)"
+        ></canvas>
+
+        <div class="bm-toolbar" role="toolbar" aria-label="Map controls">
+          <div class="bm-pill bm-legend" aria-hidden="true">
+            <span class="bm-legend-item">
+              <span class="bm-dot is-person"></span>People
+            </span>
+            <span class="bm-legend-item">
+              <span class="bm-dot is-project"></span>Projects
+            </span>
+          </div>
+
+          <div class="bm-controls">
+            <div class="bm-pill bm-seg" role="group" aria-label="Projection">
+              <button
+                type="button"
+                class="bm-segbtn"
+                [class.is-on]="mode() === '3d'"
+                [attr.aria-pressed]="mode() === '3d'"
+                (click)="setMode('3d')"
+              >
+                3D
+              </button>
+              <button
+                type="button"
+                class="bm-segbtn"
+                [class.is-on]="mode() === '2d'"
+                [attr.aria-pressed]="mode() === '2d'"
+                (click)="setMode('2d')"
+              >
+                2D
+              </button>
+            </div>
+            <div class="bm-pill bm-zoom">
+              <button
+                type="button"
+                class="bm-zbtn"
+                aria-label="Zoom in"
+                (click)="zoomIn()"
+              >
+                +
+              </button>
+              <button
+                type="button"
+                class="bm-zbtn"
+                aria-label="Zoom out"
+                (click)="zoomOut()"
+              >
+                −
+              </button>
+              <button
+                type="button"
+                class="bm-zbtn bm-zreset"
+                aria-label="Reset view"
+                (click)="resetView()"
+              >
+                Reset
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
-      <svg
-        #canvas
-        class="bm-canvas"
-        [class.is-panning]="panning()"
-        [attr.viewBox]="viewBoxStr()"
-        role="img"
-        [attr.aria-label]="ariaLabel()"
-        (wheel)="onWheel($event)"
-        (pointerdown)="onPointerDown($event)"
-        (pointermove)="onPointerMove($event)"
-        (pointerup)="onPointerUp($event)"
-        (pointercancel)="onPointerUp($event)"
-        (click)="onCanvasClick($event)"
-      >
-        <!-- Edges first, beneath the nodes. -->
-        <g class="bm-edges">
-          @for (e of placedEdges(); track e.key) {
-            <line
-              class="bm-edge"
-              [class.is-dim]="isEdgeDim(e)"
-              [attr.x1]="e.x1"
-              [attr.y1]="e.y1"
-              [attr.x2]="e.x2"
-              [attr.y2]="e.y2"
-              [attr.stroke-width]="e.width"
-              [style.opacity]="isEdgeDim(e) ? 0.06 : e.opacity"
-            />
-          }
-        </g>
-
-        <!-- Nodes: each a clickable group (dot + label). -->
-        <g class="bm-nodes">
-          @for (n of placedNodes(); track n.id) {
-            <g
-              class="bm-node"
-              [class.is-project]="n.kind === 'project'"
-              [class.is-selected]="selectedId() === n.id"
-              [class.is-dim]="isNodeDim(n.id)"
-              role="button"
-              tabindex="0"
-              [attr.aria-label]="nodeLabel(n)"
-              [attr.aria-pressed]="selectedId() === n.id"
-              (click)="onNodeClick($event, n.id)"
-              (keydown.enter)="onNodeActivate(n.id)"
-              (keydown.space)="onNodeSpace($event, n.id)"
-            >
-              <circle
-                class="bm-dot-hit"
-                [attr.cx]="n.x"
-                [attr.cy]="n.y"
-                [attr.r]="n.r + 8"
-              />
-              <circle
-                class="bm-dot"
-                [attr.cx]="n.x"
-                [attr.cy]="n.y"
-                [attr.r]="n.r"
-              />
-              <text
-                class="bm-label"
-                [attr.x]="n.x"
-                [attr.y]="n.y + n.r + 13"
-                text-anchor="middle"
-              >
-                {{ n.name }}
-              </text>
-            </g>
-          }
-        </g>
-      </svg>
-
-      <p class="bm-hint">
-        Scroll to zoom · drag to pan · click a node to focus its connections.
-      </p>
+      <p class="bm-hint">{{ hint() }}</p>
+      <span class="bm-sr" aria-live="polite">{{ announcement() }}</span>
     </div>
   `,
   styles: [
@@ -213,17 +146,66 @@ const MAX_W = WORLD * 1.6;
         gap: var(--space-3);
       }
 
-      .bm-toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        flex-wrap: wrap;
-        gap: var(--space-3);
+      .bm-frame {
+        position: relative;
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        border: 1px solid var(--glass-border);
       }
-      .bm-legend {
+      .bm-canvas {
+        display: block;
+        width: 100%;
+        height: clamp(420px, 62vh, 680px);
+        /* #080914 — the scene's FIXED deep-indigo floor (mirrors the
+           directive's BG). Deliberately NOT a surface token: glow only works
+           on dark, so the map stays a dark field even in the light theme
+           (design review R3 mandate). */
+        background: #080914;
+        touch-action: none;
+        user-select: none;
+        outline: none;
+      }
+      .bm-canvas:focus-visible {
+        outline: 2px solid var(--accent-ring);
+        outline-offset: -2px;
+        border-radius: var(--radius-lg);
+      }
+
+      /* Floating chrome INSIDE the map frame. Controls are OPAQUE pills
+         (--surface-overlay, never the frosted .card) — they float over the
+         scene, so translucency would bleed the neurons through (rule T3). */
+      .bm-toolbar {
+        position: absolute;
+        top: var(--space-3);
+        left: var(--space-3);
+        right: var(--space-3);
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--space-3);
+        pointer-events: none;
+      }
+      .bm-toolbar > * {
+        pointer-events: auto;
+      }
+      .bm-controls {
+        display: flex;
+        gap: var(--space-2);
+      }
+      .bm-pill {
         display: inline-flex;
         align-items: center;
+        background: var(--surface-overlay);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-pill);
+        box-shadow: var(--shadow-sm);
+        backdrop-filter: none;
+      }
+
+      .bm-legend {
         gap: var(--space-4);
+        padding: 0 var(--space-4);
+        height: 32px;
         font-size: 0.8125rem;
         color: var(--text-secondary);
       }
@@ -233,281 +215,170 @@ const MAX_W = WORLD * 1.6;
         gap: var(--space-2);
       }
       .bm-dot {
-        width: 10px;
-        height: 10px;
+        /* #5bbdff — the scene's PERSON azure (mirrors the directive's
+           palette). R3 mandate: ≥60° hue separation from the project-purple;
+           var(--accent) sits only ~26° away, unreadable as an encoding. */
+        width: 9px;
+        height: 9px;
         border-radius: var(--radius-pill);
-        background: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-soft);
+        background: #5bbdff;
+        box-shadow: 0 0 6px rgba(91, 189, 255, 0.5);
       }
       .bm-dot.is-project {
+        /* #9d7bff — the established project-purple (matches --accent-gradient's
+           end stop + the node paint in the scene). */
         background: #9d7bff;
-        box-shadow: 0 0 0 3px rgba(157, 123, 255, 0.18);
+        box-shadow: 0 0 6px rgba(157, 123, 255, 0.5);
       }
+
+      .bm-seg {
+        padding: 2px;
+        gap: 2px;
+      }
+      .bm-segbtn {
+        appearance: none;
+        border: 0;
+        background: transparent;
+        color: var(--text-secondary);
+        font: 600 0.75rem var(--font-sans);
+        letter-spacing: 0.02em;
+        height: 26px;
+        padding: 0 var(--space-3);
+        border-radius: var(--radius-pill);
+        cursor: pointer;
+        transition:
+          background var(--transition-fast),
+          color var(--transition-fast);
+      }
+      .bm-segbtn:hover {
+        color: var(--text-primary);
+      }
+      .bm-segbtn.is-on {
+        background: var(--accent-soft);
+        color: var(--text-primary);
+      }
+      .bm-segbtn:focus-visible {
+        outline: 2px solid var(--accent-ring);
+        outline-offset: 1px;
+      }
+
       .bm-zoom {
-        display: inline-flex;
-        gap: var(--space-2);
+        padding: 2px;
+        gap: 2px;
       }
       .bm-zbtn {
-        min-width: 36px;
-        height: 32px;
+        appearance: none;
+        border: 0;
+        background: transparent;
+        color: var(--text-secondary);
+        font: 500 0.9375rem/1 var(--font-sans);
+        min-width: 28px;
+        height: 26px;
         padding: 0 var(--space-2);
-        font-size: 1rem;
-        line-height: 1;
+        border-radius: var(--radius-pill);
+        cursor: pointer;
+        transition:
+          background var(--transition-fast),
+          color var(--transition-fast);
+      }
+      .bm-zbtn:hover {
+        background: var(--surface-hover);
+        color: var(--text-primary);
+      }
+      .bm-zbtn:focus-visible {
+        outline: 2px solid var(--accent-ring);
+        outline-offset: 1px;
       }
       .bm-zreset {
-        font-size: 0.8125rem;
-      }
-
-      .bm-canvas {
-        display: block;
-        width: 100%;
-        height: clamp(360px, 60vh, 620px);
-        border: 1px solid var(--glass-border);
-        border-radius: var(--radius-lg);
-        background:
-          radial-gradient(
-            120% 120% at 50% 0%,
-            rgba(110, 118, 255, 0.06),
-            transparent 60%
-          ),
-          var(--surface-input);
-        touch-action: none;
-        cursor: grab;
-        user-select: none;
-      }
-      .bm-canvas.is-panning {
-        cursor: grabbing;
-      }
-
-      .bm-edge {
-        stroke: var(--border-strong);
-        stroke-linecap: round;
-        transition: opacity var(--transition);
-      }
-
-      .bm-node {
-        cursor: pointer;
-      }
-      .bm-dot-hit {
-        fill: transparent;
-      }
-      .bm-dot {
-        fill: var(--accent);
-        stroke: var(--surface-base);
-        stroke-width: 2;
-        transition:
-          fill var(--transition),
-          opacity var(--transition);
-      }
-      .bm-node.is-project .bm-dot {
-        fill: #9d7bff;
-      }
-      .bm-label {
-        fill: var(--text-secondary);
-        font-family: var(--font-sans);
-        font-size: 13px;
-        font-weight: 550;
-        pointer-events: none;
-        paint-order: stroke;
-        stroke: var(--surface-base);
-        stroke-width: 3px;
-        transition:
-          fill var(--transition),
-          opacity var(--transition);
-      }
-      .bm-node:hover .bm-dot,
-      .bm-node:focus-visible .bm-dot {
-        fill: var(--accent-hover);
-      }
-      .bm-node.is-project:hover .bm-dot,
-      .bm-node.is-project:focus-visible .bm-dot {
-        fill: #b69bff;
-      }
-      .bm-node:hover .bm-label,
-      .bm-node:focus-visible .bm-label {
-        fill: var(--text-primary);
-      }
-      .bm-node:focus-visible {
-        outline: none;
-      }
-      .bm-node:focus-visible .bm-dot {
-        stroke: var(--accent-ring);
-        stroke-width: 3;
-      }
-      .bm-node.is-selected .bm-dot {
-        stroke: var(--accent-hover);
-        stroke-width: 3;
-      }
-      .bm-node.is-selected .bm-label {
-        fill: var(--text-primary);
-      }
-      .bm-node.is-dim .bm-dot {
-        opacity: 0.18;
-      }
-      .bm-node.is-dim .bm-label {
-        opacity: 0.1;
+        font-size: 0.75rem;
+        font-weight: 600;
       }
 
       .bm-hint {
         margin: 0;
         text-align: center;
-        color: var(--text-muted);
+        /* --text-secondary, not muted — the muted grey fell below AA on the
+           page background (design-panel R4 contrast finding). */
+        color: var(--text-secondary);
         font-size: 0.75rem;
+      }
+
+      /* Screen-reader-only live region for selection announcements. */
+      .bm-sr {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .bm-segbtn,
+        .bm-zbtn {
+          transition: none;
+        }
       }
     `,
   ],
 })
 export class BrainMapComponent {
-  private readonly injector = inject(Injector);
-
   /** The graph to visualise. Re-laying out when it changes (pure derivation). */
   readonly data = input<GraphData | null>(null);
 
-  /** The currently focused node id, or null. Drives neighbourhood highlight. */
+  /** The focused node id, or null. Same toggle semantics as the old SVG map:
+   *  click the selected node again = deselect; empty click clears. */
   readonly selectedId = signal<string | null>(null);
+  /** Hovered node id (mirrored from the scene; tooltip is canvas-drawn). */
+  readonly hoverId = signal<string | null>(null);
+  /** Camera mode — 3-D orbit is the DEFAULT; 2-D is the flat fallback. */
+  readonly mode = signal<"3d" | "2d">("3d");
+  /** aria-live announcement for selection changes (event-driven, not derived —
+   *  "Selection cleared" must announce once, not on every recompute). */
+  readonly announcement = signal("");
 
-  private readonly canvas =
-    viewChild<ElementRef<SVGSVGElement>>("canvas");
-
-  /** The pan/zoom window → the SVG viewBox. Starts centred on the world. */
-  private readonly _viewBox = signal<ViewBox>({
-    x: 0,
-    y: 0,
-    w: WORLD,
-    h: WORLD,
-  });
-  readonly viewBoxStr = computed(() => {
-    const v = this._viewBox();
-    return `${v.x} ${v.y} ${v.w} ${v.h}`;
-  });
-
-  /** True while a pointer-drag pan is in flight (toggles the grab cursor). */
-  readonly panning = signal(false);
-  /** Last pointer position during a pan, in CLIENT pixels. */
-  private panStart: { px: number; py: number } | null = null;
-  /** Measured SVG client size (for px→user-unit conversion). Updated on demand. */
-  private readonly clientSize = signal<{ w: number; h: number }>({
-    w: WORLD,
-    h: WORLD,
-  });
-
-  /** Canvas width/height ratio (for squaring the fit-box to the viewport). */
-  private readonly canvasAspect = computed(() => {
-    const cs = this.clientSize();
-    return cs.h > 0 ? cs.w / cs.h : 1.6;
-  });
-
-  /** True once the user has panned/zoomed — stops the auto-fit from stomping them. */
-  private touched = false;
-
-  constructor() {
-    // Measure the SVG once after first render so wheel/drag deltas convert from
-    // client px to user units accurately. afterNextRender — never setTimeout.
-    afterNextRender(() => this.measure(), { injector: this.injector });
-
-    // FIT-TO-VIEW: when the laid-out node bounding box changes (new data, or the
-    // first layout) and the user hasn't panned/zoomed yet, snap the viewBox to
-    // that bbox + padding so the nodes FILL the canvas instead of clustering in a
-    // corner of the 1000×1000 world. Reading `fitBox()` registers the dependency;
-    // this writes `_viewBox`, so allowSignalWrites is required (NG0600 guard).
-    effect(
-      () => {
-        const box = this.fitBox();
-        if (box && !this.touched) {
-          this._viewBox.set(box);
-        }
-      },
-      { allowSignalWrites: true },
-    );
-  }
+  private readonly scene = viewChild(NeuralSceneDirective);
 
   /**
-   * The tight bounding box of the laid-out nodes (their circles + labels),
-   * padded so nothing clips the canvas edge, and squared to the canvas aspect so
-   * the SVG's `preserveAspectRatio` doesn't letterbox it off-centre. Null while
-   * there are no nodes (nothing to fit). This is what fixes "4 dots in a corner":
-   * the initial view frames exactly the drawn graph, not the whole 1000×1000
-   * world the layout happens to seed into.
+   * The capped, laid-out nodes — a PURE function of {@link data}. Top-K by
+   * mention count (name tiebreak), Fibonacci-sphere seed, fixed-iteration 3-D
+   * force pass, ellipsoid normalisation, overlap relaxation. Deterministic:
+   * no `Math.random`, coincident points get hash-style index nudges.
    */
-  private readonly fitBox = computed<ViewBox | null>(() => {
-    const nodes = this.placedNodes();
-    if (nodes.length === 0) {
-      return null;
-    }
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const n of nodes) {
-      // Include the node radius AND its label (drawn below the dot).
-      minX = Math.min(minX, n.x - n.r);
-      minY = Math.min(minY, n.y - n.r);
-      maxX = Math.max(maxX, n.x + n.r);
-      maxY = Math.max(maxY, n.y + n.r + 20);
-    }
-    // Pad by a fraction of the larger span (min floor so a lone node isn't zoomed
-    // to fill the whole canvas).
-    const spanX = maxX - minX;
-    const spanY = maxY - minY;
-    const pad = Math.max(60, Math.max(spanX, spanY) * 0.12);
-    let x = minX - pad;
-    let y = minY - pad;
-    let w = spanX + pad * 2;
-    let h = spanY + pad * 2;
-    // Square to the ~viewport aspect (canvas is roughly landscape); grow the
-    // shorter axis so the fit stays centred and the whole graph is visible.
-    const aspect = this.canvasAspect();
-    if (w / h < aspect) {
-      const nw = h * aspect;
-      x -= (nw - w) / 2;
-      w = nw;
-    } else {
-      const nh = w / aspect;
-      y -= (nh - h) / 2;
-      h = nh;
-    }
-    return { x, y, w, h };
-  });
-
-  /**
-   * The capped, laid-out nodes. Pure function of {@link data}: take the top-K by
-   * mention count, seed them deterministically, then run a FIXED-iteration force
-   * pass synchronously. Cached by `computed`; no simulation loop.
-   */
-  protected readonly placedNodes = computed<PlacedNode[]>(() => {
+  protected readonly sceneNodes = computed<SceneNode[]>(() => {
     const d = this.data();
     if (!d || d.nodes.length === 0) {
       return [];
     }
 
-    // Deterministic order: most-mentioned first, name as a stable tiebreak.
+    // Deterministic order: most-mentioned first, name as a stable tiebreak
+    // (identical to the old SVG map — the parent's cap copy relies on it).
     const ordered = [...d.nodes].sort(
-      (a, b) =>
-        b.mentionCount - a.mentionCount || a.name.localeCompare(b.name),
+      (a, b) => b.mentionCount - a.mentionCount || a.name.localeCompare(b.name),
     );
     const nodes = ordered.slice(0, MAX_NODES);
     const n = nodes.length;
-    const ids = nodes.map((x) => x.id);
-    const idIndex = new Map(ids.map((id, i) => [id, i]));
+    const idIndex = new Map(nodes.map((x, i) => [x.id, i]));
 
-    // Mention-count → radius (10…34 user units), sqrt-scaled so big counts
-    // don't dominate. A lone node still reads.
+    // Mention-count → soma radius (8…26 world units), sqrt-scaled.
     const maxM = Math.max(1, ...nodes.map((x) => x.mentionCount));
     const radii = nodes.map(
-      (x) => 10 + (Math.sqrt(x.mentionCount) / Math.sqrt(maxM)) * 24,
+      (x) => 8 + (Math.sqrt(x.mentionCount) / Math.sqrt(maxM)) * 18,
     );
 
-    // SEED: golden-angle spiral, keyed by index → identical every render.
-    const cx = WORLD / 2;
-    const cy = WORLD / 2;
+    // SEED: Fibonacci sphere keyed by sort index → identical every render.
     const golden = Math.PI * (3 - Math.sqrt(5));
+    const seedR = WORLD * 0.3;
     const xs = new Float64Array(n);
     const ys = new Float64Array(n);
+    const zs = new Float64Array(n);
     for (let i = 0; i < n; i++) {
-      const radius = (WORLD * 0.42) * Math.sqrt((i + 0.5) / n);
-      const angle = i * golden;
-      xs[i] = cx + radius * Math.cos(angle);
-      ys[i] = cy + radius * Math.sin(angle);
+      const v = n === 1 ? 0 : 1 - (2 * (i + 0.5)) / n;
+      const ring = Math.sqrt(Math.max(0, 1 - v * v));
+      const ang = i * golden;
+      xs[i] = seedR * ring * Math.cos(ang);
+      ys[i] = seedR * v;
+      zs[i] = seedR * ring * Math.sin(ang);
     }
 
     // Only edges whose endpoints both survived the cap participate.
@@ -515,290 +386,425 @@ export class BrainMapComponent {
       (e) => idIndex.has(e.source) && idIndex.has(e.target),
     );
 
-    // Fruchterman-Reingold-ish constants. k = ideal edge length.
-    const area = WORLD * WORLD;
-    const k = Math.sqrt(area / Math.max(1, n)) * 0.62;
+    // Degree (connection count): attenuates hub springs below and rides along
+    // for tooltips + announcements.
+    const degree = new Map<string, number>();
+    for (const e of edges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+
+    // 3-D Fruchterman-Reingold. k (ideal spacing) is tuned UP vs the old flat
+    // map so the cloud SPREADS instead of clumping into one glowing blob.
+    const k = Math.cbrt((WORLD * WORLD * WORLD) / Math.max(1, n)) * 1.15;
     const k2 = k * k;
     let temp = WORLD * 0.16;
     const cool = temp / (ITERATIONS + 1);
-
-    const dispX = new Float64Array(n);
-    const dispY = new Float64Array(n);
+    const dx3 = new Float64Array(n);
+    const dy3 = new Float64Array(n);
+    const dz3 = new Float64Array(n);
 
     for (let iter = 0; iter < ITERATIONS; iter++) {
-      dispX.fill(0);
-      dispY.fill(0);
+      dx3.fill(0);
+      dy3.fill(0);
+      dz3.fill(0);
 
-      // Repulsion between every pair (n ≤ MAX_NODES so O(n²) is bounded).
+      // Pairwise repulsion (n ≤ MAX_NODES → O(n²) is bounded).
       for (let i = 0; i < n; i++) {
         for (let j = i + 1; j < n; j++) {
           let dx = xs[i] - xs[j];
           let dy = ys[i] - ys[j];
-          let dist2 = dx * dx + dy * dy;
-          if (dist2 < 0.01) {
-            // Deterministic nudge for coincident seeds (no Math.random).
+          let dz = zs[i] - zs[j];
+          let d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 < 0.01) {
+            // Deterministic nudge for coincident points (no Math.random).
             dx = ((i * 31 + j) % 7) - 3 + 0.5;
             dy = ((i * 17 + j) % 5) - 2 + 0.5;
-            dist2 = dx * dx + dy * dy;
+            dz = ((i * 13 + j) % 3) - 1 + 0.5;
+            d2 = dx * dx + dy * dy + dz * dz;
           }
-          const dist = Math.sqrt(dist2);
+          const dist = Math.sqrt(d2);
           const force = k2 / dist;
           const fx = (dx / dist) * force;
           const fy = (dy / dist) * force;
-          dispX[i] += fx;
-          dispY[i] += fy;
-          dispX[j] -= fx;
-          dispY[j] -= fy;
+          const fz = (dz / dist) * force;
+          dx3[i] += fx;
+          dy3[i] += fy;
+          dz3[i] += fz;
+          dx3[j] -= fx;
+          dy3[j] -= fy;
+          dz3[j] -= fz;
         }
       }
 
-      // Attraction along edges (spring), weighted by co-occurrence.
+      // Edge springs, log-weighted by co-occurrence and ATTENUATED at hubs
+      // (÷√min-degree): un-attenuated springs let high-degree nodes crush
+      // their whole neighbourhood into one caterpillar clump (R3).
       for (const e of edges) {
-        const i = idIndex.get(e.source)!;
-        const j = idIndex.get(e.target)!;
+        const i = idIndex.get(e.source) as number;
+        const j = idIndex.get(e.target) as number;
         const dx = xs[i] - xs[j];
         const dy = ys[i] - ys[j];
-        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        const dz = zs[i] - zs[j];
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
         const w = 1 + Math.log2(1 + e.weight);
-        const force = ((dist * dist) / k) * w;
+        const hub = Math.sqrt(
+          Math.min(degree.get(e.source) ?? 1, degree.get(e.target) ?? 1),
+        );
+        const force = ((dist * dist) / k) * (w / hub) * 0.85;
         const fx = (dx / dist) * force;
         const fy = (dy / dist) * force;
-        dispX[i] -= fx;
-        dispY[i] -= fy;
-        dispX[j] += fx;
-        dispY[j] += fy;
+        const fz = (dz / dist) * force;
+        dx3[i] -= fx;
+        dy3[i] -= fy;
+        dz3[i] -= fz;
+        dx3[j] += fx;
+        dy3[j] += fy;
+        dz3[j] += fz;
       }
 
-      // Apply displacement, capped by the cooling temperature; gentle pull to
-      // centre keeps disconnected components from drifting off-canvas.
+      // Apply, capped by the cooling temperature; gentle centre pull keeps
+      // disconnected components from drifting away (kept SMALL — a strong
+      // pull is what collapsed the old layout into a central blob).
       for (let i = 0; i < n; i++) {
-        const dlen = Math.sqrt(dispX[i] * dispX[i] + dispY[i] * dispY[i]) || 1;
-        xs[i] += (dispX[i] / dlen) * Math.min(dlen, temp);
-        ys[i] += (dispY[i] / dlen) * Math.min(dlen, temp);
-        xs[i] += (cx - xs[i]) * 0.012;
-        ys[i] += (cy - ys[i]) * 0.012;
+        const dl =
+          Math.sqrt(dx3[i] * dx3[i] + dy3[i] * dy3[i] + dz3[i] * dz3[i]) || 1;
+        const step = Math.min(dl, temp);
+        xs[i] += (dx3[i] / dl) * step;
+        ys[i] += (dy3[i] / dl) * step;
+        zs[i] += (dz3[i] / dl) * step;
+        xs[i] -= xs[i] * 0.004;
+        ys[i] -= ys[i] * 0.004;
+        zs[i] -= zs[i] * 0.004;
       }
       temp = Math.max(0, temp - cool);
     }
+
+    // FILL THE WORLD (R3 "the graph huddles in 20% of the canvas"): the FR
+    // equilibrium collapses dense components into a tight blob the camera then
+    // over-frames — and no affine per-axis rescale can spread a blob relative
+    // to its satellites. So remap RADIALLY: recentre on the centroid, keep
+    // each node's DIRECTION (the FR angular structure — clusters stay in
+    // their sector, hubs stay centremost) but reassign its DISTANCE by rank
+    // onto a uniform-density ball profile (r ∝ ∛rank), then squash into the
+    // brain-ish ellipsoid (y ×0.72, z ×0.85). The cloud now fills the world
+    // evenly for ANY graph shape. Fully deterministic.
+    let mx = 0;
+    let my = 0;
+    let mz = 0;
+    for (let i = 0; i < n; i++) {
+      mx += xs[i];
+      my += ys[i];
+      mz += zs[i];
+    }
+    mx /= n;
+    my /= n;
+    mz /= n;
+    for (let i = 0; i < n; i++) {
+      xs[i] -= mx;
+      ys[i] -= my;
+      zs[i] -= mz;
+    }
+    // PCA-ALIGN (R4 "the cloud reads as a centre column"): whatever shape the
+    // FR pass settles into, rotate it so its WIDEST principal axis lands on
+    // world-x (screen-horizontal) and the second-widest on world-z (the orbit
+    // plane) — the camera always faces the cloud's broadest silhouette.
+    // Deterministic power iteration on the 3×3 covariance; no Math.random.
+    if (n > 2) {
+      const c = [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+      ];
+      for (let i = 0; i < n; i++) {
+        c[0][0] += xs[i] * xs[i];
+        c[0][1] += xs[i] * ys[i];
+        c[0][2] += xs[i] * zs[i];
+        c[1][1] += ys[i] * ys[i];
+        c[1][2] += ys[i] * zs[i];
+        c[2][2] += zs[i] * zs[i];
+      }
+      c[1][0] = c[0][1];
+      c[2][0] = c[0][2];
+      c[2][1] = c[1][2];
+      const mul = (v: number[]): number[] => [
+        c[0][0] * v[0] + c[0][1] * v[1] + c[0][2] * v[2],
+        c[1][0] * v[0] + c[1][1] * v[1] + c[1][2] * v[2],
+        c[2][0] * v[0] + c[2][1] * v[1] + c[2][2] * v[2],
+      ];
+      const norm = (v: number[]): number =>
+        Math.hypot(v[0], v[1], v[2]) || 1;
+      const power = (seed: number[], ortho: number[] | null): number[] => {
+        let v = [...seed];
+        for (let it = 0; it < 40; it++) {
+          if (ortho) {
+            const d = v[0] * ortho[0] + v[1] * ortho[1] + v[2] * ortho[2];
+            v = [v[0] - d * ortho[0], v[1] - d * ortho[1], v[2] - d * ortho[2]];
+          }
+          const m = mul(v);
+          const l = norm(m);
+          if (l < 1e-9) {
+            break;
+          }
+          v = [m[0] / l, m[1] / l, m[2] / l];
+        }
+        const l = norm(v);
+        return [v[0] / l, v[1] / l, v[2] / l];
+      };
+      const v1 = power([1, 0.6, 0.3], null);
+      let v2 = power([0.3, 1, 0.6], v1);
+      const d12 = v2[0] * v1[0] + v2[1] * v1[1] + v2[2] * v1[2];
+      v2 = [v2[0] - d12 * v1[0], v2[1] - d12 * v1[1], v2[2] - d12 * v1[2]];
+      const l2 = norm(v2);
+      v2 = [v2[0] / l2, v2[1] / l2, v2[2] / l2];
+      const v3 = [
+        v1[1] * v2[2] - v1[2] * v2[1],
+        v1[2] * v2[0] - v1[0] * v2[2],
+        v1[0] * v2[1] - v1[1] * v2[0],
+      ];
+      for (let i = 0; i < n; i++) {
+        const px = xs[i];
+        const py = ys[i];
+        const pz = zs[i];
+        xs[i] = px * v1[0] + py * v1[1] + pz * v1[2]; // widest → screen-x
+        ys[i] = px * v3[0] + py * v3[1] + pz * v3[2]; // thinnest → vertical
+        zs[i] = px * v2[0] + py * v2[1] + pz * v2[2]; // 2nd → orbit depth
+      }
+    }
+
+    if (n > 1) {
+      const dists = Array.from({ length: n }, (_, i) =>
+        Math.hypot(xs[i], ys[i], zs[i]),
+      );
+      const order = Array.from({ length: n }, (_, i) => i).sort(
+        (a, b) => dists[a] - dists[b] || a - b,
+      );
+      for (let rank = 0; rank < n; rank++) {
+        const i = order[rank];
+        // Orphans/leaves (degree ≤ 1) are pulled 22% inward — un-compressed
+        // they stake out the frame corners and the connected mass huddles in
+        // the leftover space (design-panel R4 composition finding).
+        const deg = degree.get(nodes[i].id) ?? 0;
+        const target =
+          MAX_CLOUD_R * Math.cbrt((rank + 0.5) / n) * (deg <= 1 ? 0.78 : 1);
+        if (dists[i] < 1) {
+          // Centroid-coincident node: deterministic Fibonacci direction.
+          const v = 1 - (2 * (i + 0.5)) / n;
+          const ring = Math.sqrt(Math.max(0, 1 - v * v));
+          const ang = i * golden;
+          xs[i] = target * ring * Math.cos(ang);
+          ys[i] = target * v;
+          zs[i] = target * ring * Math.sin(ang);
+        } else {
+          const s = target / dists[i];
+          xs[i] *= s;
+          ys[i] *= s;
+          zs[i] *= s;
+        }
+      }
+      // PER-AXIS FILL (R4 "the cloud huddles in a centre column"): the rank
+      // remap preserves the FR *directions*, and those often cluster in one
+      // angular sector — leaving the cloud thin along an axis no radial map
+      // can widen. Normalise each axis's max extent onto the brain ellipsoid
+      // (x widest, y ×0.72, z ×0.85) so the bounding box always FILLS the
+      // frame; affine per axis, so clusters keep their relative structure.
+      let ex = 1;
+      let ey = 1;
+      let ez = 1;
+      for (let i = 0; i < n; i++) {
+        ex = Math.max(ex, Math.abs(xs[i]));
+        ey = Math.max(ey, Math.abs(ys[i]));
+        ez = Math.max(ez, Math.abs(zs[i]));
+      }
+      const fx = MAX_CLOUD_R / ex;
+      const fy = (MAX_CLOUD_R * 0.72) / ey;
+      const fz = (MAX_CLOUD_R * 0.85) / ez;
+      for (let i = 0; i < n; i++) {
+        xs[i] *= fx;
+        ys[i] *= fy;
+        zs[i] *= fz;
+      }
+    }
+
+    // OVERLAP RELAXATION: push any two somas apart until they keep a
+    // size-scaled clearance — no two neurons can fuse into one smear.
+    for (let pass = 0; pass < 40; pass++) {
+      let moved = false;
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          let dx = xs[i] - xs[j];
+          let dy = ys[i] - ys[j];
+          let dz = zs[i] - zs[j];
+          let dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          // Clearance scales with the SOMA SIZES: two big neurons carry big
+          // halos (2.6× r each), so a fixed gap let the hottest pair fuse
+          // into one blown-out clump (design-panel R4 washout finding).
+          const need = (radii[i] + radii[j]) * 2.1 + 26;
+          if (dist >= need) {
+            continue;
+          }
+          if (dist < 0.01) {
+            dx = ((i * 31 + j) % 7) - 3 + 0.5;
+            dy = ((i * 17 + j) % 5) - 2 + 0.5;
+            dz = ((i * 13 + j) % 3) - 1 + 0.5;
+            dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          }
+          const push = (need - dist) / 2 / dist;
+          xs[i] += dx * push;
+          ys[i] += dy * push;
+          zs[i] += dz * push;
+          xs[j] -= dx * push;
+          ys[j] -= dy * push;
+          zs[j] -= dz * push;
+          moved = true;
+        }
+      }
+      if (!moved) {
+        break;
+      }
+    }
+
+    // Keep the cloud inside MAX_CLOUD_R so the zoom clamps stay meaningful.
+    let bound = 1;
+    for (let i = 0; i < n; i++) {
+      bound = Math.max(
+        bound,
+        Math.sqrt(xs[i] * xs[i] + ys[i] * ys[i] + zs[i] * zs[i]) + radii[i],
+      );
+    }
+    const scale = bound > MAX_CLOUD_R ? MAX_CLOUD_R / bound : 1;
 
     return nodes.map((node, i) => ({
       id: node.id,
       name: node.name,
       kind: node.kind,
       mentionCount: node.mentionCount,
-      x: Math.round(xs[i] * 100) / 100,
-      y: Math.round(ys[i] * 100) / 100,
-      r: Math.round(radii[i] * 100) / 100,
+      degree: degree.get(node.id) ?? 0,
+      x: xs[i] * scale,
+      y: ys[i] * scale,
+      z: zs[i] * scale,
+      r: radii[i],
     }));
   });
 
-  /** Edges resolved to placed endpoints (only those between surviving nodes). */
-  protected readonly placedEdges = computed<PlacedEdge[]>(() => {
+  /** Edges between surviving nodes, with a stable key + raw weight. */
+  protected readonly sceneEdges = computed<SceneEdge[]>(() => {
     const d = this.data();
     if (!d) {
       return [];
     }
-    const pos = new Map(this.placedNodes().map((p) => [p.id, p]));
-    const maxW = Math.max(1, ...d.edges.map((e) => e.weight));
-    const out: PlacedEdge[] = [];
+    const ids = new Set(this.sceneNodes().map((p) => p.id));
+    const out: SceneEdge[] = [];
     for (const e of d.edges) {
-      const a = pos.get(e.source);
-      const b = pos.get(e.target);
-      if (!a || !b) {
-        continue;
+      if (ids.has(e.source) && ids.has(e.target)) {
+        out.push({
+          key: `${e.source}::${e.target}`,
+          source: e.source,
+          target: e.target,
+          weight: e.weight,
+        });
       }
-      const ratio = e.weight / maxW;
-      out.push({
-        key: `${e.source}::${e.target}`,
-        source: e.source,
-        target: e.target,
-        x1: a.x,
-        y1: a.y,
-        x2: b.x,
-        y2: b.y,
-        width: Math.round((0.8 + ratio * 4.2) * 100) / 100,
-        opacity: Math.round((0.22 + ratio * 0.5) * 100) / 100,
-      });
     }
     return out;
   });
 
-  /** Ids in the focused node's one-hop neighbourhood (the node + its peers). */
-  private readonly neighborhood = computed<Set<string> | null>(() => {
-    const sel = this.selectedId();
-    if (!sel) {
-      return null;
-    }
-    const set = new Set<string>([sel]);
-    for (const e of this.placedEdges()) {
-      if (e.source === sel) {
-        set.add(e.target);
-      } else if (e.target === sel) {
-        set.add(e.source);
-      }
-    }
-    return set;
-  });
-
   protected readonly ariaLabel = computed(() => {
-    const n = this.placedNodes().length;
+    const n = this.sceneNodes().length;
     if (n === 0) {
-      return "Brain map — empty.";
+      return "Neural brain map — empty.";
     }
-    return `Brain map of ${n} ${n === 1 ? "entity" : "entities"} and their connections. Scroll to zoom, drag to pan.`;
+    const e = this.sceneEdges().length;
+    return (
+      `Neural brain map of ${n} ${n === 1 ? "entity" : "entities"} and ` +
+      `${e} ${e === 1 ? "connection" : "connections"}. Arrow keys cycle ` +
+      `entities, Enter toggles selection, Escape clears.`
+    );
   });
 
-  protected isNodeDim(id: string): boolean {
-    const nb = this.neighborhood();
-    return nb !== null && !nb.has(id);
-  }
-
-  protected isEdgeDim(e: PlacedEdge): boolean {
-    const nb = this.neighborhood();
-    return nb !== null && !(nb.has(e.source) && nb.has(e.target));
-  }
-
-  protected nodeLabel(n: PlacedNode): string {
-    const kind = n.kind === "project" ? "Project" : "Person";
-    const m =
-      n.mentionCount === 1 ? "1 mention" : `${n.mentionCount} mentions`;
-    return `${n.name} — ${kind}, ${m}. Focus its connections.`;
-  }
+  protected readonly hint = computed(() =>
+    this.mode() === "3d"
+      ? "Drag to orbit · scroll to zoom · click a neuron to focus its connections."
+      : "Drag to pan · scroll to zoom · click a neuron to focus its connections.",
+  );
 
   // ── interaction ────────────────────────────────────────────────────────
 
-  protected onNodeClick(event: Event, id: string): void {
-    event.stopPropagation();
-    this.toggleSelect(id);
-  }
-
-  protected onNodeActivate(id: string): void {
-    this.toggleSelect(id);
-  }
-
-  protected onNodeSpace(event: Event, id: string): void {
-    event.preventDefault();
-    this.toggleSelect(id);
-  }
-
-  private toggleSelect(id: string): void {
-    this.selectedId.update((cur) => (cur === id ? null : id));
-  }
-
-  /** A bare canvas click (not on a node) clears the neighbourhood focus. */
-  protected onCanvasClick(event: Event): void {
-    // Node clicks stopPropagation, so anything reaching here is empty space.
-    if (event.target === this.canvas()?.nativeElement) {
-      this.selectedId.set(null);
+  /** Scene click: a node id toggles, empty space (null) clears. */
+  protected onPick(id: string | null): void {
+    if (id === null) {
+      this.clearSelection();
+    } else if (this.selectedId() === id) {
+      this.clearSelection();
+    } else {
+      this.select(id);
     }
   }
 
-  /** Wheel = zoom toward the cursor (clamped). */
-  protected onWheel(event: WheelEvent): void {
-    event.preventDefault();
-    this.touched = true;
-    const factor = event.deltaY > 0 ? 1.12 : 1 / 1.12;
-    this.zoomAt(event.clientX, event.clientY, factor);
-  }
-
-  protected onPointerDown(event: PointerEvent): void {
-    // Left button (or touch/pen) starts a pan; node clicks are handled
-    // separately and don't reach a meaningful pan because we record the start.
-    if (event.button !== 0) {
+  /** Keyboard a11y: arrows cycle in mention-rank order, Enter/Space toggles,
+   *  Escape clears. Rank order = sceneNodes order (already sorted). */
+  protected onCanvasKeydown(event: KeyboardEvent): void {
+    const nodes = this.sceneNodes();
+    if (nodes.length === 0) {
       return;
     }
-    this.touched = true;
-    this.measure();
-    this.panning.set(true);
-    this.panStart = { px: event.clientX, py: event.clientY };
-    (event.target as Element).setPointerCapture?.(event.pointerId);
-  }
-
-  protected onPointerMove(event: PointerEvent): void {
-    if (!this.panning() || !this.panStart) {
-      return;
-    }
-    const v = this._viewBox();
-    const cs = this.clientSize();
-    // Convert client-px delta → user-unit delta via the current scale.
-    const scaleX = v.w / Math.max(1, cs.w);
-    const scaleY = v.h / Math.max(1, cs.h);
-    const dx = (event.clientX - this.panStart.px) * scaleX;
-    const dy = (event.clientY - this.panStart.py) * scaleY;
-    this._viewBox.set({ x: v.x - dx, y: v.y - dy, w: v.w, h: v.h });
-    this.panStart = { px: event.clientX, py: event.clientY };
-  }
-
-  protected onPointerUp(event: PointerEvent): void {
-    this.panning.set(false);
-    this.panStart = null;
-    (event.target as Element).releasePointerCapture?.(event.pointerId);
-  }
-
-  /** Toolbar +/− : zoom about the viewBox centre. */
-  protected zoomBy(factor: number): void {
-    this.touched = true;
-    const v = this._viewBox();
-    const cx = v.x + v.w / 2;
-    const cy = v.y + v.h / 2;
-    this.applyZoom(cx, cy, factor);
-  }
-
-  /**
-   * Reset = re-fit to the laid-out graph (NOT the whole 1000×1000 world), so the
-   * nodes fill the canvas. Clears the `touched` flag so the auto-fit effect owns
-   * the view again. Falls back to the full world only when there is nothing to fit.
-   */
-  protected resetView(): void {
-    this.touched = false;
-    this.measure();
-    const box = this.fitBox();
-    this._viewBox.set(box ?? { x: 0, y: 0, w: WORLD, h: WORLD });
-  }
-
-  /** Zoom about a CLIENT (px) anchor — keeps the point under the cursor fixed. */
-  private zoomAt(clientX: number, clientY: number, factor: number): void {
-    const el = this.canvas()?.nativeElement;
-    if (!el) {
-      this.zoomBy(factor);
-      return;
-    }
-    const rect = el.getBoundingClientRect();
-    const v = this._viewBox();
-    const userX = v.x + ((clientX - rect.left) / Math.max(1, rect.width)) * v.w;
-    const userY = v.y + ((clientY - rect.top) / Math.max(1, rect.height)) * v.h;
-    this.applyZoom(userX, userY, factor);
-  }
-
-  /** Apply a clamped zoom about a USER-space anchor point. */
-  private applyZoom(anchorX: number, anchorY: number, factor: number): void {
-    const v = this._viewBox();
-    let newW = v.w * factor;
-    let newH = v.h * factor;
-    // Clamp width; keep the aspect by scaling height with the applied ratio.
-    const clampedW = Math.min(MAX_W, Math.max(MIN_W, newW));
-    const ratio = clampedW / newW;
-    newW = clampedW;
-    newH = newH * ratio;
-    // Keep the anchor point fixed on screen.
-    const tx = (anchorX - v.x) / v.w;
-    const ty = (anchorY - v.y) / v.h;
-    this._viewBox.set({
-      x: anchorX - tx * newW,
-      y: anchorY - ty * newH,
-      w: newW,
-      h: newH,
-    });
-  }
-
-  /** Cache the SVG's client size for px→user-unit conversion. */
-  private measure(): void {
-    const el = this.canvas()?.nativeElement;
-    if (el) {
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        this.clientSize.set({ w: rect.width, h: rect.height });
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      const cur = this.selectedId();
+      const idx = cur ? nodes.findIndex((x) => x.id === cur) : -1;
+      const next =
+        event.key === "ArrowRight"
+          ? (idx + 1) % nodes.length
+          : idx <= 0
+            ? nodes.length - 1
+            : idx - 1;
+      this.select(nodes[next].id);
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (this.selectedId()) {
+        this.clearSelection();
+      } else {
+        this.select(nodes[0].id);
       }
+    } else if (event.key === "Escape" && this.selectedId()) {
+      this.clearSelection();
     }
+  }
+
+  private select(id: string): void {
+    this.selectedId.set(id);
+    const node = this.sceneNodes().find((x) => x.id === id);
+    if (node) {
+      const kind = node.kind === "project" ? "Project" : "Person";
+      const m =
+        node.mentionCount === 1 ? "1 mention" : `${node.mentionCount} mentions`;
+      const c =
+        node.degree === 1 ? "1 connection" : `${node.degree} connections`;
+      this.announcement.set(`${node.name} — ${kind}, ${m}, ${c}.`);
+    }
+  }
+
+  private clearSelection(): void {
+    if (this.selectedId() !== null) {
+      this.selectedId.set(null);
+      this.announcement.set("Selection cleared.");
+    }
+  }
+
+  protected setMode(mode: "3d" | "2d"): void {
+    this.mode.set(mode);
+  }
+
+  protected zoomIn(): void {
+    this.scene()?.zoomBy(0.8);
+  }
+
+  protected zoomOut(): void {
+    this.scene()?.zoomBy(1.25);
+  }
+
+  /** Reset = re-fit the camera + clear the `touched` flag so auto-fit (and the
+   *  cinematic auto-rotate) own the view again — the old map's semantics. */
+  protected resetView(): void {
+    this.scene()?.resetView();
   }
 }
