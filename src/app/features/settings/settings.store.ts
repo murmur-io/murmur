@@ -32,6 +32,24 @@ const PROVIDER_CONNECTION_IDS: readonly string[] = [
   "gateway",
 ];
 
+/**
+ * Heuristic: does this string look like a filesystem PATH to a `.gguf` file
+ * (vs a bare registry id like `qwen3-14b`)? True when it contains a path
+ * separator, ends `.gguf` (case-insensitive), or starts with `~`. Drives which
+ * of the two mutually-exclusive brain-model controls a typed custom value fills
+ * (`brainModelPath` for a path, else `brainModelId`).
+ */
+export function looksLikeGgufPath(v: string): boolean {
+  const s = v.trim();
+  if (!s) return false;
+  return (
+    s.includes("/") ||
+    s.includes("\\") ||
+    s.startsWith("~") ||
+    s.toLowerCase().endsWith(".gguf")
+  );
+}
+
 /** Display names for the connection ids (matches the connection cards). */
 const CONNECTION_LABELS: Readonly<Record<string, string>> = {
   claude_code: "Claude Code",
@@ -116,8 +134,10 @@ export class SettingsStore {
     realtimeReactions: false,
     // Proactive brain (P2) — zero-egress recall cards while recording; default ON.
     proactiveHintsEnabled: true,
-    /** Custom GGUF model path (or registry id). Empty → null on save. */
+    /** Selected registry brain-model id. Empty → null on save. */
     brainModelId: "",
+    /** Explicit custom GGUF file PATH (wins over brainModelId). Empty → null on save. */
+    brainModelPath: "",
     // brain2 RAG — semantic-search master flag (round-tripped on save).
     semanticSearchEnabled: false,
     // brain2 connectors — web-search master toggle (NEW EGRESS; round-tripped).
@@ -707,6 +727,44 @@ export class SettingsStore {
   /** Release handle for the EVENT_BRAIN_DOWNLOAD subscription. */
   private unlistenBrainDownload: UnlistenFn | null = null;
 
+  /**
+   * Live signals of the two custom-GGUF controls — the same `valueChanges`
+   * bridge as the role controls above — so `customGgufValue` re-derives when
+   * either is patched (from load(), a registry pick, or the shared input).
+   */
+  private readonly _brainModelIdValue = toSignal(
+    this.form.controls.brainModelId.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+  private readonly _brainModelPathValue = toSignal(
+    this.form.controls.brainModelPath.valueChanges.pipe(startWith("")),
+    { initialValue: "" },
+  );
+
+  /**
+   * The single value shown in the shared "Custom GGUF model" input: the explicit
+   * custom PATH when one is set, otherwise the registry id. The input drives BOTH
+   * `brainModelPath` and `brainModelId` via `setCustomGguf`, so it can't be a
+   * plain `formControlName` — this computed is its `[value]`.
+   */
+  readonly customGgufValue = computed(
+    () => this._brainModelPathValue() || this._brainModelIdValue(),
+  );
+
+  /**
+   * Route a typed custom value to the RIGHT control by shape and clear the other,
+   * keeping `brainModelPath` (a file path, honored verbatim) and `brainModelId`
+   * (a validated registry id) mutually exclusive. A path-shaped value fills
+   * `brainModelPath`; anything else fills `brainModelId`.
+   */
+  setCustomGguf(v: string): void {
+    const isPath = looksLikeGgufPath(v);
+    this.form.patchValue({
+      brainModelPath: isPath ? v : "",
+      brainModelId: isPath ? "" : v,
+    });
+  }
+
   // ── brain2 RAG — semantic search (embedding model + reindex) ────────────
 
   /**
@@ -792,6 +850,7 @@ export class SettingsStore {
         realtimeReactions: cfg.realtimeReactions ?? false,
         proactiveHintsEnabled: cfg.proactiveHintsEnabled ?? true,
         brainModelId: cfg.brainModelId ?? "",
+        brainModelPath: cfg.brainModelPath ?? "",
         semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
         webSearchEnabled: cfg.webSearchEnabled ?? false,
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
@@ -924,7 +983,9 @@ export class SettingsStore {
     this._brainError.set(null);
     try {
       await this.ipc.selectBrainModel(id);
-      this.form.patchValue({ brainModelId: id });
+      // Clear any custom PATH: it wins over the id in resolve_brain_model, so a
+      // stale path would silently override the registry model just picked.
+      this.form.patchValue({ brainModelId: id, brainModelPath: "" });
       await this.refreshBrainModels();
     } catch (e) {
       this._brainError.set(String(e));
@@ -1063,6 +1124,8 @@ export class SettingsStore {
       // Proactive brain hints — round-tripped so a save preserves the mute.
       proactiveHintsEnabled: v.proactiveHintsEnabled,
       brainModelId: v.brainModelId || null,
+      // A custom GGUF file path (settable; wins over brainModelId in the resolver).
+      brainModelPath: v.brainModelPath || null,
       // brain2 RAG — semantic-search master flag (round-tripped so a save preserves it).
       semanticSearchEnabled: v.semanticSearchEnabled,
       // brain2 connectors — web-search toggle is settable from the form; its consent

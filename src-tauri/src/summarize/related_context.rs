@@ -204,15 +204,7 @@ mod tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn temp_db() -> Db {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "meetnotes-relctx-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path("meetnotes-relctx-test", "sqlite");
         Db::open_with_key(&p, TEST_DEK).unwrap()
     }
 

@@ -1659,15 +1659,7 @@ mod tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn tmp_db(tag: &str) -> crate::storage::Db {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-live-gate-{tag}-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path(&format!("murmur-live-gate-{tag}"), "sqlite");
         let _ = std::fs::remove_file(&p);
         crate::storage::Db::open_with_key(&p, TEST_DEK).unwrap()
     }

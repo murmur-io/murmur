@@ -139,6 +139,14 @@ pub struct AppConfigDto {
     /// bogus model id. `select_brain_model` remains the other supported mutator.
     #[serde(default)]
     pub brain_model_id: Option<String>,
+    /// Phase H — a CUSTOM on-device brain model file path (a `.gguf` NOT in the registry). Settable
+    /// from the DTO (the "Custom GGUF model" input, sent as camelCase `brainModelPath`). Unlike
+    /// `brain_model_id` this is stored VERBATIM (a local file path, not a registry id) — `dto_to_config`
+    /// only normalizes empty→`None` (clears the custom path). `resolve_brain_model` (reason.rs) prefers
+    /// this path when it points at an existing file and falls back safely to the registry id / cloud if
+    /// the file is gone, so a stale path can never break load. Not egress — a local file, not a network.
+    #[serde(default)]
+    pub brain_model_path: Option<String>,
     /// brain2 RAG — the SEMANTIC SEARCH master flag. Settable from the DTO (the Settings UI owns the
     /// toggle), unlike `cloud_egress_consented` which is preserved-only. Plain bool; an omitted value
     /// deserializes to `false` (`#[serde(default)]`), so a partial/older save can never silently
@@ -2264,15 +2272,7 @@ mod ask_vault_tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn tmp_db() -> Db {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-askvault-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path("murmur-askvault", "sqlite");
         Db::open_with_key(&p, TEST_DEK).unwrap()
     }
 
@@ -3115,6 +3115,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         brain_backend: c.brain_backend,
         realtime_reactions: c.realtime_reactions,
         brain_model_id: c.brain_model_id.clone(),
+        brain_model_path: c.brain_model_path.clone(),
         semantic_search_enabled: c.semantic_search_enabled,
         web_search_enabled: c.web_search_enabled,
         // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
@@ -3196,9 +3197,16 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
         // `cloud_egress_consented` (preserved-only), this one is settable.
         semantic_search_enabled: d.semantic_search_enabled,
-        // Phase B: the brain model path is not carried on the settings DTO (it is resolved from the
-        // shared models dir by default), so a settings save preserves the live value (default None).
-        brain_model_path: current.brain_model_path.clone(),
+        // Phase H (custom GGUF): a CUSTOM brain model file path IS carried on the settings DTO (the
+        // "Custom GGUF model" input, camelCase `brainModelPath`). Unlike `brain_model_id` there is NO
+        // registry validation — it is a local file path, stored VERBATIM. An empty/absent value clears
+        // it (→ None, i.e. fall back to the registry id). `resolve_brain_model` (reason.rs) validates
+        // the file's existence at load and falls back safely if the path is stale, so a bad/removed
+        // path can never break startup.
+        brain_model_path: match d.brain_model_path.as_deref() {
+            Some(p) if !p.is_empty() => d.brain_model_path.clone(),
+            _ => None,
+        },
         // Phase H (registry): the selected brain model id IS carried on the settings DTO, but it is
         // VALIDATED against the registry first. A `Some(known-id)` is taken; an unknown id or `None`
         // is IGNORED — the live selection is preserved (no error, no bogus id stored). This mirrors
@@ -6505,15 +6513,7 @@ mod lifecycle_tests {
     }
 
     fn tmp_db_path(tag: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-lifecycle-{tag}-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path(&format!("murmur-lifecycle-{tag}"), "sqlite");
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -7800,6 +7800,50 @@ mod lifecycle_tests {
             dto_to_config(dto_none, &current_some).brain_model_id.as_deref(),
             Some("qwen3-14b")
         );
+
+        // (d) FIX D: a CUSTOM brain_model_path IS settable verbatim (no registry validation — it's a
+        // local file path). It round-trips OUT (config_to_dto) and IN (dto_to_config) unchanged, even
+        // while a bogus brain_model_id is (correctly) ignored on the same save.
+        let cfg_with_path = AppConfig {
+            brain_model_path: Some("/models/custom.gguf".to_string()),
+            ..AppConfig::default()
+        };
+        let dto_path = config_to_dto(&cfg_with_path);
+        assert_eq!(
+            dto_path.brain_model_path.as_deref(),
+            Some("/models/custom.gguf"),
+            "config_to_dto carries the custom path OUT to the FE"
+        );
+        let merged_path = dto_to_config(dto_path, &AppConfig::default());
+        assert_eq!(
+            merged_path.brain_model_path.as_deref(),
+            Some("/models/custom.gguf"),
+            "dto_to_config stores the custom path verbatim (settable, not preserve-only)"
+        );
+
+        // (e) an EMPTY brainModelPath clears the custom path (→ None, fall back to the registry id).
+        let mut dto_empty = config_to_dto(&AppConfig::default());
+        dto_empty.brain_model_path = Some(String::new());
+        let current_path = AppConfig {
+            brain_model_path: Some("/models/old.gguf".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            dto_to_config(dto_empty, &current_path).brain_model_path, None,
+            "an empty brainModelPath clears the custom path"
+        );
+
+        // (f) the FE sends camelCase `brainModelPath`; it must deserialize into the field (and an
+        // omitted value defaults to None). Same minimal-but-valid JSON shape as case (c) below.
+        let json_path = r#"{
+            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "brainModelPath":"/m/x.gguf"
+        }"#;
+        let parsed: AppConfigDto = serde_json::from_str(json_path).unwrap();
+        assert_eq!(parsed.brain_model_path.as_deref(), Some("/m/x.gguf"));
 
         // (c) an unknown/omitted brainBackend token deserializes to the default Cloud (no crash),
         // then flows through dto_to_config as Cloud.

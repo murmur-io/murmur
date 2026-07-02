@@ -430,15 +430,7 @@ mod tests {
     /// both the legacy factory AND the role resolver refuse with `Unavailable`.
     #[test]
     fn cloud_providers_refused_after_consent_revoked() {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "meetnotes-revoke-gate-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path("meetnotes-revoke-gate-test", "sqlite");
         // Explicit key (NOT the Keychain) — Db::open would prompt/block in a test binary.
         let db = crate::storage::Db::open_with_key(
             &p,
