@@ -124,10 +124,21 @@ export interface AppConfigDto {
   realtimeReactions: boolean;
   /**
    * Phase H — the selected local brain model id (a registry id like
-   * `"bielik-11b"`, or a custom GGUF file path). Only meaningful when
-   * `brainBackend === "local"`. Null = none selected yet.
+   * `"bielik-11b"`). Only meaningful when `brainBackend === "local"`. Null =
+   * none selected yet. A custom GGUF FILE PATH goes in `brainModelPath` (below),
+   * NOT here — the backend validates this against the fixed registry and
+   * discards a typed non-registry value.
    */
   brainModelId: string | null;
+  /**
+   * An explicit custom GGUF FILE PATH the resolver honors verbatim (bypasses the
+   * `brainModelId` registry validation). Settable and round-tripped on every
+   * `save_config`; empty → null. When set it WINS over `brainModelId` in the
+   * backend's `resolve_brain_model`, so the two are mutually exclusive from the
+   * UI (picking a registry model clears the path; typing a path clears the id).
+   * Mirrors Rust `AppConfigDto.brain_model_path`.
+   */
+  brainModelPath: string | null;
   /**
    * brain2 RAG — the semantic-search master flag. When on, Ask-My-Vault retrieves
    * candidates by HYBRID (FTS ∪ vector-KNN) retrieval over the on-device embedding

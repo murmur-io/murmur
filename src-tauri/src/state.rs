@@ -383,15 +383,7 @@ mod tests {
     }
 
     fn tmp_path(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "murmur-state-{tag}-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::storage::db::unique_temp_path(&format!("murmur-state-{tag}"), "sqlite");
         let _ = std::fs::remove_file(&p);
         p
     }
