@@ -11,6 +11,7 @@ import {
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 import { IpcService } from "../../core/ipc.service";
+import { NavHistoryService } from "../../core/nav-history.service";
 import type {
   FolderNode,
   Meeting,
@@ -40,6 +41,10 @@ interface SnippetPart {
   selector: "app-library",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  // Esc in Meetings backs out ("← Murmur") — but NOT while you're typing: in the
+  // search box Esc clears/blurs it first, and it never hijacks another form field.
+  // Declarative host listener — Angular owns its lifecycle (mirrors settings).
+  host: { "(document:keydown.escape)": "onEscape()" },
   imports: [
     RouterLink,
     FolderTreeComponent,
@@ -49,7 +54,33 @@ interface SnippetPart {
   template: `
     <section class="library">
       <!-- ============ LEFT PANE — folder tree (lock-aware) ============ -->
-      <aside class="folders-pane card" aria-label="Folders">
+      <aside class="folders-pane" aria-label="Folders">
+        <!-- Drag strip mirrors the primary rail so the overlay traffic lights
+             stay clear of the Back button when the rail is flush to the edge. -->
+        <div class="rail-drag" data-tauri-drag-region></div>
+
+        <!-- Drill-down "up": returns to the last non-drill-down route (or /record). -->
+        <button
+          type="button"
+          class="rail-back"
+          (click)="nav.back()"
+          aria-label="Back to Murmur"
+        >
+          <svg
+            class="rail-back-icon"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M9.5 3.5 5 8l4.5 4.5" />
+          </svg>
+          <span class="rail-back-label">Murmur</span>
+        </button>
+
         <div class="folders-head">
           <h3 class="folders-title">Folders</h3>
           @if (unlockedCount() > 0) {
@@ -90,16 +121,18 @@ interface SnippetPart {
             </button>
           }
         </div>
-        @if (foldersLoading()) {
-          <p class="folders-state empty">Loading folders…</p>
-        } @else {
-          <app-folder-tree
-            [nodes]="folderTree()"
-            [selectedId]="activeFolderId()"
-            (select)="selectFolder($event)"
-            (dropNote)="onDropNote($event)"
-          />
-        }
+        <div class="folders-body">
+          @if (foldersLoading()) {
+            <p class="folders-state empty">Loading folders…</p>
+          } @else {
+            <app-folder-tree
+              [nodes]="folderTree()"
+              [selectedId]="activeFolderId()"
+              (select)="selectFolder($event)"
+              (dropNote)="onDropNote($event)"
+            />
+          }
+        </div>
       </aside>
 
       <!-- ============ RIGHT PANE — search, filters, meeting list ============ -->
@@ -134,7 +167,6 @@ interface SnippetPart {
             aria-label="Search meetings"
             [value]="query()"
             (input)="onQueryInput($event)"
-            (keydown.escape)="clear()"
           />
           @if (query()) {
             <button
@@ -581,26 +613,111 @@ interface SnippetPart {
   `,
   styles: [
     `
-      /* Two-pane: folder tree (left) + meeting list (right). Collapses to a
-         single column on narrow widths so the list never gets squeezed. */
+      /* Meetings is a full drill-down (L2): app-shell hides the primary rail and
+         this fixed host fills the window as a flush-left [folders rail | content]
+         layout, below the toast viewport (z 60). Mirrors settings.component. */
+      :host {
+        position: fixed;
+        inset: 0;
+        z-index: 5;
+        display: block;
+        background: var(--surface-base);
+      }
+
+      /* Two-pane shell: full-height folders rail + scrolling meetings content.
+         Collapses to stacked rows on narrow widths so the list never squeezes. */
       .library {
         display: grid;
-        grid-template-columns: minmax(200px, 248px) minmax(0, 1fr);
-        align-items: start;
-        gap: var(--space-5);
+        grid-template-columns: 248px minmax(0, 1fr);
+        height: 100vh;
+        height: 100dvh;
       }
-      @media (max-width: 720px) {
-        .library {
-          grid-template-columns: 1fr;
+
+      /* --- Left pane: folder tree (lock-aware) ---
+         A first-class full-height column flush to the window edge, same visual
+         weight as the primary rail it replaces (frosted in-flow chrome, right
+         border, NOT a floating card). Mirrors .settings-sidebar. */
+      .folders-pane {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        height: 100%;
+        padding: 0 var(--space-3) var(--space-4);
+        background: var(--surface-raised);
+        -webkit-backdrop-filter: blur(var(--glass-blur))
+          saturate(var(--glass-saturate));
+        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+        border-right: 1px solid var(--border-subtle);
+        box-shadow: var(--glass-highlight);
+        overflow: hidden;
+        animation: library-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+      }
+
+      /* Enter transition — rail + meetings pane share ONE eased glide (content
+         lags 40ms). TRANSFORM ONLY, never opacity: the fixed :host is opaque
+         near-black (--surface-base), so an opacity fade would flash black then
+         jump the UI in (the bug fixed for settings). Painted opaque from frame 1,
+         it just settles into place. Disabled under reduced-motion below. */
+      @keyframes library-enter {
+        from {
+          transform: translateY(8px);
+        }
+        to {
+          transform: none;
         }
       }
 
-      /* --- Left pane: folder tree (lock-aware) --- */
-      .folders-pane {
-        position: sticky;
-        top: 0;
-        padding: var(--space-3);
+      /* Top drag strip — mirrors the primary rail so the overlay traffic lights
+         have somewhere to float and the window stays draggable up here. */
+      .rail-drag {
+        flex: none;
+        height: 30px;
       }
+
+      /* "← Murmur" drill-down up-affordance. */
+      .rail-back {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        width: 100%;
+        height: 34px;
+        padding: 0 var(--space-2);
+        border: 0;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--text-secondary);
+        font: inherit;
+        font-size: 0.9rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          background var(--transition-fast),
+          color var(--transition-fast);
+      }
+      .rail-back:hover {
+        background: var(--surface-hover);
+        color: var(--text-primary);
+      }
+      .rail-back:focus-visible {
+        outline: none;
+        color: var(--text-primary);
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .rail-back-icon {
+        flex: none;
+        width: 16px;
+        height: 16px;
+      }
+
+      /* Folder tree scrolls independently within the fixed full-height rail. */
+      .folders-body {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+      }
+
       .folders-head {
         display: flex;
         align-items: center;
@@ -657,12 +774,18 @@ interface SnippetPart {
         font-size: 0.8125rem;
       }
 
-      /* --- Right pane: stacks search, filters and the list --- */
+      /* --- Right pane: stacks search, filters and the list ---
+         Scrolls independently, with its own padding (no longer inside .app-main's
+         padded column). Shares the rail's transform-only glide (40ms lag). */
       .meetings-pane {
         display: flex;
         flex-direction: column;
         gap: var(--space-5);
         min-width: 0;
+        height: 100%;
+        overflow-y: auto;
+        padding: var(--space-6) var(--space-6) var(--space-8);
+        animation: library-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) 40ms both;
       }
 
       /* Masked title for a locked-folder note (hidden until session-unlock). */
@@ -774,11 +897,6 @@ interface SnippetPart {
         z-index: 40;
         animation: rise 160ms var(--transition) both;
       }
-      @media (prefers-reduced-motion: reduce) {
-        .move-anchor {
-          animation: none;
-        }
-      }
 
       /* --- Drag source: dim the row being dragged for a tidy affordance ---- */
       .row-item.is-dragging {
@@ -810,11 +928,6 @@ interface SnippetPart {
         white-space: nowrap;
         vertical-align: baseline;
       }
-      @media (prefers-reduced-motion: reduce) {
-        .empty-illo {
-          animation: none;
-        }
-      }
       .title--masked {
         color: var(--text-muted);
         letter-spacing: 0.12em;
@@ -833,10 +946,13 @@ interface SnippetPart {
         white-space: nowrap;
       }
 
-      /* --- Frosted search field (pinned, sticky to the scroll top) --- */
+      /* --- Frosted search field (pinned, sticky to the scroll top) ---
+         Sticks flush to the top of the meetings pane's scroll area; the negative
+         top pulls it over the pane's own top padding so it hugs the edge as the
+         list scrolls beneath it. */
       .search {
         position: sticky;
-        top: 0;
+        top: calc(var(--space-6) * -1);
         z-index: 5;
         display: flex;
         align-items: center;
@@ -1229,6 +1345,38 @@ interface SnippetPart {
           transform: rotate(360deg);
         }
       }
+
+      /* Narrow widths: stack the folders rail on top of the meetings content
+         (rows), each scrolling within the fixed full-height shell. Mirrors the
+         settings drill-down's narrow layout. */
+      @media (max-width: 720px) {
+        .library {
+          grid-template-columns: 1fr;
+          grid-template-rows: auto minmax(0, 1fr);
+        }
+        .folders-pane {
+          border-right: 0;
+          border-bottom: 1px solid var(--border-subtle);
+        }
+        .meetings-pane {
+          padding: var(--space-5) var(--space-4) var(--space-6);
+        }
+        .search {
+          top: calc(var(--space-5) * -1);
+        }
+      }
+
+      /* Honor reduced-motion everywhere: no rail slide / content stagger (the
+         surface is opaque from frame 1, so entry is instant with no flash), and
+         no in-flow rise on the popover / empty illustration. */
+      @media (prefers-reduced-motion: reduce) {
+        .folders-pane,
+        .meetings-pane,
+        .move-anchor,
+        .empty-illo {
+          animation: none;
+        }
+      }
     `,
   ],
 })
@@ -1238,6 +1386,32 @@ export class LibraryComponent implements OnInit {
   private readonly folders = inject(FoldersService);
   private readonly drag = inject(NoteDragService);
   private readonly toast = inject(ToastService);
+
+  /** Drill-down back navigation ("← Murmur" + Esc) — no library state coupling. */
+  readonly nav = inject(NavHistoryService);
+
+  /**
+   * Esc while in Meetings. Backs out to where you came from — EXCEPT while you're
+   * typing: in the search box the first Esc clears it (or blurs when empty), and
+   * Esc is ignored inside any other form field, so it never ejects you mid-edit.
+   * Mirrors settings.component's onEscape.
+   */
+  onEscape(): void {
+    const el = document.activeElement as HTMLElement | null;
+    if (el?.classList.contains("search-input")) {
+      if (this.query().trim()) {
+        this.clear();
+      } else {
+        el.blur();
+      }
+      return;
+    }
+    const tag = el?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+      return;
+    }
+    this.nav.back();
+  }
 
   /** The meeting id whose "Move to…" folder-chip popover is open (null = none). */
   readonly movePopoverId = signal<string | null>(null);

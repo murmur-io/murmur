@@ -15,6 +15,7 @@ import {
   RouterOutlet,
 } from "@angular/router";
 import { filter, map } from "rxjs";
+import { isDrilldownRoute } from "./core/nav-history.service";
 import { FoldersService } from "./services/folders.service";
 import { ToastService, type Toast } from "./services/toast.service";
 
@@ -52,10 +53,11 @@ interface NavItem {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterOutlet, RouterLink, RouterLinkActive],
   template: `
-    <!-- Primary rail is HIDDEN under /settings: settings drills down to its own
-         two-column [section rail | content] layout (see settings.component). The
-         @if removes the aside from the DOM so the outlet's flex row fills. -->
-    @if (!inSettings()) {
+    <!-- Primary rail is HIDDEN under any drill-down route (/settings, /library):
+         each drills down to its own two-column [rail | content] layout (see
+         settings.component / library.component). The @if removes the aside from
+         the DOM so the outlet's flex row fills. -->
+    @if (!inDrilldown()) {
     <aside class="app-sidebar" [class.collapsed]="collapsed()">
       <!-- Top drag strip: reserves room for the overlay traffic lights and lets
            the user move the window (data-tauri-drag-region). Empty on purpose so
@@ -275,9 +277,9 @@ export class AppShellComponent {
 
   /**
    * The current URL, updated on every completed navigation. Seeded from
-   * `router.url` so `inSettings` is correct on a cold deep-link to `/settings`
-   * (before the first `NavigationEnd`). The subscription is framework-managed by
-   * `toSignal` — no hand-rolled `.subscribe()`.
+   * `router.url` so `inDrilldown` is correct on a cold deep-link to a drill-down
+   * route (before the first `NavigationEnd`). The subscription is framework-
+   * managed by `toSignal` — no hand-rolled `.subscribe()`.
    */
   private readonly currentUrl = toSignal(
     this.router.events.pipe(
@@ -288,11 +290,13 @@ export class AppShellComponent {
   );
 
   /**
-   * True while on any `/settings*` route. When true the primary rail is removed
-   * from the DOM so the settings drill-down owns the full width with its own
-   * two-column layout.
+   * True while on any drill-down route (`/settings*`, `/library*`). When true the
+   * primary rail is removed from the DOM so the drill-down owns the full width
+   * with its own two-column layout. Shares `isDrilldownRoute` with
+   * NavHistoryService so the rail-hide and the "← Murmur" back target stay in
+   * lockstep.
    */
-  readonly inSettings = computed(() => this.currentUrl().startsWith("/settings"));
+  readonly inDrilldown = computed(() => isDrilldownRoute(this.currentUrl()));
 
   /** Primary sidebar destinations (Settings lives in the footer as its own icon). */
   readonly navItems: readonly NavItem[] = [
