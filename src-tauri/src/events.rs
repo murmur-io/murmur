@@ -221,3 +221,17 @@ pub struct StatusPayload {
     pub message: String,
     pub meeting_id: Option<String>,
 }
+
+/// Emitted once after transcription when the cross-stream echo dedup removed ≥1 mic-echo
+/// segment (the user recorded on speakers). Counts only — NO PII. The FE shows a toast
+/// recommending headphones.
+pub const EVENT_ECHO_SUPPRESSED: &str = "murmur://echo-suppressed";
+
+/// Payload for [`EVENT_ECHO_SUPPRESSED`]. Counts only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EchoSuppressedPayload {
+    /// Number of mic-echo segments removed from the transcript.
+    pub suppressed: usize,
+    pub meeting_id: String,
+}
