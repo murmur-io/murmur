@@ -258,18 +258,24 @@ mod tests {
         assert!(egress_is_cloud(PROVIDER_ANTHROPIC, &cfg));
 
         // ollama with default loopback URL is NOT cloud.
-        let mut local_cfg = AppConfig::default();
-        local_cfg.ollama_base_url = "http://localhost:11434".into();
+        let local_cfg = AppConfig {
+            ollama_base_url: "http://localhost:11434".into(),
+            ..AppConfig::default()
+        };
         assert!(!egress_is_cloud(PROVIDER_OLLAMA, &local_cfg));
 
         // ollama with a remote URL IS cloud.
-        let mut remote_cfg = AppConfig::default();
-        remote_cfg.ollama_base_url = "https://ollama.remote.example/api".into();
+        let remote_cfg = AppConfig {
+            ollama_base_url: "https://ollama.remote.example/api".into(),
+            ..AppConfig::default()
+        };
         assert!(egress_is_cloud(PROVIDER_OLLAMA, &remote_cfg));
 
         // ollama with an unparseable URL fails safe (treated as cloud).
-        let mut bad_cfg = AppConfig::default();
-        bad_cfg.ollama_base_url = "not a url".into();
+        let bad_cfg = AppConfig {
+            ollama_base_url: "not a url".into(),
+            ..AppConfig::default()
+        };
         assert!(egress_is_cloud(PROVIDER_OLLAMA, &bad_cfg));
 
         // Unknown provider ids default to cloud (fail-safe).
@@ -278,9 +284,11 @@ mod tests {
 
     #[test]
     fn remote_ollama_requires_consent() {
-        let mut cfg = AppConfig::default();
-        cfg.ollama_base_url = "https://ollama.remote.example/api".into();
-        cfg.cloud_egress_consented = false;
+        let cfg = AppConfig {
+            ollama_base_url: "https://ollama.remote.example/api".into(),
+            cloud_egress_consented: false,
+            ..AppConfig::default()
+        };
         let res = make_provider(PROVIDER_OLLAMA, &cfg);
         assert!(
             matches!(res, Err(crate::error::AppError::Unavailable(_))),
@@ -290,9 +298,11 @@ mod tests {
 
     #[test]
     fn local_ollama_stays_unwrapped_and_ungated() {
-        let mut cfg = AppConfig::default();
-        cfg.ollama_base_url = "http://localhost:11434".into();
-        cfg.cloud_egress_consented = false;
+        let cfg = AppConfig {
+            ollama_base_url: "http://localhost:11434".into(),
+            cloud_egress_consented: false,
+            ..AppConfig::default()
+        };
         // local ollama must build without consent
         assert!(make_provider(PROVIDER_OLLAMA, &cfg).is_ok());
     }
@@ -346,12 +356,14 @@ mod tests {
     /// R1 — gateway is refused when cloud-egress consent has not been granted.
     #[test]
     fn gateway_refused_without_consent() {
-        let mut c = AppConfig::default();
-        c.gateway_base_url = "https://gw.example.com/v1".into();
-        c.cloud_egress_consented = false;
+        let c = AppConfig {
+            gateway_base_url: "https://gw.example.com/v1".into(),
+            cloud_egress_consented: false,
+            ..AppConfig::default()
+        };
         let err = make_provider(PROVIDER_GATEWAY, &c)
-            .err()
-            .expect("expected Err for gateway without consent");
+            .map(|_| ())
+            .expect_err("expected Err for gateway without consent");
         assert!(
             matches!(err, crate::error::AppError::Unavailable(_)),
             "expected Unavailable, got: {err}"
@@ -364,9 +376,11 @@ mod tests {
     /// tests in redact.rs and by the lock-security-reviewer audit.)
     #[test]
     fn gateway_localhost_is_still_redaction_wrapped() {
-        let mut c = AppConfig::default();
-        c.gateway_base_url = "http://127.0.0.1:4000/v1".into();
-        c.cloud_egress_consented = true;
+        let c = AppConfig {
+            gateway_base_url: "http://127.0.0.1:4000/v1".into(),
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
         // Must build without error — the make_provider consent gate + URL validation passed.
         assert!(
             make_provider(PROVIDER_GATEWAY, &c).is_ok(),
@@ -377,12 +391,14 @@ mod tests {
     /// R4 — a remote http:// URL is rejected at provider-construction time (InvalidArg).
     #[test]
     fn gateway_remote_http_rejected() {
-        let mut c = AppConfig::default();
-        c.gateway_base_url = "http://gw.example.com/v1".into();
-        c.cloud_egress_consented = true;
+        let c = AppConfig {
+            gateway_base_url: "http://gw.example.com/v1".into(),
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
         let err = make_provider(PROVIDER_GATEWAY, &c)
-            .err()
-            .expect("expected Err for remote http gateway");
+            .map(|_| ())
+            .expect_err("expected Err for remote http gateway");
         assert!(
             matches!(err, crate::error::AppError::InvalidArg(_)),
             "expected InvalidArg for remote http://, got: {err}"
@@ -392,12 +408,14 @@ mod tests {
     /// Empty base URL → InvalidArg (before even trying to validate the URL).
     #[test]
     fn gateway_empty_url_rejected() {
-        let mut c = AppConfig::default();
-        c.gateway_base_url = String::new(); // empty — not set
-        c.cloud_egress_consented = true;
+        let c = AppConfig {
+            gateway_base_url: String::new(), // empty — not set
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
         let err = make_provider(PROVIDER_GATEWAY, &c)
-            .err()
-            .expect("expected Err for empty gateway URL");
+            .map(|_| ())
+            .expect_err("expected Err for empty gateway URL");
         assert!(
             matches!(err, crate::error::AppError::InvalidArg(_)),
             "expected InvalidArg for empty URL, got: {err}"
@@ -412,8 +430,10 @@ mod tests {
             egress_is_cloud(PROVIDER_GATEWAY, &cfg),
             "gateway must always be cloud regardless of base URL"
         );
-        let mut cfg_loopback = AppConfig::default();
-        cfg_loopback.gateway_base_url = "http://127.0.0.1:4000/v1".into();
+        let cfg_loopback = AppConfig {
+            gateway_base_url: "http://127.0.0.1:4000/v1".into(),
+            ..AppConfig::default()
+        };
         assert!(
             egress_is_cloud(PROVIDER_GATEWAY, &cfg_loopback),
             "a loopback gateway is still cloud-classified"
