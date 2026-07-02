@@ -22,6 +22,7 @@ pub mod storage;
 pub mod summarize;
 pub mod tools;
 pub mod transcribe;
+pub mod update;
 pub mod voice_action;
 
 use tauri::window::{Effect, EffectsBuilder};
@@ -173,6 +174,9 @@ pub fn run() {
             commands::relock_folder,
             commands::relock_all,
             commands::remove_lock,
+            update::check_for_update,
+            update::app_info,
+            update::open_release_page,
         ])
         .setup(|app| {
             // Open the encrypted library FIRST. If it fails (keychain access denied, or the DB
