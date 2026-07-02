@@ -5,6 +5,7 @@ import type {
   AssistantThreadRow,
   AssistantToolPayload,
   ChatMsg,
+  ProactiveHintPayload,
   VoiceActionResultPayload,
   VoiceActionStatus,
   VoiceCommandListeningPayload,
@@ -287,6 +288,25 @@ export class MeetingConversationStore {
     return "idle";
   });
 
+  /**
+   * The current proactive recall hint (`EVENT_PROACTIVE_HINT`), or null. At most
+   * ONE card: a newer hint REPLACES the visible one (the backend throttles to
+   * ≤1 per cooldown, so replacement is the spec'd queue-of-1). Cleared on a
+   * genuinely-new recording (same lifecycle as the conversation flow) and by
+   * {@link dismissHint}. No FE timer anywhere — the cooldown lives backend-side.
+   */
+  private readonly _hint = signal<ProactiveHintPayload | null>(null);
+  readonly hint = this._hint.asReadonly();
+
+  /**
+   * Hints the user dismissed THIS app session, keyed `kind:targetId` — a
+   * dismissed card never resurfaces even if an event for the same target slips
+   * through (the backend session-dedups too; this is the FE half of the belt
+   * and braces). Deliberately NOT cleared per recording: "dismissed" is a
+   * session-scoped user choice, mirroring the backend's session-level dedup.
+   */
+  private readonly dismissedHints = new Set<string>();
+
   /** Monotonic id source for note items (stable `@for` keys). */
   private nextNoteId = 1;
   /** Monotonic id source for thread turns (stable `@for` keys). */
@@ -300,6 +320,7 @@ export class MeetingConversationStore {
   private unlistenProcessing: UnlistenFn | null = null;
   private unlistenTool: UnlistenFn | null = null;
   private unlistenChatTool: UnlistenFn | null = null;
+  private unlistenHint: UnlistenFn | null = null;
   /** Synchronous re-entrancy guard so two concurrent init() calls can't double-subscribe. */
   private initializing = false;
 
@@ -322,6 +343,7 @@ export class MeetingConversationStore {
     // chip lands on the most recent pending agent turn (no backend change).
     this.unlistenTool = await this.ipc.onAssistantTool((p) => this.onTool(p));
     this.unlistenChatTool = await this.ipc.onChatTool((p) => this.onTool(p));
+    this.unlistenHint = await this.ipc.onProactiveHint((p) => this.onHint(p));
   }
 
   /** Release the event subscriptions (e.g. on app teardown). */
@@ -332,18 +354,21 @@ export class MeetingConversationStore {
     this.unlistenProcessing?.();
     this.unlistenTool?.();
     this.unlistenChatTool?.();
+    this.unlistenHint?.();
     this.unlistenWake = null;
     this.unlistenResult = null;
     this.unlistenListening = null;
     this.unlistenProcessing = null;
     this.unlistenTool = null;
     this.unlistenChatTool = null;
+    this.unlistenHint = null;
   }
 
-  /** Empty the notes + threads (called on each new recording). */
+  /** Empty the notes + threads + the proactive hint (called on each new recording). */
   clear(): void {
     this._notes.set([]);
     this.voiceTargetNoteId = null;
+    this._hint.set(null);
   }
 
   /**
@@ -371,6 +396,9 @@ export class MeetingConversationStore {
     // record effect mis-fired on re-mount because its edge state reset to false).
     this._notes.set([]);
     this.voiceTargetNoteId = null;
+    // A stale recall hint must not carry into the new meeting's conversation
+    // (dismissedHints stays — a dismissal is session-scoped, like the backend dedup).
+    this._hint.set(null);
     this._loaded.set(false);
     void this.hydrate(id, token);
   }
@@ -1138,6 +1166,40 @@ export class MeetingConversationStore {
       };
       return next;
     });
+  }
+
+  /**
+   * A proactive recall hint landed. A hint the user already dismissed this
+   * session is dropped (belt and braces over the backend's own dedup);
+   * otherwise it REPLACES the visible card — at most one, the backend
+   * throttles the stream to ≤1 per cooldown window.
+   */
+  private onHint(p: ProactiveHintPayload): void {
+    if (this.dismissedHints.has(`${p.kind}:${p.targetId}`)) return;
+    this._hint.set(p);
+  }
+
+  /**
+   * Hide the visible recall hint WITHOUT marking it dismissed (unlike
+   * {@link dismissHint}). Called by the screen-share privacy guard
+   * (`ScreenShareService`): the backend has just auto-relocked, and a recall
+   * title from a possibly just-sealed meeting must not linger on the very
+   * surface being shared. The same hint may legitimately resurface later —
+   * the backend re-gates visibility on every emit.
+   */
+  clearHint(): void {
+    this._hint.set(null);
+  }
+
+  /**
+   * Dismiss the visible recall hint: hide the card and remember the
+   * `kind:targetId` for the rest of the session so it never resurfaces.
+   */
+  dismissHint(): void {
+    const h = this._hint();
+    if (!h) return;
+    this.dismissedHints.add(`${h.kind}:${h.targetId}`);
+    this._hint.set(null);
   }
 
   private onListening(p: VoiceCommandListeningPayload): void {

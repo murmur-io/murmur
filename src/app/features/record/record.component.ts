@@ -224,6 +224,7 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
         <app-meeting-conversation
           class="conversation"
           [meetingId]="store.meetingId()"
+          [hintsEnabled]="hintsEnabled()"
         />
       }
 
@@ -1035,6 +1036,15 @@ export class RecordComponent implements OnInit {
   /** Headphones hint: capturing system audio through speakers echoes into the mic (rec #5). */
   readonly headphonesHint = computed(
     () => this.config()?.captureSystemAudio ?? false,
+  );
+
+  /**
+   * Proactive brain hints (the global mute, default ON). Gates the recall card
+   * in the conversation surface; the backend mutes the event source too when
+   * off — this is the render-side half of the belt and braces.
+   */
+  readonly hintsEnabled = computed(
+    () => this.config()?.proactiveHintsEnabled ?? true,
   );
 
   /**
