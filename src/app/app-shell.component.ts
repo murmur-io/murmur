@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { RouterLink, RouterLinkActive, RouterOutlet } from "@angular/router";
 import { FoldersService } from "./services/folders.service";
-import { ToastService } from "./services/toast.service";
+import { ToastService, type Toast } from "./services/toast.service";
 
 /**
  * The app shell chrome — brand header, nav tabs, page layout (router-outlet) and
@@ -148,6 +148,15 @@ import { ToastService } from "./services/toast.service";
         @for (t of toasts(); track t.id) {
           <div class="toast" [class]="'is-' + t.kind" role="status">
             <span class="toast-msg">{{ t.message }}</span>
+            @if (t.action; as action) {
+              <button
+                type="button"
+                class="btn btn-primary toast-action"
+                (click)="runToastAction(t)"
+              >
+                {{ action.label }}
+              </button>
+            }
             <button
               type="button"
               class="toast-close"
@@ -173,6 +182,20 @@ import { ToastService } from "./services/toast.service";
       </div>
     }
   `,
+  styles: [
+    `
+      /* Compact inline action inside a toast (sits before the ✕ close). Uses the
+         global .btn/.btn-primary primitives; only the size is trimmed here so it
+         fits the toast strip. */
+      .toast-action {
+        flex: none;
+        height: auto;
+        padding: var(--space-1) var(--space-3);
+        font-size: 0.82rem;
+        white-space: nowrap;
+      }
+    `,
+  ],
 })
 export class AppShellComponent {
   private readonly folders = inject(FoldersService);
@@ -187,5 +210,11 @@ export class AppShellComponent {
   /** Dismiss a toast by id (also cancels its auto-dismiss timer in the service). */
   dismissToast(id: number): void {
     this.toast.dismiss(id);
+  }
+
+  /** Run a toast's inline action, then dismiss the toast. */
+  runToastAction(t: Toast): void {
+    t.action?.run();
+    this.dismissToast(t.id);
   }
 }
