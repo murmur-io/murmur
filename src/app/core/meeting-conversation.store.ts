@@ -203,6 +203,11 @@ export class MeetingConversationStore {
   readonly notes = this._notes.asReadonly();
   /** Whether anything exists yet (drives the empty-state copy). */
   readonly hasNotes = computed(() => this._notes().length > 0);
+  /** ENHANCE-MY-NOTES: true once at least one REAL persisted note line exists — i.e. what
+   *  the summarizer will actually see (un-accepted @brain anchors are persisted:false). */
+  readonly hasPersistedNotes = computed(() =>
+    this._notes().some((n) => n.persisted && n.text.trim().length > 0),
+  );
 
   /**
    * True once the active meeting's notes have finished hydrating from

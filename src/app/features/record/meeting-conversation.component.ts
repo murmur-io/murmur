@@ -79,10 +79,24 @@ export function parseBrainLine(text: string): string | null {
   template: `
     <div class="card surface" role="group" aria-label="In-meeting notes">
       <div class="surface-head">
-        <app-ai-orb class="head-orb" [state]="store.orbState()" />
+        <app-ai-orb class="head-orb" [state]="orbStateView()" />
         <span class="surface-title">Notes</span>
-        <span class="surface-hint">
-          Type <span class="kbd">&#64;brain</span> to ask in a thread
+        <span
+          class="surface-hint"
+          role="status"
+          aria-live="polite"
+          [class.is-enhancing]="enhancing()"
+          [class.is-settled]="settled()"
+        >
+          @if (enhancing()) {
+            Enhancing your notes…
+          } @else if (settled()) {
+            ✨ Notes enhanced — your bullets became the outline.
+          } @else if (enhanceAware() && store.hasPersistedNotes()) {
+            ✨ These bullets will shape your summary
+          } @else {
+            Type <span class="kbd">&#64;brain</span> to ask in a thread
+          }
         </span>
       </div>
 
@@ -94,7 +108,7 @@ export function parseBrainLine(text: string): string | null {
         <app-proactive-hint-card [hint]="h" (dismissed)="store.dismissHint()" />
       }
 
-      <div class="flow" #flow>
+      <div class="flow" #flow [class.is-enhancing]="enhancing()">
         @if (!store.hasNotes()) {
           <p class="flow-empty text-muted">
             Jot your notes here — they're saved with the meeting. Type
@@ -102,8 +116,12 @@ export function parseBrainLine(text: string): string | null {
             assistant answers there and you choose what to add to your notes.
           </p>
         }
-        @for (n of store.notes(); track n.id) {
-          <app-note-item [note]="n" (followed)="scrollToBottom()" />
+        @for (n of store.notes(); track n.id; let i = $index) {
+          <app-note-item
+            [note]="n"
+            (followed)="scrollToBottom()"
+            [style.animation-delay.ms]="enhancing() ? sweepDelay(i) : null"
+          />
         }
       </div>
 
@@ -142,7 +160,7 @@ export function parseBrainLine(text: string): string | null {
             [disabled]="!store.loaded()"
             [placeholder]="
               store.loaded()
-                ? 'pisz notatkę… (@brain to open a thread)'
+                ? 'write a note… (@brain to open a thread)'
                 : 'Loading notes…'
             "
             [value]="draft()"
@@ -413,6 +431,50 @@ export function parseBrainLine(text: string): string | null {
           animation: none;
         }
       }
+
+      /* ── ENHANCE-MY-NOTES: one-shot Quiet-Weave sweep over the note lines ── */
+      .flow app-note-item {
+        display: block;
+        transition: box-shadow var(--transition);
+      }
+      .flow.is-enhancing app-note-item {
+        border-radius: var(--radius-sm);
+        background-image: linear-gradient(
+          100deg,
+          transparent 32%,
+          color-mix(in srgb, var(--accent) 12%, transparent) 50%,
+          transparent 68%
+        );
+        background-size: 250% 100%;
+        background-repeat: no-repeat;
+        background-position: 200% 0; /* parked off-canvas after the single pass */
+        animation: enhance-sweep 900ms ease-in-out both;
+        box-shadow: inset 2px 0 0
+          color-mix(in srgb, var(--accent) 35%, transparent);
+      }
+      @keyframes enhance-sweep {
+        from {
+          background-position: -150% 0;
+        }
+        to {
+          background-position: 200% 0;
+        }
+      }
+      .surface-hint.is-enhancing,
+      .surface-hint.is-settled {
+        color: var(--accent);
+        animation: rise 200ms var(--transition) both;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .flow.is-enhancing app-note-item {
+          animation: none;
+          background-image: none; /* the static inset accent edge remains as the cue */
+        }
+        .surface-hint.is-enhancing,
+        .surface-hint.is-settled {
+          animation: none;
+        }
+      }
     `,
   ],
 })
@@ -435,6 +497,21 @@ export class MeetingConversationComponent implements OnInit {
    * the backend default.
    */
   readonly hintsEnabled = input<boolean>(true);
+
+  /** ENHANCE-MY-NOTES presentation inputs (pure; all state lives in root stores). */
+  readonly enhancing = input(false);
+  readonly settled = input(false);
+  readonly enhanceAware = input(false);
+
+  /** During the enhance pass the orb shows its shipped 'processing' choreography. */
+  readonly orbStateView = computed(() =>
+    this.enhancing() ? ("processing" as const) : this.store.orbState(),
+  );
+
+  /** Stagger for the one-shot sweep — capped so short summarizes still show a full pass. */
+  sweepDelay(i: number): number {
+    return Math.min(i, 10) * 180;
+  }
 
   /** The composer draft (signal-backed — zoneless). */
   protected readonly draft = signal("");
