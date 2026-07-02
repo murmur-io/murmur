@@ -275,13 +275,46 @@ async fn run_inner(
     drop(aec_scratch);
     drop(system_scratch);
 
+    // Measure the mic↔system offset + speaker-leak strength ONCE, on the RAW mic (never an
+    // AEC'd feed — the leak only exists in the raw capture). Drives BOTH the aligned archive
+    // mix below and the echo dedup after transcription. Best-effort: None ⇒ wall-clock pads
+    // and strict-tier-only dedup (today's behaviour, minus the echo). The scoped borrow of the
+    // mic buffer ends here, before `mic_16k`/`sys_16k` are moved into the transcription task.
+    let leak: Option<audio::align::EchoLeak> = {
+        let raw_probe: &[f32] = mic_16k_archive.as_ref().unwrap_or(&mic_16k);
+        sys_16k
+            .as_ref()
+            .and_then(|sys| audio::align::estimate_stream_offset(raw_probe, sys))
+    };
+    if let Some(l) = &leak {
+        tracing::info!(
+            target: "audio",
+            offset_s = l.offset_s,
+            correlation = l.correlation,
+            "mic/system offset measured (speaker-leak evidence)"
+        );
+    }
+
     // Archive WAV = the MIX (for playback only). Mic-only when there's no system stream.
-    // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed.
+    // Archive = the RAW (cpal) mic mixed with system audio — never the AEC'd ASR feed —
+    // offset-aligned so the two streams line up on the wall clock (kills most of the audible
+    // double-hearing on speakers).
     let archive_src = mic_16k_archive.as_ref().unwrap_or(&mic_16k);
     let archive_16k = match &sys_16k {
         Some(sys) => {
-            tracing::info!(target: "audio", "archiving mixed mic + system-audio track");
-            audio::mix(archive_src, sys)
+            let (mic_delay, sys_delay) = audio::align::archive_delays(
+                leak.as_ref(),
+                mic_started_at,
+                system_started_at,
+                audio::TARGET_RATE_HZ,
+            );
+            tracing::info!(
+                target: "audio",
+                mic_delay,
+                sys_delay,
+                "archiving mixed mic + system-audio track (offset-aligned)"
+            );
+            audio::mix_aligned(archive_src, mic_delay, sys, sys_delay)
         }
         None => archive_src.clone(),
     };
@@ -376,7 +409,7 @@ async fn run_inner(
             None
         };
 
-    let merged_segments = tokio::task::spawn_blocking(move || -> Result<Vec<crate::transcribe::types::Segment>> {
+    let (merged_segments, echo_suppressed) = tokio::task::spawn_blocking(move || -> Result<(Vec<crate::transcribe::types::Segment>, usize)> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
         let transcriber = Transcriber::load(&model_path_owned)?;
@@ -436,8 +469,12 @@ async fn run_inner(
         }
 
         // Anchor each stream's segments to its capture-start host instant → absolute timeline,
-        // merge sorted by absolute start, drop empty (e.g. muted-mic) segments, label "me"/"others".
-        Ok(merge_streams(streams))
+        // merge sorted by absolute start, drop empty (e.g. muted-mic) segments, label "me"/"others" —
+        // then drop mic-echo copies of others' speech (speakers → mic bleed; leak-gated). `leak` is
+        // Copy, captured by this move closure.
+        let (merged, echo_suppressed) =
+            crate::audio::merge::suppress_cross_stream_echo(merge_streams(streams), leak.as_ref());
+        Ok((merged, echo_suppressed))
     })
     .await
     .map_err(|e| AppError::Transcribe(format!("transcription task panicked: {e}")))??;
@@ -447,6 +484,16 @@ async fn run_inner(
     }
 
     state.db.insert_segments(meeting_id, &merged_segments)?;
+    if echo_suppressed > 0 {
+        tracing::info!(target: "transcribe", suppressed = echo_suppressed, "cross-stream echo segments removed");
+        let _ = app.emit(
+            crate::events::EVENT_ECHO_SUPPRESSED,
+            crate::events::EchoSuppressedPayload {
+                suppressed: echo_suppressed,
+                meeting_id: meeting_id.to_string(),
+            },
+        );
+    }
     state
         .db
         .update_meeting_status(meeting_id, MeetingStatus::Transcribed)?;
