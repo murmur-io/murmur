@@ -100,6 +100,11 @@ pub struct AppConfigDto {
     pub voice_trigger: bool,
     pub onboarded: bool,
     pub note_style: String,
+    /// ENHANCE-MY-NOTES mode: "enhance" | "append" ("" from an older FE ⇒ "enhance").
+    /// `#[serde(default)]` ⇒ an older FE payload that omits `notesMode` deserializes to `""`
+    /// (the `dto_to_config` empty-guard then falls back to `"enhance"`).
+    #[serde(default)]
+    pub notes_mode: String,
     pub auto_organize: bool,
     pub note_language: String,
     /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
@@ -3109,6 +3114,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
         note_style: c.note_style.clone(),
+        notes_mode: c.notes_mode.clone(),
         auto_organize: c.auto_organize,
         note_language: c.note_language.clone(),
         mcp_require_token: c.mcp_require_token,
@@ -3183,6 +3189,14 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             "standard".to_string()
         } else {
             d.note_style
+        },
+        // ENHANCE-MY-NOTES: an older FE that omits `notesMode` (or sends `""`) falls back to
+        // `"enhance"` — the mode that makes the feature do something, and the safe default for
+        // new installs. `#[serde(default)]` on the DTO field ensures an omitted key gives `""`.
+        notes_mode: if d.notes_mode.trim().is_empty() {
+            "enhance".to_string()
+        } else {
+            d.notes_mode
         },
         auto_organize: d.auto_organize,
         note_language: if d.note_language.trim().is_empty() {
