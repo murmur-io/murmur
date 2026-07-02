@@ -26,6 +26,12 @@ tauri-plugin-global-shortcut = "2"
 cpal = "0.16"
 hound = "3.5"
 rubato = "0.16"
+# Pure-Rust WebRTC audio processing (AEC3) — offline echo cancellation of the recorded mic
+# using the captured system-audio track as the far-end reference. No C++ toolchain.
+sonora = "0.1"
+# CoreAudio C-function bindings (already compiled transitively via cpal) — crash-safe
+# default-output introspection for the "you're on speakers" hint (rules §7: C funcs, no msg_send).
+objc2-core-audio = "0.3"
 
 # ── Transcription ──
 whisper-rs = { version = "0.16", features = ["metal"] }

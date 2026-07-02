@@ -45,6 +45,18 @@ final class AecCapturer {
         // to the raw cpal mic.
         try input.setVoiceProcessingEnabled(true)
 
+        // CONTAINMENT (see docs/research/2026-07-02-audio-echo-full-remediation.md):
+        // 1) By default VPIO DUCKS all other apps' audio system-wide — it can quiet the very
+        //    call being recorded and was observed killing a system-audio capture to ~-51 dB.
+        //    macOS 14+ exposes the knob; pin it to minimum.
+        // 2) Uplink AGC pumps the ASR feed's levels; disable for a level-faithful feed.
+        if #available(macOS 14.0, *) {
+            let duck = AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                enableAdvancedDucking: false, duckingLevel: .min)
+            input.voiceProcessingOtherAudioDuckingConfiguration = duck
+            input.isVoiceProcessingAGCEnabled = false
+        }
+
         let tapFormat = input.outputFormat(forBus: 0)
         // ALWAYS persist a single MONO channel. VPIO can hand us a MULTI-CHANNEL device format (a
         // 9-channel aggregate input was seen in the field) — writing that verbatim ballooned the WAV
