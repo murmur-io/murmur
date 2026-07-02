@@ -1,4 +1,5 @@
 pub mod aec;
+pub mod align;
 pub mod listener;
 pub mod merge;
 pub mod mixer;
