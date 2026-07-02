@@ -15,6 +15,30 @@ export interface StatusPayload {
   meetingId: string | null;
 }
 
+/**
+ * GitHub-release update check (`check_for_update`). Mirrors the Rust `UpdateInfo`
+ * (serde camelCase). `updateAvailable` is the sole "should we nudge" flag;
+ * `releaseName` / `releaseNotes` are null when GitHub omits them. The command
+ * REJECTS (throws) on network failure / rate-limit — a thrown error means
+ * "couldn't check", not "up to date".
+ */
+export interface UpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseUrl: string;
+  releaseName: string | null;
+  releaseNotes: string | null;
+}
+
+/** Static product identity for the Settings "About" section (`app_info`). */
+export interface AppInfo {
+  name: string;
+  version: string;
+  description: string;
+  repository: string;
+}
+
 export type Availability =
   | { Available: true }
   | { Unavailable: { reason: string } };

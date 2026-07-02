@@ -15,6 +15,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import type {
   AppConfigDto,
+  AppInfo,
   BrainBackend,
   BrainModelDto,
   GatewayHealth,
@@ -25,6 +26,7 @@ import type {
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { ThemeService, type ThemeMode } from "../../services/theme.service";
+import { UpdateService } from "../../services/update.service";
 
 /** One entry in the macOS-style Settings sidebar. `keywords` feeds the search box. */
 interface SettingsSection {
@@ -48,6 +50,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "providers", label: "Providers", keywords: "anthropic ollama claude code gateway openai api key availability model binary" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
+  { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
 ];
 
 @Component({
@@ -123,6 +126,9 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   }
                   @case ("obsidian") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.8 2.8 5.3 4.7 12 7 14l-.8-6z" /><path d="M6 1.8 6.2 8 7 14l3.4-2.6L12 5.4 9 2z" /></svg>
+                  }
+                  @case ("about") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M8 7.4v3.6M8 5.1h.01" /></svg>
                   }
                 }
               </span>
@@ -1673,6 +1679,75 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                 </div>
               </div>
             }
+
+            <!-- ── About — product identity + manual update check ── -->
+            @case ("about") {
+              <div class="card about-card">
+                @if (appInfo(); as info) {
+                  <div class="about-head">
+                    <span class="about-name">{{ info.name }}</span>
+                    <span class="about-version text-muted"
+                      >Version {{ info.version }}</span
+                    >
+                  </div>
+                  <p class="text-secondary about-desc">{{ info.description }}</p>
+                } @else {
+                  <p class="text-secondary about-desc">
+                    Loading product info…
+                  </p>
+                }
+
+                <div class="about-update">
+                  <span class="about-section-label text-muted"
+                    >Software update</span
+                  >
+                  <div class="about-update-row">
+                    <button
+                      type="button"
+                      class="btn"
+                      (click)="checkForUpdates()"
+                      [disabled]="updateStatus() === 'checking'"
+                    >
+                      @if (updateStatus() === "checking") {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Checking…
+                      } @else {
+                        Check for updates
+                      }
+                    </button>
+
+                    @switch (updateStatus()) {
+                      @case ("available") {
+                        @if (latestUpdate(); as upd) {
+                          <span class="about-update-result">
+                            <span class="text-secondary"
+                              >Version {{ upd.latestVersion }} is available.</span
+                            >
+                            <button
+                              type="button"
+                              class="btn btn-primary"
+                              (click)="downloadUpdate(upd.releaseUrl)"
+                            >
+                              Download
+                            </button>
+                          </span>
+                        }
+                      }
+                      @case ("upToDate") {
+                        <span class="text-muted about-update-line"
+                          >You're up to date.</span
+                        >
+                      }
+                      @case ("error") {
+                        <span class="text-danger about-update-line"
+                          >Couldn't check for updates.</span
+                        >
+                      }
+                    }
+                  </div>
+                </div>
+              </div>
+            }
           }
         </div>
       </div>
@@ -1832,6 +1907,54 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         flex-direction: column;
         gap: var(--space-5);
         animation: rise 320ms var(--transition) both;
+      }
+
+      /* About — product identity + manual update check. */
+      .about-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .about-head {
+        display: flex;
+        align-items: baseline;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+      }
+      .about-name {
+        font-size: 1.15rem;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+      .about-version {
+        font-size: 0.9rem;
+      }
+      .about-desc {
+        margin: 0;
+        line-height: 1.55;
+      }
+      .about-update {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        padding-top: var(--space-3);
+        border-top: 1px solid var(--border-subtle);
+      }
+      .about-section-label {
+        font-size: 0.72rem;
+        font-weight: 650;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .about-update-row,
+      .about-update-result {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        flex-wrap: wrap;
+      }
+      .about-update-line {
+        font-size: 0.9rem;
       }
 
       /* Collapse to a single column on narrow widths (sidebar stacks on top). */
@@ -2688,6 +2811,28 @@ export class SettingsComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
   private readonly theme = inject(ThemeService);
+  private readonly updates = inject(UpdateService);
+
+  // ── About — product identity + shared update-check state ────────────────
+
+  /** Static product identity (name/version/description), loaded once in ngOnInit. */
+  readonly appInfo = signal<AppInfo | null>(null);
+
+  /** Update-check lifecycle from the shared service (drives the button + result line). */
+  readonly updateStatus = this.updates.status;
+
+  /** The most-recent update-check result (the Download button reads its releaseUrl). */
+  readonly latestUpdate = this.updates.latest;
+
+  /** Run the shared manual update check (surfaces both outcomes as toasts). */
+  checkForUpdates(): void {
+    void this.updates.checkManually();
+  }
+
+  /** Open the GitHub release page for an available update. */
+  downloadUpdate(url: string): void {
+    void this.ipc.openReleasePage(url);
+  }
 
   /** Current theme choice (Light / Dark / System) — drives the Appearance control. */
   readonly themeMode = this.theme.mode;
@@ -3099,6 +3244,8 @@ export class SettingsComponent implements OnInit {
       this.embedModelPresent.set(
         await this.ipc.embedModelPresent().catch(() => false),
       );
+      // About section — product identity (best-effort; null leaves a "loading" line).
+      this.appInfo.set(await this.ipc.appInfo().catch(() => null));
     } catch (e) {
       this.loadError.set(String(e));
     }
