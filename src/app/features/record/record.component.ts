@@ -72,7 +72,7 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
         </div>
       }
 
-      @if (headphonesHint() && !store.isRecording()) {
+      @if (headphonesHint()) {
         <div class="banner is-accent" role="note">
           <span class="banner-icon" aria-hidden="true">🎧</span>
           <span>
