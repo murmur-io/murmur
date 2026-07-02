@@ -3546,6 +3546,40 @@ impl Db {
         Ok(out)
     }
 
+    /// The most recent VISIBLE meeting titled exactly `title` — the Ask surface's citation→source
+    /// resolution (a `[[Title]]` wikilink back to a meeting id/date chip). Applies the SAME
+    /// visibility predicate as [`Self::list_meetings_visible`], so a sealed-and-not-session-unlocked
+    /// meeting can never resolve — a citation string can't become an existence/date leak. Exact
+    /// (case-sensitive) title match; newest first when titles collide.
+    pub fn meeting_by_title_visible(
+        &self,
+        title: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<Meeting>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
+                    (SELECT nf.folder_id FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id
+               FROM meetings m
+              WHERE m.title = ?1
+                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                     OR EXISTS (
+                          SELECT 1 FROM notes n
+                           LEFT JOIN folders f ON f.id = n.folder_id
+                           WHERE n.meeting_id = m.id AND {visible}
+                        ))
+              ORDER BY m.started_at DESC, m.id DESC
+              LIMIT 1"
+        );
+        conn.query_row(&sql, rusqlite::params![title], row_to_meeting)
+            .optional()
+            .map_err(map_err)?
+            .transpose()
+    }
+
     /// The latest visible note for a meeting (MCP `get_meeting`); `None` if the meeting's note
     /// is sealed-and-not-session-unlocked.
     pub fn get_note_if_visible(

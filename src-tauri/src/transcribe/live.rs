@@ -479,7 +479,10 @@ fn run_informational(
             // for a future structured "agent acts" iteration. The dispatch still routes EVERY request
             // through this loop (no hardcoded write classifier), so the model decides answer-vs-draft.
             allow_writes: false,
-            // The always-on `propose_note` tool records its draft HERE (no DB write). We read it after
+            // In-meeting surfaces HAVE the notes flow + "Add to notes" Accept affordance, so the
+            // draft tool is advertised here (the vault-wide Ask page sets this false).
+            note_drafts: true,
+            // The `propose_note` tool records its draft HERE (no DB write). We read it after
             // the loop to mark the reply as a NOTE PROPOSAL vs a plain ANSWER. The model decides which.
             proposed_note: std::sync::Mutex::new(None),
         };
@@ -561,14 +564,16 @@ fn floor_intent_for(
 }
 
 /// The live tool-trace sink: emits a per-tool-call event (`EVENT_ASSISTANT_TOOL` for the card,
-/// `EVENT_CHAT_TOOL` for the chat panel — chosen by `event`) so the FE can render the "Searching
-/// notes… ✓" chips. NO PII — tool NAME + a coarse result-size count + the turn's OPAQUE thread id.
-struct ToolEventSink {
-    app: AppHandle,
-    event: &'static str,
+/// `EVENT_CHAT_TOOL` for the chat panel, `EVENT_ASK_TOOL` for the Ask page — chosen by `event`) so
+/// the FE can render the "Searching notes… ✓" chips. NO PII — tool NAME + a coarse result-size
+/// count + the turn's OPAQUE thread id. `pub(crate)` so `ask_vault` (commands.rs) reuses the SAME
+/// payload contract instead of duplicating it.
+pub(crate) struct ToolEventSink {
+    pub(crate) app: AppHandle,
+    pub(crate) event: &'static str,
     /// The turn's thread identity — stamped on every chip so simultaneous threads never
     /// cross-attribute their traces (the documented v1 gap this closes).
-    thread_id: String,
+    pub(crate) thread_id: String,
 }
 impl crate::agent::DeltaSink for ToolEventSink {
     fn tool_running(&self, tool: &str) {
