@@ -8,9 +8,9 @@ use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
 use crate::storage::models::{
-    Analytics, AssistantInteraction, Commitment, CorrectionRecord, DayCount, DocChunkHit,
-    DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData, GraphEdge,
-    GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
+    Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
+    DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
     StatusCount, VaultSource,
 };
 use crate::embed::Embedder;
@@ -427,6 +427,14 @@ impl Db {
         Self::add_column_if_missing(&conn, "notes", "model_requested", "TEXT")?;
         Self::add_column_if_missing(&conn, "notes", "model_served", "TEXT")?;
         Self::add_column_if_missing(&conn, "notes", "gateway_host", "TEXT")?;
+        // @brain THREADS: scope each persisted assistant exchange to a conversation thread.
+        // `thread_id` is an OPAQUE id (FE-supplied for an @brain thread, backend-generated UUID for
+        // the voice/wake path); `anchor_text` is the note text an @brain thread was anchored to
+        // (row content, purged on seal with the rest of the row — see
+        // `purge_assistant_interactions_tx`). Guarded ALTERs (idempotent); NULL for legacy rows,
+        // which the gated thread reader EXCLUDES (`list_assistant_threads_visible`).
+        Self::add_column_if_missing(&conn, "assistant_interactions", "thread_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "assistant_interactions", "anchor_text", "TEXT")?;
         // Phase 1 — FTS5/BM25 full-text retrieval over the three text sources
         // (meeting titles, transcript segments, note markdown). Replaces the prior
         // substring LIKE search so word-order/term retrieval works ("alpha beta" == "beta alpha")
@@ -3638,6 +3646,8 @@ impl Db {
         citations: &[String],
         status: &str,
         source_label: Option<&str>,
+        thread_id: Option<&str>,
+        anchor_text: Option<&str>,
         created_at: &str,
     ) -> Result<i64> {
         let citations_json = serde_json::to_string(citations)
@@ -3645,8 +3655,9 @@ impl Db {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO assistant_interactions
-                (meeting_id, command, answer, citations, status, source_label, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (meeting_id, command, answer, citations, status, source_label,
+                 thread_id, anchor_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 meeting_id,
                 command,
@@ -3654,6 +3665,8 @@ impl Db {
                 citations_json,
                 status,
                 source_label,
+                thread_id,
+                anchor_text,
                 created_at
             ],
         )
@@ -3708,6 +3721,61 @@ impl Db {
                 citations,
                 status,
                 source_label,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read the persisted @brain THREAD exchanges for `meeting_id` — ONLY rows that carry a
+    /// `thread_id` (legacy voice rows with NULL are EXCLUDED), oldest first — and ONLY when the
+    /// meeting is VISIBLE to the session `unlocked` set. A sealed-and-not-session-unlocked meeting
+    /// returns an EMPTY list, never an error (existence must not leak) — the same gate as
+    /// `list_assistant_interactions_visible`. On seal the rows are PURGED anyway
+    /// (`purge_assistant_interactions_tx`), so the gate is defense-in-depth.
+    pub fn list_assistant_threads_visible(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<AssistantThreadRow>> {
+        if !self.meeting_is_visible(meeting_id, unlocked)? {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT thread_id, anchor_text, command, answer, citations, status, created_at
+                   FROM assistant_interactions
+                  WHERE meeting_id = ?1 AND thread_id IS NOT NULL
+                  ORDER BY id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (thread_id, anchor_text, command, answer, citations_json, status, created_at) =
+                r.map_err(map_err)?;
+            // A malformed citations blob must never break the read — fall back to an empty list.
+            let citations: Vec<String> = serde_json::from_str(&citations_json).unwrap_or_default();
+            out.push(AssistantThreadRow {
+                thread_id,
+                anchor_text,
+                command,
+                answer,
+                citations,
+                status,
                 created_at,
             });
         }
@@ -5299,6 +5367,8 @@ mod tests {
             &["[[Notatka o pogodzie]]".to_string(), "(web) Weather — http://x".to_string()],
             "ok",
             Some("research"),
+            None,
+            None,
             "2026-06-24T10:05:00Z",
         )
         .unwrap();
@@ -5337,6 +5407,8 @@ mod tests {
             &[],
             "ok",
             Some("research"),
+            None,
+            None,
             "2026-06-24T10:05:00Z",
         )
         .unwrap();
@@ -5369,7 +5441,8 @@ mod tests {
         note_for(&db, "m1", "claude_code", "note");
         db.set_note_folder("m1", Some("f-locked")).unwrap();
         db.insert_assistant_interaction(
-            "m1", "cmd", "answer", &[], "ok", Some("research"), "2026-06-24T10:05:00Z",
+            "m1", "cmd", "answer", &[], "ok", Some("research"), None, None,
+            "2026-06-24T10:05:00Z",
         )
         .unwrap();
         assert_eq!(interaction_count(&db, "m1"), 1, "row present before seal");
@@ -5389,7 +5462,8 @@ mod tests {
         let db = mem_db();
         db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
         db.insert_assistant_interaction(
-            "m1", "cmd", "answer", &[], "ok", Some("research"), "2026-06-24T10:05:00Z",
+            "m1", "cmd", "answer", &[], "ok", Some("research"), None, None,
+            "2026-06-24T10:05:00Z",
         )
         .unwrap();
         assert_eq!(interaction_count(&db, "m1"), 1);
@@ -5399,6 +5473,139 @@ mod tests {
             0,
             "delete_meeting must purge the meeting's assistant_interactions rows"
         );
+    }
+
+    /// THREAD round-trip: exchanges persisted WITH a thread identity read back through the gated
+    /// thread reader — `thread_id` + `anchor_text` intact, `command` = the user's LATEST message
+    /// of each exchange, ordered by id ASC — while legacy rows (NULL `thread_id`) are EXCLUDED.
+    /// RED before PR D: `insert_assistant_interaction` had no thread params and
+    /// `list_assistant_threads_visible` did not exist (thread identity was FE-RAM-only).
+    #[test]
+    fn assistant_threads_round_trip_ordered_and_exclude_legacy() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z")).unwrap();
+        // A legacy-shaped voice row (no thread) — must NOT surface in the thread reader.
+        db.insert_assistant_interaction(
+            "m1", "legacy voice cmd", "a0", &[], "ok", Some("research"), None, None,
+            "2026-07-02T10:01:00Z",
+        )
+        .unwrap();
+        // An @brain thread: two exchanges, the first anchored to a note.
+        db.insert_assistant_interaction(
+            "m1",
+            "what did we decide on pricing?",
+            "Tiered pricing.",
+            &["[[Pricing sync]]".to_string()],
+            "ok",
+            Some("research"),
+            Some("t-1"),
+            Some("• pricing: tiered, ship Friday"),
+            "2026-07-02T10:02:00Z",
+        )
+        .unwrap();
+        db.insert_assistant_interaction(
+            "m1", "and the timeline?", "Ships Friday.", &[], "ok", Some("research"),
+            Some("t-1"), None, "2026-07-02T10:03:00Z",
+        )
+        .unwrap();
+
+        let rows = db
+            .list_assistant_threads_visible("m1", &std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(rows.len(), 2, "only thread-carrying rows; the legacy NULL row is excluded");
+        assert_eq!(rows[0].thread_id, "t-1");
+        assert_eq!(rows[0].anchor_text.as_deref(), Some("• pricing: tiered, ship Friday"));
+        assert_eq!(
+            rows[0].command, "what did we decide on pricing?",
+            "command is the LATEST user message of the exchange, never the rendered history"
+        );
+        assert_eq!(rows[0].answer, "Tiered pricing.");
+        assert_eq!(rows[0].citations, vec!["[[Pricing sync]]".to_string()]);
+        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].created_at, "2026-07-02T10:02:00Z");
+        // Ordered by id ASC — the follow-up comes second.
+        assert_eq!(rows[1].command, "and the timeline?");
+        assert_eq!(rows[1].thread_id, "t-1");
+        assert!(rows[1].anchor_text.is_none());
+    }
+
+    /// GATE: a sealed-and-NOT-session-unlocked meeting's threads are NEVER returned by the gated
+    /// thread reader (EMPTY, never an error) — even with rows at rest; a session-unlocked folder's
+    /// threads ARE. RED-able: drop the `meeting_is_visible` guard in
+    /// `list_assistant_threads_visible` and the first assertion fails (the row leaks).
+    #[test]
+    fn assistant_threads_gated_for_sealed_meeting() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.insert_assistant_interaction(
+            "m1", "secret thread question", "secret answer", &[], "ok", Some("research"),
+            Some("t-secret"), Some("secret anchor"), "2026-07-02T10:05:00Z",
+        )
+        .unwrap();
+        db.set_folder_locked("f-locked", true, Some(b"wrapped")).unwrap();
+
+        let empty = std::collections::HashSet::new();
+        assert!(
+            db.list_assistant_threads_visible("m1", &empty).unwrap().is_empty(),
+            "a sealed-not-unlocked meeting must surface NO threads through the gated read"
+        );
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        assert_eq!(
+            db.list_assistant_threads_visible("m1", &unlocked).unwrap().len(),
+            1,
+            "a session-unlocked folder's threads ARE visible"
+        );
+    }
+
+    /// PURGE-ON-SEAL: thread rows ride `purge_assistant_interactions_tx` (no new purge code) — after
+    /// the seal purge the raw rows are GONE and the thread reader returns EMPTY even for a session
+    /// that can see the meeting. RED-able: exclude thread-carrying rows from the purge DELETE and
+    /// both assertions fail (thread content would survive a seal at rest).
+    #[test]
+    fn assistant_threads_purged_on_seal() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.insert_assistant_interaction(
+            "m1", "thread cmd", "thread answer", &[], "ok", Some("research"),
+            Some("t-1"), Some("anchor"), "2026-07-02T10:05:00Z",
+        )
+        .unwrap();
+        assert_eq!(interaction_count(&db, "m1"), 1, "row present before seal");
+
+        // The seal purge runs in the SAME tx that drops chunks + corrections for sealed meetings.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert_eq!(interaction_count(&db, "m1"), 0, "raw thread rows gone after the seal purge");
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        assert!(
+            db.list_assistant_threads_visible("m1", &unlocked).unwrap().is_empty(),
+            "the thread reader has nothing to return after the purge"
+        );
+    }
+
+    /// PR D migration: `assistant_interactions` carries the THREAD columns (`thread_id` +
+    /// `anchor_text`). RED before the guarded ALTERs land ("no such column"), GREEN after;
+    /// `migrate_is_idempotent` covers the re-run. Legacy rows read back NULL/NULL.
+    #[test]
+    fn assistant_interactions_have_thread_columns() {
+        let db = mem_db();
+        let n: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM assistant_interactions
+                  WHERE thread_id IS NOT NULL OR anchor_text IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "fresh table: no thread rows yet, but the columns must exist");
     }
 
     #[test]

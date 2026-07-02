@@ -65,6 +65,11 @@ pub struct VoiceActionResult {
     /// `Some(content)` ⇒ a NOTE PROPOSAL the FE shows "Add to notes" on. No DB write happens server-side
     /// — the FE commits the accepted draft via `save_manual_notes`. Serializes to `proposedNote`.
     pub proposed_note: Option<String>,
+    /// Opaque id of the conversation THREAD this result belongs to (the FE-supplied @brain thread
+    /// id, or the backend-generated UUID for a voice/wake turn), so simultaneous threads resolve
+    /// the right pending bubble. Serializes to `threadId`; the dispatch threads it on via
+    /// [`Self::with_thread_id`]. NOT PII (an opaque UUID).
+    pub thread_id: Option<String>,
 }
 
 impl VoiceActionResult {
@@ -76,6 +81,7 @@ impl VoiceActionResult {
             command: String::new(),
             citations: Vec::new(),
             proposed_note: None,
+            thread_id: None,
         }
     }
 
@@ -83,6 +89,13 @@ impl VoiceActionResult {
     /// surface what the user actually said without re-plumbing each constructor.
     pub fn with_command(mut self, command: &str) -> Self {
         self.command = command.to_string();
+        self
+    }
+
+    /// Thread the turn's THREAD id onto a result (builder-style) — the FE uses it to attribute the
+    /// answer (and its trace chips) to the right open thread.
+    pub fn with_thread_id(mut self, thread_id: &str) -> Self {
+        self.thread_id = Some(thread_id.to_string());
         self
     }
 
@@ -116,6 +129,7 @@ impl VoiceActionResult {
             // The caller (`run_informational`) threads any `propose_note` draft on via
             // `with_proposed_note` after reading the executor; the loop outcome itself has none.
             proposed_note: None,
+            thread_id: None,
         }
     }
 
@@ -526,6 +540,7 @@ fn rag_answer(
                 command: String::new(),
                 citations,
                 proposed_note: None,
+                thread_id: None,
             }
         }
         Err(AppError::Unavailable(_)) => VoiceActionResult {
@@ -538,6 +553,7 @@ fn rag_answer(
             command: String::new(),
             citations,
             proposed_note: None,
+            thread_id: None,
         },
         Err(e) => VoiceActionResult {
             intent_kind: intent_kind.to_string(),
@@ -546,6 +562,7 @@ fn rag_answer(
             command: String::new(),
             citations,
             proposed_note: None,
+            thread_id: None,
         },
     }
 }
@@ -1295,6 +1312,24 @@ mod tests {
         assert_eq!(json.get("proposedNote").and_then(|v| v.as_str()), Some("note body"));
         let null_json = serde_json::to_value(VoiceActionResult::new("research", "ok", "x")).unwrap();
         assert!(null_json.get("proposedNote").unwrap().is_null(), "no proposal ⇒ proposedNote is null");
+    }
+
+    /// PR D: `thread_id` round-trips through `VoiceActionResult` — default None, threaded on via
+    /// `with_thread_id`, serialized to the camelCase `threadId` the FE uses to resolve the right
+    /// open thread's pending bubble.
+    #[test]
+    fn voice_action_result_round_trips_thread_id() {
+        let plain = VoiceActionResult::new("research", "ok", "an answer");
+        assert_eq!(plain.thread_id, None, "a result defaults to no thread identity");
+
+        let threaded = plain.with_thread_id("t-123");
+        assert_eq!(threaded.thread_id.as_deref(), Some("t-123"));
+        let json = serde_json::to_value(&threaded).unwrap();
+        assert_eq!(json.get("threadId").and_then(|v| v.as_str()), Some("t-123"));
+
+        let null_json =
+            serde_json::to_value(VoiceActionResult::new("research", "ok", "x")).unwrap();
+        assert!(null_json.get("threadId").unwrap().is_null(), "no thread ⇒ threadId is null");
     }
 
     #[test]

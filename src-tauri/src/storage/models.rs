@@ -174,6 +174,32 @@ pub struct AssistantInteraction {
     pub created_at: String,
 }
 
+/// One persisted @brain THREAD exchange — the durable substrate the FE rebuilds its thread panels
+/// from across meeting switches / restarts. Rows come from `assistant_interactions` and are
+/// returned ONLY when they carry a `thread_id` (legacy voice rows are excluded). Like
+/// [`AssistantInteraction`], it is DERIVED convenience data — purged (not sealed) when the
+/// meeting's folder is sealed, and the read is visibility-gated (sealed-not-unlocked ⇒ empty).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantThreadRow {
+    /// Opaque thread id: the FE-supplied @brain thread id, or a backend-generated UUID for the
+    /// voice/wake path. Groups the exchanges of one conversation.
+    pub thread_id: String,
+    /// The note text the @brain thread was ANCHORED to (the ✨ ask-brain seed), when any.
+    pub anchor_text: Option<String>,
+    /// The user's LATEST message of that exchange (never the rendered conversation history).
+    pub command: String,
+    /// The assistant's answer for that exchange.
+    pub answer: String,
+    /// `[[Title]]` wikilink / "(web)" citations the answer was grounded on (VISIBLE meetings only).
+    pub citations: Vec<String>,
+    /// Dispatch status: `ok` | `unavailable` | `unrecognized` | `needs_consent` | `error` |
+    /// `nothing_heard`.
+    pub status: String,
+    /// RFC3339 timestamp the exchange was recorded.
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusCount {
