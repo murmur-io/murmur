@@ -96,6 +96,32 @@ pub struct AssistantToolPayload {
     pub thread_id: Option<String>,
 }
 
+/// Emitted when the PROACTIVE brain (P1, zero-egress) surfaces one recall card during a
+/// recording: "you discussed this before → [[meeting]]" / "open commitment: …" / a current fact.
+/// Deterministic LOCAL matching only (spec D1) — no LLM, no provider, no egress, no consent
+/// needed. Throttled at the SOURCE (spec D2: ≥120 s cooldown, session dedup, and the
+/// `proactive_hints_enabled` backend mute), so the FE never has to rate-limit it.
+pub const EVENT_PROACTIVE_HINT: &str = "murmur://proactive-hint";
+
+/// Payload for [`EVENT_PROACTIVE_HINT`]. IDs + a SHORT title from an already-VISIBLE row only —
+/// never sealed content, never content bodies. `kind` is `"past_meeting"` | `"open_commitment"`
+/// | `"fact"`; `target_id` is the dedup/click-through id (the meeting id for past-meeting and
+/// commitment cards, the fact id for fact cards); `meeting_id` is the source meeting to open.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProactiveHintPayload {
+    /// "past_meeting" | "open_commitment" | "fact".
+    pub kind: String,
+    /// Short display title (meeting title / commitment line / fact triple) from a VISIBLE row.
+    pub title: String,
+    /// The dedup/click-through id for this card.
+    pub target_id: String,
+    /// The source meeting to open, when known.
+    pub meeting_id: Option<String>,
+    /// The matcher's relevance score (already ≥ the emission threshold).
+    pub score: f32,
+}
+
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
 pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
 
