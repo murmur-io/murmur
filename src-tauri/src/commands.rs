@@ -2387,8 +2387,10 @@ mod ask_vault_tests {
     fn ask_floor_preserves_no_consent_error_semantics() {
         let db = tmp_db();
         seed_note(&db, "m1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
-        let mut cfg = AppConfig::default();
-        cfg.provider_id = "anthropic".into();
+        let cfg = AppConfig {
+            provider_id: "anthropic".into(),
+            ..AppConfig::default()
+        };
         assert!(!cfg.cloud_egress_consented, "fresh config defaults to consent OFF");
         let res = block_on(ask_vault_floor(&db, &cfg, &HashSet::new(), "atlas?", &[]));
         assert!(

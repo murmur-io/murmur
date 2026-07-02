@@ -199,7 +199,7 @@ impl AppState {
         // those columns (the blobs remain the source of truth) and re-seal any stray plaintext WAV
         // whose `.enc` already exists, so plaintext never survives a crash into the next session.
         // Best-effort: a reconciliation error is logged, never fatal to startup.
-        reconcile_locked_at_rest(&*db);
+        reconcile_locked_at_rest(&db);
 
         tracing::info!(target: "state", "app state initialized");
 
