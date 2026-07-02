@@ -171,8 +171,10 @@ impl AppState {
     /// against a temp database without touching the real Keychain or app-data dir. Migrates any
     /// existing PLAINTEXT DB to encrypted (safe: the original is untouched until a verified atomic
     /// swap), then opens the keyed connection. A wrong/garbage key makes `Db::open_with_key` fail
-    /// before any write, so the file is left unchanged.
-    fn init_at(db_path: &std::path::Path, dek: &str) -> Result<Self> {
+    /// before any write, so the file is left unchanged. `pub(crate)` ONLY so other modules'
+    /// tests (e.g. the pipeline stale-consent regression) can build a real `AppState` headless —
+    /// production code must keep entering through [`AppState::init`].
+    pub(crate) fn init_at(db_path: &std::path::Path, dek: &str) -> Result<Self> {
         // B4 startup sweep: remove any PLAINTEXT-era `*.pre-encrypt.bak` snapshot an older build may
         // have left in the app-data dir (the live at-rest leak this audit closes). Runs BEFORE the
         // migration so the fresh KEYED backup that `encrypt_in_place` writes survives. LEAVES
