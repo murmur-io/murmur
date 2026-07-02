@@ -41,6 +41,7 @@ import type {
   SearchHit,
   StartResult,
   StatusPayload,
+  EchoSuppressedPayload,
   StopResult,
   TopicThread,
   VoiceActionResultPayload,
@@ -58,6 +59,7 @@ export const EVENT_STATUS = "meetnotes://status";
 export const EVENT_VOICE_START = "murmur://voice-start";
 export const EVENT_TOGGLE_RECORD = "murmur://toggle-record";
 export const EVENT_LIVE_CAPTION = "murmur://live-caption";
+export const EVENT_ECHO_SUPPRESSED = "murmur://echo-suppressed";
 // Phase H — the brain / in-meeting voice assistant event stream.
 export const EVENT_WAKE_DETECTED = "murmur://wake-detected";
 export const EVENT_VOICE_ACTION_RESULT = "murmur://voice-action-result";
@@ -132,6 +134,11 @@ export class IpcService {
   /** Available microphone input devices for the picker (name + system-default flag). */
   listInputDevices(): Promise<InputDeviceInfo[]> {
     return invoke<InputDeviceInfo[]>("list_input_devices");
+  }
+
+  /** Is the default audio output the built-in speakers (echo risk)? null = undeterminable. */
+  outputIsBuiltinSpeakers(): Promise<boolean | null> {
+    return invoke<boolean | null>("output_is_builtin_speakers");
   }
 
   getLastNote(): Promise<NoteDto | null> {
@@ -869,6 +876,15 @@ export class IpcService {
 
   onStatus(cb: (payload: StatusPayload) => void): Promise<UnlistenFn> {
     return listen<StatusPayload>(EVENT_STATUS, (event) => cb(event.payload));
+  }
+
+  /** Cross-stream echo dedup removed segments after a recording (user was on speakers). */
+  onEchoSuppressed(
+    cb: (payload: EchoSuppressedPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<EchoSuppressedPayload>(EVENT_ECHO_SUPPRESSED, (event) =>
+      cb(event.payload),
+    );
   }
 
   /** Fires when the backend voice listener hears the wake phrase. */

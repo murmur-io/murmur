@@ -96,6 +96,14 @@ pub struct AppConfig {
     /// Echo cancellation (VPIO): capture an AEC'd mic in parallel with cpal and use it as the ASR
     /// feed (the raw cpal mic stays the archive). Default OFF; EXPERIMENTAL — best with speakers.
     pub aec_enabled: bool,
+    /// Post-hoc on-device echo cancellation (WebRTC AEC3): after Stop, cancel the captured
+    /// system-audio out of the mic track (ASR feed AND playback mix) when a speaker leak is
+    /// detected. Default ON — pure offline DSP, no live-call impact; falls back to the raw mic
+    /// on any anomaly. Fixes the doubled voice when recording on speakers.
+    /// `#[serde(default = "default_true")]` ⇒ a config persisted before this field existed loads
+    /// as `true` (existing users get the fix) instead of resetting the whole config.
+    #[serde(default = "default_true")]
+    pub post_aec_enabled: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
     /// "large-v3". Default "large-v3" (~3 GB, multilingual) — best transcription quality,
     /// notably for Polish; downloaded on demand via `download_model`.
@@ -285,6 +293,7 @@ impl Default for AppConfig {
             keep_hires_masters: false,
             diarize_others: false,
             aec_enabled: false,
+            post_aec_enabled: true,
             model_size: "large-v3".to_string(),
             voice_trigger: false,
             onboarded: false,
@@ -337,6 +346,7 @@ const K_VAD_ENABLED: &str = "vad_enabled";
 const K_KEEP_HIRES_MASTERS: &str = "keep_hires_masters";
 const K_DIARIZE_OTHERS: &str = "diarize_others";
 const K_AEC_ENABLED: &str = "aec_enabled";
+const K_POST_AEC_ENABLED: &str = "post_aec_enabled";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
@@ -427,6 +437,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_AEC_ENABLED)? {
             cfg.aec_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_POST_AEC_ENABLED)? {
+            cfg.post_aec_enabled = v == "true";
         }
         if let Some(v) = db.get_setting(K_MODEL_SIZE)? {
             if !v.is_empty() {
@@ -570,6 +583,10 @@ impl AppConfig {
         db.set_setting(
             K_AEC_ENABLED,
             if self.aec_enabled { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_POST_AEC_ENABLED,
+            if self.post_aec_enabled { "true" } else { "false" },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         db.set_setting(
@@ -739,7 +756,7 @@ mod tests {
             "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
             "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
             "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
-            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
             "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
             "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
             "cloudEgressConsented":false
@@ -802,7 +819,7 @@ mod tests {
             "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
             "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
             "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
-            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
             "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
             "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
             "cloudEgressConsented":false
@@ -1030,7 +1047,7 @@ mod tests {
             "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
             "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
             "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
-            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
             "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
             "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
             "cloudEgressConsented":false
@@ -1072,7 +1089,7 @@ mod tests {
             "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
             "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
             "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
-            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
             "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
             "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
             "cloudEgressConsented":false
@@ -1118,7 +1135,7 @@ mod tests {
             "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
             "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
             "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
-            "diarizeOthers":false,"aecEnabled":false,"modelSize":"large-v3","voiceTrigger":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
             "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
             "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
             "cloudEgressConsented":false
