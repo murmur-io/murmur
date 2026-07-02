@@ -1058,7 +1058,11 @@ export class RecordComponent implements OnInit {
    */
   readonly showAssistant = computed(() => {
     const c = this.config();
-    const enabled = !!c && c.realtimeReactions === true && c.brainBackend !== "off";
+    // Mirror the LIVE role resolver: an explicit roleLiveConnection wins over
+    // the legacy brainBackend fallback (Ask=Off compat-writes brainBackend and
+    // must not hide a Live surface that is explicitly a cloud provider).
+    const liveConn = c ? c.roleLiveConnection || c.brainBackend : "";
+    const enabled = !!c && c.realtimeReactions === true && liveConn !== "off";
     return (
       enabled ||
       this.store.isRecording() ||

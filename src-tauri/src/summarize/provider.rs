@@ -5,6 +5,13 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::summarize::meta::CallMeta;
 
+/// The curated Claude model ids offered for the `claude_code` and `anthropic` connections.
+///
+/// Single source of truth for the FE model dropdowns, served through the `list_models` command —
+/// this list previously lived hardcoded in the Settings template. Order is display order (most
+/// capable first). Static compile-time data — no I/O, no egress.
+pub const CLAUDE_MODELS: &[&str] = &["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingMeta {
