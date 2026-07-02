@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   OnInit,
   computed,
   inject,
@@ -8,6 +9,7 @@ import {
 } from "@angular/core";
 import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../core/ipc.service";
 import type { AppConfigDto, ProviderStatus } from "../../core/models";
 
@@ -161,23 +163,39 @@ const SIZE_HINTS: Record<string, string> = {
                     Stored on this Mac — used for every recording.
                   </span>
                 } @else if (modelPresent() === false) {
-                  <button
-                    type="button"
-                    class="btn btn-primary"
-                    (click)="downloadModel()"
-                    [disabled]="downloading()"
-                  >
-                    @if (downloading()) {
-                      <span class="spin-ring" aria-hidden="true"></span>
-                      Downloading…
-                    } @else {
+                  @if (downloading()) {
+                    <div class="dl-progress" role="status">
+                      <div class="dl-progress-track" aria-hidden="true">
+                        <div
+                          class="dl-progress-fill"
+                          [style.width.%]="downloadFrac() * 100"
+                        ></div>
+                      </div>
+                      <span class="dl-progress-label text-muted">
+                        @if (downloadFrac() > 0) {
+                          Downloading… {{ downloadPct() }}
+                        } @else {
+                          <span class="spin-ring" aria-hidden="true"></span>
+                          Downloading…
+                        }
+                      </span>
+                    </div>
+                    <span class="text-muted model-note">
+                      Fetching the model — large models can take a few minutes.
+                    </span>
+                  } @else {
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="downloadModel()"
+                    >
                       <span class="dl-arrow" aria-hidden="true">↓</span>
                       Download model ({{ sizeHint() }})
-                    }
-                  </button>
-                  <span class="text-muted model-note">
-                    {{ sizeHint() }}, one time, on-device.
-                  </span>
+                    </button>
+                    <span class="text-muted model-note">
+                      {{ sizeHint() }}, one time, on-device.
+                    </span>
+                  }
                 } @else {
                   <span class="pill">
                     <span class="pill-dot"></span>
@@ -735,6 +753,33 @@ const SIZE_HINTS: Record<string, string> = {
         font-size: 0.85rem;
       }
 
+      /* Whisper model-download progress bar (mirrors the settings brain-progress). */
+      .dl-progress {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+        min-width: 220px;
+        flex: 1;
+      }
+      .dl-progress-track {
+        height: 8px;
+        border-radius: var(--radius-sm);
+        background: var(--surface-input);
+        overflow: hidden;
+      }
+      .dl-progress-fill {
+        height: 100%;
+        background: var(--accent);
+        border-radius: var(--radius-sm);
+        transition: width var(--transition);
+      }
+      .dl-progress-label {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        font-size: 0.85rem;
+      }
+
       .row {
         display: flex;
         gap: var(--space-2);
@@ -1050,6 +1095,7 @@ const SIZE_HINTS: Record<string, string> = {
 export class OnboardingComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
+  private readonly destroyRef = inject(DestroyRef);
 
   readonly steps = STEPS;
   readonly currentStep = signal<Step>("welcome");
@@ -1065,6 +1111,14 @@ export class OnboardingComponent implements OnInit {
   readonly downloading = signal(false);
   readonly downloadError = signal<string | null>(null);
   readonly sizeHint = computed(() => SIZE_HINTS[this.modelSize()] ?? "");
+  /** 0..1 download progress for the in-flight model (best-effort from events). */
+  readonly downloadFrac = signal(0);
+  /** Whole-percent label for the in-flight model download. */
+  readonly downloadPct = computed(
+    () => Math.round(this.downloadFrac() * 100) + "%",
+  );
+  /** Release handle for the EVENT_MODEL_DOWNLOAD subscription. */
+  private unlistenModelDownload: UnlistenFn | null = null;
 
   /** Provider step. */
   readonly providers = signal<ProviderStatus[]>([]);
@@ -1094,6 +1148,19 @@ export class OnboardingComponent implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
+    // Whisper model-download progress stream (best-effort; drives the progress bar).
+    try {
+      this.unlistenModelDownload = await this.ipc.onModelDownload((p) => {
+        if (!this.downloading()) return;
+        if (p.total && p.total > 0) {
+          this.downloadFrac.set(Math.min(1, p.downloaded / p.total));
+        }
+        if (p.done) this.downloadFrac.set(1);
+      });
+      this.destroyRef.onDestroy(() => this.unlistenModelDownload?.());
+    } catch {
+      // No model-download stream — progress stays inert; the download still resolves.
+    }
     try {
       const cfg = await this.ipc.getConfig();
       this.loadedConfig = cfg;
@@ -1163,6 +1230,7 @@ export class OnboardingComponent implements OnInit {
 
   async downloadModel(): Promise<void> {
     this.downloadError.set(null);
+    this.downloadFrac.set(0);
     this.downloading.set(true);
     try {
       // The model is fetched for the SAVED language + size — persist first.
