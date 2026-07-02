@@ -121,15 +121,19 @@ pub fn merge_streams(streams: Vec<StreamInput>) -> Vec<Segment> {
 /// docs/research/2026-07-02-audio-echo-full-remediation.md.
 ///
 /// CONTENT-LOSS GUARDS (load-bearing):
+///   - NO dedup fires without measured acoustic leak evidence — echo only exists when the user
+///     is on speakers, so headphones / no-leak recordings are never touched (BOTH tiers gated);
 ///   - only `me` segments are ever dropped; the clean `others*` copy ALWAYS survives;
 ///   - both sides need ≥ 4 tokens (short real acks — "okay", "yes ship it" — are immune);
-///   - the relaxed tier fires ONLY under measured acoustic leak evidence (headphones ⇒
-///     no evidence ⇒ strict tier only);
+///   - echo is CAUSAL (it lags its source), so a `me` segment that starts before the matching
+///     `others` (beyond a small jitter tolerance) is the user speaking first, NOT echo — kept;
 ///   - identical text outside the echo window is genuine repetition and survives.
 const ECHO_MIN_TOKENS: usize = 4;
-const ECHO_STRICT_WINDOW_S: f64 = 2.0;
+/// Echo lags its source, so the strict window is asymmetric: a small causal back-tolerance for
+/// merge/timestamp jitter, then forward to cover the echo lag + residual offset.
+const ECHO_CAUSAL_BACK_S: f64 = 0.5;
+const ECHO_STRICT_FWD_S: f64 = 2.0;
 const ECHO_STRICT_JACCARD: f32 = 0.85;
-const ECHO_RELAXED_BEFORE_S: f64 = 1.5;
 const ECHO_RELAXED_AFTER_S: f64 = 4.0;
 const ECHO_RELAXED_SIMILARITY: f32 = 0.7;
 const ECHO_CONCAT_MAX: usize = 3;
@@ -221,11 +225,14 @@ pub fn suppress_cross_stream_echo(
     segments: Vec<Segment>,
     leak: Option<&crate::audio::align::EchoLeak>,
 ) -> (Vec<Segment>, usize) {
-    let relaxed_armed = leak
+    // Echo only exists when the user is on speakers, which is exactly what a measured leak means.
+    // No leak ⇒ no echo ⇒ NOTHING is deduplicated (headphones / unreliable-offset recordings are
+    // returned untouched). This gates BOTH tiers — the strict tier is no longer ungated.
+    let leak_armed = leak
         .map(|l| l.correlation >= crate::audio::align::MIN_CORR)
         .unwrap_or(false);
     let others_refs: Vec<&Segment> = segments.iter().filter(|s| is_others(s)).collect();
-    if others_refs.is_empty() {
+    if !leak_armed || others_refs.is_empty() {
         return (segments, 0);
     }
     let candidates = build_candidates(&others_refs);
@@ -244,16 +251,18 @@ pub fn suppress_cross_stream_echo(
             if cand.tokens.len() < ECHO_MIN_TOKENS {
                 continue;
             }
+            // `delta` = how much LATER the `me` (echo) copy starts than the `others` source.
+            // Echo lags, so both windows run from a small causal back-tolerance forward.
+            // (leak evidence is already guaranteed — the fn early-returned otherwise.)
             let delta = seg.start_s - cand.start_s;
-            let strict_hit = delta.abs() <= ECHO_STRICT_WINDOW_S
+            let strict_hit = (-ECHO_CAUSAL_BACK_S..=ECHO_STRICT_FWD_S).contains(&delta)
                 && jaccard(&me_tokens, &cand.tokens) >= ECHO_STRICT_JACCARD;
             // Relaxed tier uses ORDER-PRESERVING signals only (equality, contiguous substring,
             // or token-LCS): acoustic echo is the SAME speech, so Whisper decodes it in the same
             // word order. An order-INSENSITIVE metric (multiset coverage) was dropped because it
             // eats a genuine `me` line whose words merely reappear — reordered — in a nearby
             // `others` segment (lock-security finding). Content-loss beats garbled-echo recall.
-            let relaxed_hit = relaxed_armed
-                && (-ECHO_RELAXED_BEFORE_S..=ECHO_RELAXED_AFTER_S).contains(&delta)
+            let relaxed_hit = (-ECHO_CAUSAL_BACK_S..=ECHO_RELAXED_AFTER_S).contains(&delta)
                 && (me_norm == cand.text_norm
                     || cand.text_norm.contains(&me_norm)
                     || me_norm.contains(&cand.text_norm)
@@ -495,11 +504,47 @@ mod tests {
             seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
             seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
         ];
-        let (out, n) = suppress_cross_stream_echo(segs, None);
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
         assert_eq!(n, 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].speaker.as_deref(), Some("others"), "the clean copy survives");
         assert_eq!(out[0].idx, 0, "re-indexed");
+    }
+
+    /// HEADPHONES IMMUNITY (RED-before-GREEN): with NO measured leak, echo is physically
+    /// impossible, so even a verbatim cross-stream match is genuine repetition — NOTHING is
+    /// dropped. Dedup requires leak evidence in BOTH tiers.
+    #[test]
+    fn no_dedup_without_leak_evidence() {
+        let segs = vec![
+            seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
+            seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, None);
+        assert_eq!(n, 0, "no leak ⇒ no dedup (headphones are immune)");
+        assert_eq!(out.len(), 2);
+        // A weak leak below the arming threshold is also treated as no evidence.
+        let segs2 = vec![
+            seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
+            seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
+        ];
+        let (_, n2) = suppress_cross_stream_echo(segs2, Some(&leak(0.2)));
+        assert_eq!(n2, 0, "sub-threshold correlation is not leak evidence");
+    }
+
+    /// CAUSALITY (RED-before-GREEN): echo LAGS its source. A `me` segment that starts well
+    /// before a verbatim `others` segment is the user speaking FIRST — never echo — even under
+    /// strong leak evidence. The old symmetric ±2 s window would have eaten it.
+    #[test]
+    fn me_before_others_is_not_echo() {
+        let segs = vec![
+            // me starts 1.5 s BEFORE the matching others → user spoke first.
+            seg_sp(5.0, 6.5, "the contract is now signed by both parties", "me"),
+            seg_sp(6.5, 8.0, "the contract is now signed by both parties", "others"),
+        ];
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
+        assert_eq!(n, 0, "a me line preceding the others match is not echo");
+        assert_eq!(out.len(), 2);
     }
 
     /// Genuine short agreement ("yes ship it", 3 tokens) must SURVIVE even with strong
@@ -570,7 +615,7 @@ mod tests {
             seg_sp(5.0, 7.0, "the migration plan looks good to me", "others-2"),
             seg_sp(5.3, 7.2, "the migration plan looks good to me", "me"),
         ];
-        let (out, n) = suppress_cross_stream_echo(segs, None);
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
         assert_eq!(n, 1);
         assert_eq!(out[0].speaker.as_deref(), Some("others-2"));
     }
@@ -584,7 +629,7 @@ mod tests {
             seg_sp(6.1, 7.2, "the budget by monday", "others"),
             seg_sp(5.4, 7.5, "we need to finalize the budget by monday", "me"),
         ];
-        let (out, n) = suppress_cross_stream_echo(segs, None);
+        let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
         assert_eq!(n, 1);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|s| s.speaker.as_deref() != Some("me")));
