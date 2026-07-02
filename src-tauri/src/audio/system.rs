@@ -5,12 +5,20 @@
 //! pieces verified here are: the sidecar compiles, spawn/stop plumbing, and graceful
 //! degrade-to-None when the sidecar can't capture (e.g. permission denied — it exits 3).
 
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, OnceLock};
 
 use tauri::{AppHandle, Manager};
 
 use crate::error::{AppError, Result};
+
+/// One stderr line from a system-capture helper announcing its FIRST audio buffer — the true
+/// capture-start marker (the process-spawn instant precedes SCK/tap setup by hundreds of ms).
+pub(crate) fn is_first_frame_line(line: &str) -> bool {
+    line.trim_end().ends_with("first-frame")
+}
 
 /// Filename of the sidecar — both inside `Contents/Resources` of a shipped `.app` and at the
 /// dev `OUT_DIR`.
@@ -71,6 +79,13 @@ pub struct SystemAudioRecorder {
     /// each stream's segments to its own host start instead of aligning by sample count (which
     /// drifts seconds/hour). See `audio::merge`.
     started_at: std::time::Instant,
+    /// True capture-start anchor: `Instant::now()` taken when the helper's `first-frame` stderr
+    /// line arrives. The sidecar's boot + SCK/tap setup (~100–500 ms) precedes the first buffer,
+    /// so this is a much tighter merge/mix anchor than the spawn instant. Set once.
+    first_frame_at: Arc<OnceLock<std::time::Instant>>,
+    /// Drains the sidecar's stderr (captures the anchor + prevents the pipe buffer ever blocking
+    /// the child). Joined in [`stop`].
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SystemAudioRecorder {
@@ -100,19 +115,39 @@ impl SystemAudioRecorder {
                 cmd.env(key, val);
             }
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Audio(format!("failed to spawn system-audio sidecar: {e}")))?;
+        let first_frame_at: Arc<OnceLock<std::time::Instant>> = Arc::new(OnceLock::new());
+        // Drain stderr on a dedicated thread: (a) capture the first-frame anchor, (b) prevent the
+        // 64 KB pipe buffer from ever blocking the helper (stderr was piped-but-unread before).
+        let stderr_reader = child.stderr.take().map(|stderr| {
+            let anchor = first_frame_at.clone();
+            std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if is_first_frame_line(&line) {
+                        let _ = anchor.set(std::time::Instant::now());
+                    }
+                    // Never log helper lines verbatim beyond known markers (no-PII rule).
+                }
+            })
+        });
         Ok(Self {
             child,
             wav_path,
             started_at: std::time::Instant::now(),
+            first_frame_at,
+            stderr_reader,
         })
     }
 
-    /// Host wall-clock instant when this system-audio stream started capturing (for the merge).
+    /// Host wall-clock instant when this system-audio stream started CAPTURING (for the merge).
+    /// Prefers the helper's first-frame anchor; falls back to the spawn instant (a helper that
+    /// died before capturing, or an old helper without the line).
     pub fn started_at(&self) -> std::time::Instant {
-        self.started_at
+        self.first_frame_at.get().copied().unwrap_or(self.started_at)
     }
 
     /// SIGTERM the sidecar so it finalizes the WAV, wait for it, and return the WAV path
@@ -131,6 +166,11 @@ impl SystemAudioRecorder {
             .wait()
             .map_err(|e| AppError::Audio(format!("waiting on system-audio sidecar: {e}")))?;
 
+        // Join the stderr drainer (the child is gone, so its stderr is at EOF → the thread ends).
+        if let Some(handle) = self.stderr_reader.take() {
+            let _ = handle.join();
+        }
+
         if status.success() && self.wav_path.exists() {
             Ok(Some(self.wav_path))
         } else {
@@ -141,5 +181,19 @@ impl SystemAudioRecorder {
             );
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_first_frame_line;
+
+    #[test]
+    fn first_frame_line_is_recognized() {
+        assert!(is_first_frame_line("sysaudio: first-frame"));
+        assert!(is_first_frame_line("audiocap: first-frame\n".trim()));
+        assert!(!is_first_frame_line("sysaudio: capturing"));
+        assert!(!is_first_frame_line("audiocap: tap stuck silent — rebuilding (1)"));
+        assert!(!is_first_frame_line(""));
     }
 }
