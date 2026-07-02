@@ -77,6 +77,12 @@ pub const EVENT_ASSISTANT_TOOL: &str = "murmur://assistant-tool";
 /// card and vice-versa. Payload is [`AssistantToolPayload`] (tool name + state + count, NO PII).
 pub const EVENT_CHAT_TOOL: &str = "murmur://chat-tool";
 
+/// Same shape again but scoped to the ASK-MY-VAULT page (the vault-wide agentic Q&A surface),
+/// deliberately separate from [`EVENT_ASSISTANT_TOOL`] / [`EVENT_CHAT_TOOL`] so the record-screen
+/// stores never see Ask chips and vice-versa. Payload is [`AssistantToolPayload`] (tool name +
+/// state + count + the turn's opaque `thread_id`, NO PII).
+pub const EVENT_ASK_TOOL: &str = "murmur://ask-tool";
+
 /// Payload for [`EVENT_ASSISTANT_TOOL`]. `state` is "running" | "done"; `ok` is false when the tool
 /// call errored; `count` is a coarse result-size signal for the "✓ N" badge (NEVER the content).
 #[derive(Debug, Clone, Serialize)]
