@@ -44,6 +44,11 @@ standing agent; the builder/verifier roles below are dispatched as task subagent
 the conventions explicitly). Iterate with `/tauri-dev` (`MURMUR_DEV_DEK` recipe,
 `cargo test --lib` loop).
 
+**Inject prior lessons first.** Before dispatching a role, prepend that agent's curated
+`## Recurring patterns` from `.claude/learnings/<agent>.md` to its prompt as *"Previous lessons
+(binding — do NOT repeat these)"*. This is the compounding-lessons loop
+(`.claude/learnings/README.md`) — cheap, and it stops the fleet re-paying a bug it already caught.
+
 **Rust / Tauri rules:**
 - `AppError` + `Result` everywhere (`error.rs`); new commands registered in the
   `generate_handler!` in `lib.rs`.
@@ -72,8 +77,14 @@ budget; inline SVG icons; **no new npm packages without explicit user approval.*
 constructor injection.
 
 ### 4. ADVERSARIAL verify (the part that caught 7 bugs)
-The author does **not** self-certify. Run an independent **adversarial-verifier** pass over
-the diff whose job is to make it FAIL:
+The author does **not** self-certify. Verify in **two sequential passes** (a spec review before a
+code review catches "built the wrong thing" before code-quality noise buries it):
+
+**4a — Spec review (fast):** does the diff implement what stage-1 scope / stage-2 plan actually
+asked for? Nothing missing, nothing extra, the IPC seam and data shape as agreed. Only after this
+signs off does the code/adversarial pass begin.
+
+**4b — Adversarial-verifier pass** over the diff whose job is to make it FAIL:
 - For each load-bearing claim ("it locks", "it's gated", "the migration is safe", "the signal
   updates"), ask **"what would make this false?"** and try it.
 - Exercise the real seam, not mocks: run it under `/tauri-dev`, drive the IPC command, read
@@ -87,6 +98,17 @@ the diff whose job is to make it FAIL:
 
 A verifier finding sends it BACK to stage 3. Do not advance on the author's say-so.
 
+**Record the verdict as evidence (Phase-3 gate).** Each verifier writes a schema'd JSON to
+`.claude/tmp/<task>/` (gitignored scratch) so the Definition-of-Done becomes machine-checkable, not
+prose the committer eyeballs:
+- adversarial-verifier → `adversarial-verify.json` = `{"verdict":"PASS"|"FAIL","findings":[…],"summary":"…"}`
+- lock-security-reviewer (when stage-1 flagged lock/crypto/visibility) → `lock-security.json` (same
+  shape) AND `touch .claude/tmp/<task>/.lock-touched` so the guard knows the lock gate is required.
+- Optional observability: `.claude/lib/trace-span.sh <task> verify adversarial-verify PASS adversarial-verify.json`.
+
+`.claude/hooks/finish-guard.sh` reads these on `git commit` (advisory by default; set
+`MURMUR_FINISH_GUARD=enforce` to hard-block a commit whose gates aren't PASS).
+
 ### 5. Gates green
 ```bash
 source "$HOME/.cargo/env"
@@ -97,9 +119,16 @@ bash scripts/ci.sh                      # full gate before commit (clippy + test
 `scripts/ci.sh` must end `✅ CI: all gates green`. (Reminder: `clippy --all-targets` belongs
 in `ci.sh`, NOT the inner loop — see `/tauri-dev`.)
 
+### 5b. Extract the lesson (close the loop)
+If verification caught anything real — or the run confirmed a non-obvious approach that worked —
+append ONE `## Run journal` entry to the relevant `.claude/learnings/<agent>.md` (or run
+`/learn <agent>: <lesson>`), citing the artifact that revealed it. Periodically `/curate-learnings`
+promotes repeat offenders into `## Recurring patterns`. This is what makes "every bug a permanent
+lesson" instead of a re-paid one.
+
 ### 6. Commit as QueaT
 ```bash
-git checkout -b feat/<slug>      # never commit on the murmur trunk
+git checkout -b feat/<slug>      # never commit on the murmur trunk (block-bash.sh refuses trunk push)
 git add -A && git commit -m "<type>(<scope>): <subject>"
 git log -1 --format='%an <%ae>'  # MUST be QueaT <kgm004a@gmail.com>
 ```
