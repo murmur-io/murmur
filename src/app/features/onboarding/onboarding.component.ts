@@ -1535,6 +1535,7 @@ export class OnboardingComponent implements OnInit {
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
       noteStyle: base?.noteStyle ?? "standard",
+      notesMode: base?.notesMode ?? "enhance",
       autoOrganize: base?.autoOrganize ?? false,
       noteLanguage: base?.noteLanguage ?? "auto",
       // Stage E security flags — read the current values from the snapshot and send

@@ -128,6 +128,7 @@ export class SettingsStore {
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
+    notesMode: "enhance",
     autoOrganize: false,
     noteLanguage: "auto",
     // Phase H — brain / in-meeting voice assistant.
@@ -846,6 +847,7 @@ export class SettingsStore {
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
+        notesMode: cfg.notesMode ?? "enhance",
         autoOrganize: cfg.autoOrganize ?? false,
         noteLanguage: cfg.noteLanguage ?? "auto",
         brainBackend: cfg.brainBackend ?? "cloud",
@@ -1119,6 +1121,7 @@ export class SettingsStore {
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
       noteStyle: v.noteStyle,
+      notesMode: v.notesMode,
       autoOrganize: v.autoOrganize,
       noteLanguage: v.noteLanguage,
       // Phase H — brain / in-meeting voice assistant.
