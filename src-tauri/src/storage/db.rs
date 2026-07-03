@@ -528,6 +528,35 @@ impl Db {
         // DEFAULT install (no e5 model, semantic flag off). Additive + guarded so migrate() stays
         // idempotent. Runs AFTER migrate_documents (the triggers reference doc_chunks).
         Self::migrate_doc_fts(&conn)?;
+
+        // TIER 1: one-time flip of the on-device semantic-search default to ON for the INSTALLED base
+        // (fresh installs already default ON via `AppConfig::default()`; this reaches DBs that persisted
+        // the historical default-off). Sentinel-guarded so it runs EXACTLY once and never re-fires — a
+        // user who turns semantic search off AFTER this migration stays off. Uses the HELD `conn`
+        // directly: calling self.get_setting/set_setting here would re-lock `self.lock()` and DEADLOCK.
+        // Config-only (a settings key), additive, idempotent, and fully reversible via the Settings
+        // toggle — it touches NO meeting content, crypto, or seal state.
+        let semantic_default_applied: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'semantic_default_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if semantic_default_applied.is_none() {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('semantic_search_enabled', 'true')
+                 ON CONFLICT(key) DO UPDATE SET value = 'true'",
+                [],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('semantic_default_v1', '1')",
+                [],
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -5377,6 +5406,33 @@ mod tests {
         db.migrate().unwrap();
     }
 
+    /// TIER 1 installed-base flip: `migrate()` sets `semantic_search_enabled='true'` + the
+    /// `semantic_default_v1` sentinel exactly ONCE; a later opt-out (`false`) survives a re-migrate
+    /// (the sentinel guards the block so it never re-fires). Config-only, idempotent, reversible.
+    #[test]
+    fn tier1_semantic_default_migration_runs_once_and_opt_out_persists() {
+        let db = mem_db();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_setting("semantic_default_v1").unwrap().as_deref(),
+            Some("1"),
+            "sentinel is set after the migration"
+        );
+        assert_eq!(
+            db.get_setting("semantic_search_enabled").unwrap().as_deref(),
+            Some("true"),
+            "installed base is flipped ON once"
+        );
+        // A user turns semantic OFF after the migration; re-running migrate() must NOT flip it back.
+        db.set_setting("semantic_search_enabled", "false").unwrap();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_setting("semantic_search_enabled").unwrap().as_deref(),
+            Some("false"),
+            "sentinel-guarded: a post-migration opt-out persists across re-migrate"
+        );
+    }
+
     // ── Phase 2b: egress_log ─────────────────────────────────────────────────
 
     fn sample_egress_entry() -> crate::summarize::egress_log::EgressEntry {
@@ -6414,7 +6470,14 @@ mod tests {
         db.set_setting("vault_path", "/vault2").unwrap();
         assert_eq!(db.get_setting("vault_path").unwrap().as_deref(), Some("/vault2"));
 
-        let all = db.all_settings().unwrap();
+        // Only the keys THIS test set — migrate() also seeds the Tier 1 semantic-default keys
+        // (semantic_search_enabled / semantic_default_v1), which are not this KV test's concern.
+        let all: Vec<(String, String)> = db
+            .all_settings()
+            .unwrap()
+            .into_iter()
+            .filter(|(k, _)| k == "provider_id" || k == "vault_path")
+            .collect();
         assert_eq!(
             all,
             vec![
