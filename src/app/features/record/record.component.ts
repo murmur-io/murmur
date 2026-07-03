@@ -185,9 +185,7 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
           @if (isProcessing()) {
             <div class="proc-inline" role="status">
               <span class="orb proc" aria-hidden="true"></span>
-              <span class="proc-label">{{
-                store.message() || store.stage()
-              }}</span>
+              <span class="proc-label">{{ procLabel() }}</span>
               <div class="proc-track" aria-hidden="true">
                 <div class="proc-shimmer"></div>
               </div>
@@ -710,7 +708,6 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
         color: var(--text-primary);
         font-size: 0.92rem;
         font-weight: 550;
-        text-transform: capitalize;
       }
       .proc-track {
         flex: 1;
@@ -1141,7 +1138,7 @@ export class RecordComponent implements OnInit {
       case "claude_code":
         return "Claude Code";
       case "gateway":
-        return "AI Gateway";
+        return "Kong AI Gateway";
       case "ollama":
         return "Ollama";
       default:
@@ -1162,7 +1159,7 @@ export class RecordComponent implements OnInit {
       case "claude_code":
         return "Anthropic's cloud";
       case "gateway":
-        return "your AI gateway";
+        return "your Kong AI Gateway";
       case "ollama":
         return "your remote Ollama server";
       default:
@@ -1182,6 +1179,30 @@ export class RecordComponent implements OnInit {
   readonly isProcessing = computed(
     () => this.store.isBusy() && !this.store.isRecording(),
   );
+
+  /**
+   * The processing status line. Prefer the backend's status message — it is
+   * already a clean, properly-cased sentence ("Summarizing with Claude Code…",
+   * "Writing note to vault…") — and fall back to a Title-cased stage word only
+   * when no message has been emitted yet. This replaces the old CSS
+   * `text-transform: capitalize` on `.proc-label`, which mangled the full
+   * sentence into "Summarizing With Provider 'Claude_code'…".
+   */
+  readonly procLabel = computed(() => {
+    const msg = this.store.message().trim();
+    if (msg) return msg;
+    const stage = this.store.stage();
+    const labels: Record<string, string> = {
+      recording: "Recording",
+      transcribing: "Transcribing",
+      summarizing: "Summarizing",
+      exporting: "Exporting",
+      saved: "Saved",
+      done: "Done",
+      error: "Error",
+    };
+    return labels[stage] ?? stage.charAt(0).toUpperCase() + stage.slice(1);
+  });
 
   /**
    * Whether the Record action is allowed right now. A missing vault does NOT block recording
