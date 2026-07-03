@@ -28,6 +28,7 @@
 //! lock-touching: it adds no seal, no new read path, no new export.
 
 pub mod bakeoff;
+pub mod diarization;
 
 use serde::{Deserialize, Serialize};
 
