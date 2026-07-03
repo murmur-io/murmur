@@ -122,6 +122,7 @@ mod tests {
                 completion_tokens: Some(50),
                 total_tokens: Some(150),
                 cached_tokens: None,
+                redactions: None,
             },
             redactions: RedactionCounts {
                 email: 1,
