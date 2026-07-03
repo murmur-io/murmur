@@ -46,6 +46,11 @@ const MAX_BRIEF_FACTS: usize = 40;
 /// Max note chars fed to the user-fact extractor (bounds the prompt / leak surface, like facts.rs).
 const EXTRACT_EXCERPT_CHARS: usize = 8_000;
 
+/// Max chars of the meeting's @brain THREAD TURNS fed to the extractor. Bounded like the note/notes
+/// excerpts (design spec D5): thread turns are the HIGHEST-signal source (an explicit "zapamiętaj,
+/// że…"), but the section must still stay a tight, leak-bounded budget.
+const THREAD_TURNS_MAX_CHARS: usize = 4_000;
+
 /// One current user-memory fact, as surfaced to the FE audit view. Content-bearing (subject /
 /// predicate / object) BUT only ever built from VISIBLE facts (`Db::list_user_facts_visible`), so a
 /// sealed source never reaches here. `sourceMeetingId` is the provenance link (the audit "where did
@@ -89,6 +94,21 @@ pub struct UserMemory {
     pub facts: Vec<UserMemoryFact>,
     /// The injected brief (same text the agentic loop receives), or empty when memory is empty.
     pub brief: String,
+    /// TRUE when cross-meeting memory is turned OFF entirely (config `user_memory_enabled == false`).
+    /// In that state `facts`/`brief` are EMPTY and NOTHING is injected into any prompt — the FE shows
+    /// a "memory is off" affordance rather than an empty list. Default FALSE (memory on) so a payload
+    /// that omits it (older FE) reads as enabled.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl UserMemory {
+    /// The explicit "memory is turned OFF" payload: empty facts, empty brief, `disabled: true`. Used
+    /// by `get_user_memory` when the config gate is off so the FE can render a distinct "memory is
+    /// off" affordance instead of an "empty memory" one — and NOTHING content-bearing is surfaced.
+    pub fn disabled() -> Self {
+        Self { facts: Vec::new(), brief: String::new(), disabled: true }
+    }
 }
 
 /// DETERMINISTIC brief synthesis (no LLM, no DB, no clock) — the headless-testable core. Assemble the
@@ -133,13 +153,14 @@ struct RawUserFact {
 }
 
 const EXTRACT_SYSTEM: &str = "You extract durable facts, preferences and commitments ABOUT THE \
-USER (the person whose notes these are — first person \"I / me / my\") from a meeting note and the \
-user's own typed notes. Output STRICT JSON ONLY (no prose, no code fences): \
-{\"facts\":[{\"predicate\":\"short attribute\",\"object\":\"value\"}]}.\n\
+USER (the person whose notes these are — first person \"I / me / my\") from a meeting note, the \
+user's own typed notes, and the user's own messages to the brain assistant. Output STRICT JSON \
+ONLY (no prose, no code fences): {\"facts\":[{\"predicate\":\"short attribute\",\"object\":\"value\"}]}.\n\
 - Extract ONLY durable, user-scoped state worth remembering across meetings: the user's own \
 preferences (\"prefers replies in Polish\"), ongoing work (\"works on Project Atlas\"), commitments \
 and recurring context (\"deadline Q3 = 2026-09-15\"). Prefer things the user explicitly asks to \
-remember (\"remember that…\", \"zapamiętaj, że…\").\n\
+remember (\"remember that…\", \"zapamiętaj, że…\") — an explicit ask in a THREAD TURN is the \
+highest-signal source.\n\
 - predicate is a short, stable attribute (e.g. \"prefers\", \"works on\", \"role\", \"deadline\").\n\
 - object is the current value (e.g. \"Polish replies\", \"Project Atlas\", \"2026-09-15\").\n\
 - Do NOT extract facts about OTHER people or projects (those are entity facts, handled elsewhere), \
@@ -153,30 +174,55 @@ Output ONLY the JSON.";
 /// supersedes it, exactly like entity facts.
 const USER_SUBJECT: &str = "You";
 
-/// BEST-EFFORT extraction of user-scoped fact candidates from a meeting's note markdown + the user's
-/// own typed notes. Uses the on-device reasoner's `structured` decode; on ANY failure (stub reasoner
-/// / no model / decode error / parse error) returns an EMPTY vec — never an error, never a panic,
-/// never a block beyond the reasoner call itself. The RECONCILE is the load-bearing deterministic
-/// core; this is the soft front-end that feeds it. Every candidate carries the [`USER_SCOPE`]
-/// sentinel + the [`USER_SUBJECT`] so `reconcile_facts` keys them on the predicate.
+/// PURE + headless-testable assembly of the extraction USER prompt from the meeting's title, note
+/// markdown, the user's own typed notes, and the meeting's own @brain THREAD TURNS (design spec D5 —
+/// an explicit "zapamiętaj, że…" in a thread is the highest-signal source). Each free-text source is
+/// bounded (note/notes → [`EXTRACT_EXCERPT_CHARS`], thread turns → [`THREAD_TURNS_MAX_CHARS`]) and an
+/// empty source is omitted entirely so an all-empty payload stays minimal. Split out so the
+/// prompt-assembly + the source ordering can be unit-tested without a live model.
+fn build_extraction_user_prompt(
+    title: &str,
+    note_markdown: &str,
+    typed_notes: &str,
+    thread_turns: &str,
+) -> String {
+    let excerpt: String = note_markdown.chars().take(EXTRACT_EXCERPT_CHARS).collect();
+    let notes_excerpt: String = typed_notes.chars().take(EXTRACT_EXCERPT_CHARS).collect();
+    let thread_excerpt: String = thread_turns.chars().take(THREAD_TURNS_MAX_CHARS).collect();
+    let mut user = format!("MEETING: {title}");
+    // THREAD TURNS first after the title: the highest-signal, most explicit source.
+    if !thread_excerpt.trim().is_empty() {
+        user.push_str(&format!(
+            "\n\nUSER'S OWN MESSAGES TO THE BRAIN (THREAD TURNS):\n{thread_excerpt}"
+        ));
+    }
+    if !notes_excerpt.trim().is_empty() {
+        user.push_str(&format!("\n\nUSER'S OWN TYPED NOTES:\n{notes_excerpt}"));
+    }
+    user.push_str(&format!("\n\nNOTE:\n{excerpt}"));
+    user
+}
+
+/// BEST-EFFORT extraction of user-scoped fact candidates from a meeting's note markdown, the user's
+/// own typed notes, and the meeting's own @brain THREAD TURNS (design spec D5 — the highest-signal
+/// source). Uses the on-device reasoner's `structured` decode; on ANY failure (stub reasoner / no
+/// model / decode error / parse error) returns an EMPTY vec — never an error, never a panic, never a
+/// block beyond the reasoner call itself. The RECONCILE is the load-bearing deterministic core; this
+/// is the soft front-end that feeds it. Every candidate carries the [`USER_SCOPE`] sentinel + the
+/// [`USER_SUBJECT`] so `reconcile_facts` keys them on the predicate.
 pub fn extract_user_fact_candidates(
     reasoner: &dyn LocalReasoner,
     title: &str,
     note_markdown: &str,
     typed_notes: &str,
+    thread_turns: &str,
 ) -> Vec<FactCandidate> {
     // No real brain (the default build / no model) → no extraction. The deterministic reconcile +
     // synthesis are still exercised on whatever candidates a real brain would produce.
     if reasoner.id() == "stub" {
         return Vec::new();
     }
-    let excerpt: String = note_markdown.chars().take(EXTRACT_EXCERPT_CHARS).collect();
-    let notes_excerpt: String = typed_notes.chars().take(EXTRACT_EXCERPT_CHARS).collect();
-    let user = if notes_excerpt.trim().is_empty() {
-        format!("MEETING: {title}\n\nNOTE:\n{excerpt}")
-    } else {
-        format!("MEETING: {title}\n\nUSER'S OWN TYPED NOTES:\n{notes_excerpt}\n\nNOTE:\n{excerpt}")
-    };
+    let user = build_extraction_user_prompt(title, note_markdown, typed_notes, thread_turns);
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -296,6 +342,42 @@ mod tests {
         assert_eq!(dto.source_meeting_id.as_deref(), Some("m1"));
         assert_eq!(dto.predicate, "prefer");
         assert_eq!(dto.object, "Polish replies");
+    }
+
+    /// D5 — the meeting's own @brain THREAD TURNS are appended to the extraction prompt as a
+    /// dedicated, clearly-labelled section (the highest-signal source). This binds the seam a real
+    /// model would see: an explicit "zapamiętaj że wolę odpowiedzi po polsku" reaches the extractor.
+    /// RED before D5: `build_extraction_user_prompt` did not take/emit thread turns at all.
+    #[test]
+    fn extraction_prompt_includes_thread_turns_section() {
+        let prompt = build_extraction_user_prompt(
+            "Sync",
+            "note body",
+            "",
+            "User: zapamiętaj że wolę odpowiedzi po polsku",
+        );
+        assert!(prompt.contains("THREAD TURNS"));
+        assert!(prompt.contains("zapamiętaj że wolę odpowiedzi po polsku"));
+        // The note body is still present (thread turns AUGMENT, never replace, the note source).
+        assert!(prompt.contains("note body"));
+    }
+
+    /// Empty thread turns ⇒ NO thread-turns section at all (an all-note payload stays minimal, and
+    /// the extractor never sees a bare empty header). Note is always present.
+    #[test]
+    fn extraction_prompt_omits_empty_thread_turns() {
+        let prompt = build_extraction_user_prompt("Sync", "note body", "", "   ");
+        assert!(!prompt.contains("THREAD TURNS"));
+        assert!(prompt.contains("note body"));
+    }
+
+    /// The thread-turns section is hard-bounded to its char budget (bounds prompt / leak surface).
+    #[test]
+    fn extraction_prompt_bounds_thread_turns() {
+        let huge = "z".repeat(THREAD_TURNS_MAX_CHARS * 3);
+        let prompt = build_extraction_user_prompt("Sync", "n", "", &huge);
+        let z_count = prompt.chars().filter(|c| *c == 'z').count();
+        assert!(z_count <= THREAD_TURNS_MAX_CHARS);
     }
 
     /// candidates_from_raw scopes every candidate to the user + drops empty pairs.

@@ -1817,6 +1817,8 @@ export class OnboardingComponent implements OnInit {
       brainModelPath: base?.brainModelPath ?? null,
       // Proactive brain hints — round-trip the snapshot, default ON (fresh install).
       proactiveHintsEnabled: base?.proactiveHintsEnabled ?? true,
+      // Cross-meeting user memory — round-trip the snapshot, default ON (fresh install).
+      userMemoryEnabled: base?.userMemoryEnabled ?? true,
       // brain2 RAG — semantic-search master flag; round-trip the snapshot, default off.
       semanticSearchEnabled: base?.semanticSearchEnabled ?? false,
       // brain2 connectors — web-search toggle + its preserve-only consent; round-trip

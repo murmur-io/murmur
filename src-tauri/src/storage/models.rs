@@ -86,6 +86,28 @@ pub struct EntityDetail {
     pub neighbors: Vec<EntityNeighbor>,
 }
 
+/// One row of the `/people` personal-CRM list (`list_people`): a Person entity rolled up over
+/// the EXISTING gated graph + facts + commitments readers. EVERY count here is VISIBLE-only —
+/// a Person whose mentions/facts/commitments live solely in sealed-and-not-session-unlocked
+/// meetings never surfaces (dropped by `list_entities_visible`'s `HAVING`), and its counts
+/// reflect only visible sources. No new/ungated query feeds this DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonCard {
+    pub id: String,
+    pub name: String,
+    /// Number of VISIBLE meetings mentioning this person (sealed meetings drop out).
+    pub meeting_count: i64,
+    /// ISO 8601 start of the most-recent VISIBLE meeting that mentioned this person, or `None`
+    /// when there is no visible mention (should not happen — a card is only built for a visible
+    /// person, but kept fail-soft).
+    pub last_talked: Option<String>,
+    /// Open (`- [ ]`) action items across VISIBLE meetings owned by this person (name match).
+    pub open_commitment_count: i64,
+    /// Currently-valid (open) facts about this person from VISIBLE meetings.
+    pub current_fact_count: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Meeting {
