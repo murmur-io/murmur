@@ -43,6 +43,12 @@ use crate::error::{AppError, Result};
 pub struct CandleBertEmbedder {
     /// Directory holding `model.safetensors` + `tokenizer.json` + `config.json`.
     model_dir: PathBuf,
+    /// Asymmetric QUERY prefix for the selected model (e.g. `"query: "`). Applied by
+    /// [`Embedder::embed_query`]'s default impl via [`Self::query_prefix`].
+    query_prefix: String,
+    /// Asymmetric PASSAGE prefix for the selected model (e.g. `"passage: "`). Applied by
+    /// [`Embedder::embed_passage`]'s default impl via [`Self::passage_prefix`].
+    passage_prefix: String,
     /// Lazily-built, cached `(model, tokenizer, device)`. `None` until the first `embed` call.
     inner: Mutex<Option<Arc<Loaded>>>,
 }
@@ -55,11 +61,16 @@ struct Loaded {
 }
 
 impl CandleBertEmbedder {
-    /// Build an embedder for the e5 files in `model_dir`. CHEAP + non-blocking: it only validates the
-    /// three files exist and stores the dir — the safetensors/tokenizer load is deferred to first use,
-    /// so this is safe to call from `active_embedder` on the startup path. Returns `Err` (never panics)
-    /// if a required file is missing.
-    pub fn new(model_dir: PathBuf) -> Result<Self> {
+    /// Build an embedder for the BERT files in `model_dir`, applying the selected model's asymmetric
+    /// `query_prefix`/`passage_prefix` (e5 and mmlw both use `"query: "`/`"passage: "`). CHEAP +
+    /// non-blocking: it only validates the three files exist and stores the dir/prefixes — the
+    /// safetensors/tokenizer load is deferred to first use, so this is safe to call from
+    /// `active_embedder` on the startup path. Returns `Err` (never panics) if a required file is missing.
+    pub fn new(
+        model_dir: PathBuf,
+        query_prefix: impl Into<String>,
+        passage_prefix: impl Into<String>,
+    ) -> Result<Self> {
         for f in EMBED_MODEL_FILES {
             let p = model_dir.join(f);
             if !p.is_file() {
@@ -70,6 +81,8 @@ impl CandleBertEmbedder {
         }
         Ok(Self {
             model_dir,
+            query_prefix: query_prefix.into(),
+            passage_prefix: passage_prefix.into(),
             inner: Mutex::new(None),
         })
     }
@@ -143,6 +156,23 @@ impl CandleBertEmbedder {
 impl Embedder for CandleBertEmbedder {
     fn dim(&self) -> usize {
         EMBED_DIM
+    }
+
+    /// Override the trait default so the SELECTED model's passage prefix is applied (not the module
+    /// const). e5 and mmlw share `"passage: "`, so this is behavior-identical for both bundled models
+    /// while correctly generalizing to any future model whose convention differs.
+    fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let prefixed: Vec<String> =
+            texts.iter().map(|t| format!("{}{t}", self.passage_prefix)).collect();
+        self.embed(&prefixed)
+    }
+
+    /// Override the trait default so the SELECTED model's query prefix is applied. See
+    /// [`Self::embed_passage`].
+    fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let prefixed: Vec<String> =
+            texts.iter().map(|t| format!("{}{t}", self.query_prefix)).collect();
+        self.embed(&prefixed)
     }
 
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -257,7 +287,8 @@ mod smoke {
             dir.join("model.safetensors").is_file(),
             "e5 model not found at {dir:?}"
         );
-        let e = CandleBertEmbedder::new(dir).expect("construct CandleBertEmbedder");
+        let e = CandleBertEmbedder::new(dir, "query: ", "passage: ")
+            .expect("construct CandleBertEmbedder");
 
         let passages = vec![
             "Notatki ze spotkania o projekcie Atlas i terminie integracji API.".to_string(),
