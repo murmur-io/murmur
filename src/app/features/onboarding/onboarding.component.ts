@@ -29,7 +29,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   claude_code: "Claude Code",
   anthropic: "Anthropic API",
   ollama: "Ollama",
-  gateway: "AI Gateway (OpenAI-compatible)",
+  gateway: "Kong AI Gateway (OpenAI-compatible)",
 };
 
 /**
@@ -368,7 +368,7 @@ const SIZE_HINTS: Record<string, string> = {
                 }
                 @case ("gateway") {
                   <div class="setup-well">
-                    <p class="setup-title">Connect your AI gateway</p>
+                    <p class="setup-title">Connect your Kong AI Gateway</p>
                     <p class="setup-text text-secondary">
                       Enter your gateway's OpenAI-compatible base URL (e.g.
                       https://…/v1). An API key can be added later in
