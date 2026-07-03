@@ -1,0 +1,8 @@
+{
+  "meeting": "REPLACE-with-a-label-for-this-recording",
+  "reference": [
+    { "start": 0.0, "end": 4.2, "speaker": "REPLACE-with-Person-A" },
+    { "start": 4.2, "end": 9.8, "speaker": "REPLACE-with-Person-B" },
+    { "start": 9.8, "end": 14.5, "speaker": "REPLACE-with-Person-A" }
+  ]
+}
