@@ -408,7 +408,7 @@ murmur/
 
 ## 🗺️ Status
 
-Murmur ships at **v0.6.3** — a signed, notarized macOS app. The full record → transcribe → summarize
+Murmur ships at **v0.6.4** — a signed, notarized macOS app. The full record → transcribe → summarize
 pipeline, the conversation-first record screen with in-meeting `@brain` threads, the on-device brain +
 semantic search, the `/brain` knowledge hub, the per-folder Touch ID lock, the knowledge graph,
 Ask-Your-Vault, and the MCP server are all implemented. Some capabilities — live ScreenCaptureKit capture,
