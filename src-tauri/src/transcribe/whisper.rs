@@ -170,6 +170,41 @@ impl Transcriber {
             let t0 = segment.start_timestamp();
             let t1 = segment.end_timestamp();
 
+            // ASR CONFIDENCE (Tier 3b/A) — ONLY on the `Accurate` batch path (the authoritative,
+            // persisted transcript). The `Fast` live/voice-trigger captions are throwaway (greedy
+            // best_of:1) so they leave `confidence = None`. Confidence = the mean of whisper's
+            // per-token LINEAR probabilities (`token_probability` = `whisper_full_get_token_p`),
+            // DISCOUNTED by the segment's no-speech probability so a confident-but-likely-silence
+            // decode scores low. All getters return plain `f32` / `Option` (`get_token`) — no
+            // fallible call, no `unwrap`, no panic; a segment with no readable tokens yields `None`
+            // rather than a wrong-but-confident value. HONEST SCOPE: the wiring ships here, but the
+            // real confidence VALUES + the `LOW_CONFIDENCE_P` threshold calibration need a loaded
+            // GGUF + Metal on a signed Mac — `cargo test --lib` cannot exercise a real decode.
+            let confidence = if quality == TranscribeQuality::Accurate {
+                let n_tok = segment.n_tokens();
+                if n_tok > 0 {
+                    let mut sum = 0.0_f32;
+                    let mut count = 0_u32;
+                    for tk in 0..n_tok {
+                        if let Some(token) = segment.get_token(tk) {
+                            sum += token.token_probability();
+                            count += 1;
+                        }
+                    }
+                    if count > 0 {
+                        let mean_p = sum / count as f32;
+                        let no_speech = segment.no_speech_probability().clamp(0.0, 1.0);
+                        Some((mean_p * (1.0 - no_speech)).clamp(0.0, 1.0))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let trimmed = text.trim();
             if !full_text.is_empty() && !trimmed.is_empty() {
                 full_text.push(' ');
@@ -185,6 +220,7 @@ impl Transcriber {
                 // assigned by the wall-clock merge in `audio::merge` from which stream produced
                 // these segments, not here. Live/voice-trigger callers leave it as `None`.
                 speaker: None,
+                confidence,
             });
         }
 

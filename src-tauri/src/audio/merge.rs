@@ -88,6 +88,8 @@ pub fn merge_streams(streams: Vec<StreamInput>) -> Vec<Segment> {
                         .clone()
                         .unwrap_or_else(|| stream.speaker.to_string()),
                 ),
+                // Carry the ASR confidence through the wall-clock merge unchanged (metadata).
+                confidence: seg.confidence,
             });
         }
     }
@@ -298,6 +300,7 @@ mod tests {
             end_s,
             text: text.into(),
             speaker: None,
+            confidence: None,
         }
     }
 
@@ -490,7 +493,7 @@ mod tests {
     use crate::audio::align::EchoLeak;
 
     fn seg_sp(start_s: f64, end_s: f64, text: &str, speaker: &str) -> Segment {
-        Segment { idx: 0, start_s, end_s, text: text.into(), speaker: Some(speaker.into()) }
+        Segment { idx: 0, start_s, end_s, text: text.into(), speaker: Some(speaker.into()), confidence: None }
     }
     fn leak(corr: f32) -> EchoLeak {
         EchoLeak { offset_s: 0.3, correlation: corr }
