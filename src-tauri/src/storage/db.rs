@@ -1178,6 +1178,57 @@ impl Db {
         Ok(())
     }
 
+    /// Crash-recovery reconcile: flip every meeting still stuck in `RECORDING` to the terminal
+    /// `ERROR` state. Returns the number of rows reconciled.
+    ///
+    /// `start_recording` (`commands.rs`) inserts a meeting row in `RECORDING` up-front so a crash /
+    /// SIGKILL mid-capture leaves a recoverable row instead of losing the meeting outright. A process
+    /// that dies before `stop_recording`, though, never transitions that row out of `RECORDING`, so
+    /// it lingers in the library as a "ghost" that still looks live forever. Run this once at launch
+    /// (from `lib.rs` setup, after the DB is open + migrated) to make each ghost HONEST: it becomes a
+    /// plain terminal `ERROR` row (which the library already renders as "Error" — no audio, no note,
+    /// no spinner).
+    ///
+    /// ADDITIVE + non-destructive: no row is deleted and no other column is touched. Full audio
+    /// salvage of an abandoned recording (mic spill) is a SEPARATE, later task. Idempotent — with no
+    /// live recording a second call reconciles 0. Non-`RECORDING` rows (Complete/Error/…) are left
+    /// untouched by the `WHERE status = 'RECORDING'` guard. Logs only meeting UUIDs + a count (no PII).
+    pub fn reconcile_stuck_recordings(&self) -> Result<usize> {
+        let conn = self.lock();
+        // Collect the ghost ids first (UUIDs — not PII) so the reconcile is auditable in the log.
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM meetings WHERE status = ?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![MeetingStatus::Recording.as_str()],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(map_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_err)?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let n = conn
+            .execute(
+                "UPDATE meetings SET status = ?2 WHERE status = ?1",
+                rusqlite::params![
+                    MeetingStatus::Recording.as_str(),
+                    MeetingStatus::Error.as_str()
+                ],
+            )
+            .map_err(map_err)?;
+        tracing::info!(
+            target: "startup",
+            reconciled = n,
+            ids = ?ids,
+            "reconciled stuck RECORDING meetings to ERROR (crash recovery)"
+        );
+        Ok(n)
+    }
+
     pub fn finalize_meeting(
         &self,
         id: &str,
@@ -6296,6 +6347,52 @@ mod tests {
         assert_eq!(fin.audio_path.as_deref(), Some("/tmp/m1.wav"));
 
         assert!(db.get_meeting("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_stuck_recordings_flips_recording_to_error_and_is_idempotent() {
+        let db = mem_db();
+
+        // A ghost: inserted RECORDING and never stopped (crash mid-capture).
+        db.insert_meeting(&sample_meeting("ghost", "2026-07-04T09:00:00Z"))
+            .unwrap();
+        db.update_meeting_status("ghost", MeetingStatus::Recording)
+            .unwrap();
+
+        // A healthy, finished meeting that must be left alone.
+        db.insert_meeting(&sample_meeting("done", "2026-07-04T10:00:00Z"))
+            .unwrap();
+        db.update_meeting_status("done", MeetingStatus::Summarized)
+            .unwrap();
+
+        // An already-terminal ERROR row must NOT be re-counted (guards against a broad WHERE).
+        db.insert_meeting(&sample_meeting("failed", "2026-07-04T11:00:00Z"))
+            .unwrap();
+        db.update_meeting_status("failed", MeetingStatus::Error)
+            .unwrap();
+
+        // First reconcile flips exactly the one stuck RECORDING row to ERROR.
+        assert_eq!(db.reconcile_stuck_recordings().unwrap(), 1);
+        assert_eq!(
+            db.get_meeting("ghost").unwrap().unwrap().status,
+            MeetingStatus::Error
+        );
+        // Non-recording rows are untouched.
+        assert_eq!(
+            db.get_meeting("done").unwrap().unwrap().status,
+            MeetingStatus::Summarized
+        );
+        assert_eq!(
+            db.get_meeting("failed").unwrap().unwrap().status,
+            MeetingStatus::Error
+        );
+
+        // Idempotent: with no live recording a second call reconciles nothing.
+        assert_eq!(db.reconcile_stuck_recordings().unwrap(), 0);
+        assert_eq!(
+            db.get_meeting("ghost").unwrap().unwrap().status,
+            MeetingStatus::Error
+        );
     }
 
     #[test]
