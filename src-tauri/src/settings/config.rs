@@ -249,6 +249,16 @@ pub struct AppConfig {
     /// as `true`.
     #[serde(default = "default_true")]
     pub proactive_hints_enabled: bool,
+    /// Cross-meeting USER MEMORY master gate (Phase 3, `crate::user_memory`). Default ON (spec: memory
+    /// is a headline capability). When OFF, memory is turned off ENTIRELY in the BACKEND: no user-fact
+    /// extraction runs after a meeting (`persist_user_facts_for_meeting` early-returns), NO memory
+    /// brief is injected into ANY surface (the @brain agentic loop, Ask, per-meeting chat), and
+    /// `get_user_memory` reports the disabled marker — not just UI hiding. Existing facts are NOT
+    /// deleted by flipping it (the user can forget/clear them); flipping it back ON resumes injection
+    /// from the still-present facts. `#[serde(default = "default_true")]` ⇒ a config persisted before
+    /// this field existed loads as `true` (memory stays on for existing installs).
+    #[serde(default = "default_true")]
+    pub user_memory_enabled: bool,
     /// Model-role override — the CONNECTION serving the **Notes** role (everything Murmur writes).
     /// `""` (the default, and every pre-role install) = inherit the legacy mapping EXACTLY — see
     /// [`crate::summarize::roles::resolve`]. Values: `claude_code`/`anthropic`/`ollama`/`gateway`
@@ -337,6 +347,7 @@ impl Default for AppConfig {
             gateway_base_url: String::new(),
             gateway_model: String::new(),
             proactive_hints_enabled: true,
+            user_memory_enabled: true,
             role_notes_connection: String::new(),
             role_notes_model: String::new(),
             role_notes_effort: String::new(),
@@ -392,6 +403,7 @@ const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
 const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
+const K_USER_MEMORY_ENABLED: &str = "user_memory_enabled";
 const K_ROLE_NOTES_CONNECTION: &str = "role_notes_connection";
 const K_ROLE_NOTES_MODEL: &str = "role_notes_model";
 const K_ROLE_NOTES_EFFORT: &str = "role_notes_effort";
@@ -544,6 +556,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_PROACTIVE_HINTS_ENABLED)? {
             cfg.proactive_hints_enabled = v == "true";
         }
+        if let Some(v) = db.get_setting(K_USER_MEMORY_ENABLED)? {
+            cfg.user_memory_enabled = v == "true";
+        }
         // Model-role keys: `""` is a VALID value (= inherit legacy) and also the default, so the
         // stored value is taken verbatim (mirrors `provider_model`, not `anthropic_model`).
         if let Some(v) = db.get_setting(K_ROLE_NOTES_CONNECTION)? {
@@ -691,6 +706,10 @@ impl AppConfig {
         db.set_setting(
             K_PROACTIVE_HINTS_ENABLED,
             if self.proactive_hints_enabled { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_USER_MEMORY_ENABLED,
+            if self.user_memory_enabled { "true" } else { "false" },
         )?;
         db.set_setting(K_ROLE_NOTES_CONNECTION, &self.role_notes_connection)?;
         db.set_setting(K_ROLE_NOTES_MODEL, &self.role_notes_model)?;
@@ -1212,6 +1231,37 @@ mod tests {
         let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().proactive_hints_enabled);
+    }
+
+    /// Cross-meeting USER MEMORY — the master gate defaults ON for fresh installs AND for configs
+    /// persisted before the field existed (both the settings-table path and the serde path), and an
+    /// explicit OFF round-trips (turning memory off is a real, persistable choice — not a one-way
+    /// latch). ON-on-absent is the "memory stays on for existing installs" guarantee.
+    #[test]
+    fn user_memory_enabled_defaults_on_and_round_trips() {
+        // In-memory default + empty settings table (key never written) ⇒ ON.
+        assert!(AppConfig::default().user_memory_enabled);
+        let db = temp_db();
+        assert!(AppConfig::load(&db).unwrap().user_memory_enabled);
+
+        // serde path: a JSON payload omitting the field entirely loads ON (default_true).
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.user_memory_enabled, "an omitted key must default ON");
+
+        // Explicit OFF persists + reloads OFF (the backend-side memory kill switch).
+        let cfg = AppConfig { user_memory_enabled: false, ..Default::default() };
+        cfg.save(&db).unwrap();
+        assert!(!AppConfig::load(&db).unwrap().user_memory_enabled);
     }
 
     /// Model roles — the 9 role keys default `""` (inherit-legacy) for fresh installs AND for

@@ -38,6 +38,31 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-03] Phase 1 COMPLETE user memory (D5 thread-turns + Ask/detail inject + flag) — lock-touching
+- **Pattern:** three seams. (1) D5: `extract_user_fact_candidates` grew a `thread_turns` arg + a PURE
+  testable `build_extraction_user_prompt` seam (thread turns section, bounded, omitted-when-empty);
+  fed from `list_assistant_interactions_visible` (GATED — the just-finished meeting is its own unlocked
+  meeting, USER command text only). (2) Inject the gated brief into the 2 non-agentic surfaces:
+  `vault_chat::build`/`agentic_system` + `chat::build` each took a `memory_brief` arg with an
+  EMPTY⇒byte-identical contract (a `memory_block` helper). Brief computed by a new commands-level
+  `gated_memory_brief_for_injection(&AppState, &unlocked)` → `list_user_facts_visible` (same gate as the
+  @brain loop). (3) `user_memory_enabled` flag (default TRUE, `default_true`) threaded EVERYWHERE:
+  extraction skip, all 3 inject paths (incl. live.rs `gated_user_memory_brief(.., enabled)`),
+  `get_user_memory` → `UserMemory::disabled()` marker. Full DTO wiring BE (AppConfigDto/dto_to_config/
+  config_to_dto) + FE (models.ts UserMemory.disabled?/AppConfigDto.userMemoryEnabled + settings.store 3
+  sites + onboarding literal).
+- **Trap hit:** an `fn(a,b,c)`→`fn(a,b,c,d)` arg change hit ~8 test call sites (ask_vault_loop ×4,
+  build_ask_vault_floor_prompt ×2, ask_vault_floor ×1, vault_chat::build ×1) — grep the symbol, fix them
+  all in the same pass. FE: a full-DTO `AppConfigDto` literal in onboarding.component.ts (NOT just the
+  store) needed the new field or `ng build` TS2741'd — grep every literal, not just the store.
+- **Caught by:** `cargo test --lib` (781 pass, +13 new); `cargo clippy --lib` clean; `ng lint`+`ng build`
+  green. RED proven by swapping `list_user_facts_visible`→`user_facts_all()` in the inject helper: the
+  ask-gate test FAILED ("sealed-source user fact must NOT be in the injected brief"); reverted → GREEN.
+- **Lesson:** the byte-identical-when-empty contract is the safe way to add a prompt segment behind a
+  flag — test it explicitly (`assert_eq!(with_empty, pre_change)`) on EVERY surface, so a disabled/empty
+  brief can never drift the prompt. FLAG for lock-security-reviewer (new gated read + new inject path).
+- **Status:** GREEN (781 lib tests; FE lint+build clean).
+
 ### [2026-07-03] Phase 3 cross-meeting user memory (lock-touching)
 - **Pattern:** reused the bitemporal `facts` substrate (pure `reconcile_facts`) for a NEW user-scoped
   `user_facts` table (separate table, NO entity FK, `USER_SCOPE` sentinel in the `entity_id` reconcile

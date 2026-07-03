@@ -12,7 +12,7 @@ use crate::storage::models::{
     CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
-    NoteRecord, PinResult, RecipeRecord, SearchHit, TopicThread,
+    NoteRecord, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -193,6 +193,11 @@ pub struct AppConfigDto {
     /// `AppConfig::default` — an older FE payload must not silently flip the backend mute.
     #[serde(default = "default_true")]
     pub proactive_hints_enabled: bool,
+    /// Cross-meeting USER MEMORY master gate (`crate::user_memory`). Settable from the DTO (the
+    /// Settings UI owns the toggle). Defaults ON when omitted (`default_true`), matching
+    /// `AppConfig::default` — an older FE payload must not silently turn memory off.
+    #[serde(default = "default_true")]
+    pub user_memory_enabled: bool,
     /// Model-role override — the connection serving the NOTES role (see
     /// `crate::summarize::roles`). Settable from the DTO (a future Settings UI owns the rows).
     /// `""` (and an omitted key, `#[serde(default)]`) = inherit the legacy mapping — so an older
@@ -1211,6 +1216,13 @@ pub fn get_user_memory(state: State<'_, AppState>) -> Result<crate::user_memory:
 pub(crate) fn get_user_memory_inner(
     state: &AppState,
 ) -> Result<crate::user_memory::UserMemory, AppError> {
+    // FLAG: memory turned OFF entirely ⇒ the explicit disabled marker (empty facts + empty brief +
+    // `disabled: true`), so the FE shows a "memory is off" affordance and NOTHING is surfaced. This
+    // mirrors the injection paths, which are also flag-suppressed — the audit view can never show
+    // facts the brain would not inject.
+    if !user_memory_enabled(state) {
+        return Ok(crate::user_memory::UserMemory::disabled());
+    }
     let unlocked = unlocked_snapshot(state)?;
     let facts = state.db.list_user_facts_visible(&unlocked)?;
     // The audit view and the injected brief are derived from EXACTLY the same visible set, so the UI
@@ -1220,7 +1232,7 @@ pub(crate) fn get_user_memory_inner(
         .iter()
         .map(crate::user_memory::UserMemoryFact::from_fact)
         .collect();
-    Ok(crate::user_memory::UserMemory { facts: dtos, brief })
+    Ok(crate::user_memory::UserMemory { facts: dtos, brief, disabled: false })
 }
 
 /// Forget ONE user-memory fact (bitemporal invalidate — the row is CLOSED, never silently deleted,
@@ -1347,7 +1359,13 @@ pub async fn chat_meeting(
     // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
     // default provider as before (the legacy chat path always ignored `brain_backend`).
     let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Ask, &config)?;
-    let (system, user) = crate::summarize::chat::build(&transcript, &history, &question);
+    // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
+    // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
+    // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked);
+    let (system, user) =
+        crate::summarize::chat::build(&transcript, &history, &question, &memory_brief);
     provider.complete(&system, &user).await
 }
 
@@ -2005,9 +2023,21 @@ fn persist_user_facts_for_meeting(
     title: &str,
     markdown: &str,
 ) -> Result<(), AppError> {
-    // The user's OWN typed notes for this meeting are the highest-signal memory source (an explicit
+    // FLAG: when the user has turned cross-meeting memory OFF, skip extraction ENTIRELY — no
+    // reasoner call, no candidates, nothing new persisted. (Existing facts stay; the user can
+    // forget/clear them, and the gated reads/injection are separately flag-suppressed.)
+    if !user_memory_enabled(state) {
+        return Ok(());
+    }
+    // The user's OWN typed notes for this meeting are a high-signal memory source (an explicit
     // "remember that…"). Empty when none (best-effort read).
     let typed_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
+    // D5 — the meeting's own @brain THREAD TURNS are the HIGHEST-signal source (an explicit
+    // "zapamiętaj, że…" in a thread). GATED like every content read: the just-finished meeting is
+    // its own unlocked meeting, so `list_assistant_interactions_visible` under the live unlock
+    // snapshot returns its turns (and NOTHING for a sealed-not-unlocked meeting — fail-closed). We
+    // feed the USER COMMAND text (the high-signal part), never the assistant's answer.
+    let thread_turns = gated_meeting_thread_turns(state, meeting_id);
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner is
     //    re-resolved from the LIVE config so a consent/backend change applies without restart.
     let candidates = crate::user_memory::extract_user_fact_candidates(
@@ -2015,6 +2045,7 @@ fn persist_user_facts_for_meeting(
         title,
         markdown,
         &typed_notes,
+        &thread_turns,
     );
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
@@ -2032,6 +2063,61 @@ fn persist_user_facts_for_meeting(
     crate::facts::set_meeting_id(&mut ops, meeting_id);
     state.db.apply_user_fact_ops(&ops)?;
     Ok(())
+}
+
+/// Whether cross-meeting USER MEMORY is enabled (config `user_memory_enabled`, default TRUE). When
+/// OFF: no extraction runs, no brief is injected into ANY surface, and `get_user_memory` reports the
+/// disabled marker. Fail-safe: a poisoned config mutex reports ENABLED (the default) so a transient
+/// lock error never silently disables the feature.
+fn user_memory_enabled(state: &AppState) -> bool {
+    state
+        .config
+        .lock()
+        .map(|c| c.user_memory_enabled)
+        .unwrap_or(true)
+}
+
+/// Read the meeting's OWN @brain THREAD TURNS for user-fact extraction (design spec D5), GATED by the
+/// live session unlock snapshot: `list_assistant_interactions_visible` returns the meeting's turns
+/// only when the meeting is VISIBLE (a sealed-not-unlocked meeting returns EMPTY — fail-closed). Only
+/// the USER COMMAND text is included (the high-signal part — an explicit "zapamiętaj, że…"); the
+/// assistant's answer is never fed back into extraction. Best-effort: any read error ⇒ empty string
+/// (extraction degrades to note+notes). Content-free on error.
+fn gated_meeting_thread_turns(state: &AppState, meeting_id: &str) -> String {
+    let unlocked = match unlocked_snapshot(state) {
+        Ok(u) => u,
+        Err(_) => return String::new(),
+    };
+    let turns = match state
+        .db
+        .list_assistant_interactions_visible(meeting_id, &unlocked)
+    {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    turns
+        .iter()
+        .map(|i| format!("User: {}", i.command.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The gated cross-meeting USER MEMORY brief for injection into the non-agentic Ask / meeting-chat
+/// surfaces (design spec: parity with the @brain agentic loop, which already injects it). It is
+/// DERIVED data — never sealed, always REGENERATED from the currently-VISIBLE user facts under the
+/// passed `unlocked` snapshot — so a sealed-not-unlocked meeting's user facts inject NOTHING. When
+/// memory is disabled (config `user_memory_enabled == false`) it returns EMPTY, so the prompt is
+/// byte-identical to the pre-memory prompt. Rides the EXISTING redaction + consent egress of the
+/// surface it is injected into — no new egress class.
+fn gated_memory_brief_for_injection(
+    state: &AppState,
+    unlocked: &std::collections::HashSet<String>,
+) -> String {
+    if !user_memory_enabled(state) {
+        return String::new();
+    }
+    let facts = state.db.list_user_facts_visible(unlocked).unwrap_or_default();
+    crate::user_memory::synthesize_brief(&facts)
 }
 
 /// Resolve the people + projects in a meeting note → persist them to the encrypted DB graph
@@ -2073,6 +2159,18 @@ const ENTITY_NEIGHBOR_LIMIT: i64 = 12;
 pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.build_graph(&unlocked)
+}
+
+/// `/people` personal CRM: one card per VISIBLE Person entity, rolled up over the SAME gated
+/// graph/facts/commitment readers as the graph + rollup views (`list_entities_visible` filtered to
+/// people, `entity_mentions_visible`, `list_facts_visible`, `list_open_commitments`). Snapshots the
+/// live session `unlocked` set like `get_graph`, so a person whose only mentions are in
+/// sealed-and-not-session-unlocked meetings never appears and every count reflects visible sources
+/// only. Read-only, no model, no new egress.
+#[tauri::command]
+pub fn list_people(state: State<'_, AppState>) -> Result<Vec<PersonCard>, AppError> {
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.list_people(&unlocked)
 }
 
 /// Detail for one entity: the entity, its VISIBLE backlinked meetings (as `VaultSource` chips),
@@ -2149,7 +2247,10 @@ pub async fn ask_vault(
     // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
     // again, while sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
     let unlocked = unlocked_snapshot(state.inner())?;
-    ask_vault_floor(&state.db, &config, &unlocked, &question, &history).await
+    // Gated cross-meeting USER MEMORY brief (parity with the @brain loop): VISIBLE facts only under
+    // this same unlock snapshot, empty when memory is disabled ⇒ the floor prompt is byte-identical.
+    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked);
+    ask_vault_floor(&state.db, &config, &unlocked, &question, &history, &memory_brief).await
 }
 
 /// Max agentic rounds for the Ask surface. Not live-latency-bound like the in-meeting loop
@@ -2201,6 +2302,15 @@ fn ask_vault_agentic_attempt(
         event: crate::events::EVENT_ASK_TOOL,
         thread_id: thread_id.to_string(),
     };
+    // Gated cross-meeting USER MEMORY brief for the agentic persona (parity with the @brain loop):
+    // VISIBLE facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒ the persona
+    // is byte-identical. Rides the loop's existing redaction + consent egress (no new class).
+    let unlocked_now = state
+        .unlocked_folders
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let memory_brief = gated_memory_brief_for_injection(&state, &unlocked_now);
     match ask_vault_loop(
         &*reasoner,
         &executor,
@@ -2208,6 +2318,7 @@ fn ask_vault_agentic_attempt(
         &state.unlocked_folders,
         question,
         history,
+        &memory_brief,
         Some(&sink as &dyn crate::agent::DeltaSink),
     ) {
         Ok(converged) => converged,
@@ -2227,6 +2338,7 @@ fn ask_vault_agentic_attempt(
 /// vault-QA persona over the rendered conversation, then map a converged outcome onto the Ask DTO.
 /// `Ok(None)` = non-convergence (caller floors); `Err` propagates (caller floors) — the loop
 /// contract of `run_informational`, applied to the Ask surface.
+#[allow(clippy::too_many_arguments)]
 fn ask_vault_loop(
     reasoner: &dyn crate::reason::LocalReasoner,
     executor: &dyn crate::agent::ToolExecutor,
@@ -2234,9 +2346,10 @@ fn ask_vault_loop(
     unlocked: &std::sync::Mutex<std::collections::HashSet<String>>,
     question: &str,
     history: &[ChatTurn],
+    memory_brief: &str,
     sink: Option<&dyn crate::agent::DeltaSink>,
 ) -> Result<Option<AskVaultResult>, AppError> {
-    let system = crate::summarize::vault_chat::agentic_system();
+    let system = crate::summarize::vault_chat::agentic_system(memory_brief);
     let user = crate::summarize::vault_chat::render_conversation(history, question);
     let Some(outcome) =
         crate::agent::run_agentic_loop(reasoner, &system, &user, executor, ASK_MAX_STEPS, sink)?
@@ -2301,6 +2414,7 @@ fn build_ask_vault_floor_prompt(
     unlocked: &std::collections::HashSet<String>,
     question: &str,
     history: &[ChatTurn],
+    memory_brief: &str,
 ) -> Result<AskFloorPrompt, AppError> {
     // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪
     // vector KNN, RRF-fused) — embedding the query with the active embedder — then pack with the
@@ -2345,7 +2459,8 @@ fn build_ask_vault_floor_prompt(
             citations: Vec::new(),
         }));
     }
-    let (system, user) = crate::summarize::vault_chat::build(&corpus, history, question);
+    let (system, user) =
+        crate::summarize::vault_chat::build(&corpus, history, question, memory_brief);
     Ok(AskFloorPrompt::Ready { system, user, sources })
 }
 
@@ -2359,8 +2474,9 @@ async fn ask_vault_floor(
     unlocked: &std::collections::HashSet<String>,
     question: &str,
     history: &[ChatTurn],
+    memory_brief: &str,
 ) -> Result<AskVaultResult, AppError> {
-    match build_ask_vault_floor_prompt(db, config, unlocked, question, history)? {
+    match build_ask_vault_floor_prompt(db, config, unlocked, question, history, memory_brief)? {
         AskFloorPrompt::Empty(result) => Ok(result),
         AskFloorPrompt::Ready { system, user, sources } => {
             // ASK role. With role keys absent this builds the legacy default provider for EVERY
@@ -2514,9 +2630,11 @@ mod ask_vault_tests {
         )
         .unwrap();
         assert!(!corpus.trim().is_empty(), "fixture must produce a non-empty corpus");
-        let (want_system, want_user) = crate::summarize::vault_chat::build(&corpus, &history, q);
+        // Empty memory brief ⇒ the floor prompt must stay BYTE-IDENTICAL to the pre-memory build.
+        let (want_system, want_user) =
+            crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history).unwrap() {
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "").unwrap() {
             AskFloorPrompt::Ready { system, user, sources } => {
                 assert_eq!(system, want_system, "floor system prompt diverged from pre-change");
                 assert_eq!(user, want_user, "floor user prompt diverged from pre-change");
@@ -2531,7 +2649,7 @@ mod ask_vault_tests {
 
         // The empty-vault early return keeps the EXACT pre-change canned answer.
         let empty = tmp_db();
-        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[]).unwrap() {
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "").unwrap() {
             AskFloorPrompt::Empty(r) => {
                 assert_eq!(
                     r.answer,
@@ -2555,7 +2673,7 @@ mod ask_vault_tests {
             ..AppConfig::default()
         };
         assert!(!cfg.cloud_egress_consented, "fresh config defaults to consent OFF");
-        let res = block_on(ask_vault_floor(&db, &cfg, &HashSet::new(), "atlas?", &[]));
+        let res = block_on(ask_vault_floor(&db, &cfg, &HashSet::new(), "atlas?", &[], ""));
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
             "no-consent floor must keep the Unavailable refusal: {res:?}"
@@ -2582,7 +2700,7 @@ mod ask_vault_tests {
             serde_json::json!({ "tool": "get_open_commitments", "args": {} }),
             serde_json::json!({ "answer": "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]]." }),
         ]);
-        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "who owns the deck?", &[], None)
+        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "who owns the deck?", &[], "", None)
             .unwrap()
             .expect("scripted brain converged");
         assert_eq!(out.answer, "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]].");
@@ -2612,7 +2730,7 @@ mod ask_vault_tests {
         let stuck = ScriptReasoner::ok(vec![
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "a" } }),
         ]);
-        let out = ask_vault_loop(&stuck, &exec, &db, &unlocked, "q", &[], None).unwrap();
+        let out = ask_vault_loop(&stuck, &exec, &db, &unlocked, "q", &[], "", None).unwrap();
         assert!(out.is_none(), "non-convergence must return Ok(None) for the command to floor");
 
         struct Refuses;
@@ -2632,7 +2750,7 @@ mod ask_vault_tests {
                 Err(AppError::Unavailable("no consent".into()))
             }
         }
-        let res = ask_vault_loop(&Refuses, &exec, &db, &unlocked, "q", &[], None);
+        let res = ask_vault_loop(&Refuses, &exec, &db, &unlocked, "q", &[], "", None);
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
             "a loop error must propagate so the attempt wrapper can floor: {res:?}"
@@ -2730,7 +2848,7 @@ mod ask_vault_tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "Atlas Secret Terms" } }),
             serde_json::json!({ "answer": "Here is what I found." }),
         ]);
-        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "the secret terms?", &[], None)
+        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "the secret terms?", &[], "", None)
             .unwrap()
             .expect("converged");
         assert!(
@@ -3246,6 +3364,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
         proactive_hints_enabled: c.proactive_hints_enabled,
+        user_memory_enabled: c.user_memory_enabled,
         role_notes_connection: c.role_notes_connection.clone(),
         role_notes_model: c.role_notes_model.clone(),
         role_notes_effort: c.role_notes_effort.clone(),
@@ -3378,6 +3497,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default —
         // the backend mute is an explicit user choice, never a partial-save side effect.
         proactive_hints_enabled: d.proactive_hints_enabled,
+        // Cross-meeting USER MEMORY: the master gate IS settable from the DTO (Settings owns the
+        // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default — an
+        // older FE payload can never silently turn memory off.
+        user_memory_enabled: d.user_memory_enabled,
         // Model-role keys ARE settable from the DTO (a future Settings UI owns the rows), like
         // `gateway_model` — plain strings, `""` = inherit legacy. An omitted key deserializes to
         // `""` (`#[serde(default)]`), so an older FE payload can never flip a role.
@@ -6889,6 +7012,81 @@ mod lifecycle_tests {
         .unwrap();
     }
 
+    /// Add a user-memory fact sourced from `meeting_id` (the gating + purge anchor) for the injection
+    /// tests below.
+    fn add_user_fact(db: &Db, meeting_id: &str, object: &str) {
+        db.apply_user_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+            entity_id: crate::user_memory::USER_SCOPE.to_string(),
+            subject: "You".into(),
+            predicate: "prefer".into(),
+            object: object.into(),
+            valid_from: "2026-06-27T09:00:00Z".into(),
+            recorded_at: "2026-06-27T09:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some(meeting_id.to_string()),
+        })])
+        .unwrap();
+    }
+
+    /// LOCK INVARIANT for the Ask surface's memory injection (RED-before-GREEN, task Phase-1 Ask):
+    /// a user-memory fact whose SOURCE meeting is sealed-and-not-session-unlocked does NOT appear in
+    /// the `ask_vault` system prompt, and an EMPTY memory brief yields a BYTE-IDENTICAL prompt. Before
+    /// the visibility gate on `gated_memory_brief_for_injection` (deleting the
+    /// `list_user_facts_visible` predicate) this FAILS — the sealed fact leaks into the Ask prompt.
+    #[test]
+    fn ask_vault_memory_brief_is_gated_and_empty_is_byte_identical() {
+        let state = build_state("ask-mem-gate");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m1", "We shipped the beta.", None);
+        state.db.set_meeting_folder("m1", Some("f1")).unwrap();
+        add_user_fact(&state.db, "m1", "Polish replies");
+
+        // A grounding corpus + the (byte-identical) EMPTY-brief prompt to compare against.
+        let corpus = "### [[Sync]] · 2026-07-01 · id:m1\nWe shipped the beta.";
+        let (want_empty_system, _) =
+            crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", "");
+
+        // OPEN folder: the fact is VISIBLE → the gated brief carries it → it reaches the Ask prompt.
+        let open = unlocked_snapshot(&state).unwrap();
+        let brief_open = gated_memory_brief_for_injection(&state, &open);
+        assert!(brief_open.contains("Polish replies"), "an open-folder user fact must be in the brief");
+        let (sys_open, _) =
+            crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", &brief_open);
+        assert!(sys_open.contains("Polish replies"), "and reach the Ask system prompt when open");
+        assert_ne!(sys_open, want_empty_system, "a present brief changes the prompt");
+
+        // SEAL the folder (session NOT unlocked). Flip the flag only (the real seal purges the fact);
+        // here we prove the READ GATE hides a fact whose row still exists at rest.
+        state.db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        let sealed = unlocked_snapshot(&state).unwrap();
+        let brief_sealed = gated_memory_brief_for_injection(&state, &sealed);
+        assert!(brief_sealed.is_empty(), "a sealed-source user fact must NOT be in the injected brief");
+        let (sys_sealed, _) =
+            crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", &brief_sealed);
+        assert!(!sys_sealed.contains("Polish replies"), "the sealed fact must not reach the Ask prompt");
+        // Empty brief ⇒ the prompt is BYTE-IDENTICAL to the pre-memory prompt.
+        assert_eq!(sys_sealed, want_empty_system, "empty memory ⇒ byte-identical Ask prompt");
+
+        // A SESSION UNLOCK re-admits it (reversible gate).
+        state.unlocked_folders.lock().unwrap().insert("f1".to_string());
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        assert!(
+            gated_memory_brief_for_injection(&state, &unlocked).contains("Polish replies"),
+            "a session unlock must re-admit the user fact to the Ask brief"
+        );
+
+        // FLAG OFF: even the visible fact must NOT be injected when memory is disabled.
+        state.config.lock().unwrap().user_memory_enabled = false;
+        assert!(
+            gated_memory_brief_for_injection(&state, &unlocked).is_empty(),
+            "memory disabled must suppress the Ask brief even for a visible fact"
+        );
+        // And get_user_memory reports the explicit disabled marker (empty + disabled:true).
+        let mem = get_user_memory_inner(&state).unwrap();
+        assert!(mem.disabled, "disabled flag ⇒ the audit payload reports disabled");
+        assert!(mem.facts.is_empty() && mem.brief.is_empty(), "disabled ⇒ nothing surfaced");
+    }
+
     /// PR-A #3 belt-and-braces: sealing a folder while NO recording is active clears any stale
     /// live-transcript buffer (post clear-on-Stop it is normally already empty — idempotent
     /// hygiene so a stale tail can never outlive the folder it belongs to).
@@ -7741,6 +7939,10 @@ mod lifecycle_tests {
             dto.proactive_hints_enabled,
             "omitted proactiveHintsEnabled defaults ON (matches AppConfig::default)"
         );
+        assert!(
+            dto.user_memory_enabled,
+            "omitted userMemoryEnabled defaults ON (matches AppConfig::default)"
+        );
     }
 
     /// Proactive brain P1 — the mute toggle round-trips through the settings DTO: `config_to_dto`
@@ -7759,6 +7961,25 @@ mod lifecycle_tests {
         assert!(
             !dto_to_config(dto, &current).proactive_hints_enabled,
             "a settings save must be able to mute the backend scanner"
+        );
+    }
+
+    /// Cross-meeting USER MEMORY — the master gate round-trips through the settings DTO:
+    /// `config_to_dto` carries it OUT (the FE reads `userMemoryEnabled`) and `dto_to_config` takes it
+    /// IN (the FE sets it), so Settings can actually turn memory off in the backend.
+    #[test]
+    fn dto_round_trips_user_memory_toggle() {
+        // OUT: the DTO reflects the live value.
+        let cfg = AppConfig { user_memory_enabled: false, ..Default::default() };
+        assert!(!config_to_dto(&cfg).user_memory_enabled);
+
+        // IN: the DTO value lands in the merged config (proven from a differing `current`).
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.user_memory_enabled = false;
+        let current = AppConfig::default(); // ON
+        assert!(
+            !dto_to_config(dto, &current).user_memory_enabled,
+            "a settings save must be able to turn cross-meeting memory off"
         );
     }
 
