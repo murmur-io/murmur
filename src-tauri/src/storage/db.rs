@@ -5458,6 +5458,7 @@ mod tests {
                 completion_tokens: Some(50),
                 total_tokens: Some(150),
                 cached_tokens: None,
+                redactions: None,
             },
             redactions: RedactionCounts { email: 1, card: 0, phone: 1, name: 2 },
             system_bytes: 512,
@@ -5536,6 +5537,7 @@ mod tests {
                 completion_tokens: None,
                 total_tokens: Some(total_tokens),
                 cached_tokens: None,
+                redactions: None,
             },
             redactions: RedactionCounts {
                 email: redaction_email,
@@ -5686,6 +5688,7 @@ mod tests {
                 completion_tokens: Some(5),
                 total_tokens: Some(15),
                 cached_tokens: None,
+                redactions: None,
             },
             redactions: RedactionCounts::default(),
             system_bytes: 0,

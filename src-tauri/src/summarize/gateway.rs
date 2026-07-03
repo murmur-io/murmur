@@ -173,6 +173,9 @@ pub(crate) fn parse_chat_response(body: &str) -> Result<(String, CallMeta)> {
             .as_ref()
             .and_then(|u| u.prompt_tokens_details.as_ref())
             .and_then(|d| d.cached_tokens),
+        // The raw provider never redacts (the RedactingProvider wrapper does + overwrites this
+        // with the real scrub count for cloud egress).
+        redactions: None,
     };
 
     Ok((note.to_string(), meta))

@@ -173,6 +173,9 @@ pub(crate) fn parse_messages_response(body: &str) -> crate::error::Result<(Strin
                 .usage
                 .as_ref()
                 .and_then(|u| u.cache_read_input_tokens),
+            // The raw provider never redacts (the RedactingProvider wrapper does + overwrites this
+            // with the real scrub count for cloud egress).
+            redactions: None,
         }
     };
 
