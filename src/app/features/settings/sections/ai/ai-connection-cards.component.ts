@@ -27,7 +27,7 @@ const CONNECTIONS: readonly ConnectionDef[] = [
   { id: "claude_code", name: "Claude Code" },
   { id: "anthropic", name: "Anthropic API" },
   { id: "ollama", name: "Ollama" },
-  { id: "gateway", name: "AI Gateway" },
+  { id: "gateway", name: "Kong AI Gateway" },
 ];
 
 /**
