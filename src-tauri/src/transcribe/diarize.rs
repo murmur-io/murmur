@@ -364,6 +364,7 @@ mod tests {
             end_s,
             text: "x".into(),
             speaker: None,
+            confidence: None,
         }
     }
 

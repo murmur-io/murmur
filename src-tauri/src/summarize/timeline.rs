@@ -241,6 +241,7 @@ mod tests {
             end_s,
             text: "x".into(),
             speaker: Some("me".into()),
+            confidence: None,
         }
     }
     fn turn(start_s: f64, end_s: f64) -> SpeakerTurn {
