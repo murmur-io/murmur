@@ -11,7 +11,10 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import type { MeetingTimeline as MeetingTimelineData } from "../../core/models";
+import type {
+  MeetingTimeline as MeetingTimelineData,
+  SpeakerSuggestion,
+} from "../../core/models";
 
 /** A speaker turn resolved to render geometry + a stable lane + palette index. */
 interface SpeakerBlock {
@@ -213,6 +216,19 @@ interface AxisTick {
                         <span class="legend-name">{{ lane.speaker }}</span>
                         <span class="legend-pencil" aria-hidden="true">✎</span>
                       </button>
+                      <!-- Voiceprint suggestion — one-tap accept renames + enrols. -->
+                      @if (suggestionByLabel().get(lane.speaker); as name) {
+                        <button
+                          type="button"
+                          class="legend-suggest"
+                          [attr.aria-label]="
+                            'Rename ' + lane.speaker + ' to ' + name
+                          "
+                          (click)="acceptSuggestion(lane.speaker)"
+                        >
+                          Looks like <span class="legend-suggest-name">{{ name }}</span>?
+                        </button>
+                      }
                     }
                     <span class="legend-time">{{ fmt(lane.talkS) }}</span>
                   </span>
@@ -574,6 +590,36 @@ interface AxisTick {
         border-radius: var(--radius-sm);
         font-size: 0.8125rem;
         font-weight: 550;
+      }
+
+      /* --- Voiceprint suggestion chip ("Looks like Anna?") --- */
+      .legend-suggest {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25ch;
+        padding: 2px var(--space-2);
+        border: 1px solid var(--accent-soft);
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        color: var(--accent);
+        font: inherit;
+        font-size: 0.75rem;
+        line-height: 1.2;
+        cursor: pointer;
+        white-space: nowrap;
+        transition:
+          background var(--transition),
+          border-color var(--transition);
+      }
+      .legend-suggest:hover {
+        border-color: var(--accent);
+      }
+      .legend-suggest:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .legend-suggest-name {
+        font-weight: 650;
       }
 
       /* --- The shared scale tracks --- */
@@ -1078,6 +1124,14 @@ export class MeetingTimelineComponent {
   readonly error = input<boolean>(false);
   /** Whether a seek will actually move audio (false when audioPath is null). */
   readonly hasAudio = input<boolean>(false);
+  /**
+   * Speaker voiceprints (opt-in) — one suggested person name per diarized
+   * `others-{n}` lane, from cross-meeting re-identification. Presentational only:
+   * the chip's accept emits `renameSpeaker` (which the parent runs + which enrolls
+   * the cluster). Empty when the opt-in is off, nothing matched, or the meeting is
+   * locked. A suggestion is a best-effort guess, NOT a certain identity.
+   */
+  readonly suggestions = input<SpeakerSuggestion[]>([]);
 
   /** Seek request in seconds — the parent applies it to its `<audio>`. */
   readonly seek = output<number>();
@@ -1096,6 +1150,23 @@ export class MeetingTimelineComponent {
   readonly renameSpeaker = output<{ oldLabel: string; newLabel: string }>();
 
   private readonly injector = inject(Injector);
+
+  /**
+   * Lookup: diarized cluster label (`others-{n}`) → its suggested person name.
+   * Drives the "Looks like [[Anna]]?" chip on the matching lane. Only clusters
+   * still awaiting a name appear here (the backend suggester skips already-labeled
+   * ones), so the chip never covers a lane the user already named.
+   */
+  readonly suggestionByLabel = computed(() => {
+    const map = new Map<string, string>();
+    for (const s of this.suggestions()) {
+      const name = s.suggestedLabel?.trim();
+      if (name) {
+        map.set(s.speaker, name);
+      }
+    }
+    return map;
+  });
 
   /** The speaker currently being inline-renamed (its original label), or null. */
   readonly editingLabel = signal<string | null>(null);
@@ -1419,6 +1490,20 @@ export class MeetingTimelineComponent {
   cancelRename(event: Event): void {
     event.stopPropagation();
     this.editingLabel.set(null);
+  }
+
+  /**
+   * Accept a voiceprint suggestion for a lane: emit the same `renameSpeaker` the
+   * manual rename does (`others-{n}` → the suggested name). The parent runs the
+   * IPC rename — which ENROLLS the cluster's voiceprint under that name — and
+   * folds the fresh timeline back in, so the chip disappears with the relabel.
+   */
+  acceptSuggestion(oldLabel: string): void {
+    const newLabel = this.suggestionByLabel().get(oldLabel)?.trim();
+    if (!newLabel || newLabel === oldLabel) {
+      return;
+    }
+    this.renameSpeaker.emit({ oldLabel, newLabel });
   }
 
   /** True when the playhead sits inside a chapter — highlights its label. */

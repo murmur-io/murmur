@@ -92,6 +92,60 @@ import { SettingsStore } from "../settings.store";
                 </label>
               </div>
 
+              <!-- Speaker voiceprints — cross-meeting re-identification (opt-in). -->
+              <div class="card">
+                <label class="toggle-row">
+                  <span class="toggle-copy">
+                    <span class="toggle-title">Recognise speakers across meetings</span>
+                    <span class="text-secondary toggle-sub">
+                      Recognise the same speaker across meetings, fully on-device.
+                      Experimental — accuracy unverified; captures a voice fingerprint
+                      of remote participants (opt-in). Needs “Split Others into
+                      individual speakers” above.
+                    </span>
+                  </span>
+                  <input type="checkbox" formControlName="voiceprintEnabled" />
+                </label>
+
+                <!-- Management list — the captured voiceprints, each forgettable. -->
+                @if (voiceprints().length) {
+                  <div class="vp-list">
+                    <div class="vp-list-head">
+                      <span class="vp-list-title text-secondary">
+                        {{ voiceprints().length }} stored
+                        {{ voiceprints().length === 1 ? "voiceprint" : "voiceprints" }}
+                      </span>
+                      <button
+                        type="button"
+                        class="btn btn-ghost vp-clear"
+                        [disabled]="voiceprintBusy()"
+                        (click)="clearVoiceprints()"
+                      >
+                        Forget all
+                      </button>
+                    </div>
+                    @for (vp of voiceprints(); track vp.id) {
+                      <div class="vp-row">
+                        <span class="vp-name">
+                          {{ vp.label || "Speaker " + vp.clusterIndex }}
+                        </span>
+                        <button
+                          type="button"
+                          class="vp-forget"
+                          [disabled]="voiceprintBusy()"
+                          [attr.aria-label]="
+                            'Forget voiceprint ' + (vp.label || vp.clusterIndex)
+                          "
+                          (click)="forgetVoiceprint(vp.id)"
+                        >
+                          Forget
+                        </button>
+                      </div>
+                    }
+                  </div>
+                }
+              </div>
+
               <!-- On-device echo removal (post-processing) — toggle row -->
               <div class="card">
                 <label class="toggle-row">
@@ -176,6 +230,61 @@ import { SettingsStore } from "../settings.store";
       .toggle-sub {
         font-size: 0.85rem;
       }
+
+      /* --- Speaker-voiceprint management list (under the toggle) --- */
+      .vp-list {
+        margin-top: var(--space-4);
+        padding-top: var(--space-3);
+        border-top: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+      }
+      .vp-list-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+      }
+      .vp-list-title {
+        font-size: 0.8125rem;
+      }
+      .vp-clear {
+        padding: var(--space-1) var(--space-2);
+        font-size: 0.8125rem;
+      }
+      .vp-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+      }
+      .vp-name {
+        color: var(--text-primary);
+        font-size: 0.9rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .vp-forget {
+        flex-shrink: 0;
+        background: none;
+        border: none;
+        color: var(--text-secondary);
+        font-size: 0.8125rem;
+        cursor: pointer;
+        padding: var(--space-1) var(--space-2);
+        border-radius: var(--radius-sm);
+        transition: color var(--transition-fast), background var(--transition-fast);
+      }
+      .vp-forget:hover:not(:disabled) {
+        color: var(--live);
+        background: var(--surface-raised);
+      }
+      .vp-forget:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
     `,
   ],
 })
@@ -184,4 +293,14 @@ export class SettingsAudioSectionComponent {
 
   readonly form = this.store.form;
   readonly inputDevices = this.store.inputDevices;
+  readonly voiceprints = this.store.voiceprints;
+  readonly voiceprintBusy = this.store.voiceprintBusy;
+
+  forgetVoiceprint(id: string): void {
+    void this.store.forgetVoiceprint(id);
+  }
+
+  clearVoiceprints(): void {
+    void this.store.clearVoiceprints();
+  }
 }
