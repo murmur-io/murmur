@@ -1,8 +1,8 @@
 # Murmur Contributor License Agreement (CLA)
 
-> ⚠️ **DRAFT — not yet binding.** Adapted from the **Apache Software Foundation Individual CLA v2.0** (a public template). Before this takes effect the maintainer must (a) fill `[RIGHTS HOLDER]` with the chosen entity, (b) confirm the **license-grant** approach below (recommended) vs full assignment, and (c) have qualified counsel review it. Existing contributors who have not signed will be asked for retroactive sign-off (or their contributions clean-room replaced) before any commercial license is offered over the affected code. **Nothing here is legal advice.**
+> ⚠️ **DRAFT — for review, not yet binding.** Adapted from the **Apache Software Foundation Individual CLA v2.0** (a public template). Resolved: the rights holder is **Jakub Gawroński** (an individual for now — transferable to a company later); the approach is a **relicensing license *grant*** (§2), **not** a copyright assignment, so contributors keep full ownership. Still to do before it binds: (a) a qualified-counsel review, and (b) a **retroactive sign-off from existing contributor Lukasz Swierlikowski** for his pre-CLA commits (or a clean-room replacement) before any commercial license is offered over the affected code. **Nothing here is legal advice.**
 
-This agreement documents the rights granted by contributors to **`[RIGHTS HOLDER]`** ("the Maintainer") for the **Murmur** project. It lets Murmur remain free and open under **AGPL-3.0** while allowing the Maintainer to offer commercial licenses (dual licensing). You retain full ownership of your Contributions.
+This agreement documents the rights granted by contributors to **Jakub Gawroński** ("the Maintainer") for the **Murmur** project. It lets Murmur remain free and open under **AGPL-3.0** while allowing the Maintainer to offer commercial licenses (dual licensing). You retain full ownership of your Contributions.
 
 ## Individual CLA
 

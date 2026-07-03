@@ -16,6 +16,6 @@ That grant is what makes Murmur's **dual-licensing model** possible: the code st
 4. Open a PR against `murmur`. The CLA check must pass before merge.
 5. Sign the CLA — see [`CLA.md`](CLA.md). (Once the CLA bot is wired, a PR comment will prompt you to sign once; until then, add a `Signed-off-by: Name <email>` DCO line to your commits and note your CLA agreement in the PR.)
 
-## Status of the CLA (maintainer to finalize)
+## Status of the CLA
 
-> ⚠️ **The CLA in [`CLA.md`](CLA.md) is a DRAFT.** Before it is binding the maintainer must decide: (1) the **rights-holding entity** (individual vs company), (2) **relicensing grant vs full assignment** (a grant is recommended), and (3) collect **retroactive sign-off** from existing contributors who have not signed. Prior contributors with unsigned commits will be contacted for a retroactive sign-off (or a clean-room replacement of those contributions) before any commercial license is offered over the affected code.
+> The CLA in [`CLA.md`](CLA.md) is a **DRAFT for review**. Resolved: rights holder = **Jakub Gawroński** (individual for now), **license grant** (not assignment — you keep your copyright). Remaining before it's binding: a qualified-counsel review, and a **retroactive sign-off from existing contributor Lukasz Swierlikowski** for his pre-CLA commits (or a clean-room replacement) before any commercial license is offered over the affected code. Automated signature collection (`cla-assistant` GitHub App) will be wired when outside contributions start; until then, DCO `Signed-off-by` + a note in the PR suffices.
