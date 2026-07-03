@@ -744,6 +744,68 @@ fn resolve_summarize_egress(
     Ok((config, provider))
 }
 
+/// Content-FREE per-note PRIVACY RECEIPT facts (Tier 4c), derived purely from in-hand egress
+/// metadata at note-generation time. All fields are booleans / non-PII destination labels /
+/// integer counts — NEVER note text, transcript, attendee names, titles, keys, or DEK/KEK/CK.
+///
+/// This is a plain self-declared record, NOT a cryptographic attestation and NOT a
+/// verifiable/provable claim — it is exactly as trustworthy as the app that wrote it. Its value is
+/// that a local-only summary can state, in one screenshot-able front-matter line, that nothing left
+/// the device.
+pub(crate) struct PrivacyReceiptFacts {
+    /// `true` when nothing left the device to produce this note (a loopback-ollama / on-device
+    /// summary) — the honest `privacy-cloud-calls: 0` headline. Reuses [`egress_is_cloud`], the
+    /// SAME classifier the consent gate enforces, so it can never under-claim "local" (a REMOTE
+    /// `ollama_base_url` correctly classifies as cloud).
+    ///
+    /// [`egress_is_cloud`]: crate::summarize::egress_is_cloud
+    pub local_only: bool,
+    /// Non-PII destination LABEL for a cloud summary (`api.anthropic.com`, a gateway `host:port`,
+    /// …); `None` for a local summary (nothing left the device to declare).
+    pub egress_host: Option<String>,
+    /// The redaction firewall's REAL scrub total for THIS summary call. `None` for a local provider
+    /// (it returns unwrapped — no firewall ran), so no `privacy-pii-redacted` key is stamped.
+    pub redacted_pii: Option<u32>,
+}
+
+/// Compute the [`PrivacyReceiptFacts`] for a just-generated note. Pure: no I/O, no state, no
+/// egress-ledger query (the ledger's `meeting_id` is always `None` → not per-note attributable).
+///
+/// The `egress_host` labels MIRROR `make_provider_resolved`'s own `destination` match (literal
+/// constants, no drift risk); a numeric cloud-CALL count is deliberately NOT reported (would
+/// under-count, since entity-extraction / auto-organize also call the cloud — the dangerous
+/// direction for a privacy claim), so the honest cloud receipt is the host + the PII count.
+pub(crate) fn privacy_receipt_facts(
+    connection: &str,
+    config: &AppConfig,
+    gateway_host: Option<&str>,
+    call_meta: &crate::summarize::meta::CallMeta,
+) -> PrivacyReceiptFacts {
+    let local_only = !crate::summarize::egress_is_cloud(connection, config);
+    let egress_host: Option<String> = if local_only {
+        None
+    } else {
+        match connection {
+            crate::summarize::PROVIDER_CLAUDE_CODE => Some("claude_code (Anthropic CLI)".to_string()),
+            crate::summarize::PROVIDER_ANTHROPIC => Some("api.anthropic.com".to_string()),
+            crate::summarize::PROVIDER_GATEWAY => gateway_host.map(str::to_string),
+            crate::summarize::PROVIDER_OLLAMA => reqwest::Url::parse(&config.ollama_base_url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string)),
+            other => Some(other.to_string()),
+        }
+    };
+    let redacted_pii = call_meta
+        .redactions
+        .as_ref()
+        .map(|r| r.email + r.card + r.phone + r.name);
+    PrivacyReceiptFacts {
+        local_only,
+        egress_host,
+        redacted_pii,
+    }
+}
+
 /// Summarize a transcript with the configured provider, persist the note to the canonical
 /// DB, and — when a vault folder is configured — export it to the Obsidian vault and update
 /// the meeting status/title. When NO vault is configured the note is still fully saved
@@ -920,6 +982,15 @@ async fn summarize_and_export(
     // Provenance names the RESOLVED connection that actually served the note (identical to
     // `provider_id` while role keys are absent).
     let provider_id_for_fm = notes_target.connection.clone();
+    // Tier 4c — compute the content-FREE per-note PRIVACY RECEIPT facts HERE, from in-hand egress
+    // metadata, BEFORE `gateway_host` is moved into the `NoteRecord` below (the helper only borrows
+    // it). See `privacy_receipt_facts` for the honest-self-report rationale.
+    let privacy = privacy_receipt_facts(
+        &notes_target.connection,
+        config,
+        gateway_host.as_deref(),
+        &call_meta,
+    );
     state.db.upsert_note(&NoteRecord {
         meeting_id: meeting_id.to_string(),
         provider_id: notes_target.connection.clone(),
@@ -1012,6 +1083,19 @@ async fn summarize_and_export(
         &provider_id_for_fm,
         model_requested_for_fm.as_deref(),
         model_served_for_fm.as_deref(),
+    );
+    // Tier 4c — stamp the content-free per-note PRIVACY RECEIPT (facts computed in the prep block
+    // above). Local/on-device summary ⇒ `privacy-cloud-calls: 0` (nothing left the device — the
+    // honest local headline). Cloud summary ⇒ `privacy-egress-host: <label>` + `privacy-pii-redacted:
+    // <n>` (no cloud-CALL count is claimed — not per-note attributable and would under-count).
+    // Pure + idempotent, same contract as the provenance injector above; a (re)summarize rebuilds
+    // `markdown` fresh so the keys REFRESH rather than duplicate. Vault-write-only (like the
+    // provenance keys): no new content read, no DB write, no egress-ledger query.
+    let markdown = export::inject_privacy_receipt_frontmatter(
+        &markdown,
+        privacy.local_only,
+        privacy.egress_host.as_deref(),
+        privacy.redacted_pii,
     );
     let exported_path = export::write_note(
         Path::new(vault_path),
@@ -1344,6 +1428,143 @@ fn should_auto_index(semantic_enabled: bool, embed_model_present: bool) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Tier 4c: privacy_receipt_facts (per-note egress self-report wiring) ────────────────────
+    //
+    // These guard the WIRING the pure `inject_privacy_receipt_frontmatter` tests (in
+    // export/obsidian.rs) cannot: that `summarize_and_export` derives the right facts from a
+    // provider connection + config + `CallMeta` and feeds them to the injector. The injector was
+    // defined + tested but UN-CALLED before this change; without a facts test the vault note would
+    // silently carry no `privacy-*` key at all (the "compiles but inert" gap).
+    use crate::summarize::meta::{CallMeta, RedactionCounts};
+
+    /// LOCAL provider (loopback ollama) ⇒ `local_only`, no host, no PII count — and the injector
+    /// stamps ONLY the honest `privacy-cloud-calls: 0` headline. The task's explicit requirement.
+    #[test]
+    fn privacy_receipt_facts_local_ollama_stamps_zero_cloud_calls() {
+        let cfg = AppConfig {
+            ollama_base_url: "http://localhost:11434".into(),
+            ..AppConfig::default()
+        };
+        // A local provider returns UNWRAPPED (no RedactingProvider), so no firewall ran → None.
+        let meta = CallMeta::default();
+        let facts = privacy_receipt_facts(crate::summarize::PROVIDER_OLLAMA, &cfg, None, &meta);
+        assert!(facts.local_only, "loopback ollama = nothing left the device");
+        assert_eq!(facts.egress_host, None);
+        assert_eq!(facts.redacted_pii, None);
+        // End-to-end through the SAME injector the pipeline calls.
+        let out = crate::export::inject_privacy_receipt_frontmatter(
+            "---\ntitle: T\n---\n# T\n\nBody.\n",
+            facts.local_only,
+            facts.egress_host.as_deref(),
+            facts.redacted_pii,
+        );
+        assert!(out.contains("privacy-cloud-calls: 0"), "local headline stamped: {out}");
+        assert!(!out.contains("privacy-egress-host"), "no host for a local note: {out}");
+        assert!(!out.contains("privacy-pii-redacted"), "no pii key for a local note: {out}");
+    }
+
+    /// ANTHROPIC (cloud) ⇒ the non-PII host label + the firewall's REAL scrub total (summed across
+    /// buckets) reach the receipt; NO cloud-CALL integer is claimed (would under-count).
+    #[test]
+    fn privacy_receipt_facts_anthropic_stamps_host_and_real_pii_count() {
+        let cfg = AppConfig::default();
+        let meta = CallMeta {
+            redactions: Some(RedactionCounts { email: 2, card: 0, phone: 1, name: 3 }),
+            ..Default::default()
+        };
+        let facts = privacy_receipt_facts(crate::summarize::PROVIDER_ANTHROPIC, &cfg, None, &meta);
+        assert!(!facts.local_only, "anthropic is cloud egress");
+        assert_eq!(facts.egress_host.as_deref(), Some("api.anthropic.com"));
+        assert_eq!(facts.redacted_pii, Some(6), "2+0+1+3 = the real firewall total");
+        let out = crate::export::inject_privacy_receipt_frontmatter(
+            "---\ntitle: T\n---\nBody.",
+            facts.local_only,
+            facts.egress_host.as_deref(),
+            facts.redacted_pii,
+        );
+        assert!(out.contains("privacy-egress-host: api.anthropic.com"), "host: {out}");
+        assert!(out.contains("privacy-pii-redacted: 6"), "real count: {out}");
+        assert!(!out.contains("privacy-cloud-calls"), "no cloud-call count claimed: {out}");
+    }
+
+    /// GATEWAY ⇒ the receipt reuses the already-computed non-PII endpoint `host:port` label.
+    #[test]
+    fn privacy_receipt_facts_gateway_uses_endpoint_host() {
+        let facts = privacy_receipt_facts(
+            crate::summarize::PROVIDER_GATEWAY,
+            &AppConfig::default(),
+            Some("127.0.0.1:4000"),
+            &CallMeta::default(),
+        );
+        assert!(!facts.local_only, "gateway is always cloud (a localhost gateway may forward)");
+        assert_eq!(facts.egress_host.as_deref(), Some("127.0.0.1:4000"));
+    }
+
+    /// A REMOTE `ollama_base_url` classifies as CLOUD — the receipt can NEVER under-claim "local".
+    #[test]
+    fn privacy_receipt_facts_remote_ollama_is_cloud_not_local() {
+        let cfg = AppConfig {
+            ollama_base_url: "https://ollama.remote.example/api".into(),
+            ..AppConfig::default()
+        };
+        let meta = CallMeta {
+            redactions: Some(RedactionCounts::default()),
+            ..Default::default()
+        };
+        let facts = privacy_receipt_facts(crate::summarize::PROVIDER_OLLAMA, &cfg, None, &meta);
+        assert!(!facts.local_only, "a remote ollama endpoint is cloud egress, not local");
+        assert_eq!(facts.egress_host.as_deref(), Some("ollama.remote.example"));
+        assert_eq!(facts.redacted_pii, Some(0), "wrapped-but-zero scrubs = an honest 0");
+    }
+
+    /// REFRESH-on-resummarize: each (re)summarize hands the injector a FRESH markdown (the LLM
+    /// regenerates the note carrying no `privacy-*` key), so switching provider between runs
+    /// REFRESHES the receipt — a run-2 cloud note does NOT retain run-1's `privacy-cloud-calls: 0`.
+    #[test]
+    fn privacy_receipt_refreshes_when_provider_changes_between_summaries() {
+        // Run 1: local ollama.
+        let local_cfg = AppConfig {
+            ollama_base_url: "http://localhost:11434".into(),
+            ..AppConfig::default()
+        };
+        let f1 = privacy_receipt_facts(
+            crate::summarize::PROVIDER_OLLAMA,
+            &local_cfg,
+            None,
+            &CallMeta::default(),
+        );
+        let run1 = crate::export::inject_privacy_receipt_frontmatter(
+            "---\ntitle: T\n---\nBody.",
+            f1.local_only,
+            f1.egress_host.as_deref(),
+            f1.redacted_pii,
+        );
+        assert!(run1.contains("privacy-cloud-calls: 0"), "run 1 = local: {run1}");
+
+        // Run 2 (resummarize): provider switched to anthropic; the model produced a FRESH note.
+        let f2 = privacy_receipt_facts(
+            crate::summarize::PROVIDER_ANTHROPIC,
+            &AppConfig::default(),
+            None,
+            &CallMeta {
+                redactions: Some(RedactionCounts { email: 1, card: 0, phone: 0, name: 0 }),
+                ..Default::default()
+            },
+        );
+        let run2 = crate::export::inject_privacy_receipt_frontmatter(
+            "---\ntitle: T\n---\nBody.", // fresh markdown, no stale privacy keys
+            f2.local_only,
+            f2.egress_host.as_deref(),
+            f2.redacted_pii,
+        );
+        assert!(run2.contains("privacy-egress-host: api.anthropic.com"), "run 2 = cloud host: {run2}");
+        assert!(run2.contains("privacy-pii-redacted: 1"), "run 2 real count: {run2}");
+        assert!(
+            !run2.contains("privacy-cloud-calls: 0"),
+            "the local headline did NOT bleed into the cloud re-summary: {run2}"
+        );
+    }
 
     /// LEAK regression (lock-security review 2026-07-02): a cloud-egress consent REVOKE landing
     /// DURING transcription — between `run_inner`'s Stop-time config snapshot and the summarize

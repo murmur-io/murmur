@@ -445,11 +445,17 @@ impl SummarizerProvider for RedactingProvider {
             model_requested: self.model_requested.clone(),
             call_kind: "summarize",
             meta: meta.clone(),
-            redactions,
+            redactions: redactions.clone(),
             system_bytes: 0, // summarize has no separate system prompt
             user_bytes,
             meeting_id: None,
         });
+        // Tier 4c — surface the SAME scrub count to the CALLER so the per-note privacy receipt can
+        // report how many PII items the firewall removed before this cloud call. A LOCAL provider
+        // returns unwrapped upstream and never reaches this wrapper, so a local note's
+        // `CallMeta.redactions` stays `None` (no firewall ran) — correctly, no PII key is stamped.
+        let mut meta = meta;
+        meta.redactions = Some(redactions);
         Ok((out, meta))
     }
 
@@ -483,11 +489,14 @@ impl SummarizerProvider for RedactingProvider {
             model_requested: self.model_requested.clone(),
             call_kind: "complete",
             meta: meta.clone(),
-            redactions,
+            redactions: redactions.clone(),
             system_bytes,
             user_bytes,
             meeting_id: None,
         });
+        // Tier 4c — surface the scrub count to the caller (see `summarize_with_meta`).
+        let mut meta = meta;
+        meta.redactions = Some(redactions);
         Ok((out, meta))
     }
 
@@ -545,11 +554,14 @@ impl SummarizerProvider for RedactingProvider {
             model_requested: self.model_requested.clone(),
             call_kind: "complete_json",
             meta: meta.clone(),
-            redactions,
+            redactions: redactions.clone(),
             system_bytes,
             user_bytes,
             meeting_id: None,
         });
+        // Tier 4c — surface the scrub count to the caller (see `summarize_with_meta`).
+        let mut meta = meta;
+        meta.redactions = Some(redactions);
         Ok((out, meta))
     }
     // `complete_json` inherits the delegating default: calls `complete_json_with_meta` and
@@ -924,6 +936,7 @@ mod tests {
                 completion_tokens: Some(13),
                 total_tokens: Some(55),
                 cached_tokens: None,
+                redactions: None,
             }))
         }
         async fn complete_with_meta(&self, system: &str, user: &str) -> Result<(String, crate::summarize::meta::CallMeta)> {
@@ -934,6 +947,7 @@ mod tests {
                 completion_tokens: Some(5),
                 total_tokens: Some(15),
                 cached_tokens: None,
+                redactions: None,
             }))
         }
     }
@@ -989,6 +1003,31 @@ mod tests {
         );
         // Only non-PII metadata present:
         assert!(debug.contains("api.anthropic.com"), "destination label is non-PII");
+    }
+
+    /// Tier 4c (v1.1) — RED-before-GREEN: `summarize_with_meta` must SURFACE the firewall's scrub
+    /// count to the CALLER via `CallMeta.redactions`, so the per-note privacy receipt reports a
+    /// REAL number equal to what actually left the device redacted. RED on the pre-change code
+    /// (the field did not exist / stayed `None`); GREEN once `RedactingProvider` sets
+    /// `meta.redactions = Some(count)` before returning.
+    #[test]
+    fn summarize_with_meta_surfaces_redaction_count_to_caller() {
+        let prov = RedactingProvider::with_name_redactor(
+            Arc::new(EchoMetaProvider),
+            Arc::new(NoopNameRedactor),
+        );
+        // One email in the transcript → the firewall scrubs exactly one EMAIL placeholder.
+        let (_out, meta) = block_on(
+            prov.summarize_with_meta(&sample_req("Ping alice@corp.example about the roadmap.")),
+        )
+        .unwrap();
+        let counts = meta
+            .redactions
+            .expect("scrub count surfaced to the caller (Some), not dropped");
+        assert_eq!(counts.email, 1, "one email scrubbed");
+        assert_eq!(counts.card, 0);
+        assert_eq!(counts.phone, 0);
+        assert_eq!(counts.name, 0, "no-op name redactor → zero names");
     }
 
     /// The default `with_name_redactor` path records to a NoopEgressSink — no panic, no row.
@@ -1066,6 +1105,7 @@ mod tests {
                         completion_tokens: Some(7),
                         total_tokens: Some(49),
                         cached_tokens: None,
+                        redactions: None,
                     },
                 ))
             }

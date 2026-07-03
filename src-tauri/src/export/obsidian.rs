@@ -560,6 +560,109 @@ pub fn inject_provenance_frontmatter(
     format!("---\n{new_fm}{after_close}")
 }
 
+/// Stamp a content-free **PRIVACY RECEIPT** into a note's YAML front-matter — an HONEST
+/// self-report of what left the device to produce this note.
+///
+/// This is a plain self-declared record, **not** a cryptographic attestation and **not** a
+/// verifiable/provable claim: it is exactly as trustworthy as the app that wrote it. Its value is
+/// that a local-only summary can state, in one screenshot-able line, that nothing egressed.
+///
+/// Mirrors [`inject_provenance_frontmatter`] byte-for-byte in structure (strip the opening
+/// `---\n`, find the closing fence, skip keys already present, append the missing keys before the
+/// closing fence, reconstruct). Pure — no I/O, no state — and byte-identical to the input when
+/// there is nothing to inject or the note has no front-matter block.
+///
+/// Keys (all content-FREE — booleans / integer counts / non-PII host labels, NEVER note text,
+/// transcript, attendee names, titles, keys, or DEK/KEK/CK material):
+/// - `privacy-cloud-calls: 0` — stamped **only** when `local_only` (nothing left the device: a
+///   loopback-ollama / on-device-reasoner summary). This is the strong local headline; `0` is
+///   truthful exactly because [`egress_is_cloud`](crate::summarize::egress_is_cloud) — the SAME
+///   classifier the consent gate uses — reports local.
+/// - `privacy-egress-host: <host>` — for a cloud summary, the non-PII destination label
+///   (`api.anthropic.com`, `claude_code (Anthropic CLI)`, a gateway `host:port`, …). Its presence
+///   is the honest signal that the summary DID leave the device, and where.
+/// - `privacy-pii-redacted: <n>` — for a cloud summary with a known count, how many PII items the
+///   redaction firewall scrubbed before egress. Omitted when the count is unknown.
+///
+/// A numeric cloud-CALL count `> 0` is deliberately NOT stamped. The egress ledger is a global
+/// rolling log (per-entry `meeting_id` is `None`), so a call count is not per-note attributable,
+/// and stamping `1` would UNDER-count total cloud activity (entity-extraction / auto-organize also
+/// call the cloud) — the dangerous direction for a privacy claim. The local-vs-host signal is the
+/// honest headline; the numeric receipt for the cloud case is the redaction count, not a call
+/// count. Values need no YAML quoting (host labels carry no `": "` colon-space; unquoted style
+/// matches `inject_provenance_frontmatter`).
+pub fn inject_privacy_receipt_frontmatter(
+    markdown: &str,
+    local_only: bool,
+    egress_host: Option<&str>,
+    redacted_pii: Option<u32>,
+) -> String {
+    // The content-free receipt key(s) to (potentially) inject, in stable order.
+    let mut wanted: Vec<(&str, String)> = Vec::new();
+    if local_only {
+        // Strong local headline: nothing left the device to produce this note.
+        wanted.push(("privacy-cloud-calls", "0".to_string()));
+    } else {
+        // Cloud summary: declare WHERE it went + how much PII the firewall scrubbed. No call COUNT
+        // (not per-note attributable + would under-count — see the doc comment).
+        if let Some(host) = egress_host.map(str::trim).filter(|h| !h.is_empty()) {
+            wanted.push(("privacy-egress-host", host.to_string()));
+        }
+        if let Some(n) = redacted_pii {
+            wanted.push(("privacy-pii-redacted", n.to_string()));
+        }
+    }
+
+    // Nothing to inject — preserve byte identity.
+    if wanted.is_empty() {
+        return markdown.to_string();
+    }
+
+    // The note must start with `---\n` to have a frontmatter block.
+    let Some(rest_after_open) = markdown.strip_prefix("---\n") else {
+        return markdown.to_string();
+    };
+
+    // Find the closing `---` line (same logic as `inject_provenance_frontmatter`).
+    let Some(close_pos) = rest_after_open.find("\n---\n").or_else(|| {
+        if rest_after_open.ends_with("\n---") {
+            Some(rest_after_open.len() - 4)
+        } else {
+            None
+        }
+    }) else {
+        return markdown.to_string();
+    };
+
+    let fm_content = &rest_after_open[..close_pos]; // the YAML lines between the fences
+
+    // Idempotent: keep only keys NOT already present (a defensive double-call within one export is
+    // a no-op; a fresh (re)summarize always builds new markdown, so keys are stamped each time).
+    let missing: Vec<(&str, String)> = wanted
+        .into_iter()
+        .filter(|(k, _)| {
+            let prefix = format!("{k}:");
+            !fm_content.lines().any(|l| l.starts_with(&prefix))
+        })
+        .collect();
+    if missing.is_empty() {
+        return markdown.to_string();
+    }
+
+    // Append the missing keys before the closing fence.
+    let mut new_fm = fm_content.to_string();
+    if !new_fm.ends_with('\n') && !new_fm.is_empty() {
+        new_fm.push('\n');
+    }
+    for (k, v) in &missing {
+        new_fm.push_str(&format!("{k}: {v}\n"));
+    }
+
+    // Reconstruct the full note.
+    let after_close = &rest_after_open[close_pos..]; // starts with `\n---`
+    format!("---\n{new_fm}{after_close}")
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -816,5 +919,108 @@ mod tests {
         assert!(fm.contains("ai-model: claude-opus-4-8"), "model key inside fm: {fm}");
         // Body untouched.
         assert!(out.ends_with("# Body\n"), "body unchanged: {out}");
+    }
+
+    // ── Tier 4c: inject_privacy_receipt_frontmatter (per-note egress self-report) ────────────
+
+    /// LOCAL summary ⇒ only the honest `privacy-cloud-calls: 0` headline is stamped. Even if a
+    /// host / count are (defensively) passed, a local note NEVER stamps a host or pii key.
+    #[test]
+    fn privacy_receipt_local_stamps_zero_cloud_calls_only() {
+        let md = "---\ntitle: T\ndate: 2026-07-03\n---\n# T\n\nBody.\n";
+        let out = inject_privacy_receipt_frontmatter(md, true, Some("api.anthropic.com"), Some(9));
+        assert!(out.contains("privacy-cloud-calls: 0"), "local headline present: {out}");
+        assert!(!out.contains("privacy-egress-host"), "no host for a local note: {out}");
+        assert!(!out.contains("privacy-pii-redacted"), "no pii key for a local note: {out}");
+    }
+
+    /// CLOUD summary ⇒ the non-PII destination host + the real redaction count are stamped, and no
+    /// `privacy-cloud-calls` integer is claimed (not per-note attributable — see the fn doc).
+    #[test]
+    fn privacy_receipt_cloud_stamps_host_and_pii_count() {
+        let md = "---\ntitle: T\n---\nBody.";
+        let out = inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(14));
+        assert!(out.contains("privacy-egress-host: api.anthropic.com"), "host: {out}");
+        assert!(out.contains("privacy-pii-redacted: 14"), "pii count: {out}");
+        assert!(
+            !out.contains("privacy-cloud-calls"),
+            "no cloud-call count is claimed for a cloud note (would under-count): {out}"
+        );
+    }
+
+    /// CONTENT-FREE & NON-NO-OP: a note whose BODY carries PII must have that PII preserved as
+    /// opaque passthrough, and the injector must NEVER copy any body text into a `privacy-*` key.
+    /// The ONLY new lines vs the input are `privacy-*` keys.
+    #[test]
+    fn privacy_receipt_is_content_free_and_non_noop() {
+        let md = "---\ntitle: Board Sync\n---\n# Board Sync\n\nContact bob@example.com or call +1 415 555 0199.\n";
+        let out = inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(3));
+        // It actually stamped something (not a no-op).
+        assert_ne!(out, md, "the receipt was injected");
+        assert!(out.contains("privacy-egress-host: api.anthropic.com"), "host stamped: {out}");
+        assert!(out.contains("privacy-pii-redacted: 3"), "count stamped: {out}");
+        // The body PII survives untouched (passthrough) — but NEVER inside an injected key.
+        assert!(out.contains("bob@example.com"), "body PII preserved as passthrough");
+        for line in out.lines().filter(|l| l.starts_with("privacy-")) {
+            assert!(!line.contains("bob@example.com"), "no email in a privacy key: {line}");
+            assert!(!line.contains("555 0199"), "no phone in a privacy key: {line}");
+            assert!(!line.contains("Board Sync"), "no title/body text in a privacy key: {line}");
+        }
+        // The ONLY lines present in the output but not the input are `privacy-*` keys.
+        let input_lines: std::collections::HashSet<&str> = md.lines().collect();
+        for line in out.lines() {
+            if !input_lines.contains(line) {
+                assert!(
+                    line.starts_with("privacy-"),
+                    "the only injected lines are privacy-* keys, got: {line}"
+                );
+            }
+        }
+    }
+
+    /// The injected keys appear INSIDE the frontmatter fence (before the closing `---`), body
+    /// untouched. Also exercises a host label containing spaces/parens (needs no YAML quoting).
+    #[test]
+    fn privacy_receipt_keys_are_inside_the_frontmatter_block() {
+        let md = "---\ntitle: T\ndate: 2026-07-03\n---\n# Body\n";
+        let out =
+            inject_privacy_receipt_frontmatter(md, false, Some("claude_code (Anthropic CLI)"), Some(2));
+        let close = out.find("\n---\n").expect("closing fence present");
+        let fm = &out[..close];
+        assert!(
+            fm.contains("privacy-egress-host: claude_code (Anthropic CLI)"),
+            "host key inside fm: {fm}"
+        );
+        assert!(fm.contains("privacy-pii-redacted: 2"), "pii key inside fm: {fm}");
+        assert!(out.ends_with("# Body\n"), "body unchanged: {out}");
+    }
+
+    /// Idempotent: injecting twice equals injecting once — a re-export never duplicates the keys.
+    #[test]
+    fn privacy_receipt_is_idempotent() {
+        let md = "---\ntitle: T\n---\nBody.";
+        let once = inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(7));
+        let twice =
+            inject_privacy_receipt_frontmatter(&once, false, Some("api.anthropic.com"), Some(7));
+        assert_eq!(once, twice, "second inject is a no-op");
+        assert_eq!(once.matches("privacy-egress-host:").count(), 1, "no duplicate host key");
+        assert_eq!(once.matches("privacy-pii-redacted:").count(), 1, "no duplicate pii key");
+    }
+
+    /// Notes WITHOUT a `---` frontmatter block are returned byte-identical (even with PII in body).
+    #[test]
+    fn privacy_receipt_leaves_notes_without_frontmatter_unchanged() {
+        let md = "# Just a heading\n\nNo frontmatter, mentions bob@example.com.";
+        let out = inject_privacy_receipt_frontmatter(md, true, None, None);
+        assert_eq!(out, md, "no frontmatter → byte-identical");
+    }
+
+    /// A cloud note with an UNKNOWN host and count is a no-op (byte-identical) — never a bogus
+    /// empty stamp. Guards the `wanted.is_empty()` early return.
+    #[test]
+    fn privacy_receipt_cloud_without_facts_is_noop() {
+        let md = "---\ntitle: T\n---\nBody.";
+        let out = inject_privacy_receipt_frontmatter(md, false, None, None);
+        assert_eq!(out, md, "cloud with no host/count → nothing to honestly stamp");
     }
 }
