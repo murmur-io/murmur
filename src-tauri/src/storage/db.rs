@@ -446,6 +446,12 @@ impl Db {
         // Guarded ALTER (idempotent); NULL for every row in an open folder.
         Self::add_column_if_missing(&conn, "segments", "text_blob", "BLOB")?;
         Self::add_column_if_missing(&conn, "timelines", "data_blob", "BLOB")?;
+        // Tier 3b/A — per-segment ASR confidence (mean token probability × (1−no_speech), computed on
+        // the Accurate batch path). Guarded ALTER (idempotent, ADDITIVE); NULL for every legacy row
+        // and for `Fast`-path rows → reads back as `confidence: None`. NON-CONTENT metadata (a
+        // probability, never words): seal-blanking (`UPDATE segments SET text=''`) leaves it, exactly
+        // like `start_s`/`end_s`/`speaker`, so it never survives as leaked content.
+        Self::add_column_if_missing(&conn, "segments", "confidence", "REAL")?;
         // Rec #3: faithful per-stream float32 MASTER archives (mic native + system 48k), opt-in.
         // Each is sealed at rest exactly like `audio_path` (→ `<file>.enc`). NULL for every meeting
         // recorded without `keep_hires_masters` → zero change for existing / non-opted users. These
@@ -2357,8 +2363,8 @@ impl Db {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR REPLACE INTO segments
-                       (meeting_id, idx, start_s, end_s, text, speaker)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                       (meeting_id, idx, start_s, end_s, text, speaker, confidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )
                 .map_err(map_err)?;
             for seg in segments {
@@ -2369,6 +2375,7 @@ impl Db {
                     seg.end_s,
                     seg.text,
                     seg.speaker,
+                    seg.confidence,
                 ])
                 .map_err(map_err)?;
             }
@@ -2382,7 +2389,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT idx, start_s, end_s, text, speaker
+                "SELECT idx, start_s, end_s, text, speaker, confidence
                    FROM segments WHERE meeting_id = ?1 ORDER BY idx",
             )
             .map_err(map_err)?;
@@ -2395,6 +2402,8 @@ impl Db {
                     text: row.get(3)?,
                     // NULL (legacy / unattributed rows) → None.
                     speaker: row.get(4)?,
+                    // NULL (legacy / Fast-path rows) → None; a stored REAL → Some(f32).
+                    confidence: row.get(5)?,
                 })
             })
             .map_err(map_err)?;
@@ -6309,6 +6318,7 @@ mod tests {
                 end_s: 1.5,
                 text: "hello".into(),
                 speaker: Some("me".into()),
+                confidence: None,
             },
             Segment {
                 idx: 1,
@@ -6316,6 +6326,7 @@ mod tests {
                 end_s: 3.0,
                 text: "world".into(),
                 speaker: None,
+                confidence: None,
             },
         ];
         db.insert_segments("m1", &segs).unwrap();
@@ -6347,6 +6358,43 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Tier 3b/A: `segments.confidence` persists through `insert_segments` → `get_segments`. A stored
+    /// `Some(0.42)` round-trips (within f32 epsilon), a `None` writes NULL and reads back `None`, and
+    /// the additive column never disturbs the other fields.
+    #[test]
+    fn segments_confidence_round_trips() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("mc", "2026-07-03T10:00:00Z"))
+            .unwrap();
+        let segs = vec![
+            Segment {
+                idx: 0,
+                start_s: 0.0,
+                end_s: 1.0,
+                text: "clear speech".into(),
+                speaker: Some("me".into()),
+                confidence: Some(0.42),
+            },
+            Segment {
+                idx: 1,
+                start_s: 1.0,
+                end_s: 2.0,
+                text: "unknown".into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            },
+        ];
+        db.insert_segments("mc", &segs).unwrap();
+        let read = db.get_segments("mc").unwrap();
+        assert_eq!(read.len(), 2);
+        let c0 = read[0].confidence.expect("Some(0.42) must round-trip");
+        assert!((c0 - 0.42).abs() < 1e-6, "confidence drifted: {c0}");
+        assert_eq!(read[1].confidence, None, "NULL confidence must read back as None");
+        // The additive column did not perturb the other fields.
+        assert_eq!(read[0].text, "clear speech");
+        assert_eq!(read[1].speaker.as_deref(), Some("others"));
     }
 
     #[test]
@@ -7972,6 +8020,7 @@ mod lock_tests {
                 end_s: (i + 1) as f64,
                 text: t.to_string(),
                 speaker: if i % 2 == 0 { Some("me".into()) } else { Some("others".into()) },
+                confidence: None,
             })
             .collect();
         db.insert_segments(meeting_id, &segs).unwrap();

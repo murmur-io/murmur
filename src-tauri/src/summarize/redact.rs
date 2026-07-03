@@ -755,6 +755,7 @@ mod tests {
                 end_s: 2.0,
                 text: "let's begin".into(),
                 speaker: Some("Anna Kowalska".into()),
+                confidence: None,
             },
             Segment {
                 idx: 1,
@@ -762,6 +763,7 @@ mod tests {
                 end_s: 6.0,
                 text: "sounds good".into(),
                 speaker: Some("me".into()),
+                confidence: None,
             },
         ];
         let feed = crate::pipeline::build_transcript_feed(&segs);

@@ -17,6 +17,10 @@ pub mod claude_code;
 pub mod digest;
 pub mod dossier;
 pub mod graph;
+/// Tier 3b (B) anti-hallucination — DETERMINISTIC GROUNDING of the generated note against its own
+/// transcript segments. Pure, on-device, zero-egress; annotates unsupported summary units with a
+/// non-destructive `> unverified` marker.
+pub mod grounding;
 /// The REAL on-device PERSON-name NER redactor (Phase D). ALWAYS compiled; the real impl is selected
 /// at runtime by `redact::active_name_redactor` when the NER model dir is present, else the
 /// byte-identical `NoopNameRedactor` (so a no-model build's name egress is unchanged).

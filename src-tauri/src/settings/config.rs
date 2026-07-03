@@ -285,6 +285,20 @@ pub struct AppConfig {
     /// this field existed loads as `true` (memory stays on for existing installs).
     #[serde(default = "default_true")]
     pub user_memory_enabled: bool,
+    /// Tier 3b (B) anti-hallucination — DETERMINISTIC GROUNDING of the generated note. When ON, a
+    /// pure, on-device, ZERO-EGRESS pass (`crate::summarize::grounding`) runs after summarization and
+    /// annotates any summary bullet / action item / prose line whose content words are NOT supported
+    /// by this meeting's OWN transcript segments with a non-destructive `> unverified` blockquote
+    /// (`> unverified (low audio confidence)` when the best-overlapping segments were acoustically
+    /// shaky). NON-DESTRUCTIVE: the original line stays byte-identical (action-item parsing is
+    /// unaffected); it only APPENDS a marker. Default OFF / OPT-IN (`#[serde(default)]` ⇒ `false`):
+    /// the overlap thresholds are UNCALIBRATED placeholders, so an over-flag would `> unverified` a
+    /// legitimately-abstractive sentence and degrade the note 100% of users read — it must stay opt-in
+    /// until a gold-label precision/recall pass on real data justifies flipping the default. PRESERVE-
+    /// ONLY on the settings DTO for now (the FE toggle is a follow-up) — a normal settings save neither
+    /// grants nor clears it; it round-trips through the load/save keys.
+    #[serde(default)]
+    pub ground_summary: bool,
     /// Model-role override — the CONNECTION serving the **Notes** role (everything Murmur writes).
     /// `""` (the default, and every pre-role install) = inherit the legacy mapping EXACTLY — see
     /// [`crate::summarize::roles::resolve`]. Values: `claude_code`/`anthropic`/`ollama`/`gateway`
@@ -375,6 +389,7 @@ impl Default for AppConfig {
             gateway_model: String::new(),
             proactive_hints_enabled: true,
             user_memory_enabled: true,
+            ground_summary: false,
             role_notes_connection: String::new(),
             role_notes_model: String::new(),
             role_notes_effort: String::new(),
@@ -432,6 +447,7 @@ const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
 const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
 const K_USER_MEMORY_ENABLED: &str = "user_memory_enabled";
+const K_GROUND_SUMMARY: &str = "ground_summary";
 const K_ROLE_NOTES_CONNECTION: &str = "role_notes_connection";
 const K_ROLE_NOTES_MODEL: &str = "role_notes_model";
 const K_ROLE_NOTES_EFFORT: &str = "role_notes_effort";
@@ -590,6 +606,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_USER_MEMORY_ENABLED)? {
             cfg.user_memory_enabled = v == "true";
         }
+        if let Some(v) = db.get_setting(K_GROUND_SUMMARY)? {
+            cfg.ground_summary = v == "true";
+        }
         // Model-role keys: `""` is a VALID value (= inherit legacy) and also the default, so the
         // stored value is taken verbatim (mirrors `provider_model`, not `anthropic_model`).
         if let Some(v) = db.get_setting(K_ROLE_NOTES_CONNECTION)? {
@@ -745,6 +764,10 @@ impl AppConfig {
         db.set_setting(
             K_USER_MEMORY_ENABLED,
             if self.user_memory_enabled { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_GROUND_SUMMARY,
+            if self.ground_summary { "true" } else { "false" },
         )?;
         db.set_setting(K_ROLE_NOTES_CONNECTION, &self.role_notes_connection)?;
         db.set_setting(K_ROLE_NOTES_MODEL, &self.role_notes_model)?;
@@ -1075,6 +1098,53 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    /// Tier 3b (B): `ground_summary` defaults OFF / opt-in (empty DB ⇒ false, thresholds uncalibrated),
+    /// and both an explicit ON and an explicit OFF round-trip through save/load — so an opt-IN persists
+    /// across reload despite the default-false.
+    #[test]
+    fn ground_summary_defaults_off_and_round_trips_both_ways() {
+        let db = temp_db();
+        // Empty DB (no stored key) ⇒ the default (OFF / opt-in until calibrated).
+        assert!(
+            !AppConfig::load(&db).unwrap().ground_summary,
+            "ground_summary must default OFF on a fresh DB (opt-in until calibrated)"
+        );
+
+        // Explicit ON persists (a maintainer/user opt-in).
+        AppConfig { ground_summary: true, ..Default::default() }
+            .save(&db)
+            .unwrap();
+        assert!(
+            AppConfig::load(&db).unwrap().ground_summary,
+            "an explicit ground_summary opt-in must persist"
+        );
+
+        // Explicit OFF persists.
+        AppConfig { ground_summary: false, ..Default::default() }
+            .save(&db)
+            .unwrap();
+        assert!(!AppConfig::load(&db).unwrap().ground_summary);
+    }
+
+    /// A config payload that OMITS `ground_summary` (persisted before the field existed) deserializes
+    /// it as `false` via `#[serde(default)]` — matching `AppConfig::default` (opt-in until calibrated).
+    #[test]
+    fn missing_ground_summary_deserializes_off() {
+        // A minimal payload carrying only the no-serde-default fields; `ground_summary` is omitted.
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.ground_summary, "serde default for ground_summary must be false (opt-in)");
     }
 
     #[test]
