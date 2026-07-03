@@ -76,6 +76,18 @@ import { ToastService } from "../../services/toast.service";
             <p class="empty-title">Couldn’t load your memory</p>
             <p class="empty">{{ error() }}</p>
           </div>
+        } @else if (disabled()) {
+          <div class="card empty-state">
+            <span class="empty-mark" aria-hidden="true"></span>
+            <p class="empty-title">Cross-meeting memory is off</p>
+            <p class="empty">
+              The brain isn’t learning or remembering durable facts about you, and
+              injects nothing into its answers. Turn it back on in
+              <a routerLink="/settings">Settings → Privacy</a> to let it build
+              context across your meetings — stored locally, gated, and
+              forgettable.
+            </p>
+          </div>
         } @else if (facts().length === 0) {
           <div class="card empty-state">
             <span class="empty-mark" aria-hidden="true"></span>
@@ -321,6 +333,14 @@ export class BrainMemoryComponent {
   readonly facts = computed<UserMemoryFact[]>(
     () => this.memory()?.facts ?? [],
   );
+
+  /**
+   * TRUE when cross-meeting memory is turned OFF entirely (`get_user_memory`
+   * returns the `disabled` marker with empty facts/brief). Renders a distinct
+   * "memory is off" affordance rather than an "empty memory" one — mirrors the
+   * backend, which suppresses ALL injection in this state.
+   */
+  readonly disabled = computed<boolean>(() => this.memory()?.disabled ?? false);
 
   /** The id of the fact currently being forgotten (disables just that row). */
   readonly forgettingId = signal<string | null>(null);
