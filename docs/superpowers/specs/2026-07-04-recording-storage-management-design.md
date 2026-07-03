@@ -208,10 +208,20 @@ end.
 - Audio compression / cloud offload / re-download of pruned audio.
 - Any change to notes/transcripts/timelines or their retention.
 
-## 9. Open items for the implementation plan
+## 9. Refinements resolved during planning
 
-- Exact reuse of the folder-lock check inside the prune candidate query (mirror
-  `meeting_is_unlocked` / the folder lock join used by `visibility_clause`).
-- Whether the meeting-row `audio_pruned_at` badge needs a new field on the existing meeting
-  list DTO or can piggyback on `audio_path == null`.
-- Event name/shape for the prune-completed FE refresh (extend `events.rs`).
+The implementation plan (`docs/superpowers/plans/2026-07-04-recording-storage-management.md`)
+resolved the open items — two are scope REDUCTIONS vs this spec, recorded here for traceability:
+
+- **No `audio_pruned_at` column (dropped).** The "audio freed" badge derives in the FE from
+  `audioPath === null` on a finalized, non-error meeting (every finalized recording gets a path;
+  a locked meeting's path points at its `.enc`, so null is prune-specific). This avoids touching
+  the widely-constructed `Meeting` struct + every meeting SELECT, and **removes the need for any
+  DB migration** — a net simplification (supersedes the "additive migration" note in §6/§7).
+- **Startup-prune trigger replaced by a save-config prune.** Auto-prune runs (a) after each
+  recording and (b) on `save_config` when auto-prune is ON with a cap set — so lowering the limit
+  enforces immediately. Strictly better UX than a startup pass; needs no `lib.rs` setup edit
+  (supersedes the "startup prune" notes in §4.1/§6).
+- Prune-candidate lock exclusion reuses the exact `notes.folder_id IN (folders WHERE locked=1)`
+  predicate from `reblank_locked_folders_at_rest` (`Db::prunable_audio_candidates`).
+- FE refresh event: `EVENT_STORAGE_PRUNED` (`murmur://storage-pruned`, counts only, NO PII).
