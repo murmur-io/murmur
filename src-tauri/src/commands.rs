@@ -190,6 +190,11 @@ pub struct AppConfigDto {
     /// toggle), unlike `cloud_egress_consented` which is preserved-only. Plain bool; an omitted value
     /// deserializes to `false` (`#[serde(default)]`), so a partial/older save can never silently
     /// enable it. Flipping it on does NOT auto-index — the user runs `reindex_embeddings` to backfill.
+    /// TIER 1 ASYMMETRY (intentional): the INTERNAL `AppConfig` now defaults this ON (the fresh-install
+    /// default), but this DTO stays fail-safe-`false` so a partial/malformed FE save can never SILENTLY
+    /// turn it ON (a field-omitting save resolves to `false` = the fail-safe OFF direction). `config_to_dto`
+    /// carries the real stored value OUT and the FE echoes it back, so the true value still round-trips
+    /// (see `dto_round_trips_semantic_search_enabled_both_ways`).
     #[serde(default)]
     pub semantic_search_enabled: bool,
     /// brain2 connector framework — the WEB SEARCH master toggle. Settable from the DTO (the Settings
@@ -2645,7 +2650,14 @@ mod ask_vault_tests {
         let db = tmp_db();
         seed_note(&db, "m1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
         seed_note(&db, "m2", "Weekly Sync", "Anna owns QA for atlas.", None);
-        let cfg = AppConfig::default(); // semantic_search_enabled = false → the FTS floor branch
+        // Tier 1 flipped the semantic default ON; PIN it false so this test keeps EXPLICITLY exercising
+        // the FTS-floor branch (its stated purpose) rather than the hybrid branch — which, on an empty
+        // vec_chunks, happens to degenerate to the same bytes. Defensive/self-documenting, not a strict
+        // regression guard (the hybrid path is byte-identical here even without the pin).
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
         let unlocked = HashSet::new();
         let history = vec![
             ChatTurn { role: "user".into(), content: "earlier question".into() },
@@ -7945,9 +7957,13 @@ mod lifecycle_tests {
             "flag-off Ask corpus must surface ingested document/note content; got: {corpus:?}"
         );
 
-        // 3. The tool seam (default config: semantic OFF) surfaces the token through BOTH advertised
-        //    search tools — the same seam MCP and the agentic loop dispatch through.
-        let cfg = AppConfig::default();
+        // 3. The tool seam (PIN semantic OFF — this test asserts the flag-OFF keyword-fallback path)
+        //    surfaces the token through BOTH advertised search tools — the same seam MCP and the
+        //    agentic loop dispatch through.
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
         let out = crate::tools::execute_tool(
             &crate::tools::ToolCall::SearchMeetings { query: "fioletowoszary".into() },
             &state.db,
@@ -7971,6 +7987,41 @@ mod lifecycle_tests {
             out2.contains("Ulubiony"),
             "search_semantic (flag OFF) must fall back to gated keyword doc search and surface \
              document CONTENT; got: {out2:?}"
+        );
+    }
+
+    /// TIER 1 default-on graceful degradation: with `semantic_search_enabled = true` but NO e5 model
+    /// (CI / the common fresh-install state), `search_semantic` must DEGRADE to gated keyword doc
+    /// search and still surface document CONTENT — not panic, not go empty. Proves the NEW default is
+    /// safe when the model is absent (which it is until the user downloads e5).
+    #[test]
+    fn semantic_on_without_model_surfaces_keyword_results() {
+        let state = build_state("docs-semantic-on-nomodel");
+        make_open_folder(&state.db, "f-open", "Project");
+        import_text_inner(
+            &state,
+            "Preferencje",
+            "Ulubiony kolor użytkownika to fioletowoszary.",
+            "f-open",
+        )
+        .unwrap();
+        let nothing = HashSet::new();
+        // The NEW default: semantic ON. With no e5 model on disk the hybrid leg degenerates to FTS.
+        let cfg = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
+        let out = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchSemantic { query: "fioletowoszary".into() },
+            &state.db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Ulubiony"),
+            "semantic ON + no model must degrade to gated keyword doc search and surface CONTENT; \
+             got: {out:?}"
         );
     }
 
