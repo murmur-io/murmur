@@ -442,6 +442,47 @@ mod tests {
         assert!(merge_streams(Vec::new()).is_empty());
     }
 
+    /// WS8 DEGRADATION (crash-safe default-on guard). With `capture_system_audio` ON, if system
+    /// capture yields NOTHING — Screen-Recording (TCC) permission denied (the fresh-install state),
+    /// or the sidecar spawned but captured no audio → an EMPTY "others" stream — the merge must still
+    /// produce the COMPLETE mic transcript, every segment attributed "me", with no panic and no lost
+    /// content. This is the "degrade to mic-only, never fail the recording" contract the default-on
+    /// flip depends on, proven at the merge layer: the `audio::system` spawn/stop layer returns
+    /// `Ok(None)` on capture failure and the pipeline then feeds only the mic StreamInput (see
+    /// `pipeline::run_inner`). Complements `single_stream_passthrough_is_mic_only_me` (stream ABSENT)
+    /// with the stream-PRESENT-but-EMPTY case.
+    #[test]
+    fn empty_system_stream_degrades_to_full_mic_only() {
+        let origin = Instant::now();
+        let mic = StreamInput {
+            segments: vec![
+                seg(0, 0.0, 2.0, "the whole call recorded on my mic"),
+                seg(1, 2.0, 4.0, "second line survives too"),
+            ],
+            started_at: origin,
+            speaker: SPEAKER_ME,
+        };
+        // System capture failed/denied → an EMPTY stream (zero segments), same start instant.
+        let system = StreamInput {
+            segments: Vec::new(),
+            started_at: origin,
+            speaker: SPEAKER_OTHERS,
+        };
+        let out = merge_streams(vec![mic, system]);
+        // No content lost: both mic segments survive, in order, re-indexed.
+        assert_eq!(out.len(), 2, "mic transcript is complete despite the absent far side");
+        assert!(
+            out.iter().all(|s| s.speaker.as_deref() == Some("me")),
+            "with no system stream every segment is attributed to me"
+        );
+        assert_eq!(
+            out.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["the whole call recorded on my mic", "second line survives too"]
+        );
+        assert_eq!(out.iter().map(|s| s.idx).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(out[0].start_s, 0.0, "no spurious time shift from the empty system stream");
+    }
+
     /// REGRESSION (mute × wall-clock alignment — the load-bearing Phase-B invariant).
     ///
     /// A muted-mic span writes SILENCE that keeps the mic buffer full-length (see
