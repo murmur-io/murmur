@@ -57,7 +57,7 @@ import { SettingsStore } from "../settings.store";
                     Emails, card numbers and phone numbers are automatically
                     scrubbed before any text leaves this Mac — that covers the Anthropic
                     API, Claude Code (the <code>claude</code> CLI uploads your
-                    transcript to Anthropic too), an AI Gateway, and a remote Ollama
+                    transcript to Anthropic too), a Kong AI Gateway, and a remote Ollama
                     server — then restored in your notes. Only Ollama running on this
                     Mac keeps everything on-device.
                   </p>
@@ -74,7 +74,7 @@ import { SettingsStore } from "../settings.store";
                 <div class="privacy-section">
                   <span class="privacy-section-label text-muted">Cloud processing</span>
                   <p class="text-secondary privacy-note">
-                    Cloud providers — Claude Code, the Anthropic API, an AI Gateway, or
+                    Cloud providers — Claude Code, the Anthropic API, a Kong AI Gateway, or
                     a remote Ollama server — send your (redacted) transcript off this
                     Mac to write each summary. Only Ollama running on this Mac stays
                     fully on-device. Until you allow this once, cloud summaries are

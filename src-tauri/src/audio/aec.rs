@@ -61,6 +61,92 @@ pub fn sweep_stale_scratch() {
     }
 }
 
+/// Basenames of the helper binaries the app spawns to CAPTURE audio. At app startup nothing is
+/// recording yet, so any of these still alive is an ORPHAN from a previous session that died
+/// without a clean Stop — a crash, a force-quit, or (in dev) a `tauri dev` hot-rebuild SIGKILLing
+/// the app mid-recording. An orphan reparents to launchd (ppid 1) and keeps capturing system audio
+/// to its temp WAV until its own 4h self-limit — gigabytes of dead-session audio.
+const CAPTURE_HELPERS: [&str; 3] = ["meetnotes-sysaudio", "meetnotes-audiocap", "meetnotes-aeccap"];
+
+/// SIGTERM any ORPHANED capture helper (a [`CAPTURE_HELPERS`] binary reparented to launchd) and
+/// delete its scratch WAV. Best-effort, called ONCE at startup. This closes the gap
+/// [`sweep_stale_scratch`] can't: a *live* orphan keeps its WAV mtime fresh, so the file-age sweep
+/// never reclaims it, and the child runs for hours.
+///
+/// PRECISE + SAFE: it targets ONLY processes with `ppid == 1` (launchd) — a helper freshly spawned
+/// by THIS running app is a child of our pid (never launchd), and a concurrently-running Murmur's
+/// live helper is a child of *its* pid — so neither is ever touched. Only a truly-orphaned,
+/// parentless helper matches.
+pub fn reap_orphaned_capture_helpers() {
+    let Ok(out) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+    else {
+        return;
+    };
+    let mut reaped = 0u32;
+    for (pid, wav) in parse_orphan_helpers(&String::from_utf8_lossy(&out.stdout)) {
+        // SIGTERM (not SIGKILL): let the helper's signal handler close its file, then reclaim it.
+        let killed = std::process::Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if killed {
+            reaped += 1;
+            if let Some(path) = wav {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    if reaped > 0 {
+        // WARN, not INFO: an orphan reaching startup means a prior session leaked a capture helper.
+        tracing::warn!(target: "audio", reaped, "reaped orphaned capture helper(s) at startup");
+    }
+}
+
+/// Pure parser for `ps -axo pid=,ppid=,command=` output: return `(pid, scratch_wav)` for every line
+/// that is an ORPHANED (`ppid == 1`) capture helper. `scratch_wav` is the helper's capture-scratch
+/// argument (`meetnotes-sys-*.wav` / `meetnotes-aec-*.wav`), when present, so the caller can delete
+/// it after the kill. Isolated from the process-spawning so the ppid==1 safety filter is unit-
+/// testable without live processes. (Assumes the scratch/binary paths carry no embedded spaces —
+/// true for the OS temp dir + the app resource dir; this is best-effort startup cleanup.)
+fn parse_orphan_helpers(ps_output: &str) -> Vec<(i32, Option<std::path::PathBuf>)> {
+    let mut out = Vec::new();
+    for line in ps_output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 3 {
+            continue;
+        }
+        let (Ok(pid), Ok(ppid)) = (tokens[0].parse::<i32>(), tokens[1].parse::<i32>()) else {
+            continue;
+        };
+        if ppid != 1 {
+            continue; // NOT an orphan — a child of a live app (ours or another). Never touch it.
+        }
+        // A command token whose basename IS one of our capture helpers.
+        let is_helper = tokens.iter().any(|t| {
+            let base = t.rsplit('/').next().unwrap_or(t);
+            CAPTURE_HELPERS.contains(&base)
+        });
+        if !is_helper {
+            continue;
+        }
+        // The scratch WAV arg (same pattern sweep_stale_scratch reclaims), if the helper carries one.
+        let wav = tokens
+            .iter()
+            .find(|t| {
+                let base = t.rsplit('/').next().unwrap_or(t);
+                (base.starts_with("meetnotes-sys-") || base.starts_with("meetnotes-aec-"))
+                    && base.ends_with(".wav")
+            })
+            .map(std::path::PathBuf::from);
+        out.push((pid, wav));
+    }
+    out
+}
+
 /// Path to the bundled VPIO AEC helper (resource dir, then the dev `AECCAP_BIN` fallback).
 pub fn aec_helper_path(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(p) = app
@@ -148,5 +234,48 @@ impl AecRecorder {
             );
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // A realistic `ps -axo pid=,ppid=,command=` fixture: the actual orphan we found (audiocap,
+    // ppid 1) + a legit LIVE helper (child of a running app, ppid 32431) that MUST be spared +
+    // an unrelated launchd child + a sysaudio orphan with no scratch arg.
+    const PS: &str = "\
+ 5916     1 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-83191e88.wav 14400
+ 7001 32431 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-live-abc.wav 14400
+  412     1 /usr/libexec/somethingd
+ 8080     1 /Users/x/target/debug/meetnotes-sysaudio";
+
+    #[test]
+    fn selects_only_orphaned_helpers_and_extracts_scratch() {
+        let got = parse_orphan_helpers(PS);
+        // The audiocap orphan (with its scratch WAV) and the sysaudio orphan (no scratch arg).
+        assert_eq!(
+            got,
+            vec![
+                (5916, Some(PathBuf::from("/var/folders/sl/T/meetnotes-sys-83191e88.wav"))),
+                (8080, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn never_reaps_a_live_child_helper() {
+        // SAFETY INVARIANT: pid 7001 is a live capture helper of a RUNNING app (ppid 32431). It is
+        // a byte-for-byte twin of the orphan except for its parent — it must NEVER be selected.
+        let ids: Vec<i32> = parse_orphan_helpers(PS).into_iter().map(|(p, _)| p).collect();
+        assert!(!ids.contains(&7001), "must not reap a helper still owned by a live app");
+    }
+
+    #[test]
+    fn ignores_non_helper_and_malformed_lines() {
+        assert!(parse_orphan_helpers("  412     1 /usr/libexec/somethingd").is_empty());
+        assert!(parse_orphan_helpers("garbage\n\n123 abc def").is_empty());
+        assert!(parse_orphan_helpers("").is_empty());
     }
 }

@@ -45,6 +45,21 @@ pub const CONN_LOCAL: &str = "local";
 /// Reasoner-only connection id: no model — the deterministic [`crate::reason::StubReasoner`] floor.
 pub const CONN_OFF: &str = "off";
 
+/// Human-facing display name for a connection id — for USER-VISIBLE status lines
+/// (e.g. the pipeline's "Summarizing with …" line). Mirrors the FE connection
+/// labels (`CONNECTION_LABELS` in `settings.store.ts`) so the two never diverge.
+/// An unknown id falls back to itself, so a newly-added provider is never blank.
+pub fn connection_display_name(connection: &str) -> &str {
+    match connection {
+        "claude_code" => "Claude Code",
+        "anthropic" => "Anthropic API",
+        "ollama" => "Ollama",
+        "gateway" => "Kong AI Gateway",
+        CONN_LOCAL => "the on-device model",
+        other => other,
+    }
+}
+
 /// A model role — the fixed, user-meaningful set of "what Murmur uses AI for".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -220,6 +235,19 @@ pub fn reasoner_target(role: Role, cfg: &AppConfig) -> RoleTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_display_name_is_human_friendly() {
+        // The four real providers render as their user-facing labels (matches the FE).
+        assert_eq!(connection_display_name("claude_code"), "Claude Code");
+        assert_eq!(connection_display_name("anthropic"), "Anthropic API");
+        assert_eq!(connection_display_name("ollama"), "Ollama");
+        assert_eq!(connection_display_name("gateway"), "Kong AI Gateway");
+        // Never the raw id / underscore token in a user-visible status line.
+        assert_ne!(connection_display_name("claude_code"), "claude_code");
+        // Unknown id falls back to itself (never blank) so a new provider still shows.
+        assert_eq!(connection_display_name("brand_new"), "brand_new");
+    }
 
     /// A discriminating legacy config: every legacy knob set to a distinct value so the identity
     /// matrix can tell exactly which knob each resolution read.

@@ -55,7 +55,7 @@ const CONNECTION_LABELS: Readonly<Record<string, string>> = {
   claude_code: "Claude Code",
   anthropic: "Anthropic API",
   ollama: "Ollama",
-  gateway: "AI Gateway",
+  gateway: "Kong AI Gateway",
 };
 
 /**
@@ -451,7 +451,7 @@ export class SettingsStore {
         case "gateway": {
           const dest = this.gatewayDestination();
           return {
-            connection: "AI Gateway",
+            connection: "Kong AI Gateway",
             destination: dest ? dest.host : "your gateway (base URL not set)",
           };
         }
