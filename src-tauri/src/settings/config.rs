@@ -170,7 +170,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub semantic_search_enabled: bool,
     /// brain2 RAG Phase 2 — the SELECTED on-device embedding model id (from
-    /// [`crate::embed::EMBED_MODELS`], e.g. `"multilingual-e5-small"` (default) / `"mmlw-e5-small"`).
+    /// [`crate::embed::EMBED_MODELS`], e.g. `"multilingual-e5-small"` (default) / `"mmlw-retrieval-e5-small"`).
     /// `None`/empty (the default) resolves to `multilingual-e5-small` ⇒ BYTE-IDENTICAL to the
     /// historical hardcoded behavior. Set via the `select_embed_model` command, which also triggers a
     /// re-index (a different model's vectors are not comparable). `#[serde(default)]` ⇒ a config
@@ -1026,13 +1026,13 @@ mod tests {
         assert!(AppConfig::load(&db).unwrap().embed_model_id.is_none());
 
         let cfg = AppConfig {
-            embed_model_id: Some("mmlw-e5-small".to_string()),
+            embed_model_id: Some("mmlw-retrieval-e5-small".to_string()),
             ..Default::default()
         };
         cfg.save(&db).unwrap();
         assert_eq!(
             AppConfig::load(&db).unwrap().embed_model_id.as_deref(),
-            Some("mmlw-e5-small")
+            Some("mmlw-retrieval-e5-small")
         );
 
         // Clearing back to None (default model) also round-trips — not a one-way latch.
