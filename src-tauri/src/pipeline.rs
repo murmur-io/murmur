@@ -621,7 +621,10 @@ async fn summarize_and_export(
     emit_status(
         app,
         "summarizing",
-        &format!("Summarizing with provider '{}'…", notes_target.connection),
+        &format!(
+            "Summarizing with {}…",
+            crate::summarize::roles::connection_display_name(&notes_target.connection)
+        ),
         meeting_id,
     );
 
