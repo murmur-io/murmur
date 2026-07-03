@@ -4557,6 +4557,21 @@ pub async fn download_brain_model(
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// WS2 (EXPERIMENTAL) — availability of the on-device Apple Foundation Models sidecar
+/// (`meetnotes-afm`): is it bundled, and (if so) does its on-device model report available? Lets the
+/// FE offer the "Apple Intelligence (on-device)" brain option ONLY on macOS-26 Apple-Silicon
+/// hardware where the native sidecar is present — never advertise it elsewhere. On every current
+/// (non-macOS-26) build the sidecar is ABSENT, so this returns
+/// `{sidecar_present:false, model_available:None}`.
+///
+/// Opens NO content-read path (a device-capability probe only, like [`brain_model_present`]), so no
+/// `meeting_is_unlocked` / `visibility_clause` gate applies. NEVER panics, NEVER egresses (the probe
+/// is a local `--probe` spawn; a missing/wedged sidecar degrades gracefully).
+#[tauri::command]
+pub fn afm_available(app: AppHandle) -> Result<crate::reason::afm::AfmStatus, AppError> {
+    Ok(crate::reason::afm::probe(Some(&app)))
+}
+
 /// `true` when all three multilingual-e5-small files are present in the shared models dir's embed
 /// sub-dir — i.e. the REAL embedder would load (candle is always compiled; it activates on model
 /// presence). Cheap existence probe; NEVER errors on a missing models dir (treats it as "not present").

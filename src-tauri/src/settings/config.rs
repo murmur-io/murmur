@@ -13,6 +13,12 @@ use crate::storage::Db;
 /// - **`Local`**: the on-device GGUF (`MistralReasoner`, e.g. Bielik) when the selected model file
 ///   is present on disk (mistralrs is always compiled); otherwise the `StubReasoner`.
 /// - **`Off`**: the dependency-free `StubReasoner` (the deterministic floor — zero brain).
+/// - **`AppleFoundation`** (EXPERIMENTAL, opt-in — the default stays `Cloud`): the on-device Apple
+///   Foundation Models reasoner ([`crate::reason::afm`]) via the `meetnotes-afm` Swift sidecar
+///   (macOS 26+, Apple Silicon). ON-DEVICE like `Local`: no cloud egress, no consent gate, no
+///   redaction wrap. Until a signed macOS-26 build bundles the native sidecar it is ABSENT on every
+///   machine, so `AppleFoundation` degrades to the deterministic `StubReasoner` — byte-identical to
+///   `Off`/`Local`-without-a-model. Do NOT flip the default to this until on-Mac-verified.
 ///
 /// `#[serde(default)]` on the field ⇒ a config persisted before this field existed loads as
 /// `Cloud` (the chosen default). NEVER changes the egress envelope: a Cloud brain that lacks
@@ -27,23 +33,33 @@ pub enum BrainBackend {
     Local,
     /// No brain — the deterministic floor.
     Off,
+    /// EXPERIMENTAL — on-device Apple Foundation Models via the `meetnotes-afm` sidecar (macOS 26+
+    /// Apple Silicon); falls back to the stub when the sidecar/model is absent. Explicit
+    /// `#[serde(rename = "apple")]` so the persisted token is the single word `apple` (the container
+    /// `rename_all = "lowercase"` would otherwise emit `applefoundation`).
+    #[serde(rename = "apple")]
+    AppleFoundation,
 }
 
 impl BrainBackend {
-    /// Stable lowercase token persisted in the settings table (`cloud` | `local` | `off`).
+    /// Stable lowercase token persisted in the settings table (`cloud` | `local` | `off` | `apple`).
     pub fn as_str(self) -> &'static str {
         match self {
             BrainBackend::Cloud => "cloud",
             BrainBackend::Local => "local",
             BrainBackend::Off => "off",
+            BrainBackend::AppleFoundation => "apple",
         }
     }
 
-    /// Parse the persisted token; an unknown/empty value falls back to the default (`Cloud`).
+    /// Parse the persisted token; an unknown/empty value falls back to the default (`Cloud`) — so an
+    /// OLD build reading a config written by a NEW build (e.g. an `apple` token it doesn't know)
+    /// downgrades gracefully to `Cloud`, never crashes.
     pub fn from_str_or_default(s: &str) -> Self {
         match s {
             "local" => BrainBackend::Local,
             "off" => BrainBackend::Off,
+            "apple" => BrainBackend::AppleFoundation,
             _ => BrainBackend::Cloud,
         }
     }
@@ -917,7 +933,14 @@ mod tests {
         // Absent key ⇒ Cloud (the chosen default for fresh + pre-existing installs).
         assert_eq!(AppConfig::load(&db).unwrap().brain_backend, BrainBackend::Cloud);
 
-        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+        // AppleFoundation (WS2) joins the DB save/load round-trip loop — a persisted `apple` token
+        // reloads as AppleFoundation, never the Cloud default.
+        for backend in [
+            BrainBackend::Cloud,
+            BrainBackend::Local,
+            BrainBackend::Off,
+            BrainBackend::AppleFoundation,
+        ] {
             let cfg = AppConfig {
                 brain_backend: backend,
                 ..Default::default()
@@ -933,11 +956,32 @@ mod tests {
         assert_eq!(BrainBackend::Cloud.as_str(), "cloud");
         assert_eq!(BrainBackend::Local.as_str(), "local");
         assert_eq!(BrainBackend::Off.as_str(), "off");
+        // WS2 — AppleFoundation persists as the single token `apple`.
+        assert_eq!(BrainBackend::AppleFoundation.as_str(), "apple");
         assert_eq!(BrainBackend::from_str_or_default("local"), BrainBackend::Local);
         assert_eq!(BrainBackend::from_str_or_default("off"), BrainBackend::Off);
-        // Unknown / empty falls back to the default brain.
+        assert_eq!(
+            BrainBackend::from_str_or_default("apple"),
+            BrainBackend::AppleFoundation
+        );
+        // Unknown / empty falls back to the default brain — INCLUDING the un-renamed
+        // `applefoundation` spelling, which an OLD build must NOT accidentally accept.
         assert_eq!(BrainBackend::from_str_or_default("bogus"), BrainBackend::Cloud);
         assert_eq!(BrainBackend::from_str_or_default(""), BrainBackend::Cloud);
+        assert_eq!(
+            BrainBackend::from_str_or_default("applefoundation"),
+            BrainBackend::Cloud
+        );
+
+        // serde: AppleFoundation serializes to the QUOTED token `"apple"` and round-trips back.
+        assert_eq!(
+            serde_json::to_string(&BrainBackend::AppleFoundation).unwrap(),
+            "\"apple\""
+        );
+        assert_eq!(
+            serde_json::from_str::<BrainBackend>("\"apple\"").unwrap(),
+            BrainBackend::AppleFoundation
+        );
 
         // JSON DTO: a payload omitting brainBackend loads as Cloud (#[serde(default)]).
         let json = r#"{

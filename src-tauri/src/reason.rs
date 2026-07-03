@@ -26,6 +26,12 @@ use crate::summarize::roles::{self, Role};
 /// runtime by [`local_reasoner`] when a GGUF resolves on disk, else the dependency-free stub.
 pub mod mistral;
 
+/// WS2 — the EXPERIMENTAL on-device Apple Foundation Models reasoner ([`afm::AfmReasoner`]), driven
+/// by the `meetnotes-afm` Swift sidecar (macOS 26+). Selected at runtime for
+/// [`BrainBackend::AppleFoundation`]; falls back to the [`StubReasoner`] when the sidecar is absent
+/// (the current state on every non-macOS-26 machine).
+pub mod afm;
+
 /// A curated, mistral.rs-arch-SAFE on-device reasoning model the user can pick from. The app must
 /// serve BOTH English and Polish, so the brain offers a CHOICE — not one hardcoded GGUF. Every entry
 /// here is a `Q4_K_M` GGUF whose architecture mistral.rs parses today (`llama` / `qwen2` / `qwen3`,
@@ -270,6 +276,10 @@ pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
             tracing::info!(target: "reason", "brain backend = off; using stub reasoner");
             Box::new(StubReasoner)
         }
+        BrainBackend::AppleFoundation => {
+            tracing::info!(target: "reason", "brain backend = apple foundation (on-device sidecar)");
+            afm::afm_reasoner(config)
+        }
     }
 }
 
@@ -362,6 +372,12 @@ impl ReasonerCell {
         match target.connection.as_str() {
             roles::CONN_OFF => Arc::new(StubReasoner),
             roles::CONN_LOCAL => self.local_cached(&cfg, &target),
+            // WS2 anti-egress ORDERING (load-bearing): the on-device AFM arm MUST come BEFORE the
+            // catch-all cloud arm below. The `_` sends anything non-off/non-local/non-apple to the
+            // cloud (egress); without this explicit arm an `apple` target would silently
+            // cloud-dispatch. AfmReasoner holds only a PathBuf, so build per call like CloudReasoner
+            // (no cache slot); a missing sidecar falls back to the stub inside `afm_reasoner_arc`.
+            roles::CONN_AFM => afm::afm_reasoner_arc(&cfg),
             // Cheap per call: the provider (+ consent gate) is built lazily inside, from a fresh
             // config read, so this instance can never pin a stale provider/consent state.
             _ => Arc::new(CloudReasoner::for_role(Arc::clone(&self.config), role)),
@@ -1358,5 +1374,61 @@ mod tests {
     fn active_reasoner_default_is_cloud() {
         let id = active_reasoner(&AppConfig::default()).id().to_string();
         assert!(id.starts_with("cloud:"), "default brain must be cloud, got {id}");
+    }
+
+    // ---- WS2: AppleFoundation dispatch + anti-egress ordering --------------------------------
+
+    /// GRACEFUL FALLBACK: the AppleFoundation backend with NO sidecar (this CLT-only machine)
+    /// resolves to the deterministic stub — byte-identical to Off, zero egress, no panic. Mirrors
+    /// `active_reasoner_local_backend_without_model_yields_stub`. The env override is force-unset
+    /// under the shared lock so a concurrent spawn test can't leak a fixture sidecar into this probe.
+    #[test]
+    fn active_reasoner_apple_backend_without_sidecar_yields_stub() {
+        let _g = crate::reason::afm::AFM_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("MURMUR_AFM_SIDECAR");
+        let cfg = AppConfig {
+            brain_backend: BrainBackend::AppleFoundation,
+            ..Default::default()
+        };
+        assert_eq!(active_reasoner(&cfg).id(), "stub");
+    }
+
+    /// ANTI-EGRESS ORDERING regression (the load-bearing `CONN_AFM`-before-`_` arm): a mid-session
+    /// flip to AppleFoundation must dispatch the on-device path — which, with the sidecar absent,
+    /// is the stub — and must NEVER fall through to the catch-all CloudReasoner (a `cloud:` id would
+    /// mean an on-device backend silently egressed). RED if the `CONN_AFM` arm is removed: the
+    /// `apple` target would hit `_ => CloudReasoner` and this assertion would see `cloud:`.
+    #[test]
+    fn reasoner_cell_apple_backend_dispatches_stub_never_cloud() {
+        use crate::summarize::roles::Role;
+        let _g = crate::reason::afm::AFM_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("MURMUR_AFM_SIDECAR");
+        let cfg = shared(AppConfig {
+            brain_backend: BrainBackend::Off,
+            ..Default::default()
+        });
+        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        assert_eq!(cell.current().id(), "stub", "Off dispatches the stub");
+
+        cfg.lock().unwrap().brain_backend = BrainBackend::AppleFoundation;
+        let id = cell.current().id().to_string();
+        assert_eq!(id, "stub", "AFM without a sidecar dispatches the stub, got {id}");
+        assert!(
+            !id.starts_with("cloud:"),
+            "AFM (on-device) must NEVER fall through to the cloud reasoner (anti-egress), got {id}"
+        );
+
+        // Per-role explicit `apple` key routes the same on-device path (also stub-when-absent),
+        // never cloud — proving the CONN_AFM arm covers the explicit-target path too.
+        cfg.lock().unwrap().brain_backend = BrainBackend::Cloud;
+        cfg.lock().unwrap().role_ask_connection = "apple".to_string();
+        let ask_id = cell.current_for(Role::Ask).id().to_string();
+        assert_eq!(ask_id, "stub", "explicit Ask→apple dispatches on-device (stub when absent)");
+        // Notes (no key) keeps the legacy Cloud dispatch — the AFM arm didn't hijack other roles.
+        assert!(cell.current_for(Role::Notes).id().starts_with("cloud:"));
     }
 }
