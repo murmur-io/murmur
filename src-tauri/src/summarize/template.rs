@@ -146,13 +146,42 @@ never the keys."
     )
 }
 
-/// The full summary system prompt: the style template + the output-language directive.
-pub fn build_template(style: &str, note_language: &str) -> String {
-    format!(
+/// The full summary system prompt: the style template + the output-language directive, and — when
+/// the transcript is SPEAKER-LABELED (`labeled`, i.e. the meeting had ≥2 distinct diarized speakers)
+/// — the speaker-attribution directive so the model attributes decisions / key points / action-item
+/// OWNERS to who actually said them. `labeled == false` (the default solo-`me` meeting) is
+/// byte-identical to the pre-Tier-0 prompt.
+pub fn build_template(style: &str, note_language: &str, labeled: bool) -> String {
+    let mut t = format!(
         "{}\n\n{}",
         template_for_style(style),
         language_directive(note_language)
-    )
+    );
+    if labeled {
+        t.push_str("\n\n");
+        t.push_str(speaker_attribution_directive());
+    }
+    t
+}
+
+/// Appended to the system prompt ONLY when the transcript is speaker-labeled (`[start-end] (speaker)
+/// text`, the same shape the timeline consumes — see [`crate::summarize::timeline`]). Tells the model
+/// to attribute content to the speaker who said it (`me` = the person recording; `others` /
+/// `others-0` / `others-1` … = the DISTINCT other participants) so action-item OWNERS and decisions
+/// are correctly assigned instead of guessed from speaker-blind text. Mirrors `timeline::SYSTEM`.
+pub(crate) fn speaker_attribution_directive() -> &'static str {
+    "SPEAKER ATTRIBUTION: the transcript below is diarized — each line is `[start-end] (speaker) \
+text` (seconds). The `(speaker)` tag is the source of truth for who is talking: `me` is the person \
+recording the meeting; `others`, `others-0`, `others-1`, … are the DISTINCT people on the other \
+side of the call. Use it to:\n\
+- Attribute every DECISION and KEY POINT to the speaker who made it.\n\
+- Assign each action item to its real OWNER — write items as `Owner — action`, where Owner is the \
+speaker responsible (map `me` to the recording user; use a participant's real NAME when it is \
+clearly stated in the conversation, otherwise keep the tag label).\n\
+- List the distinct speakers under the `participants` front-matter (real names when clearly stated, \
+else the tag labels).\n\
+Never attribute to `me` something another participant said or owns, and never invent a speaker the \
+tags do not support."
 }
 
 /// Render the full prompt text a provider sends (template + meta + vault titles + transcript).
@@ -338,5 +367,27 @@ mod tests {
         assert!(notes_at < transcript_at, "skeleton before transcript");
         assert!(s.contains("## Also discussed"), "instructs the Also discussed section");
         assert!(s.contains("Never output a section titled"), "forbids a My notes section");
+    }
+
+    /// TIER 0: the speaker-attribution directive is appended ONLY when `labeled`, and the
+    /// `labeled == false` prompt is byte-identical to the legacy `template + language` prompt.
+    /// RED on the old 2-arg `build_template` (no `labeled` param, never appends the directive).
+    #[test]
+    fn build_template_adds_attribution_only_when_labeled() {
+        let base = format!(
+            "{}\n\n{}",
+            template_for_style("standard"),
+            language_directive("auto")
+        );
+        // Unlabeled (the default solo-`me` meeting): byte-identical to the legacy prompt.
+        let unlabeled = build_template("standard", "auto", false);
+        assert_eq!(unlabeled, base, "unlabeled must be byte-identical to the pre-Tier-0 prompt");
+        assert!(!unlabeled.contains("SPEAKER ATTRIBUTION"));
+        // Labeled: the unlabeled prompt PLUS the attribution directive instructing owner/speaker.
+        let labeled = build_template("standard", "auto", true);
+        assert!(labeled.starts_with(&base), "labeled prompt extends the base prompt");
+        assert!(labeled.contains("SPEAKER ATTRIBUTION"));
+        assert!(labeled.contains("OWNER"), "instructs action-item OWNER attribution");
+        assert!(labeled.contains("(speaker)") && labeled.contains("others"));
     }
 }

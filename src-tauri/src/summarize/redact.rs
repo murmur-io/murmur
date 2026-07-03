@@ -740,6 +740,68 @@ mod tests {
         assert!(out.contains("Anna Kowalska") && out.contains("Bob Smith"));
     }
 
+    /// TIER 0 PII (lock-security): a real NAME that occupies a `(speaker)` tag rides `req.transcript`
+    /// (via `pipeline::build_transcript_feed` → `summary_text`), so the SAME NameRedactor firewall
+    /// that scrubs the body scrubs the tag before egress — the speaker labels use NO side channel
+    /// (the analogue of the old un-scrubbed `user_notes` leak). RED-before-GREEN: the pre-redaction
+    /// feed CONTAINS the raw name; what egresses must NOT.
+    #[test]
+    fn tier0_named_speaker_tag_is_scrubbed_before_egress() {
+        use crate::transcribe::types::Segment;
+        let segs = vec![
+            Segment {
+                idx: 0,
+                start_s: 0.0,
+                end_s: 2.0,
+                text: "let's begin".into(),
+                speaker: Some("Anna Kowalska".into()),
+            },
+            Segment {
+                idx: 1,
+                start_s: 2.0,
+                end_s: 6.0,
+                text: "sounds good".into(),
+                speaker: Some("me".into()),
+            },
+        ];
+        let feed = crate::pipeline::build_transcript_feed(&segs);
+        // Two distinct speakers ⇒ labeled ⇒ the raw name occupies a `(speaker)` tag pre-redaction.
+        assert!(feed.labeled);
+        assert!(
+            feed.summary_text.contains("(Anna Kowalska)"),
+            "raw name sits in the tag before redaction"
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        struct CaptureProvider(std::sync::Arc<std::sync::Mutex<String>>);
+        #[async_trait]
+        impl SummarizerProvider for CaptureProvider {
+            fn id(&self) -> &str {
+                "capture"
+            }
+            async fn availability(&self) -> Availability {
+                Availability::Available
+            }
+            async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+                *self.0.lock().unwrap() = req.transcript.clone();
+                Ok(req.transcript.clone())
+            }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+        let prov = RedactingProvider::with_name_redactor(
+            Arc::new(CaptureProvider(captured.clone())),
+            Arc::new(FixtureNameRedactor),
+        );
+        block_on(prov.summarize(&sample_req(&feed.summary_text))).unwrap();
+        let sent = captured.lock().unwrap().clone();
+        // The name in the speaker tag was scrubbed to a token before egress; the labeled line survives.
+        assert!(!sent.contains("Anna Kowalska"), "name must NOT egress");
+        assert!(sent.contains("\u{27ea}NAME_1\u{27eb}"), "name replaced by the stable token");
+        assert!(sent.contains("[0.0-2.0] ("), "the labeled line shape survives redaction");
+    }
+
     // ── Phase D model plumbing + active factory ──────────────────────────────
 
     #[test]

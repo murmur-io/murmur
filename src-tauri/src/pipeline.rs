@@ -583,23 +583,17 @@ async fn run_inner(
         .db
         .update_meeting_status(meeting_id, MeetingStatus::Transcribed)?;
 
-    // Rebuild the full transcript text from the merged, time-ordered segments — EXCLUDING segments
-    // the user spoke TO the assistant ("Klaudku, sprawdź pogodę"). Those are assistant commands, not
-    // meeting content: fed to the summarizer they get mangled into owner-less action items. The
-    // assistant's ANSWER lives in the persisted Q&A log (assistant_interactions), not the note.
-    let mut full_text = String::new();
-    for seg in &merged_segments {
-        let t = seg.text.trim();
-        if t.is_empty() || crate::audio::wake::is_assistant_directed(t) {
-            continue;
-        }
-        if !full_text.is_empty() {
-            full_text.push(' ');
-        }
-        full_text.push_str(t);
-    }
+    // Rebuild the transcript from the merged, time-ordered segments — EXCLUDING segments the user
+    // spoke TO the assistant ("Klaudku, sprawdź pogodę"). Those are assistant commands, not meeting
+    // content: fed to the summarizer they get mangled into owner-less action items. The assistant's
+    // ANSWER lives in the persisted Q&A log (assistant_interactions), not the note.
+    // TIER 0: `build_transcript_feed` yields a SPEAKER-LABELED `summary_text` (`[start-end] (speaker)
+    // text`, the exact shape the timeline already consumes) when the meeting has ≥2 distinct speakers
+    // — so the note can attribute owners/decisions — and stays byte-identical flat text for the
+    // default solo-`me` meeting. `retrieval_text` is always the flat join (RAG query unchanged).
+    let feed = build_transcript_feed(&merged_segments);
 
-    if full_text.trim().is_empty() {
+    if feed.summary_text.trim().is_empty() {
         return Err(AppError::Transcribe(
             "No speech detected in the recording — nothing to transcribe. \
              Check your microphone input and try recording again."
@@ -614,13 +608,91 @@ async fn run_inner(
         app,
         state,
         meeting_id,
-        &full_text,
+        &feed,
         lang.map(str::to_string),
         duration_s,
         &date_iso,
         &ended_at,
     )
     .await
+}
+
+/// TIER 0 — the summarizer's transcript, in two forms.
+///
+/// The pipeline computes diarized, timestamped segments but historically fed the summarizer a flat,
+/// speaker-stripped wall of text — so the note (the one artifact every user reads) could never
+/// attribute owners/decisions even when system-audio capture labeled the far side. `summary_text`
+/// fixes that: for a meeting with ≥2 DISTINCT speakers it is the `[start-end] (speaker) text` shape
+/// the timeline already uses ([`crate::summarize::timeline`]), so the model can attribute. For the
+/// default solo-`me` meeting (one distinct speaker) it stays the flat join — BYTE-IDENTICAL to the
+/// old note input. `retrieval_text` is ALWAYS the flat join: it feeds only the RAG salient-query
+/// path (`orchestrate_context`), which must not be perturbed by tag tokens.
+///
+/// The labeled `summary_text` becomes `SummarizeRequest.transcript`, so any real NAME that ever
+/// occupies a `(speaker)` tag is scrubbed by the SAME RedactingProvider/DebertaNameRedactor firewall
+/// as the rest of the transcript before any cloud egress — it rides no side channel.
+pub(crate) struct TranscriptFeed {
+    /// Flat text (assistant-directed segments dropped) for retrieval — byte-identical to the legacy join.
+    pub retrieval_text: String,
+    /// What the model summarizes: speaker-labeled when `labeled`, else identical to `retrieval_text`.
+    pub summary_text: String,
+    /// Whether `summary_text` carries `(speaker)` tags (i.e. ≥2 distinct speakers).
+    pub labeled: bool,
+}
+
+/// Build the [`TranscriptFeed`] from the merged, time-ordered segments. Drops empty and
+/// assistant-directed ("Klaudku, …") segments with the IDENTICAL predicate the flat loops used.
+pub(crate) fn build_transcript_feed(
+    segments: &[crate::transcribe::types::Segment],
+) -> TranscriptFeed {
+    use crate::audio::merge::SPEAKER_ME;
+    let kept: Vec<&crate::transcribe::types::Segment> = segments
+        .iter()
+        .filter(|s| {
+            let t = s.text.trim();
+            !t.is_empty() && !crate::audio::wake::is_assistant_directed(t)
+        })
+        .collect();
+
+    let mut retrieval_text = String::new();
+    for s in &kept {
+        if !retrieval_text.is_empty() {
+            retrieval_text.push(' ');
+        }
+        retrieval_text.push_str(s.text.trim());
+    }
+
+    // ≥2 distinct speaker labels (None counts as `me`, the mic stream) ⇒ worth tagging. A default
+    // mono-`me` meeting has exactly one distinct label ⇒ stays flat (byte-identical to before).
+    let distinct: std::collections::HashSet<&str> = kept
+        .iter()
+        .map(|s| s.speaker.as_deref().unwrap_or(SPEAKER_ME))
+        .collect();
+    let labeled = distinct.len() >= 2;
+
+    let summary_text = if labeled {
+        // The line shape is IDENTICAL to summarize::timeline's feed so the model reads one convention.
+        kept.iter()
+            .map(|s| {
+                format!(
+                    "[{:.1}-{:.1}] ({}) {}",
+                    s.start_s,
+                    s.end_s,
+                    s.speaker.as_deref().unwrap_or(SPEAKER_ME),
+                    s.text.trim()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        retrieval_text.clone()
+    };
+
+    TranscriptFeed {
+        retrieval_text,
+        summary_text,
+        labeled,
+    }
 }
 
 /// Resolve the summarize step's (config, NOTES provider) from the LIVE state — the egress
@@ -659,7 +731,7 @@ async fn summarize_and_export(
     app: &AppHandle,
     state: &AppState,
     meeting_id: &str,
-    transcript_text: &str,
+    feed: &TranscriptFeed,
     language: Option<String>,
     duration_s: i64,
     date_iso: &str,
@@ -724,7 +796,8 @@ async fn summarize_and_export(
         &state.db,
         meeting_id,
         related_title.as_deref(),
-        transcript_text,
+        // Retrieval query planning reads the FLAT text — unperturbed by `(speaker)` tag tokens.
+        &feed.retrieval_text,
         &unlocked,
         config,
     );
@@ -738,14 +811,16 @@ async fn summarize_and_export(
     let manual_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
 
     let request = SummarizeRequest {
-        transcript: transcript_text.to_string(),
+        // TIER 0: the SPEAKER-LABELED transcript (or the flat one for a solo-`me` meeting). It rides
+        // `req.transcript`, so the RedactingProvider firewall scrubs any name in a `(speaker)` tag.
+        transcript: feed.summary_text.clone(),
         meta: MeetingMeta {
             date_iso: date_iso.to_string(),
             title_hint: None,
             duration_s,
             language,
         },
-        template: template::build_template(&config.note_style, &config.note_language),
+        template: template::build_template(&config.note_style, &config.note_language, feed.labeled),
         vault_titles,
         related_context,
         user_notes: if config.notes_mode == "enhance" && !manual_notes.trim().is_empty() {
@@ -1136,19 +1211,10 @@ pub async fn resummarize_existing(
         ));
     }
 
-    // Rebuild full text from segments (same joining as the transcriber), EXCLUDING assistant-
-    // directed utterances ("Klaudku, …") so they never reach the action-items extraction.
-    let mut full_text = String::new();
-    for seg in &segments {
-        let t = seg.text.trim();
-        if t.is_empty() || crate::audio::wake::is_assistant_directed(t) {
-            continue;
-        }
-        if !full_text.is_empty() {
-            full_text.push(' ');
-        }
-        full_text.push_str(t);
-    }
+    // Rebuild the transcript from segments — EXCLUDING assistant-directed utterances ("Klaudku, …")
+    // so they never reach action-item extraction. TIER 0: `build_transcript_feed` speaker-labels the
+    // summary input when ≥2 distinct speakers, else stays byte-identical flat text.
+    let feed = build_transcript_feed(&segments);
 
     let date_iso = meeting
         .started_at
@@ -1162,7 +1228,7 @@ pub async fn resummarize_existing(
         app,
         state,
         meeting_id,
-        &full_text,
+        &feed,
         config.language.clone(),
         meeting.duration_s,
         &date_iso,
@@ -1301,6 +1367,74 @@ mod tests {
     fn derive_title_prefers_frontmatter() {
         let md = "---\ntitle: Q3 Planning\ndate: 2026-06-24\n---\n# Heading\n";
         assert_eq!(derive_title(md, "2026-06-24"), "Q3 Planning");
+    }
+
+    // ── TIER 0: speaker-aware transcript feed ────────────────────────────────
+    fn seg(
+        idx: i64,
+        start: f64,
+        end: f64,
+        speaker: Option<&str>,
+        text: &str,
+    ) -> crate::transcribe::types::Segment {
+        crate::transcribe::types::Segment {
+            idx,
+            start_s: start,
+            end_s: end,
+            text: text.to_string(),
+            speaker: speaker.map(str::to_string),
+        }
+    }
+
+    /// The default mono-`me` meeting (one distinct label, incl. `None`→`me`): NOT labeled;
+    /// `summary_text` == `retrieval_text` == the exact legacy flat join. Guards no-regression on the
+    /// artifact 100% of users read. RED on any change that tags a single-speaker meeting.
+    #[test]
+    fn feed_single_speaker_is_flat_and_byte_identical() {
+        let segs = vec![
+            seg(0, 0.0, 2.0, Some("me"), "  hello everyone  "),
+            seg(1, 2.0, 5.0, None, "let's begin"),
+        ];
+        let feed = build_transcript_feed(&segs);
+        assert!(!feed.labeled, "one distinct speaker ⇒ not labeled");
+        assert_eq!(feed.summary_text, "hello everyone let's begin");
+        assert_eq!(feed.summary_text, feed.retrieval_text, "flat == retrieval");
+        assert!(!feed.summary_text.contains('(') && !feed.summary_text.contains('['));
+    }
+
+    /// ≥2 distinct speakers ⇒ labeled with the EXACT `[start-end] (speaker) text` timeline shape,
+    /// while `retrieval_text` stays FLAT (no tag/timestamp tokens perturb the RAG query).
+    #[test]
+    fn feed_multi_speaker_is_labeled_timeline_format() {
+        let segs = vec![
+            seg(0, 0.0, 2.0, Some("me"), "hi there"),
+            seg(1, 2.0, 6.0, Some("others"), "great to meet you"),
+        ];
+        let feed = build_transcript_feed(&segs);
+        assert!(feed.labeled);
+        assert_eq!(
+            feed.summary_text,
+            "[0.0-2.0] (me) hi there\n[2.0-6.0] (others) great to meet you"
+        );
+        assert_eq!(feed.retrieval_text, "hi there great to meet you");
+        assert!(!feed.retrieval_text.contains('[') && !feed.retrieval_text.contains("(me)"));
+    }
+
+    /// Empty + assistant-directed ("Klaudku, …") segments are dropped identically to the old flat
+    /// loop; the surviving multi-speaker lines are labeled and carry no assistant command.
+    #[test]
+    fn feed_filters_empty_and_assistant_directed() {
+        let segs = vec![
+            seg(0, 0.0, 1.0, Some("me"), "   "),
+            seg(1, 1.0, 3.0, Some("me"), "Klaudku, sprawdź pogodę"),
+            seg(2, 3.0, 5.0, Some("me"), "let's plan the launch"),
+            seg(3, 5.0, 8.0, Some("others"), "sounds good"),
+        ];
+        let feed = build_transcript_feed(&segs);
+        assert!(feed.labeled);
+        assert!(!feed.summary_text.contains("Klaudku") && !feed.summary_text.contains("pogodę"));
+        assert!(feed.summary_text.contains("(me) let's plan the launch"));
+        assert!(feed.summary_text.contains("(others) sounds good"));
     }
 
     const HZ: usize = crate::audio::TARGET_RATE_HZ as usize;
