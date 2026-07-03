@@ -399,7 +399,30 @@ impl Db {
                confidence REAL NOT NULL DEFAULT 1.0,
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );
-             CREATE INDEX IF NOT EXISTS idx_user_facts_meeting ON user_facts(meeting_id);",
+             CREATE INDEX IF NOT EXISTS idx_user_facts_meeting ON user_facts(meeting_id);
+
+             -- On-device VOICE BIOMETRICS for diarized remote speakers (opt-in, default off). One row
+             -- per diarized others-{cluster_index} cluster of a meeting: the L2-normalized CAM++
+             -- speaker embedding (little-endian f32 BLOB), plus the bound person `label` once the user
+             -- enrolls the cluster by rename (NULL until then). `meeting_id` is the provenance +
+             -- gating + purge anchor: a voiceprint is DERIVED content of the meeting it was captured
+             -- from, so — exactly like `user_facts` / `facts` / `note_chunks` — it is PURGED on seal in
+             -- the same atomic tx (`purge_speaker_voiceprints_tx`) and every read is visibility-gated
+             -- (`list_voiceprints_visible`). A voiceprint derived from a sealed meeting must NEVER be
+             -- read or matched. FK CASCADE on meeting_id so a deleted meeting drops its voiceprints.
+             -- PRIVACY: these embeddings are never egressed; capturing a non-consenting participant's
+             -- voiceprint is an explicit opt-in (untested under BIPA/CIPA).
+             CREATE TABLE IF NOT EXISTS speaker_voiceprints (
+               id TEXT PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               cluster_index INTEGER NOT NULL,
+               label TEXT,
+               dim INTEGER NOT NULL,
+               embedding BLOB NOT NULL,
+               created_at TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_voiceprints_meeting ON speaker_voiceprints(meeting_id);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -1477,6 +1500,10 @@ impl Db {
         // derived data (never sealed) → the next read regenerates it from the remaining VISIBLE
         // sources only (design spec D3).
         Self::purge_user_facts_tx(&tx, meeting_ids)?;
+        // VOICEPRINT LOCK-SAFETY: drop the (opt-in) voice biometrics captured for these meetings in
+        // the SAME seal tx — a sealed meeting's remote-speaker voiceprint must not linger at rest,
+        // same purge-on-seal contract as `user_facts` above. Re-derivable on a later re-diarize.
+        Self::purge_speaker_voiceprints_tx(&tx, meeting_ids)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -1512,6 +1539,28 @@ impl Db {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM user_facts WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// VOICEPRINT LOCK-SAFETY: delete every `speaker_voiceprints` row derived from `meeting_ids`
+    /// within an EXISTING transaction, so the purge lands in the SAME atomic unit as the plaintext
+    /// blanking on a seal (and on `delete_meeting` / the startup reconcile). A voiceprint is a voice
+    /// BIOMETRIC derived from the meeting's system audio; a sealed meeting must surface NOTHING, so —
+    /// exactly like `user_facts` / `facts` / `note_chunks` — we DELETE rather than key-seal. Dropped by
+    /// design and not recoverable from the row (never keyed); the underlying audio is still sealed +
+    /// restorable, and a later re-diarize (with the opt-in on) re-derives the voiceprint. This is the
+    /// stricter-safe choice: a biometric of a locked speaker must not linger at rest.
+    fn purge_speaker_voiceprints_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM speaker_voiceprints WHERE meeting_id = ?1",
                 rusqlite::params![mid],
             )
             .map_err(map_err)?;
@@ -3187,6 +3236,15 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
+        // VOICEPRINT LOCK-SAFETY: purge the (opt-in) voice biometrics captured for every meeting in a
+        // locked folder, in this same reconciliation transaction — so a crash-while-unlocked (which
+        // may have re-diarized against a since-sealed meeting) cannot leave a remote speaker's
+        // voiceprint at rest after a restart. Same purge-on-seal contract as `user_facts` above.
+        tx.execute(
+            &format!("DELETE FROM speaker_voiceprints WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
         // brain2 realtime notes LOCK-SAFETY: re-blank the typed-notes plaintext of every meeting in a
         // locked folder ONLY WHERE its `manual_notes_blob` exists (the sealed copy is present) — so a
         // crash-while-unlocked (which restored the plaintext) cannot leave typed plaintext at rest
@@ -4725,6 +4783,152 @@ impl Db {
         Ok(out)
     }
 
+    /// Persist ONE voiceprint (opt-in voice biometric) for a diarized cluster of `meeting_id`.
+    /// `embedding` is the L2-normalized CAM++ vector; it is stored as a little-endian f32 BLOB.
+    /// `label` is NULL initially (bound later on enroll-by-rename). NO PII is logged (the embedding,
+    /// label, and meeting id are never logged). The row is provenance-anchored to `meeting_id`, so it
+    /// is gated by `list_voiceprints_visible` and purged on seal / cascade-deleted with the meeting.
+    pub fn insert_voiceprint(
+        &self,
+        id: &str,
+        meeting_id: &str,
+        cluster_index: i64,
+        label: Option<&str>,
+        embedding: &[f32],
+        created_at: &str,
+    ) -> Result<()> {
+        let blob = crate::transcribe::diarize::embedding_to_blob(embedding);
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO speaker_voiceprints \
+               (id, meeting_id, cluster_index, label, dim, embedding, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                meeting_id,
+                cluster_index,
+                label,
+                embedding.len() as i64,
+                blob,
+                created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED read of stored voiceprints: only those whose source meeting is VISIBLE (its note-folder
+    /// is open or session-`unlocked`). A voiceprint derived from a sealed-and-not-unlocked meeting is
+    /// EXCLUDED — it must never be read or matched (a voice biometric of a locked speaker stays
+    /// invisible). Fail-closed: an INNER JOIN on `meetings` drops a NULL/orphaned meeting_id, and the
+    /// visibility clause drops a sealed folder. Mirrors `list_user_facts_visible` exactly. A blob that
+    /// fails to decode is skipped defensively (never surfaced malformed).
+    pub fn list_voiceprints_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<Voiceprint>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT vp.id, vp.meeting_id, vp.cluster_index, vp.label, vp.dim, vp.embedding, \
+                    vp.created_at \
+               FROM speaker_voiceprints vp \
+               JOIN meetings m ON m.id = vp.meeting_id \
+              WHERE ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              ORDER BY vp.created_at DESC, vp.id DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let blob: Vec<u8> = row.get(5)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    blob,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, meeting_id, cluster_index, label, dim, blob, created_at) =
+                r.map_err(map_err)?;
+            // Defensive: a malformed blob (not a multiple of 4) is skipped, never surfaced.
+            let embedding = match crate::transcribe::diarize::blob_to_embedding(&blob) {
+                Some(e) => e,
+                None => continue,
+            };
+            out.push(Voiceprint {
+                id,
+                meeting_id,
+                cluster_index,
+                label,
+                dim,
+                embedding,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// ENROLL (Phase 2): bind a person `label` to the voiceprint of ONE diarized cluster of
+    /// `meeting_id` (the `others-{cluster_index}` cluster). Called from the gated `rename_speaker`
+    /// command when a diarized-cluster label is renamed to a person name — so the next meeting can
+    /// re-identify the same voice. Idempotent: re-labeling overwrites. Returns the number of rows
+    /// updated (0 if this meeting produced no voiceprint for that cluster — e.g. the recording
+    /// predates the opt-in, so enroll is simply a no-op). NO PII is logged by the caller.
+    ///
+    /// GATE NOTE: the WRITE target is anchored to `meeting_id`; the CALLER (`rename_speaker`) has
+    /// already refused a locked meeting, so this only ever writes for a visible meeting. No read of
+    /// any other meeting's voiceprint happens here.
+    pub fn set_voiceprint_label_for_cluster(
+        &self,
+        meeting_id: &str,
+        cluster_index: i64,
+        label: &str,
+    ) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE speaker_voiceprints SET label = ?3 \
+                   WHERE meeting_id = ?1 AND cluster_index = ?2",
+                rusqlite::params![meeting_id, cluster_index, label],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
+    /// FORGET one voiceprint by id — a HARD delete (a voice biometric is not history worth keeping;
+    /// mirror the `purge_speaker_voiceprints_tx` delete-not-invalidate discipline). Idempotent
+    /// (deleting a missing id is a no-op). Returns true iff a row was removed.
+    pub fn delete_voiceprint(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM speaker_voiceprints WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    /// CLEAR every stored voiceprint (the "forget all captured voices" affordance). HARD delete of
+    /// the whole table — a voice biometric store the user asked to erase. Returns the count removed.
+    pub fn clear_voiceprints(&self) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute("DELETE FROM speaker_voiceprints", [])
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
     /// FORGET one user fact by id (bitemporal INVALIDATE, never a silent delete): close the row at
     /// `at` if it is still open. Idempotent (a already-closed row is untouched). History is preserved
     /// — the fact simply stops being current, so it drops out of `list_user_facts_visible` and the
@@ -4819,6 +5023,21 @@ pub struct RawDocument {
     pub id: String,
     pub text: String,
     pub blob: Option<Vec<u8>>,
+}
+
+/// One stored speaker voiceprint row (opt-in voice biometric for a diarized "others" cluster).
+/// `embedding` is the decoded, L2-normalized CAM++ vector (`dim` floats). `label` is the bound
+/// person name once the cluster is enrolled by rename (NULL until then). Read ONLY through the gated
+/// `list_voiceprints_visible` — never surface one whose source meeting is sealed.
+#[derive(Debug, Clone)]
+pub struct Voiceprint {
+    pub id: String,
+    pub meeting_id: String,
+    pub cluster_index: i64,
+    pub label: Option<String>,
+    pub dim: i64,
+    pub embedding: Vec<f32>,
+    pub created_at: String,
 }
 
 /// Build the SQL predicate (no params) that selects notes whose folder is open or
@@ -8250,6 +8469,175 @@ mod lock_tests {
             .unwrap();
         db.delete_meeting("m1").unwrap();
         assert!(db.user_facts_all().unwrap().is_empty(), "FK CASCADE drops user facts");
+    }
+
+    // ── Voiceprints: at-rest storage + LOCK invariants (mirror the user_facts tests exactly) ──────
+
+    /// A voiceprint stored via `insert_voiceprint` round-trips byte-exact through the BLOB and reads
+    /// back through the gated reader with its embedding, cluster index, and NULL label intact.
+    #[test]
+    fn voiceprint_round_trips_through_gated_reader() {
+        let db = file_db("voiceprint-round-trip");
+        seed_note(&db, "m1", "note", None);
+        let emb = vec![0.1f32, -0.2, 0.3, 0.4, -0.5];
+        db.insert_voiceprint("vp1", "m1", 0, None, &emb, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        let got = db.list_voiceprints_visible(&HashSet::new()).unwrap();
+        assert_eq!(got.len(), 1, "the voiceprint is visible for an open meeting");
+        assert_eq!(got[0].id, "vp1");
+        assert_eq!(got[0].meeting_id, "m1");
+        assert_eq!(got[0].cluster_index, 0);
+        assert_eq!(got[0].dim, emb.len() as i64);
+        assert!(got[0].label.is_none(), "label is NULL until enrolled");
+        assert_eq!(got[0].embedding, emb, "embedding round-trips byte-exact through the BLOB");
+    }
+
+    /// GATE: a voiceprint whose source meeting is SEALED (its folder locked, not session-unlocked)
+    /// must NOT surface from `list_voiceprints_visible` — a voice biometric of a locked speaker stays
+    /// invisible. RED-before-GREEN: with an ungated SELECT the row would surface while sealed.
+    #[test]
+    fn list_voiceprints_visible_excludes_sealed_meeting() {
+        let db = file_db("voiceprint-gate");
+        seed_folder(&db, "f-lock", "Secret");
+        seed_note(&db, "secret1", "private", Some("f-lock"));
+        db.insert_voiceprint("vp1", "secret1", 1, None, &[0.5f32, 0.5, 0.5, 0.5], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(db.list_voiceprints_visible(&HashSet::new()).unwrap().len(), 1);
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        assert!(
+            db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty(),
+            "a sealed-not-unlocked meeting's voiceprint must not surface (gate violation)"
+        );
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert_eq!(
+            db.list_voiceprints_visible(&unlocked).unwrap().len(),
+            1,
+            "the voiceprint reappears once the folder is session-unlocked"
+        );
+    }
+
+    /// PURGE-ON-SEAL (DB layer): the same atomic seal tx that purges user facts also DELETES the
+    /// meeting's voiceprints (purge_speaker_voiceprints_tx). RED-before-GREEN: without the purge call
+    /// the voiceprint row survives the seal at rest.
+    #[test]
+    fn seal_purges_voiceprints() {
+        let db = file_db("voiceprint-purge");
+        seed_note(&db, "m1", "note", None);
+        db.insert_voiceprint("vp1", "m1", 0, None, &[0.1f32, 0.2, 0.3], "2026-07-01T00:00:00Z")
+            .unwrap();
+        // Present before the seal (visible for the open meeting).
+        assert_eq!(db.list_voiceprints_visible(&HashSet::new()).unwrap().len(), 1);
+        // The seal purge (chunks + corrections + assistant interactions + facts + user facts +
+        // VOICEPRINTS) in one tx.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert!(
+            db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty(),
+            "voiceprints must be purged on seal (drop-on-seal, like user facts)"
+        );
+    }
+
+    /// At-rest reconcile (crash-while-unlocked recovery): `reblank_locked_folders_at_rest` purges the
+    /// voiceprints of every meeting in a LOCKED folder in the same reconciliation tx. RED-before-GREEN:
+    /// without the reconcile DELETE a voiceprint re-derived while unlocked would survive a restart.
+    #[test]
+    fn reconcile_purges_voiceprints_in_locked_folder() {
+        let db = file_db("voiceprint-reconcile");
+        seed_folder(&db, "f-lock", "Secret");
+        seed_note(&db, "secret1", "private", Some("f-lock"));
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        // Simulate a crash-while-unlocked leftover: a voiceprint persisted against a since-locked
+        // meeting (the folder is locked at rest, so this row must not survive the reconcile).
+        db.insert_voiceprint("vp1", "secret1", 0, None, &[0.9f32, 0.1], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        db.reblank_locked_folders_at_rest().unwrap();
+        // Even with the folder session-unlocked, the row is GONE (reconcile deleted it at rest).
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert!(
+            db.list_voiceprints_visible(&unlocked).unwrap().is_empty(),
+            "the at-rest reconcile must purge a locked folder's voiceprints"
+        );
+    }
+
+    /// delete_meeting cascades to speaker_voiceprints (FK ON DELETE CASCADE).
+    #[test]
+    fn delete_meeting_cascades_to_voiceprints() {
+        let db = file_db("voiceprint-cascade");
+        seed_note(&db, "m1", "note", None);
+        db.insert_voiceprint("vp1", "m1", 0, None, &[0.1f32, 0.2], "2026-07-01T00:00:00Z")
+            .unwrap();
+        db.delete_meeting("m1").unwrap();
+        assert!(
+            db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty(),
+            "FK CASCADE drops voiceprints"
+        );
+    }
+
+    /// ENROLL (Phase 2): binding a person label to a cluster's voiceprint sets `label` on exactly
+    /// that (meeting, cluster) row, leaves others untouched, and is idempotent (overwrite).
+    #[test]
+    fn set_voiceprint_label_for_cluster_enrolls_one_row() {
+        let db = file_db("voiceprint-enroll");
+        seed_note(&db, "m1", "note", None);
+        db.insert_voiceprint("vp0", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+        db.insert_voiceprint("vp1", "m1", 1, None, &[0.0f32, 1.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        let n = db.set_voiceprint_label_for_cluster("m1", 0, "Sarah").unwrap();
+        assert_eq!(n, 1, "exactly the cluster-0 row is labeled");
+
+        let got = db.list_voiceprints_visible(&HashSet::new()).unwrap();
+        let c0 = got.iter().find(|v| v.cluster_index == 0).unwrap();
+        let c1 = got.iter().find(|v| v.cluster_index == 1).unwrap();
+        assert_eq!(c0.label.as_deref(), Some("Sarah"), "enroll bound the label");
+        assert!(c1.label.is_none(), "the other cluster is untouched");
+
+        // Idempotent overwrite.
+        assert_eq!(db.set_voiceprint_label_for_cluster("m1", 0, "Sara").unwrap(), 1);
+        let got2 = db.list_voiceprints_visible(&HashSet::new()).unwrap();
+        assert_eq!(
+            got2.iter().find(|v| v.cluster_index == 0).unwrap().label.as_deref(),
+            Some("Sara")
+        );
+
+        // No voiceprint for that cluster → no-op (0 rows), never an error (pre-opt-in recordings).
+        assert_eq!(db.set_voiceprint_label_for_cluster("m1", 9, "Nobody").unwrap(), 0);
+    }
+
+    /// FORGET one voiceprint by id removes exactly that row; deleting a missing id is a no-op.
+    #[test]
+    fn delete_voiceprint_removes_one_row() {
+        let db = file_db("voiceprint-forget-one");
+        seed_note(&db, "m1", "note", None);
+        db.insert_voiceprint("vp0", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+        db.insert_voiceprint("vp1", "m1", 1, None, &[0.0f32, 1.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        assert!(db.delete_voiceprint("vp0").unwrap(), "removed");
+        let got = db.list_voiceprints_visible(&HashSet::new()).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "vp1", "only the requested row is gone");
+        assert!(!db.delete_voiceprint("missing").unwrap(), "no-op on a missing id");
+    }
+
+    /// CLEAR removes every voiceprint (the "forget all captured voices" affordance).
+    #[test]
+    fn clear_voiceprints_removes_all() {
+        let db = file_db("voiceprint-clear");
+        seed_note(&db, "m1", "note", None);
+        seed_note(&db, "m2", "note2", None);
+        db.insert_voiceprint("vp0", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+        db.insert_voiceprint("vp1", "m2", 0, None, &[0.0f32, 1.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(db.clear_voiceprints().unwrap(), 2, "both rows cleared");
+        assert!(db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty());
     }
 }
 

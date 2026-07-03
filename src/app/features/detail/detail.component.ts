@@ -22,6 +22,7 @@ import type {
   MeetingDetail,
   MeetingTimeline,
   Segment,
+  SpeakerSuggestion,
 } from "../../core/models";
 import {
   FoldersService,
@@ -625,6 +626,7 @@ interface ParsedNote {
             [loading]="timelineLoading()"
             [error]="timelineError()"
             [hasAudio]="!!audioSrc()"
+            [suggestions]="speakerSuggestions()"
             (seek)="seekTo($event)"
             (retry)="loadTimeline()"
             (pin)="onPin($event)"
@@ -2058,6 +2060,13 @@ export class DetailComponent implements OnInit {
   readonly timeline = signal<MeetingTimeline | null>(null);
   readonly timelineLoading = signal(false);
   readonly timelineError = signal(false);
+  /**
+   * Speaker voiceprint suggestions (opt-in) — one per diarized `others-{n}` lane
+   * the backend re-identified against a prior labeled voiceprint. Fed to the
+   * timeline as the "Looks like [[Anna]]?" chip. Loaded best-effort alongside the
+   * timeline; empty when the opt-in is off, the meeting is locked, or nothing matched.
+   */
+  readonly speakerSuggestions = signal<SpeakerSuggestion[]>([]);
 
   // --- Pin-this-moment (timeline (pin) → pinMoment IPC + clipboard) --------
   /** Transient confirmation after a successful pin, e.g. "Pinned 2:14 — …". */
@@ -2136,6 +2145,7 @@ export class DetailComponent implements OnInit {
     // Clear non-derived per-meeting state for a clean same-route reload.
     this.timeline.set(null);
     this.timelineError.set(false);
+    this.speakerSuggestions.set([]);
     this.tags.set([]);
     this.graph.set(null);
     this.graphError.set("");
@@ -2288,6 +2298,27 @@ export class DetailComponent implements OnInit {
     } finally {
       this.timelineLoading.set(false);
     }
+    // Voiceprint speaker suggestions (opt-in) — best-effort, never blocks the
+    // timeline. Empty when the feature is off / meeting locked / nothing matched.
+    void this.loadSpeakerSuggestions();
+  }
+
+  /**
+   * Load the opt-in voiceprint speaker suggestions for the current meeting into
+   * `speakerSuggestions`. Best-effort: any failure (feature off, no models,
+   * locked) just leaves the chips absent — never a crash, never blocks the view.
+   */
+  private async loadSpeakerSuggestions(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id) {
+      this.speakerSuggestions.set([]);
+      return;
+    }
+    try {
+      this.speakerSuggestions.set(await this.ipc.suggestSpeakerLabels(id));
+    } catch {
+      this.speakerSuggestions.set([]);
+    }
   }
 
   /**
@@ -2348,6 +2379,10 @@ export class DetailComponent implements OnInit {
       this.timeline.set(
         await this.ipc.renameSpeaker(id, change.oldLabel, change.newLabel),
       );
+      // The relabel enrols this cluster's voiceprint (opt-in) and clears its
+      // suggestion — re-fetch so the accepted chip drops and any newly-resolvable
+      // cluster surfaces. Best-effort; a failure just leaves the chips as they were.
+      void this.loadSpeakerSuggestions();
     } catch {
       // Keep the existing timeline; the relabel simply didn't take.
     }

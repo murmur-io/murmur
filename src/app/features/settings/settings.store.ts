@@ -16,6 +16,7 @@ import type {
   InputDeviceInfo,
   ProviderStatus,
   ReindexResult,
+  VoiceprintInfo,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
@@ -123,6 +124,8 @@ export class SettingsStore {
     vadEnabled: true,
     keepHiresMasters: false,
     diarizeOthers: false,
+    // Speaker voiceprints — cross-meeting on-device re-identification. Opt-in, default off.
+    voiceprintEnabled: false,
     aecEnabled: false,
     postAecEnabled: true,
     modelSize: "large-v3",
@@ -174,6 +177,17 @@ export class SettingsStore {
   /** Available mic input devices for the picker (loaded best-effort in load()). */
   private readonly _inputDevices = signal<InputDeviceInfo[]>([]);
   readonly inputDevices = this._inputDevices.asReadonly();
+  /**
+   * Stored speaker voiceprints for the management list (opt-in voice biometrics).
+   * GATED backend — a sealed-not-unlocked meeting's row is excluded. Populated
+   * best-effort in load(); refreshed after a forget/clear. NEVER carries the raw
+   * embedding (only label + provenance + dim).
+   */
+  private readonly _voiceprints = signal<VoiceprintInfo[]>([]);
+  readonly voiceprints = this._voiceprints.asReadonly();
+  /** True while a voiceprint forget/clear IPC call is in flight (debounces clicks). */
+  private readonly _voiceprintBusy = signal(false);
+  readonly voiceprintBusy = this._voiceprintBusy.asReadonly();
   private readonly _hasKey = signal(false);
   readonly hasKey = this._hasKey.asReadonly();
   private readonly _saved = signal(false);
@@ -870,6 +884,7 @@ export class SettingsStore {
         vadEnabled: cfg.vadEnabled ?? true,
         keepHiresMasters: cfg.keepHiresMasters ?? false,
         diarizeOthers: cfg.diarizeOthers ?? false,
+        voiceprintEnabled: cfg.voiceprintEnabled ?? false,
         aecEnabled: cfg.aecEnabled ?? false,
         postAecEnabled: cfg.postAecEnabled ?? true,
         modelSize: cfg.modelSize ?? "large-v3",
@@ -927,6 +942,8 @@ export class SettingsStore {
       }
       this.updateDownloadHint();
       this._inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
+      // Speaker voiceprints — the gated management list (best-effort; failure leaves it empty).
+      this._voiceprints.set(await this.ipc.listVoiceprints().catch(() => []));
       this._hasKey.set(await this.ipc.hasAnthropicKey());
       this._hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
@@ -1191,6 +1208,7 @@ export class SettingsStore {
       vadEnabled: v.vadEnabled,
       keepHiresMasters: v.keepHiresMasters,
       diarizeOthers: v.diarizeOthers,
+      voiceprintEnabled: v.voiceprintEnabled,
       aecEnabled: v.aecEnabled,
       postAecEnabled: v.postAecEnabled,
       modelSize: v.modelSize,
@@ -1307,6 +1325,42 @@ export class SettingsStore {
       this._revokeError.set(String(e));
     } finally {
       this._revoking.set(false);
+    }
+  }
+
+  /** Re-fetch the gated voiceprint management list (after a forget/clear, or on demand). */
+  async refreshVoiceprints(): Promise<void> {
+    this._voiceprints.set(await this.ipc.listVoiceprints().catch(() => []));
+  }
+
+  /**
+   * FORGET one stored voiceprint (hard-delete a captured voice biometric), then
+   * re-fetch the gated list. Best-effort: a failure leaves the list unchanged.
+   */
+  async forgetVoiceprint(id: string): Promise<void> {
+    if (this._voiceprintBusy()) return;
+    this._voiceprintBusy.set(true);
+    try {
+      await this.ipc.forgetVoiceprint(id);
+      await this.refreshVoiceprints();
+    } catch {
+      // Leave the list as-is; the delete simply didn't take.
+    } finally {
+      this._voiceprintBusy.set(false);
+    }
+  }
+
+  /** CLEAR every stored voiceprint ("forget all captured voices"), then re-fetch the list. */
+  async clearVoiceprints(): Promise<void> {
+    if (this._voiceprintBusy()) return;
+    this._voiceprintBusy.set(true);
+    try {
+      await this.ipc.clearVoiceprints();
+      await this.refreshVoiceprints();
+    } catch {
+      // Leave the list as-is.
+    } finally {
+      this._voiceprintBusy.set(false);
     }
   }
 
