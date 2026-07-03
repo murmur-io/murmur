@@ -2,8 +2,16 @@
 //! out of any text BEFORE it leaves for an LLM provider, then de-tokenize the reply so the
 //! final note still reads with the real values. Wraps any provider at the make_provider seam.
 //!
-//! Honest scope: regex reliably catches emails / cards / phones. Personal NAMES need on-device
-//! NER (not in this stack) and are therefore NOT redacted here — surfaced in the Settings copy.
+//! Honest scope: regex reliably catches emails / cards / phones. Personal NAMES are additionally
+//! masked by the on-device NER name layer ([`NameRedactor`]) when the model is installed.
+//!
+//! Field coverage (the firewall's egress contract — kept in sync with the doc-comment on
+//! [`RedactingProvider::summarize_with_meta`]): EVERY `SummarizeRequest` field that reaches the
+//! inner provider is scrubbed there before egress — `transcript` / `related_context` / `user_notes`
+//! (regex + NER), `template` / `meta.title_hint` (regex), and `vault_titles` (FILTERED: any title
+//! the firewall would alter is dropped, since a masked wikilink target is useless). Only the
+//! non-PII format flags (`meta.date_iso`, `meta.language`, `meta.duration_s`) pass verbatim. A new
+//! string field is caught by `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -389,6 +397,21 @@ impl SummarizerProvider for RedactingProvider {
     }
 
     /// Redact inputs, call inner provider (capturing `CallMeta`), restore outputs, record egress.
+    ///
+    /// FIREWALL CONTRACT — every `SummarizeRequest` field that EGRESSES to the inner (cloud)
+    /// provider is scrubbed here before the `req.clone()` is forwarded. The classification:
+    /// - `transcript`, `related_context`, `user_notes` — full firewall: regex (email/card/phone)
+    ///   via the shared map + the NER name layer, tokens restored in the reply.
+    /// - `template` (rides the SYSTEM prompt) and `meta.title_hint` (rides `render_user_content`) —
+    ///   regex layer via the shared map, tokens restored in the reply (defense-in-depth; low-risk
+    ///   instruction/label strings).
+    /// - `vault_titles` (the `[[wikilink]]` target list embedded in `render_user_content`, incl.
+    ///   auto-created `[[Person Name]].md` pages) — FILTERED: any title the firewall would alter
+    ///   is DROPPED before egress (design B — see the inline rationale below).
+    /// - `meta.date_iso`, `meta.language`, `meta.duration_s` — deliberately UN-scrubbed non-PII
+    ///   format flags (an ISO date / language code / integer; scrubbing a date would false-positive
+    ///   as a PHONE and garble the note). Any NEW string field MUST be classified here and is
+    ///   caught by `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
     async fn summarize_with_meta(
         &self,
         req: &SummarizeRequest,
@@ -425,6 +448,54 @@ impl SummarizerProvider for RedactingProvider {
             name_pairs.extend(more);
             c2
         });
+        // DEFENSE-IN-DEPTH — the note-format `template` rides the prompt as the SYSTEM message
+        // (anthropic/gateway/claude_code providers) and `meta.title_hint` rides
+        // `render_user_content`; both previously egressed VERBATIM inside `req.clone()`. Scrub them
+        // through the SAME shared regex map so any email/card/phone is tokenized before egress and
+        // restored in the reply. (Regex layer only, per the firewall's honest-scope note — these are
+        // low-risk instruction/label strings, not meeting-body text.) The production case (a clean
+        // built-in template, `title_hint = None`) is byte-identical: `redact_into` leaves PII-free
+        // text untouched and adds no map entry.
+        let red_template = redact_into(&req.template, &mut map, &mut rev);
+        let red_title_hint = req
+            .meta
+            .title_hint
+            .as_ref()
+            .map(|h| redact_into(h, &mut map, &mut rev));
+
+        // VAULT-TITLE FIREWALL (design B — FILTER, not mask+restore). `vault_titles` is the list of
+        // EXISTING NOTE TITLES the model may [[wikilink]] to; it is embedded verbatim into
+        // `render_user_content` and so EGRESSES. It includes auto-created `[[Person Name]].md` pages,
+        // whose stems are raw personal names — the SAME side-channel class as the (already-closed)
+        // `user_notes` and speaker-tag leaks. We DROP any title the firewall would alter rather than
+        // mask+restore it, because:
+        //   - a title is only useful as a LINK TARGET, and a masked title (`Offer - ⟪NAME_1⟫`) is not
+        //     a target the user wants linked; and
+        //   - the name layer assigns `⟪NAME_n⟫` tokens PER `redact_names` call (see
+        //     `ner_deberta::apply_person_spans` — numbering restarts each call), so masking each
+        //     title in its own call would COLLIDE its tokens with the transcript's, and
+        //     `restore_names` could then resolve a wikilink to the WRONG person's page. Filtering
+        //     sidesteps that entirely and gives a hard guarantee: no title the firewall flags reaches
+        //     the provider.
+        // The predicate uses standalone `redact` + the active name layer purely as DETECTORS (their
+        // scrubbed output is discarded — no title tokens enter the shared restore map). A clean vault
+        // (no PII in any title) is byte-identical: every title survives the filter unchanged.
+        let red_titles: Vec<String> = req
+            .vault_titles
+            .iter()
+            .filter(|title| {
+                let title = title.as_str();
+                let (regex_scrubbed, _) = redact(title);
+                if regex_scrubbed.as_str() != title {
+                    return false; // an email/card/phone in the title → drop it
+                }
+                let (name_scrubbed, name_hits) = self.names.redact_names(title);
+                // a PERSON detected in the title → drop it (only fires when a NER model is present)
+                name_scrubbed.as_str() == title && name_hits.is_empty()
+            })
+            .cloned()
+            .collect();
+
         // Byte sizes of the REDACTED content (sizes, never the text itself).
         let user_bytes = red_transcript.len()
             + red_related.as_ref().map(|c| c.len()).unwrap_or(0)
@@ -433,6 +504,9 @@ impl SummarizerProvider for RedactingProvider {
         r.transcript = red_transcript;
         r.related_context = red_related;
         r.user_notes = red_notes;
+        r.template = red_template;
+        r.meta.title_hint = red_title_hint;
+        r.vault_titles = red_titles;
         let (out, meta) = self.inner.summarize_with_meta(&r).await?;
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
@@ -1239,6 +1313,183 @@ mod tests {
         assert!(
             notes.contains("about the deck"),
             "non-PII text must pass through: {notes}"
+        );
+    }
+
+    // ── VAULT-TITLES: the [[wikilink]] side-channel (design B — FILTER) ───────
+
+    /// Render exactly what a provider sends: the SYSTEM prompt (`req.template`) plus the USER
+    /// content (`render_user_content`, which embeds vault titles / title_hint / related / notes /
+    /// transcript). This is the faithful egress surface the firewall must keep PII-free.
+    fn rendered_egress(req: &SummarizeRequest) -> String {
+        format!(
+            "{}\n{}",
+            req.template,
+            crate::summarize::template::render_user_content(req)
+        )
+    }
+
+    /// VAULT-TITLE LEAK (regex layer). `vault_titles` egresses via `render_user_content`
+    /// ("EXISTING NOTE TITLES …"), so a regex-detectable PII value in a title — e.g. an
+    /// auto-created contact page whose stem carries an email — must NOT reach the inner provider.
+    ///
+    /// RED-before-GREEN: on the UNPATCHED code (`req.clone()` forwarded `vault_titles` verbatim)
+    /// this same body with the assertion flipped to `contains(...)` PASSED — the email leaked.
+    /// After the design-B filter it is ABSENT: the offending title is dropped, a clean title
+    /// survives as a valid link target.
+    #[test]
+    fn vault_title_with_regex_pii_is_filtered_before_egress() {
+        let mut req = sample_req("no PII in transcript");
+        req.vault_titles = vec![
+            "Offer - jane@doe.example".to_string(), // email in the title → must be dropped
+            "Q3 Roadmap".to_string(),               // clean title → must survive as a link target
+        ];
+        let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
+        let provider = RedactingProvider::new(inner.clone());
+        block_on(provider.summarize(&req)).unwrap();
+        let egressed = inner.0.lock().unwrap().clone().expect("inner was called");
+        let egress = rendered_egress(&egressed);
+        assert!(
+            !egress.contains("jane@doe.example"),
+            "email-bearing vault title must NOT egress: {egress}"
+        );
+        assert!(
+            !egressed.vault_titles.iter().any(|t| t == "Offer - jane@doe.example"),
+            "the PII title must be filtered out of the egressed list"
+        );
+        assert!(
+            egress.contains("Q3 Roadmap"),
+            "a clean title must still egress as a valid [[wikilink]] target: {egress}"
+        );
+    }
+
+    /// VAULT-TITLE NAME LEAK — the precise falsification of the Settings copy ("NAMES are
+    /// additionally masked before any redacted text leaves this Mac"). With the NER name layer
+    /// ACTIVE (the `FixtureNameRedactor` seam the other name-seam tests use), a personal NAME
+    /// sitting in a vault title (an auto-created `[[Person Name]].md` page) used to bypass the name
+    /// firewall entirely, because `summarize_with_meta` overwrote only transcript/related/notes and
+    /// forwarded `vault_titles` verbatim.
+    ///
+    /// RED-before-GREEN: on the UNPATCHED code this body with the assertion flipped to
+    /// `contains("Anna Kowalska")` PASSED even with the redactor active (proving the bypass). After
+    /// the design-B filter the flagged title is dropped, so the name is ABSENT; a clean title stays.
+    #[test]
+    fn vault_title_with_person_name_is_filtered_when_ner_active() {
+        let mut req = sample_req("no PII in transcript");
+        req.vault_titles = vec![
+            "Meeting with Anna Kowalska".to_string(), // person page the NER layer detects → dropped
+            "Roadmap".to_string(),                    // clean title → survives
+        ];
+        let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
+        let provider =
+            RedactingProvider::with_name_redactor(inner.clone(), Arc::new(FixtureNameRedactor));
+        block_on(provider.summarize(&req)).unwrap();
+        let egressed = inner.0.lock().unwrap().clone().expect("inner was called");
+        let egress = rendered_egress(&egressed);
+        assert!(
+            !egress.contains("Anna Kowalska"),
+            "a NAME in a vault title must NOT egress when the name layer is active: {egress}"
+        );
+        assert!(
+            egress.contains("Roadmap"),
+            "a clean title must still egress as a link target: {egress}"
+        );
+    }
+
+    /// DEFENSE-IN-DEPTH: a user-authored custom `template` (rides the SYSTEM prompt) and
+    /// `meta.title_hint` (rides `render_user_content`) previously carried any email/card/phone the
+    /// user typed straight past the firewall inside `req.clone()`. Both are now scrubbed through the
+    /// shared regex map before egress.
+    ///
+    /// RED-before-GREEN: on the UNPATCHED code the emails were PRESENT in the egressed content;
+    /// after the fix they are ABSENT while the non-PII instruction text still passes through.
+    #[test]
+    fn template_and_title_hint_are_scrubbed_before_egress() {
+        let mut req = sample_req("no PII in transcript");
+        req.template = "Custom recipe — ping ops@corp.example for context.".to_string();
+        req.meta.title_hint = Some("Sync re carl@corp.example".to_string());
+        let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
+        let provider = RedactingProvider::new(inner.clone());
+        block_on(provider.summarize(&req)).unwrap();
+        let egressed = inner.0.lock().unwrap().clone().expect("inner was called");
+        let egress = rendered_egress(&egressed);
+        assert!(
+            !egress.contains("ops@corp.example"),
+            "template email must not egress: {egress}"
+        );
+        assert!(
+            !egress.contains("carl@corp.example"),
+            "title_hint email must not egress: {egress}"
+        );
+        // Non-PII instruction text still passes through (the template stays usable).
+        assert!(
+            egressed.template.contains("Custom recipe"),
+            "template instruction text preserved"
+        );
+    }
+
+    /// ROOT-CAUSE / FUTURE-PROOFING. `RedactingProvider` scrubs an ALLOWLIST of fields — the exact
+    /// design that let `vault_titles` (and, before it, `user_notes`) slip through. This test places
+    /// a UNIQUE sentinel PII string in EVERY PII-bearing String / `Vec<String>` field of
+    /// `SummarizeRequest` and asserts none reaches the inner provider un-scrubbed. It enumerates the
+    /// whole struct via a literal (there is no `Default`), so a NEWLY-ADDED string field forces a
+    /// compile error here until it is explicitly classified — scrubbed (add a sentinel below) or
+    /// exempt (a documented non-PII format flag). That is the guard the allowlist bug needed.
+    #[test]
+    fn every_string_field_of_summarize_request_is_scrubbed_or_exempt() {
+        use crate::summarize::provider::MeetingMeta;
+        // Distinct email-shaped sentinels — deterministically caught by the regex layer (no model
+        // needed), so this test is stable in the headless loop.
+        let req = SummarizeRequest {
+            transcript: "s-transcript@leak.example".to_string(), // SCRUBBED (regex + NER)
+            meta: MeetingMeta {
+                // EXEMPT — non-PII format flags, deliberately forwarded verbatim. NOTE: an ISO date
+                // WOULD false-positive as a PHONE if it went through the firewall, so scrubbing it
+                // would garble the note's date — a concrete reason it must stay exempt.
+                date_iso: "2026-07-04".to_string(),
+                title_hint: Some("s-hint@leak.example".to_string()), // SCRUBBED (regex)
+                duration_s: 60,                                      // not a string
+                language: Some("pl".to_string()),                    // EXEMPT (enum-like flag)
+            },
+            template: "recipe s-template@leak.example".to_string(), // SCRUBBED (regex, system prompt)
+            vault_titles: vec![
+                "Offer - s-title@leak.example".to_string(), // SCRUBBED (design B filter → dropped)
+                "Clean Retained Title".to_string(),         // control: a clean title must survive
+            ],
+            related_context: Some("s-related@leak.example".to_string()), // SCRUBBED (regex + NER)
+            user_notes: Some("s-notes@leak.example".to_string()),        // SCRUBBED (regex + NER)
+        };
+        let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
+        let provider = RedactingProvider::new(inner.clone());
+        block_on(provider.summarize(&req)).unwrap();
+        let egressed = inner.0.lock().unwrap().clone().expect("inner was called");
+        let egress = rendered_egress(&egressed);
+        for sentinel in [
+            "s-transcript@leak.example",
+            "s-hint@leak.example",
+            "s-template@leak.example",
+            "s-title@leak.example",
+            "s-related@leak.example",
+            "s-notes@leak.example",
+        ] {
+            assert!(
+                !egress.contains(sentinel),
+                "PII sentinel {sentinel} leaked to the inner provider: {egress}"
+            );
+        }
+        // The two DELIBERATE exemptions still pass verbatim (non-PII format flags the note needs).
+        assert!(
+            egress.contains("2026-07-04"),
+            "date_iso is a non-PII format flag, forwarded verbatim"
+        );
+        assert!(
+            egress.contains("- language: pl"),
+            "language is a non-PII enum-like flag, forwarded verbatim"
+        );
+        // A clean vault title must NOT be over-filtered.
+        assert!(
+            egress.contains("Clean Retained Title"),
+            "clean titles must survive the filter as valid link targets"
         );
     }
 }
