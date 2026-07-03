@@ -1,4 +1,6 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
+import { ReactiveFormsModule } from "@angular/forms";
+import { RouterLink } from "@angular/router";
 import { SettingsStore } from "../settings.store";
 
 /**
@@ -10,9 +12,10 @@ import { SettingsStore } from "../settings.store";
   selector: "app-settings-privacy-section",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [ReactiveFormsModule, RouterLink],
   template: `
     <div class="section-stack">
-              <div class="card privacy-card">
+              <div class="card privacy-card" [formGroup]="form">
                 <div class="privacy-head">
                   <span class="privacy-mark" aria-hidden="true">
                     <svg
@@ -163,6 +166,28 @@ import { SettingsStore } from "../settings.store";
                   @if (consentError(); as cerr) {
                     <p class="text-danger privacy-note">{{ cerr }}</p>
                   }
+                </div>
+
+                <!-- (1c) Cross-meeting user memory -->
+                <div class="privacy-section">
+                  <span class="privacy-section-label text-muted"
+                    >Cross-meeting memory</span
+                  >
+                  <label class="toggle-row">
+                    <span class="toggle-copy">
+                      <span class="toggle-title">Remember facts about you</span>
+                      <span class="text-secondary toggle-sub">
+                        The brain remembers durable facts about you across
+                        meetings — how you like to work, what you own, your
+                        commitments — so it can answer with context. Everything
+                        is stored locally on this Mac, gated behind your locked
+                        folders, and forgettable: review or clear it any time on
+                        the <a routerLink="/brain">Brain page</a>. Turn this off
+                        to stop learning and inject nothing.
+                      </span>
+                    </span>
+                    <input type="checkbox" formControlName="userMemoryEnabled" />
+                  </label>
                 </div>
 
                 <!-- (2) Locked folders (honest encryption boundary) -->
@@ -335,6 +360,29 @@ import { SettingsStore } from "../settings.store";
         letter-spacing: -0.01em;
       }
 
+      /* Cross-meeting-memory toggle (mirrors the AI-section toggle rows). */
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-4);
+        cursor: pointer;
+      }
+      .toggle-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .toggle-title {
+        color: var(--text-primary);
+        font-size: 0.95rem;
+        font-weight: 550;
+      }
+      .toggle-sub {
+        font-size: 0.85rem;
+        line-height: 1.55;
+      }
+
       /* Cloud-processing consent — button + reassurance, or the granted pill. */
       .cloud-consent-row {
         display: flex;
@@ -475,6 +523,9 @@ import { SettingsStore } from "../settings.store";
 })
 export class SettingsPrivacySectionComponent {
   private readonly store = inject(SettingsStore);
+
+  /** The shared settings form — the `userMemoryEnabled` toggle round-trips here. */
+  readonly form = this.store.form;
 
   readonly cloudConsented = this.store.cloudConsented;
   readonly consenting = this.store.consenting;

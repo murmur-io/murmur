@@ -26,7 +26,14 @@ const SIDEBAR_KEY = "murmur-sidebar-collapsed";
 interface NavItem {
   readonly path: string;
   readonly label: string;
-  readonly icon: "record" | "meetings" | "analytics" | "graph" | "brain" | "ask";
+  readonly icon:
+    | "record"
+    | "meetings"
+    | "analytics"
+    | "graph"
+    | "people"
+    | "brain"
+    | "ask";
 }
 
 /**
@@ -116,6 +123,13 @@ interface NavItem {
                     <circle cx="15" cy="7.5" r="2.1" stroke="currentColor" stroke-width="1.4" />
                     <circle cx="9" cy="15" r="2.1" stroke="currentColor" stroke-width="1.4" />
                     <path d="M6.7 7.3l5.2 6.2M6.9 6.6l6-.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                  </svg>
+                }
+                @case ("people") {
+                  <svg viewBox="0 0 20 20" fill="none">
+                    <circle cx="7.3" cy="7.5" r="2.6" stroke="currentColor" stroke-width="1.4" />
+                    <path d="M2.8 15.5c.4-2.4 2.3-3.9 4.5-3.9s4.1 1.5 4.5 3.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                    <path d="M13 5.2a2.3 2.3 0 0 1 0 4.4M14.4 11.9c1.6.4 2.7 1.7 3 3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
                   </svg>
                 }
                 @case ("brain") {
@@ -304,6 +318,7 @@ export class AppShellComponent {
     { path: "/library", label: "Meetings", icon: "meetings" },
     { path: "/analytics", label: "Analytics", icon: "analytics" },
     { path: "/graph", label: "Graph", icon: "graph" },
+    { path: "/people", label: "People", icon: "people" },
     { path: "/brain", label: "Brain", icon: "brain" },
     { path: "/ask", label: "Ask", icon: "ask" },
   ];
