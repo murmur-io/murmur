@@ -293,7 +293,7 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
                   class="btn btn-primary btn-sm"
                   (click)="downloadEmbedModel()"
                 >
-                  Download embedding model (~120 MB)
+                  Download embedding model (~470 MB)
                 </button>
                 <span class="text-muted semantic-note">
                   One time, on-device — required before semantic search can
