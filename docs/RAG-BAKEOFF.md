@@ -140,13 +140,13 @@ hybrid          0.7778     0.7213     0.7917
 - **MRR** — how high was the *first* correct hit.
 Higher is better on all three (0–1). If **hybrid** beats **fts** on your PL + paraphrase queries, the vector layer earns its keep; if **fts ≈ hybrid**, it doesn't at your scale. Compare **semantic** vs **hybrid** to see whether fusion helps or the raw vectors are enough.
 
-### 4. Comparing embedding MODELS (e5 vs mmlw-e5-small)
+### 4. Comparing embedding MODELS (e5 vs mmlw-retrieval-e5-small)
 Two embedders ship as first-class selectable options (both BERT / 384-dim, so switching needs **no** DB migration — only a re-index):
 - `multilingual-e5-small` (default, intfloat) — general multilingual.
-- `mmlw-e5-small` (sdadas) — a **Polish-first** distilled e5, strong PL-MTEB retrieval.
+- `mmlw-retrieval-e5-small` (sdadas) — a **Polish-first RETRIEVAL-tuned** e5 (distilled on 60M PL-EN pairs then contrastive fine-tuned on Polish MS MARCO); beats the plain distilled `mmlw-e5-small` on PIRB nDCG@10 (52.34 vs 47.64).
 
 To bake them off against each other on your Polish queries:
-1. In the app, pick the model (or call the `select_embed_model` command with `"multilingual-e5-small"` / `"mmlw-e5-small"`) → download it (`download_embed_model`) → **re-index** (`reindex_embeddings`, required because a different model's vectors aren't comparable).
+1. In the app, pick the model (or call the `select_embed_model` command with `"multilingual-e5-small"` / `"mmlw-retrieval-e5-small"`) → download it (`download_embed_model`) → **re-index** (`reindex_embeddings`, required because a different model's vectors aren't comparable).
 2. Copy the DB and run the harness above → record the table.
 3. Switch the model, re-index, re-run → compare the `semantic`/`hybrid` rows. The model with the higher PL recall@k / nDCG@k wins for your vault.
 

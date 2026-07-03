@@ -4553,7 +4553,7 @@ pub fn embed_model_present() -> Result<bool, AppError> {
     Ok(crate::embed::embed_model_present())
 }
 
-/// The bundled selectable embedders (multilingual-e5-small default + mmlw-e5-small), each with
+/// The bundled selectable embedders (multilingual-e5-small default + mmlw-retrieval-e5-small), each with
 /// `downloaded` (files present in its own subdir) and `selected` (mirrors the persisted
 /// `embed_model_id`). Feeds the embedder picker. No content read / no egress — static metadata +
 /// on-disk existence only.
@@ -8728,16 +8728,16 @@ mod lifecycle_tests {
         assert!(!res.reindex_needed, "re-selecting the default must not force a re-index");
 
         // Switching to mmlw CHANGES the resolved model ⇒ re-index needed; persists + reloads.
-        let res = select_embed_model_inner(&state, "mmlw-e5-small".to_string()).unwrap();
-        assert_eq!(res.selected, "mmlw-e5-small");
+        let res = select_embed_model_inner(&state, "mmlw-retrieval-e5-small".to_string()).unwrap();
+        assert_eq!(res.selected, "mmlw-retrieval-e5-small");
         assert!(res.reindex_needed, "changing the embed model must flag a re-index");
         assert_eq!(
             state.config.lock().unwrap().embed_model_id.as_deref(),
-            Some("mmlw-e5-small")
+            Some("mmlw-retrieval-e5-small")
         );
         assert_eq!(
             AppConfig::load(&state.db).unwrap().embed_model_id.as_deref(),
-            Some("mmlw-e5-small")
+            Some("mmlw-retrieval-e5-small")
         );
 
         // Unknown id ⇒ InvalidArg, selection unchanged.
@@ -8745,7 +8745,7 @@ mod lifecycle_tests {
         assert!(matches!(err, AppError::InvalidArg(_)));
         assert_eq!(
             state.config.lock().unwrap().embed_model_id.as_deref(),
-            Some("mmlw-e5-small")
+            Some("mmlw-retrieval-e5-small")
         );
 
         // Restore the default so the shared process-global doesn't leak mmlw into other tests.
