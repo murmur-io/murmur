@@ -1790,7 +1790,7 @@ export class OnboardingComponent implements OnInit {
       diarizeOthers: base?.diarizeOthers ?? false,
       voiceprintEnabled: base?.voiceprintEnabled ?? false,
       aecEnabled: base?.aecEnabled ?? false,
-      postAecEnabled: base?.postAecEnabled ?? true,
+      postAecEnabled: base?.postAecEnabled ?? false,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
