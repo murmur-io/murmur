@@ -1791,6 +1791,10 @@ export class OnboardingComponent implements OnInit {
       voiceprintEnabled: base?.voiceprintEnabled ?? false,
       aecEnabled: base?.aecEnabled ?? false,
       postAecEnabled: base?.postAecEnabled ?? false,
+      // Recording-storage cap + opt-in auto-prune — preserve-only here (the Settings
+      // Storage section owns them); round-trip the snapshot, defaults = no cap / off.
+      audioStorageLimitGb: base?.audioStorageLimitGb ?? null,
+      audioAutoPrune: base?.audioAutoPrune ?? false,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),

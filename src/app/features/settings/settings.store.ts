@@ -16,6 +16,7 @@ import type {
   InputDeviceInfo,
   ProviderStatus,
   ReindexResult,
+  StorageReport,
   VoiceprintInfo,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -128,6 +129,9 @@ export class SettingsStore {
     voiceprintEnabled: false,
     aecEnabled: false,
     postAecEnabled: true,
+    // Recording-storage cap (GB, string for an empty = "no cap") + opt-in auto-prune.
+    audioStorageLimitGb: "",
+    audioAutoPrune: false,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -188,6 +192,42 @@ export class SettingsStore {
   /** True while a voiceprint forget/clear IPC call is in flight (debounces clicks). */
   private readonly _voiceprintBusy = signal(false);
   readonly voiceprintBusy = this._voiceprintBusy.asReadonly();
+
+  // ── Recording storage — usage report + manual free-up (opt-in cap) ──────
+
+  /** Live disk-usage report for the recordings dir (best-effort; null before first load). */
+  private readonly _storageReport = signal<StorageReport | null>(null);
+  readonly storageReport = this._storageReport.asReadonly();
+  /** True while a manual "Free up space" prune is in flight (debounces the button). */
+  private readonly _storageBusy = signal(false);
+  readonly storageBusy = this._storageBusy.asReadonly();
+  /** Bytes freed by the last manual "Free up space" (for a confirmation line). */
+  private readonly _lastFreed = signal<number | null>(null);
+  readonly lastFreed = this._lastFreed.asReadonly();
+
+  /** Refresh the recording-storage usage report (best-effort; a failure leaves it null). */
+  async loadStorageReport(): Promise<void> {
+    this._storageReport.set(await this.ipc.getStorageReport().catch(() => null));
+  }
+
+  /** Manual prune to the cap NOW (no-op with no cap set), then refresh the report. */
+  async freeUpSpace(): Promise<void> {
+    this._storageBusy.set(true);
+    this._lastFreed.set(null);
+    try {
+      const s = await this.ipc.freeUpSpace();
+      this._lastFreed.set(s.freedBytes);
+      await this.loadStorageReport();
+    } finally {
+      this._storageBusy.set(false);
+    }
+  }
+
+  /** Reveal the recordings folder in Finder (best-effort; fire-and-forget). */
+  revealAudioDir(): void {
+    void this.ipc.revealAudioDir();
+  }
+
   private readonly _hasKey = signal(false);
   readonly hasKey = this._hasKey.asReadonly();
   private readonly _saved = signal(false);
@@ -887,6 +927,9 @@ export class SettingsStore {
         voiceprintEnabled: cfg.voiceprintEnabled ?? false,
         aecEnabled: cfg.aecEnabled ?? false,
         postAecEnabled: cfg.postAecEnabled ?? true,
+        audioStorageLimitGb:
+          cfg.audioStorageLimitGb != null ? String(cfg.audioStorageLimitGb) : "",
+        audioAutoPrune: cfg.audioAutoPrune ?? false,
         modelSize: cfg.modelSize ?? "large-v3",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
@@ -966,6 +1009,8 @@ export class SettingsStore {
       );
       // About section — product identity (best-effort; null leaves a "loading" line).
       this._appInfo.set(await this.ipc.appInfo().catch(() => null));
+      // Recording-storage usage report (best-effort; drives the Storage section + Library bar).
+      await this.loadStorageReport();
     } catch (e) {
       this._loadError.set(String(e));
     }
@@ -1211,6 +1256,12 @@ export class SettingsStore {
       voiceprintEnabled: v.voiceprintEnabled,
       aecEnabled: v.aecEnabled,
       postAecEnabled: v.postAecEnabled,
+      // Recording-storage cap: the form control is a STRING → a positive number, or
+      // null when blank (= no cap). Opt-in auto-prune rides every save like the other flags.
+      audioStorageLimitGb: v.audioStorageLimitGb.trim()
+        ? Number(v.audioStorageLimitGb)
+        : null,
+      audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
@@ -1264,6 +1315,8 @@ export class SettingsStore {
     try {
       await this.ipc.saveConfig(cfg);
       this._saved.set(true);
+      // A save may have triggered an auto-prune (limit lowered) — refresh the usage report.
+      await this.loadStorageReport();
     } catch (e) {
       this._loadError.set("Save failed: " + String(e));
     }
