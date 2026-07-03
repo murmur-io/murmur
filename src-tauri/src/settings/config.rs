@@ -98,7 +98,23 @@ pub struct AppConfig {
     /// Preferred microphone input device by NAME (cpal exposes no stable id). None = system
     /// default. A saved device that is no longer present falls back to default at capture time.
     pub input_device: Option<String>,
-    /// Capture system audio (the other side of the call) via ScreenCaptureKit. Default off.
+    /// Capture system audio (the other side of the call) via the Core Audio process tap (macOS
+    /// 14.4+) or the ScreenCaptureKit sidecar (13–14.3). Default ON (WS8) — a fresh user's first
+    /// Zoom/Meet/Teams call captures BOTH sides, which is the differentiated edge and the
+    /// diarization/voiceprint keystone. SAFE to default on because capture degrades GRACEFULLY to
+    /// mic-only, crash-free, whenever it can't run: no helper bundled/available
+    /// (`audio::system::is_available` false ⇒ never attempted), a spawn failure (the start call's
+    /// `Err` arm logs + records mic-only), or Screen-Recording (TCC) permission denied — the
+    /// fresh-install state — where the helper exits non-zero and `SystemAudioRecorder::stop` returns
+    /// `Ok(None)`, so the pipeline runs the mic-only single pass (everything attributed `me`). It
+    /// NEVER panics/aborts/fails the recording. The settings-table load treats an absent key as this
+    /// new default (`K_CAPTURE_SYSTEM_AUDIO`), so BOTH fresh and existing key-less installs pick it
+    /// up; an explicit stored opt-out (`false`) is still honored across reload.
+    ///
+    /// NOT verifiable headless — SIGNED-MAC ONLY (per the honesty bar): the real macOS
+    /// Screen-Recording TCC prompt appearing, that a grant-then-restart actually lights up SCK/tap
+    /// capture, genuine dual-stream both-sides capture, and whether capture survives Bluetooth
+    /// headphones — all FFI/permission/live-audio, unprovable by `cargo test`.
     pub capture_system_audio: bool,
     /// Voice-activity-detection pre-segmentation + ASR-feed loudness normalisation for the
     /// Accurate batch transcription. Default ON; off = transcribe the whole buffer (legacy).
@@ -358,7 +374,7 @@ impl Default for AppConfig {
             ollama_model: "llama3.1".to_string(),
             claude_binary: "claude".to_string(),
             input_device: None,
-            capture_system_audio: false,
+            capture_system_audio: true,
             vad_enabled: true,
             keep_hires_masters: false,
             diarize_others: false,
@@ -878,6 +894,30 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().post_aec_enabled);
+    }
+
+    /// WS8 — system-audio capture defaults ON so a fresh user's first Zoom/Meet/Teams call captures
+    /// BOTH sides (the differentiated edge + the diarization/voiceprint keystone). Default-on is safe
+    /// because capture degrades GRACEFULLY to mic-only when Screen-Recording (TCC) permission is
+    /// absent or no helper is bundled — never panics/aborts/fails the recording (see the field doc +
+    /// `audio::system` spawn/stop + `audio::merge::merge_streams` single-stream passthrough). Assert
+    /// the in-memory struct default AND the settings-table load (empty DB / absent key) resolve to
+    /// `true`, and that an explicit opt-out still persists + reloads OFF (not a one-way latch — the
+    /// existing user who deliberately turned it off stays off). RED on the pre-flip default (`false`).
+    #[test]
+    fn capture_system_audio_defaults_on() {
+        // In-memory struct default.
+        assert!(AppConfig::default().capture_system_audio);
+        // Settings-table path: empty DB (no key written) loads the ON default.
+        let db = temp_db();
+        assert!(AppConfig::load(&db).unwrap().capture_system_audio);
+        // But an explicit opt-out still persists + reloads OFF.
+        let cfg = AppConfig {
+            capture_system_audio: false,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(!AppConfig::load(&db).unwrap().capture_system_audio);
     }
 
     /// A2 — the app default whisper model is `small` (RAM-safe; `large-v3` is ~3 GB and swaps on
