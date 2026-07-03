@@ -75,8 +75,8 @@ pub trait Embedder {
 /// prefers symmetric encoding is validated @Mac, not by `cargo test`.
 ///
 /// NOTE: this is the DEFAULT (multilingual-e5-small) passage prefix; a selected [`EmbedModel`]
-/// carries its own — resolved via [`selected_embed_model`]. `mmlw-e5-small` happens to share the
-/// same `"query: "`/`"passage: "` convention (verified against its HF card), so the effective prefix
+/// carries its own — resolved via [`selected_embed_model`]. `mmlw-retrieval-e5-small` happens to share
+/// the same `"query: "`/`"passage: "` convention (verified against its HF card), so the effective prefix
 /// is identical for both bundled options.
 pub const PASSAGE_PREFIX: &str = "passage: ";
 
@@ -129,10 +129,13 @@ pub struct EmbedModel {
 ///
 /// - `multilingual-e5-small` (intfloat) — the DEFAULT; the historical values, so a fresh/unset
 ///   config behaves BYTE-IDENTICALLY to before this registry existed.
-/// - `mmlw-e5-small` (sdadas) — a Polish-first distilled e5 (BERT, hidden_size 384, XLM-R tokenizer),
-///   initialized from the multilingual-e5-small checkpoint. Its HF card documents the SAME
-///   `"query: "`/`"passage: "` asymmetric prefix convention as e5. Strong PL-MTEB retrieval scores;
-///   the real recall win is a Mac-eval (the `eval::bakeoff` harness), not a `cargo test` claim.
+/// - `mmlw-retrieval-e5-small` (sdadas) — a Polish-first RETRIEVAL-tuned e5 (BERT, hidden_size 384,
+///   XLM-R tokenizer): initialized from multilingual-e5-small, knowledge-distilled on 60M PL-EN pairs,
+///   THEN contrastive-fine-tuned on Polish MS MARCO. Beats the plain distilled `mmlw-e5-small` on the
+///   Polish IR Benchmark (PIRB nDCG@10 52.34 vs 47.64 — the retrieval-specific, apples-to-apples number;
+///   the "67.5" figure was a DIFFERENT benchmark, PL-MTEB avg-by-task-type for the 768-dim roberta-base).
+///   Uses e5's own `"query: "`/`"passage: "` prefixes. The real recall win is a Mac-eval (the
+///   `eval::bakeoff` harness), not a `cargo test` claim.
 pub static EMBED_MODELS: &[EmbedModel] = &[
     EmbedModel {
         id: DEFAULT_EMBED_MODEL_ID,
@@ -143,11 +146,12 @@ pub static EMBED_MODELS: &[EmbedModel] = &[
         passage_prefix: PASSAGE_PREFIX,
     },
     EmbedModel {
-        id: "mmlw-e5-small",
-        name: "MMLW E5 Small (Polish-first)",
-        subdir: "embed-mmlw-e5-small",
-        hf_base: "https://huggingface.co/sdadas/mmlw-e5-small/resolve/main",
-        // mmlw's HF card: "queries should be prefixed with \"query: \" and passages with \"passage: \"".
+        id: "mmlw-retrieval-e5-small",
+        name: "MMLW Retrieval E5 Small (Polish-first)",
+        subdir: "embed-mmlw-retrieval-e5-small",
+        hf_base: "https://huggingface.co/sdadas/mmlw-retrieval-e5-small/resolve/main",
+        // mmlw-retrieval-e5's HF card uses e5's OWN asymmetric prefixes (query_prefix="query: ",
+        // answer_prefix="passage: "); the Polish "zapytanie: " prefix is the ROBERTA family's, not this one.
         query_prefix: "query: ",
         passage_prefix: "passage: ",
     },
@@ -439,7 +443,7 @@ pub fn fuse_doc_hits(
 /// when the server omits `Content-Length`). A file already present on disk is SKIPPED. INBOUND ONLY:
 /// fetches model files and sends NO request body / NO meeting content (no egress). NO PII logged —
 /// filenames + byte counts only. The HF base + destination subdir come from [`selected_embed_model`],
-/// so `mmlw-e5-small` is fetched from its own repo into its own dir.
+/// so `mmlw-retrieval-e5-small` is fetched from its own repo into its own dir.
 pub async fn download_embed_model<F>(mut on_progress: F) -> Result<PathBuf>
 where
     F: FnMut(usize, u64, Option<u64>),
@@ -622,10 +626,11 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), EMBED_MODELS.len(), "embed model ids must be unique");
         // mmlw is a first-class selectable option with the documented e5-compatible prefixes.
-        let mmlw = embed_model_by_id("mmlw-e5-small").expect("mmlw-e5-small must be registered");
+        let mmlw = embed_model_by_id("mmlw-retrieval-e5-small")
+            .expect("mmlw-retrieval-e5-small must be registered");
         assert_eq!(mmlw.query_prefix, "query: ");
         assert_eq!(mmlw.passage_prefix, "passage: ");
-        assert!(mmlw.hf_base.contains("sdadas/mmlw-e5-small"));
+        assert!(mmlw.hf_base.contains("sdadas/mmlw-retrieval-e5-small"));
         assert_ne!(mmlw.subdir, EMBED_MODEL_SUBDIR, "each model needs its own subdir");
         // The default carries the historical values verbatim (byte-identical default behavior).
         let def = default_embed_model();
@@ -641,9 +646,9 @@ mod tests {
     #[test]
     fn selected_embed_model_resolves_and_falls_back() {
         let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_selected_embed_model_id(Some("mmlw-e5-small".to_string()));
-        assert_eq!(selected_embed_model().id, "mmlw-e5-small");
-        assert!(embed_model_dir().unwrap().ends_with("embed-mmlw-e5-small"));
+        set_selected_embed_model_id(Some("mmlw-retrieval-e5-small".to_string()));
+        assert_eq!(selected_embed_model().id, "mmlw-retrieval-e5-small");
+        assert!(embed_model_dir().unwrap().ends_with("embed-mmlw-retrieval-e5-small"));
 
         // Unknown id ⇒ default. Empty ⇒ default. None ⇒ default.
         set_selected_embed_model_id(Some("does-not-exist".to_string()));
@@ -663,9 +668,9 @@ mod tests {
         let selected: Vec<&str> = dtos.iter().filter(|d| d.selected).map(|d| d.id.as_str()).collect();
         assert_eq!(selected, vec![DEFAULT_EMBED_MODEL_ID], "None ⇒ default is selected");
 
-        let dtos = embed_model_dtos(Some("mmlw-e5-small"));
+        let dtos = embed_model_dtos(Some("mmlw-retrieval-e5-small"));
         let selected: Vec<&str> = dtos.iter().filter(|d| d.selected).map(|d| d.id.as_str()).collect();
-        assert_eq!(selected, vec!["mmlw-e5-small"]);
+        assert_eq!(selected, vec!["mmlw-retrieval-e5-small"]);
 
         // Unknown id ⇒ the default is marked selected (never zero-selected).
         let dtos = embed_model_dtos(Some("bogus"));
