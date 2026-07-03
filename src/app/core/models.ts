@@ -80,6 +80,15 @@ export interface AppConfigDto {
   vadEnabled: boolean;
   keepHiresMasters: boolean;
   diarizeOthers: boolean;
+  /**
+   * Speaker voiceprints — recognise the SAME diarized speaker across meetings,
+   * fully on-device. OPT-IN, default false: captures a voice fingerprint of remote
+   * participants (never egressed, but a biometric nonetheless). Settable and
+   * round-tripped on every `save_config` like `diarizeOthers`; an omitted key
+   * serde-defaults to false in the backend, so the FE MUST always send it or a
+   * normal save silently disables it. Mirrors Rust `AppConfigDto.voiceprint_enabled`.
+   */
+  voiceprintEnabled: boolean;
   aecEnabled: boolean;
   postAecEnabled: boolean;
   modelSize: string;
@@ -666,6 +675,46 @@ export interface TopicSpan {
 export interface MeetingTimeline {
   speakers: SpeakerTurn[];
   topics: TopicSpan[];
+}
+
+/**
+ * Speaker voiceprints (opt-in, on-device re-identification). Mirrors the Rust
+ * `SpeakerSuggestion` (serde camelCase). One suggested person name for a diarized
+ * `others-{n}` cluster of the CURRENT meeting, produced by cosine matching against
+ * prior LABELED voiceprints — surfaced by `suggestSpeakerLabels`. Accepting it is a
+ * one-tap `renameSpeaker(speaker → suggestedLabel)` (which also enrolls the cluster).
+ *
+ * HONESTY: re-identification ACCURACY (cross-mic / cross-meeting) is UNVERIFIED —
+ * only the backend match threshold decides what surfaces here; a suggestion is a
+ * best-effort guess, never a certain identity.
+ */
+export interface SpeakerSuggestion {
+  /** The timeline label being suggested FOR (e.g. `"others-1"`). */
+  speaker: string;
+  /** The suggested person name (the label the accept-tap renames to). */
+  suggestedLabel: string;
+  /** Cosine match score, 0..=1 — a "how confident" affordance. */
+  score: number;
+}
+
+/**
+ * One stored voiceprint for the Settings management list. Mirrors the Rust
+ * `VoiceprintInfo` (serde camelCase). NEVER carries the raw embedding — only the
+ * label + provenance + dimension needed to list/forget. Read ONLY through the
+ * GATED `listVoiceprints` command: a sealed-and-not-session-unlocked meeting's
+ * voiceprint is EXCLUDED (never listed, never a match candidate).
+ */
+export interface VoiceprintInfo {
+  id: string;
+  /** Source meeting the voice fingerprint was captured in. */
+  meetingId: string;
+  /** The diarized cluster index within its source meeting (the `others-{n}` suffix). */
+  clusterIndex: number;
+  /** The bound person name once the cluster is enrolled by rename (null until then). */
+  label: string | null;
+  /** Embedding dimensionality (a harmless count; NOT the embedding itself). */
+  dim: number;
+  createdAt: string;
 }
 
 export interface SearchHit {

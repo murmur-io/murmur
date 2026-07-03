@@ -61,6 +61,36 @@ pub struct ProviderStatus {
     pub reason: Option<String>,
 }
 
+/// One stored voiceprint surfaced to a management view (opt-in voice biometrics). NEVER carries the
+/// raw embedding — only the label + provenance + dimension the FE needs to list/forget. Read ONLY
+/// through the gated `list_voiceprints` command (a sealed meeting's row never reaches here).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceprintInfo {
+    pub id: String,
+    pub meeting_id: String,
+    /// The diarized cluster index within its source meeting (the `others-{n}` suffix).
+    pub cluster_index: i64,
+    /// The bound person name once the cluster is enrolled by rename (None until then).
+    pub label: Option<String>,
+    /// Embedding dimensionality (a harmless count; NOT the embedding itself).
+    pub dim: i64,
+    pub created_at: String,
+}
+
+/// A suggested label for a diarized cluster of the current meeting, from cosine re-identification
+/// against the GATED set of labeled prior voiceprints. The FE offers it as a one-tap rename.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerSuggestion {
+    /// The timeline label being suggested for (e.g. `others-1`).
+    pub speaker: String,
+    /// The suggested person name.
+    pub suggested_label: String,
+    /// The cosine score of the match (0..=1), for a "how confident" affordance.
+    pub score: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfigDto {
@@ -92,6 +122,8 @@ pub struct AppConfigDto {
     pub keep_hires_masters: bool,
     #[serde(default)]
     pub diarize_others: bool,
+    #[serde(default)]
+    pub voiceprint_enabled: bool,
     #[serde(default)]
     pub aec_enabled: bool,
     #[serde(default = "default_true")]
@@ -3338,6 +3370,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         vad_enabled: c.vad_enabled,
         keep_hires_masters: c.keep_hires_masters,
         diarize_others: c.diarize_others,
+        voiceprint_enabled: c.voiceprint_enabled,
         aec_enabled: c.aec_enabled,
         post_aec_enabled: c.post_aec_enabled,
         model_size: c.model_size.clone(),
@@ -3404,6 +3437,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         vad_enabled: d.vad_enabled,
         keep_hires_masters: d.keep_hires_masters,
         diarize_others: d.diarize_others,
+        voiceprint_enabled: d.voiceprint_enabled,
         aec_enabled: d.aec_enabled,
         post_aec_enabled: d.post_aec_enabled,
         model_size: if d.model_size.trim().is_empty() {
@@ -3958,21 +3992,31 @@ pub fn rename_speaker(
     old_label: String,
     new_label: String,
 ) -> Result<MeetingTimeline, AppError> {
-    let new_label = new_label.trim();
+    rename_speaker_inner(state.inner(), &meeting_id, &old_label, new_label.trim())
+}
+
+/// Inner of [`rename_speaker`] taking `&AppState` (unit-testable gate + enroll). `new_label` is
+/// already trimmed by the command wrapper.
+pub(crate) fn rename_speaker_inner(
+    state: &AppState,
+    meeting_id: &str,
+    old_label: &str,
+    new_label: &str,
+) -> Result<MeetingTimeline, AppError> {
     if new_label.is_empty() {
         return Err(AppError::InvalidArg("new speaker name is empty".into()));
     }
     // BLK-2b WRITE-GATE: a sealed-and-not-unlocked meeting's timeline `data` is blanked; refuse to
     // rename a speaker (would persist a near-empty plaintext timeline over the sealed blob in a
     // locked folder). Fail closed.
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+    if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to rename a speaker".into(),
         ));
     }
     let json = state
         .db
-        .get_timeline_data(&meeting_id)?
+        .get_timeline_data(meeting_id)?
         .ok_or_else(|| AppError::InvalidArg("no timeline for this meeting yet".into()))?;
     let mut tl: crate::storage::models::MeetingTimeline = serde_json::from_str(&json)
         .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
@@ -3983,8 +4027,174 @@ pub fn rename_speaker(
     }
     let updated = serde_json::to_string(&tl)
         .map_err(|e| AppError::Storage(format!("serialize timeline: {e}")))?;
-    state.db.set_timeline_data(&meeting_id, &updated)?;
+    state.db.set_timeline_data(meeting_id, &updated)?;
+
+    // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label is a diarized cluster (`others-{n}`) and
+    // the meeting produced a voiceprint for that cluster, bind the new person name to it so the next
+    // meeting can re-identify this voice. Best-effort + no-op when: the opt-in is off, `others-{n}`
+    // doesn't parse, or no voiceprint exists for that cluster (pre-opt-in recording). The rename
+    // itself already succeeded regardless — a failed/absent enroll never fails the command. The WRITE
+    // is anchored to THIS (already-unlocked) meeting; no other meeting's voiceprint is read/written.
+    if let Some(cluster_index) = parse_others_cluster(old_label) {
+        let enabled = state
+            .config
+            .lock()
+            .map(|c| c.voiceprint_enabled)
+            .unwrap_or(false);
+        if enabled {
+            match state
+                .db
+                .set_voiceprint_label_for_cluster(meeting_id, cluster_index, new_label)
+            {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(
+                            target: "transcribe", meeting_id = %meeting_id, cluster_index,
+                            "enrolled a voiceprint on rename"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "transcribe", error = %e,
+                    "voiceprint enroll-on-rename failed (rename unaffected)"
+                ),
+            }
+        }
+    }
     Ok(tl)
+}
+
+/// Parse a diarized-cluster timeline label `others-{n}` → its cluster index, else None. The plain
+/// `others` label (single remote speaker, no cluster suffix) and any human name return None.
+fn parse_others_cluster(label: &str) -> Option<i64> {
+    label
+        .strip_prefix(crate::audio::merge::SPEAKER_OTHERS)?
+        .strip_prefix('-')?
+        .parse::<i64>()
+        .ok()
+}
+
+// ── VOICEPRINTS (Phase 2): cosine re-identification + enroll + management ───────────────────────
+//
+// GATE DISCIPLINE (lock-model): every read here goes through `list_voiceprints_visible`, so a
+// sealed-and-not-session-unlocked meeting's voiceprint is INVISIBLE — it is never listed, never a
+// match candidate, and never a suggestion source. The suggester compares THIS meeting's clusters
+// only against OTHER visible LABELED voiceprints; a sealed prior contributes nothing. The raw
+// embedding never crosses the IPC boundary (the DTOs carry label + provenance + dim only).
+
+/// Suggest a person label for each diarized `others-{n}` cluster of `meeting_id`, by cosine
+/// re-identification against prior LABELED voiceprints. GATED: `meeting_is_unlocked` first (a locked
+/// meeting yields no suggestions), then the candidate set is `list_voiceprints_visible` restricted to
+/// labeled rows from OTHER meetings — a sealed prior is never in it. Only matches `>=`
+/// `VOICEPRINT_MATCH_THRESHOLD` are returned. Empty when the opt-in is off, no voiceprint exists, or
+/// nothing matches. NO PII is logged.
+#[tauri::command]
+pub fn suggest_speaker_labels(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<SpeakerSuggestion>, AppError> {
+    suggest_speaker_labels_inner(state.inner(), &meeting_id)
+}
+
+/// Inner of [`suggest_speaker_labels`] taking `&AppState` (unit-testable gate).
+pub(crate) fn suggest_speaker_labels_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<Vec<SpeakerSuggestion>, AppError> {
+    use crate::transcribe::diarize::{
+        suggest_voiceprint_labels, ClusterEmbeddingRef, LabeledEmbeddingRef,
+        VOICEPRINT_MATCH_THRESHOLD,
+    };
+    // READ-GATE: a locked meeting surfaces nothing (its own clusters are invisible anyway, but fail
+    // closed explicitly).
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Ok(Vec::new());
+    }
+    // The whole VISIBLE voiceprint corpus (sealed priors already excluded by the visibility clause).
+    let unlocked = unlocked_snapshot(state)?;
+    let all = state.db.list_voiceprints_visible(&unlocked)?;
+
+    // THIS meeting's clusters (candidates to label) vs OTHER meetings' LABELED prints (the gallery).
+    let mine: Vec<_> = all.iter().filter(|v| v.meeting_id == meeting_id).collect();
+    if mine.is_empty() {
+        return Ok(Vec::new());
+    }
+    let labeled_refs: Vec<LabeledEmbeddingRef<'_>> = all
+        .iter()
+        .filter(|v| v.meeting_id != meeting_id)
+        .filter_map(|v| {
+            v.label
+                .as_deref()
+                .filter(|l| !l.trim().is_empty())
+                .map(|label| LabeledEmbeddingRef { label, embedding: &v.embedding })
+        })
+        .collect();
+    if labeled_refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cluster_refs: Vec<ClusterEmbeddingRef<'_>> = mine
+        .iter()
+        // Only suggest for clusters that are NOT already labeled in this meeting.
+        .filter(|v| v.label.as_deref().map(|l| l.trim().is_empty()).unwrap_or(true))
+        .map(|v| ClusterEmbeddingRef {
+            cluster_index: v.cluster_index as i32,
+            embedding: &v.embedding,
+        })
+        .collect();
+
+    let suggestions =
+        suggest_voiceprint_labels(&cluster_refs, &labeled_refs, VOICEPRINT_MATCH_THRESHOLD);
+    Ok(suggestions
+        .into_iter()
+        .map(|s| SpeakerSuggestion {
+            speaker: format!("{}-{}", crate::audio::merge::SPEAKER_OTHERS, s.cluster_index),
+            suggested_label: s.label,
+            score: s.score,
+        })
+        .collect())
+}
+
+/// List stored voiceprints for a management view (label + source meeting + cluster + dim), GATED —
+/// a sealed-not-unlocked meeting's voiceprint is EXCLUDED. The raw embedding is NEVER returned.
+#[tauri::command]
+pub fn list_voiceprints(state: State<'_, AppState>) -> Result<Vec<VoiceprintInfo>, AppError> {
+    list_voiceprints_inner(state.inner())
+}
+
+/// Inner of [`list_voiceprints`] taking `&AppState` (unit-testable gate).
+pub(crate) fn list_voiceprints_inner(state: &AppState) -> Result<Vec<VoiceprintInfo>, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    let rows = state.db.list_voiceprints_visible(&unlocked)?;
+    Ok(rows
+        .into_iter()
+        .map(|v| VoiceprintInfo {
+            id: v.id,
+            meeting_id: v.meeting_id,
+            cluster_index: v.cluster_index,
+            label: v.label,
+            dim: v.dim,
+            created_at: v.created_at,
+        })
+        .collect())
+}
+
+/// FORGET one stored voiceprint by id (hard delete — a voice biometric the user chose to erase).
+/// Idempotent. Content-free logging (the id only). Not itself a content READ, so no gate is needed
+/// (a delete widens no visibility); the management list it feeds IS gated.
+#[tauri::command]
+pub fn forget_voiceprint(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    let removed = state.db.delete_voiceprint(&id)?;
+    tracing::info!(target: "transcribe", voiceprint_id = %id, removed, "voiceprint forgotten");
+    Ok(())
+}
+
+/// CLEAR every stored voiceprint (the "forget all captured voices" affordance). Content-free
+/// logging (a count only).
+#[tauri::command]
+pub fn clear_voiceprints(state: State<'_, AppState>) -> Result<(), AppError> {
+    let n = state.db.clear_voiceprints()?;
+    tracing::info!(target: "transcribe", count = n, "all voiceprints cleared");
+    Ok(())
 }
 
 /// Speaker + topic timeline for a meeting (AI-derived, cached after first generation).
@@ -7085,6 +7295,166 @@ mod lifecycle_tests {
         let mem = get_user_memory_inner(&state).unwrap();
         assert!(mem.disabled, "disabled flag ⇒ the audit payload reports disabled");
         assert!(mem.facts.is_empty() && mem.brief.is_empty(), "disabled ⇒ nothing surfaced");
+    }
+
+    // ── VOICEPRINTS (Phase 2): matcher gating + enroll + management ───────────────────────────────
+
+    /// CRITICAL LOCK INVARIANT (RED-before-GREEN): `suggest_speaker_labels` NEVER sources a
+    /// suggestion from a SEALED voiceprint. A labeled prior in a locked-not-unlocked folder must NOT
+    /// match the current meeting's cluster; a session unlock re-admits it. Before the
+    /// `list_voiceprints_visible` gate (an ungated SELECT of labeled priors) this FAILS — the sealed
+    /// person's name leaks as a suggestion.
+    #[test]
+    fn suggest_speaker_labels_never_uses_a_sealed_voiceprint() {
+        let state = build_state("vp-suggest-gate");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // A LABELED prior voiceprint ("Sarah") living in a folder we will SEAL.
+        make_open_folder(&state.db, "f-secret", "Secret");
+        seed_meeting(&state.db, "prior", "prior note", None);
+        state.db.set_meeting_folder("prior", Some("f-secret")).unwrap();
+        let sarah = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-prior", "prior", 0, Some("Sarah"), &sarah, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // The CURRENT (open) meeting has a cluster near-identical to Sarah's voiceprint.
+        seed_meeting(&state.db, "cur", "current note", None);
+        let cur_cluster = vec![0.99f32, 0.14, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 1, None, &cur_cluster, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        // OPEN prior → the suggestion surfaces (Sarah for others-1).
+        let sugg_open = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg_open.len(), 1, "an open labeled prior yields a suggestion");
+        assert_eq!(sugg_open[0].speaker, "others-1");
+        assert_eq!(sugg_open[0].suggested_label, "Sarah");
+        assert!(sugg_open[0].score >= 0.9);
+
+        // SEAL the prior's folder (session NOT unlocked): the sealed labeled prior must vanish from
+        // the candidate gallery → NO suggestion. RED here without the gate.
+        state.db.set_folder_locked("f-secret", true, Some(&b"wrapped"[..])).unwrap();
+        let sugg_sealed = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert!(
+            sugg_sealed.is_empty(),
+            "a sealed voiceprint must never source a suggestion (leak)"
+        );
+
+        // A session unlock re-admits it (reversible gate).
+        state.unlocked_folders.lock().unwrap().insert("f-secret".to_string());
+        let sugg_unlocked = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg_unlocked.len(), 1, "a session unlock re-admits the labeled prior");
+        assert_eq!(sugg_unlocked[0].suggested_label, "Sarah");
+    }
+
+    /// A LOCKED current meeting yields no suggestions (fail-closed READ-GATE), even with a strong
+    /// visible labeled prior.
+    #[test]
+    fn suggest_speaker_labels_locked_current_meeting_is_empty() {
+        let state = build_state("vp-suggest-locked-cur");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        seed_meeting(&state.db, "prior", "prior", None);
+        let v = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-prior", "prior", 0, Some("Sarah"), &v, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        make_open_folder(&state.db, "f-cur", "Cur");
+        seed_meeting(&state.db, "cur", "cur", None);
+        state.db.set_meeting_folder("cur", Some("f-cur")).unwrap();
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 1, None, &v, "2026-07-02T00:00:00Z")
+            .unwrap();
+        state.db.set_folder_locked("f-cur", true, Some(&b"wrapped"[..])).unwrap();
+
+        assert!(
+            suggest_speaker_labels_inner(&state, "cur").unwrap().is_empty(),
+            "a locked current meeting must surface no suggestions"
+        );
+    }
+
+    /// ENROLL-ON-RENAME: renaming a diarized cluster (`others-1` → "Sarah") binds the label to that
+    /// cluster's voiceprint row (opt-in on). A NON-cluster rename or a plain-`others` label enrolls
+    /// nothing; and with the opt-in OFF nothing is enrolled.
+    #[test]
+    fn rename_speaker_enrolls_the_cluster_voiceprint() {
+        let state = build_state("vp-enroll");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        let emb = vec![0.6f32, 0.8];
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 1, None, &emb, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Rename the diarized cluster others-1 → "Sarah": the voiceprint gets labeled.
+        rename_speaker_inner(&state, "m1", "others-1", "Sarah").unwrap();
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label.as_deref(), Some("Sarah"), "enroll bound the label");
+        assert_eq!(listed[0].cluster_index, 1);
+
+        // A rename of a PLAIN non-cluster label enrolls nothing (still one row, label unchanged).
+        rename_speaker_inner(&state, "m1", "me", "Bob").unwrap();
+        assert_eq!(
+            list_voiceprints_inner(&state).unwrap()[0].label.as_deref(),
+            Some("Sarah"),
+            "renaming a non-cluster label does not touch a voiceprint"
+        );
+    }
+
+    /// ENROLL is suppressed when the opt-in is OFF (no silent biometric binding).
+    #[test]
+    fn rename_speaker_does_not_enroll_when_opt_in_off() {
+        let state = build_state("vp-enroll-off");
+        state.config.lock().unwrap().voiceprint_enabled = false;
+        seed_meeting(&state.db, "m1", "note", None);
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        rename_speaker_inner(&state, "m1", "others-0", "Sarah").unwrap();
+        assert!(
+            list_voiceprints_inner(&state).unwrap()[0].label.is_none(),
+            "opt-in OFF ⇒ no enroll"
+        );
+    }
+
+    /// list/forget/clear management commands are gated (list) and idempotent (forget/clear).
+    #[test]
+    fn voiceprint_management_list_forget_clear() {
+        let state = build_state("vp-manage");
+        seed_meeting(&state.db, "m1", "note", None);
+        seed_meeting(&state.db, "m2", "note2", None);
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 0, Some("Sarah"), &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_voiceprint("vp2", "m2", 0, None, &[0.0f32, 1.0], "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 2, "both visible voiceprints listed");
+        // The DTO carries no raw embedding — only label + provenance + dim.
+        let sarah = listed.iter().find(|v| v.id == "vp1").unwrap();
+        assert_eq!(sarah.label.as_deref(), Some("Sarah"));
+        assert_eq!(sarah.dim, 2);
+
+        // Forget one.
+        state.db.delete_voiceprint("vp1").unwrap();
+        assert_eq!(list_voiceprints_inner(&state).unwrap().len(), 1);
+        // Clear all.
+        state.db.clear_voiceprints().unwrap();
+        assert!(list_voiceprints_inner(&state).unwrap().is_empty());
     }
 
     /// PR-A #3 belt-and-braces: sealing a folder while NO recording is active clears any stale
