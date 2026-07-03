@@ -436,7 +436,20 @@ async fn run_inner(
             None
         };
 
-    let (merged_segments, echo_suppressed) = tokio::task::spawn_blocking(move || -> Result<(Vec<crate::transcribe::types::Segment>, usize)> {
+    // VOICEPRINTS (opt-in, default OFF): capture a per-cluster voice biometric for the diarized
+    // "others" clusters, but ONLY when diarization is on AND the explicit `voiceprint_enabled` flag is
+    // set. The extractor loads from the SAME CAM++ embedding model the diarizer used; keep a clone of
+    // that path so the closure can build a standalone extractor after diarizing. PRIVACY: these
+    // embeddings are stored on-device (SQLCipher, folder-lock-sealed, purged on seal) and NEVER
+    // egressed. Capturing a non-consenting participant's voiceprint is why this is an explicit opt-in.
+    let voiceprint_enabled = config.voiceprint_enabled && config.diarize_others;
+    let voiceprint_emb_path: Option<std::path::PathBuf> = if voiceprint_enabled {
+        diarize_models.as_ref().map(|(_seg, emb)| emb.clone())
+    } else {
+        None
+    };
+
+    let (merged_segments, echo_suppressed, cluster_voiceprints) = tokio::task::spawn_blocking(move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
         let transcriber = Transcriber::load(&model_path_owned)?;
@@ -473,6 +486,10 @@ async fn run_inner(
             speaker: SPEAKER_ME,
         }];
 
+        // Per-cluster voiceprints computed inside the blocking closure (where the system samples +
+        // spans live); persisted after the closure with `state.db`. Empty unless voiceprints are on.
+        let mut cluster_voiceprints: Vec<crate::transcribe::diarize::ClusterVoiceprint> = Vec::new();
+
         if let (Some(sys), Some(sys_started)) = (sys_16k, system_started_at) {
             let mut sys_segments =
                 transcribe_stream(&transcriber, vad.as_mut(), &sys, lang_owned.as_deref())?;
@@ -480,7 +497,19 @@ async fn run_inner(
             if let Some(d) = &diarizer {
                 match d.diarize(&sys) {
                     Ok(spans) => {
-                        crate::transcribe::diarize::relabel_others(&mut sys_segments, &spans)
+                        crate::transcribe::diarize::relabel_others(&mut sys_segments, &spans);
+                        // VOICEPRINTS (opt-in): compute one L2-normalized CAM++ embedding per distinct
+                        // cluster from the SAME system samples fed to the diarizer, at the diarizer's
+                        // sample rate. Best-effort: any sherpa failure → empty (labels unaffected).
+                        if let Some(emb_path) = &voiceprint_emb_path {
+                            cluster_voiceprints =
+                                crate::transcribe::diarize::compute_cluster_voiceprints(
+                                    emb_path,
+                                    &sys,
+                                    &spans,
+                                    d.sample_rate(),
+                                );
+                        }
                     }
                     Err(e) => tracing::warn!(
                         target: "transcribe", error = %e,
@@ -501,10 +530,39 @@ async fn run_inner(
         // Copy, captured by this move closure.
         let (merged, echo_suppressed) =
             crate::audio::merge::suppress_cross_stream_echo(merge_streams(streams), leak.as_ref());
-        Ok((merged, echo_suppressed))
+        Ok((merged, echo_suppressed, cluster_voiceprints))
     })
     .await
     .map_err(|e| AppError::Transcribe(format!("transcription task panicked: {e}")))??;
+
+    // Persist the (opt-in) per-cluster voiceprints — one row per diarized "others" cluster, label
+    // NULL until enrolled by rename. Best-effort: a persist failure is logged (no PII) and never
+    // fails the pipeline (the transcript + labels are already the source of truth). The rows are
+    // provenance-anchored to this meeting → gated on read + purged on seal.
+    if !cluster_voiceprints.is_empty() {
+        let now = chrono::Utc::now().to_rfc3339();
+        for vp in &cluster_voiceprints {
+            let id = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = state.db.insert_voiceprint(
+                &id,
+                meeting_id,
+                vp.cluster_index as i64,
+                None,
+                &vp.embedding,
+                &now,
+            ) {
+                tracing::warn!(
+                    target: "transcribe", error = %e,
+                    "persisting a voiceprint failed (diarization/labels unaffected)"
+                );
+            }
+        }
+        tracing::info!(
+            target: "transcribe",
+            clusters = cluster_voiceprints.len(),
+            "captured per-cluster voiceprints"
+        );
+    }
 
     if has_system {
         tracing::info!(target: "transcribe", segments = merged_segments.len(), "merged mic + system streams (me/others)");

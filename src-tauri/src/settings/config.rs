@@ -93,6 +93,14 @@ pub struct AppConfig {
     /// Run N-way speaker diarization on the system ("others") stream to label remote speakers
     /// (others-0/1/2). Default OFF; requires system-audio capture + downloads ~40 MB of models.
     pub diarize_others: bool,
+    /// Capture a per-cluster VOICE BIOMETRIC (speaker embedding) for the diarized "others" clusters,
+    /// stored on-device (SQLCipher, folder-lock-sealed, NEVER egressed) so a remote speaker can later
+    /// be re-identified across meetings once enrolled by name. Requires `diarize_others` to also be
+    /// on. Default OFF — capturing a non-consenting participant's voiceprint is an explicit opt-in
+    /// (untested under BIPA/CIPA; never default it on). `#[serde(default)]` ⇒ a config persisted
+    /// before this field existed loads as `false`.
+    #[serde(default)]
+    pub voiceprint_enabled: bool,
     /// Echo cancellation (VPIO): capture an AEC'd mic in parallel with cpal and use it as the ASR
     /// feed (the raw cpal mic stays the archive). Default OFF; EXPERIMENTAL — best with speakers.
     pub aec_enabled: bool,
@@ -322,6 +330,7 @@ impl Default for AppConfig {
             vad_enabled: true,
             keep_hires_masters: false,
             diarize_others: false,
+            voiceprint_enabled: false,
             aec_enabled: false,
             post_aec_enabled: false,
             model_size: "small".to_string(),
@@ -378,6 +387,7 @@ const K_CAPTURE_SYSTEM_AUDIO: &str = "capture_system_audio";
 const K_VAD_ENABLED: &str = "vad_enabled";
 const K_KEEP_HIRES_MASTERS: &str = "keep_hires_masters";
 const K_DIARIZE_OTHERS: &str = "diarize_others";
+const K_VOICEPRINT_ENABLED: &str = "voiceprint_enabled";
 const K_AEC_ENABLED: &str = "aec_enabled";
 const K_POST_AEC_ENABLED: &str = "post_aec_enabled";
 const K_MODEL_SIZE: &str = "model_size";
@@ -470,6 +480,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_DIARIZE_OTHERS)? {
             cfg.diarize_others = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_VOICEPRINT_ENABLED)? {
+            cfg.voiceprint_enabled = v == "true";
         }
         if let Some(v) = db.get_setting(K_AEC_ENABLED)? {
             cfg.aec_enabled = v == "true";
@@ -628,6 +641,10 @@ impl AppConfig {
         db.set_setting(
             K_DIARIZE_OTHERS,
             if self.diarize_others { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_VOICEPRINT_ENABLED,
+            if self.voiceprint_enabled { "true" } else { "false" },
         )?;
         db.set_setting(
             K_AEC_ENABLED,
@@ -1103,6 +1120,37 @@ mod tests {
         let loaded = AppConfig::load(&db).unwrap();
         assert!(!loaded.lock_require_biometric);
         assert!(!loaded.relock_on_screenshare);
+    }
+
+    /// Voiceprint capture is a PRIVACY-sensitive opt-in: it defaults OFF on a fresh install (the
+    /// setting key is absent), and an explicit ON round-trips through save/load. Never let this
+    /// default on (see the field doc — untested under BIPA/CIPA).
+    #[test]
+    fn voiceprint_enabled_defaults_off_and_round_trips() {
+        let db = temp_db();
+        // Absent key ⇒ OFF for fresh + pre-existing installs.
+        assert!(
+            !AppConfig::load(&db).unwrap().voiceprint_enabled,
+            "voiceprint capture must default OFF (privacy opt-in)"
+        );
+
+        let cfg = AppConfig {
+            voiceprint_enabled: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(
+            AppConfig::load(&db).unwrap().voiceprint_enabled,
+            "an explicit voiceprint opt-in must round-trip through save/load"
+        );
+
+        // And turning it back OFF round-trips (not a one-way latch).
+        let off = AppConfig {
+            voiceprint_enabled: false,
+            ..Default::default()
+        };
+        off.save(&db).unwrap();
+        assert!(!AppConfig::load(&db).unwrap().voiceprint_enabled);
     }
 
     #[test]

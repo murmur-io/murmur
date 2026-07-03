@@ -33,6 +33,8 @@ import type {
   Meeting,
   MeetingDetail,
   MeetingTimeline,
+  SpeakerSuggestion,
+  VoiceprintInfo,
   ModelDownloadProgress,
   NerDownloadProgress,
   NoteDto,
@@ -670,6 +672,36 @@ export class IpcService {
       oldLabel,
       newLabel,
     });
+  }
+
+  /**
+   * Speaker voiceprints (opt-in) — suggest a person name for each diarized
+   * `others-{n}` cluster of a meeting, by cosine re-identification against prior
+   * LABELED voiceprints. GATED backend: a locked meeting yields `[]`, and a sealed
+   * prior is never a match candidate. Empty when the opt-in is off, nothing matches,
+   * or no voiceprint exists. Accepting a suggestion is a one-tap `renameSpeaker`.
+   */
+  suggestSpeakerLabels(meetingId: string): Promise<SpeakerSuggestion[]> {
+    return invoke<SpeakerSuggestion[]>("suggest_speaker_labels", { meetingId });
+  }
+
+  /**
+   * List stored voiceprints for the Settings management view (label + provenance +
+   * dim — NEVER the raw embedding). GATED: a sealed-not-unlocked meeting's row is
+   * excluded.
+   */
+  listVoiceprints(): Promise<VoiceprintInfo[]> {
+    return invoke<VoiceprintInfo[]>("list_voiceprints");
+  }
+
+  /** Forget (hard-delete) one stored voiceprint by id. Idempotent. */
+  forgetVoiceprint(id: string): Promise<void> {
+    return invoke<void>("forget_voiceprint", { id });
+  }
+
+  /** Clear every stored voiceprint (the "forget all captured voices" affordance). */
+  clearVoiceprints(): Promise<void> {
+    return invoke<void>("clear_voiceprints");
   }
 
   /** Whether a usable Whisper model is present (configured path or default models dir). */
