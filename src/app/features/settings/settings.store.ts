@@ -810,6 +810,32 @@ export class SettingsStore {
   private unlistenEmbedDownload: UnlistenFn | null = null;
   private unlistenReindex: UnlistenFn | null = null;
 
+  // ── Phase D — on-device PERSON-name redaction (NER) model ──────────────
+
+  /**
+   * Whether the on-device PERSON-name NER model is present (the redaction
+   * firewall additionally masks NAMES before cloud egress). `null` = not yet
+   * checked. Drives the honest Privacy copy: when false the copy must NOT claim
+   * names are redacted — only emails/cards/phones are by default.
+   */
+  private readonly _nerModelPresent = signal<boolean | null>(null);
+  readonly nerModelPresent = this._nerModelPresent.asReadonly();
+  /** True while the NER model is downloading — disables its button. */
+  private readonly _downloadingNerModel = signal(false);
+  readonly downloadingNerModel = this._downloadingNerModel.asReadonly();
+  /** 0..1 download progress for the in-flight NER-model download. */
+  private readonly _nerDownloadFrac = signal(0);
+  readonly nerDownloadFrac = this._nerDownloadFrac.asReadonly();
+  /** Whole-percent label for the in-flight NER-model download. */
+  readonly nerPct = computed(
+    () => Math.round(this.nerDownloadFrac() * 100) + "%",
+  );
+  /** Surfaced if ipc.downloadNerModel() rejects. */
+  private readonly _nerDownloadError = signal<string | null>(null);
+  readonly nerDownloadError = this._nerDownloadError.asReadonly();
+  /** Release handle for the NER-download event stream. */
+  private unlistenNerDownload: UnlistenFn | null = null;
+
   async load(): Promise<void> {
     try {
       const cfg = await this.ipc.getConfig();
@@ -912,6 +938,11 @@ export class SettingsStore {
       await this.subscribeSemanticStreams();
       this._embedModelPresent.set(
         await this.ipc.embedModelPresent().catch(() => false),
+      );
+      // Phase D — PERSON-name NER (redaction) model presence + download stream.
+      await this.subscribeNerDownload();
+      this._nerModelPresent.set(
+        await this.ipc.nerModelPresent().catch(() => false),
       );
       // About section — product identity (best-effort; null leaves a "loading" line).
       this._appInfo.set(await this.ipc.appInfo().catch(() => null));
@@ -1060,6 +1091,48 @@ export class SettingsStore {
       this._embedDownloadError.set(String(e));
     } finally {
       this._downloadingEmbedModel.set(false);
+    }
+  }
+
+  // ── Phase D — PERSON-name NER (redaction) model ────────────────────────
+
+  /**
+   * Subscribe ONCE to the NER-download progress stream and store the unlisten so
+   * DestroyRef can release it (no leaked listener). Best-effort: a missing
+   * backend stream just leaves the progress bar inert (the download still
+   * resolves via the command promise). Mirrors {@link subscribeSemanticStreams}.
+   */
+  private async subscribeNerDownload(): Promise<void> {
+    try {
+      this.unlistenNerDownload = await this.ipc.onNerDownload((p) => {
+        // Per-file progress: blend the completed files + the current file's
+        // fraction across the whole set so the single bar advances smoothly.
+        if (p.fileCount > 0) {
+          const cur = p.total && p.total > 0 ? p.downloaded / p.total : 0;
+          this._nerDownloadFrac.set(
+            Math.min(1, (p.fileIndex + cur) / p.fileCount),
+          );
+        }
+        if (p.done) this._nerDownloadFrac.set(1);
+      });
+      this.destroyRef.onDestroy(() => this.unlistenNerDownload?.());
+    } catch {
+      // No stream available — progress bar stays inert; the command still resolves.
+    }
+  }
+
+  /** Download the on-device PERSON-name NER model, then re-check presence. */
+  async downloadNerModel(): Promise<void> {
+    this._nerDownloadError.set(null);
+    this._nerDownloadFrac.set(0);
+    this._downloadingNerModel.set(true);
+    try {
+      await this.ipc.downloadNerModel();
+      this._nerModelPresent.set(await this.ipc.nerModelPresent());
+    } catch (e) {
+      this._nerDownloadError.set(String(e));
+    } finally {
+      this._downloadingNerModel.set(false);
     }
   }
 

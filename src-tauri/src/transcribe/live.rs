@@ -509,7 +509,12 @@ fn run_informational(
         // Cloud-only). NO new egress class.
         let (live, typed_notes) =
             gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
-        let system = assistant_system_prompt(&live, &typed_notes);
+        // Phase 3 CROSS-MEETING USER MEMORY: synthesize the memory brief from the currently-VISIBLE
+        // user facts only (sealed-source facts are excluded by `list_user_facts_visible`), and inject
+        // it next to the live-transcript section. It rides the SAME redaction firewall + cloud-consent
+        // gate as every other prompt segment — NO new egress class (design spec C3).
+        let memory_brief = gated_user_memory_brief(&state.db, unlocked);
+        let system = assistant_system_prompt(&live, &typed_notes, &memory_brief);
         match crate::agent::run_agentic_loop(
             &*reasoner,
             &system,
@@ -1048,6 +1053,20 @@ fn gated_live_context(
     (live, typed)
 }
 
+/// Phase 3 CROSS-MEETING USER MEMORY: synthesize the injectable memory brief from the CURRENTLY-
+/// VISIBLE user facts (design spec C3/D3). The visibility gate lives in `list_user_facts_visible`
+/// (source-meeting `visibility_clause`), so a sealed-and-not-session-unlocked meeting's user facts
+/// are NEVER read here and NEVER injected — the brief is regenerated from the remaining visible
+/// sources on every turn. Best-effort: a read error degrades to an EMPTY brief (no injection), never
+/// a failure. The brief egresses only inside the already-redacted, consent-gated system prompt.
+fn gated_user_memory_brief(
+    db: &crate::storage::Db,
+    unlocked: &std::collections::HashSet<String>,
+) -> String {
+    let facts = db.list_user_facts_visible(unlocked).unwrap_or_default();
+    crate::user_memory::synthesize_brief(&facts)
+}
+
 /// Clear the accumulated live-transcript buffer. Called when a recording STOPS
 /// (`commands::stop_recording`) so a stale tail can never be injected into assistant prompts after
 /// Stop — nor keep egressing once the just-recorded folder is sealed — and by the lock-surface
@@ -1096,7 +1115,7 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// to the pre-feature output (the section is simply absent). Both the injected transcript AND the typed
 /// notes egress through the SAME redaction firewall as every other prompt
 /// (`RedactingProvider::complete` scrubs `system` + `user`) — they are NOT a new egress class.
-fn assistant_system_prompt(live_transcript: &str, typed_notes: &str) -> String {
+fn assistant_system_prompt(live_transcript: &str, typed_notes: &str, memory_brief: &str) -> String {
     let base = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
                 sentences). Do not invent facts; if you cannot find the answer, say so plainly. \
                 Decide what the user wants: for a plain QUESTION or conversation, just ANSWER it. \
@@ -1130,6 +1149,19 @@ fn assistant_system_prompt(live_transcript: &str, typed_notes: &str) -> String {
         let notes_tail = tail_chars(notes, LIVE_TRANSCRIPT_INJECT_CHARS);
         prompt.push_str(&format!(
             "\n\nUSER'S OWN TYPED NOTES for this meeting (their emphasis — weight these):\n{notes_tail}"
+        ));
+    }
+    // Phase 3 CROSS-MEETING USER MEMORY: the synthesized brief of what the brain durably knows about
+    // the USER across all meetings (preferences, ongoing work, commitments), regenerated from
+    // currently-VISIBLE user facts only. Appended as a distinct bounded section; ABSENT when empty
+    // (so the prompt is BYTE-IDENTICAL to the pre-feature output when there is no memory). It rides
+    // the SAME redaction firewall + cloud-consent gate as the rest of the prompt — NOT a new egress
+    // class.
+    let brief = memory_brief.trim();
+    if !brief.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nWHAT YOU KNOW ABOUT THE USER (durable memory across meetings — use it to ground and \
+             personalize your answers; it may be stale, so defer to anything the user says now):\n{brief}"
         ));
     }
     prompt
@@ -1644,7 +1676,7 @@ mod tests {
     /// attribution from it would be hallucinated).
     #[test]
     fn assistant_system_prompt_is_honest_about_attribution() {
-        let p = assistant_system_prompt("we shipped the beta", "");
+        let p = assistant_system_prompt("we shipped the beta", "", "");
         let lower = p.to_lowercase();
         assert!(lower.contains("unattributed"), "must state the transcript is unattributed: {p}");
         assert!(lower.contains("microphone"), "must state the mic-side capture origin: {p}");
@@ -1714,7 +1746,7 @@ mod tests {
         let (tail, notes) = gated_live_context(&db, &live, "m1", &unlocked);
         assert!(tail.is_empty(), "sealed-not-unlocked meeting must inject NO live tail");
         assert!(notes.is_empty(), "sealed-not-unlocked meeting must inject NO typed notes");
-        let prompt = assistant_system_prompt(&tail, &notes);
+        let prompt = assistant_system_prompt(&tail, &notes, "");
         assert!(!prompt.contains("LIVE TRANSCRIPT"), "no live section for a sealed meeting: {prompt}");
         assert!(!prompt.contains("sealed meeting tail"), "the RAM buffer must not reach the prompt");
         // The in-flight buffer itself is NOT wiped — a session re-unlock re-injects it.
@@ -1800,11 +1832,11 @@ mod tests {
     #[test]
     fn assistant_system_prompt_injects_transcript_only_when_present() {
         // No live transcript (not recording / no captions yet) ⇒ the base prompt, no transcript section.
-        let base = assistant_system_prompt("", "");
+        let base = assistant_system_prompt("", "", "");
         assert!(!base.contains("LIVE TRANSCRIPT"), "no transcript section when empty: {base}");
         assert!(base.contains("in-meeting assistant"));
         // With a transcript ⇒ it is embedded + the brain is told to use it for the current meeting.
-        let with = assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "");
+        let with = assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "", "");
         assert!(with.contains("LIVE TRANSCRIPT"), "names the transcript section: {with}");
         assert!(with.contains("assigned the deck to Anna"), "embeds the transcript text");
         assert!(with.to_lowercase().contains("current"), "tells the brain it's the current meeting");
@@ -1816,8 +1848,8 @@ mod tests {
     #[test]
     fn assistant_system_prompt_instructs_propose_note_decision() {
         for prompt in [
-            assistant_system_prompt("", ""),
-            assistant_system_prompt("we shipped the beta", ""),
+            assistant_system_prompt("", "", ""),
+            assistant_system_prompt("we shipped the beta", "", ""),
         ] {
             assert!(prompt.contains("propose_note"), "names the propose_note tool: {prompt}");
             assert!(
@@ -1834,7 +1866,7 @@ mod tests {
         // A very long transcript is truncated to the RECENT tail (so a 2-hour meeting can't blow the
         // context) and marked elided.
         let long = "x ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS); // way over the inject budget
-        let p = assistant_system_prompt(&long, "");
+        let p = assistant_system_prompt(&long, "", "");
         assert!(p.contains('…'), "elision marker present when truncated");
         assert!(p.chars().count() < long.chars().count(), "shorter than the raw transcript");
     }
@@ -1845,30 +1877,122 @@ mod tests {
     fn assistant_system_prompt_injects_typed_notes_and_empty_is_byte_identical() {
         // Empty typed notes ⇒ no typed-notes section, AND byte-identical to the no-notes prompt for
         // BOTH the no-transcript and with-transcript branches.
-        let no_tx = assistant_system_prompt("", "");
+        let no_tx = assistant_system_prompt("", "", "");
         assert!(!no_tx.contains("TYPED NOTES"), "no typed-notes section when empty: {no_tx}");
         let tx = "we shipped the beta and assigned the deck to Anna";
         assert_eq!(
-            assistant_system_prompt(tx, ""),
-            assistant_system_prompt(tx, "   "),
+            assistant_system_prompt(tx, "", ""),
+            assistant_system_prompt(tx, "   ", ""),
             "whitespace-only typed notes must be byte-identical to none (no regression)"
         );
 
         // Present typed notes ⇒ embedded under the labeled section, alongside the transcript.
-        let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.");
+        let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.", "");
         assert!(with.contains("TYPED NOTES"), "names the typed-notes section: {with}");
         assert!(with.contains("Anna owns QA sign-off"), "embeds the typed-notes text");
         assert!(with.contains("LIVE TRANSCRIPT"), "still injects the transcript too");
 
         // Typed notes inject even with NO transcript (the user can type before any caption lands).
-        let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker");
+        let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker", "");
         assert!(notes_only.contains("TYPED NOTES"), "typed notes inject without a transcript");
         assert!(notes_only.contains("budget cap is the blocker"));
         assert!(!notes_only.contains("LIVE TRANSCRIPT"), "no transcript section when transcript empty");
 
         // A very long typed-notes buffer is truncated to the recent tail (bounded like the transcript).
         let long = "y ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS);
-        let p = assistant_system_prompt("", &long);
+        let p = assistant_system_prompt("", &long, "");
         assert!(p.contains('…'), "elision marker present when typed notes truncated");
+    }
+
+    // ── Phase 3 CROSS-MEETING USER MEMORY: brief injection + the seal invariant ───────────────────
+
+    /// The memory brief is injected as its own labeled section when present, and the EMPTY-brief
+    /// prompt is BYTE-IDENTICAL to the no-brief output (no regression). This is the "included when
+    /// present, empty when memory is empty" contract from the task.
+    #[test]
+    fn assistant_system_prompt_injects_memory_brief_and_empty_is_byte_identical() {
+        // Empty brief ⇒ no memory section, AND byte-identical to the no-brief prompt for BOTH the
+        // no-transcript and with-transcript branches.
+        let no_brief = assistant_system_prompt("", "", "");
+        assert!(!no_brief.to_uppercase().contains("KNOW ABOUT THE USER"), "no memory section when empty");
+        assert_eq!(
+            assistant_system_prompt("we shipped the beta", "", ""),
+            assistant_system_prompt("we shipped the beta", "", "   "),
+            "whitespace-only brief must be byte-identical to none (no regression)"
+        );
+
+        // Present brief ⇒ embedded under the labeled memory section, alongside transcript + notes.
+        let brief = "- You prefer: Polish replies\n- You work on: Project Atlas";
+        let with = assistant_system_prompt("we shipped the beta", "ship Friday", brief);
+        assert!(with.to_uppercase().contains("KNOW ABOUT THE USER"), "names the memory section: {with}");
+        assert!(with.contains("Project Atlas"), "embeds the brief text");
+        assert!(with.contains("LIVE TRANSCRIPT"), "still injects the transcript too");
+        assert!(with.contains("TYPED NOTES"), "still injects the typed notes too");
+
+        // The brief injects even with NO transcript and NO notes.
+        let brief_only = assistant_system_prompt("", "", brief);
+        assert!(brief_only.to_uppercase().contains("KNOW ABOUT THE USER"), "brief injects standalone");
+        assert!(brief_only.contains("Polish replies"));
+    }
+
+    /// THE WHOLE-FEATURE SEAL INVARIANT (RED-before-GREEN, design spec D3 / task C5.i): a user-memory
+    /// fact whose SOURCE meeting is sealed-and-not-session-unlocked is NEITHER returned by
+    /// `list_user_facts_visible` NOR present in the injected brief. Before the visibility gate on
+    /// `list_user_facts_visible` this test FAILS (the sealed fact leaks into the brief); after the
+    /// gate it passes. Session re-unlock re-admits it (the gate is reversible, not a wipe).
+    #[test]
+    fn user_memory_brief_excludes_sealed_source_and_reinjects_after_unlock() {
+        let db = tmp_db("user-mem-seal");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        // A summarized, foldered meeting is the SOURCE of a user fact.
+        seed_meeting(&db, "m1", Some("f1"));
+        db.apply_user_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+            entity_id: crate::user_memory::USER_SCOPE.to_string(),
+            subject: "You".into(),
+            predicate: "prefer".into(),
+            object: "Polish replies".into(),
+            valid_from: "2026-07-01T00:00:00Z".into(),
+            recorded_at: "2026-07-01T00:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some("m1".into()),
+        })])
+        .unwrap();
+
+        // While the folder is OPEN the fact is visible → the brief contains it.
+        let mut unlocked = std::collections::HashSet::new();
+        let brief_open = gated_user_memory_brief(&db, &unlocked);
+        assert!(brief_open.contains("Polish replies"), "an open-folder user fact must be in the brief");
+        let prompt_open = assistant_system_prompt("", "", &brief_open);
+        assert!(prompt_open.contains("Polish replies"), "and injected into the prompt");
+
+        // SEAL the folder (session NOT unlocked). NOTE: `set_folder_locked` only flips the flag — the
+        // real seal path PURGES the fact (`purge_user_facts_tx`); here we assert the READ GATE alone,
+        // so we don't purge, proving the gate hides a fact whose row still exists at rest.
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        let visible_sealed = db.list_user_facts_visible(&unlocked).unwrap();
+        assert!(
+            visible_sealed.is_empty(),
+            "a sealed-not-unlocked meeting's user fact must be INVISIBLE to the gated reader"
+        );
+        let brief_sealed = gated_user_memory_brief(&db, &unlocked);
+        assert!(brief_sealed.is_empty(), "sealed-source fact must NOT appear in the injected brief");
+        let prompt_sealed = assistant_system_prompt("", "", &brief_sealed);
+        assert!(!prompt_sealed.contains("Polish replies"), "the sealed fact must not reach the prompt");
+        assert!(!prompt_sealed.to_uppercase().contains("KNOW ABOUT THE USER"), "no memory section at all");
+
+        // A SESSION UNLOCK re-admits it (reversible gate).
+        unlocked.insert("f1".to_string());
+        assert!(
+            gated_user_memory_brief(&db, &unlocked).contains("Polish replies"),
+            "a session unlock must re-inject the user fact"
+        );
     }
 }

@@ -18,6 +18,7 @@
 use crate::error::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 /// The REAL on-device embedder (multilingual-e5-small via candle). ALWAYS compiled; the real impl is
 /// selected at runtime by [`active_embedder`] when the e5 model dir is present, else the stub.
@@ -72,35 +73,179 @@ pub trait Embedder {
 /// documents and `"query: "` on queries; using the right prefix is load-bearing for retrieval recall
 /// (incl. Polish). This is a Mac-eval TUNABLE — the exact prefix string and whether the bake-off
 /// prefers symmetric encoding is validated @Mac, not by `cargo test`.
+///
+/// NOTE: this is the DEFAULT (multilingual-e5-small) passage prefix; a selected [`EmbedModel`]
+/// carries its own — resolved via [`selected_embed_model`]. `mmlw-e5-small` happens to share the
+/// same `"query: "`/`"passage: "` convention (verified against its HF card), so the effective prefix
+/// is identical for both bundled options.
 pub const PASSAGE_PREFIX: &str = "passage: ";
 
 /// e5 ASYMMETRIC PREFIX (query side). See [`PASSAGE_PREFIX`].
 pub const QUERY_PREFIX: &str = "query: ";
 
-/// Sub-directory under the shared models dir holding the multilingual-e5-small files
+/// Sub-directory under the shared models dir holding the DEFAULT (multilingual-e5-small) files
 /// (`model.safetensors` + `tokenizer.json` + `config.json`). 384-dim ⇒ [`EMBED_DIM`] is unchanged,
-/// so swapping the real model in costs ZERO vec0 schema migration.
+/// so swapping the real model in costs ZERO vec0 schema migration. A selected [`EmbedModel`] carries
+/// its own subdir — resolved via [`selected_embed_model`].
 pub const EMBED_MODEL_SUBDIR: &str = "embed-multilingual-e5-small";
 
-/// The three Hugging Face files the real e5 embedder needs, fetched INBOUND-ONLY by
-/// `download_embed_model`. Order is irrelevant; each is downloaded into [`EMBED_MODEL_SUBDIR`].
+/// The three Hugging Face files the real embedder needs, fetched INBOUND-ONLY by
+/// `download_embed_model`. Order is irrelevant; each is downloaded into the selected model's subdir.
+/// Every bundled [`EmbedModel`] uses this same three-file set (BERT safetensors + tokenizer + config).
 pub const EMBED_MODEL_FILES: &[&str] = &["model.safetensors", "tokenizer.json", "config.json"];
 
-/// Hugging Face `resolve/main` base for intfloat/multilingual-e5-small. INBOUND ONLY — fetched,
-/// never sent meeting content.
+/// Hugging Face `resolve/main` base for the DEFAULT (intfloat/multilingual-e5-small). INBOUND ONLY —
+/// fetched, never sent meeting content. A selected [`EmbedModel`] carries its own base.
 pub const EMBED_MODEL_HF_BASE: &str =
     "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main";
 
-/// Resolve the on-disk dir the real e5 embedder loads from: `<models_dir>/embed-multilingual-e5-small/`.
+/// The stable id of the DEFAULT embedder. `None`/unknown selection resolves here → BYTE-IDENTICAL to
+/// the historical hardcoded-const behavior.
+pub const DEFAULT_EMBED_MODEL_ID: &str = "multilingual-e5-small";
+
+/// A selectable on-device embedder. All bundled options MUST be BERT / 384-hidden so the `vec0`
+/// column width ([`EMBED_DIM`]) never changes — a differently-dimensioned model would be a `vec0`
+/// SCHEMA migration, which we explicitly do NOT do (the loader guards `hidden_size == EMBED_DIM` and
+/// fails loud otherwise). Fields are `&'static str` (a compile-time registry, like `BRAIN_MODELS`).
+#[derive(Debug, Clone, Copy)]
+pub struct EmbedModel {
+    /// Stable id persisted in `AppConfig::embed_model_id` (e.g. `"multilingual-e5-small"`).
+    pub id: &'static str,
+    /// Human label for the picker.
+    pub name: &'static str,
+    /// Sub-directory under the shared models dir holding this model's three files.
+    pub subdir: &'static str,
+    /// Hugging Face `resolve/main` base the three files are fetched from (INBOUND ONLY).
+    pub hf_base: &'static str,
+    /// Asymmetric QUERY prefix for this model (the search side).
+    pub query_prefix: &'static str,
+    /// Asymmetric PASSAGE prefix for this model (the index side).
+    pub passage_prefix: &'static str,
+}
+
+/// The bundled, selectable embedders. ALL are BERT / hidden_size 384 (verified against their HF
+/// `config.json`), so switching between them needs NO `vec0` schema migration — only a re-index
+/// (`reindex_embeddings`) because the vectors from a different model are not comparable.
+///
+/// - `multilingual-e5-small` (intfloat) — the DEFAULT; the historical values, so a fresh/unset
+///   config behaves BYTE-IDENTICALLY to before this registry existed.
+/// - `mmlw-e5-small` (sdadas) — a Polish-first distilled e5 (BERT, hidden_size 384, XLM-R tokenizer),
+///   initialized from the multilingual-e5-small checkpoint. Its HF card documents the SAME
+///   `"query: "`/`"passage: "` asymmetric prefix convention as e5. Strong PL-MTEB retrieval scores;
+///   the real recall win is a Mac-eval (the `eval::bakeoff` harness), not a `cargo test` claim.
+pub static EMBED_MODELS: &[EmbedModel] = &[
+    EmbedModel {
+        id: DEFAULT_EMBED_MODEL_ID,
+        name: "Multilingual E5 Small (default)",
+        subdir: EMBED_MODEL_SUBDIR,
+        hf_base: EMBED_MODEL_HF_BASE,
+        query_prefix: QUERY_PREFIX,
+        passage_prefix: PASSAGE_PREFIX,
+    },
+    EmbedModel {
+        id: "mmlw-e5-small",
+        name: "MMLW E5 Small (Polish-first)",
+        subdir: "embed-mmlw-e5-small",
+        hf_base: "https://huggingface.co/sdadas/mmlw-e5-small/resolve/main",
+        // mmlw's HF card: "queries should be prefixed with \"query: \" and passages with \"passage: \"".
+        query_prefix: "query: ",
+        passage_prefix: "passage: ",
+    },
+];
+
+/// Look up a bundled embedder by id; `None` for an unknown id.
+pub fn embed_model_by_id(id: &str) -> Option<&'static EmbedModel> {
+    EMBED_MODELS.iter().find(|m| m.id == id)
+}
+
+/// IPC view of an [`EmbedModel`] for the picker: the static metadata plus the two runtime flags the
+/// FE needs — `downloaded` (all three files present in this model's subdir) and `selected` (mirrors
+/// the persisted `embed_model_id`, with `None`/unknown resolving to the default). No content read /
+/// no egress — static metadata + on-disk existence only.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbedModelDto {
+    pub id: String,
+    pub name: String,
+    pub downloaded: bool,
+    pub selected: bool,
+}
+
+/// Build the picker DTOs for all bundled embedders. `selected_id` is the persisted config value
+/// (`None`/empty ⇒ the default is the selected one). `downloaded` probes each model's own subdir
+/// under `models_dir` (an unresolvable models dir ⇒ all `false`, graceful). NEVER panics.
+pub fn embed_model_dtos(selected_id: Option<&str>) -> Vec<EmbedModelDto> {
+    let base = crate::transcribe::models_dir().ok();
+    let effective = selected_id
+        .filter(|s| !s.is_empty())
+        .and_then(embed_model_by_id)
+        .map(|m| m.id)
+        .unwrap_or(DEFAULT_EMBED_MODEL_ID);
+    EMBED_MODELS
+        .iter()
+        .map(|m| {
+            let downloaded = base
+                .as_ref()
+                .map(|b| {
+                    let dir = b.join(m.subdir);
+                    EMBED_MODEL_FILES.iter().all(|f| dir.join(f).is_file())
+                })
+                .unwrap_or(false);
+            EmbedModelDto {
+                id: m.id.to_string(),
+                name: m.name.to_string(),
+                downloaded,
+                selected: m.id == effective,
+            }
+        })
+        .collect()
+}
+
+/// The DEFAULT embedder descriptor (the first registry entry). Infallible.
+pub fn default_embed_model() -> &'static EmbedModel {
+    &EMBED_MODELS[0]
+}
+
+/// Process-global "which embedder is selected" — the SEAM that lets the existing zero-arg
+/// `active_embedder`/`embed_model_present`/`embed_model_dir`/`download_embed_model` resolve the
+/// user's configured model WITHOUT threading `&AppConfig` through every call site. `None` (never set,
+/// or set to `None`) means "use the default" → byte-identical to the historical behavior. Written
+/// once by `AppConfig::load` at startup and again by `AppConfig::save` when the selection changes;
+/// read on every embedder construction. A poisoned lock degrades to the default (never panics).
+static SELECTED_EMBED_MODEL_ID: RwLock<Option<String>> = RwLock::new(None);
+
+/// Set the process-global selected embedder id (called by `AppConfig::load`/`save`). `None` clears
+/// back to the default. NEVER panics — a poisoned lock is silently ignored (the default stands).
+pub fn set_selected_embed_model_id(id: Option<String>) {
+    if let Ok(mut g) = SELECTED_EMBED_MODEL_ID.write() {
+        *g = id.filter(|s| !s.is_empty());
+    }
+}
+
+/// Resolve the currently-selected [`EmbedModel`]: the process-global id if it names a known model,
+/// else the DEFAULT. NEVER panics (a poisoned lock or an unknown id both fall back to the default),
+/// so this is safe on any hot path.
+pub fn selected_embed_model() -> &'static EmbedModel {
+    let id = SELECTED_EMBED_MODEL_ID
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    match id.as_deref().and_then(embed_model_by_id) {
+        Some(m) => m,
+        None => default_embed_model(),
+    }
+}
+
+/// Resolve the on-disk dir the SELECTED embedder loads from: `<models_dir>/<selected.subdir>/`.
 /// Creating the models dir can fail (returns `Err`); the dir itself may not yet exist (that is fine —
 /// the caller checks [`embed_model_present`]). NEVER panics.
 pub fn embed_model_dir() -> Result<PathBuf> {
-    Ok(crate::transcribe::models_dir()?.join(EMBED_MODEL_SUBDIR))
+    Ok(crate::transcribe::models_dir()?.join(selected_embed_model().subdir))
 }
 
-/// `true` when all three e5 model files exist in [`embed_model_dir`]. Pure existence probe (the only
-/// I/O is `is_file`); a models-dir resolution error is treated as "not present" (graceful — falls
-/// back to the stub), never propagated as a hard error.
+/// `true` when all three model files exist in the SELECTED model's [`embed_model_dir`]. Pure
+/// existence probe (the only I/O is `is_file`); a models-dir resolution error is treated as "not
+/// present" (graceful — falls back to the stub), never propagated as a hard error.
 pub fn embed_model_present() -> bool {
     match embed_model_dir() {
         Ok(dir) => EMBED_MODEL_FILES.iter().all(|f| dir.join(f).is_file()),
@@ -144,18 +289,22 @@ impl Embedder for StubEmbedder {
 /// so callers build one per operation. NEVER invoked when `semantic_search_enabled` is off (the gate
 /// short-circuits before this is called) — building the real embedder does NOT flip that flag.
 pub fn active_embedder() -> Box<dyn Embedder> {
+    let model = selected_embed_model();
     if embed_model_present() {
-        match embed_model_dir().and_then(candle_bert::CandleBertEmbedder::new) {
+        let built = embed_model_dir().and_then(|dir| {
+            candle_bert::CandleBertEmbedder::new(dir, model.query_prefix, model.passage_prefix)
+        });
+        match built {
             Ok(e) => {
-                tracing::info!(target: "embed", "local embed model ready (lazy load)");
+                tracing::info!(target: "embed", model_id = %model.id, "local embed model ready (lazy load)");
                 return Box::new(e);
             }
             Err(e) => {
-                tracing::warn!(target: "embed", error = %e, "local embed init failed; using stub embedder");
+                tracing::warn!(target: "embed", model_id = %model.id, error = %e, "local embed init failed; using stub embedder");
             }
         }
     } else {
-        tracing::info!(target: "embed", "no local embed model present; using stub embedder");
+        tracing::info!(target: "embed", model_id = %model.id, "no local embed model present; using stub embedder");
     }
     Box::new(StubEmbedder)
 }
@@ -282,13 +431,15 @@ pub fn fuse_doc_hits(
         .collect()
 }
 
-/// Download the three e5 model files into [`embed_model_dir`], INBOUND-ONLY, with progress.
+/// Download the three model files for the SELECTED embedder into [`embed_model_dir`], INBOUND-ONLY,
+/// with progress.
 ///
 /// Mirrors [`crate::reason::download_brain_model`]: each file streams to `<file>.part` then renames
 /// atomically; `on_progress(file_index, downloaded, total)` fires as bytes arrive (`total` is `None`
 /// when the server omits `Content-Length`). A file already present on disk is SKIPPED. INBOUND ONLY:
 /// fetches model files and sends NO request body / NO meeting content (no egress). NO PII logged —
-/// filenames + byte counts only.
+/// filenames + byte counts only. The HF base + destination subdir come from [`selected_embed_model`],
+/// so `mmlw-e5-small` is fetched from its own repo into its own dir.
 pub async fn download_embed_model<F>(mut on_progress: F) -> Result<PathBuf>
 where
     F: FnMut(usize, u64, Option<u64>),
@@ -296,6 +447,7 @@ where
     use crate::error::AppError;
     use tokio::io::AsyncWriteExt;
 
+    let model = selected_embed_model();
     let dir = embed_model_dir()?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Storage(format!("create embed model dir: {e}")))?;
@@ -305,7 +457,7 @@ where
         if dest.is_file() {
             continue;
         }
-        let url = format!("{EMBED_MODEL_HF_BASE}/{file}");
+        let url = format!("{}/{file}", model.hf_base);
         tracing::info!(target: "embed", file = %file, "downloading embed model file");
 
         let mut resp = reqwest::get(&url)
@@ -354,6 +506,14 @@ where
 
     Ok(dir)
 }
+
+/// A process-wide lock serializing every test that mutates the [`SELECTED_EMBED_MODEL_ID`] global
+/// (in THIS module and in `config`/`commands` tests). `cargo test` runs tests in parallel, so without
+/// this a test that sets the selection could race a test that reads `embed_model_dir`/`active_embedder`
+/// under the default. Callers lock it for the whole set→act→restore span, and MUST restore the
+/// selection to `None` (the default) before dropping the guard.
+#[cfg(test)]
+pub(crate) static EMBED_SELECTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -439,6 +599,9 @@ mod tests {
 
     #[test]
     fn embed_model_dir_is_under_models_dir() {
+        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // With no selection set, the resolver falls back to the default (e5) subdir.
+        set_selected_embed_model_id(None);
         let dir = embed_model_dir().unwrap();
         assert!(dir.ends_with(EMBED_MODEL_SUBDIR));
         // The three e5 files are the documented set.
@@ -446,8 +609,74 @@ mod tests {
         assert!(EMBED_MODEL_HF_BASE.contains("intfloat/multilingual-e5-small"));
     }
 
+    /// The registry is well-formed: the DEFAULT is first, ids are unique, mmlw is present, and EVERY
+    /// bundled option is 384-safe by construction (they all share EMBED_MODEL_FILES; the loader guards
+    /// hidden_size == EMBED_DIM at load, so a wrong-width model would fail loud — never silently).
+    #[test]
+    fn embed_registry_is_wellformed_and_has_mmlw() {
+        assert_eq!(default_embed_model().id, DEFAULT_EMBED_MODEL_ID);
+        assert_eq!(EMBED_MODELS[0].id, DEFAULT_EMBED_MODEL_ID, "default must be first");
+        // Unique ids.
+        let mut ids: Vec<&str> = EMBED_MODELS.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), EMBED_MODELS.len(), "embed model ids must be unique");
+        // mmlw is a first-class selectable option with the documented e5-compatible prefixes.
+        let mmlw = embed_model_by_id("mmlw-e5-small").expect("mmlw-e5-small must be registered");
+        assert_eq!(mmlw.query_prefix, "query: ");
+        assert_eq!(mmlw.passage_prefix, "passage: ");
+        assert!(mmlw.hf_base.contains("sdadas/mmlw-e5-small"));
+        assert_ne!(mmlw.subdir, EMBED_MODEL_SUBDIR, "each model needs its own subdir");
+        // The default carries the historical values verbatim (byte-identical default behavior).
+        let def = default_embed_model();
+        assert_eq!(def.subdir, EMBED_MODEL_SUBDIR);
+        assert_eq!(def.hf_base, EMBED_MODEL_HF_BASE);
+        assert_eq!(def.query_prefix, QUERY_PREFIX);
+        assert_eq!(def.passage_prefix, PASSAGE_PREFIX);
+    }
+
+    /// The process-global selection seam: setting a known id resolves to it; unknown/None fall back
+    /// to the default. `embed_model_dir` tracks the selection's subdir. Restore the default after so
+    /// this test cannot leak state into others that share the process global.
+    #[test]
+    fn selected_embed_model_resolves_and_falls_back() {
+        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_selected_embed_model_id(Some("mmlw-e5-small".to_string()));
+        assert_eq!(selected_embed_model().id, "mmlw-e5-small");
+        assert!(embed_model_dir().unwrap().ends_with("embed-mmlw-e5-small"));
+
+        // Unknown id ⇒ default. Empty ⇒ default. None ⇒ default.
+        set_selected_embed_model_id(Some("does-not-exist".to_string()));
+        assert_eq!(selected_embed_model().id, DEFAULT_EMBED_MODEL_ID);
+        set_selected_embed_model_id(Some(String::new()));
+        assert_eq!(selected_embed_model().id, DEFAULT_EMBED_MODEL_ID);
+        set_selected_embed_model_id(None);
+        assert_eq!(selected_embed_model().id, DEFAULT_EMBED_MODEL_ID);
+    }
+
+    /// The picker DTOs cover every registry entry, mark exactly one as `selected` (the resolved one),
+    /// and default (None) selects the default model.
+    #[test]
+    fn embed_model_dtos_mark_selected() {
+        let dtos = embed_model_dtos(None);
+        assert_eq!(dtos.len(), EMBED_MODELS.len());
+        let selected: Vec<&str> = dtos.iter().filter(|d| d.selected).map(|d| d.id.as_str()).collect();
+        assert_eq!(selected, vec![DEFAULT_EMBED_MODEL_ID], "None ⇒ default is selected");
+
+        let dtos = embed_model_dtos(Some("mmlw-e5-small"));
+        let selected: Vec<&str> = dtos.iter().filter(|d| d.selected).map(|d| d.id.as_str()).collect();
+        assert_eq!(selected, vec!["mmlw-e5-small"]);
+
+        // Unknown id ⇒ the default is marked selected (never zero-selected).
+        let dtos = embed_model_dtos(Some("bogus"));
+        assert!(dtos.iter().filter(|d| d.selected).count() == 1);
+        assert!(dtos.iter().find(|d| d.selected).map(|d| d.id.as_str()) == Some(DEFAULT_EMBED_MODEL_ID));
+    }
+
     #[test]
     fn embed_model_present_false_when_any_file_missing() {
+        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_selected_embed_model_id(None);
         // On a clean machine the e5 dir is absent ⇒ not present. Even with a partial dir (only one of
         // the three files), `present` must be false — the loader needs all three.
         let dir = embed_model_dir().unwrap();
@@ -466,6 +695,8 @@ mod tests {
     /// `active_reasoner_falls_back_to_stub_without_model`).
     #[test]
     fn active_embedder_falls_back_to_stub_without_model() {
+        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_selected_embed_model_id(None);
         // Only meaningful as a fallback assertion when no real model is installed; on a clean
         // machine/CI the e5 dir is absent, so the always-compiled candle backend still yields the stub.
         if !embed_model_present() {

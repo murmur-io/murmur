@@ -61,13 +61,68 @@ import { SettingsStore } from "../settings.store";
                     server — then restored in your notes. Only Ollama running on this
                     Mac keeps everything on-device.
                   </p>
-                  <p class="text-secondary privacy-note">
-                    Names: the pattern firewall alone does not catch them, but an
-                    on-device name-redaction layer additionally masks people's names
-                    when its local model is present. Without that model, names can
-                    leave your device alongside the transcript when you use a cloud
-                    provider.
-                  </p>
+                </div>
+
+                <!-- (1a) On-device name redaction (Phase D — NER model) -->
+                <div class="privacy-section">
+                  <span class="privacy-section-label text-muted"
+                    >Name redaction</span
+                  >
+                  @if (nerModelPresent() === true) {
+                    <p class="text-secondary privacy-note">
+                      An on-device name-redaction model is installed, so people's
+                      NAMES are additionally masked before any redacted text leaves
+                      this Mac (Polish + English), then restored in your notes.
+                    </p>
+                    <span class="pill is-success ner-pill">
+                      <span class="pill-dot"></span>
+                      Name redaction on
+                    </span>
+                  } @else {
+                    <!-- HONEST copy: without the model, do NOT claim names are
+                         redacted — only emails / cards / phones are by default. -->
+                    <p class="text-secondary privacy-note">
+                      By default only emails, card numbers and phone numbers are
+                      redacted — people's NAMES are not. The pattern firewall alone
+                      can't catch names, so they can leave your device alongside the
+                      transcript when you use a cloud provider. Download the optional
+                      on-device name-redaction model to additionally mask names
+                      (Polish + English) before any text leaves this Mac.
+                    </p>
+                    @if (downloadingNerModel()) {
+                      <div class="dl-progress" role="status">
+                        <div class="dl-progress-track" aria-hidden="true">
+                          <div
+                            class="dl-progress-fill"
+                            [style.width.%]="nerDownloadFrac() * 100"
+                          ></div>
+                        </div>
+                        <span class="dl-progress-label text-muted">
+                          @if (nerDownloadFrac() > 0) {
+                            Downloading… {{ nerPct() }}
+                          } @else {
+                            <span class="spin-ring" aria-hidden="true"></span>
+                            Downloading…
+                          }
+                        </span>
+                      </div>
+                    } @else {
+                      <button
+                        type="button"
+                        class="btn"
+                        (click)="downloadNerModel()"
+                        [disabled]="nerModelPresent() === null"
+                      >
+                        Enable name redaction (download model)
+                      </button>
+                      <span class="text-muted ner-hint">
+                        One time, on-device, no meeting content is sent.
+                      </span>
+                    }
+                    @if (nerDownloadError(); as nerr) {
+                      <p class="text-danger privacy-note">{{ nerr }}</p>
+                    }
+                  }
                 </div>
 
                 <!-- (1b) Cloud processing consent (E10) -->
@@ -357,6 +412,42 @@ import { SettingsStore } from "../settings.store";
         line-height: 1.5;
       }
 
+      /* Name-redaction status pill + one-line hint. */
+      .ner-pill {
+        align-self: flex-start;
+      }
+      .ner-hint {
+        display: block;
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
+
+      /* NER model-download progress bar (mirrors the onboarding wizard). */
+      .dl-progress {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+        max-width: 320px;
+      }
+      .dl-progress-track {
+        height: 8px;
+        border-radius: var(--radius-sm);
+        background: var(--surface-input);
+        overflow: hidden;
+      }
+      .dl-progress-fill {
+        height: 100%;
+        background: var(--accent);
+        border-radius: var(--radius-sm);
+        transition: width var(--transition);
+      }
+      .dl-progress-label {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-2);
+        font-size: 0.85rem;
+      }
+
       /* Inline spinner on the Download button (matches the onboarding wizard). */
       .spin-ring {
         width: 15px;
@@ -392,8 +483,19 @@ export class SettingsPrivacySectionComponent {
   readonly mcpUrl = this.store.mcpUrl;
   readonly mcpConfig = this.store.mcpConfig;
 
+  // Phase D — on-device name-redaction (NER) model affordance.
+  readonly nerModelPresent = this.store.nerModelPresent;
+  readonly downloadingNerModel = this.store.downloadingNerModel;
+  readonly nerDownloadFrac = this.store.nerDownloadFrac;
+  readonly nerPct = this.store.nerPct;
+  readonly nerDownloadError = this.store.nerDownloadError;
+
   allowCloudProcessing(): void {
     void this.store.allowCloudProcessing();
+  }
+
+  downloadNerModel(): void {
+    void this.store.downloadNerModel();
   }
 
   copyMcpConfig(): void {

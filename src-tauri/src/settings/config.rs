@@ -98,15 +98,18 @@ pub struct AppConfig {
     pub aec_enabled: bool,
     /// Post-hoc on-device echo cancellation (WebRTC AEC3): after Stop, cancel the captured
     /// system-audio out of the mic track (ASR feed AND playback mix) when a speaker leak is
-    /// detected. Default ON — pure offline DSP, no live-call impact; falls back to the raw mic
-    /// on any anomaly. Fixes the doubled voice when recording on speakers.
-    /// `#[serde(default = "default_true")]` ⇒ a config persisted before this field existed loads
-    /// as `true` (existing users get the fix) instead of resetting the whole config.
-    #[serde(default = "default_true")]
+    /// detected. Pure offline DSP, no live-call impact; falls back to the raw mic on any anomaly.
+    /// Fixes the doubled voice when recording on speakers — but rides an UNPROVEN v0.1 AEC3 crate
+    /// on every system-audio recording, so it is DEFAULT-OFF until real-Mac-verified. Users can
+    /// opt in from Settings.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`
+    /// (the safe default) instead of resetting the whole config.
+    #[serde(default)]
     pub post_aec_enabled: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
-    /// "large-v3". Default "large-v3" (~3 GB, multilingual) — best transcription quality,
-    /// notably for Polish; downloaded on demand via `download_model`.
+    /// "large-v3". Default "small" (~466 MB) — a RAM-safe default: `large-v3` is ~3 GB and swaps
+    /// on 8 GB Macs, and onboarding already preselects `small`. All sizes (incl. `large-v3`, best
+    /// for Polish) stay selectable; the chosen model is downloaded on demand via `download_model`.
     pub model_size: String,
     /// Voice trigger: start recording when a wake phrase is heard. Default off.
     pub voice_trigger: bool,
@@ -158,6 +161,15 @@ pub struct AppConfig {
     /// (Phase 2c) replaces the stub; until then the only embedder is the deterministic `StubEmbedder`.
     #[serde(default)]
     pub semantic_search_enabled: bool,
+    /// brain2 RAG Phase 2 — the SELECTED on-device embedding model id (from
+    /// [`crate::embed::EMBED_MODELS`], e.g. `"multilingual-e5-small"` (default) / `"mmlw-e5-small"`).
+    /// `None`/empty (the default) resolves to `multilingual-e5-small` ⇒ BYTE-IDENTICAL to the
+    /// historical hardcoded behavior. Set via the `select_embed_model` command, which also triggers a
+    /// re-index (a different model's vectors are not comparable). `#[serde(default)]` ⇒ a config
+    /// persisted before this field existed loads as `None`. All bundled options are BERT/384 so
+    /// switching costs NO `vec0` schema migration (only a re-embed).
+    #[serde(default)]
+    pub embed_model_id: Option<String>,
     /// Phase B — optional explicit path to a local reasoning GGUF for the on-device brain
     /// (`MistralReasoner`). `None` (the default) means the resolver falls back to the default model
     /// filename inside the shared models dir. Consulted at runtime when `brain_backend == Local`;
@@ -301,8 +313,8 @@ impl Default for AppConfig {
             keep_hires_masters: false,
             diarize_others: false,
             aec_enabled: false,
-            post_aec_enabled: true,
-            model_size: "large-v3".to_string(),
+            post_aec_enabled: false,
+            model_size: "small".to_string(),
             voice_trigger: false,
             onboarded: false,
             note_style: "standard".to_string(),
@@ -314,6 +326,7 @@ impl Default for AppConfig {
             relock_on_screenshare: true,
             cloud_egress_consented: false,
             semantic_search_enabled: false,
+            embed_model_id: None,
             brain_model_path: None,
             brain_model_id: None,
             brain_backend: BrainBackend::default(),
@@ -368,6 +381,7 @@ const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
+const K_EMBED_MODEL_ID: &str = "embed_model_id";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
 const K_BRAIN_BACKEND: &str = "brain_backend";
@@ -495,6 +509,11 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
             cfg.semantic_search_enabled = v == "true";
         }
+        cfg.embed_model_id = opt(db.get_setting(K_EMBED_MODEL_ID)?);
+        // Publish the selection to the process-global seam the zero-arg embedder resolvers read
+        // (`embed::active_embedder`/`embed_model_present`/`embed_model_dir`/`download_embed_model`).
+        // `None`/empty ⇒ the default model ⇒ byte-identical to the historical behavior.
+        crate::embed::set_selected_embed_model_id(cfg.embed_model_id.clone());
         cfg.brain_model_path = opt(db.get_setting(K_BRAIN_MODEL_PATH)?);
         cfg.brain_model_id = opt(db.get_setting(K_BRAIN_MODEL_ID)?);
         if let Some(v) = db.get_setting(K_BRAIN_BACKEND)? {
@@ -637,6 +656,12 @@ impl AppConfig {
             if self.semantic_search_enabled { "true" } else { "false" },
         )?;
         db.set_setting(
+            K_EMBED_MODEL_ID,
+            self.embed_model_id.as_deref().unwrap_or(""),
+        )?;
+        // Keep the process-global embedder selection in sync with the persisted value on every save.
+        crate::embed::set_selected_embed_model_id(self.embed_model_id.clone());
+        db.set_setting(
             K_BRAIN_MODEL_PATH,
             self.brain_model_path.as_deref().unwrap_or(""),
         )?;
@@ -756,6 +781,37 @@ mod tests {
     #[test]
     fn notes_mode_defaults_to_enhance() {
         assert_eq!(AppConfig::default().notes_mode, "enhance");
+    }
+
+    /// A1 — offline AEC3 rides an UNPROVEN v0.1 crate on every system-audio recording, so it is
+    /// DEFAULT-OFF until real-Mac-verified. Assert both the in-memory struct default AND the
+    /// settings-table load path (empty DB / key absent) resolve to `false`. `#[serde(default)]`
+    /// (bool default = false) covers a config persisted before the field flip.
+    #[test]
+    fn post_aec_defaults_off() {
+        // In-memory struct default.
+        assert!(!AppConfig::default().post_aec_enabled);
+        // Settings-table path: empty DB (no key written) loads false.
+        let db = temp_db();
+        assert!(!AppConfig::load(&db).unwrap().post_aec_enabled);
+        // But an explicit opt-in still persists + reloads ON (not a one-way latch).
+        let cfg = AppConfig {
+            post_aec_enabled: true,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(AppConfig::load(&db).unwrap().post_aec_enabled);
+    }
+
+    /// A2 — the app default whisper model is `small` (RAM-safe; `large-v3` is ~3 GB and swaps on
+    /// 8 GB Macs). Must match `transcribe::model_filename("", _)`'s empty-size fallback so a config
+    /// that bypasses onboarding no longer lands on `large-v3`. All sizes stay selectable.
+    #[test]
+    fn model_size_defaults_to_small() {
+        assert_eq!(AppConfig::default().model_size, "small");
+        // Empty settings table loads the same default.
+        let db = temp_db();
+        assert_eq!(AppConfig::load(&db).unwrap().model_size, "small");
     }
 
     #[test]
@@ -921,6 +977,35 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    #[test]
+    fn embed_model_id_defaults_none_and_round_trips() {
+        // Serialize with other tests that touch the process-global embedder selection.
+        let _g = crate::embed::EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let db = temp_db();
+        // Absent key ⇒ None (⇒ the default embedder ⇒ byte-identical to historical behavior).
+        assert!(AppConfig::load(&db).unwrap().embed_model_id.is_none());
+
+        let cfg = AppConfig {
+            embed_model_id: Some("mmlw-e5-small".to_string()),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert_eq!(
+            AppConfig::load(&db).unwrap().embed_model_id.as_deref(),
+            Some("mmlw-e5-small")
+        );
+
+        // Clearing back to None (default model) also round-trips — not a one-way latch.
+        let cleared = AppConfig {
+            embed_model_id: None,
+            ..Default::default()
+        };
+        cleared.save(&db).unwrap();
+        assert!(AppConfig::load(&db).unwrap().embed_model_id.is_none());
     }
 
     #[test]

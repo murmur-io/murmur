@@ -89,7 +89,76 @@ Once 2c wires a real on-device embedder (BGE-M3 via mistral.rs/llama.cpp or fast
 
 ---
 
+## Stage 2b — AUTOMATED metric harness (`eval::bakeoff`) — recall@k / nDCG@k / MRR
+
+The human 0–2 scoring above is the gold signal, but it's slow and subjective. The `eval::bakeoff` module (`src-tauri/src/eval/`) automates the comparison: give it a **labeled set** (queries + the meeting ids that *should* be retrieved) and it runs all three legs — **FTS-only**, **semantic-only** (vector KNN), and **hybrid** (RRF fusion) — and prints **recall@k**, **nDCG@k**, and **MRR** per mode. Same visibility gating as the app (sealed-not-unlocked meetings are invisible to the eval).
+
+### 1. Build a labeled set (JSON)
+Format = a top-level array of `{ query, lang, expected_meeting_ids }`. A sample lives at `src-tauri/src/eval/fixtures/rag-bakeoff-sample.json` — copy it and fill the `expected_meeting_ids` with **real meeting ids from your DB**.
+
+To find meeting ids, read your dev DB (see the "inspect the dev DB" recipe): the ids are `meetings.id`. Reuse the Stage-1 question set — you already know which meetings each question *should* pull. Example:
+```json
+[
+  { "query": "kiedy ustaliliśmy deadline na integrację API", "lang": "pl",
+    "expected_meeting_ids": ["mtg_abc123"] },
+  { "query": "what did we decide about the Q3 budget", "lang": "en",
+    "expected_meeting_ids": ["mtg_def456", "mtg_ghi789"] }
+]
+```
+
+### 2. Point the harness at a real DB + set and run it (on your Mac)
+The end-to-end run is an `#[ignore]`d test driven by env vars (no recompile needed to change the set):
+
+```bash
+source ~/.cargo/env
+# Copy your dev DB first (WAL-safe): the dev app writes MeetNotes-dev/meetnotes.sqlite with the dev DEK.
+cp ~/Library/Application\ Support/MeetNotes-dev/meetnotes.sqlite* /tmp/   # copy the .sqlite + -wal + -shm
+
+cd src-tauri
+MURMUR_BAKEOFF_DB=/tmp/meetnotes.sqlite \
+MURMUR_BAKEOFF_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+MURMUR_BAKEOFF_SET=/path/to/your-labeled-set.json \
+MURMUR_BAKEOFF_K=5 \
+cargo test --lib eval::bakeoff::tests::run_bakeoff_over_real_db_from_env -- --ignored --nocapture
+```
+- `MURMUR_BAKEOFF_DEK` = the dev DEK (above) for a dev DB; the real Keychain DEK for a release DB.
+- The embedder is `active_embedder()` — the **real model when its files are on disk**, else the stub (it prints a WARNING; stub numbers are NOT a quality signal, so download the model first).
+- To include a sealed folder, unlock it in the app, then copy the DB (its chunks are only present while unlocked).
+
+### 3. Read the output
+A table like:
+```
+RAG bake-off — 18 queries, k=5
+mode          recall@5     ndcg@5        mrr
+--------------------------------------------
+fts             0.6111     0.5487     0.6389
+semantic        0.7222     0.6841     0.7500
+hybrid          0.7778     0.7213     0.7917
+```
+- **recall@k** — did the right meetings show up in the top-k at all (coverage).
+- **nDCG@k** — were they ranked *high* (position-weighted).
+- **MRR** — how high was the *first* correct hit.
+Higher is better on all three (0–1). If **hybrid** beats **fts** on your PL + paraphrase queries, the vector layer earns its keep; if **fts ≈ hybrid**, it doesn't at your scale. Compare **semantic** vs **hybrid** to see whether fusion helps or the raw vectors are enough.
+
+### 4. Comparing embedding MODELS (e5 vs mmlw-e5-small)
+Two embedders ship as first-class selectable options (both BERT / 384-dim, so switching needs **no** DB migration — only a re-index):
+- `multilingual-e5-small` (default, intfloat) — general multilingual.
+- `mmlw-e5-small` (sdadas) — a **Polish-first** distilled e5, strong PL-MTEB retrieval.
+
+To bake them off against each other on your Polish queries:
+1. In the app, pick the model (or call the `select_embed_model` command with `"multilingual-e5-small"` / `"mmlw-e5-small"`) → download it (`download_embed_model`) → **re-index** (`reindex_embeddings`, required because a different model's vectors aren't comparable).
+2. Copy the DB and run the harness above → record the table.
+3. Switch the model, re-index, re-run → compare the `semantic`/`hybrid` rows. The model with the higher PL recall@k / nDCG@k wins for your vault.
+
+*mmlw config verified: BERT architecture (`model_type: bert`, loadable by candle's `BertModel`), `hidden_size == 384` (matches `EMBED_DIM`, zero schema change), and the same `"query: "`/`"passage: "` asymmetric prefix convention as e5 (per its HF card).*
+
+### Metric math is unit-tested (no model needed)
+The recall@k / nDCG@k / MRR implementations are pure and covered by deterministic unit tests over synthetic rankings (`cargo test --lib eval::` — runs in the normal loop). The *real* run above is the only part that needs a Mac + the model.
+
+---
+
 ## Honesty notes
 - Stage 1 is fully doable **today** (FTS5 is live) and is the cheaper, decision-first gate — do it first.
-- Stage 2 needs the real embedder (Phase 2c) + your signed/dev build on a real Mac; headless tests can't measure retrieval *quality* or Polish recall.
+- Stage 2 needs the real embedder + your signed/dev build on a real Mac; headless tests can't measure retrieval *quality* or Polish recall.
+- Stage 2b (`eval::bakeoff`) gives OBJECTIVE recall@k/nDCG@k/MRR numbers, but they're only as good as your labeled set — label from real questions where you *know* the right meetings, and keep the set stable across runs so model/mode comparisons are apples-to-apples.
 - Keep the question set stable across runs so scores are comparable. Real questions from your actual work give far better signal than synthetic ones.

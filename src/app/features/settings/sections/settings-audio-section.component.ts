@@ -39,8 +39,8 @@ import { SettingsStore } from "../settings.store";
                   <span class="toggle-copy">
                     <span class="toggle-title">Capture system audio</span>
                     <span class="text-secondary toggle-sub">
-                      Records the other side of the call — needs the Screen Recording
-                      permission on first use.
+                      Capture the other side of a Zoom / Meet / Teams call, not just
+                      your mic — needs the Screen Recording permission on first use.
                     </span>
                   </span>
                   <input type="checkbox" formControlName="captureSystemAudio" />
@@ -80,11 +80,12 @@ import { SettingsStore } from "../settings.store";
               <div class="card">
                 <label class="toggle-row">
                   <span class="toggle-copy">
-                    <span class="toggle-title">Identify remote speakers</span>
+                    <span class="toggle-title">Split “Others” into individual speakers</span>
                     <span class="text-secondary toggle-sub">
                       Label individual people on the other side of the call (Speaker
-                      1/2/3) instead of one “Others”. Needs system-audio capture;
-                      downloads ~40 MB of models on first use.
+                      1/2/3) instead of one “Others”. Experimental — verify the
+                      quality on your calls. Needs system-audio capture; downloads
+                      ~40 MB of models on first use.
                     </span>
                   </span>
                   <input type="checkbox" formControlName="diarizeOthers" />
