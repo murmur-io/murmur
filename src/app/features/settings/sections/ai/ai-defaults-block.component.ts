@@ -35,7 +35,7 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
           <option value="claude_code">Claude Code (default)</option>
           <option value="anthropic">Anthropic API</option>
           <option value="ollama">Ollama</option>
-          <option value="gateway">AI Gateway (OpenAI-compatible)</option>
+          <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
         </select>
         <span class="field-help text-muted">
           Used for everything Murmur writes: notes, answers, digests, briefs.
@@ -55,7 +55,7 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
         @switch (form.controls.providerId.value) {
           @case ("gateway") {
             <p class="brain-note text-muted">
-              The model for AI Gateway is set in its connection card above.
+              The model for Kong AI Gateway is set in its connection card above.
             </p>
           }
           @case ("ollama") {
