@@ -37,6 +37,21 @@ fn main() {
         "13.4",
         &["EventKit", "Foundation"],
     );
+    // WS2 (DEFERRED) — Apple Foundation Models reasoner sidecar. `afm/afm.swift` does NOT exist yet:
+    // it needs the macOS 26 SDK (`import FoundationModels`, `@Generable`/`DynamicGenerationSchema`),
+    // which this CLT-only Mac lacks. `build_swift_helper` EARLY-RETURNS when the source is absent
+    // (see the `!src.exists()` guard), so this line is a HARMLESS NO-OP today and compiles nothing.
+    // Once `afm/afm.swift` is written on a signed macOS-26 machine this stages `binaries/meetnotes-afm`
+    // (arm64; the x86_64 slice fails FoundationModels → the single-arch fallback), and ONLY THEN may a
+    // `bundle.resources` entry be added to `tauri.conf.json` (tauri_build validates the binary exists,
+    // so that entry cannot land before the compile).
+    build_swift_helper(
+        "afm/afm.swift",
+        "meetnotes-afm",
+        "AFM_BIN",
+        "26.0",
+        &["FoundationModels"],
+    );
     tauri_build::build();
 }
 
