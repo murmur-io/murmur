@@ -339,8 +339,9 @@ fn dispatch_tool(
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
     // The `semantic_search_enabled` flag lives in the whole-DB-encrypted settings table; load it from
-    // the SAME DB the MCP reader opened. A load failure degrades to the default (flag OFF), matching
-    // the pre-refactor `unwrap_or(false)` behaviour.
+    // the SAME DB the MCP reader opened. On a load failure this degrades to `AppConfig::default()`,
+    // whose Tier 1 default is now flag ON — harmless: with no e5 model the hybrid `search_semantic`
+    // leg degenerates to the SAME gated FTS (no leak, no crash), and every leg stays visibility-gated.
     let config = crate::settings::AppConfig::load(db).unwrap_or_default();
     crate::tools::execute_tool(&call, db, unlocked_set, &config).map_err(|e| (-32000, e.to_string()))
 }
@@ -517,7 +518,9 @@ mod tests {
     fn search_semantic_flag_off_degrades_to_labelled_keyword_match() {
         let (db, p) = temp_db();
         seed(&db, "m1", "Budget", "budget planning hiring quarter", None);
-        // Flag defaults OFF (never written).
+        // Tier 1 flipped the semantic default ON; this test covers the flag-OFF keyword-degradation
+        // labelling, so pin the flag it asserts about explicitly (it used to rely on the old default).
+        db.set_setting("semantic_search_enabled", "false").unwrap();
         let out = dispatch_tool(
             &db,
             "search_semantic",
