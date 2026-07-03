@@ -44,7 +44,9 @@ pub(crate) fn budget_for(provider_id: &str) -> usize {
 
 /// Basic EN + PL stopword set. Deliberately small + deterministic (no external word-list dep); it
 /// strips the highest-frequency function words so the salient query keys off content terms.
-fn is_stopword(t: &str) -> bool {
+/// `pub(crate)` so the grounding pass (`summarize::grounding`) reuses the SAME word list — one
+/// source of truth, no second stopword set to drift.
+pub(crate) fn is_stopword(t: &str) -> bool {
     const STOP: &[&str] = &[
         // English
         "the", "and", "for", "are", "but", "not", "you", "your", "all", "can", "had", "her", "was",
@@ -70,8 +72,10 @@ fn is_stopword(t: &str) -> bool {
     STOP.contains(&t)
 }
 
-/// Tokenize to lowercased alphanumeric tokens (Unicode-aware; handles PL diacritics).
-fn tokenize(s: &str) -> Vec<String> {
+/// Tokenize to lowercased alphanumeric tokens (Unicode-aware; handles PL diacritics). `pub(crate)`
+/// so the grounding pass (`summarize::grounding`) tokenizes summary units + transcript segments the
+/// SAME way the retrieval query does — no divergent tokenizer.
+pub(crate) fn tokenize(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())

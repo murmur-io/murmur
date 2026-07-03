@@ -670,22 +670,47 @@ pub(crate) fn build_transcript_feed(
         .collect();
     let labeled = distinct.len() >= 2;
 
+    // Tier 3b/A3 — PREVENTIVE [UNCLEAR] MARKING. Prefix an acoustically-shaky segment (ASR
+    // `confidence < LOW_CONFIDENCE_P`) so the summarizer is TOLD which spans are garbled and does not
+    // confidently mint an action item from bad audio. NON-ACTIVATING BY DEFAULT: `confidence` is only
+    // computed on the Accurate batch path with a real model — on CI / model-less installs every
+    // segment is `None` ⇒ no prefix ⇒ `summary_text` is BYTE-IDENTICAL to before (the mono-`me`
+    // default egress is unchanged). The marker is a fixed on-device token (no PII) and rides
+    // `req.transcript` through the SAME RedactingProvider firewall as the rest of the feed — no new
+    // egress class, no side channel. `retrieval_text` is NEVER prefixed (retrieval stays flat).
+    let unclear = |s: &crate::transcribe::types::Segment| -> &'static str {
+        if s.confidence
+            .map(|c| c < crate::summarize::grounding::LOW_CONFIDENCE_P)
+            .unwrap_or(false)
+        {
+            "[UNCLEAR] "
+        } else {
+            ""
+        }
+    };
+
     let summary_text = if labeled {
         // The line shape is IDENTICAL to summarize::timeline's feed so the model reads one convention.
         kept.iter()
             .map(|s| {
                 format!(
-                    "[{:.1}-{:.1}] ({}) {}",
+                    "[{:.1}-{:.1}] ({}) {}{}",
                     s.start_s,
                     s.end_s,
                     s.speaker.as_deref().unwrap_or(SPEAKER_ME),
+                    unclear(s),
                     s.text.trim()
                 )
             })
             .collect::<Vec<_>>()
             .join("\n")
     } else {
-        retrieval_text.clone()
+        // Flat join, but with the [UNCLEAR] prefix on shaky segments. All-`None` ⇒ every prefix is
+        // "" ⇒ this equals `retrieval_text` exactly (the single-speaker byte-identical guarantee).
+        kept.iter()
+            .map(|s| format!("{}{}", unclear(s), s.text.trim()))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
 
     TranscriptFeed {
@@ -837,6 +862,25 @@ async fn summarize_and_export(
     // The `manual_notes` buffer stays the DURABLE CANONICAL store — never blanked here, so
     // every (re)summarize re-reads it fresh in EITHER mode; empty buffer ⇒ byte-identical.
     let markdown = finalize_note_markdown(&generated, &manual_notes, &config.notes_mode);
+
+    // Tier 3b (B) — DETERMINISTIC GROUNDING (anti-hallucination). Annotate summary units this
+    // meeting's OWN transcript does not support with a non-destructive `> unverified` line (or
+    // `(low audio confidence)` when the overlap was acoustically shaky). Gated by `ground_summary`
+    // (default OFF / opt-in until the overlap thresholds are calibrated on real data — an over-flag
+    // would `> unverified` a legitimately-abstractive sentence in the note 100% of users read).
+    // GATE/EGRESS posture: reads ONLY `get_segments(meeting_id)` — this meeting's own
+    // segments, the SAME plaintext the pipeline just summarized — so it adds NO new read path, NO
+    // cross-meeting read, and NO egress (pure local string ops). The markers become part of the note
+    // markdown and are sealed WITH it. Best-effort: a `get_segments` failure degrades to no segments
+    // ⇒ `annotate_unverified` returns the note byte-identical; it NEVER fails the pipeline. Runs
+    // BEFORE `upsert_note` + the vault write so the DB copy and the exported `.md` carry the same
+    // grounded body.
+    let markdown = if config.ground_summary {
+        let segments = state.db.get_segments(meeting_id).unwrap_or_default();
+        crate::summarize::grounding::annotate_unverified(&markdown, &segments)
+    } else {
+        markdown
+    };
 
     state
         .db
@@ -1383,6 +1427,7 @@ mod tests {
             end_s: end,
             text: text.to_string(),
             speaker: speaker.map(str::to_string),
+            confidence: None,
         }
     }
 
@@ -1435,6 +1480,48 @@ mod tests {
         assert!(!feed.summary_text.contains("Klaudku") && !feed.summary_text.contains("pogodę"));
         assert!(feed.summary_text.contains("(me) let's plan the launch"));
         assert!(feed.summary_text.contains("(others) sounds good"));
+    }
+
+    /// Tier 3b/A3: a shaky segment (`confidence < LOW_CONFIDENCE_P`) is prefixed `[UNCLEAR]` in the
+    /// summarizer feed; high-confidence + `None` segments are NOT; `retrieval_text` NEVER carries the
+    /// marker; and a feed with ALL-`None` confidence is byte-identical to today (no-regression proof
+    /// for the model-less / CI default).
+    #[test]
+    fn feed_marks_low_confidence_segments_unclear() {
+        let mut low = seg(0, 0.0, 2.0, Some("me"), "the garbled acoustic span");
+        low.confidence = Some(0.30);
+        let mut hi = seg(1, 2.0, 5.0, Some("others"), "the clear response here");
+        hi.confidence = Some(0.95);
+        let feed = build_transcript_feed(&[low, hi]);
+        assert!(feed.labeled);
+        // The low-confidence line is marked; the confident one is not.
+        assert!(
+            feed.summary_text.contains("(me) [UNCLEAR] the garbled acoustic span"),
+            "low-confidence span must be prefixed [UNCLEAR]; got: {}",
+            feed.summary_text
+        );
+        assert!(feed.summary_text.contains("(others) the clear response here"));
+        assert!(!feed.summary_text.contains("[UNCLEAR] the clear"));
+        // Retrieval text is never perturbed by the marker.
+        assert!(!feed.retrieval_text.contains("[UNCLEAR]"));
+
+        // No-regression: ALL-None confidence ⇒ summary_text is byte-identical to the pre-A3 output
+        // (both the labeled and the flat single-speaker paths).
+        let none_multi = vec![
+            seg(0, 0.0, 2.0, Some("me"), "hi there"),
+            seg(1, 2.0, 6.0, Some("others"), "great to meet you"),
+        ];
+        assert_eq!(
+            build_transcript_feed(&none_multi).summary_text,
+            "[0.0-2.0] (me) hi there\n[2.0-6.0] (others) great to meet you"
+        );
+        let none_solo = vec![
+            seg(0, 0.0, 2.0, Some("me"), "hello everyone"),
+            seg(1, 2.0, 5.0, None, "let's begin"),
+        ];
+        let solo = build_transcript_feed(&none_solo);
+        assert_eq!(solo.summary_text, "hello everyone let's begin");
+        assert_eq!(solo.summary_text, solo.retrieval_text);
     }
 
     const HZ: usize = crate::audio::TARGET_RATE_HZ as usize;

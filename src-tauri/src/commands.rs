@@ -3547,6 +3547,11 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default — an
         // older FE payload can never silently turn memory off.
         user_memory_enabled: d.user_memory_enabled,
+        // Tier 3b (B) grounding: NOT yet carried on the settings DTO (the FE toggle is a follow-up),
+        // so PRESERVE the live value here — a normal settings save can neither enable nor clear it,
+        // and it round-trips through the dedicated K_GROUND_SUMMARY load/save keys. Mirrors the
+        // preserve-only discipline used for consent + embedder id.
+        ground_summary: current.ground_summary,
         // Model-role keys ARE settable from the DTO (a future Settings UI owns the rows), like
         // `gateway_model` — plain strings, `""` = inherit legacy. An omitted key deserializes to
         // `""` (`#[serde(default)]`), so an older FE payload can never flip a role.
@@ -7228,8 +7233,8 @@ mod lifecycle_tests {
         db.insert_segments(
             mid,
             &[
-                Segment { idx: 0, start_s: 0.0, end_s: 2.0, text: "alpha bravo".to_string(), speaker: None },
-                Segment { idx: 1, start_s: 2.0, end_s: 4.0, text: "charlie delta".to_string(), speaker: None },
+                Segment { idx: 0, start_s: 0.0, end_s: 2.0, text: "alpha bravo".to_string(), speaker: None, confidence: None },
+                Segment { idx: 1, start_s: 2.0, end_s: 4.0, text: "charlie delta".to_string(), speaker: None, confidence: None },
             ],
         )
         .unwrap();
