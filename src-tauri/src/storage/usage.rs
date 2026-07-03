@@ -121,7 +121,12 @@ pub fn prune_to_limit(
         }
         if let Some(p) = c.mic_master_path.as_deref() {
             let f = delete_plaintext(p);
-            db.set_meeting_mic_master_path(&c.meeting_id, None)?;
+            // Conditional-clear (CAS): NULL the column ONLY if it still holds the snapshotted
+            // plaintext path `p`. A concurrent seal that re-pointed it to `.enc` between the
+            // snapshot and now is left intact — so prune can never orphan a freshly-sealed
+            // pointer (TOCTOU data-loss guard). The lifecycle lock at the call sites makes this
+            // interleaving impossible in the first place; the CAS is a second, defence-in-depth net.
+            db.clear_meeting_mic_master_path_if(&c.meeting_id, p)?;
             used = used.saturating_sub(f);
             summary.freed_bytes += f;
             summary.masters_deleted += 1;
@@ -131,7 +136,7 @@ pub fn prune_to_limit(
         }
         if let Some(p) = c.sys_master_path.as_deref() {
             let f = delete_plaintext(p);
-            db.set_meeting_sys_master_path(&c.meeting_id, None)?;
+            db.clear_meeting_sys_master_path_if(&c.meeting_id, p)?;
             used = used.saturating_sub(f);
             summary.freed_bytes += f;
             summary.masters_deleted += 1;
@@ -148,7 +153,7 @@ pub fn prune_to_limit(
         }
         if let Some(p) = c.audio_path.as_deref() {
             let f = delete_plaintext(p);
-            db.set_meeting_audio_path(&c.meeting_id, None)?;
+            db.clear_meeting_audio_path_if(&c.meeting_id, p)?;
             used = used.saturating_sub(f);
             summary.freed_bytes += f;
             summary.pruned_count += 1;
@@ -169,7 +174,9 @@ pub fn maybe_prune(
     if !auto_prune {
         return Ok(PruneSummary::default());
     }
-    let Some(gb) = limit_gb else {
+    // `Some(0)` is NOT a "delete everything" cap — treat it as no cap (mirrors `AppConfig::load`'s
+    // `filter(|n| *n > 0)`), so a stray 0 can never prune every recording's audio.
+    let Some(gb) = limit_gb.filter(|g| *g > 0) else {
         return Ok(PruneSummary::default());
     };
     prune_to_limit(db, audio_dir, gb as u64 * BYTES_PER_GB, exclude_meeting)

@@ -388,13 +388,24 @@ async fn run_inner(
     // OLDEST recordings' audio to stay under it — never THIS recording (excluded), never a
     // locked folder's, never notes/transcripts. Best-effort: a prune error never fails the
     // recording.
-    match crate::storage::usage::maybe_prune(
-        &state.db,
-        &wav_dir,
-        config.audio_storage_limit_gb,
-        config.audio_auto_prune,
-        Some(meeting_id),
-    ) {
+    let prune_result = {
+        // Hold the seal lifecycle guard across the SYNCHRONOUS prune ONLY — a std Mutex guard must
+        // never be held across an `.await`, so it is scoped to this block and dropped before the
+        // next await below. Same guard `lock_folder`/`unlock_folder`/`relock_*` hold, so the prune
+        // can never interleave with a folder seal (poison-tolerant, like `commands::lifecycle_guard`).
+        let _lifecycle = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::storage::usage::maybe_prune(
+            &state.db,
+            &wav_dir,
+            config.audio_storage_limit_gb,
+            config.audio_auto_prune,
+            Some(meeting_id),
+        )
+    };
+    match prune_result {
         Ok(s) if s.freed_bytes > 0 => {
             tracing::info!(target: "storage", freed = s.freed_bytes, count = s.pruned_count, "auto-pruned old recordings to stay under the storage cap");
             let _ = app.emit(

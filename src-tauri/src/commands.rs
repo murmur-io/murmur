@@ -3327,6 +3327,10 @@ pub fn save_config(
         Err(_) => (None, false),
     };
     if let Ok(dir) = crate::pipeline::audio_dir() {
+        // Hold the seal lifecycle guard across the prune (config lock already released above, so
+        // the lock order is lifecycle ⊃ db, never config held while holding lifecycle) so the
+        // prune can never interleave with a folder seal.
+        let _lifecycle = lifecycle_guard(state.inner());
         if let Ok(s) = crate::storage::usage::maybe_prune(&state.db, &dir, limit_gb, auto, None) {
             if s.freed_bytes > 0 {
                 let _ = app.emit(
@@ -3695,6 +3699,8 @@ pub fn free_up_space(state: State<'_, AppState>) -> Result<PruneSummaryDto, AppE
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         c.audio_storage_limit_gb
+            // `Some(0)` is not a "delete everything" cap → no cap (mirrors `AppConfig::load`).
+            .filter(|g| *g > 0)
             .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB)
     };
     let Some(limit) = limit_bytes else {
@@ -3705,6 +3711,11 @@ pub fn free_up_space(state: State<'_, AppState>) -> Result<PruneSummaryDto, AppE
         });
     };
     let dir = crate::pipeline::audio_dir()?;
+    // Hold the seal lifecycle guard across the prune so it can never interleave with a folder
+    // seal (`lock_folder`) — the same guard every other multi-step audio-path mutator holds.
+    // Acquired AFTER the config lock is released (single lock order: lifecycle ⊃ db, never
+    // config held while holding lifecycle).
+    let _lifecycle = lifecycle_guard(state.inner());
     let s = crate::storage::usage::prune_to_limit(&state.db, &dir, limit, None)?;
     Ok(PruneSummaryDto {
         freed_bytes: s.freed_bytes,
