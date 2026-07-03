@@ -704,6 +704,57 @@ export interface BrainOverview {
   embedModelPresent: boolean;
 }
 
+/**
+ * ONE user-memory fact — "what the brain knows about you". Mirrors the backend
+ * `crate::user_memory::UserMemoryFact` (camelCase via `#[serde(rename_all)]`).
+ * The visible facts are the same set synthesized into the grounding brief, so the
+ * Memory view is a faithful mirror of what the brain actually injects. `subject`
+ * is the person/topic the fact is about, `predicate` the relationship, `object`
+ * the value (e.g. "you" / "prefers" / "async standups"). `sourceMeetingId` is the
+ * provenance link (always set for a visible fact — the gated reader drops
+ * NULL-source rows fail-closed). Forgetting one bitemporally CLOSES it (never a
+ * silent delete), so it drops out of `getUserMemory()` and the regenerated brief.
+ */
+export interface UserMemoryFact {
+  id: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  /** Valid-time origin (the source meeting's time — when the brain learned it). */
+  validFrom: string;
+  /** The meeting this was derived from (provenance + purge anchor). */
+  sourceMeetingId: string | null;
+  confidence: number;
+}
+
+/**
+ * The full user-memory audit payload for the Memory view (`get_user_memory`).
+ * Mirrors the backend `crate::user_memory::UserMemory`. GATED server-side: only
+ * facts whose SOURCE meeting is visible under the live unlocked snapshot are
+ * returned — a sealed-not-unlocked meeting's user memory surfaces NOTHING, so
+ * re-fetch on a FoldersService lock-state change to shift the list live. `brief`
+ * is the exact injected grounding text (empty when memory is empty).
+ */
+export interface UserMemory {
+  facts: UserMemoryFact[];
+  brief: string;
+}
+
+/**
+ * Phase D — progress for the on-device PERSON-name NER model (mDeBERTa-v3)
+ * download (`EVENT_NER_DOWNLOAD`). Mirrors the backend `NerDownloadPayload`: the
+ * model is 3 files, so progress is reported per-file (`fileIndex` / `fileCount`).
+ * `total` is null when the server omits Content-Length; `done` fires once all
+ * files are written + renamed into place. Sends NO meeting content (inbound-only).
+ */
+export interface NerDownloadProgress {
+  fileIndex: number;
+  fileCount: number;
+  downloaded: number;
+  total: number | null;
+  done: boolean;
+}
+
 export interface ChatTurn {
   role: "user" | "assistant";
   content: string;

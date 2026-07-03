@@ -38,6 +38,21 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-03] Phase 3 cross-meeting user memory (lock-touching)
+- **Pattern:** reused the bitemporal `facts` substrate (pure `reconcile_facts`) for a NEW user-scoped
+  `user_facts` table (separate table, NO entity FK, `USER_SCOPE` sentinel in the `entity_id` reconcile
+  slot only — never persisted). Purge-on-seal wired into BOTH the seal tx (`purge_user_facts_tx`) AND
+  the at-rest reconcile; gated read `list_user_facts_visible` mirrors `list_facts_visible`'s
+  meetings-JOIN `visibility_clause`. Injected the brief into `assistant_system_prompt` exactly like
+  `live_transcript` (rides the existing RedactingProvider + consent gate — no new egress class).
+- **Trap hit:** a SQL string comment containing `"double quotes"` TERMINATES the Rust string literal →
+  21 spurious compile errors. Use single-quotes / plain words in SQL-string comments.
+- **Caught by:** `cargo test --lib` (12 new tests). RED-before-GREEN proven by deleting the
+  visibility predicate → both the DB gate test AND the brief-injection test failed (sealed fact leaks).
+- **Lesson:** when adding an `fn(a, b)` arg, grep ALL call sites incl. test modules — 13 test sites
+  needed the 3rd arg; a `perl -0pi` batch is faster than 13 Edits. Flag for lock-security-reviewer.
+- **Status:** GREEN (771 lib tests pass; migration still idempotent).
+
 ### [2026-07-02 seed] Distilled from rust-tauri.md + lock-model.md
 - **Pattern:** errors/commands/SQLCipher/additive-migrations/seal-verify/gate-reads/crash-safe-FFI.
 - **Caught by:** operator (seeding the loop).
