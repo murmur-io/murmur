@@ -1442,7 +1442,10 @@ mod tests {
         let r = crate::voice_action::VoiceActionResult::nothing_heard();
         assert_eq!(r.status, "nothing_heard");
         assert!(r.command.is_empty(), "nothing was heard ⇒ no command surfaced");
-        assert!(r.summary.contains("Nie usłyszałem"), "friendly PL nudge, not 'didn't catch an action'");
+        assert!(
+            r.summary.contains("didn't hear"),
+            "friendly nudge to click + speak again, not 'didn't catch an action'"
+        );
     }
 
     #[test]
