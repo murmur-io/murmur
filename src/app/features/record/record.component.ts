@@ -14,6 +14,7 @@ import { IpcService } from "../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../core/models";
 import { MicMuteToggleComponent } from "./mic-mute-toggle.component";
 import { MeetingConversationComponent } from "./meeting-conversation.component";
+import { BrainRevealCardComponent } from "./brain-reveal-card.component";
 import { MeetingConversationStore } from "../../core/meeting-conversation.store";
 
 @Component({
@@ -24,6 +25,7 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
     RouterLink,
     MicMuteToggleComponent,
     MeetingConversationComponent,
+    BrainRevealCardComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
   template: `
@@ -260,6 +262,13 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
             <span>{{ err }}</span>
           </div>
         }
+      }
+
+      <!-- ── Brain reveal — after the first note lands, surface the already-alive
+           shallow brain (people + open commitments) mapped on defaults. In-flow,
+           gated on a resolved note; one-time dismissible. ──────────────────── -->
+      @if (store.stage() === "done") {
+        <app-brain-reveal-card [active]="!!store.lastNote()" />
       }
 
       <!-- ── Minimal stats strip — hidden once the conversation thread is the
