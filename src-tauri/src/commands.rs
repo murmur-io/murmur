@@ -2824,8 +2824,12 @@ pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<S
     let json = state.db.get_timeline_data(&meeting_id)?.ok_or_else(|| {
         AppError::InvalidArg("open the meeting once to generate its timeline first".into())
     })?;
-    let tl: MeetingTimeline = serde_json::from_str(&json)
+    let mut tl: MeetingTimeline = serde_json::from_str(&json)
         .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
+    // Same coverage-repair the Detail view applies (heal a legacy cache that ends short of the
+    // recording) so the exported canvas spans the meeting instead of the provider's early cluster.
+    let segments = state.db.get_segments(&meeting_id)?;
+    crate::summarize::timeline::repair_coverage(&mut tl, &segments);
     let title = meeting.title.unwrap_or_else(|| "Meeting".to_string());
     let topics: Vec<(String, f64, f64)> = tl
         .topics
@@ -3748,12 +3752,16 @@ pub async fn get_timeline(
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
         return Ok(MeetingTimeline::default());
     }
+    // Fetch segments up-front: they anchor the coverage-repair for BOTH a cached timeline (so a
+    // legacy cache generated before the repair existed — e.g. one ending at 0:14 for a 0:45
+    // recording — heals on read) and a freshly-generated one.
+    let segments = state.db.get_segments(&meeting_id)?;
     if let Some(json) = state.db.get_timeline_data(&meeting_id)? {
-        if let Ok(t) = serde_json::from_str::<MeetingTimeline>(&json) {
+        if let Ok(mut t) = serde_json::from_str::<MeetingTimeline>(&json) {
+            crate::summarize::timeline::repair_coverage(&mut t, &segments);
             return Ok(t);
         }
     }
-    let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Ok(MeetingTimeline::default());
     }
