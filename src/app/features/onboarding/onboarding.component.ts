@@ -33,16 +33,28 @@ const PROVIDER_LABELS: Record<string, string> = {
 };
 
 /**
- * The four selectable providers, in display order. The tile list is FE-pinned
- * because `provider_statuses` omits the gateway until a base URL is
+ * The privacy posture the user consciously chooses at the provider step:
+ *  - `"local"` — fully on-device (Ollama on this Mac + local brain); NOTHING
+ *    leaves the Mac.
+ *  - `"cloud"` — a cloud provider behind the redaction firewall; only REDACTED
+ *    text ever leaves. Cloud is the DEFAULT (product decision) but the choice is
+ *    explicit + visible, never silent.
+ */
+type Posture = "local" | "cloud";
+
+/**
+ * The cloud-posture providers (behind the redaction firewall), in display order.
+ * FE-pinned because `provider_statuses` omits the gateway until a base URL is
  * configured — the wizard must still offer it (with a setup well below).
  */
-const PROVIDER_IDS: readonly string[] = [
+const CLOUD_PROVIDER_IDS: readonly string[] = [
   "claude_code",
   "anthropic",
-  "ollama",
   "gateway",
 ];
+
+/** The local-posture provider — Ollama running on THIS Mac (loopback). */
+const LOCAL_PROVIDER_ID = "ollama";
 
 /** Approx download size per Whisper quality (mirrors Settings). */
 const SIZE_HINTS: Record<string, string> = {
@@ -225,12 +237,93 @@ const SIZE_HINTS: Record<string, string> = {
             <!-- ───────────────────────── AI PROVIDER ────────────────────── -->
             @case ("provider") {
               <div class="ob-head">
-                <span class="ob-eyebrow">Summaries</span>
-                <h2 class="ob-title">Pick how notes get written</h2>
+                <span class="ob-eyebrow">Privacy &amp; summaries</span>
+                <h2 class="ob-title">How should your notes get written?</h2>
                 <p class="ob-sub text-secondary">
                   After transcription, an AI turns the transcript into a clean
-                  summary. You just need one of these working.
+                  summary. First, choose where that happens — this is a conscious
+                  privacy choice.
                 </p>
+              </div>
+
+              <!-- A3 — the explicit two-posture choice. Cloud is the default. -->
+              <div
+                class="postures"
+                role="radiogroup"
+                aria-label="Where notes get written"
+              >
+                <button
+                  type="button"
+                  class="posture"
+                  [class.is-selected]="posture() === 'local'"
+                  (click)="selectPosture('local')"
+                  role="radio"
+                  [attr.aria-checked]="posture() === 'local'"
+                >
+                  <span class="posture-icon" aria-hidden="true">
+                    <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
+                      <rect
+                        x="3"
+                        y="4"
+                        width="14"
+                        height="9"
+                        rx="1.6"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                      />
+                      <path
+                        d="M7 16.5h6M10 13.5v3"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linecap="round"
+                      />
+                    </svg>
+                  </span>
+                  <span class="posture-name">Fully local</span>
+                  <span class="posture-sub text-secondary">
+                    Ollama on this Mac. Nothing leaves your Mac.
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  class="posture"
+                  [class.is-selected]="posture() === 'cloud'"
+                  (click)="selectPosture('cloud')"
+                  role="radio"
+                  [attr.aria-checked]="posture() === 'cloud'"
+                >
+                  <span class="posture-recommended">Default</span>
+                  <span class="posture-icon" aria-hidden="true">
+                    <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
+                      <path
+                        d="M6 14.5a3.5 3.5 0 0 1-.3-6.98A4.5 4.5 0 0 1 14.4 8.2 3 3 0 0 1 14 14.5H6Z"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </span>
+                  <span class="posture-name">Cloud via redaction firewall</span>
+                  <span class="posture-sub text-secondary">
+                    A cloud AI. Only redacted text ever leaves.
+                  </span>
+                </button>
+              </div>
+
+              <!-- Persistent, visible privacy-posture badge (A3). -->
+              <div
+                class="privacy-badge"
+                [class.is-local]="posture() === 'local'"
+                role="status"
+              >
+                <span class="privacy-badge-dot" aria-hidden="true"></span>
+                <span class="privacy-badge-label">{{
+                  privacyBadge().label
+                }}</span>
+                <span class="privacy-badge-detail text-muted">
+                  {{ privacyBadge().detail }}
+                </span>
               </div>
 
               <div class="providers">
@@ -874,6 +967,115 @@ const SIZE_HINTS: Record<string, string> = {
         display: inline-flex;
       }
 
+      /* ── A3 privacy-posture chooser (two big cards) ───────────────────── */
+      .postures {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: var(--space-3);
+      }
+      @media (max-width: 520px) {
+        .postures {
+          grid-template-columns: 1fr;
+        }
+      }
+      .posture {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+        text-align: left;
+        padding: var(--space-4);
+        border: 1px solid var(--glass-border);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text-primary);
+        font-family: inherit;
+        cursor: pointer;
+        transition:
+          border-color var(--transition),
+          background var(--transition),
+          box-shadow var(--transition),
+          transform var(--transition-fast);
+      }
+      .posture:hover {
+        border-color: var(--border-strong);
+        background: var(--surface-hover);
+      }
+      .posture:active {
+        transform: translateY(1px);
+      }
+      .posture:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .posture.is-selected {
+        border-color: transparent;
+        background: var(--accent-soft);
+        box-shadow:
+          0 0 0 1px var(--accent),
+          var(--glass-highlight);
+      }
+      .posture-icon {
+        display: inline-flex;
+        color: var(--accent-hover);
+      }
+      .posture-name {
+        font-size: 0.95rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .posture-sub {
+        font-size: 0.8125rem;
+        line-height: 1.45;
+      }
+      .posture-recommended {
+        position: absolute;
+        top: var(--space-3);
+        right: var(--space-3);
+        padding: 2px 8px;
+        border-radius: var(--radius-pill);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+
+      /* Persistent, visible privacy-posture badge. */
+      .privacy-badge {
+        display: flex;
+        align-items: baseline;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+        padding: var(--space-2) var(--space-3);
+        border-radius: var(--radius-md);
+        background: var(--accent-soft);
+        border: 1px solid var(--glass-border);
+      }
+      .privacy-badge.is-local {
+        background: var(--success-soft);
+      }
+      .privacy-badge-dot {
+        align-self: center;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        flex: none;
+      }
+      .privacy-badge.is-local .privacy-badge-dot {
+        background: var(--success);
+      }
+      .privacy-badge-label {
+        font-size: 0.85rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .privacy-badge-detail {
+        font-size: 0.8125rem;
+      }
+
       /* ── Provider chooser ─────────────────────────────────────────────── */
       .providers {
         display: flex;
@@ -1206,6 +1408,13 @@ export class OnboardingComponent implements OnInit {
   /** Provider step. */
   readonly providers = signal<ProviderStatus[]>([]);
   readonly provider = signal("claude_code");
+  /**
+   * The consciously-chosen privacy POSTURE (A3). Cloud is the DEFAULT (product
+   * decision) but the two-way choice is explicit + visible — never silent. It is
+   * seeded from the loaded provider on mount (ollama → local, else cloud) so
+   * re-running setup reflects the real state.
+   */
+  readonly posture = signal<Posture>("cloud");
   readonly checking = signal(false);
   readonly apiKey = signal("");
   readonly savingKey = signal(false);
@@ -1225,13 +1434,17 @@ export class OnboardingComponent implements OnInit {
   readonly skippedProvider = signal(false);
 
   /**
-   * The 4 selectable tiles, FE-pinned (see PROVIDER_IDS) and merged with the
-   * availability fan-out — an unconfigured gateway has NO status row, so it
-   * renders as needing setup instead of vanishing.
+   * The provider tiles for the CHOSEN posture, FE-pinned (CLOUD_PROVIDER_IDS /
+   * LOCAL_PROVIDER_ID) and merged with the availability fan-out — an unconfigured
+   * gateway has NO status row, so it renders as needing setup instead of
+   * vanishing. The local posture shows only Ollama; the cloud posture shows the
+   * redaction-firewall providers.
    */
   readonly providerTiles = computed<ProviderStatus[]>(() => {
     const statuses = this.providers();
-    return PROVIDER_IDS.map(
+    const ids =
+      this.posture() === "local" ? [LOCAL_PROVIDER_ID] : CLOUD_PROVIDER_IDS;
+    return ids.map(
       (id) =>
         statuses.find((p) => p.id === id) ?? {
           id,
@@ -1241,6 +1454,23 @@ export class OnboardingComponent implements OnInit {
         },
     );
   });
+
+  /**
+   * The visible privacy-posture badge (A3): a short, honest one-liner of what
+   * leaves the Mac under the current choice. Derived, not stored — always mirrors
+   * `posture()`.
+   */
+  readonly privacyBadge = computed(() =>
+    this.posture() === "local"
+      ? {
+          label: "Fully local",
+          detail: "Nothing leaves your Mac",
+        }
+      : {
+          label: "Cloud via redaction firewall",
+          detail: "Only redacted text ever leaves",
+        },
+  );
 
   /**
    * FE mirror of the backend's egress classification for the picked provider
@@ -1306,6 +1536,14 @@ export class OnboardingComponent implements OnInit {
       this.language.set(cfg.language ?? "");
       this.modelSize.set(cfg.modelSize ?? "small");
       this.provider.set(cfg.providerId ?? "claude_code");
+      // Seed the posture from the loaded provider so re-running setup reflects
+      // reality: only the local provider (Ollama) implies the local posture;
+      // everything else (incl. a fresh install's claude_code default) is cloud.
+      this.posture.set(
+        (cfg.providerId ?? "claude_code") === LOCAL_PROVIDER_ID
+          ? "local"
+          : "cloud",
+      );
       this.vaultPath.set(cfg.vaultPath ?? null);
       this.gatewayBaseUrl.set(cfg.gatewayBaseUrl ?? "");
       this.ollamaBaseUrl.set(cfg.ollamaBaseUrl ?? "http://localhost:11434");
@@ -1387,6 +1625,27 @@ export class OnboardingComponent implements OnInit {
   }
 
   // ── Provider step ───────────────────────────────────────────────────────
+
+  /**
+   * A3 — the conscious privacy-posture choice. Switching posture also picks a
+   * sensible provider so the choice is never left in an inconsistent state:
+   *  - local  → Ollama on this Mac (fully on-device).
+   *  - cloud  → keep the current cloud pick, or default to claude_code if the
+   *    current selection is the local provider.
+   * An explicit posture pick supersedes an earlier "set this up later".
+   */
+  selectPosture(p: Posture): void {
+    if (this.posture() === p) return;
+    this.skippedProvider.set(false);
+    this.posture.set(p);
+    this.keyError.set(null);
+    if (p === "local") {
+      this.provider.set(LOCAL_PROVIDER_ID);
+    } else if (this.provider() === LOCAL_PROVIDER_ID) {
+      this.provider.set("claude_code");
+    }
+    void this.persistConfig();
+  }
 
   selectProvider(id: string): void {
     // An explicit pick supersedes an earlier "set this up later" — consent
