@@ -342,8 +342,12 @@ pub async fn start_recording(
     let meeting_id = meeting_uuid.to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
 
-    // Persist the meeting in RECORDING state up-front so a crash mid-capture leaves a
-    // recoverable row.
+    // Persist the meeting in RECORDING state up-front so a crash mid-capture leaves a row behind
+    // rather than losing the meeting silently. If this process dies before `stop_recording`, that
+    // row is reconciled to the terminal ERROR state at the next launch
+    // (`Db::reconcile_stuck_recordings`, called from `lib.rs` setup) so it never lingers as a
+    // "still recording" ghost. Full audio salvage of the abandoned capture is tracked separately
+    // (mic-spill task).
     state.db.insert_meeting(&Meeting {
         id: meeting_id.clone(),
         started_at,
