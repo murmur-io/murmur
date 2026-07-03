@@ -87,7 +87,7 @@ fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
 }
 
 /// `<app-data>/<app_dir_name()>/audio`, created if absent (`MeetNotes` release, `MeetNotes-dev` dev).
-fn audio_dir() -> Result<PathBuf> {
+pub(crate) fn audio_dir() -> Result<PathBuf> {
     let base = dirs::data_dir()
         .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
     let dir = base.join(crate::state::app_dir_name()).join(AUDIO_SUBDIR);
