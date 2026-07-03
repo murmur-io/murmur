@@ -41,6 +41,8 @@ import type {
   NoteDto,
   PersonCard,
   PinResult,
+  PruneSummary,
+  StorageReport,
   UserMemory,
   ProviderStatus,
   SavedRecipe,
@@ -164,6 +166,21 @@ export class IpcService {
 
   saveConfig(config: AppConfigDto): Promise<void> {
     return invoke<void>("save_config", { config });
+  }
+
+  /** Recording-storage usage report (on-disk path, byte totals, cap, auto-prune flag). */
+  getStorageReport(): Promise<StorageReport> {
+    return invoke<StorageReport>("get_storage_report");
+  }
+
+  /** Prune oldest recordings to the cap NOW (no-op with no cap set). Never touches notes/locked audio. */
+  freeUpSpace(): Promise<PruneSummary> {
+    return invoke<PruneSummary>("free_up_space");
+  }
+
+  /** Reveal the recordings folder in Finder. */
+  revealAudioDir(): Promise<void> {
+    return invoke<void>("reveal_audio_dir");
   }
 
   /**
