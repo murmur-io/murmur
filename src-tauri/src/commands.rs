@@ -3614,6 +3614,96 @@ pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppErr
     Ok(crate::audio::list_input_devices())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReportDto {
+    pub audio_dir: String,
+    pub used_bytes: u64,
+    pub limit_bytes: Option<u64>,
+    pub playback_bytes: u64,
+    pub masters_bytes: u64,
+    pub sealed_bytes: u64,
+    pub recording_count: u64,
+    pub auto_prune: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneSummaryDto {
+    pub freed_bytes: u64,
+    pub pruned_count: u64,
+    pub masters_deleted: u64,
+}
+
+/// Recording-storage usage report: on-disk audio path, byte totals bucketed by category,
+/// recording count, and the current cap + auto-prune flag. Sizes only — no content.
+#[tauri::command]
+pub fn get_storage_report(state: State<'_, AppState>) -> Result<StorageReportDto, AppError> {
+    let (limit_bytes, auto_prune) = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        (
+            c.audio_storage_limit_gb
+                .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB),
+            c.audio_auto_prune,
+        )
+    };
+    let dir = crate::pipeline::audio_dir()?;
+    let u = crate::storage::usage::scan_audio_usage(&dir)?;
+    Ok(StorageReportDto {
+        audio_dir: dir.to_string_lossy().into_owned(),
+        used_bytes: u.used_bytes,
+        limit_bytes,
+        playback_bytes: u.playback_bytes,
+        masters_bytes: u.masters_bytes,
+        sealed_bytes: u.sealed_bytes,
+        recording_count: u.recording_count,
+        auto_prune,
+    })
+}
+
+/// Manual "Free up space": prune oldest recordings to the cap NOW (works even when auto-prune
+/// is off). Requires a cap — with none set it is an inert zero summary (the FE disables the
+/// button). Never touches notes or locked audio.
+#[tauri::command]
+pub fn free_up_space(state: State<'_, AppState>) -> Result<PruneSummaryDto, AppError> {
+    let limit_bytes = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.audio_storage_limit_gb
+            .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB)
+    };
+    let Some(limit) = limit_bytes else {
+        return Ok(PruneSummaryDto {
+            freed_bytes: 0,
+            pruned_count: 0,
+            masters_deleted: 0,
+        });
+    };
+    let dir = crate::pipeline::audio_dir()?;
+    let s = crate::storage::usage::prune_to_limit(&state.db, &dir, limit, None)?;
+    Ok(PruneSummaryDto {
+        freed_bytes: s.freed_bytes,
+        pruned_count: s.pruned_count,
+        masters_deleted: s.masters_deleted,
+    })
+}
+
+/// Reveal the recordings folder in Finder (macOS `open`). No content read.
+#[tauri::command]
+pub fn reveal_audio_dir() -> Result<(), AppError> {
+    let dir = crate::pipeline::audio_dir()?;
+    std::process::Command::new("open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| AppError::Storage(format!("reveal audio dir: {e}")))?;
+    Ok(())
+}
+
 /// Whether the CURRENT default audio output is the built-in speakers (echo risk while
 /// capturing system audio). Best-effort introspection — `None` when undeterminable.
 #[tauri::command]
@@ -9537,5 +9627,31 @@ mod gateway_key_tests {
             crate::summarize::gateway::validate_gateway_url("http://127.0.0.1:4000/v1").is_ok(),
             "loopback http gateway URL must be accepted"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_cmd_tests {
+    use super::*;
+
+    #[test]
+    fn free_up_space_is_noop_without_a_cap() {
+        let p = crate::storage::db::unique_temp_path("murmur-cmd-storage", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let state = AppState::init_at(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        // No limit set (default None) → free_up_space must be an inert zero summary.
+        let s = crate::storage::usage::prune_to_limit(
+            &state.db,
+            &crate::pipeline::audio_dir().unwrap(),
+            u64::MAX,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.freed_bytes, 0);
+        let _ = std::fs::remove_file(&p);
     }
 }
