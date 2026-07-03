@@ -198,6 +198,16 @@ export interface AppConfigDto {
    */
   proactiveHintsEnabled: boolean;
   /**
+   * Cross-meeting USER MEMORY master gate. Off turns memory off ENTIRELY in the
+   * BACKEND: no user-fact extraction after a meeting, no memory brief injected
+   * into any surface (the @brain loop, Ask, per-meeting chat), and
+   * `getUserMemory()` reports `disabled`. Existing facts are NOT deleted by
+   * flipping it off (the user forgets/clears them). Settable flag, round-tripped
+   * on every `save_config`. Default TRUE. Mirrors Rust
+   * `AppConfigDto.user_memory_enabled`.
+   */
+  userMemoryEnabled: boolean;
+  /**
    * Stage 4 — per-feature model-role overrides (Notes / Ask / Live), mirroring
    * Rust `AppConfigDto.role_*` (camelCase). `""` = inherit: the role follows
    * the legacy mapping (Notes → the Default AI triple; Ask/Live → the
@@ -738,6 +748,13 @@ export interface UserMemoryFact {
 export interface UserMemory {
   facts: UserMemoryFact[];
   brief: string;
+  /**
+   * TRUE when cross-meeting memory is turned OFF entirely (`userMemoryEnabled`
+   * is false). In that state `facts`/`brief` are empty and nothing is injected
+   * into any prompt — the FE shows a "memory is off" affordance rather than an
+   * empty list. Optional (older payloads omit it) ⇒ treat absent as `false`.
+   */
+  disabled?: boolean;
 }
 
 /**
@@ -851,6 +868,31 @@ export interface EntityDetail {
   /** Visible meetings mentioning this entity (reuses the `VaultSource` backlink chip shape). */
   meetings: VaultSource[];
   neighbors: EntityNeighbor[];
+}
+
+/**
+ * One card in the `/people` personal-CRM list (`listPeople()`). Mirrors the Rust
+ * `PersonCard` (camelCase via `#[serde(rename_all)]`) — a Person entity rolled up
+ * over the SAME gated graph/facts/commitment readers as the graph. GATED
+ * server-side: every count reflects VISIBLE sources only, and a person whose
+ * mentions/facts/commitments live solely in sealed-not-unlocked meetings never
+ * appears — so re-fetch on a FoldersService lock-state change to shift the list
+ * live (mirrors {@link GraphData}). The `id` links to the existing entity detail.
+ */
+export interface PersonCard {
+  id: string;
+  name: string;
+  /** VISIBLE meetings mentioning this person (sealed-not-unlocked meetings drop out). */
+  meetingCount: number;
+  /**
+   * ISO 8601 start of the most-recent VISIBLE meeting that mentioned this person,
+   * or null when there is no visible mention.
+   */
+  lastTalked: string | null;
+  /** Open (`- [ ]`) action items across VISIBLE meetings owned by this person. */
+  openCommitmentCount: number;
+  /** Currently-valid (open) facts about this person from VISIBLE meetings. */
+  currentFactCount: number;
 }
 
 export interface AskVaultResult {

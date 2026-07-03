@@ -10,8 +10,8 @@ use std::collections::HashSet;
 use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
-    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, RecipeRecord, SearchHit,
-    StatusCount, VaultSource,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, PersonCard, RecipeRecord,
+    SearchHit, StatusCount, VaultSource,
 };
 use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
@@ -4542,6 +4542,70 @@ impl Db {
         Ok(out)
     }
 
+    /// GATED `/people` personal-CRM rollup: one [`PersonCard`] per VISIBLE Person entity, built
+    /// ENTIRELY from the existing gated graph/facts/commitment readers — NO new or ungated query.
+    ///
+    /// LOCK MODEL: the candidate set is `list_entities_visible` filtered to `EntityKind::Person`,
+    /// so a person mentioned ONLY in sealed-and-not-session-unlocked meetings is already dropped
+    /// (its `HAVING cnt > 0` count is 0 while sealed) and never surfaces here. Each per-person count
+    /// then reuses a gate that pushes the SAME `unlocked` set through `visibility_clause`:
+    /// `entity_mentions_visible` (meeting_count + last_talked), `list_facts_visible` (current facts),
+    /// and `list_open_commitments` (owner-scoped, name match) — so every count reflects VISIBLE
+    /// sources only; a sealed source contributes nothing to any of them. Ordered by most-recent
+    /// contact (last_talked DESC), then name.
+    pub fn list_people(&self, unlocked: &HashSet<String>) -> Result<Vec<PersonCard>> {
+        // GATE: the visible-only entity set, Persons only. A sealed-only person is absent here.
+        let people: Vec<GraphNode> = self
+            .list_entities_visible(unlocked)?
+            .into_iter()
+            .filter(|n| n.kind == EntityKind::Person)
+            .collect();
+        // Owner-scoped commitments are cheap to compute ONCE (the full visible rollup) and bucket
+        // by lowercased owner name, rather than re-scanning every note per person.
+        let mut commitments_by_owner: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for c in self.list_open_commitments(unlocked, None)? {
+            if let Some(owner) = c.owner.as_deref() {
+                let key = owner.trim().to_lowercase();
+                if !key.is_empty() {
+                    *commitments_by_owner.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut out: Vec<PersonCard> = Vec::with_capacity(people.len());
+        for p in people {
+            // meeting_count + last_talked: VISIBLE mentions only, newest first.
+            let mentions = self.entity_mentions_visible(&p.id, unlocked)?;
+            let meeting_count = mentions.len() as i64;
+            let last_talked = mentions.first().map(|m| m.started_at.clone());
+            // current_fact_count: currently-valid facts about this person from VISIBLE meetings.
+            let current_fact_count = self.list_facts_visible(&p.id, unlocked)?.len() as i64;
+            // open_commitment_count: open action items owned by this person (case-insensitive name).
+            let open_commitment_count = commitments_by_owner
+                .get(&p.name.trim().to_lowercase())
+                .copied()
+                .unwrap_or(0);
+            out.push(PersonCard {
+                id: p.id,
+                name: p.name,
+                meeting_count,
+                last_talked,
+                open_commitment_count,
+                current_fact_count,
+            });
+        }
+        // Most-recent contact first (None last), ties broken by name.
+        out.sort_by(|a, b| match (a.last_talked.as_deref(), b.last_talked.as_deref()) {
+            (Some(x), Some(y)) => y
+                .cmp(x)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        Ok(out)
+    }
+
     // ── CROSS-MEETING USER MEMORY (Phase 3) ────────────────────────────────────
     //
     // User facts reuse the bitemporal `crate::facts::{Fact, FactOp}` shape and the PURE deterministic
@@ -8415,6 +8479,113 @@ mod graph_tests {
             db.entity_mentions_visible(&secret_p, &unlocked).unwrap().len(),
             1
         );
+    }
+
+    /// `/people` CRM GATE: a Person mentioned ONLY in a sealed-and-not-session-unlocked meeting is
+    /// ABSENT from `list_people`, and every count on a visible Person reflects VISIBLE sources only.
+    /// A Person seen in BOTH an open and a sealed meeting keeps only the open-source counts while the
+    /// folder is sealed, and the sealed source's meeting/fact/commitment all reappear once the folder
+    /// id is session-unlocked. RED-before-GREEN: drop the `list_entities_visible` filter (or the
+    /// per-count gated readers) and the secret person / sealed counts leak.
+    #[test]
+    fn list_people_excludes_sealed_person_and_counts_visible_only() {
+        use crate::facts::{FactOp, NewFact};
+        let db = file_db("people-gate");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "secret", "Secret");
+
+        // OPEN meeting: mentions Bob, has an open commitment Bob owns, no facts here.
+        seed_note(&db, "open1", "## Action items\n- [ ] Bob — ship the deck 2026-07-01\n", None);
+        // SEALED meeting: mentions Bob AGAIN + a Secret-Person-only mention, plus Bob's sealed
+        // commitment and a sealed fact about Bob.
+        seed_note(
+            &db,
+            "sealed1",
+            "## Action items\n- [ ] Bob — secret task 2026-07-05\n",
+            Some("secret"),
+        );
+
+        let bob = db.upsert_entity("Bob", EntityKind::Person).unwrap();
+        db.add_mention(&bob, "open1").unwrap();
+        db.add_mention(&bob, "sealed1").unwrap();
+        let secret_p = db.upsert_entity("Secret Person", EntityKind::Person).unwrap();
+        db.add_mention(&secret_p, "sealed1").unwrap();
+
+        // One VISIBLE-source fact about Bob (open meeting) + one SEALED-source fact (sealed meeting).
+        let add = |predicate: &str, object: &str, meeting_id: &str| {
+            FactOp::Add(NewFact {
+                entity_id: bob.clone(),
+                subject: "Bob".to_string(),
+                predicate: predicate.to_string(),
+                object: object.to_string(),
+                valid_from: "2026-06-01T00:00:00Z".to_string(),
+                recorded_at: "2026-06-01T00:00:00Z".to_string(),
+                confidence: 1.0,
+                meeting_id: Some(meeting_id.to_string()),
+            })
+        };
+        db.apply_fact_ops(&[add("role", "PM", "open1"), add("team", "Growth", "sealed1")])
+            .unwrap();
+
+        // SEAL the folder; session NOT unlocked.
+        seal_folder(&db, "secret", &kek);
+
+        let empty: HashSet<String> = HashSet::new();
+        let sealed_view = db.list_people(&empty).unwrap();
+
+        // (1) A person known only through the sealed meeting must NOT surface.
+        assert!(
+            !sealed_view.iter().any(|p| p.id == secret_p),
+            "a person mentioned only in a sealed-not-unlocked meeting leaked into /people"
+        );
+
+        // (2) Bob surfaces via his OPEN meeting, but every count reflects VISIBLE sources only.
+        let bob_card = sealed_view
+            .iter()
+            .find(|p| p.id == bob)
+            .expect("Bob is visible via his open meeting");
+        assert_eq!(bob_card.name, "Bob");
+        assert_eq!(bob_card.meeting_count, 1, "only the open meeting counts while sealed");
+        assert_eq!(
+            bob_card.last_talked.as_deref(),
+            Some("2026-06-26T09:00:00Z+open1"),
+            "last_talked = the open meeting's start (the sealed one is invisible)"
+        );
+        assert_eq!(
+            bob_card.open_commitment_count, 1,
+            "only the open-meeting commitment counts; the sealed task is hidden"
+        );
+        assert_eq!(
+            bob_card.current_fact_count, 1,
+            "only the open-source fact counts; the sealed fact is hidden"
+        );
+
+        // (3) Session-unlock the folder → the sealed contributions reappear. A real `unlock_folder`
+        // decrypts the sealed note markdown back into the plaintext column for the session; the
+        // `seal_folder` test helper only seals, so mirror that restore here (the CK->markdown decrypt
+        // is exercised by the lock round-trip tests) before asserting the note-derived commitment
+        // count. Mentions + facts need no restore — their rows persist through sealing.
+        db.restore_note_markdown(
+            "sealed1",
+            "claude_code",
+            "## Action items\n- [ ] Bob — secret task 2026-07-05\n",
+        )
+        .unwrap();
+        let unlocked = unlocked_set(&["secret"]);
+        let unlocked_view = db.list_people(&unlocked).unwrap();
+        assert!(
+            unlocked_view.iter().any(|p| p.id == secret_p),
+            "the secret person reappears once its folder id is in the unlocked set"
+        );
+        let bob_u = unlocked_view.iter().find(|p| p.id == bob).unwrap();
+        assert_eq!(bob_u.meeting_count, 2, "both meetings visible when unlocked");
+        assert_eq!(
+            bob_u.last_talked.as_deref(),
+            Some("2026-06-26T09:00:00Z+sealed1"),
+            "last_talked advances to the now-visible sealed meeting (later suffix sorts last)"
+        );
+        assert_eq!(bob_u.open_commitment_count, 2, "both commitments visible when unlocked");
+        assert_eq!(bob_u.current_fact_count, 2, "both facts visible when unlocked");
     }
 
     #[test]
