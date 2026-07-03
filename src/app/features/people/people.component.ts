@@ -9,16 +9,16 @@ import {
 import { IpcService } from "../../core/ipc.service";
 import type { PersonCard } from "../../core/models";
 import { FoldersService } from "../../services/folders.service";
-import { EntityDetailComponent } from "../graph/entity-detail.component";
+import { PersonDossierComponent } from "./person-dossier.component";
 
 /**
  * The `/people` page — a personal CRM over the people across your meetings.
  *
  * A directory of {@link PersonCard}s (name + when you last talked + how many open
- * commitments and known facts) is the spine; picking a card opens the SAME
- * self-contained {@link EntityDetailComponent} panel the /graph page uses (its
- * neighborhood + backlinked meetings + connected entities) — no graph is rebuilt
- * here, the detail component is reused verbatim.
+ * commitments and known facts) is the spine; picking a card opens the structured
+ * {@link PersonDossierComponent} pane — a glanceable, deterministic, egress-free
+ * dossier (mentioning-meeting timeline + who-owes-what commitments + bitemporal
+ * facts + co-occurring neighbours) assembled from the gated DB, no cloud call.
  *
  * Lock-awareness (mirrors GraphComponent): `listPeople()` returns ONLY visible
  * people with visible-only counts, so we re-fetch whenever {@link FoldersService}'s
@@ -31,7 +31,7 @@ import { EntityDetailComponent } from "../graph/entity-detail.component";
   selector: "app-people",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [EntityDetailComponent],
+  imports: [PersonDossierComponent],
   template: `
     <section class="people">
       <header class="p-head">
@@ -150,7 +150,7 @@ import { EntityDetailComponent } from "../graph/entity-detail.component";
           </ul>
 
           @if (selectedId(); as id) {
-            <app-entity-detail
+            <app-person-dossier
               class="p-detail"
               [entityId]="id"
               (select)="onSelect($event)"
@@ -332,7 +332,7 @@ export class PeopleComponent {
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
 
-  /** The selected person id — opens the reused entity-detail panel. */
+  /** The selected person id — opens the structured person-dossier pane. */
   readonly selectedId = signal<string | null>(null);
 
   protected readonly total = computed(() => this.people().length);
