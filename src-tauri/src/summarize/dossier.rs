@@ -19,6 +19,8 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Result;
 use crate::facts::Fact;
 use crate::storage::models::{Commitment, EntityNeighbor, GraphEntity, VaultSource};
@@ -43,7 +45,8 @@ fn budget_for(provider_id: &str) -> usize {
 /// Db reads — a sealed-not-unlocked meeting contributes nothing. The `corpus` is the
 /// citation-tagged note material (each meeting headed `### [[Title]] · date · id:`), ready to feed
 /// a provider (cloud command) or hand to an MCP client (egress-free) for synthesis.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DossierData {
     pub entity: GraphEntity,
     /// Visible meetings mentioning this entity (newest first), as `[[Title]]` citation chips.
@@ -58,6 +61,11 @@ pub struct DossierData {
     /// by `list_facts_visible` — a sealed-not-unlocked meeting's facts are absent.
     pub facts: Vec<Fact>,
     /// Citation-tagged note corpus, each meeting headed `### [[Title]] · date · id:`.
+    /// `#[serde(skip)]`: an internal synthesis input (the largest field — full visible note bodies)
+    /// consumed only by `render_dossier_user`/`format_dossier_client` via direct field access. It
+    /// NEVER crosses IPC — the structured FE render (`get_person_dossier`) needs only
+    /// entity/meetings/commitments/neighbors/facts. `String: Default` satisfies the skip on deser.
+    #[serde(skip)]
     pub corpus: String,
 }
 
