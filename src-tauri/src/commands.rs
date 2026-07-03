@@ -3319,6 +3319,26 @@ pub fn save_config(
     config: AppConfigDto,
 ) -> Result<(), AppError> {
     save_config_inner(state.inner(), config)?;
+    // Enforce the cap immediately when a save leaves auto-prune ON with a cap set (e.g. the
+    // user just lowered the limit). Best-effort; the config lock is already released. Runs
+    // BEFORE `restart_voice_listener` (which consumes `app`) so `app.emit` stays valid.
+    let (limit_gb, auto) = match state.config.lock() {
+        Ok(c) => (c.audio_storage_limit_gb, c.audio_auto_prune),
+        Err(_) => (None, false),
+    };
+    if let Ok(dir) = crate::pipeline::audio_dir() {
+        if let Ok(s) = crate::storage::usage::maybe_prune(&state.db, &dir, limit_gb, auto, None) {
+            if s.freed_bytes > 0 {
+                let _ = app.emit(
+                    crate::events::EVENT_STORAGE_PRUNED,
+                    crate::events::StoragePrunedPayload {
+                        freed_bytes: s.freed_bytes,
+                        pruned_count: s.pruned_count,
+                    },
+                );
+            }
+        }
+    }
     // Reconcile the voice-trigger listener with the new config (AppHandle-dependent; runs after
     // the config lock is released by `save_config_inner`).
     restart_voice_listener(app);

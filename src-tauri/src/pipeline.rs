@@ -384,6 +384,31 @@ async fn run_inner(
         }
     }
 
+    // Storage retention (opt-in): if the user set a cap + enabled auto-prune, delete the
+    // OLDEST recordings' audio to stay under it — never THIS recording (excluded), never a
+    // locked folder's, never notes/transcripts. Best-effort: a prune error never fails the
+    // recording.
+    match crate::storage::usage::maybe_prune(
+        &state.db,
+        &wav_dir,
+        config.audio_storage_limit_gb,
+        config.audio_auto_prune,
+        Some(meeting_id),
+    ) {
+        Ok(s) if s.freed_bytes > 0 => {
+            tracing::info!(target: "storage", freed = s.freed_bytes, count = s.pruned_count, "auto-pruned old recordings to stay under the storage cap");
+            let _ = app.emit(
+                crate::events::EVENT_STORAGE_PRUNED,
+                crate::events::StoragePrunedPayload {
+                    freed_bytes: s.freed_bytes,
+                    pruned_count: s.pruned_count,
+                },
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(target: "storage", error = %e, "auto-prune failed (non-fatal)"),
+    }
+
     // ── 2 + 3. Transcribe EACH stream separately, then MERGE by wall-clock ────
     emit_status(app, "transcribing", "Transcribing audio…", meeting_id);
 
