@@ -2107,9 +2107,13 @@ export class LibraryComponent implements OnInit {
 
   /**
    * A finalized recording whose audio was freed to save space (audio gone, note kept).
-   * A locked meeting's path points at its `.enc` (non-null), so this is prune-specific.
+   * NEVER a locked/sealed meeting: a masked read can surface `audioPath: null`, and
+   * prune excludes every `folders.locked = 1` folder — so mirror that exclusion here
+   * (`node.locked`) rather than mislabel a sealed meeting as "audio freed".
    */
   isAudioFreed(m: Meeting): boolean {
-    return m.audioPath === null && m.status !== "ERROR";
+    if (m.audioPath !== null || m.status === "ERROR") return false;
+    const node = m.folderId ? this.folderById().get(m.folderId) : undefined;
+    return !node?.locked;
   }
 }

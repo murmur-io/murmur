@@ -1256,11 +1256,19 @@ export class SettingsStore {
       voiceprintEnabled: v.voiceprintEnabled,
       aecEnabled: v.aecEnabled,
       postAecEnabled: v.postAecEnabled,
-      // Recording-storage cap: the form control is a STRING → a positive number, or
-      // null when blank (= no cap). Opt-in auto-prune rides every save like the other flags.
-      audioStorageLimitGb: v.audioStorageLimitGb.trim()
-        ? Number(v.audioStorageLimitGb)
-        : null,
+      // Recording-storage cap: the form control is a STRING. Clamp to ≥1 GB — blank /
+      // 0 / negative / NaN → null (no cap). A 0 must NEVER be sent: an in-session prune
+      // with limit 0 would delete every non-locked recording's audio, and AppConfig::load
+      // filters n>0 so a persisted 0 silently becomes "no cap" on restart (asymmetric).
+      // Opt-in auto-prune rides every save like the other flags.
+      audioStorageLimitGb: (() => {
+        const n = Math.floor(Number(v.audioStorageLimitGb));
+        return v.audioStorageLimitGb.trim() !== "" &&
+          Number.isFinite(n) &&
+          n >= 1
+          ? n
+          : null;
+      })(),
       audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,

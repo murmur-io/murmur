@@ -90,6 +90,8 @@ export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
 export const EVENT_REINDEX = "murmur://reindex-embeddings";
 // Phase D — on-device PERSON-name NER (redaction) model download progress stream.
 export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
+// Recording-storage: an AUTO-prune freed ≥1 old recording's audio to stay under the cap.
+export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -1043,6 +1045,16 @@ export class IpcService {
   onLiveCaption(cb: (text: string) => void): Promise<UnlistenFn> {
     return listen<{ text: string }>(EVENT_LIVE_CAPTION, (e) =>
       cb(e.payload.text),
+    );
+  }
+
+  /** Fires after an AUTO-prune removed ≥1 old recording's audio to stay under the storage cap. */
+  onStoragePruned(
+    cb: (p: { freedBytes: number; prunedCount: number }) => void,
+  ): Promise<UnlistenFn> {
+    return listen<{ freedBytes: number; prunedCount: number }>(
+      EVENT_STORAGE_PRUNED,
+      (e) => cb(e.payload),
     );
   }
 
