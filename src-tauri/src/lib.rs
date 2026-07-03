@@ -222,6 +222,21 @@ pub fn run() {
                 ));
             }
 
+            // Crash-recovery: a session that died mid-record (crash / SIGKILL / `tauri dev`
+            // hot-rebuild) never ran `stop_recording`, so the meeting row `start_recording` inserted
+            // up-front sits in the library forever as a `RECORDING` "ghost". Flip every such stuck row
+            // to the terminal `ERROR` state so it renders honestly (no spinner, no phantom live row).
+            // ORDERING IS LOAD-BEARING: a future crash-salvage stage (task: mic spill) must claim the
+            // far-side scratch WAV BEFORE the reaper below deletes it, so the launch order is
+            // salvage → reconcile → reap. Reconcile therefore stays ABOVE the reaper/sweep; when
+            // salvage lands it goes ABOVE this reconcile.
+            {
+                let state = app.state::<AppState>();
+                if let Err(e) = state.db.reconcile_stuck_recordings() {
+                    tracing::warn!(target: "startup", error = %e, "could not reconcile stuck recordings");
+                }
+            }
+
             // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
             // (crash / force-quit / a `tauri dev` hot-rebuild SIGKILLing the app mid-record). Such a
             // helper reparents to launchd and keeps capturing to a temp WAV for up to 4h — GBs of
