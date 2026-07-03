@@ -65,11 +65,21 @@ npx ng lint
 echo "── ng build ──"
 npx ng build
 
-echo "── headless core E2E (say → ffmpeg → Whisper → provider → Obsidian) ──"
-bash scripts/e2e-core.sh
+# ── Headless audio E2E. Heavy + host-specific: it needs `say` (macOS TTS), ffmpeg, and a
+#    ~142 MB whisper model download (e2e-core.sh) — and cloud PR runners have no signed
+#    provider. `MURMUR_CI_SKIP_E2E=1` skips ONLY these two steps (everything above still runs),
+#    so the GitHub Actions per-PR `gate` job reuses THIS script as the single source of truth
+#    instead of duplicating the command list. Default (unset) = full local behavior, unchanged.
+#    The full E2E still runs locally and in the CI `full-gate` job (weekly + on-demand). ──
+if [ "${MURMUR_CI_SKIP_E2E:-0}" = "1" ]; then
+  echo "── headless E2E: SKIPPED (MURMUR_CI_SKIP_E2E=1) — run the full gate locally or via the CI full-gate job ──"
+else
+  echo "── headless core E2E (say → ffmpeg → Whisper → provider → Obsidian) ──"
+  bash scripts/e2e-core.sh
 
-echo "── headless mixing E2E (mic + system → mixed transcript, both sides) ──"
-bash scripts/e2e-mix.sh
+  echo "── headless mixing E2E (mic + system → mixed transcript, both sides) ──"
+  bash scripts/e2e-mix.sh
+fi
 
 echo
 echo "✅ CI: all gates green"
