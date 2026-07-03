@@ -27,7 +27,16 @@ If contributions are made in the course of employment, the **employer** signs a 
 ## How to sign
 
 - **Preferred (once wired):** the `cla-assistant` GitHub App will prompt You to sign once on Your first PR.
-- **Interim:** add `Signed-off-by: Your Name <your@email>` (DCO) to Your commits **and** state in the PR that You agree to this CLA.
+- **Interim (for now):** a contributor records their agreement in the **Signatories** table below (via a PR, or on the maintainer's behalf with their written OK) — one line, covering **all past and future** contributions.
+
+## Signatories
+
+Adding a row here means: *"I agree to this CLA, and it covers all of my past and future contributions to Murmur."*
+
+| Name | GitHub | Date | Scope |
+|---|---|---|---|
+| Jakub Gawroński | @JakubGawr | 2026-07-03 | rights holder / maintainer |
+| _Łukasz Świerlikowski_ | _@LukeSwierlik_ | _pending_ | _all past + future contributions_ |
 
 ---
 *Adapted from the Apache Software Foundation ICLA v2.0 (https://www.apache.org/licenses/icla.pdf) and the CCLA v1.0. Grafana and GitLab use the same pattern to combine AGPL/open-source with a commercial license.*
