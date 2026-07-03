@@ -944,6 +944,70 @@ export interface PersonCard {
   currentFactCount: number;
 }
 
+/**
+ * One OPEN action-item "commitment" rolled up across the library, with its meeting
+ * context. Mirrors the Rust `Commitment` (camelCase via `#[serde(rename_all)]`).
+ * Produced by the deterministic gated aggregation — only OPEN (`- [ ]`) items from
+ * VISIBLE meetings contribute, so a sealed-not-unlocked meeting yields nothing.
+ */
+export interface Commitment {
+  meetingId: string;
+  meetingTitle: string;
+  /** ISO 8601 meeting start (recency ordering + the [[Title]] context). */
+  startedAt: string;
+  /** The item owner (name), or null when unattributed. */
+  owner: string | null;
+  /** The due date (as written in the note), or null. */
+  dueDate: string | null;
+  text: string;
+}
+
+/**
+ * One persisted bitemporal FACT row about an entity. Mirrors the Rust `Fact`
+ * (camelCase via `#[serde(rename_all)]`). `validTo == null` ⇒ CURRENTLY valid (the
+ * present state); a non-null `validTo` ⇒ CLOSED/superseded at that instant (history —
+ * the fact is never deleted, only closed). GATED like the rest of the dossier: a
+ * sealed-not-unlocked source meeting's facts never surface.
+ */
+export interface Fact {
+  id: string;
+  entityId: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  /** Valid-time start — when the fact became true (the source meeting's time). */
+  validFrom: string;
+  /** Valid-time end — null while currently valid, set when superseded. */
+  validTo: string | null;
+  /** Transaction time — when the reconcile run recorded it. */
+  recordedAt: string;
+  /** The meeting the fact was derived from (gating + purge anchor); null for legacy rows. */
+  meetingId: string | null;
+  confidence: number;
+}
+
+/**
+ * The structured, GATED, egress-free person dossier for the `/people` detail pane
+ * (`getPersonDossier`). Mirrors the Rust `DossierData` (camelCase) field-for-field
+ * EXCEPT `corpus`: that field is `#[serde(skip)]` on the backend (the full note
+ * bodies are a synthesis-only input that NEVER crosses IPC), so there is deliberately
+ * NO `corpus` field here. Assembled DETERMINISTICALLY from the encrypted DB with NO
+ * provider/cloud call. Every list is visibility-gated — a sealed-and-not-session-
+ * unlocked meeting contributes nothing (its meeting, commitments, and facts stay
+ * invisible) until the folder is session-unlocked.
+ */
+export interface DossierData {
+  entity: GraphEntity;
+  /** Visible meetings mentioning this entity, newest first (the mention timeline). */
+  meetings: VaultSource[];
+  /** Open commitments tied to this entity (a mentioning meeting's item OR owner-name match). */
+  commitments: Commitment[];
+  /** Top co-occurring neighbour entities (shared visible meetings). */
+  neighbors: EntityNeighbor[];
+  /** Visible bitemporal facts (open + recently-closed), newest first. */
+  facts: Fact[];
+}
+
 export interface AskVaultResult {
   answer: string;
   sources: VaultSource[];
