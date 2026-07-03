@@ -161,13 +161,15 @@ pub struct AppConfig {
     /// by the purpose-built `consent_to_cloud_egress` / `revoke_cloud_egress` commands, so flipping
     /// it either way is an explicit, auditable user act.
     pub cloud_egress_consented: bool,
-    /// brain2 RAG Phase 2b — master gate for the on-device semantic (vector) retrieval layer.
-    /// Default OFF (`#[serde(default)]` ⇒ a config persisted before this field existed loads as
-    /// `false`). When OFF, NOTHING in the vector path runs: no chunk indexing on note creation, the
-    /// Ask-My-Vault corpus stays pure FTS, and the MCP `search_semantic` tool reports "disabled" —
-    /// so shipping this changes NOTHING vs today. It is wired ON only once a real embedding model
-    /// (Phase 2c) replaces the stub; until then the only embedder is the deterministic `StubEmbedder`.
-    #[serde(default)]
+    /// brain2 RAG Tier 1 — master gate for the on-device semantic (vector) retrieval layer.
+    /// Default ON (`#[serde(default = "default_true")]` ⇒ a config persisted before this field existed
+    /// loads as `true`). SAFE to default on: when the e5 model is PRESENT, note chunks auto-index on
+    /// creation and Ask / MCP `search_semantic` / related-meetings use hybrid FTS+vector retrieval;
+    /// when the model is ABSENT (the common fresh-install state) `should_auto_index` stays false and
+    /// every retrieval leg DEGENERATES to the same gated FTS as before — so default-on changes NOTHING
+    /// for a model-less install and only lights up once the user downloads e5. The Settings opt-out
+    /// persists (a stored `false` is honored across reload; see `semantic_flag_off_round_trips`).
+    #[serde(default = "default_true")]
     pub semantic_search_enabled: bool,
     /// brain2 RAG Phase 2 — the SELECTED on-device embedding model id (from
     /// [`crate::embed::EMBED_MODELS`], e.g. `"multilingual-e5-small"` (default) / `"mmlw-retrieval-e5-small"`).
@@ -344,7 +346,7 @@ impl Default for AppConfig {
             lock_require_biometric: true,
             relock_on_screenshare: true,
             cloud_egress_consented: false,
-            semantic_search_enabled: false,
+            semantic_search_enabled: true,
             embed_model_id: None,
             brain_model_path: None,
             brain_model_id: None,
@@ -862,16 +864,18 @@ mod tests {
         assert!(cfg.relock_on_screenshare);
         // E10 cloud-egress consent is fail-closed (OFF) until explicitly granted.
         assert!(!cfg.cloud_egress_consented);
-        // Phase 2b semantic search is OFF by default — shipping it changes nothing.
-        assert!(!cfg.semantic_search_enabled);
+        // Tier 1: semantic search defaults ON; graceful FTS fallback until the e5 model is downloaded.
+        assert!(cfg.semantic_search_enabled);
     }
 
-    /// A config persisted before `semantic_search_enabled` existed (key absent from both the JSON
-    /// DTO and the settings table) must load with the flag defaulting to `false` — `#[serde(default)]`
-    /// for the JSON path, the missing-key fallthrough for the settings-table path. Proves the
-    /// prod-safe default for existing installs.
+    /// TIER 1: a config whose JSON omits `semantic_search_enabled` now loads it as `true`
+    /// (`#[serde(default = "default_true")]` for the JSON path), and an empty settings DB loads the ON
+    /// struct default. The forward-compat path matches the struct default so old payloads pick up the
+    /// new default. NOTE: an existing install that already PERSISTED `false` (any prior Settings save
+    /// wrote the key) keeps FTS-only until re-enabled — reaching that installed base is a deliberate,
+    /// reversible follow-up (a guarded one-time settings flip), intentionally NOT shipped in this change.
     #[test]
-    fn missing_semantic_flag_defaults_off() {
+    fn missing_semantic_flag_defaults_on() {
         // JSON path: deserialize a payload that omits the field entirely.
         let json = r#"{
             "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
@@ -884,11 +888,11 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(!cfg.semantic_search_enabled, "serde default must be false");
+        assert!(cfg.semantic_search_enabled, "serde default must be true");
 
-        // Settings-table path: an empty DB (no key written) loads false.
+        // Settings-table path: an empty DB (no key written) loads the ON struct default.
         let db = temp_db();
-        assert!(!AppConfig::load(&db).unwrap().semantic_search_enabled);
+        assert!(AppConfig::load(&db).unwrap().semantic_search_enabled);
     }
 
     #[test]
@@ -1013,6 +1017,20 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    /// TIER 1 default-on: an EXPLICIT opt-out (a stored `false`) must PERSIST across reload — a user
+    /// who turns semantic search off stays off despite the new default-true. The critical new
+    /// regression that keeps default-on from being a footgun.
+    #[test]
+    fn semantic_flag_off_round_trips() {
+        let db = temp_db();
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert!(!AppConfig::load(&db).unwrap().semantic_search_enabled);
     }
 
     #[test]
