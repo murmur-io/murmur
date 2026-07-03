@@ -89,6 +89,9 @@ Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/
   - starting, iterating, or debugging the dev app → **`tauri-dev`**
   - shipping a feature or a bug fix → **`ship-feature`**
   - a "should we / can we / how would we add X" question → **`research`**
-- **Agents** (`.claude/agents/`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `murmur-researcher` — dispatch as subagents; the implementer never owns the verdict.
+  - running / understanding / debugging the CI gate (`scripts/ci.sh` + GitHub Actions) → **`ci-maintenance`**
+  - adding or changing a check in the CI gate → **`add-ci-gate`**
+  - writing / tuning a GitHub Actions workflow → **`github-actions`**
+- **Agents** (`.claude/agents/`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `ci-cd-engineer` (designs & maintains CI — the local `scripts/ci.sh` gate + the GitHub Actions macOS PR-gate that wraps it; CD/notarized release stays with `release-engineer`), `murmur-researcher` — dispatch as subagents; the implementer never owns the verdict.
 
 When a task is multi-step (a feature, a refactor, a release), reach for the **Workflow tool** and let an independent **adversarial-verifier** own the verdict.
