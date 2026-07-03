@@ -44,6 +44,11 @@ use crate::settings::{AppConfig, BrainBackend};
 pub const CONN_LOCAL: &str = "local";
 /// Reasoner-only connection id: no model — the deterministic [`crate::reason::StubReasoner`] floor.
 pub const CONN_OFF: &str = "off";
+/// Reasoner-only connection id (WS2, EXPERIMENTAL): the on-device Apple Foundation Models brain
+/// ([`crate::reason::afm`]) via the `meetnotes-afm` sidecar. ON-DEVICE like [`CONN_LOCAL`] — it
+/// builds no `SummarizerProvider` and is auto-excluded from the cloud agentic loop (see
+/// [`RoleTarget::is_reasoner_only`]); falls back to the stub when the sidecar is absent.
+pub const CONN_AFM: &str = "apple";
 
 /// Human-facing display name for a connection id — for USER-VISIBLE status lines
 /// (e.g. the pipeline's "Summarizing with …" line). Mirrors the FE connection
@@ -56,6 +61,7 @@ pub fn connection_display_name(connection: &str) -> &str {
         "ollama" => "Ollama",
         "gateway" => "Kong AI Gateway",
         CONN_LOCAL => "the on-device model",
+        CONN_AFM => "Apple Intelligence (on-device)",
         other => other,
     }
 }
@@ -95,10 +101,15 @@ pub struct RoleTarget {
 }
 
 impl RoleTarget {
-    /// `true` when this target is served by a [`crate::reason::LocalReasoner`] only (`local`/
-    /// `off`) — it can never build a `SummarizerProvider`, and the agentic loops don't run on it.
+    /// `true` when this target is served by a [`crate::reason::LocalReasoner`] only (`local`/`off`/
+    /// `apple`) — it can never build a `SummarizerProvider`, and the cloud agentic loops don't run
+    /// on it. Including `apple` here is what auto-excludes the on-device Apple Foundation Models
+    /// backend from the cloud agentic-eligibility gate AND makes `provider_for` refuse to build a
+    /// cloud provider for an explicit `apple` role key — both correct, both free.
     pub fn is_reasoner_only(&self) -> bool {
-        self.connection == CONN_LOCAL || self.connection == CONN_OFF
+        self.connection == CONN_LOCAL
+            || self.connection == CONN_OFF
+            || self.connection == CONN_AFM
     }
 }
 
@@ -176,6 +187,14 @@ fn legacy_brain_target(cfg: &AppConfig) -> RoleTarget {
         },
         BrainBackend::Off => RoleTarget {
             connection: CONN_OFF.to_string(),
+            model: String::new(),
+            effort: String::new(),
+        },
+        // WS2 — the on-device Apple Foundation Models reasoner. Model/effort are empty (the sidecar
+        // pins `SystemLanguageModel.default`), so a `role_*_connection = "apple"` key ALSO routes to
+        // AFM automatically via the explicit_target path — per-role AFM steering falls out for free.
+        BrainBackend::AppleFoundation => RoleTarget {
+            connection: CONN_AFM.to_string(),
             model: String::new(),
             effort: String::new(),
         },
@@ -284,7 +303,12 @@ mod tests {
                 _ => "",
             };
             let notes_want = target(provider_id, legacy_model, "high");
-            for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            for backend in [
+                BrainBackend::Cloud,
+                BrainBackend::Local,
+                BrainBackend::Off,
+                BrainBackend::AppleFoundation,
+            ] {
                 let cfg = legacy_cfg(provider_id, backend);
                 // Notes ignores brain_backend entirely.
                 assert_eq!(resolve(Role::Notes, &cfg), notes_want, "{provider_id}/{backend:?}");
@@ -293,6 +317,7 @@ mod tests {
                     BrainBackend::Cloud => notes_want.clone(),
                     BrainBackend::Local => target(CONN_LOCAL, "bielik-11b-v3", ""),
                     BrainBackend::Off => target(CONN_OFF, "", ""),
+                    BrainBackend::AppleFoundation => target(CONN_AFM, "", ""),
                 };
                 for role in [Role::Ask, Role::Live] {
                     assert_eq!(
@@ -352,7 +377,13 @@ mod tests {
     /// identical for every backend (the RED/GREEN proof for the gate swap).
     #[test]
     fn reasoner_only_matches_legacy_cloud_gate_under_fallback() {
-        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+        // AppleFoundation is reasoner-only ⇒ the cloud agentic gate is CLOSED for it (like Local/Off).
+        for backend in [
+            BrainBackend::Cloud,
+            BrainBackend::Local,
+            BrainBackend::Off,
+            BrainBackend::AppleFoundation,
+        ] {
             let cfg = legacy_cfg("claude_code", backend);
             let legacy_gate_open = backend == BrainBackend::Cloud;
             for role in [Role::Ask, Role::Live] {
@@ -371,7 +402,12 @@ mod tests {
     #[test]
     fn provider_target_is_default_triple_under_fallback_for_all_backends() {
         for provider_id in ["claude_code", "anthropic", "ollama", "gateway"] {
-            for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            for backend in [
+                BrainBackend::Cloud,
+                BrainBackend::Local,
+                BrainBackend::Off,
+                BrainBackend::AppleFoundation,
+            ] {
                 let cfg = legacy_cfg(provider_id, backend);
                 let want = legacy_default_target(&cfg);
                 for role in [Role::Notes, Role::Ask, Role::Live] {
@@ -405,7 +441,12 @@ mod tests {
     /// from `provider_id` instead would cloud-dispatch an Off/Local install's pre-analysis.
     #[test]
     fn reasoner_target_maps_brain_backend_for_all_roles_under_fallback() {
-        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+        for backend in [
+            BrainBackend::Cloud,
+            BrainBackend::Local,
+            BrainBackend::Off,
+            BrainBackend::AppleFoundation,
+        ] {
             let cfg = legacy_cfg("claude_code", backend);
             let want = legacy_brain_target(&cfg);
             for role in [Role::Notes, Role::Ask, Role::Live] {
@@ -436,6 +477,44 @@ mod tests {
         assert_eq!(Role::Live.as_str(), "live");
         assert!(target(CONN_LOCAL, "", "").is_reasoner_only());
         assert!(target(CONN_OFF, "", "").is_reasoner_only());
+        assert!(target(CONN_AFM, "", "").is_reasoner_only());
         assert!(!target("claude_code", "", "").is_reasoner_only());
+    }
+
+    /// WS2 — the AppleFoundation backend maps to the on-device AFM reasoner-only target across all
+    /// three resolution views, is auto-excluded from the cloud agentic gate, renders a human display
+    /// name, and is reachable BOTH via `brain_backend = AppleFoundation` (legacy path) AND via an
+    /// explicit `role_*_connection = "apple"` key (explicit path).
+    #[test]
+    fn apple_foundation_maps_to_afm_reasoner_only() {
+        let want = target(CONN_AFM, "", "");
+
+        // (a) brain_backend = AppleFoundation → CONN_AFM for the reasoner + resolve views (Ask/Live).
+        let cfg = AppConfig {
+            brain_backend: BrainBackend::AppleFoundation,
+            ..AppConfig::default()
+        };
+        assert_eq!(legacy_brain_target(&cfg), want);
+        for role in [Role::Ask, Role::Live] {
+            assert_eq!(resolve(role, &cfg), want, "{role:?}");
+            assert_eq!(reasoner_target(role, &cfg), want, "{role:?}");
+            // The cloud agentic-eligibility gate (commands.rs) auto-excludes AFM like Local/Off.
+            assert!(resolve(role, &cfg).is_reasoner_only(), "{role:?} must be reasoner-only");
+        }
+
+        // (b) A human-facing display name (never the raw token) — mirrors the FE label.
+        assert_eq!(connection_display_name(CONN_AFM), "Apple Intelligence (on-device)");
+        assert_ne!(connection_display_name(CONN_AFM), CONN_AFM);
+
+        // (c) An EXPLICIT per-role `apple` key also routes to AFM and stays reasoner-only (the
+        // provider factory then refuses to build a cloud provider for it — is_reasoner_only == true).
+        let explicit = AppConfig {
+            role_ask_connection: "apple".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(resolve(Role::Ask, &explicit), want);
+        assert_eq!(reasoner_target(Role::Ask, &explicit), want);
+        assert!(provider_target(Role::Ask, &explicit).is_reasoner_only());
+        assert_eq!(provider_target(Role::Ask, &explicit).connection, CONN_AFM);
     }
 }

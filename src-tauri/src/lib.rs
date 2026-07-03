@@ -169,6 +169,7 @@ pub fn run() {
             commands::list_brain_models,
             commands::select_brain_model,
             commands::download_brain_model,
+            commands::afm_available,
             commands::embed_model_present,
             commands::list_embed_models,
             commands::select_embed_model,
