@@ -140,10 +140,19 @@ impl VoiceActionResult {
         VoiceActionResult::new(
             "unknown",
             "nothing_heard",
-            "Nie usłyszałem polecenia — kliknij i powiedz jeszcze raz.",
+            "I didn't hear a command — click and say it again.",
         )
     }
 }
+
+/// The honest notice surfaced when a RAG floor request found VISIBLE vault matches but NO AI model
+/// is available to SYNTHESIZE an answer — i.e. the active reasoner is the deterministic
+/// [`crate::reason::StubReasoner`] (`id() == "stub"`: brain backend Off, or Local with no GGUF
+/// downloaded yet). The stub's `reason()` returns a DIAGNOSTIC ECHO, never an answer; surfacing that
+/// echo as the assistant's reply is a bug, so the floor returns THIS message + keeps the gated
+/// citations (still useful) under a non-"ok" status the FE renders as a non-answer notice.
+const NO_MODEL_ANSWER_NOTICE: &str = "No AI model is available to answer — showing matching notes \
+    instead. Pick a provider or download an on-device model in Settings.";
 
 /// Dispatch one parsed [`VoiceIntent`] over the GATED vault + consent-gated brain. Synchronous (the
 /// live loop spawns it off-thread) and PANIC-FREE: every fallible step degrades to a graceful
@@ -511,6 +520,26 @@ fn rag_answer(
             "ok",
             format!("I couldn't find anything in your vault about \"{display_query}\"."),
         );
+    }
+
+    // STUB-SHIM (the floor): no real brain is available to SYNTHESIZE an answer. The active reasoner
+    // is the deterministic `StubReasoner` (`id() == "stub"`: backend Off, or Local with no GGUF
+    // downloaded), whose `reason()` returns a DIAGNOSTIC ECHO ("[stub-reason] system=… user=…"),
+    // NEVER an answer — surfacing that echo as the reply reads like a broken answer. Mirror the exact
+    // `reasoner.id() == "stub"` guard the note-context floor uses (`orchestrate.rs`): do NOT call
+    // `reason()`, return an HONEST notice + KEEP the gated citations (still useful), under a non-"ok"
+    // status the FE already renders as a non-answer notice. Placed AFTER grounding so the useful
+    // citations are still surfaced; the visible-only citation set was built above.
+    if reasoner.id() == "stub" {
+        return VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "unavailable".to_string(),
+            summary: NO_MODEL_ANSWER_NOTICE.to_string(),
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+        };
     }
 
     // The brain may now ground its answer on BOTH the user's vault notes AND any web results. The
@@ -1037,6 +1066,62 @@ mod tests {
         assert!(
             !res.citations.iter().any(|c| c.contains("Secret")),
             "SEALED meeting must NOT be cited"
+        );
+    }
+
+    /// RED-before-GREEN (adversarial bug 2026-07-04): on the DETERMINISTIC FLOOR (brain backend Off,
+    /// or Local with no GGUF downloaded), `ReasonerCell` dispatches the `StubReasoner`, whose
+    /// `reason()` returns a DIAGNOSTIC ECHO ("[stub-reason] system=… user=…"). Before the fix, with
+    /// non-empty vault grounding this echo became the `summary` under status "ok" and rendered in the
+    /// FE thread as the assistant's ANSWER — a broken-looking reply. The floor MUST NOT surface the
+    /// stub echo: it returns an honest "no model available" notice (non-"ok" status) while KEEPING
+    /// the gated citations. RED on the old code (summary == the "[stub-reason] …" echo, status "ok").
+    #[test]
+    fn floor_with_stub_reasoner_never_surfaces_stub_echo() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db); // gives a VISIBLE "Atlas Kickoff" note ⇒ non-empty grounding.
+        let stub = crate::reason::StubReasoner;
+        let res = handle_voice_action(
+            &VoiceIntent::Research { topic: "Atlas".into() },
+            &stub,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            None,
+        );
+
+        // THE BUG: the stub's diagnostic echo must NEVER become the assistant's answer.
+        assert!(
+            !res.summary.contains("[stub-reason]"),
+            "stub echo leaked as the answer: {}",
+            res.summary
+        );
+        assert!(
+            !res.summary.contains("stub-reason"),
+            "no stub-echo shape may surface: {}",
+            res.summary
+        );
+        // Honest, non-"ok" status the FE renders as a non-answer notice (reused: the SlackSearch arm's
+        // "unavailable" — an existing VoiceActionStatus already rendered on the FE).
+        assert_eq!(res.status, "unavailable", "stub floor must be a non-'ok' notice, not an answer");
+        assert!(
+            res.summary.contains("No AI model is available"),
+            "the honest notice must be surfaced: {}",
+            res.summary
+        );
+        // The gated citations are still useful and MUST be kept (VISIBLE meeting only).
+        assert!(
+            res.citations.contains(&"[[Atlas Kickoff]]".to_string()),
+            "the visible-only citations must be preserved: {:?}",
+            res.citations
+        );
+        // ...and the SEALED meeting stays out of the citations even on the stub floor.
+        assert!(
+            !res.citations.iter().any(|c| c.contains("Secret")),
+            "SEALED meeting must NOT be cited on the stub floor: {:?}",
+            res.citations
         );
     }
 
