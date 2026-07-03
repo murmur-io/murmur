@@ -42,7 +42,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   // Stage-2 hub: Brain & AI + Providers collapsed into ONE section (keywords merged).
   { id: "ai", label: "AI & Models", keywords: "provider assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake anthropic ollama claude code gateway openai api key availability binary default consent revoke privacy egress" },
   { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet" },
-  { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop" },
+  { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
 ];

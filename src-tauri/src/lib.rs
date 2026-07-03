@@ -145,6 +145,7 @@ pub fn run() {
             commands::link_meeting_entities,
             commands::get_graph,
             commands::get_entity_detail,
+            commands::list_people,
             commands::ask_vault,
             commands::entity_dossier,
             commands::generate_digest,

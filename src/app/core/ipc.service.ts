@@ -36,6 +36,7 @@ import type {
   ModelDownloadProgress,
   NerDownloadProgress,
   NoteDto,
+  PersonCard,
   PinResult,
   UserMemory,
   ProviderStatus,
@@ -400,6 +401,19 @@ export class IpcService {
   /** Detail for one entity: the entity + its visible backlinked meetings + top neighbors. */
   getEntityDetail(entityId: string): Promise<EntityDetail> {
     return invoke<EntityDetail>("get_entity_detail", { entityId });
+  }
+
+  /**
+   * The `/people` personal-CRM list: one {@link PersonCard} per VISIBLE Person
+   * entity (name + last-talked + open-commitment / fact counts), rolled up over
+   * the SAME gated graph/facts/commitment readers as {@link getGraph}. GATED
+   * server-side — a person whose mentions/facts/commitments live solely in
+   * sealed-not-unlocked meetings never appears, and every count reflects visible
+   * sources only — so re-fetch on a FoldersService lock-state change to shift the
+   * list live (mirrors {@link getGraph}). Each `id` links to the entity detail.
+   */
+  listPeople(): Promise<PersonCard[]> {
+    return invoke<PersonCard[]>("list_people");
   }
 
   // ── brain2 — the Brain page "what's in my brain" overview ──────────────
