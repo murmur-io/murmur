@@ -25,6 +25,7 @@ import type {
   ChatTurn,
   DigestResult,
   DocumentInfo,
+  DossierData,
   EntityDetail,
   Folder,
   FolderNode,
@@ -416,6 +417,21 @@ export class IpcService {
    */
   listPeople(): Promise<PersonCard[]> {
     return invoke<PersonCard[]>("list_people");
+  }
+
+  /**
+   * The STRUCTURED, egress-free person dossier for the `/people` detail pane: the
+   * entity + its mentioning-meeting TIMELINE + open COMMITMENTS (who-owes-what) +
+   * bitemporal FACTS (open + recently-closed) + co-occurring NEIGHBOURS, assembled
+   * DETERMINISTICALLY from the gated DB with NO cloud call (unlike the cloud-
+   * synthesizing `entity_dossier`). GATED server-side exactly like
+   * {@link getEntityDetail}: a sealed-and-not-session-unlocked meeting contributes
+   * nothing, and an unknown / sealed-only id REJECTS (InvalidArg) — so re-fetch on
+   * the entity id change (and, upstream, on a FoldersService lock-state change) to
+   * shift content live. The note-body `corpus` is serde-skipped and never crosses IPC.
+   */
+  getPersonDossier(entityId: string): Promise<DossierData> {
+    return invoke<DossierData>("get_person_dossier", { entityId });
   }
 
   // ── brain2 — the Brain page "what's in my brain" overview ──────────────
