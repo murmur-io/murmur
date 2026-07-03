@@ -5,7 +5,7 @@
 //! Murmur ships THREE retrieval legs over one vault: keyword **FTS** (`Db::search_visible`),
 //! on-device **semantic** vector KNN (`Db::search_semantic_visible`), and their **hybrid** RRF fusion
 //! (`embed::rrf_fuse`). Which one — and which embedding model ([`crate::embed::EMBED_MODELS`]:
-//! multilingual-e5-small vs mmlw-e5-small) — actually retrieves the right meetings for a real (often
+//! multilingual-e5-small vs mmlw-retrieval-e5-small) — actually retrieves the right meetings for a real (often
 //! Polish) query can ONLY be answered empirically. This module is that measurement: given a labeled
 //! set and a [`crate::embed::Embedder`], it runs all three modes and reports **recall@k**, **nDCG@k**,
 //! and **MRR** per mode so a human can pick the winner on a Mac.
