@@ -18,6 +18,7 @@ import type {
 import { FoldersService } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
 import { BrainMapComponent } from "./brain-map.component";
+import { BrainMemoryComponent } from "./brain-memory.component";
 import { BrainNoteEditorComponent } from "./brain-note-editor.component";
 import { BrainSourceCardComponent } from "./brain-source-card.component";
 
@@ -76,6 +77,7 @@ interface FolderOption {
     BrainSourceCardComponent,
     BrainNoteEditorComponent,
     BrainMapComponent,
+    BrainMemoryComponent,
   ],
   template: `
     <section class="brain">
@@ -317,6 +319,9 @@ interface FolderOption {
           }
         }
       </section>
+
+      <!-- 4 — MEMORY: "what the brain knows about you" (collapsible) --------- -->
+      <app-brain-memory />
 
       @if (noteEditorOpen()) {
         <app-brain-note-editor

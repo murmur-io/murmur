@@ -373,7 +373,33 @@ impl Db {
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );
              CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity_id);
-             CREATE INDEX IF NOT EXISTS idx_facts_meeting ON facts(meeting_id);",
+             CREATE INDEX IF NOT EXISTS idx_facts_meeting ON facts(meeting_id);
+             -- CROSS-MEETING USER MEMORY (Phase 3). The SAME bitemporal shape as `facts`
+             -- (subject·predicate·object with valid_from/valid_to — invalidate-not-delete via
+             -- reconcile) but USER-SCOPED, not entity-scoped: these are durable facts/preferences/
+             -- commitments about the USER accumulated across ALL meetings (prefers Polish replies,
+             -- works on Project Atlas, deadline Q3 = 15.09). Deliberately a SEPARATE table (no
+             -- entity FK) so the entity-graph fact reads (`list_facts_visible`) can NEVER surface a
+             -- user fact and vice-versa. `meeting_id` is the provenance + gating + purge anchor:
+             -- user facts are DERIVED content tied to the meeting they were learned from, so — exactly
+             -- like `facts` / `note_chunks` / `correction_log` — they are PURGED on seal in the same
+             -- atomic tx (`purge_user_facts_tx`) and every USER-FACING read is visibility-gated
+             -- (`list_user_facts_visible`). FK CASCADE on meeting_id so a deleted meeting drops its
+             -- user facts too. NULL meeting_id (legacy/imperative-without-source) reads back as NOT
+             -- visible (fail-closed via the INNER JOIN in the gated reader).
+             CREATE TABLE IF NOT EXISTS user_facts (
+               id TEXT PRIMARY KEY,
+               subject TEXT NOT NULL,
+               predicate TEXT NOT NULL,
+               object TEXT NOT NULL,
+               valid_from TEXT NOT NULL,
+               valid_to TEXT,
+               recorded_at TEXT NOT NULL,
+               meeting_id TEXT,
+               confidence REAL NOT NULL DEFAULT 1.0,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_user_facts_meeting ON user_facts(meeting_id);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -1445,6 +1471,12 @@ impl Db {
         // drop them in the SAME seal tx so a sealed meeting contributes no fact — same purge-on-seal
         // contract as corrections / chunks / assistant interactions.
         Self::purge_facts_tx(&tx, meeting_ids)?;
+        // Phase 3 CROSS-MEETING USER MEMORY: user-scoped facts are DERIVED content tied to the source
+        // meeting (plaintext at rest); drop them in the SAME seal tx so a sealed meeting contributes
+        // no user memory — identical purge-on-seal contract as `facts` above. The injected brief is
+        // derived data (never sealed) → the next read regenerates it from the remaining VISIBLE
+        // sources only (design spec D3).
+        Self::purge_user_facts_tx(&tx, meeting_ids)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -1460,6 +1492,26 @@ impl Db {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM facts WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3 CROSS-MEETING USER MEMORY LOCK-SAFETY: delete every `user_facts` row derived from
+    /// `meeting_ids` within an EXISTING transaction, so the purge lands in the SAME atomic unit as
+    /// the plaintext blanking on a seal (and on `delete_meeting` / the startup reconcile). User facts
+    /// are plaintext-derived (subject · predicate · object) memory that mirrors a meeting; a sealed
+    /// meeting must surface NOTHING and inject NOTHING, so — exactly like `facts` / `correction_log`
+    /// / `note_chunks` / `assistant_interactions` — we DELETE rather than key-seal. Dropped by design
+    /// and not recoverable (never keyed); the underlying transcript is still sealed + restorable, and a
+    /// later re-summarize re-derives user facts. The (derived) memory brief is regenerated on the
+    /// next read from the remaining VISIBLE user facts only.
+    fn purge_user_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM user_facts WHERE meeting_id = ?1",
                 rusqlite::params![mid],
             )
             .map_err(map_err)?;
@@ -3126,6 +3178,15 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
+        // Phase 3 CROSS-MEETING USER MEMORY LOCK-SAFETY: purge user-scoped facts for every meeting in
+        // a locked folder, in this same reconciliation transaction — so a crash-while-unlocked (which
+        // may have re-derived user memory against a since-sealed meeting) cannot leave plaintext user
+        // facts at rest after a restart. Same purge-on-seal contract as `facts` above.
+        tx.execute(
+            &format!("DELETE FROM user_facts WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
         // brain2 realtime notes LOCK-SAFETY: re-blank the typed-notes plaintext of every meeting in a
         // locked folder ONLY WHERE its `manual_notes_blob` exists (the sealed copy is present) — so a
         // crash-while-unlocked (which restored the plaintext) cannot leave typed plaintext at rest
@@ -4480,6 +4541,154 @@ impl Db {
         }
         Ok(out)
     }
+
+    // ── CROSS-MEETING USER MEMORY (Phase 3) ────────────────────────────────────
+    //
+    // User facts reuse the bitemporal `crate::facts::{Fact, FactOp}` shape and the PURE deterministic
+    // `reconcile_facts` core, but persist to the SEPARATE `user_facts` table (no entity FK). In the
+    // in-memory `Fact`/`NewFact` the `entity_id` field carries the USER-SCOPE SENTINEL
+    // (`crate::user_memory::USER_SCOPE`) so `reconcile_facts` keys on `(sentinel, subject, predicate)`
+    // — it is the reconcile key only, NOT a stored column. LOCK MODEL: `user_facts_all` is the
+    // INTERNAL un-gated reconcile input (pipeline-only, before any seal can hide rows, like
+    // `facts_for_entities`); every USER-FACING read goes through `list_user_facts_visible`, and a
+    // sealed meeting's user facts are PURGED on seal (`purge_user_facts_tx`).
+
+    /// ALL user facts (open + closed) — the reconcile input. INTERNAL: the un-gated lifecycle read
+    /// (the pipeline reconciles before any seal can hide rows), NOT a user-facing surface. Rows are
+    /// hydrated into `crate::facts::Fact` with `entity_id` set to the user-scope sentinel so the pure
+    /// `reconcile_facts` keys them correctly. Newest-recorded last (stable reconcile order).
+    pub fn user_facts_all(&self) -> Result<Vec<crate::facts::Fact>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, subject, predicate, object, valid_from, valid_to, recorded_at, \
+                        meeting_id, confidence \
+                   FROM user_facts ORDER BY recorded_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_user_fact).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Apply a batch of reconcile [`crate::facts::FactOp`]s to `user_facts` in ONE atomic transaction:
+    /// INSERT each `Add`, set `valid_to` on each `Invalidate` (only if still open — idempotent), skip
+    /// `NoOp`. A fresh UUID is minted per Add. The `entity_id` on an Add op is the user-scope sentinel
+    /// and is NOT persisted (there is no entity column). The whole batch commits or rolls back
+    /// together, so a crash mid-apply never leaves a half-reconciled store.
+    pub fn apply_user_fact_ops(&self, ops: &[crate::facts::FactOp]) -> Result<()> {
+        use crate::facts::FactOp;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        for op in ops {
+            match op {
+                FactOp::Add(nf) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    tx.execute(
+                        "INSERT INTO user_facts \
+                           (id, subject, predicate, object, valid_from, valid_to, \
+                            recorded_at, meeting_id, confidence) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+                        rusqlite::params![
+                            id,
+                            nf.subject,
+                            nf.predicate,
+                            nf.object,
+                            nf.valid_from,
+                            nf.recorded_at,
+                            nf.meeting_id,
+                            nf.confidence,
+                        ],
+                    )
+                    .map_err(map_err)?;
+                }
+                FactOp::Invalidate { id, valid_to } => {
+                    tx.execute(
+                        "UPDATE user_facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
+                        rusqlite::params![id, valid_to],
+                    )
+                    .map_err(map_err)?;
+                }
+                FactOp::NoOp => {}
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED read: the CURRENTLY-VALID (open) user facts whose SOURCE meeting is VISIBLE, newest
+    /// valid_from first. Visibility uses the SAME predicate as every other graph/MCP read
+    /// (`visibility_clause`): a user fact is visible iff its source meeting has a visible note (or no
+    /// note yet). A row with a NULL `meeting_id` is NOT visible — the INNER JOIN to `meetings` drops
+    /// it (fail-closed). This is the single user-facing user-fact read: it feeds BOTH the audit view
+    /// (`get_user_memory`) AND the injected memory brief, so a sealed-and-not-session-unlocked
+    /// meeting's user facts surface NOTHING and are injected into NO prompt. Only OPEN facts
+    /// (`valid_to IS NULL`) are returned — a forgotten/superseded fact is closed and excluded.
+    pub fn list_user_facts_visible(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::facts::Fact>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT uf.id, uf.subject, uf.predicate, uf.object, uf.valid_from, \
+                    uf.valid_to, uf.recorded_at, uf.meeting_id, uf.confidence \
+               FROM user_facts uf \
+               JOIN meetings m ON m.id = uf.meeting_id \
+              WHERE uf.valid_to IS NULL \
+                AND ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              ORDER BY uf.valid_from DESC, uf.id DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_user_fact).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// FORGET one user fact by id (bitemporal INVALIDATE, never a silent delete): close the row at
+    /// `at` if it is still open. Idempotent (a already-closed row is untouched). History is preserved
+    /// — the fact simply stops being current, so it drops out of `list_user_facts_visible` and the
+    /// regenerated brief. Returns `true` iff a row was closed by this call.
+    pub fn forget_user_fact(&self, id: &str, at: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE user_facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
+                rusqlite::params![id, at],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    /// CLEAR all user memory: bitemporal-close EVERY currently-open user fact at `at` (invalidate,
+    /// never delete — closed history stays for the record). After this the brief regenerates empty and
+    /// the audit view is empty. Returns the number of facts closed.
+    pub fn clear_user_facts(&self, at: &str) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE user_facts SET valid_to = ?1 WHERE valid_to IS NULL",
+                rusqlite::params![at],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
 }
 
 /// Collision-proof unique temp path for file-backed tests.
@@ -4642,6 +4851,25 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
         recorded_at: row.get(7)?,
         meeting_id: row.get(8)?,
         confidence: row.get(9)?,
+    })
+}
+
+/// Map a `user_facts` row (column order: id, subject, predicate, object, valid_from, valid_to,
+/// recorded_at, meeting_id, confidence — NO entity column) to a [`crate::facts::Fact`], stamping the
+/// user-scope sentinel into `entity_id` so the pure `reconcile_facts` keys the row correctly. The
+/// sentinel is a reconcile key only, never persisted.
+fn row_to_user_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
+    Ok(crate::facts::Fact {
+        id: row.get(0)?,
+        entity_id: crate::user_memory::USER_SCOPE.to_string(),
+        subject: row.get(1)?,
+        predicate: row.get(2)?,
+        object: row.get(3)?,
+        valid_from: row.get(4)?,
+        valid_to: row.get(5)?,
+        recorded_at: row.get(6)?,
+        meeting_id: row.get(7)?,
+        confidence: row.get(8)?,
     })
 }
 
@@ -7816,6 +8044,148 @@ mod lock_tests {
             .unwrap();
         db.delete_meeting("m1").unwrap();
         assert!(db.facts_for_entities(&[atlas]).unwrap().is_empty(), "FK CASCADE drops facts");
+    }
+
+    // ── Phase 3 CROSS-MEETING USER MEMORY: persistence + reconcile + gating + forget + purge ──
+
+    fn user_add_op(predicate: &str, object: &str, valid_from: &str, meeting_id: &str) -> FactOp {
+        FactOp::Add(NewFact {
+            entity_id: crate::user_memory::USER_SCOPE.to_string(),
+            subject: "You".to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: valid_from.to_string(),
+            recorded_at: valid_from.to_string(),
+            confidence: 1.0,
+            meeting_id: Some(meeting_id.to_string()),
+        })
+    }
+
+    /// ROUND-TRIP persist/reconcile (task C5.ii): apply an open user fact; a later reconcile of a
+    /// CHANGED object for the SAME predicate closes the old (valid_to set) and opens the new — both
+    /// rows survive (bitemporal history), and only the current one is visible. RED-before-GREEN:
+    /// without the Invalidate UPDATE two open rows survive, failing the single-open assertion.
+    #[test]
+    fn user_facts_apply_and_reconcile_round_trips() {
+        let db = file_db("user-facts-roundtrip");
+        seed_note(&db, "m1", "note", None);
+        db.apply_user_fact_ops(&[user_add_op("prefer", "English replies", "2026-06-01T00:00:00Z", "m1")])
+            .unwrap();
+
+        // A later meeting supersedes the preference: prefer = Polish replies.
+        seed_note(&db, "m2", "note2", None);
+        let existing = db.user_facts_all().unwrap();
+        assert_eq!(existing.len(), 1);
+        let cands = vec![FactCandidate {
+            entity_id: crate::user_memory::USER_SCOPE.to_string(),
+            subject: "You".to_string(),
+            predicate: "prefer".to_string(),
+            object: "Polish replies".to_string(),
+            confidence: 1.0,
+        }];
+        let at = "2026-06-20T00:00:00Z";
+        let mut ops = crate::facts::reconcile_facts(&existing, &cands, at);
+        crate::facts::set_meeting_id(&mut ops, "m2");
+        db.apply_user_fact_ops(&ops).unwrap();
+
+        let all = db.user_facts_all().unwrap();
+        assert_eq!(all.len(), 2, "history preserved — old user fact kept, not overwritten");
+        let open: Vec<_> = all.iter().filter(|f| f.valid_to.is_none()).collect();
+        assert_eq!(open.len(), 1, "exactly one currently-valid user fact");
+        assert_eq!(open[0].object, "Polish replies");
+
+        // The gated read returns only the OPEN, VISIBLE fact.
+        let visible = db.list_user_facts_visible(&HashSet::new()).unwrap();
+        assert_eq!(visible.len(), 1, "only the current preference is visible");
+        assert_eq!(visible[0].object, "Polish replies");
+        assert_eq!(visible[0].meeting_id.as_deref(), Some("m2"), "provenance = the source meeting");
+    }
+
+    /// GATE (task C5.i, DB layer): a user fact whose source meeting is sealed-and-not-unlocked is
+    /// INVISIBLE and reappears once the folder is session-unlocked. Uses set_folder_locked directly
+    /// (NOT lock_folder) so the row survives at rest — this proves the READ GATE, independent of the
+    /// purge-on-seal. RED-before-GREEN: drop the meetings-JOIN visibility predicate → the sealed user
+    /// fact leaks into the audit view AND the brief.
+    #[test]
+    fn list_user_facts_visible_excludes_sealed_meeting() {
+        let db = file_db("user-facts-gate");
+        seed_folder(&db, "f-lock", "Secret");
+        seed_note(&db, "secret1", "private", Some("f-lock"));
+        db.apply_user_fact_ops(&[user_add_op("salary", "confidential", "2026-06-01T00:00:00Z", "secret1")])
+            .unwrap();
+
+        assert_eq!(db.list_user_facts_visible(&HashSet::new()).unwrap().len(), 1);
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        assert!(
+            db.list_user_facts_visible(&HashSet::new()).unwrap().is_empty(),
+            "a sealed-not-unlocked meeting's user facts must not surface (gate violation)"
+        );
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert_eq!(
+            db.list_user_facts_visible(&unlocked).unwrap().len(),
+            1,
+            "user facts reappear once the folder is session-unlocked"
+        );
+    }
+
+    /// FORGET (task C5.iii): forget_user_fact bitemporally CLOSES the row (never deletes) so it drops
+    /// out of the gated read; a second forget is a no-op. clear_user_facts closes ALL open facts.
+    #[test]
+    fn forget_and_clear_user_facts() {
+        let db = file_db("user-facts-forget");
+        seed_note(&db, "m1", "note", None);
+        db.apply_user_fact_ops(&[
+            user_add_op("prefer", "Polish", "2026-06-01T00:00:00Z", "m1"),
+            user_add_op("role", "PM", "2026-06-01T00:00:00Z", "m1"),
+        ])
+        .unwrap();
+        let visible = db.list_user_facts_visible(&HashSet::new()).unwrap();
+        assert_eq!(visible.len(), 2);
+        let target = visible[0].id.clone();
+
+        // Forget one → it is closed and drops out.
+        assert!(db.forget_user_fact(&target, "2026-06-02T00:00:00Z").unwrap(), "closed one open fact");
+        assert!(!db.forget_user_fact(&target, "2026-06-02T00:00:00Z").unwrap(), "re-forget is a no-op");
+        let after = db.list_user_facts_visible(&HashSet::new()).unwrap();
+        assert_eq!(after.len(), 1, "the forgotten fact drops out of the gated read");
+        assert!(after.iter().all(|f| f.id != target));
+        // The row still EXISTS (closed, not deleted) — history preserved.
+        assert_eq!(db.user_facts_all().unwrap().len(), 2, "forget is an invalidate, not a delete");
+
+        // Clear all → nothing visible; every open fact closed.
+        let n = db.clear_user_facts("2026-06-03T00:00:00Z").unwrap();
+        assert_eq!(n, 1, "one remaining open fact closed");
+        assert!(db.list_user_facts_visible(&HashSet::new()).unwrap().is_empty(), "no user memory after clear");
+    }
+
+    /// PURGE-ON-SEAL (task C2.a, DB layer): the same atomic seal tx that purges facts also DELETES the
+    /// meeting's user facts (purge_user_facts_tx). RED-before-GREEN: without the purge_user_facts_tx
+    /// call the user-fact row survives the seal at rest.
+    #[test]
+    fn seal_purges_user_facts() {
+        let db = file_db("user-facts-purge");
+        seed_note(&db, "m1", "note", None);
+        db.apply_user_fact_ops(&[user_add_op("prefer", "Polish", "2026-06-01T00:00:00Z", "m1")])
+            .unwrap();
+        assert_eq!(db.user_facts_all().unwrap().len(), 1);
+        // The seal purge (chunks + corrections + assistant interactions + facts + USER facts) in one tx.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert!(
+            db.user_facts_all().unwrap().is_empty(),
+            "user facts must be purged on seal (drop-on-seal, like facts / note_chunks)"
+        );
+    }
+
+    /// delete_meeting cascades to user_facts (FK ON DELETE CASCADE).
+    #[test]
+    fn delete_meeting_cascades_to_user_facts() {
+        let db = file_db("user-facts-cascade");
+        seed_note(&db, "m1", "note", None);
+        db.apply_user_fact_ops(&[user_add_op("prefer", "Polish", "2026-06-01T00:00:00Z", "m1")])
+            .unwrap();
+        db.delete_meeting("m1").unwrap();
+        assert!(db.user_facts_all().unwrap().is_empty(), "FK CASCADE drops user facts");
     }
 }
 

@@ -1191,6 +1191,70 @@ pub(crate) fn delete_document_inner(state: &AppState, id: &str) -> Result<(), Ap
     Ok(())
 }
 
+// ── CROSS-MEETING USER MEMORY (Phase 3) ────────────────────────────────────────
+//
+// The auditable "what the brain knows about you" surface: list the current user-scoped memory facts
+// (with provenance), forget one, or clear all. Every read is VISIBILITY-GATED — a user fact whose
+// SOURCE meeting is sealed-and-not-session-unlocked is INVISIBLE here (and injected into no prompt),
+// because `list_user_facts_visible` filters by source-meeting `visibility_clause` on the live
+// unlocked snapshot. Forget/clear are bitemporal INVALIDATE (close valid_to), never a silent delete.
+
+/// List the current user-memory facts (open + visible) with provenance, plus the synthesized brief
+/// that is injected into grounding. GATED: only facts whose SOURCE meeting is visible under the live
+/// unlocked snapshot are returned — a sealed-not-unlocked meeting's user memory surfaces NOTHING.
+#[tauri::command]
+pub fn get_user_memory(state: State<'_, AppState>) -> Result<crate::user_memory::UserMemory, AppError> {
+    get_user_memory_inner(state.inner())
+}
+
+/// Inner of [`get_user_memory`] taking `&AppState` (unit-testable gate).
+pub(crate) fn get_user_memory_inner(
+    state: &AppState,
+) -> Result<crate::user_memory::UserMemory, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    let facts = state.db.list_user_facts_visible(&unlocked)?;
+    // The audit view and the injected brief are derived from EXACTLY the same visible set, so the UI
+    // faithfully mirrors what the brain actually injects.
+    let brief = crate::user_memory::synthesize_brief(&facts);
+    let dtos = facts
+        .iter()
+        .map(crate::user_memory::UserMemoryFact::from_fact)
+        .collect();
+    Ok(crate::user_memory::UserMemory { facts: dtos, brief })
+}
+
+/// Forget ONE user-memory fact (bitemporal invalidate — the row is CLOSED, never silently deleted,
+/// so history is preserved). After this the fact drops out of `get_user_memory` and the regenerated
+/// brief. Idempotent. Content-free logging (the fact id only, never its text).
+#[tauri::command]
+pub fn forget_user_fact(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    forget_user_fact_inner(state.inner(), &id)
+}
+
+/// Inner of [`forget_user_fact`] taking `&AppState` (unit-testable).
+pub(crate) fn forget_user_fact_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    let at = chrono::Utc::now().to_rfc3339();
+    let closed = state.db.forget_user_fact(id, &at)?;
+    tracing::info!(target: "user_memory", fact_id = %id, closed, "user fact forgotten (invalidated)");
+    Ok(())
+}
+
+/// Clear ALL user memory: bitemporal-close every currently-open user fact (invalidate, never delete —
+/// closed history stays). After this `get_user_memory` and the brief are empty. Content-free logging
+/// (a count only).
+#[tauri::command]
+pub fn clear_user_memory(state: State<'_, AppState>) -> Result<(), AppError> {
+    clear_user_memory_inner(state.inner())
+}
+
+/// Inner of [`clear_user_memory`] taking `&AppState` (unit-testable).
+pub(crate) fn clear_user_memory_inner(state: &AppState) -> Result<(), AppError> {
+    let at = chrono::Utc::now().to_rfc3339();
+    let n = state.db.clear_user_facts(&at)?;
+    tracing::info!(target: "user_memory", count = n, "user memory cleared (all facts invalidated)");
+    Ok(())
+}
+
 /// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
 #[tauri::command]
 pub fn search_meetings(
@@ -1840,6 +1904,15 @@ pub async fn build_and_persist_entities(
         tracing::warn!(target: "facts", error = %e, "fact reconcile failed (note unaffected)");
     }
 
+    // Phase 3 CROSS-MEETING USER MEMORY — extract → reconcile → apply USER-SCOPED facts (preferences,
+    // ongoing work, commitments about the USER) from the note + the user's own typed notes. Same
+    // BEST-EFFORT + NEVER-fails-the-note contract as the entity facts above: empty with the stub / no
+    // model, a hiccup is logged (non-PII) and swallowed. Runs even with zero entities (user memory is
+    // not entity-scoped).
+    if let Err(e) = persist_user_facts_for_meeting(state, meeting_id, title, markdown) {
+        tracing::warn!(target: "user_memory", error = %e, "user-fact reconcile failed (note unaffected)");
+    }
+
     // Sink B — vault [[ ]] stubs, ONLY when a vault is configured AND the meeting's folder is
     // NOT sealed on disk. Disk-truth `locked` (not session `unlocked`): a session-unlock must
     // never re-write encrypted-content stubs back to plaintext on disk.
@@ -1913,6 +1986,51 @@ fn persist_facts_for_meeting(
     // 4) Stamp the source meeting (gating + purge anchor) and apply atomically.
     crate::facts::set_meeting_id(&mut ops, meeting_id);
     state.db.apply_fact_ops(&ops)?;
+    Ok(())
+}
+
+/// Phase 3 CROSS-MEETING USER MEMORY — extract → reconcile → apply USER-SCOPED facts for one
+/// summarized meeting. Mirrors [`persist_facts_for_meeting`] but for the user, not entities:
+///   1. BEST-EFFORT extract user·predicate·object candidates from the note + the user's own typed
+///      notes (empty with the stub / no model — the deterministic core is what carries the value),
+///   2. load the EXISTING user facts (un-gated lifecycle read — reconcile runs before any seal),
+///   3. run the PURE deterministic [`crate::facts::reconcile_facts`] at the meeting's time (the
+///      user-scope sentinel in `entity_id` keys the reconcile),
+///   4. stamp the source meeting onto the Add ops and apply them to `user_facts` in ONE atomic tx.
+///
+/// The (derived) memory brief is regenerated lazily on the next read/turn — no cache to invalidate.
+fn persist_user_facts_for_meeting(
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<(), AppError> {
+    // The user's OWN typed notes for this meeting are the highest-signal memory source (an explicit
+    // "remember that…"). Empty when none (best-effort read).
+    let typed_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
+    // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner is
+    //    re-resolved from the LIVE config so a consent/backend change applies without restart.
+    let candidates = crate::user_memory::extract_user_fact_candidates(
+        &*state.reasoner.current_for(crate::summarize::roles::Role::Notes),
+        title,
+        markdown,
+        &typed_notes,
+    );
+    if candidates.is_empty() {
+        return Ok(()); // nothing to reconcile — common in the default (no-model) build.
+    }
+    // 2) Existing user facts (all of them — the reconcile input).
+    let existing = state.db.user_facts_all()?;
+    // 3) Deterministic reconcile at the meeting's time (valid-time origin).
+    let at = state
+        .db
+        .get_meeting(meeting_id)?
+        .map(|m| m.started_at)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let mut ops = crate::facts::reconcile_facts(&existing, &candidates, &at);
+    // 4) Stamp the source meeting (gating + purge anchor) and apply atomically.
+    crate::facts::set_meeting_id(&mut ops, meeting_id);
+    state.db.apply_user_fact_ops(&ops)?;
     Ok(())
 }
 
@@ -3209,6 +3327,12 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
         // `cloud_egress_consented` (preserved-only), this one is settable.
         semantic_search_enabled: d.semantic_search_enabled,
+        // brain2 RAG Phase 2: the SELECTED embedder id is NOT carried on the settings DTO — it is
+        // owned exclusively by the dedicated `select_embed_model` command (which validates the id and
+        // reports whether a re-index is needed). Preserve the live value, so a generic settings save
+        // can never change (or clear) the embedder. Mirrors the `cloud_egress_consented` preserve-only
+        // discipline.
+        embed_model_id: current.embed_model_id.clone(),
         // Phase H (custom GGUF): a CUSTOM brain model file path IS carried on the settings DTO (the
         // "Custom GGUF model" input, camelCase `brainModelPath`). Unlike `brain_model_id` there is NO
         // registry validation — it is a local file path, stored VERBATIM. An empty/absent value clears
@@ -4094,6 +4218,88 @@ pub async fn download_brain_model(
 #[tauri::command]
 pub fn embed_model_present() -> Result<bool, AppError> {
     Ok(crate::embed::embed_model_present())
+}
+
+/// The bundled selectable embedders (multilingual-e5-small default + mmlw-e5-small), each with
+/// `downloaded` (files present in its own subdir) and `selected` (mirrors the persisted
+/// `embed_model_id`). Feeds the embedder picker. No content read / no egress — static metadata +
+/// on-disk existence only.
+#[tauri::command]
+pub fn list_embed_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::embed::EmbedModelDto>, AppError> {
+    let selected = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.embed_model_id.clone()
+    };
+    Ok(crate::embed::embed_model_dtos(selected.as_deref()))
+}
+
+/// Result of [`select_embed_model`]. `reindex_needed` is `true` when the selection actually CHANGED
+/// the resolved model (so its old vectors are stale — a different model's embeddings are not
+/// comparable): the FE should prompt the user to run `reindex_embeddings` (and download the new
+/// model first via `download_embed_model` if `!embed_model_present()`). Counts/flags only — no PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectEmbedModelResult {
+    pub selected: String,
+    pub reindex_needed: bool,
+    pub model_present: bool,
+}
+
+/// Persist the user's SELECTED on-device embedding model id. Validates `model_id` against the
+/// registry (unknown ⇒ `AppError::InvalidArg`) and saves it to config; `AppConfig::save` republishes
+/// the process-global selection so `embed::active_embedder`/`embed_model_present`/`download_embed_model`
+/// pick up the new model with NO restart. Switching the model INVALIDATES existing vectors (a
+/// different model's embeddings are not comparable), so `reindex_needed` is `true` when the resolved
+/// model actually changed — the FE then prompts the user to download (if missing) + re-index. All
+/// bundled options are BERT/384 ⇒ NO `vec0` schema migration. Does NOT download and does NOT auto-
+/// reindex (both are explicit user actions).
+#[tauri::command]
+pub fn select_embed_model(
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<SelectEmbedModelResult, AppError> {
+    select_embed_model_inner(&state, model_id)
+}
+
+/// Testable core of [`select_embed_model`]: validate the id, compute whether the resolved model
+/// changed, persist it. No `AppHandle`, so it runs headless.
+fn select_embed_model_inner(
+    state: &AppState,
+    model_id: String,
+) -> Result<SelectEmbedModelResult, AppError> {
+    let model = crate::embed::embed_model_by_id(&model_id)
+        .ok_or_else(|| AppError::InvalidArg(format!("unknown embed model id: {model_id}")))?;
+
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+
+    // The PREVIOUS resolved model id (None/empty/unknown ⇒ the default) — the re-index trigger keys
+    // on a real change of the resolved model, not merely a config-string write.
+    let prev_resolved = c
+        .embed_model_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(crate::embed::embed_model_by_id)
+        .map(|m| m.id)
+        .unwrap_or(crate::embed::DEFAULT_EMBED_MODEL_ID);
+    let reindex_needed = prev_resolved != model.id;
+
+    c.embed_model_id = Some(model.id.to_string());
+    c.save(&state.db)?; // republishes the process-global selection.
+    drop(c);
+
+    Ok(SelectEmbedModelResult {
+        selected: model.id.to_string(),
+        reindex_needed,
+        model_present: crate::embed::embed_model_present(),
+    })
 }
 
 /// Download the multilingual-e5-small model (3 HF files) into the shared models dir, INBOUND-ONLY,
@@ -7912,6 +8118,47 @@ mod lifecycle_tests {
             state.config.lock().unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
+    }
+
+    /// `select_embed_model` validates the id, PERSISTS it, and reports `reindex_needed` only when the
+    /// resolved model actually CHANGED (a different model's vectors are stale). Unknown id ⇒
+    /// `InvalidArg` with the selection untouched. Serialized on the embedder-selection global lock;
+    /// restores the default (`None`) at the end so it cannot leak state into parallel tests.
+    #[test]
+    fn select_embed_model_persists_and_flags_reindex() {
+        let _g = crate::embed::EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = build_state("embed-select");
+
+        // Selecting the SAME (default) model as the effective one ⇒ no re-index needed.
+        let res = select_embed_model_inner(&state, "multilingual-e5-small".to_string()).unwrap();
+        assert_eq!(res.selected, "multilingual-e5-small");
+        assert!(!res.reindex_needed, "re-selecting the default must not force a re-index");
+
+        // Switching to mmlw CHANGES the resolved model ⇒ re-index needed; persists + reloads.
+        let res = select_embed_model_inner(&state, "mmlw-e5-small".to_string()).unwrap();
+        assert_eq!(res.selected, "mmlw-e5-small");
+        assert!(res.reindex_needed, "changing the embed model must flag a re-index");
+        assert_eq!(
+            state.config.lock().unwrap().embed_model_id.as_deref(),
+            Some("mmlw-e5-small")
+        );
+        assert_eq!(
+            AppConfig::load(&state.db).unwrap().embed_model_id.as_deref(),
+            Some("mmlw-e5-small")
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged.
+        let err = select_embed_model_inner(&state, "not-a-real-embedder".to_string()).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)));
+        assert_eq!(
+            state.config.lock().unwrap().embed_model_id.as_deref(),
+            Some("mmlw-e5-small")
+        );
+
+        // Restore the default so the shared process-global doesn't leak mmlw into other tests.
+        crate::embed::set_selected_embed_model_id(None);
     }
 
     /// The download-target resolver rejects an unknown id (the exact guard `download_brain_model`
