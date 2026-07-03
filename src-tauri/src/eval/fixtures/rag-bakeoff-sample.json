@@ -1,0 +1,27 @@
+[
+  {
+    "query": "budget planning for the next quarter",
+    "lang": "en",
+    "expected_meeting_ids": ["REPLACE-with-a-real-meeting-id"]
+  },
+  {
+    "query": "planowanie budżetu na następny kwartał",
+    "lang": "pl",
+    "expected_meeting_ids": ["REPLACE-with-a-real-meeting-id"]
+  },
+  {
+    "query": "who owns the API integration deadline",
+    "lang": "en",
+    "expected_meeting_ids": ["REPLACE-with-a-real-meeting-id"]
+  },
+  {
+    "query": "kto odpowiada za termin integracji API",
+    "lang": "pl",
+    "expected_meeting_ids": ["REPLACE-with-a-real-meeting-id", "REPLACE-with-another-id"]
+  },
+  {
+    "query": "decisions from the roadmap review",
+    "lang": "en",
+    "expected_meeting_ids": ["REPLACE-with-a-real-meeting-id"]
+  }
+]

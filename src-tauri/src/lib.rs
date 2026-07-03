@@ -6,6 +6,7 @@ pub mod connectors;
 pub mod crypto;
 pub mod embed;
 pub mod error;
+pub mod eval;
 pub mod events;
 pub mod export;
 pub mod facts;
@@ -23,6 +24,7 @@ pub mod summarize;
 pub mod tools;
 pub mod transcribe;
 pub mod update;
+pub mod user_memory;
 pub mod voice_action;
 
 use tauri::window::{Effect, EffectsBuilder};
@@ -95,6 +97,9 @@ pub fn run() {
             commands::list_documents,
             commands::get_document,
             commands::delete_document,
+            commands::get_user_memory,
+            commands::forget_user_fact,
+            commands::clear_user_memory,
             commands::get_config,
             commands::save_config,
             commands::consent_to_cloud_egress,
@@ -160,6 +165,8 @@ pub fn run() {
             commands::select_brain_model,
             commands::download_brain_model,
             commands::embed_model_present,
+            commands::list_embed_models,
+            commands::select_embed_model,
             commands::download_embed_model,
             commands::reindex_embeddings,
             commands::related_meetings,

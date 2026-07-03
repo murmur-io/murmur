@@ -34,8 +34,10 @@ import type {
   MeetingDetail,
   MeetingTimeline,
   ModelDownloadProgress,
+  NerDownloadProgress,
   NoteDto,
   PinResult,
+  UserMemory,
   ProviderStatus,
   SavedRecipe,
   SearchHit,
@@ -80,6 +82,8 @@ export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
 export const EVENT_REINDEX = "murmur://reindex-embeddings";
+// Phase D — on-device PERSON-name NER (redaction) model download progress stream.
+export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -412,6 +416,39 @@ export class IpcService {
     return invoke<BrainOverview>("brain_overview");
   }
 
+  // ── user memory — "what the brain knows about you" ─────────────────────
+
+  /**
+   * The current user-memory facts (subject/predicate/object + provenance) plus
+   * the synthesized brief that is injected into grounding. GATED server-side:
+   * only facts whose SOURCE meeting is visible under the live unlocked snapshot
+   * are returned — a sealed-not-unlocked meeting's user memory surfaces NOTHING,
+   * so re-fetch on a FoldersService lock-state change to shift the list live
+   * (mirrors {@link brainOverview}).
+   */
+  getUserMemory(): Promise<UserMemory> {
+    return invoke<UserMemory>("get_user_memory");
+  }
+
+  /**
+   * Forget ONE user-memory fact by id (a bitemporal INVALIDATE — the row is
+   * CLOSED, never silently deleted, so history is preserved). After this the
+   * fact drops out of {@link getUserMemory} and the regenerated brief.
+   * Idempotent (an already-closed / unknown id is a no-op).
+   */
+  forgetUserFact(id: string): Promise<void> {
+    return invoke<void>("forget_user_fact", { id });
+  }
+
+  /**
+   * Clear ALL user memory: bitemporally close every currently-open user fact
+   * (invalidate, never delete — closed history stays). After this
+   * {@link getUserMemory} and the brief are empty.
+   */
+  clearUserMemory(): Promise<void> {
+    return invoke<void>("clear_user_memory");
+  }
+
   // ── brain2 documents — expand the brain with imported .md/.txt files ────
 
   /**
@@ -686,6 +723,32 @@ export class IpcService {
    */
   reindexEmbeddings(): Promise<ReindexResult> {
     return invoke<ReindexResult>("reindex_embeddings");
+  }
+
+  // ── Phase D — on-device PERSON-name redaction (NER) model ──────────────
+
+  /**
+   * Whether the on-device PERSON-name NER model (mDeBERTa-v3) is present — i.e.
+   * the redaction firewall additionally masks people's NAMES before any cloud
+   * egress. Cheap existence probe; NEVER errors on a missing models dir. When
+   * false, only emails / card numbers / phone numbers are redacted by default —
+   * names can leave alongside the transcript on a cloud provider. Mirrors
+   * {@link embedModelPresent}.
+   */
+  nerModelPresent(): Promise<boolean> {
+    return invoke<boolean>("ner_model_present");
+  }
+
+  /**
+   * Download the on-device PERSON-name NER model (mDeBERTa-v3, 3 files) into the
+   * shared models dir. Progress streams over {@link onNerDownload}
+   * (EVENT_NER_DOWNLOAD); the promise resolves with the model dir when the
+   * download finishes. INBOUND-ONLY — sends NO meeting content (no egress). The
+   * model is picked up lazily on the next cloud summarization. Mirrors
+   * {@link downloadEmbedModel}.
+   */
+  downloadNerModel(): Promise<string> {
+    return invoke<string>("download_ner_model");
   }
 
   /** Show/hide the floating always-on-top recorder bar window. */
@@ -1023,5 +1086,12 @@ export class IpcService {
   /** Fires with COUNT-only progress for the in-flight semantic reindex backfill. */
   onReindex(cb: (p: ReindexProgress) => void): Promise<UnlistenFn> {
     return listen<ReindexProgress>(EVENT_REINDEX, (e) => cb(e.payload));
+  }
+
+  /** Fires with per-file progress for the in-flight PERSON-name NER model download. */
+  onNerDownload(cb: (p: NerDownloadProgress) => void): Promise<UnlistenFn> {
+    return listen<NerDownloadProgress>(EVENT_NER_DOWNLOAD, (e) =>
+      cb(e.payload),
+    );
   }
 }

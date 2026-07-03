@@ -36,11 +36,12 @@ pub const DIARIZE_EMB_MODEL_FILE: &str = "wespeaker_en_voxceleb_CAM++.onnx";
 /// are multilingual-only (no `.en` variant), so Polish always resolves the full
 /// multilingual `ggml-large-v3.bin`.
 ///
-/// An empty size falls back to the app default (`large-v3`), matching
-/// `AppConfig::default().model_size`.
+/// An empty size falls back to the app default (`small`), matching
+/// `AppConfig::default().model_size` — a RAM-safe default so a config that bypasses onboarding
+/// no longer lands on the ~3 GB `large-v3`. All sizes (incl. `large-v3`) stay selectable.
 pub fn model_filename(size: &str, language: &str) -> String {
     let size = match size.trim() {
-        "" => "large-v3",
+        "" => "small",
         s => s,
     };
     let en_only = language == "en" && matches!(size, "tiny" | "base" | "small" | "medium");
@@ -284,10 +285,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_size_falls_back_to_large_v3_default() {
-        // Mirrors AppConfig::default().model_size.
-        assert_eq!(model_filename("", ""), "ggml-large-v3.bin");
-        assert_eq!(model_filename("   ", "pl"), "ggml-large-v3.bin");
+    fn empty_size_falls_back_to_small_default() {
+        // Mirrors AppConfig::default().model_size — a RAM-safe default (was large-v3, ~3 GB).
+        // For English, the empty-size fallback resolves the multilingual build (no explicit "en").
+        assert_eq!(model_filename("", ""), "ggml-small.bin");
+        assert_eq!(model_filename("   ", "pl"), "ggml-small.bin");
+        // large-v3 stays selectable when explicitly chosen.
+        assert_eq!(model_filename("large-v3", ""), "ggml-large-v3.bin");
     }
 
     #[test]
