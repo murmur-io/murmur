@@ -17,6 +17,7 @@ import type {
   Meeting,
   MeetingStatus,
   SearchHit,
+  StorageReport,
 } from "../../core/models";
 import {
   FoldersService,
@@ -294,6 +295,23 @@ interface SnippetPart {
             @if (!listLoading() && displayedMeetings().length > 0) {
               <span class="count">{{ displayedMeetings().length }}</span>
             }
+            @if (storageReport(); as sr) {
+              @if (sr.limitBytes !== null) {
+                <a
+                  class="storage-chip"
+                  routerLink="/settings"
+                  [attr.data-state]="
+                    storagePct() >= 95 ? 'red' : storagePct() >= 75 ? 'amber' : 'ok'
+                  "
+                  title="Manage recording storage"
+                >
+                  <span class="storage-fill" [style.width.%]="storagePct()"></span>
+                  <span class="storage-label"
+                    >{{ mb(sr.usedBytes) }} / {{ mb(sr.limitBytes) }}</span
+                  >
+                </a>
+              }
+            }
           </header>
 
           @if (listLoading()) {
@@ -448,6 +466,14 @@ interface SnippetPart {
                           <span class="duration">{{
                             formatDuration(m.durationS)
                           }}</span>
+                        }
+                        @if (isAudioFreed(m)) {
+                          <span class="dot" aria-hidden="true">·</span>
+                          <span
+                            class="pill audio-freed"
+                            title="Recording audio was freed to save space — the note is kept"
+                            >audio freed</span
+                          >
                         }
                       </span>
                     </span>
@@ -1101,6 +1127,43 @@ interface SnippetPart {
         margin: 0;
       }
 
+      /* --- Recording-storage usage chip (header, only with a cap set) --- */
+      .storage-chip {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        overflow: hidden;
+        margin-left: auto;
+        padding: 3px var(--space-2);
+        border-radius: var(--radius-pill);
+        background: var(--surface-input);
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        text-decoration: none;
+        min-width: 8rem;
+      }
+      .storage-fill {
+        position: absolute;
+        inset: 0 auto 0 0;
+        background: var(--accent-soft);
+        border-radius: inherit;
+      }
+      .storage-chip[data-state="amber"] .storage-fill {
+        background: color-mix(in srgb, var(--warning, #d9a441) 30%, transparent);
+      }
+      .storage-chip[data-state="red"] .storage-fill {
+        background: color-mix(in srgb, var(--live, #e5484d) 30%, transparent);
+      }
+      .storage-label {
+        position: relative;
+      }
+
+      /* Muted "audio freed" chip on a pruned meeting row. */
+      .audio-freed {
+        font-size: 0.7rem;
+        color: var(--text-muted);
+      }
+
       /* --- Meeting / results list --- */
       .list {
         list-style: none;
@@ -1427,6 +1490,16 @@ export class LibraryComponent implements OnInit {
   readonly meetings = signal<Meeting[]>([]);
   readonly loading = signal(true);
 
+  // --- Recording-storage usage (header chip, only when a cap is set) -------
+  /** Live disk-usage report for the recordings dir (best-effort; null before load / on failure). */
+  readonly storageReport = signal<StorageReport | null>(null);
+  /** % of the cap in use (0..100, clamped); 0 when no cap is set. */
+  readonly storagePct = computed(() => {
+    const r = this.storageReport();
+    if (!r || r.limitBytes == null || r.limitBytes === 0) return 0;
+    return Math.min(100, Math.round((r.usedBytes / r.limitBytes) * 100));
+  });
+
   // --- Folder filter (left pane) ------------------------------------------
   /** The lock-aware folder forest from the signal store. */
   readonly folderTree = this.folders.tree;
@@ -1571,6 +1644,13 @@ export class LibraryComponent implements OnInit {
       this.meetings.set(meetings.value);
     }
     this.loading.set(false);
+    // Recording-storage usage — best-effort; drives the header chip when a cap is set.
+    this.ipc
+      .getStorageReport()
+      .then((r) => this.storageReport.set(r))
+      .catch(() => {
+        /* best-effort: no cap set / backend unavailable → the chip stays hidden */
+      });
   }
 
   /** Fetch the distinct tag set; on failure leave `tags` empty (no filter bar). */
@@ -2016,5 +2096,20 @@ export class LibraryComponent implements OnInit {
       return `${m}m ${s}s`;
     }
     return `${s}s`;
+  }
+
+  /** Human MB/GB label (binary) — matches the Settings → Storage section. */
+  mb(bytes: number): string {
+    if (bytes >= 1024 * 1024 * 1024)
+      return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+    return Math.round(bytes / (1024 * 1024)) + " MB";
+  }
+
+  /**
+   * A finalized recording whose audio was freed to save space (audio gone, note kept).
+   * A locked meeting's path points at its `.enc` (non-null), so this is prune-specific.
+   */
+  isAudioFreed(m: Meeting): boolean {
+    return m.audioPath === null && m.status !== "ERROR";
   }
 }
