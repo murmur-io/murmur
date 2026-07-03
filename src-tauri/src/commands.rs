@@ -128,6 +128,12 @@ pub struct AppConfigDto {
     pub aec_enabled: bool,
     #[serde(default = "default_true")]
     pub post_aec_enabled: bool,
+    /// Recording-storage cap in GB (`None` = no cap). Mirrors `AppConfig::audio_storage_limit_gb`.
+    #[serde(default)]
+    pub audio_storage_limit_gb: Option<u32>,
+    /// Auto-delete oldest recordings' audio over the cap. Opt-in, default false.
+    #[serde(default)]
+    pub audio_auto_prune: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -3413,6 +3419,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         voiceprint_enabled: c.voiceprint_enabled,
         aec_enabled: c.aec_enabled,
         post_aec_enabled: c.post_aec_enabled,
+        audio_storage_limit_gb: c.audio_storage_limit_gb,
+        audio_auto_prune: c.audio_auto_prune,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -3480,6 +3488,11 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         voiceprint_enabled: d.voiceprint_enabled,
         aec_enabled: d.aec_enabled,
         post_aec_enabled: d.post_aec_enabled,
+        // Recording-storage cap + auto-prune ARE settable from the DTO (the Storage UI owns them).
+        // Plain settable fields — an omitted cap deserializes to `None`, auto-prune to `false`
+        // (`#[serde(default)]`), so a partial/older save can never silently enable pruning.
+        audio_storage_limit_gb: d.audio_storage_limit_gb,
+        audio_auto_prune: d.audio_auto_prune,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a
