@@ -2225,6 +2225,34 @@ pub fn get_entity_detail(
         .ok_or_else(|| AppError::InvalidArg(format!("no entity with id {entity_id}")))
 }
 
+/// Structured, GATED, egress-free person dossier for the `/people` detail pane. Unlike
+/// [`entity_dossier`] (which CLOUD-synthesizes a markdown String via the provider and discards the
+/// struct), this returns the STRUCTURED [`DossierData`](crate::summarize::dossier::DossierData) with
+/// NO provider/cloud call — deterministic DB assembly, strictly MORE local-first. Gated exactly like
+/// [`get_entity_detail`]/[`list_people`]: it snapshots the LIVE session unlock set and reuses
+/// `build_dossier_data` VERBATIM, so a sealed-and-not-session-unlocked meeting contributes NOTHING
+/// (its title, note body, commitments, and facts all stay invisible until the folder is
+/// session-unlocked). `corpus` is `#[serde(skip)]`, so meeting note bodies never reach the FE.
+#[tauri::command]
+pub fn get_person_dossier(
+    state: State<'_, AppState>,
+    entity_id: String,
+) -> Result<crate::summarize::dossier::DossierData, AppError> {
+    get_person_dossier_inner(state.inner(), &entity_id)
+}
+
+/// Inner of [`get_person_dossier`] taking `&AppState` (unit-testable gate). `None` — an unknown id
+/// OR an entity visible only through sealed-not-unlocked meetings — maps to `InvalidArg`, mirroring
+/// [`get_entity_detail`] so unknown-vs-sealed-only stays indistinguishable (no existence leak).
+pub(crate) fn get_person_dossier_inner(
+    state: &AppState,
+    entity_id: &str,
+) -> Result<crate::summarize::dossier::DossierData, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    crate::summarize::dossier::build_dossier_data(&state.db, entity_id, &unlocked)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no visible entity with id {entity_id}")))
+}
+
 /// Ask-My-Vault: answer a question across ALL past meetings' notes (grounded, with sources).
 ///
 /// PR G (ask-unify): on the CLOUD brain backend this routes through the SAME model-driven agentic
@@ -7252,6 +7280,102 @@ mod lifecycle_tests {
             created_at: "2026-06-27T08:00:00Z".to_string(),
         })
         .unwrap();
+    }
+
+    /// WS6 (Tier 4b) — the NEW structured, egress-free `get_person_dossier` command inherits the
+    /// dossier visibility gate through `get_person_dossier_inner`: with a folder sealed and NOT
+    /// session-unlocked, its meeting + commitment contribute NOTHING to the dossier, and both reappear
+    /// only once the folder id is inserted into the live `unlocked_folders` set. An unknown entity id
+    /// → `AppError::InvalidArg` (unknown vs sealed-only indistinguishable — no existence leak). This
+    /// is the command-seam mirror of `dossier::build_dossier_gates_sealed_and_filters_commitments`.
+    #[test]
+    fn get_person_dossier_gates_sealed() {
+        let state = build_state("person-dossier");
+        let db = &state.db;
+        make_open_folder(db, "f-lock", "Locked");
+        seed_meeting(db, "open1", "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n", None);
+        seed_meeting(
+            db,
+            "sealedX",
+            "LOCKED Atlas price\n## Action items\n- [ ] Carol — sign 2026-07-09\n",
+            Some("f-lock"),
+        );
+        let atlas = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&atlas, "open1").unwrap();
+        db.add_mention(&atlas, "sealedX").unwrap();
+        db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        // Sealed + not session-unlocked: the sealed meeting + its commitment MUST be invisible.
+        let data = get_person_dossier_inner(&state, &atlas).unwrap();
+        assert!(
+            data.meetings.iter().any(|m| m.meeting_id == "open1"),
+            "the visible mentioning meeting must be present"
+        );
+        assert!(
+            data.meetings.iter().all(|m| m.meeting_id != "sealedX"),
+            "sealed-not-unlocked meeting leaked into the dossier (gate violation)"
+        );
+        assert!(
+            data.commitments.iter().any(|c| c.text.contains("draft Atlas spec")),
+            "the visible commitment must be present"
+        );
+        assert!(
+            data.commitments.iter().all(|c| !c.text.contains("sign")),
+            "sealed-not-unlocked commitment leaked (gate violation)"
+        );
+
+        // Session-unlock the folder → the sealed meeting + its commitment reappear (reversible gate).
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        let data2 = get_person_dossier_inner(&state, &atlas).unwrap();
+        assert!(
+            data2.meetings.iter().any(|m| m.meeting_id == "sealedX"),
+            "session-unlock must reveal the sealed meeting"
+        );
+        assert!(
+            data2.commitments.iter().any(|c| c.text.contains("sign")),
+            "session-unlock must reveal the sealed commitment"
+        );
+
+        // Unknown id → InvalidArg (unknown vs sealed-only indistinguishable; no existence leak).
+        match get_person_dossier_inner(&state, "no-such-entity") {
+            Err(AppError::InvalidArg(_)) => {}
+            other => panic!("unknown entity must be InvalidArg, got {other:?}"),
+        }
+    }
+
+    /// WS6 (Tier 4b) DTO contract lock: the serialized `DossierData` the FE receives exposes
+    /// `entity`/`meetings`/`commitments`/`neighbors`/`facts` in camelCase and OMITS `corpus`
+    /// (`#[serde(skip)]`) — so meeting note bodies never cross IPC. Guards both the FE field contract
+    /// and the leak invariant.
+    #[test]
+    fn get_person_dossier_dto_omits_corpus_and_is_camelcase() {
+        let state = build_state("person-dossier-dto");
+        let db = &state.db;
+        seed_meeting(db, "m-open", "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n", None);
+        let atlas = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&atlas, "m-open").unwrap();
+
+        let data = get_person_dossier_inner(&state, &atlas).unwrap();
+        let v = serde_json::to_value(&data).unwrap();
+        let obj = v.as_object().expect("dossier serializes to a JSON object");
+        for key in ["entity", "meetings", "commitments", "neighbors", "facts"] {
+            assert!(obj.contains_key(key), "DTO must expose `{key}`");
+        }
+        assert!(
+            !obj.contains_key("corpus"),
+            "corpus must be serde-skipped — note bodies must never cross IPC to the FE"
+        );
+        // Nested camelCase the FE consumes (a commitment carries meetingId/meetingTitle/dueDate).
+        let commit = v["commitments"].get(0).expect("the visible commitment must serialize");
+        assert!(commit.get("meetingId").is_some(), "commitment.meetingId must be camelCase");
+        assert!(
+            commit.get("meeting_id").is_none(),
+            "snake_case commitment.meeting_id must not appear"
+        );
     }
 
     /// Add a user-memory fact sourced from `meeting_id` (the gating + purge anchor) for the injection
