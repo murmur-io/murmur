@@ -82,9 +82,99 @@ pub async fn generate(
         "additionalProperties": false
     });
     let v = provider.complete_json(SYSTEM, &transcript, &schema).await?;
-    serde_json::from_value(v).map_err(|e| {
+    let mut tl: MeetingTimeline = serde_json::from_value(v).map_err(|e| {
         crate::error::AppError::Summarize(format!("timeline: invalid JSON shape from provider: {e}"))
-    })
+    })?;
+    // The provider prompt asks it to "cover the whole timeline", but in practice — especially on
+    // SPARSE transcripts with silence gaps, and on smaller/local models — it drops the trailing
+    // segments and ends the timeline far short of the recording (and occasionally overshoots with
+    // a hallucinated endS). Repair deterministically so the derived timeline actually spans the
+    // transcript instead of collapsing into an early cluster.
+    repair_coverage(&mut tl, segments);
+    Ok(tl)
+}
+
+/// Small epsilon (seconds) below which a coverage gap is ignored — avoids extending a span for
+/// sub-second float noise while still catching the real "timeline ends at 0:14 for a 0:45
+/// recording" gap this repairs.
+const COVER_EPS: f64 = 0.25;
+
+/// Deterministically repair an AI-derived timeline so it COVERS the transcript.
+///
+/// The provider tends to (a) drop trailing/sparse segments — leaving the timeline ending well
+/// before the recording does — and occasionally (b) emit a wildly out-of-range `endS`. Both make
+/// the FE's shared scale disagree with the audio player (the "timeline shows only a few seconds of
+/// a 45s recording" bug). We anchor to the LAST TRANSCRIBED SEGMENT — deliberately NOT the raw
+/// recording duration — so a meeting with a genuinely silent tail still lets the FE zoom to the
+/// meaningful content rather than being stretched across dead air. Steps, per track:
+///   1. clamp every span to `[0, content_end]` (kills the hallucinated overshoot + inverted spans),
+///   2. drop spans left degenerate (`end <= start`) after clamping,
+///   3. extend the last (max-`end`) turn/topic to `content_end` when it falls meaningfully short,
+///      so both the speaker lanes and the topic ribbon reach the end of the transcript.
+///
+/// Idempotent (running it twice is a no-op) and pure over `(timeline, segments)`, so it can also
+/// heal a legacy cached timeline when read back, not just freshly-generated ones.
+pub fn repair_coverage(tl: &mut MeetingTimeline, segments: &[Segment]) {
+    let content_end = segments.iter().map(|s| s.end_s).fold(0.0_f64, f64::max);
+    if content_end <= 0.0 {
+        return; // no transcript span to anchor to — leave the timeline untouched.
+    }
+    cover(
+        &mut tl.speakers,
+        content_end,
+        |t| (t.start_s, t.end_s),
+        |t, s, e| {
+            t.start_s = s;
+            t.end_s = e;
+        },
+    );
+    cover(
+        &mut tl.topics,
+        content_end,
+        |t| (t.start_s, t.end_s),
+        |t, s, e| {
+            t.start_s = s;
+            t.end_s = e;
+        },
+    );
+}
+
+/// Clamp → drop-degenerate → extend-last for one track. Generic over the span type via
+/// get/set accessors so `SpeakerTurn` and `TopicSpan` share the exact same repair.
+fn cover<T>(
+    items: &mut Vec<T>,
+    content_end: f64,
+    get: impl Fn(&T) -> (f64, f64),
+    set: impl Fn(&mut T, f64, f64),
+) {
+    for it in items.iter_mut() {
+        let (s, e) = get(it);
+        let s = s.clamp(0.0, content_end);
+        let e = e.clamp(s, content_end);
+        set(it, s, e);
+    }
+    items.retain(|it| {
+        let (s, e) = get(it);
+        e > s
+    });
+    // Extend whichever span currently ends latest to the transcript end, so the track covers the
+    // recording. (Extending the LAST span — not inserting a synthetic one — keeps the real labels.)
+    let last = items
+        .iter()
+        .enumerate()
+        .max_by(|a, b| {
+            get(a.1)
+                .1
+                .partial_cmp(&get(b.1).1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i);
+    if let Some(i) = last {
+        let (s, e) = get(&items[i]);
+        if content_end - e > COVER_EPS {
+            set(&mut items[i], s, content_end);
+        }
+    }
 }
 
 /// Extract the first balanced JSON object from a reply and parse it into a [`MeetingTimeline`].
@@ -138,5 +228,125 @@ mod tests {
         assert_eq!(t.speakers.len(), 1);
         assert_eq!(t.speakers[0].speaker, "User 1");
         assert_eq!(t.topics[0].label, "Intro");
+    }
+
+    // ── repair_coverage: make the AI timeline actually span the transcript ────────────────
+
+    use crate::storage::models::{MeetingTimeline, SpeakerTurn, TopicSpan};
+
+    fn seg(start_s: f64, end_s: f64) -> Segment {
+        Segment {
+            idx: 0,
+            start_s,
+            end_s,
+            text: "x".into(),
+            speaker: Some("me".into()),
+        }
+    }
+    fn turn(start_s: f64, end_s: f64) -> SpeakerTurn {
+        SpeakerTurn {
+            speaker: "Jakub".into(),
+            start_s,
+            end_s,
+        }
+    }
+    fn topic(label: &str, start_s: f64, end_s: f64) -> TopicSpan {
+        TopicSpan {
+            label: label.into(),
+            start_s,
+            end_s,
+        }
+    }
+
+    /// RED-before-GREEN: the exact production bug (meeting fe25c4ee) — segments cover 0.2..44.5 but
+    /// the provider's timeline ends at 13.7. Before `repair_coverage`, the timeline stays at 13.7
+    /// (< 0.9× the 45s recording → the FE zooms the axis to ~0:14). After, both tracks reach 44.5.
+    #[test]
+    fn repair_extends_short_timeline_to_last_segment() {
+        let segments = vec![seg(0.2, 3.9), seg(9.9, 13.7), seg(29.4, 31.6), seg(43.5, 44.5)];
+        let mut tl = MeetingTimeline {
+            speakers: vec![turn(0.2, 3.9), turn(9.9, 13.7)],
+            topics: vec![topic("Test Brain Note", 0.2, 7.9), topic("Architecture Issue", 7.9, 13.7)],
+        };
+        repair_coverage(&mut tl, &segments);
+        let sp_max = tl.speakers.iter().map(|t| t.end_s).fold(0.0, f64::max);
+        let tp_max = tl.topics.iter().map(|t| t.end_s).fold(0.0, f64::max);
+        assert!((sp_max - 44.5).abs() < 1e-6, "speakers should reach 44.5, got {sp_max}");
+        assert!((tp_max - 44.5).abs() < 1e-6, "topics should reach 44.5, got {tp_max}");
+        // Labels + earlier spans are preserved; only the LAST span was extended.
+        assert_eq!(tl.topics.len(), 2);
+        assert_eq!(tl.topics[0].end_s, 7.9);
+        assert_eq!(tl.topics[1].label, "Architecture Issue");
+        assert_eq!(tl.topics[1].end_s, 44.5);
+    }
+
+    /// A hallucinated far-future `endS` is clamped back to the transcript end (the eee2e31e case:
+    /// segments to 82.6, provider emitted endS=1200).
+    #[test]
+    fn repair_clamps_hallucinated_overshoot() {
+        let segments = vec![seg(0.5, 40.0), seg(80.0, 82.6)];
+        let mut tl = MeetingTimeline {
+            speakers: vec![turn(0.5, 1200.0)],
+            topics: vec![topic("Intro", 0.0, 5.0), topic("Deep dive", 5.0, 1200.0)],
+        };
+        repair_coverage(&mut tl, &segments);
+        assert!((tl.speakers[0].end_s - 82.6).abs() < 1e-6);
+        assert!((tl.topics[1].end_s - 82.6).abs() < 1e-6);
+    }
+
+    /// Idempotent: repairing an already-repaired timeline changes nothing.
+    #[test]
+    fn repair_is_idempotent() {
+        let segments = vec![seg(0.0, 10.0), seg(40.0, 44.5)];
+        let mut tl = MeetingTimeline {
+            speakers: vec![turn(0.0, 10.0)],
+            topics: vec![topic("A", 0.0, 6.0), topic("B", 6.0, 10.0)],
+        };
+        repair_coverage(&mut tl, &segments);
+        let once = serde_json::to_string(&tl).unwrap();
+        repair_coverage(&mut tl, &segments);
+        assert_eq!(once, serde_json::to_string(&tl).unwrap());
+    }
+
+    /// When the timeline already covers the transcript, repair does not over-extend (no spurious
+    /// stretch past the real content).
+    #[test]
+    fn repair_noop_when_already_covers() {
+        let segments = vec![seg(0.0, 30.0)];
+        let mut tl = MeetingTimeline {
+            speakers: vec![turn(0.0, 30.0)],
+            topics: vec![topic("Whole", 0.0, 30.0)],
+        };
+        repair_coverage(&mut tl, &segments);
+        assert_eq!(tl.topics[0].end_s, 30.0);
+        assert_eq!(tl.speakers[0].end_s, 30.0);
+    }
+
+    /// A span entirely beyond the transcript end is dropped (clamps to a zero-width span, then
+    /// pruned); the remaining last span is extended to cover.
+    #[test]
+    fn repair_drops_span_entirely_beyond_content() {
+        let segments = vec![seg(0.0, 20.0)];
+        let mut tl = MeetingTimeline {
+            speakers: vec![turn(0.0, 5.0)],
+            topics: vec![topic("Real", 0.0, 8.0), topic("Ghost", 50.0, 60.0)],
+        };
+        repair_coverage(&mut tl, &segments);
+        assert_eq!(tl.topics.len(), 1, "the beyond-content ghost span is dropped");
+        assert_eq!(tl.topics[0].label, "Real");
+        assert!((tl.topics[0].end_s - 20.0).abs() < 1e-6, "the surviving span covers to 20.0");
+    }
+
+    /// No segments (or all zero-length) → nothing to anchor to → the timeline is left untouched
+    /// (no panic, no bogus extension).
+    #[test]
+    fn repair_noop_on_empty_segments() {
+        let mut tl = MeetingTimeline {
+            speakers: vec![turn(0.0, 5.0)],
+            topics: vec![topic("A", 0.0, 5.0)],
+        };
+        repair_coverage(&mut tl, &[]);
+        assert_eq!(tl.speakers[0].end_s, 5.0);
+        assert_eq!(tl.topics[0].end_s, 5.0);
     }
 }

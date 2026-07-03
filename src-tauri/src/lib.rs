@@ -208,8 +208,13 @@ pub fn run() {
                 ));
             }
 
-            // Reclaim any capture scratch WAVs stranded by a previous crashed/stuck session
-            // (a stuck VPIO/AEC helper once left a 91 GB temp file). Nothing records yet at setup.
+            // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
+            // (crash / force-quit / a `tauri dev` hot-rebuild SIGKILLing the app mid-record). Such a
+            // helper reparents to launchd and keeps capturing to a temp WAV for up to 4h — GBs of
+            // dead-session audio the file-age sweep below can't catch (its mtime stays fresh). Run
+            // FIRST so the kill releases the file, THEN reclaim any stale scratch left behind.
+            // Nothing records yet at setup, so any live capture helper is by definition an orphan.
+            crate::audio::aec::reap_orphaned_capture_helpers();
             crate::audio::aec::sweep_stale_scratch();
 
             create_bar_window(app.handle())?;
