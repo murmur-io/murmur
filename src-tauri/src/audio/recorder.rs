@@ -268,6 +268,56 @@ impl Recorder {
         let start = offset.min(guard.len());
         guard[start..].to_vec()
     }
+
+    /// A cheap, cloneable READ-ONLY handle onto this recording's live sample buffer, handed to the
+    /// STAGE-2 crash-salvage spill writer (`crate::audio::spill`). It shares the SAME `Arc<Shared>`
+    /// the cpal callback appends to, so the writer reads the growing buffer DIRECTLY — never touching
+    /// the real-time data callback, never draining, lock-guarded (best-effort on a poisoned lock).
+    pub fn sample_reader(&self) -> SampleReader {
+        SampleReader {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Read-only view onto a live recording's mono sample buffer for the crash-salvage spill writer.
+/// Holds a clone of the recorder's `Arc<Shared>`; every read is lock-guarded and NON-draining, so it
+/// can run on a separate (NON-real-time) thread without disturbing capture or the final `stop()`
+/// buffer. Never mutates anything — the RT cpal callback remains the sole writer of `samples`.
+pub struct SampleReader {
+    shared: Arc<Shared>,
+}
+
+impl SampleReader {
+    /// Total mono samples captured so far (source rate). `0` on a poisoned lock (best-effort).
+    pub fn total(&self) -> usize {
+        self.shared.samples.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Clone the samples from `offset` to the current end (no drain). Empty past-the-end or on a
+    /// poisoned lock — mirrors [`Recorder::snapshot_from`].
+    pub fn snapshot_from(&self, offset: usize) -> Vec<f32> {
+        let Ok(guard) = self.shared.samples.lock() else {
+            return Vec::new();
+        };
+        let start = offset.min(guard.len());
+        guard[start..].to_vec()
+    }
+
+    /// Test-only: a reader over a fixed sample buffer (no live recorder / device), so the spill
+    /// writer's incremental-mirror logic is exercisable headless.
+    #[cfg(test)]
+    pub(crate) fn from_samples(samples: Vec<f32>) -> Self {
+        let shared = Arc::new(Shared::new());
+        *shared.samples.lock().unwrap() = samples;
+        Self { shared }
+    }
+
+    /// Test-only: append more samples to simulate ongoing capture between flushes.
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&self, more: &[f32]) {
+        self.shared.samples.lock().unwrap().extend_from_slice(more);
+    }
 }
 
 impl Drop for Recorder {
