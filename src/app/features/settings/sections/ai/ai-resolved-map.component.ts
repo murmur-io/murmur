@@ -122,6 +122,11 @@ import { SettingsStore } from "../../settings.store";
       .map-loc {
         flex: none;
       }
+      .btn-sm {
+        height: 30px;
+        padding: 0 var(--space-3);
+        font-size: 0.8125rem;
+      }
       .map-change {
         flex: none;
         white-space: nowrap;

@@ -1136,10 +1136,10 @@ export class SettingsStore {
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
       await this.refreshBrainModels();
-      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
+      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement
+      // nudge. refreshPosture() also refreshes the resolved "what runs where"
+      // AI map, so no separate refreshAiMap() call is needed here.
       await this.refreshPosture();
-      // The resolved "what runs where" map for the Settings AI section.
-      void this.refreshAiMap();
       // Brain Live RAM headroom (best-effort; true = never warn behind a failed probe).
       this._brainLiveRamOk.set(
         await this.ipc.brainLiveRamOk().catch(() => true),
