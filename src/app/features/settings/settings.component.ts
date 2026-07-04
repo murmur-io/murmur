@@ -481,9 +481,12 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         padding: var(--space-7) var(--space-6) var(--space-8);
       }
       /* Cap the reading width AND center the column — the same centered
-         max-width reading column as the main pages (.app-main). */
+         max-width reading column as the main pages (.app-main). The error
+         banner is a direct .settings-content child too, so it rides the same
+         rule (it otherwise spans the full pane width). */
       .content-header,
-      .section-body {
+      .section-body,
+      .settings-content > .banner {
         width: 100%;
         max-width: var(--content-max);
         margin: 0 auto;
