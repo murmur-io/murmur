@@ -79,8 +79,11 @@ an AI provider, and (optionally) an Obsidian vault.
   <img src="docs/screenshots/onboarding.png" alt="First-run onboarding wizard" width="720">
 </p>
 
-To unlock the in-meeting brain, download an on-device model (Bielik / Qwen) and turn on **realtime
-reactions** in Settings — see [Providers & the on-device brain](#-providers--the-on-device-brain).
+To run the in-meeting brain fully offline, download an on-device model (Bielik / Qwen) and turn on
+**realtime reactions** in Settings — it gives grounded, cited answers on device. The full model-driven
+**agentic loop** (the brain chooses which tools to call) runs with a **provider connection** — including
+local **Ollama** — while a downloaded on-device model uses a grounded retrieval floor. See
+[Providers & the on-device brain](#-providers--the-on-device-brain).
 Building from source? Jump to [Development](#-development).
 
 ---
@@ -102,9 +105,10 @@ your whole history, and browse what it knows — all over the same store.
   standalone **`@brain`** to open an anchored, multi-turn **thread** where the assistant answers — the
   recording bar stays out of the way at the top.
 - **Voice *or* text, one loop.** Ask by voice (wake phrase or a single **Ask AI** click, click-to-stop
-  so it catches your whole question) or by typing `@brain` — both funnel through the **same model-driven
-  agentic loop** that decides which gated tools to call. A live tool-trace ("Searching notes… ✓") shows
-  its work.
+  so it catches your whole question) or by typing `@brain` — both funnel through the **same brain**. With a
+  **provider connection** (including local **Ollama**) it's a model-driven **agentic loop** that decides
+  which gated tools to call, with a live tool-trace ("Searching notes… ✓"); a downloaded on-device model
+  answers from a grounded retrieval floor instead.
 - **Grounded, not hallucinated.** Every answer is retrieved from your own transcripts and notes first,
   then summarized — with the source meetings cited as chips you can open.
 - **✨ Ask brain on any note.** Hover a note and hit **✨ ask brain** to open a thread seeded from that
@@ -135,8 +139,9 @@ your whole history, and browse what it knows — all over the same store.
   agentic loop, every answer linked back to the meetings it came from. Single-meeting chat cites
   time-indexed transcript segments.
 - **Hybrid retrieval** — keyword search (FTS) fused with on-device **semantic vectors**
-  (`multilingual-e5-small`, 384-dim, `sqlite-vec` KNN, Reciprocal Rank Fusion). On-device, off by default,
-  one-time backfill to enable.
+  (`multilingual-e5-small`, 384-dim, `sqlite-vec` KNN, Reciprocal Rank Fusion). On device and **on by
+  default**; it downloads a ~470 MB on-device embedding model from Settings to activate, and falls back to
+  keyword search until then.
 - **Related meetings** (semantic neighbors) and **entity dossiers** that synthesize a person or project
   across everything they touched.
 
@@ -160,12 +165,15 @@ your whole history, and browse what it knows — all over the same store.
   and merged by host wall-clock into **Me / Others**.
 - **On-device Whisper** (`whisper.cpp` via `whisper-rs`, **Metal**). A *Fast* pass drives ~3-second live
   captions while you record; an *Accurate* beam-search pass (anti-hallucination gates) runs once after you stop.
+- **Live captions are mic-only until you stop.** During the call, the live captions (and the live `@brain`
+  context) transcribe *your* microphone; the other side's system audio is captured in parallel and folded
+  into the full **Me / Others** transcript only after you stop.
 - **Best-effort extras, graceful by default** — Silero **VAD**, optional **speaker diarization** of the
   others stream, **offline echo cancellation**, and opt-in hi-fidelity native-rate masters; each degrades
   cleanly when its model is absent.
 - **Guardrails** — a 4-hour cap, live mic-mute that preserves sync, an input-device picker, and detection
-  of a running meeting app (Zoom / Teams / Webex). Whisper sizes `tiny`…`large-v3` (default **large-v3**)
-  download once from Settings.
+  of a running meeting app (Zoom / Teams / Webex). Whisper sizes `tiny`…`large-v3` (**default `small`**,
+  ~470 MB — a RAM-safe default; all sizes stay selectable) download once from Settings.
 
 <p align="center">
   <img src="docs/screenshots/bar.png" alt="Floating always-on-top recorder bar" width="560">
@@ -189,8 +197,9 @@ your whole history, and browse what it knows — all over the same store.
   re-summarize any meeting with a different model.
 - **Recipes** turn a transcript into emails, decision logs, or action lists; action items can push to **Apple Reminders**.
 - **Timeline & more** — an interactive **speaker + topic timeline**, pin-a-moment block refs, weekly
-  **digests**, deterministic cross-meeting **Topic Threads**, and a calendar-aware **pre-meeting brief**
-  (on-device EventKit, zero-OAuth).
+  **digests**, and deterministic cross-meeting **Topic Threads**. Your on-device macOS **calendar**
+  (EventKit, zero-OAuth) is reachable on demand as the brain's `calendar_lookup` tool when you ask in
+  Ask / `@brain` (e.g. "who's in my next meeting?") — there is no standalone proactive brief screen.
 
 <p align="center">
   <img src="docs/screenshots/detail-timeline.png" alt="Interactive speaker + topic timeline" width="860">
@@ -222,8 +231,10 @@ Murmur is a **Tauri 2.11** desktop app: a **Rust** core (crate `murmur`, lib `me
 talks to an **Angular 18 zoneless** frontend over Tauri IPC. There's no NgRx — every screen is a standalone
 *signals* component calling a single `IpcService`. The Rust side captures, transcribes, summarizes, and
 persists everything to **one SQLCipher-encrypted SQLite database** — the canonical store. Over it sit the
-**on-device brain** (an agentic reasoning + RAG loop that powers the in-meeting assistant and Ask), plus
-three read surfaces: the app UI, a read-only **MCP server**, and your Obsidian vault.
+**brain** (a grounded RAG + reasoning layer powering the in-meeting assistant and Ask — full model-driven
+agentic tool-choice with a provider connection incl. local Ollama, a grounded retrieval floor on a
+downloaded on-device model), plus three read surfaces: the app UI, a read-only **MCP server**, and your
+Obsidian vault.
 
 ```mermaid
 flowchart LR
@@ -235,7 +246,7 @@ flowchart LR
   redact["🛡️ Redaction firewall"] --> prov
   prov["✍️ Summarizer<br/>claude_code · anthropic · ollama · gateway"] --> db
   db[("🗄️ SQLite + SQLCipher<br/>per-folder AES-256-GCM lock")]
-  db --> brain["🧠 On-device brain<br/>agentic loop · GGUF reasoner · e5 vectors"]
+  db --> brain["🧠 Brain (grounded RAG + reasoning)<br/>GGUF/cloud reasoner · e5 vectors"]
   brain --> live["💬 In-meeting @brain threads"]
   brain --> ask["🔎 Ask across all meetings"]
   db --> mcp["🧩 MCP server · 127.0.0.1:8765"]
@@ -288,7 +299,7 @@ to run **without a network**.
 
 | Brain / provider | Where it runs | Does meeting text leave your Mac? |
 | --- | --- | --- |
-| **On-device brain** (Bielik / Qwen GGUF) | Fully local | **No.** Reasoning + the in-meeting assistant, on-device. |
+| **On-device brain** (Bielik / Qwen GGUF) | Fully local | **No.** Grounded reasoning + the in-meeting assistant, on-device. |
 | **Ollama** | Fully local | **No.** Nothing leaves the device. |
 | **Claude Code** (default summarizer) | Local CLI → Anthropic's cloud | **Yes** — the *redacted* transcript is sent to Anthropic. |
 | **Anthropic API** (BYO key) | Direct HTTPS → Anthropic | **Yes** — the *redacted* transcript is sent to Anthropic. |
@@ -337,7 +348,9 @@ and the **candle** DeBERTa NER redactor — is **always compiled in** (no cargo 
 runtime **only when its model files are present**, otherwise degrading to a clean no-op.
 
 - 🧠 **On-device reasoners.** A curated GGUF registry — **Bielik-11B**, **Qwen3-14B**, **Qwen2.5-3B** — runs
-  locally via `mistralrs` (Metal). Download one and the brain activates; nothing leaves your Mac.
+  locally via `mistralrs` (Metal). Download one and the on-device brain activates with grounded, cited
+  answers; nothing leaves your Mac. The full model-driven agentic tool-choice runs with a provider
+  connection (including local **Ollama**).
 - 🌐 **Optional live web** (off by default). A consent-gated **Brave** connector (BYO key) lets the brain
   reach the web when you ask it to; web hits are shown distinctly as "via web", and queries are redacted
   before they leave.
