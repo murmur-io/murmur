@@ -44,8 +44,8 @@ interface RoleRowVm {
  * instead). The Ask row is the successor of the old "Assistant backend"
  * select (its Local/Off targets live here now, and changing it compat-writes
  * the legacy `brainBackend` — see SettingsStore.setRoleConnection). The
- * global GGUF registry block (owns `brainModelId`) renders below the rows
- * whenever Ask or Live picks "Local model" — it is shared, not per-role.
+ * global GGUF registry (owns `brainModelId`) now lives under Engines →
+ * Murmur Brain → Configure, not in these rows — it is shared, not per-role.
  */
 @Component({
   selector: "app-ai-role-rows",
