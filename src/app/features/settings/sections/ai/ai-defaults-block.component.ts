@@ -143,6 +143,18 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
                   One-time ~{{ brainLiveSizeLabel() }} download from Hugging Face.
                 </span>
               }
+              <!--
+                RAM headroom (deliverable #4): brain_live_ram_ok() reports whether
+                the light engine fits alongside a live recording. A NON-BLOCKING
+                warning only — enablement is never hard-blocked (the probe returns
+                true when RAM can't be read, so this never fires on an unknown box).
+              -->
+              @if (!brainLiveRamOk()) {
+                <span class="brain-live-ram-warn">
+                  ⚠ Realtime reactions need more RAM to run smoothly alongside
+                  recording.
+                </span>
+              }
             </div>
 
             @if (enablingBrainLive()) {
@@ -663,6 +675,11 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
         font-size: 0.8125rem;
         line-height: 1.5;
       }
+      .brain-live-ram-warn {
+        font-size: 0.8125rem;
+        line-height: 1.5;
+        color: var(--warning);
+      }
       .brain-live-card .btn {
         flex: none;
         align-self: flex-start;
@@ -874,6 +891,7 @@ export class AiDefaultsBlockComponent {
   readonly postureError = this.store.postureError;
   readonly enablingBrainLive = this.store.enablingBrainLive;
   readonly brainLiveModelReady = this.store.brainLiveModelReady;
+  readonly brainLiveRamOk = this.store.brainLiveRamOk;
   readonly brainDownloadingId = this.store.brainDownloadingId;
   readonly brainDownloadFrac = this.store.brainDownloadFrac;
   readonly brainPct = this.store.brainPct;

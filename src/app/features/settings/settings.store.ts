@@ -761,6 +761,11 @@ export class SettingsStore {
     if (PROVIDER_CONNECTION_IDS.includes(connection)) {
       void this.ensureModels(connection);
     }
+    // Keep the posture segment honest against backend truth (it derives from the
+    // STORED config — an unsaved role edit doesn't change dispatch yet, so this
+    // holds the last real posture rather than an optimistic guess, and it flips
+    // to Custom once save() persists a role that breaks the preset).
+    void this.refreshPosture();
   }
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
@@ -802,6 +807,16 @@ export class SettingsStore {
   /** True while the one-tap "Enable Murmur Brain Live" flow (hybrid + light model) runs. */
   private readonly _enablingBrainLive = signal(false);
   readonly enablingBrainLive = this._enablingBrainLive.asReadonly();
+
+  /**
+   * Whether this Mac has enough RAM to run Realtime Reactions alongside a live
+   * recording (`brain_live_ram_ok`, the combined-residency guard). Drives a
+   * NON-BLOCKING warning on the Brain Live enablement card — enablement is never
+   * hard-blocked. Defaults TRUE (never warn behind an unread probe); set
+   * best-effort in load().
+   */
+  private readonly _brainLiveRamOk = signal(true);
+  readonly brainLiveRamOk = this._brainLiveRamOk.asReadonly();
 
   /**
    * The installed-base retirement nudge (`brain_model_retirement_nudge`), or null.
@@ -1032,6 +1047,10 @@ export class SettingsStore {
       await this.refreshBrainModels();
       // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
       await this.refreshPosture();
+      // Brain Live RAM headroom (best-effort; true = never warn behind a failed probe).
+      this._brainLiveRamOk.set(
+        await this.ipc.brainLiveRamOk().catch(() => true),
+      );
       // brain2 RAG — embedding-model presence + reindex/download progress streams.
       await this.subscribeSemanticStreams();
       this._embedModelPresent.set(
@@ -1147,6 +1166,43 @@ export class SettingsStore {
 
   // ── Murmur Brain — posture + Brain Live enablement + retirement nudge ───
 
+  /**
+   * Re-sync the reactive form's posture-OWNED controls (the nine role keys +
+   * `brainBackend`) from FRESH backend config after a `set_brain_posture` /
+   * `enableBrainLive` write.
+   *
+   * WHY (a silent zero-egress regression otherwise): a posture preset writes the
+   * `role_*` + `brain_backend` DB keys directly (e.g. Fully-Local sets them all
+   * to "local"), but the reactive form still holds the STALE values from the
+   * one-time load() ("" = inherit-cloud). The very next ordinary save() serializes
+   * `form.getRawValue()`, so it would send `roleNotesConnection:""` etc. and the
+   * backend `dto_to_config` takes them verbatim — CLOBBERING the "local" keys the
+   * posture just wrote and flipping the posture back to cloud egress. Re-patching
+   * the form to backend truth here ends that clobber while keeping the per-feature
+   * role editor fully editable (it legitimately writes these same keys via the
+   * form, so they can't be preserve-only backend-side). Mirrors load()'s
+   * config→form role mapping exactly.
+   */
+  private async syncPostureFormFromBackend(): Promise<void> {
+    const cfg = await this.ipc.getConfig().catch(() => null);
+    if (!cfg) return;
+    this.form.patchValue({
+      brainBackend: cfg.brainBackend ?? "cloud",
+      roleNotesConnection: cfg.roleNotesConnection ?? "",
+      roleNotesModel: cfg.roleNotesModel ?? "",
+      roleNotesEffort: cfg.roleNotesEffort ?? "",
+      roleAskConnection: cfg.roleAskConnection ?? "",
+      roleAskModel: cfg.roleAskModel ?? "",
+      roleAskEffort: cfg.roleAskEffort ?? "",
+      roleLiveConnection: cfg.roleLiveConnection ?? "",
+      roleLiveModel: cfg.roleLiveModel ?? "",
+      roleLiveEffort: cfg.roleLiveEffort ?? "",
+    });
+    // Keep the Ask-row "Inherit" restore baseline honest: a posture may have
+    // changed brain_backend, so the value load() snapshotted is now stale.
+    this._loadedBrainBackend = (cfg.brainBackend ?? "cloud") as BrainBackend;
+  }
+
   /** Re-read the DERIVED posture + the retirement nudge (best-effort; failure is non-fatal). */
   async refreshPosture(): Promise<void> {
     try {
@@ -1170,6 +1226,9 @@ export class SettingsStore {
     this._postureBusy.set(true);
     try {
       await this.ipc.setBrainPosture(p);
+      // Re-patch the form to the role/brainBackend keys the preset just wrote, or
+      // the next save() would clobber them back (silent zero-egress regression).
+      await this.syncPostureFormFromBackend();
       await this.refreshPosture();
     } catch (e) {
       this._postureError.set(String(e));
@@ -1209,6 +1268,9 @@ export class SettingsStore {
         await this.ipc.selectBrainModel(light.id);
       }
       await this.refreshBrainModels();
+      // The setBrainPosture("hybrid") above wrote the role/brainBackend keys —
+      // re-patch the form so the next save() doesn't clobber them back to cloud.
+      await this.syncPostureFormFromBackend();
       await this.refreshPosture();
     } catch (e) {
       this._postureError.set(String(e));
@@ -1228,10 +1290,21 @@ export class SettingsStore {
     return light ? light.approxSizeBytes : null;
   });
 
-  /** Whether the smallest LIGHT model is already on this Mac (skips the download step). */
+  /**
+   * Whether the light model the backend would ACTUALLY run for Brain Live is
+   * already on this Mac (skips the download step). Mirrors the backend's
+   * `class_model_id(Light)` (reason.rs): the light engine resolves to the
+   * SELECTED light if the user picked one, else the registry DEFAULT light (the
+   * first light in display order — `qwen3-1.7b`). Readiness = THAT specific model
+   * is downloaded — NOT "any light is downloaded", which would be a false
+   * positive when a different, unselected light happens to be on disk while
+   * `light()` still resolves to the un-downloaded default → the stub.
+   */
   readonly brainLiveModelReady = computed<boolean>(() => {
     const lights = this.brainModels().filter((m) => m.class === "light");
-    return lights.length > 0 && lights.some((m) => m.downloaded);
+    if (lights.length === 0) return false;
+    const effective = lights.find((m) => m.selected) ?? lights[0];
+    return effective.downloaded;
   });
 
   /**
@@ -1481,6 +1554,10 @@ export class SettingsStore {
       this._saved.set(true);
       // A save may have triggered an auto-prune (limit lowered) — refresh the usage report.
       await this.loadStorageReport();
+      // The saved role/brainBackend keys may have changed what derive_posture
+      // reads — re-read it so the posture segment reflects backend truth (never a
+      // stale "Fully local" label over a just-saved cloud role).
+      await this.refreshPosture();
     } catch (e) {
       this._loadError.set("Save failed: " + String(e));
     }

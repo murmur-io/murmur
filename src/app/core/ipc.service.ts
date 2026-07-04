@@ -835,6 +835,17 @@ export class IpcService {
     return invoke<void>("set_brain_contradiction_cards", { enabled });
   }
 
+  /**
+   * Whether this Mac has enough RAM to run Realtime Reactions (the light engine)
+   * alongside a live recording — the combined-residency guard. Lets the Brain
+   * Live enablement card show a non-blocking "needs more RAM" warning. `true`
+   * when total RAM can't be read (never block behind a failed probe). Read-only
+   * capability probe (no content, no egress).
+   */
+  brainLiveRamOk(): Promise<boolean> {
+    return invoke<boolean>("brain_live_ram_ok");
+  }
+
   // ── brain2 RAG — semantic search (embedding model + reindex backfill) ───
 
   /**
