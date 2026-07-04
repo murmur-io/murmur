@@ -29,7 +29,7 @@ import { SettingsStore } from "../../settings.store";
       <div class="posture-head-copy">
         <h3>What Murmur uses</h3>
         <p class="text-secondary posture-intro">
-          One choice powers everything Murmur writes; tune individual features under Advanced.
+          Pick how much runs on this Mac. The map below shows exactly what runs where — tune it under Advanced.
         </p>
       </div>
 
@@ -86,7 +86,7 @@ import { SettingsStore } from "../../settings.store";
           >
             <span class="posture-opt-title">Cloud</span>
             <span class="posture-opt-sub text-muted">
-              Your Default AI does everything
+              Your Default engine does everything
             </span>
           </button>
           <button
@@ -98,7 +98,7 @@ import { SettingsStore } from "../../settings.store";
           >
             <span class="posture-opt-title">Hybrid ⭐</span>
             <span class="posture-opt-sub text-muted">
-              Cloud notes + on-device reactions
+              Cloud notes + realtime reactions on this Mac
             </span>
           </button>
           <button

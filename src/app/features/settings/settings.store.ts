@@ -687,7 +687,7 @@ export class SettingsStore {
 
   /** Notes-row Inherit summary — Notes always falls back to the Default AI triple. */
   readonly notesInheritSummary = computed(
-    () => `Follows Default AI: ${this.defaultAiSummary()}`,
+    () => `Follows the Default engine: ${this.defaultAiSummary()}`,
   );
 
   /**
@@ -703,7 +703,7 @@ export class SettingsStore {
       case "off":
         return "Follows the assistant fallback: Off — retrieval only";
       default:
-        return `Follows Default AI: ${this.defaultAiSummary()}`;
+        return `Follows the Default engine: ${this.defaultAiSummary()}`;
     }
   });
 
