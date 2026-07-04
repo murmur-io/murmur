@@ -1290,6 +1290,16 @@ export interface MyShareEntry {
   expiresAt: string | null;
   revoked: boolean;
   downloadCount: number;
+  /**
+   * The LOCAL meeting this share belongs to — the filter key for THIS note's Active-links list.
+   * `null` when the share was created on another device (no local `outbound_shares` row → masked,
+   * same as `title`).
+   */
+  meetingId: string | null;
+  /** The server-enforced open cap (`null` ⇒ uncapped) driving the `X / Y opens` label. Display-only. */
+  maxDownloads: number | null;
+  /** `link` (mode-A zero-knowledge link) vs `user` (mode-B Murmur↔Murmur grant). */
+  mode: "link" | "user";
 }
 
 // ── M5-CLIENT: Murmur↔Murmur (mode B) ──
