@@ -29,6 +29,7 @@
 
 pub mod bakeoff;
 pub mod diarization;
+pub mod notes_bakeoff;
 
 use serde::{Deserialize, Serialize};
 

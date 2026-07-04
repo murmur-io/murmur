@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::listener::VoiceListener;
@@ -141,6 +141,15 @@ pub struct AppState {
     /// Reset to `false` at each `start_recording`; latched `true` the first tick the cap is reached.
     /// Distinct from the byte/size storage cap — this is the wall-clock TIME cap.
     pub capped_notified: AtomicBool,
+    /// Realtime Reactions SHADOW-mode counter (spec §4.2): how many contradiction cards WOULD have
+    /// fired this recording while the `brain_contradiction_cards` sub-toggle is OFF. Lets the FE offer
+    /// "the brain would have flagged N — enable?" — user-local calibration, no telemetry. Reset to 0
+    /// at each `start_recording`; incremented by the reactions worker when in shadow mode.
+    pub reactions_shadow_count: AtomicU64,
+    /// Per-recording SESSION dedup of already-surfaced whisper cards (key = entity|predicate|old-value).
+    /// Prevents the same contradiction re-emitting every ~21 s scan (and re-inflating the shadow count)
+    /// — the "does not resurface this session" contract (deep-review). Cleared at each `start_recording`.
+    pub reactions_emitted: Mutex<std::collections::HashSet<String>>,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
     /// thread shares the SAME set as the command surface.
@@ -230,6 +239,8 @@ impl AppState {
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
             capped_notified: AtomicBool::new(false),
+            reactions_shadow_count: AtomicU64::new(0),
+            reactions_emitted: Mutex::new(std::collections::HashSet::new()),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),

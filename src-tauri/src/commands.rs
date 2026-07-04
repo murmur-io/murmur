@@ -349,6 +349,14 @@ pub async fn start_recording(
     state
         .capped_notified
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Fresh recording ⇒ reset the Realtime-Reactions shadow counter (per-recording calibration) and
+    // the per-recording whisper-card dedup set (each recording surfaces a contradiction at most once).
+    state
+        .reactions_shadow_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut e) = state.reactions_emitted.lock() {
+        e.clear();
+    }
 
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
@@ -462,11 +470,35 @@ pub async fn start_recording(
     // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
     // during recording (see transcribe::live). Never affects the recording or final note.
     if let Some(cfg) = state.config.lock().ok().map(|c| c.clone()) {
-        if let Ok(Some(model_path)) = crate::transcribe::model::resolve_model_path(
-            cfg.whisper_model_path.as_deref().map(std::path::Path::new),
-            &cfg.model_size,
-            cfg.language.as_deref().unwrap_or(""),
-        ) {
+        let lang = cfg.language.as_deref().unwrap_or("");
+        let configured = || {
+            crate::transcribe::model::resolve_model_path(
+                cfg.whisper_model_path.as_deref().map(std::path::Path::new),
+                &cfg.model_size,
+                lang,
+            )
+            .ok()
+            .flatten()
+        };
+        // D1 (spec §4.3): while Realtime Reactions (Brain Live) is on, pin the LIVE tick to `small`
+        // when present — a large-v3 live tick alone can saturate the Metal GPU the light reasoner also
+        // needs. If `small` is NOT on disk, fall back to the configured model + warn (pinning to an
+        // absent file would kill the live loop). The post-call ACCURATE pass is unaffected.
+        let live_model = if cfg.brain_live {
+            match crate::transcribe::model::resolve_model_path(None, "small", lang) {
+                Ok(Some(p)) => Some(p),
+                _ => {
+                    tracing::warn!(
+                        target: "live",
+                        "reactions on but ggml-small absent; live tick uses the configured whisper model (may contend with the light reasoner)"
+                    );
+                    configured()
+                }
+            }
+        } else {
+            configured()
+        };
+        if let Some(model_path) = live_model {
             crate::transcribe::live::spawn(app.clone(), model_path, cfg.language.clone());
         }
     }
@@ -2113,10 +2145,13 @@ fn persist_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner
     //    is re-resolved from the LIVE config, so a consent/backend change applies without restart.
     let candidates = crate::facts::extract_fact_candidates(
-        &*state.reasoner.current_for(crate::summarize::roles::Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine (facts stop egressing); OFF ⇒ today's Notes reasoner.
+        &*state.reasoner.extraction_reasoner(),
         title,
         markdown,
         entity_refs,
+        // Post-call extraction over the full note: no tight cap (the realtime path uses a capped preset).
+        crate::reason::GenOptions::default(),
     );
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
@@ -2171,7 +2206,8 @@ fn persist_user_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner is
     //    re-resolved from the LIVE config so a consent/backend change applies without restart.
     let candidates = crate::user_memory::extract_user_fact_candidates(
-        &*state.reasoner.current_for(crate::summarize::roles::Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine (user facts stop egressing); OFF ⇒ today's reasoner.
+        &*state.reasoner.extraction_reasoner(),
         title,
         markdown,
         &typed_notes,
@@ -3668,6 +3704,13 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             Some(id) if crate::reason::brain_model_by_id(id).is_some() => d.brain_model_id.clone(),
             _ => current.brain_model_id.clone(),
         },
+        // Murmur Brain postures: `brain_live` + the light/heavy class model ids are set by the
+        // dedicated posture / Brain-Live commands (like `cloud_egress_consented`), NEVER by the raw
+        // settings save — so a partial/older DTO can neither enable Brain Live nor repoint an engine.
+        brain_live: current.brain_live,
+        brain_light_model_id: current.brain_light_model_id.clone(),
+        brain_heavy_model_id: current.brain_heavy_model_id.clone(),
+        brain_contradiction_cards: current.brain_contradiction_cards,
         // Phase H (brain backend): which reasoner powers the brain (cloud/local/off) IS taken from
         // the DTO (the Settings UI owns the toggle). `BrainBackend` deserializes an unknown/omitted
         // token to the default `Cloud`, so the value here is always a valid enum variant.
@@ -4787,6 +4830,98 @@ pub fn list_brain_models(
     ))
 }
 
+/// The installed-base migration nudge: `Some` when the persisted `brain_model_id` points at a RETIRED
+/// model (e.g. the non-commercial `qwen2.5-3b`), telling the FE to offer the Apache-licensed
+/// replacement. `None` for an active/absent selection. Read-only capability probe (no content, no
+/// egress) — like [`brain_model_present`]. The retired GGUF keeps working until the user switches;
+/// nothing is changed silently.
+#[tauri::command]
+pub fn brain_model_retirement_nudge(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::reason::RetiredModelNudge>, AppError> {
+    let selected = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.brain_model_id.clone()
+    };
+    let dir = crate::transcribe::models_dir()?;
+    Ok(crate::reason::retired_model_nudge(selected.as_deref(), &dir))
+}
+
+/// The DERIVED Murmur Brain posture (spec §2.1) for the Settings display — computed from the live
+/// config (resolved role targets + `brain_live`), NEVER stored. `custom` when the dispatch keys match
+/// no preset, so the label can never lie about egress. Read-only capability probe (no content).
+#[tauri::command]
+pub fn brain_posture(state: State<'_, AppState>) -> Result<crate::settings::Posture, AppError> {
+    let c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(crate::settings::postures::derive_posture(&c))
+}
+
+/// Apply a Murmur Brain posture PRESET (`cloud` / `hybrid` / `fully_local`) and persist it. `custom`
+/// is a derived-only label and is rejected (`InvalidArg`). This is the SINGLE writer of the posture
+/// presets — the raw settings save preserves `brain_live` + the posture role keys (see
+/// `dto_to_config`), so a partial save can never change the posture. The Hybrid preset deliberately
+/// leaves `role_live_*` untouched (the @brain assistant stays intact).
+#[tauri::command]
+pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<(), AppError> {
+    let p = crate::settings::Posture::from_settable(&posture)
+        .ok_or_else(|| AppError::InvalidArg(format!("not a settable posture: {posture}")))?;
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    crate::settings::postures::apply_posture(&mut c, p);
+    c.save(&state.db)?;
+    Ok(())
+}
+
+/// Whether the machine has enough RAM to run Realtime Reactions (the light engine) alongside a live
+/// recording — the combined-residency guard (spec §3.3), including a KV estimate + call-overhead. Lets
+/// the Brain Live card warn / gate before enabling. `true` when total RAM can't be read (never block
+/// behind a failed probe). Read-only capability probe.
+#[tauri::command]
+pub fn brain_live_ram_ok() -> Result<bool, AppError> {
+    let light = crate::reason::default_model_for_class(crate::reason::ModelClass::Light);
+    let models: Vec<&crate::reason::BrainModel> = light.into_iter().collect();
+    Ok(crate::reason::residency_fits(
+        &models,
+        total_ram_gb(),
+        crate::reason::CALL_OVERHEAD_GB,
+    ))
+}
+
+/// The Realtime-Reactions SHADOW counter (spec §4.2): how many contradiction cards WOULD have fired
+/// this recording while the sub-toggle is OFF. Lets the FE offer "the brain would have flagged N —
+/// enable?" (user-local calibration, no telemetry). Read-only; resets each `start_recording`.
+#[tauri::command]
+pub fn brain_reactions_shadow_count(state: State<'_, AppState>) -> Result<u64, AppError> {
+    Ok(state
+        .reactions_shadow_count
+        .load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Flip the Realtime-Reactions CONTRADICTION-card sub-toggle (spec §4.2). Default OFF (shadow mode);
+/// the FE offers this only once the user's OWN shadow count clears a bar. Dedicated command (not the
+/// raw settings save, which preserves it) so a partial/older save can never silently enable ⚠ cards.
+#[tauri::command]
+pub fn set_brain_contradiction_cards(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    c.brain_contradiction_cards = enabled;
+    c.save(&state.db)?;
+    Ok(())
+}
+
 /// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
 /// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the reasoner dispatch
 /// (`ReasonerCell`) re-resolves per call, so the model takes effect on the next reasoning call
@@ -4799,16 +4934,22 @@ pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Resul
 
 /// Testable core of [`select_brain_model`]: validate the id against the registry, persist it.
 fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), AppError> {
-    if crate::reason::brain_model_by_id(&model_id).is_none() {
-        return Err(AppError::InvalidArg(format!(
-            "unknown brain model id: {model_id}"
-        )));
-    }
+    let model = crate::reason::brain_model_by_id(&model_id)
+        .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
     let mut c = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    c.brain_model_id = Some(model_id);
+    // Keep the legacy single-model id (BrainBackend::Local + custom-path fallback) …
+    c.brain_model_id = Some(model_id.clone());
+    // … AND wire the CLASS handle so the Brain-Live `light()` / Fully-Local `heavy()` handles actually
+    // use what the user just selected. Without this, selecting a light model leaves `light()` pointing
+    // at the registry DEFAULT (a different, un-downloaded GGUF) → it silently resolves to the stub and
+    // Realtime Reactions never fire despite Brain Live being "on".
+    match model.class {
+        crate::reason::ModelClass::Light => c.brain_light_model_id = Some(model_id),
+        crate::reason::ModelClass::Heavy => c.brain_heavy_model_id = Some(model_id),
+    }
     c.save(&state.db)?;
     Ok(())
 }
@@ -4838,10 +4979,14 @@ pub async fn download_brain_model(
         return Ok(dest.to_string_lossy().to_string());
     }
 
+    // The pinned integrity hash for this model (None until the registry entry is pinned — the
+    // downloader then verifies before promoting the file, or warns + skips when None).
+    let expected_sha = crate::reason::brain_model_by_id(&model_id).and_then(|m| m.sha256);
+
     // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
     const EMIT_EVERY: u64 = 8 * 1024 * 1024;
     let mut last_emit: u64 = 0;
-    crate::reason::download_brain_model(url, &dest, |downloaded, total| {
+    crate::reason::download_brain_model(url, &dest, expected_sha, |downloaded, total| {
         if downloaded - last_emit >= EMIT_EVERY {
             last_emit = downloaded;
             let _ = app.emit(
@@ -7532,6 +7677,8 @@ mod lifecycle_tests {
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),
@@ -9386,7 +9533,7 @@ mod lifecycle_tests {
             let current = AppConfig {
                 brain_backend: BrainBackend::Cloud,
                 realtime_reactions: false,
-                brain_model_id: Some("qwen2.5-3b".to_string()),
+                brain_model_id: Some("qwen3-4b-instruct-2507".to_string()),
                 ..AppConfig::default()
             };
             let merged = dto_to_config(dto, &current);
@@ -9538,7 +9685,9 @@ mod lifecycle_tests {
     /// `brain_backend` deserializes to the default `Cloud` rather than crashing the save.
     #[test]
     fn dto_unknown_brain_model_id_preserved_and_unknown_backend_defaults_cloud() {
-        // (a) unknown model id ⇒ ignored, current selection preserved.
+        // (a) unknown model id ⇒ ignored, current selection preserved. The `current` here is the now
+        // RETIRED `qwen2.5-3b`, so this doubles as the installed-base guarantee: a settings save must
+        // not wipe a persisted retired selection (its on-disk GGUF keeps resolving; see reason.rs).
         let mut dto = config_to_dto(&AppConfig::default());
         dto.brain_model_id = Some("totally-made-up-model".to_string());
         let current = AppConfig {
@@ -9639,18 +9788,33 @@ mod lifecycle_tests {
             state.config.lock().unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
+        // Selecting a HEAVY model also wires the class handle so heavy()/Fully-Local uses it.
+        assert_eq!(
+            state.config.lock().unwrap().brain_heavy_model_id.as_deref(),
+            Some("bielik-11b-v3"),
+            "selecting a heavy model must set brain_heavy_model_id (else heavy() ignores the choice)"
+        );
         // Survives a reload from the settings table.
         assert_eq!(
             AppConfig::load(&state.db).unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
 
-        // Unknown id ⇒ InvalidArg, selection unchanged.
+        // Selecting a LIGHT model wires the light class handle (the Brain-Live path) — the bug this
+        // guards: a light selection that only set brain_model_id left light() on the registry default.
+        select_brain_model_inner(&state, "qwen3-1.7b".to_string()).unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().brain_light_model_id.as_deref(),
+            Some("qwen3-1.7b"),
+            "selecting a light model must set brain_light_model_id (else Realtime Reactions stay stub)"
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged (still the last valid pick, qwen3-1.7b).
         let err = select_brain_model_inner(&state, "not-a-real-model".to_string()).unwrap_err();
         assert!(matches!(err, AppError::InvalidArg(_)));
         assert_eq!(
             state.config.lock().unwrap().brain_model_id.as_deref(),
-            Some("bielik-11b-v3")
+            Some("qwen3-1.7b")
         );
     }
 
@@ -9704,12 +9868,18 @@ mod lifecycle_tests {
             brain_download_target("bogus-id"),
             Err(AppError::InvalidArg(_))
         ));
-        let (url, dest) = brain_download_target("qwen2.5-3b").unwrap();
+        // A RETIRED id is also rejected by the download target (un-selectable / un-downloadable fresh;
+        // the installed-base file, if present, is only RESOLVED, never re-fetched).
+        assert!(matches!(
+            brain_download_target("qwen2.5-3b"),
+            Err(AppError::InvalidArg(_))
+        ));
+        let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
         assert_eq!(
             url,
-            "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
         );
-        assert!(dest.ends_with("Qwen2.5-3B-Instruct-Q4_K_M.gguf"));
+        assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
     }
 
     // ── rename_folder / delete_folder (folder lifecycle) ────────────────────────────────────────

@@ -1636,7 +1636,7 @@ impl Db {
                 .prepare("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
                 .map_err(map_err)?;
             // `chunk_idx` is a per-class ordinal; the two classes are distinguished by `source_type`.
-            let classes: [(&str, &[String], &[Vec<f32>]); 2] = [
+            let classes = [
                 ("voice", &note_chunks, &note_vectors),
                 ("transcript", &transcript_chunks, &transcript_vectors),
             ];
