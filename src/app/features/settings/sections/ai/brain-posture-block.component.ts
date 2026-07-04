@@ -25,6 +25,14 @@ import { SettingsStore } from "../../settings.store";
   imports: [],
   template: `
     <div class="card posture-card">
+      <!-- Intro header — frames the section before the posture chooser. -->
+      <div class="posture-head-copy">
+        <h3>What Murmur uses</h3>
+        <p class="text-secondary posture-intro">
+          One choice powers everything Murmur writes; tune individual features under Advanced.
+        </p>
+      </div>
+
       <!--
         Installed-base migration nudge: the persisted on-device model was
         retired for licensing → offer the Apache-licensed replacement.
@@ -194,6 +202,21 @@ import { SettingsStore } from "../../settings.store";
       .retirement-reason {
         font-size: 0.8125rem;
         line-height: 1.5;
+      }
+
+      /* ── Section intro header ── */
+      .posture-head-copy {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+      }
+      .posture-head-copy h3 {
+        margin: 0;
+      }
+      .posture-intro {
+        margin: 0;
+        font-size: 0.875rem;
+        line-height: 1.55;
       }
 
       /* ── Posture group heading ── */
