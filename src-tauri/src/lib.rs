@@ -4,6 +4,7 @@ pub mod calendar;
 pub mod commands;
 pub mod connectors;
 pub mod crypto;
+pub mod e2ee;
 pub mod embed;
 pub mod error;
 pub mod eval;

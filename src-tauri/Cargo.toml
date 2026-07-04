@@ -105,6 +105,29 @@ zeroize = { version = "1", features = ["derive"] }
 # Constant-time equality / conditional selection for secret comparisons (C4/C5/C6). User-approved.
 subtle = "2"
 
+# ── Client E2EE (Milestone M2 — sharing) ──
+# Shared wire-format + envelope codec, compiled into BOTH the app and the server so format drift is
+# a COMPILE error (spec §2/§4). Path-dep on the murmur-server workspace crate (permissive-licensed).
+murmur-protocol = { path = "../../murmur-server/crates/murmur-protocol" }
+# HPKE RFC 9180 Base mode for the mode-B recipient NK wrap (DHKEM(X25519,HKDF-SHA256)+HKDF-SHA256+
+# AES-256-GCM). rozbb/rust-hpke — Cloudflare-reviewed; pinned suite (spec §4.6/§4.8).
+hpke = "0.12"
+# Ed25519 detached signatures over the canonical identity bundle + share grant (spec §4.8). The
+# `zeroize` feature wipes the signing seed on drop. Keys are built from raw seeds (`from_bytes`), so
+# no `rand_core` keygen feature is needed. X25519 (enc) keys come from HPKE's own KEM (`sk_to_pk`),
+# so no separate x25519-dalek dependency is required.
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+# Argon2id password-hardening for the optional link-share password (spec §4.7).
+argon2 = "0.5"
+# HKDF-SHA256 for KEK_pw, KEK_link, and the L-derived fetch gate secret (spec §4.6).
+hkdf = "0.12"
+# SHA-256 of the content cell for the signed share-grant binding (spec §4.8).
+sha2 = "0.10"
+# BIP39 24-word recovery phrase (256-bit) for the recovery key RK (spec §4.3/§4.6).
+bip39 = "2"
+# CSPRNG source for HPKE seal / keypair generation (rand_core 0.6 ecosystem, matches hpke 0.12).
+rand = "0.8"
+
 # ── Misc ──
 chrono = { version = "0.4", features = ["clock", "serde"] }
 dirs = "5"
