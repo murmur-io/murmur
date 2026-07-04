@@ -50,8 +50,7 @@ const CONNECTIONS: readonly ConnectionDef[] = [
       <div class="conn-head">
         <h3>Engines</h3>
         <p class="text-secondary conn-sub">
-          Where models can run. Set each engine up once — pick which one Murmur
-          uses under Default engine below.
+          Where models can run. Set each engine up once.
         </p>
       </div>
 

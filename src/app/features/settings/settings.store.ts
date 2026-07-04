@@ -848,6 +848,32 @@ export class SettingsStore {
   }
 
   /**
+   * The per-feature role row the map's "Change" wants the Advanced block to
+   * scroll to + flash. Written by `requestHighlightRole`, consumed by
+   * `AiRoleRowsComponent` (which opens the disclosure, scrolls the row into
+   * view, and flashes it), then cleared via `clearHighlightRole` once handled.
+   */
+  private readonly _highlightRole = signal<"notes" | "ask" | "live" | null>(
+    null,
+  );
+  readonly highlightRole = this._highlightRole.asReadonly();
+
+  /**
+   * Ask the role rows to scroll to + flash `role`. The null-then-set makes a
+   * REPEAT click on the same row's "Change" re-fire the highlight even when the
+   * value is unchanged (a plain `.set(role)` would be a no-op for the effect).
+   */
+  requestHighlightRole(role: "notes" | "ask" | "live"): void {
+    this._highlightRole.set(null);
+    this._highlightRole.set(role);
+  }
+
+  /** Clear the highlight request once the role rows have handled it. */
+  clearHighlightRole(): void {
+    this._highlightRole.set(null);
+  }
+
+  /**
    * The posture mid-download (drives the target-card progress indicator).
    * Non-null only while `setPosture` is downloading absent needed models.
    */
@@ -903,28 +929,9 @@ export class SettingsStore {
     this.neededModelsFor(this.posture()),
   );
 
-  /**
-   * The "right now" one-sentence summary for the active posture — for the
-   * posture state-line in the redesigned AI & Models block (Task 2).
-   *
-   * Returns "" when `posture()` is null (not yet loaded), so the template never
-   * shows "Custom" as a pre-load flash. "Custom" is returned only for the actual
-   * `"custom"` posture value.
-   */
-  readonly postureStateLine = computed((): string => {
-    switch (this.posture()) {
-      case "cloud":
-        return "Claude Code writes everything — notes, answers, briefs. Only transcription runs on this Mac.";
-      case "hybrid":
-        return "Claude writes notes; your Mac runs realtime reactions and keeps fact-extraction on-device.";
-      case "fully_local":
-        return "Everything runs on this Mac. Nothing leaves. @brain answers run on-device (private, a little slower live).";
-      case "custom":
-        return "Custom — some features run on-device, some in the cloud.";
-      default:
-        return ""; // null = posture not yet loaded — show nothing rather than a misleading "Custom"
-    }
-  });
+  // (The old `postureStateLine` summary was replaced by the per-posture
+  // `postureMeaning()` line in brain-posture-block — more accurate about which
+  // jobs stay on-device, and not hardcoded to "Claude Code" as the writer.)
 
   /**
    * The installed-base retirement nudge (`brain_model_retirement_nudge`), or null.
