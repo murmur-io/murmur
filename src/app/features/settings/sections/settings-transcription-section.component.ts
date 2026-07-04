@@ -235,7 +235,7 @@ export class SettingsTranscriptionSectionComponent {
   readonly downloadHint = this.store.downloadHint;
 
   onModelChoiceChange(): void {
-    void this.store.onModelChoiceChange();
+    this.store.onModelChoiceChange();
   }
 
   downloadModel(): void {

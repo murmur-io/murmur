@@ -1,4 +1,5 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
+import { GlassService } from "../../../services/glass.service";
 import { ThemeService, type ThemeMode } from "../../../services/theme.service";
 
 /**
@@ -48,6 +49,39 @@ import { ThemeService, type ThemeMode } from "../../../services/theme.service";
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" /><path d="M8 20h8M12 16v4" /></svg>
                     System
                   </button>
+                </div>
+              </div>
+
+              <!-- Liquid Glass intensity — how translucent the chrome panels
+                   (sidebar / pill bar / rails) are. Applies live, auto-saved. -->
+              <div class="card appearance-card">
+                <div class="appearance-copy">
+                  <h3>Liquid Glass</h3>
+                  <p class="text-secondary">
+                    How much of the background shows through the glass panels.
+                    <b>0%</b> makes them solid — the same effect macOS applies
+                    with “Reduce transparency”.
+                  </p>
+                </div>
+                <div class="glass-row">
+                  <svg class="glass-glyph is-min" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <rect x="3" y="3" width="14" height="14" rx="4" fill="currentColor" />
+                  </svg>
+                  <input
+                    class="glass-slider"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="5"
+                    [value]="glassLevel()"
+                    (input)="setGlass($any($event.target).value)"
+                    aria-label="Liquid Glass transparency"
+                  />
+                  <svg class="glass-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                    <rect x="3" y="3" width="14" height="14" rx="4" stroke="currentColor" stroke-width="1.5" opacity="0.55" />
+                    <path d="M6.5 13.5c2.5-2.5 4.5-4.5 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.7" />
+                  </svg>
+                  <span class="glass-value">{{ glassLevel() }}%</span>
                 </div>
               </div>
     </div>
@@ -122,17 +156,88 @@ import { ThemeService, type ThemeMode } from "../../../services/theme.service";
         background: var(--accent-soft);
         color: var(--accent);
       }
+
+      /* --- Liquid Glass slider --- */
+      .glass-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        max-width: 420px;
+      }
+      .glass-glyph {
+        flex: none;
+        width: 18px;
+        height: 18px;
+        color: var(--text-muted);
+      }
+      .glass-value {
+        flex: none;
+        min-width: 44px;
+        text-align: right;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      .glass-slider {
+        flex: 1 1 auto;
+        min-width: 0;
+        height: 22px;
+        margin: 0;
+        appearance: none;
+        -webkit-appearance: none;
+        background: transparent;
+        cursor: pointer;
+      }
+      .glass-slider::-webkit-slider-runnable-track {
+        height: 5px;
+        border-radius: var(--radius-pill);
+        background: var(--surface-input);
+        border: 1px solid var(--border);
+      }
+      .glass-slider::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 18px;
+        height: 18px;
+        margin-top: -7.5px;
+        border-radius: 50%;
+        background: var(--text-on-accent);
+        border: none;
+        box-shadow:
+          0 0 0 1px var(--border-strong),
+          var(--shadow-sm);
+        transition: transform var(--transition-fast);
+      }
+      .glass-slider::-webkit-slider-thumb:hover {
+        transform: scale(1.08);
+      }
+      .glass-slider:focus,
+      .glass-slider:focus-visible {
+        outline: none;
+      }
+      .glass-slider:focus-visible::-webkit-slider-thumb {
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
     `,
   ],
 })
 export class SettingsAppearanceSectionComponent {
   private readonly theme = inject(ThemeService);
+  private readonly glass = inject(GlassService);
 
   /** Current theme choice (Light / Dark / System) — drives the Appearance control. */
   readonly themeMode = this.theme.mode;
 
+  /** Liquid Glass transparency 0–100 — drives the slider position + label. */
+  readonly glassLevel = this.glass.level;
+
   /** Apply a theme immediately (persisted in the service; no save() needed). */
   setTheme(mode: ThemeMode): void {
     this.theme.setMode(mode);
+  }
+
+  /** Apply + persist the glass level live as the slider moves (auto-saved). */
+  setGlass(value: string): void {
+    this.glass.setLevel(Number(value));
   }
 }

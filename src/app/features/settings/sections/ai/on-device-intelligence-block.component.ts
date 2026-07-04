@@ -56,7 +56,7 @@ import { SettingsStore } from "../../settings.store";
                 model.
               </span>
             </span>
-            <input type="checkbox" formControlName="semanticSearchEnabled" />
+            <input class="switch" type="checkbox" formControlName="semanticSearchEnabled" />
           </label>
 
           <!-- Embedding model: present pill, or a download control with progress -->

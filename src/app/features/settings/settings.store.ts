@@ -1,7 +1,7 @@
 import { DestroyRef, Injectable, computed, inject, signal } from "@angular/core";
-import { toSignal } from "@angular/core/rxjs-interop";
+import { takeUntilDestroyed, toSignal } from "@angular/core/rxjs-interop";
 import { FormBuilder, FormControl } from "@angular/forms";
-import { startWith } from "rxjs";
+import { debounceTime, startWith } from "rxjs";
 import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
@@ -133,7 +133,10 @@ export class SettingsStore {
     aecEnabled: false,
     postAecEnabled: true,
     // Recording-storage cap (GB, string for an empty = "no cap") + opt-in auto-prune.
-    audioStorageLimitGb: "",
+    // COMMITS ON BLUR: with auto-save, per-keystroke commits would persist
+    // intermediate values ("1" while typing "15") — and a lowered cap can
+    // trigger an in-session auto-prune. Blur = the typed value is final.
+    audioStorageLimitGb: this.fb.nonNullable.control("", { updateOn: "blur" }),
     audioAutoPrune: false,
     modelSize: "large-v3",
     voiceTrigger: false,
@@ -178,6 +181,57 @@ export class SettingsStore {
   readonly keyControl = new FormControl("", { nonNullable: true });
   /** BYO Brave Search API key input (web-search connector). Cleared after save. */
   readonly webKeyControl = new FormControl("", { nonNullable: true });
+
+  /**
+   * PROTOTYPE auto-save (no Save button): every committed form change persists
+   * after a short debounce. TWO gates:
+   * - `autoSaveReady` — armed only by a SUCCESSFUL load(), so a failed load's
+   *   pristine defaults can never be written over the user's stored config;
+   * - `form.dirty` — UI interactions mark controls dirty, programmatic
+   *   patchValue (the load() seeding storm) does not, so opening Settings
+   *   never writes. Store methods that patch the form ON THE USER'S BEHALF
+   *   (role/posture/model picks, vault pickers) call markAsDirty() so their
+   *   change autosaves like any direct edit. Never reset to pristine — dirty
+   *   simply means "the user has touched settings this session".
+   * The subscription performs an action (save); all state stays in signals.
+   */
+  private autoSaveReady = false;
+  /** True while a form change awaits its debounced save (drives the destroy flush). */
+  private autoSavePending = false;
+  private readonly _autoSaveMark = this.form.valueChanges
+    .pipe(takeUntilDestroyed())
+    .subscribe(() => {
+      this.autoSavePending = true;
+    });
+  private readonly _autoSave = this.form.valueChanges
+    .pipe(debounceTime(500), takeUntilDestroyed())
+    .subscribe(() => {
+      this.autoSavePending = false;
+      if (!(this.autoSaveReady && this.form.dirty)) return;
+      // A synchronous throw here would KILL the subscription and silently end
+      // auto-save for the session — contain it and surface it in the banner.
+      try {
+        void this.save();
+      } catch (e) {
+        this._loadError.set("Save failed: " + String(e));
+      }
+    });
+
+  constructor() {
+    // Leaving /settings destroys this store (component-provided) — flush a
+    // change still sitting in the 500ms debounce window instead of dropping
+    // it (adversarial-verify finding: toggle → ⌘N within 500ms lost the edit).
+    this.destroyRef.onDestroy(() => {
+      if (this.autoSavePending && this.autoSaveReady && this.form.dirty) {
+        this.autoSavePending = false;
+        try {
+          void this.save(); // fire-and-forget; the IPC completes after teardown
+        } catch {
+          // best-effort flush — nowhere left to surface an error
+        }
+      }
+    });
+  }
 
   private readonly _providers = signal<ProviderStatus[]>([]);
   readonly providers = this._providers.asReadonly();
@@ -777,6 +831,8 @@ export class SettingsStore {
         });
         break;
     }
+    // User-driven form write → dirty, so the auto-save picks it up.
+    this.form.markAsDirty();
     if (PROVIDER_CONNECTION_IDS.includes(connection)) {
       void this.ensureModels(connection);
     }
@@ -926,6 +982,7 @@ export class SettingsStore {
       brainModelPath: isPath ? v : "",
       brainModelId: isPath ? "" : v,
     });
+    this.form.markAsDirty(); // user-driven → auto-save
   }
 
   // ── brain2 RAG — semantic search (embedding model + reindex) ────────────
@@ -1132,6 +1189,9 @@ export class SettingsStore {
       this._appInfo.set(await this.ipc.appInfo().catch(() => null));
       // Recording-storage usage report (best-effort; drives the Storage section + Library bar).
       await this.loadStorageReport();
+      // Only a SUCCESSFUL load arms auto-save — arming after a failed load
+      // would let the pristine defaults overwrite the user's stored config.
+      this.autoSaveReady = true;
     } catch (e) {
       this._loadError.set(String(e));
     }
@@ -1207,6 +1267,7 @@ export class SettingsStore {
       // Clear any custom PATH: it wins over the id in resolve_brain_model, so a
       // stale path would silently override the registry model just picked.
       this.form.patchValue({ brainModelId: id, brainModelPath: "" });
+      this.form.markAsDirty(); // user-driven → auto-save
       await this.refreshBrainModels();
     } catch (e) {
       this._brainError.set(String(e));
@@ -1517,6 +1578,7 @@ export class SettingsStore {
         brainModelId: nudge.replacementId,
         brainModelPath: "",
       });
+      this.form.markAsDirty(); // user-driven → auto-save
       await this.refreshBrainModels();
       await this.refreshPosture();
     } catch (e) {
@@ -1641,13 +1703,18 @@ export class SettingsStore {
 
   async pickVault(): Promise<void> {
     const dir = await open({ directory: true, multiple: false });
-    if (typeof dir === "string") this.form.patchValue({ vaultPath: dir });
+    if (typeof dir === "string") {
+      this.form.patchValue({ vaultPath: dir });
+      this.form.markAsDirty(); // user-driven → auto-save
+    }
   }
 
   async pickModel(): Promise<void> {
     const file = await open({ directory: false, multiple: false });
-    if (typeof file === "string")
+    if (typeof file === "string") {
       this.form.patchValue({ whisperModelPath: file });
+      this.form.markAsDirty(); // user-driven → auto-save
+    }
   }
 
   async save(): Promise<void> {
@@ -1678,12 +1745,14 @@ export class SettingsStore {
       // filters n>0 so a persisted 0 silently becomes "no cap" on restart (asymmetric).
       // Opt-in auto-prune rides every save like the other flags.
       audioStorageLimitGb: (() => {
-        const n = Math.floor(Number(v.audioStorageLimitGb));
-        return v.audioStorageLimitGb.trim() !== "" &&
-          Number.isFinite(n) &&
-          n >= 1
-          ? n
-          : null;
+        // The rendered input is type="number": its accessor commits a NUMBER
+        // (or null when cleared) into this string-typed control — normalize
+        // to a string FIRST or `.trim()` throws and kills the auto-save
+        // subscriber for the whole session (adversarial-verify finding).
+        const raw: unknown = v.audioStorageLimitGb;
+        const s = raw == null ? "" : String(raw).trim();
+        const n = Math.floor(Number(s));
+        return s !== "" && Number.isFinite(n) && n >= 1 ? n : null;
       })(),
       audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
@@ -1753,6 +1822,10 @@ export class SettingsStore {
       // reads — re-read it so the posture segment reflects backend truth (never a
       // stale "Fully local" label over a just-saved cloud role).
       await this.refreshPosture();
+      // A saved language/quality choice changes which Whisper model is needed —
+      // re-check presence so the download hint stays honest (was previously done
+      // by onModelChoiceChange's direct save, now retired).
+      this._modelPresent.set(await this.ipc.modelPresent().catch(() => false));
     } catch (e) {
       this._loadError.set("Save failed: " + String(e));
     }
@@ -1967,11 +2040,14 @@ export class SettingsStore {
     }
   }
 
-  /** Persist the chosen language + quality, then re-check which model is present. */
-  async onModelChoiceChange(): Promise<void> {
+  /**
+   * React to the language/quality selects. NO direct save() — the select is a
+   * form control, so the debounced auto-save persists it (a direct call here
+   * produced a double save — adversarial-verify finding); save() itself
+   * refreshes the model-present indicator once the new choice is stored.
+   */
+  onModelChoiceChange(): void {
     this.updateDownloadHint();
-    await this.save();
-    this._modelPresent.set(await this.ipc.modelPresent());
   }
 
   private updateDownloadHint(): void {

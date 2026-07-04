@@ -109,7 +109,7 @@ import { SettingsStore } from "../settings.store";
                       vault (e.g. Standups, 1-1s, Acme Project).
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="autoOrganize" />
+                  <input class="switch" type="checkbox" formControlName="autoOrganize" />
                 </label>
               </div>
     </div>

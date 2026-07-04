@@ -34,7 +34,7 @@ import { SettingsStore } from "../../settings.store";
               listening and (for cloud) sends audio-derived text mid-meeting.
             </span>
           </span>
-          <input type="checkbox" formControlName="realtimeReactions" />
+          <input class="switch" type="checkbox" formControlName="realtimeReactions" />
         </label>
 
         <label class="toggle-row">
@@ -47,7 +47,7 @@ import { SettingsStore } from "../../settings.store";
               every two minutes.
             </span>
           </span>
-          <input type="checkbox" formControlName="proactiveHintsEnabled" />
+          <input class="switch" type="checkbox" formControlName="proactiveHintsEnabled" />
         </label>
 
         <!--
