@@ -208,11 +208,13 @@ interface HitRow {
         cursor: pointer;
         transition: background var(--transition-fast), color var(--transition-fast);
       }
-      .qs-row:hover,
-      .qs-row.selected {
-        background: var(--accent-soft);
+      /* Hover is NEUTRAL; the keyboard selection uses the native macOS
+         pattern — a flat accent fill with white content (menu/Spotlight). */
+      .qs-row:hover {
+        background: var(--surface-hover);
         color: var(--text-primary);
       }
+      .qs-row.selected { background: var(--accent); }
       .qs-row:focus-visible {
         outline: none;
         box-shadow: 0 0 0 3px var(--accent-ring);
@@ -226,8 +228,16 @@ interface HitRow {
         color: var(--text-muted);
       }
       .qs-row-icon svg { width: 18px; height: 18px; display: block; }
+      .qs-row:hover .qs-row-icon { color: var(--text-primary); }
       .qs-row.selected .qs-row-icon,
-      .qs-row:hover .qs-row-icon { color: var(--accent-hover); }
+      .qs-row.selected .qs-row-title,
+      .qs-row.selected .qs-date { color: var(--text-on-accent); }
+      .qs-row.selected .qs-row-snippet { color: rgba(255, 255, 255, 0.78); }
+      .qs-row.selected .qs-chip {
+        border-color: transparent;
+        background: rgba(255, 255, 255, 0.2);
+        color: var(--text-on-accent);
+      }
       .qs-row-main {
         flex: 1 1 auto;
         min-width: 0;
