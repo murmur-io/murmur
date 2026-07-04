@@ -77,17 +77,9 @@ fn role_row(job: &str, title: &str, role: Role, cfg: &AppConfig) -> AiMapRow {
         _ => {
             let cloud = crate::summarize::egress_is_cloud(conn, cfg);
             // Show the model the connection will ACTUALLY use: an empty resolved model falls
-            // back to the connection's own model key, mirroring the provider factory arms.
-            let model = if !t.model.trim().is_empty() {
-                t.model.clone()
-            } else {
-                match conn {
-                    crate::summarize::PROVIDER_OLLAMA => cfg.ollama_model.clone(),
-                    crate::summarize::PROVIDER_GATEWAY => cfg.gateway_model.clone(),
-                    crate::summarize::PROVIDER_ANTHROPIC => cfg.anthropic_model.clone(),
-                    _ => String::new(),
-                }
-            };
+            // back to the connection's own model key. Mirror backend truth by deferring to the
+            // canonical crate helper rather than re-copying its per-connection fallback arms.
+            let model = crate::summarize::effective_model_requested(&t, cfg);
             AiMapRow {
                 engine: roles::connection_display_name(conn).to_string(),
                 model,
@@ -209,6 +201,40 @@ mod tests {
         assert_eq!(notes.model, cfg.ollama_model, "empty role model must fall back to ollama_model");
         assert!(notes.on_device, "loopback ollama must not classify as cloud");
         assert!(!notes.redacted);
+    }
+
+    #[test]
+    fn cloud_nondefault_role_redacts_and_falls_back_to_connection_model() {
+        // An explicit Ask role on anthropic with an EMPTY role model must render the
+        // connection's own key (anthropic_model), be off-device, and be redacted.
+        let cfg = AppConfig {
+            role_ask_connection: "anthropic".into(),
+            anthropic_model: "claude-opus-4-8".into(),
+            ..Default::default()
+        };
+        let rows = ai_map_rows(&cfg);
+        let ask = row(&rows, "ask");
+        assert_eq!(ask.engine, "Anthropic API");
+        assert_eq!(ask.model, cfg.anthropic_model, "empty role model falls back to anthropic_model");
+        assert!(!ask.on_device, "anthropic is cloud ⇒ not on-device");
+        assert!(ask.redacted, "cloud egress passes the redaction firewall");
+        assert!(ask.active);
+        assert!(ask.routable);
+    }
+
+    #[test]
+    fn reasoner_only_role_is_on_device_with_no_model() {
+        // An explicit Ask role of `off` (CONN_OFF) resolves to retrieval-only: on-device, no model.
+        let cfg = AppConfig {
+            role_ask_connection: CONN_OFF.into(),
+            ..Default::default()
+        };
+        let rows = ai_map_rows(&cfg);
+        let ask = row(&rows, "ask");
+        assert_eq!(ask.engine, "Retrieval only (no model)");
+        assert_eq!(ask.model, "");
+        assert!(ask.on_device);
+        assert!(!ask.redacted);
     }
 
     #[test]
