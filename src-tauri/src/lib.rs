@@ -172,6 +172,8 @@ pub fn run() {
             commands::brain_model_present,
             commands::list_brain_models,
             commands::brain_model_retirement_nudge,
+            commands::brain_posture,
+            commands::set_brain_posture,
             commands::select_brain_model,
             commands::download_brain_model,
             commands::afm_available,

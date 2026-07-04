@@ -179,6 +179,15 @@ impl AppState {
         Self::init_at(&db_path, &dek)
     }
 
+    /// Whether a recording is currently in progress. Cheap best-effort read (a poisoned lock counts as
+    /// "not recording" — fail-open, since this only GATES deferrable background work). Drives the
+    /// recording-active gate (spec §3.3; adversarial review perf #4): heavy inference / batch fact
+    /// extraction / embedder reindex defer while this is true, so they never contend with live capture
+    /// on the Metal GPU that whisper needs for smooth captions.
+    pub fn is_recording(&self) -> bool {
+        self.recorder.lock().map(|r| r.is_some()).unwrap_or(false)
+    }
+
     /// Core of [`AppState::init`] with the DB path + DEK injected, so it can be unit-tested
     /// against a temp database without touching the real Keychain or app-data dir. Migrates any
     /// existing PLAINTEXT DB to encrypted (safe: the original is untouched until a verified atomic

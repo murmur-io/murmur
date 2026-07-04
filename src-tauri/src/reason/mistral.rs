@@ -8,13 +8,22 @@
 //! Everything here is **COMPILE-proven only** in the headless CI loop. What can ONLY be verified on a
 //! signed/dev build on a real Mac, with a GGUF actually present:
 //! - real inference correctness (does the model produce sane text at all);
-//! - the **JSON-schema-constrained decode** ([`Constraint::JsonSchema`]) actually yielding valid,
-//!   schema-conforming JSON;
+//! - the token cap / `enable_thinking` actually taking effect in the sampler;
 //! - Polish-language quality;
-//! - Metal performance (load time, tokens/sec, memory).
+//! - Metal performance (load time, tokens/sec, memory), and the cap-2 co-residency / drop-leak
+//!   behavior (spec §3.3, Spike B).
 //!
 //! `cargo test --lib` NEVER runs a forward pass here. Treat a green build as proof the impl
 //! typechecks/links against mistralrs 0.8.1 — NOT as proof inference works.
+//!
+//! ## Shared, capped weight cache (spec §3.3)
+//!
+//! Loaded engines live in a PROCESS-GLOBAL [`model_cache`] keyed by canonical GGUF path, so a model's
+//! multi-GB weights load ONCE and the light + heavy engines can co-reside. The cache is capped at
+//! [`MODEL_CACHE_CAP`] and **REFUSES rather than evicts**: mistral.rs has documented drop-leaks
+//! (issues #723/#865), so until a real-Mac spike (Spike B) proves clean drops we NEVER unload — a 3rd
+//! distinct model is refused (`Err`), the caller degrades to the deterministic floor, and the FE can
+//! nudge "restart to switch models".
 //!
 //! ## Graceful + crash-safe
 //!
@@ -32,33 +41,46 @@
 //! inside `tokio::task::spawn_blocking`. Callers SHOULD still `spawn_blocking` us off the async pool.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use mistralrs::{GgufModelBuilder, Model, TextMessageRole, TextMessages};
+use mistralrs::{GgufModelBuilder, Model, RequestBuilder, TextMessageRole};
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
-use crate::reason::{parse_first_json, LocalReasoner};
+use crate::reason::{parse_first_json, GenOptions, LocalReasoner};
 
-/// A [`LocalReasoner`] running a local GGUF model in-process via mistralrs (Metal). The model is
-/// loaded lazily + cached behind an `Arc` so repeated calls reuse one engine.
+/// Max distinct GGUF models held resident at once — the light + heavy co-residency budget (spec
+/// §3.3). REFUSE-don't-evict at the cap (see the module header).
+const MODEL_CACHE_CAP: usize = 2;
+
+/// The process-global loaded-model cache: canonical GGUF path → engine. Shared by every
+/// [`MistralReasoner`] instance (and, later, the LocalSummarizerProvider), so a model's weights load
+/// exactly once. A `Vec` (not a map) keeps the cap trivially enforceable and preserves load order.
+fn model_cache() -> &'static Mutex<Vec<(PathBuf, Arc<Model>)>> {
+    static CACHE: OnceLock<Mutex<Vec<(PathBuf, Arc<Model>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A [`LocalReasoner`] running a local GGUF model in-process via mistralrs (Metal). The heavy engine
+/// lives in the shared [`model_cache`]; this holds only the path + a worker runtime, so instances are
+/// cheap to create (the light and heavy handles each build one, sharing weights by path).
 pub struct MistralReasoner {
     id: String,
+    /// Full canonical GGUF path — the shared-cache key.
+    model_path: PathBuf,
     /// Directory holding the GGUF (mistralrs' `GgufModelBuilder` takes a dir + filename list).
     model_dir: PathBuf,
     /// GGUF filename within `model_dir`.
     model_file: String,
     /// Dedicated runtime used to drive mistralrs' async API from the sync trait methods.
     rt: tokio::runtime::Runtime,
-    /// Lazily-built, cached engine handle. `None` until the first `reason`/`structured` call.
-    model: Mutex<Option<Arc<Model>>>,
 }
 
 impl MistralReasoner {
     /// Build a reasoner for the GGUF at `model_path`. CHEAP + non-blocking: it only splits the path
-    /// and stands up the worker runtime — the multi-GB model load is deferred to first use, so this
-    /// is safe to call from `active_reasoner` on the startup path. Returns `Err` (never panics) if
-    /// the path has no parent/filename or the runtime can't be built.
+    /// and stands up the worker runtime — the multi-GB model load is deferred to first use (and shared
+    /// via [`model_cache`]), so this is safe to call from `active_reasoner` on the startup path.
+    /// Returns `Err` (never panics) if the path has no parent/filename or the runtime can't be built.
     pub fn new(model_path: PathBuf) -> Result<Self> {
         let model_dir = model_path
             .parent()
@@ -75,22 +97,27 @@ impl MistralReasoner {
             .map_err(|e| AppError::Summarize(format!("brain runtime init failed: {e}")))?;
         Ok(Self {
             id: format!("mistralrs:{model_file}"),
+            model_path,
             model_dir,
             model_file,
             rt,
-            model: Mutex::new(None),
         })
     }
 
-    /// Lazily load (once) + return the cached engine handle. Serializes concurrent first-loads behind
-    /// the mutex; a load failure surfaces as `Err` and leaves the cache empty (a later call may retry).
+    /// Return the cached engine for this model's path, loading it once if absent. Serializes loads
+    /// behind the shared-cache mutex; at [`MODEL_CACHE_CAP`] a NEW path is REFUSED (`Err`) rather than
+    /// evicting a resident model — the caller then degrades to the deterministic floor.
     fn model(&self) -> Result<Arc<Model>> {
-        let mut guard = self
-            .model
+        let mut cache = model_cache()
             .lock()
-            .map_err(|_| AppError::Summarize("brain model mutex poisoned".into()))?;
-        if let Some(m) = guard.as_ref() {
+            .map_err(|_| AppError::Summarize("brain model cache poisoned".into()))?;
+        if let Some((_, m)) = cache.iter().find(|(p, _)| p == &self.model_path) {
             return Ok(m.clone());
+        }
+        if cache.len() >= MODEL_CACHE_CAP {
+            return Err(AppError::Summarize(format!(
+                "Murmur Brain holds at most {MODEL_CACHE_CAP} models at once; restart to switch models"
+            )));
         }
         let builder = GgufModelBuilder::new(
             self.model_dir.to_string_lossy().to_string(),
@@ -101,8 +128,42 @@ impl MistralReasoner {
         let model = block_on(&self.rt, builder.build())?
             .map_err(|e| AppError::Summarize(format!("brain model load failed: {e}")))?;
         let arc = Arc::new(model);
-        *guard = Some(arc.clone());
+        cache.push((self.model_path.clone(), arc.clone()));
         Ok(arc)
+    }
+
+    /// Free-form generation with explicit [`GenOptions`] — the load-bearing path. The token cap
+    /// (`set_sampler_max_len`) bounds a runaway decode; `enable_thinking(false)` keeps qwen3 thinking
+    /// traces out (a no-op on non-thinking models). An in-flight generation is NOT cancellable once
+    /// submitted — the cap is the only per-call bound (spec §4.3).
+    fn reason_with(&self, system: &str, user: &str, opts: GenOptions) -> Result<String> {
+        let model = self.model()?;
+        let mut req = RequestBuilder::new()
+            .add_message(TextMessageRole::System, system)
+            .add_message(TextMessageRole::User, user)
+            .enable_thinking(opts.enable_thinking);
+        if let Some(t) = opts.temperature {
+            req = req.set_sampler_temperature(t);
+        }
+        if let Some(n) = opts.max_tokens {
+            req = req.set_sampler_max_len(n);
+        }
+        let resp = block_on(&self.rt, model.send_chat_request(req))?
+            .map_err(|e| AppError::Summarize(format!("brain generation failed: {e}")))?;
+        Self::first_content(resp)
+    }
+
+    /// Structured generation with explicit [`GenOptions`]: instruct the JSON schema in the prompt
+    /// (mistralrs' `Constraint::JsonSchema` overflowed the context on Bielik-11B; see the module
+    /// header) and recover the object via the robust extractor — the SAME approach `CloudReasoner`
+    /// uses. Threads the token cap through so the realtime path stays bounded.
+    fn structured_with_opts(&self, system: &str, user: &str, json_schema: &Value, opts: GenOptions) -> Result<Value> {
+        let sys = format!(
+            "{system}\n\nRespond with ONLY a single JSON object conforming to this schema: \
+             {json_schema}. No prose, no markdown fences."
+        );
+        let content = self.reason_with(&sys, user, opts)?;
+        parse_first_json(&content)
     }
 
     /// Pull the first choice's text content out of a chat completion response.
@@ -121,28 +182,21 @@ impl LocalReasoner for MistralReasoner {
     }
 
     fn reason(&self, system: &str, user: &str) -> Result<String> {
-        let model = self.model()?;
-        let messages = TextMessages::new()
-            .add_message(TextMessageRole::System, system)
-            .add_message(TextMessageRole::User, user);
-        let resp = block_on(&self.rt, model.send_chat_request(messages))?
-            .map_err(|e| AppError::Summarize(format!("brain generation failed: {e}")))?;
-        Self::first_content(resp)
+        self.reason_with(system, user, GenOptions::default())
     }
 
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value> {
-        // mistralrs' `Constraint::JsonSchema` overflowed the model context on Bielik-11B
-        // (a `narrow … start: 32768` model error at the 32K context boundary), so instead we
-        // INSTRUCT JSON in the prompt and recover it with the robust extractor — the SAME
-        // approach `CloudReasoner` uses. `reason()` (unconstrained generation) is proven to work
-        // (the on-Mac smoke test produced sane Polish); `parse_first_json` tolerates any prose or
-        // markdown fence the model wraps around the object.
-        let sys = format!(
-            "{system}\n\nRespond with ONLY a single JSON object conforming to this schema: \
-             {json_schema}. No prose, no markdown fences."
-        );
-        let content = self.reason(&sys, user)?;
-        parse_first_json(&content)
+        self.structured_with_opts(system, user, json_schema, GenOptions::default())
+    }
+
+    fn structured_with(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+    ) -> Result<Value> {
+        self.structured_with_opts(system, user, json_schema, opts)
     }
 }
 

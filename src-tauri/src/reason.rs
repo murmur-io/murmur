@@ -294,6 +294,59 @@ pub fn brain_model_dtos(
         .collect()
 }
 
+/// The registry's DEFAULT model for a class — the first entry of that class in display order
+/// (`Light` → qwen3-1.7b, `Heavy` → qwen3-4b-instruct-2507). Used when the user hasn't picked a
+/// class-specific model; once its GGUF is downloaded it activates automatically.
+pub fn default_model_for_class(class: ModelClass) -> Option<&'static BrainModel> {
+    BRAIN_MODELS.iter().find(|m| m.class == class)
+}
+
+/// The EFFECTIVE model id for a class: the user's explicit pick
+/// (`brain_light_model_id` / `brain_heavy_model_id`) when set, else the registry default for the
+/// class. Drives the Brain-Live `light()` / `heavy()` handles.
+pub fn class_model_id(cfg: &AppConfig, class: ModelClass) -> Option<String> {
+    let explicit = match class {
+        ModelClass::Light => cfg.brain_light_model_id.as_deref(),
+        ModelClass::Heavy => cfg.brain_heavy_model_id.as_deref(),
+    };
+    explicit
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| default_model_for_class(class).map(|m| m.id.to_string()))
+}
+
+/// A fixed call-overhead RAM budget (GB) for the combined-residency guard: the OS + a Zoom/Meet call
+/// + a browser + the webview + whisper + the embedder, all live during a recording (spec §3.3).
+pub const CALL_OVERHEAD_GB: u64 = 4;
+
+/// Estimated combined-residency RAM (GB) for a set of resident models INCLUDING a coarse KV-cache
+/// budget — the registry's per-model `min_ram_gb` is per-model-ALONE and LIES for co-residency during
+/// a live call (spec §3.3; adversarial review perf #3, which flagged the missing KV line). Weights are
+/// ceil-GB of `approx_size_bytes`; KV is a coarse per-model estimate; plus [`CALL_OVERHEAD_GB`]. Pure.
+pub fn combined_residency_gb(models: &[&BrainModel], call_overhead_gb: u64) -> u64 {
+    /// A heavy model over a long transcript allocates ~1–2 GB of KV; budget 1 GB/model coarsely.
+    const KV_PER_MODEL_GB: u64 = 1;
+    let gib = 1u64 << 30;
+    let weights_gb: u64 = models
+        .iter()
+        .map(|m| m.approx_size_bytes.div_ceil(gib))
+        .sum();
+    weights_gb + models.len() as u64 * KV_PER_MODEL_GB + call_overhead_gb
+}
+
+/// Whether a resident model set fits the machine's total RAM (spec §3.3 combined guard). `None` total
+/// ⇒ `true` — never block behind a failed RAM probe (the picker's existing philosophy).
+pub fn residency_fits(
+    models: &[&BrainModel],
+    total_ram_gb: Option<u64>,
+    call_overhead_gb: u64,
+) -> bool {
+    match total_ram_gb {
+        Some(total) => combined_residency_gb(models, call_overhead_gb) <= total,
+        None => true,
+    }
+}
+
 /// Resolve a user-supplied CUSTOM brain GGUF path override, or `Ok(None)`.
 ///
 /// `configured` is the explicit path from settings (`brain_model_path`), used verbatim if it points
@@ -343,11 +396,52 @@ pub fn resolve_brain_model(
     Ok(None)
 }
 
-/// Download `url` to `dest` atomically (`dest.part` → rename), invoking `on_progress(downloaded,
-/// total)` as bytes arrive (total is `None` when the server omits `Content-Length`). INBOUND ONLY:
-/// this fetches a model file and sends NO request body / NO meeting content (no egress). Streams via
-/// `Response::chunk` (no extra stream-combinator dep). NO PII logged — model id / byte counts only.
-pub async fn download_brain_model<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<()>
+/// Compute the lower-case hex SHA-256 of `path` via the macOS-native `shasum -a 256` (no new crate —
+/// CLAUDE.md forbids adding a hashing dependency). Sync core, so it is unit-testable without a
+/// runtime; the async wrapper runs it on the blocking pool (hashing a multi-GB file is CPU-heavy).
+fn sha256_hex_sync(path: &Path) -> Result<String> {
+    let out = std::process::Command::new("shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(path)
+        .output()
+        .map_err(|e| AppError::Summarize(format!("shasum spawn failed: {e}")))?;
+    if !out.status.success() {
+        return Err(AppError::Summarize("shasum returned a non-zero status".into()));
+    }
+    // Output shape: "<hex>  <path>\n" — the hash is the first whitespace-delimited token.
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_lowercase())
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| AppError::Summarize("shasum produced no 64-hex digest".into()))
+}
+
+async fn sha256_hex(path: &Path) -> Result<String> {
+    let p = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sha256_hex_sync(&p))
+        .await
+        .map_err(|e| AppError::Summarize(format!("shasum task join failed: {e}")))?
+}
+
+/// Download `url` to `dest` with HTTP Range **resume** + optional pinned **SHA-256** verify (spec §5).
+///
+/// - Resume: a surviving `dest.part` from an interrupted run is continued via `Range: bytes=<n>-`; if
+///   the server ignores Range (200 not 206) the partial is discarded and the download restarts.
+/// - Integrity: when `expected_sha256` is `Some`, the completed `.part` is verified BEFORE the atomic
+///   rename — a mismatch deletes the file and returns `Err` (never promote an unverified GGUF, which
+///   feeds the P1 no-silent-fallback invariant). `None` = unpinned entry: verification is SKIPPED with
+///   a loud warning (an honest interim state until the registry hashes are pinned).
+///
+/// INBOUND ONLY: fetches a model file and sends NO request body / NO meeting content (no egress).
+/// Streams via `Response::chunk` (no extra stream-combinator dep). NO PII logged — byte counts only.
+pub async fn download_brain_model<F>(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+    mut on_progress: F,
+) -> Result<()>
 where
     F: FnMut(u64, Option<u64>),
 {
@@ -355,22 +449,44 @@ where
 
     tracing::info!(target: "reason", file = %dest.display(), "downloading brain model");
 
-    let mut resp = reqwest::get(url)
+    let part = dest.with_extension("part");
+    // Resume from a surviving partial, if any.
+    let mut existing: u64 = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
+
+    let client = reqwest::Client::new();
+    let mut req = client.get(url);
+    if existing > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+        tracing::info!(target: "reason", resume_from = existing, "resuming brain model download");
+    }
+    let resp = req
+        .send()
         .await
         .map_err(|e| AppError::Summarize(format!("brain model download request failed: {e}")))?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
         return Err(AppError::Summarize(format!(
-            "brain model download HTTP {}",
-            resp.status()
+            "brain model download HTTP {status}"
         )));
     }
-    let total = resp.content_length();
+    // We requested a resume but the server sent the FULL body (200, not 206 Partial) → it ignored
+    // Range; discard the stale partial and restart from zero so we never concatenate mismatched bytes.
+    let resuming = status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if existing > 0 && !resuming {
+        let _ = tokio::fs::remove_file(&part).await;
+        existing = 0;
+    }
+    // On a 206 the Content-Length is the REMAINING bytes; total = already-on-disk + remaining.
+    let total = resp.content_length().map(|r| existing + r);
 
-    let part = dest.with_extension("part");
-    let mut file = tokio::fs::File::create(&part)
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part)
         .await
-        .map_err(|e| AppError::Summarize(format!("create brain model temp file: {e}")))?;
-    let mut downloaded: u64 = 0;
+        .map_err(|e| AppError::Summarize(format!("open brain model temp file: {e}")))?;
+    let mut resp = resp;
+    let mut downloaded: u64 = existing;
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -393,6 +509,30 @@ where
             "brain model download returned empty body".into(),
         ));
     }
+
+    // Verify BEFORE promoting — an unverified GGUF must never be loaded.
+    match expected_sha256 {
+        Some(expected) => {
+            let got = sha256_hex(&part).await.map_err(|e| {
+                // Can't verify ⇒ don't promote; leave the .part for a resume-verify retry.
+                AppError::Summarize(format!("brain model integrity check failed to run: {e}"))
+            })?;
+            if !got.eq_ignore_ascii_case(expected) {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(AppError::Summarize(
+                    "brain model SHA-256 mismatch — download corrupt or tampered; deleted".into(),
+                ));
+            }
+        }
+        None => {
+            tracing::warn!(
+                target: "reason",
+                file = %dest.display(),
+                "no pinned SHA-256 for this model — integrity check SKIPPED (unpinned registry entry)"
+            );
+        }
+    }
+
     tokio::fs::rename(&part, dest)
         .await
         .map_err(|e| AppError::Summarize(format!("rename brain model file: {e}")))?;
@@ -542,6 +682,37 @@ impl ReasonerCell {
         }
     }
 
+    /// The LIGHT-engine handle for Brain-Live features (realtime reactions, fact extraction). Resolves
+    /// the posture's light model to a LOADED local instance, or the dependency-free [`StubReasoner`]
+    /// when its GGUF is absent/unloadable — **NEVER a cloud fallback** (P1 invariant: a missing local
+    /// model DEGRADES the feature, it does not silently egress). Presence is rechecked per call.
+    /// Callers consult this ONLY when Brain Live is ON; with it OFF the existing role-resolved paths
+    /// apply unchanged. (Adversarial review, code-truth #1/#3 + product #1: the v0.1 "else the
+    /// role-resolved reasoner" order would have silently egressed facts on a missing model.)
+    pub fn light(&self) -> Arc<dyn LocalReasoner> {
+        self.class_or_stub(ModelClass::Light)
+    }
+
+    /// The HEAVY-engine handle (local Notes/Ask + post-call analysis). Same LOCAL-or-stub,
+    /// NEVER-cloud contract as [`light`](Self::light).
+    pub fn heavy(&self) -> Arc<dyn LocalReasoner> {
+        self.class_or_stub(ModelClass::Heavy)
+    }
+
+    /// Resolve a class engine LOCAL-or-stub — never cloud, never the single class-agnostic custom path
+    /// override (`brain_model_path`), so the light and heavy handles can't collide on one custom file.
+    /// A poisoned config mutex still yields the stub (fail-closed, no egress).
+    fn class_or_stub(&self, class: ModelClass) -> Arc<dyn LocalReasoner> {
+        let model_id = match self.config.lock() {
+            Ok(c) => class_model_id(&c, class),
+            Err(p) => class_model_id(&p.into_inner(), class),
+        };
+        match resolve_brain_model(None, model_id.as_deref()) {
+            Ok(Some(_)) => Arc::from(local_reasoner_resolved(None, model_id.as_deref())),
+            _ => Arc::new(StubReasoner),
+        }
+    }
+
     /// The LOCAL dispatch: reuse the cached instance while the resolved GGUF path is unchanged;
     /// rebuild (inside the cache lock, so concurrent callers never double-load a model) only when
     /// it changes. Resolution is a cheap filesystem probe per call — never a model load.
@@ -614,6 +785,45 @@ fn local_reasoner_resolved(
     Box::new(StubReasoner)
 }
 
+/// Generation options for ONE reasoning call (spec §3.1 / §4.3). Defaults reproduce today's behavior
+/// for every reasoner that IGNORES them; the LIGHT realtime-extraction path sets a small `max_tokens`
+/// so a rambling on-device generation can't saturate Metal for tens of seconds — the sampler cap is
+/// the ONLY real per-call bound (an in-flight generation is not cancellable). `enable_thinking=false`
+/// keeps qwen3 thinking traces out of structured extraction (a no-op on non-thinking models).
+#[derive(Debug, Clone, Copy)]
+pub struct GenOptions {
+    /// Hard decode cap (mistralrs `set_sampler_max_len`). `None` = the model's own default (today's
+    /// behavior). Load-bearing for the realtime path.
+    pub max_tokens: Option<usize>,
+    /// Sampling temperature. `None` = the model's default sampler.
+    pub temperature: Option<f64>,
+    /// Whether to allow qwen3 "thinking" traces. Default `false` — we never want thinking in
+    /// structured extraction; on non-thinking models this is a no-op.
+    pub enable_thinking: bool,
+}
+
+impl Default for GenOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            temperature: None,
+            enable_thinking: false,
+        }
+    }
+}
+
+impl GenOptions {
+    /// The LIGHT realtime-extraction preset: a hard 128-token cap, low temperature, no thinking
+    /// (spec §4.3 — triples are short; the cap is the contention lever).
+    pub fn light_extraction() -> Self {
+        Self {
+            max_tokens: Some(128),
+            temperature: Some(0.2),
+            enable_thinking: false,
+        }
+    }
+}
+
 /// A local (on-device, no-egress) reasoning model. Synchronous: the real impl runs a local model
 /// to completion on a worker thread; the stub is pure. All methods are deterministic for a given
 /// input in the stub.
@@ -631,6 +841,20 @@ pub trait LocalReasoner: Send + Sync {
     /// `Constraint::JsonSchema` — it overflowed the context on Bielik-11B); the stub likewise ignores
     /// the schema but still returns valid JSON through the same extractor.
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value>;
+
+    /// Structured reasoning WITH generation options (a token cap etc.). Default: IGNORE the options
+    /// and delegate to [`structured`](Self::structured) — the Stub / Cloud / AFM reasoners have no
+    /// local sampler to bound. [`mistral::MistralReasoner`] OVERRIDES this to honor the cap, the only
+    /// real per-call bound on a runaway on-device generation (spec §4.3).
+    fn structured_with(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        _opts: GenOptions,
+    ) -> Result<Value> {
+        self.structured(system, user, json_schema)
+    }
 }
 
 /// Extract the first BALANCED top-level JSON object `{...}` from `text`.
@@ -985,6 +1209,24 @@ mod tests {
     }
 
     #[test]
+    fn sha256_hex_sync_is_stable_64hex_and_content_sensitive() {
+        // The macOS-native shasum path (no new crate): 64 hex chars, deterministic per content.
+        let a = tmp_file("sha-a", b"murmur brain");
+        let a2 = tmp_file("sha-a2", b"murmur brain");
+        let b = tmp_file("sha-b", b"different bytes entirely");
+        let ha = sha256_hex_sync(&a).unwrap();
+        let ha2 = sha256_hex_sync(&a2).unwrap();
+        let hb = sha256_hex_sync(&b).unwrap();
+        assert_eq!(ha.len(), 64);
+        assert!(ha.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(ha, ha2, "identical content ⇒ identical hash");
+        assert_ne!(ha, hb, "different content ⇒ different hash");
+        for f in [a, a2, b] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
     fn registry_lookup_by_id() {
         // Every advertised id resolves; an unknown id is None.
         for m in BRAIN_MODELS {
@@ -1112,6 +1354,21 @@ mod tests {
         // An active or absent selection produces no nudge.
         assert!(retired_model_nudge(Some("qwen3-1.7b"), &dir).is_none());
         assert!(retired_model_nudge(None, &dir).is_none());
+    }
+
+    #[test]
+    fn residency_guard_counts_weights_kv_and_overhead() {
+        let light = brain_model_by_id("qwen3-1.7b").unwrap();
+        let heavy = brain_model_by_id("qwen3-4b-instruct-2507").unwrap();
+        // light(~1.1→2) + heavy(~2.5→3) weights + KV(2) + overhead(4) ≈ 11 GB.
+        let g = combined_residency_gb(&[light, heavy], CALL_OVERHEAD_GB);
+        assert!((10..=13).contains(&g), "combined residency ~11 GB, got {g}");
+        // 8 GB can't co-reside light+heavy during a call; 16 GB fits; unknown RAM never blocks.
+        assert!(!residency_fits(&[light, heavy], Some(8), CALL_OVERHEAD_GB));
+        assert!(residency_fits(&[light, heavy], Some(16), CALL_OVERHEAD_GB));
+        assert!(residency_fits(&[light, heavy], None, CALL_OVERHEAD_GB));
+        // Light alone (the Brain-Live-during-recording set) fits 8 GB.
+        assert!(residency_fits(&[light], Some(8), CALL_OVERHEAD_GB));
     }
 
     #[test]
@@ -1641,5 +1898,32 @@ mod tests {
         assert_eq!(ask_id, "stub", "explicit Ask→apple dispatches on-device (stub when absent)");
         // Notes (no key) keeps the legacy Cloud dispatch — the AFM arm didn't hijack other roles.
         assert!(cell.current_for(Role::Notes).id().starts_with("cloud:"));
+    }
+
+    /// P1 INVARIANT (spec §2.1 / §3.4; adversarial review code-truth #1/#3 + product #1): the
+    /// Brain-Live `light()` / `heavy()` engine handles are LOCAL-or-STUB and **NEVER** the cloud
+    /// reasoner — even under a Cloud backend with cloud consent. A missing local model must degrade
+    /// the feature to the stub (empty extraction), it must never silently egress. Deterministic
+    /// regardless of what GGUFs happen to live in the shared models dir (asserts "not cloud").
+    #[test]
+    fn brain_live_class_handles_are_local_or_stub_never_cloud() {
+        let cfg = shared(AppConfig {
+            brain_live: true,
+            brain_backend: BrainBackend::Cloud,
+            cloud_egress_consented: true,
+            // default class ids (qwen3-1.7b / qwen3-4b-instruct-2507) — absent on disk in CI ⇒ stub.
+            ..Default::default()
+        });
+        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        for id in [cell.light().id().to_string(), cell.heavy().id().to_string()] {
+            assert!(
+                id == "stub" || id.starts_with("mistralrs:"),
+                "class handle must be local-or-stub, got {id}"
+            );
+            assert!(
+                !id.starts_with("cloud:"),
+                "class handle must NEVER be a cloud reasoner (anti-egress), got {id}"
+            );
+        }
     }
 }

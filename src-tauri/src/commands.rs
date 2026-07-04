@@ -462,11 +462,35 @@ pub async fn start_recording(
     // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
     // during recording (see transcribe::live). Never affects the recording or final note.
     if let Some(cfg) = state.config.lock().ok().map(|c| c.clone()) {
-        if let Ok(Some(model_path)) = crate::transcribe::model::resolve_model_path(
-            cfg.whisper_model_path.as_deref().map(std::path::Path::new),
-            &cfg.model_size,
-            cfg.language.as_deref().unwrap_or(""),
-        ) {
+        let lang = cfg.language.as_deref().unwrap_or("");
+        let configured = || {
+            crate::transcribe::model::resolve_model_path(
+                cfg.whisper_model_path.as_deref().map(std::path::Path::new),
+                &cfg.model_size,
+                lang,
+            )
+            .ok()
+            .flatten()
+        };
+        // D1 (spec §4.3): while Realtime Reactions (Brain Live) is on, pin the LIVE tick to `small`
+        // when present — a large-v3 live tick alone can saturate the Metal GPU the light reasoner also
+        // needs. If `small` is NOT on disk, fall back to the configured model + warn (pinning to an
+        // absent file would kill the live loop). The post-call ACCURATE pass is unaffected.
+        let live_model = if cfg.brain_live {
+            match crate::transcribe::model::resolve_model_path(None, "small", lang) {
+                Ok(Some(p)) => Some(p),
+                _ => {
+                    tracing::warn!(
+                        target: "live",
+                        "reactions on but ggml-small absent; live tick uses the configured whisper model (may contend with the light reasoner)"
+                    );
+                    configured()
+                }
+            }
+        } else {
+            configured()
+        };
+        if let Some(model_path) = live_model {
             crate::transcribe::live::spawn(app.clone(), model_path, cfg.language.clone());
         }
     }
@@ -3668,6 +3692,12 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             Some(id) if crate::reason::brain_model_by_id(id).is_some() => d.brain_model_id.clone(),
             _ => current.brain_model_id.clone(),
         },
+        // Murmur Brain postures: `brain_live` + the light/heavy class model ids are set by the
+        // dedicated posture / Brain-Live commands (like `cloud_egress_consented`), NEVER by the raw
+        // settings save — so a partial/older DTO can neither enable Brain Live nor repoint an engine.
+        brain_live: current.brain_live,
+        brain_light_model_id: current.brain_light_model_id.clone(),
+        brain_heavy_model_id: current.brain_heavy_model_id.clone(),
         // Phase H (brain backend): which reasoner powers the brain (cloud/local/off) IS taken from
         // the DTO (the Settings UI owns the toggle). `BrainBackend` deserializes an unknown/omitted
         // token to the default `Cloud`, so the value here is always a valid enum variant.
@@ -4807,6 +4837,36 @@ pub fn brain_model_retirement_nudge(
     Ok(crate::reason::retired_model_nudge(selected.as_deref(), &dir))
 }
 
+/// The DERIVED Murmur Brain posture (spec §2.1) for the Settings display — computed from the live
+/// config (resolved role targets + `brain_live`), NEVER stored. `custom` when the dispatch keys match
+/// no preset, so the label can never lie about egress. Read-only capability probe (no content).
+#[tauri::command]
+pub fn brain_posture(state: State<'_, AppState>) -> Result<crate::settings::Posture, AppError> {
+    let c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(crate::settings::postures::derive_posture(&c))
+}
+
+/// Apply a Murmur Brain posture PRESET (`cloud` / `hybrid` / `fully_local`) and persist it. `custom`
+/// is a derived-only label and is rejected (`InvalidArg`). This is the SINGLE writer of the posture
+/// presets — the raw settings save preserves `brain_live` + the posture role keys (see
+/// `dto_to_config`), so a partial save can never change the posture. The Hybrid preset deliberately
+/// leaves `role_live_*` untouched (the @brain assistant stays intact).
+#[tauri::command]
+pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<(), AppError> {
+    let p = crate::settings::Posture::from_settable(&posture)
+        .ok_or_else(|| AppError::InvalidArg(format!("not a settable posture: {posture}")))?;
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    crate::settings::postures::apply_posture(&mut c, p);
+    c.save(&state.db)?;
+    Ok(())
+}
+
 /// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
 /// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the reasoner dispatch
 /// (`ReasonerCell`) re-resolves per call, so the model takes effect on the next reasoning call
@@ -4858,10 +4918,14 @@ pub async fn download_brain_model(
         return Ok(dest.to_string_lossy().to_string());
     }
 
+    // The pinned integrity hash for this model (None until the registry entry is pinned — the
+    // downloader then verifies before promoting the file, or warns + skips when None).
+    let expected_sha = crate::reason::brain_model_by_id(&model_id).and_then(|m| m.sha256);
+
     // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
     const EMIT_EVERY: u64 = 8 * 1024 * 1024;
     let mut last_emit: u64 = 0;
-    crate::reason::download_brain_model(url, &dest, |downloaded, total| {
+    crate::reason::download_brain_model(url, &dest, expected_sha, |downloaded, total| {
         if downloaded - last_emit >= EMIT_EVERY {
             last_emit = downloaded;
             let _ = app.emit(
