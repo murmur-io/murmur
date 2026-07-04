@@ -8118,7 +8118,7 @@ pub(crate) async fn share_note_to_link_inner(
     // (4) Upload: content cell + wrapped_nk + gate_salt + gate_secret + rev + passwordRequired.
     //     L is NOT in this request (CreateShareRequest has no `l` field) — it stays on-device.
     let expires_at = expires_days.map(|d| {
-        let days = d.min(365).max(1) as i64;
+        let days = d.clamp(1, 365) as i64;
         (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
     });
     let argon = if pw_ref.is_some() {
@@ -8315,11 +8315,12 @@ fn tofu_check(
     }
 }
 
+/// The logged-in sharing session's `(account_id, generation, MK, access_token)` tuple.
+type SessionMk = (String, u32, zeroize::Zeroizing<[u8; 32]>, String);
+
 /// The logged-in sharing session's `(account_id, generation, MK, access_token)`, or a fail-closed
 /// `Unavailable` when logged out (mode-B needs MK to DERIVE the identity keypair for sign/open).
-fn require_session_mk(
-    state: &AppState,
-) -> Result<(String, u32, zeroize::Zeroizing<[u8; 32]>, String), AppError> {
+fn require_session_mk(state: &AppState) -> Result<SessionMk, AppError> {
     let g = state
         .account_session
         .lock()
