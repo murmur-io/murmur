@@ -97,6 +97,11 @@ export interface ConnectionCardVm {
             : "On this Mac — nothing leaves"
         }}
       </span>
+      @if (card().id === "ollama") {
+        <span class="conn-reason text-muted">
+          Your own local model server — separate from the built-in Murmur Brain.
+        </span>
+      }
       @if (unavailableReason(); as reason) {
         <span class="conn-reason text-muted">{{ reason }}</span>
       }

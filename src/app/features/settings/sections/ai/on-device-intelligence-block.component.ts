@@ -3,12 +3,12 @@ import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
 
 /**
- * AI & Models → "On-device intelligence" block (Task 5).
+ * AI & Models → "Search index" block.
  *
- * Extracted verbatim from AiDefaultsBlockComponent as a standalone card.
- * Owns the always-on-device honesty badges (Embeddings / Name redaction /
- * Transcription), the semantic-search toggle, the embedding-model download
- * flow, and the re-index controls.
+ * Owns the semantic-search toggle, the embedding-model download flow, and the
+ * re-index controls. The always-on-device honesty rows (Embeddings / Name
+ * redaction / Transcription) now live in the "What runs where" map card, so
+ * the badges that used to sit here were removed.
  *
  * All work is on-device — no cloud calls, no consent requirement.
  */
@@ -21,30 +21,7 @@ import { SettingsStore } from "../../settings.store";
     <div class="card ondevice-card" [formGroup]="form">
       <!-- ── On-device intelligence ──────────────────────────────────── -->
       <div class="use-group">
-        <span class="use-group-label text-muted">On-device intelligence</span>
-
-        <!--
-          Fixed "always on-device" badges — these stages are NOT routable to
-          any provider (they activate on local model presence), so they stay
-          out of every picker above. Honesty line, not controls.
-        -->
-        <div class="ondevice-badges">
-          <span class="pill">
-            <span class="pill-dot"></span>
-            Embeddings
-          </span>
-          <span class="pill">
-            <span class="pill-dot"></span>
-            Name redaction
-          </span>
-          <span class="pill">
-            <span class="pill-dot"></span>
-            Transcription
-          </span>
-          <span class="text-muted ondevice-note">
-            Always run on this Mac — never sent to any provider.
-          </span>
-        </div>
+        <span class="use-group-label text-muted">Search index</span>
 
         <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
         <div class="semantic">
@@ -184,17 +161,6 @@ import { SettingsStore } from "../../settings.store";
         text-transform: uppercase;
       }
 
-      /* Fixed always-on-device badges (not controls). */
-      .ondevice-badges {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        flex-wrap: wrap;
-      }
-      .ondevice-note {
-        font-size: 0.8125rem;
-        line-height: 1.5;
-      }
       .btn-sm {
         height: 32px;
         padding: 0 var(--space-3);

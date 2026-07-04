@@ -4,7 +4,6 @@ import {
   computed,
   effect,
   inject,
-  signal,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
@@ -58,7 +57,7 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
             stroke-linejoin="round"
           />
         </svg>
-        ⚙ Advanced — connections, models, per-feature
+        ⚙ Advanced — engines & routing
       </button>
 
       @if (expanded()) {
@@ -69,7 +68,7 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
           <!-- Block 2: Default AI + Default model / reasoning effort -->
           <div class="adv-defaults card" [formGroup]="form">
             <label class="field">
-              <span class="field-label">Default AI</span>
+              <span class="field-label">Default engine</span>
               <!--
                 Disabled when posture is "fully_local" — the on-device pipeline
                 runs notes on the selected GGUF, so this picker has no effect.
@@ -94,8 +93,9 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
                 </span>
               } @else {
                 <span class="field-help text-muted">
-                  Used for everything Murmur writes: notes, answers, digests,
-                  briefs. Set the connection up in the Providers block above.
+                  Runs Notes, Ask and &#64;brain unless a per-feature override
+                  below says otherwise. Cloud engines are redacted first. Set
+                  engines up in the Engines block above.
                 </span>
               }
             </label>
@@ -327,8 +327,8 @@ export class AiAdvancedBlockComponent {
 
   readonly form = this.store.form;
 
-  /** Whether the Advanced disclosure region is open. Collapsed by default. */
-  readonly expanded = signal(false);
+  /** Whether the Advanced disclosure is open — store-owned so the map's "Change" opens it. */
+  readonly expanded = this.store.advancedExpanded;
 
   /** True when the committed posture is "fully_local" — disables the Default-AI select. */
   readonly fullyLocal = computed(() => this.store.posture() === "fully_local");
@@ -347,7 +347,7 @@ export class AiAdvancedBlockComponent {
         this.store.roleLiveConnValue() ||
         this.store.brainBackendValue() === "local"
       ) {
-        this.expanded.set(true);
+        this.store.advancedExpanded.set(true);
       }
     },
     { allowSignalWrites: true },
@@ -374,7 +374,7 @@ export class AiAdvancedBlockComponent {
   });
 
   toggle(): void {
-    this.expanded.update((v) => !v);
+    this.store.advancedExpanded.update((v) => !v);
   }
 
   /** Prefetch the newly-picked Default AI's model catalog (claude_code/anthropic only). */

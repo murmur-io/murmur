@@ -526,6 +526,19 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
       case "get_entity_detail": return ENTITY_DETAIL[args.entityId] || ENTITY_DETAIL["p-marcus"];
       case "link_meeting_entities": return { people: ["Sarah Chen", "Marcus Reid"], projects: ["Project Atlas"] };
 
+      // ── AI & Models settings (posture + the "What runs where" resolved map) ──
+      case "brain_posture": return "hybrid";
+      case "set_brain_posture": return null;
+      case "resolved_ai_map": return [
+        { job: "notes", title: "Notes & summaries", engine: "Claude Code", model: "claude-sonnet-4-6", onDevice: false, redacted: true, active: true, routable: true },
+        { job: "ask", title: "Ask & chat", engine: "Claude Code", model: "claude-sonnet-4-6", onDevice: false, redacted: true, active: true, routable: true },
+        { job: "live", title: "Live @brain", engine: "Claude Code", model: "claude-sonnet-4-6", onDevice: false, redacted: true, active: true, routable: true },
+        { job: "reactions", title: "Realtime reactions", engine: "Qwen3 1.7B", model: "qwen3-1.7b", onDevice: true, redacted: false, active: true, routable: false },
+        { job: "transcription", title: "Transcription", engine: "Whisper", model: "small", onDevice: true, redacted: false, active: true, routable: false },
+        { job: "embeddings", title: "Search index", engine: "Multilingual E5", model: "multilingual-e5-small", onDevice: true, redacted: false, active: true, routable: false },
+        { job: "redaction", title: "Name redaction", engine: "On-device NER", model: "", onDevice: true, redacted: false, active: true, routable: false },
+      ];
+
       // ── brain page (brain2) ──
       case "brain_overview": return { meetingCount: 47, documentCount: 6, noteCount: 12, indexedChunkCount: 1284, semanticEnabled: true, embedModelPresent: true };
       case "list_documents": return DOCS_BY_FOLDER[args.folderId] || [];

@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AccountStatus,
   ActionItem,
+  AiMapRow,
   Analytics,
   AppConfigDto,
   MyShareEntry,
@@ -939,6 +940,11 @@ export class IpcService {
    */
   brainPosture(): Promise<Posture> {
     return invoke<Posture>("brain_posture");
+  }
+
+  /** The resolved "what runs where" rows for the Settings AI map (read-only config projection). */
+  resolvedAiMap(): Promise<AiMapRow[]> {
+    return invoke<AiMapRow[]>("resolved_ai_map");
   }
 
   /**
