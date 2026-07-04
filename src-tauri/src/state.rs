@@ -95,6 +95,11 @@ pub struct AppState {
     pub system_recorder: Mutex<Option<SystemAudioRecorder>>,
     /// Some while recording AND echo-cancellation (VPIO AEC) capture is enabled + available.
     pub aec_recorder: Mutex<Option<crate::audio::aec::AecRecorder>>,
+    /// Some while recording: the STAGE-2 crash-salvage spill writer, mirroring the RAM mic buffer to
+    /// an on-disk spill so a crash mid-record is recoverable at next launch (see `audio::spill`). Its
+    /// `Drop` deletes the plaintext spill + sidecar, so `stop_recording` just `take()`s it into a
+    /// guard that drops on every exit path (clean Stop ⇒ spill gone; only a crash leaves it behind).
+    pub spill_writer: Mutex<Option<crate::audio::spill::SpillWriter>>,
     /// Some while the voice-trigger listener is running.
     pub voice_listener: Mutex<Option<VoiceListener>>,
     /// MANUAL voice-command capture (the button trigger): `Some` while the user has clicked
@@ -216,6 +221,7 @@ impl AppState {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
             aec_recorder: Mutex::new(None),
+            spill_writer: Mutex::new(None),
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
             db,
