@@ -458,8 +458,8 @@ fn group_turns(segments: &[crate::transcribe::types::Segment]) -> Vec<Turn> {
             cur_text.push_str(text);
             cur_end = seg.end_s;
         } else {
-            if cur_speaker.is_some() {
-                flush(&mut turns, cur_speaker.as_ref().unwrap(), &cur_text, cur_start, cur_end);
+            if let Some(sp) = &cur_speaker {
+                flush(&mut turns, sp, &cur_text, cur_start, cur_end);
             }
             cur_speaker = Some(seg.speaker.clone());
             cur_text = text.to_string();

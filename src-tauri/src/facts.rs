@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::reason::LocalReasoner;
+use crate::reason::{GenOptions, LocalReasoner};
 
 /// A persisted bitemporal fact row (DB-shaped). `valid_to == None` ⇒ currently valid; `Some` ⇒
 /// closed (superseded) at that instant. `meeting_id` is the meeting we learned it from (the gating
@@ -233,6 +233,7 @@ pub fn extract_fact_candidates(
     title: &str,
     note_markdown: &str,
     entities: &[(String, String)],
+    opts: GenOptions,
 ) -> Vec<FactCandidate> {
     if entities.is_empty() {
         return Vec::new();
@@ -268,7 +269,7 @@ pub fn extract_fact_candidates(
         "required": ["facts"]
     });
 
-    let value = match reasoner.structured(EXTRACT_SYSTEM, &user, &schema) {
+    let value = match reasoner.structured_with(EXTRACT_SYSTEM, &user, &schema, opts) {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(target: "facts", error = %e, "fact extraction failed; no candidates (best-effort)");

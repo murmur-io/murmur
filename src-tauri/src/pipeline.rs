@@ -915,7 +915,10 @@ async fn summarize_and_export(
     // salient-query path stays the FALLBACK FLOOR. The reasoner call is synchronous, so this keeps
     // the existing inline shape (no extra await). Best-effort + GATED: same egress/consent envelope.
     let related_context = crate::orchestrate::orchestrate_context(
-        &*state.reasoner.current_for(Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine for retrieval planning (no egress); a missing light
+        // model degrades to the stub ⇒ the deterministic `build_grounding_context` floor below — never
+        // silently to cloud (spec §3.4). OFF ⇒ today's Notes reasoner.
+        &*state.reasoner.extraction_reasoner(),
         &state.db,
         meeting_id,
         related_title.as_deref(),
