@@ -1277,7 +1277,11 @@ pub(crate) fn index_meeting_if_enabled(
     if !db.meeting_is_visible(meeting_id, unlocked)? {
         return Ok(()); // sealed-not-unlocked: never index its plaintext.
     }
-    db.index_meeting_chunks(meeting_id, embedder)
+    // Load the meeting's RESTORED/visible plaintext segments so transcript chunks (source_type=
+    // 'transcript') are indexed alongside the note-summary chunks. A sealed meeting is already excluded
+    // above, so these are visible plaintext; an empty transcript simply yields zero transcript chunks.
+    let segments = db.get_segments(meeting_id)?;
+    db.index_meeting_chunks(meeting_id, &segments, embedder)
 }
 
 /// brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION (ALWAYS ON). Build the GATED corpus of

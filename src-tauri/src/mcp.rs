@@ -568,8 +568,8 @@ mod tests {
         seed(&db, "sealed", "Sealed", "budget planning hiring quarter secret", Some("f-lock"));
 
         let emb = crate::embed::active_embedder();
-        db.index_meeting_chunks("open", emb.as_ref()).unwrap();
-        db.index_meeting_chunks("sealed", emb.as_ref()).unwrap();
+        db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", &[], emb.as_ref()).unwrap();
         // Seal the folder AFTER indexing (a stray vec row now exists for a sealed meeting).
         db.set_folder_locked("f-lock", true, None).unwrap();
 
