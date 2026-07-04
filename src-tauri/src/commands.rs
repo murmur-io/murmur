@@ -4787,6 +4787,26 @@ pub fn list_brain_models(
     ))
 }
 
+/// The installed-base migration nudge: `Some` when the persisted `brain_model_id` points at a RETIRED
+/// model (e.g. the non-commercial `qwen2.5-3b`), telling the FE to offer the Apache-licensed
+/// replacement. `None` for an active/absent selection. Read-only capability probe (no content, no
+/// egress) — like [`brain_model_present`]. The retired GGUF keeps working until the user switches;
+/// nothing is changed silently.
+#[tauri::command]
+pub fn brain_model_retirement_nudge(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::reason::RetiredModelNudge>, AppError> {
+    let selected = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.brain_model_id.clone()
+    };
+    let dir = crate::transcribe::models_dir()?;
+    Ok(crate::reason::retired_model_nudge(selected.as_deref(), &dir))
+}
+
 /// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
 /// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the reasoner dispatch
 /// (`ReasonerCell`) re-resolves per call, so the model takes effect on the next reasoning call
@@ -9386,7 +9406,7 @@ mod lifecycle_tests {
             let current = AppConfig {
                 brain_backend: BrainBackend::Cloud,
                 realtime_reactions: false,
-                brain_model_id: Some("qwen2.5-3b".to_string()),
+                brain_model_id: Some("qwen3-4b-instruct-2507".to_string()),
                 ..AppConfig::default()
             };
             let merged = dto_to_config(dto, &current);
@@ -9538,7 +9558,9 @@ mod lifecycle_tests {
     /// `brain_backend` deserializes to the default `Cloud` rather than crashing the save.
     #[test]
     fn dto_unknown_brain_model_id_preserved_and_unknown_backend_defaults_cloud() {
-        // (a) unknown model id ⇒ ignored, current selection preserved.
+        // (a) unknown model id ⇒ ignored, current selection preserved. The `current` here is the now
+        // RETIRED `qwen2.5-3b`, so this doubles as the installed-base guarantee: a settings save must
+        // not wipe a persisted retired selection (its on-disk GGUF keeps resolving; see reason.rs).
         let mut dto = config_to_dto(&AppConfig::default());
         dto.brain_model_id = Some("totally-made-up-model".to_string());
         let current = AppConfig {
@@ -9704,12 +9726,18 @@ mod lifecycle_tests {
             brain_download_target("bogus-id"),
             Err(AppError::InvalidArg(_))
         ));
-        let (url, dest) = brain_download_target("qwen2.5-3b").unwrap();
+        // A RETIRED id is also rejected by the download target (un-selectable / un-downloadable fresh;
+        // the installed-base file, if present, is only RESOLVED, never re-fetched).
+        assert!(matches!(
+            brain_download_target("qwen2.5-3b"),
+            Err(AppError::InvalidArg(_))
+        ));
+        let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
         assert_eq!(
             url,
-            "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
         );
-        assert!(dest.ends_with("Qwen2.5-3B-Instruct-Q4_K_M.gguf"));
+        assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
     }
 
     // ── rename_folder / delete_folder (folder lifecycle) ────────────────────────────────────────

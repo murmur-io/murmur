@@ -230,7 +230,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub brain_model_path: Option<String>,
     /// Phase B (model registry) — the SELECTED on-device brain model id (from `reason::BRAIN_MODELS`,
-    /// e.g. `bielik-11b-v3` / `qwen3-14b` / `qwen2.5-3b`). `None` (the default) means no model is
+    /// e.g. `qwen3-1.7b` / `qwen3-4b-instruct-2507` / `bielik-11b-v3`). `None` (the default) means no model is
     /// chosen ⇒ the resolver falls back to the `StubReasoner`. Set via the `select_brain_model`
     /// command. Consulted at runtime when `brain_backend == Local`. `#[serde(default)]` ⇒ a config
     /// persisted before this field existed loads as `None`.
