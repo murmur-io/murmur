@@ -27,9 +27,9 @@ import { SettingsStore } from "../../settings.store";
     <div class="card posture-card">
       <!-- Intro header — frames the section before the posture chooser. -->
       <div class="posture-head-copy">
-        <h3>What Murmur uses</h3>
+        <h3>Where your AI runs</h3>
         <p class="text-secondary posture-intro">
-          Pick how much runs on this Mac. The map below shows exactly what runs where — tune it under Advanced.
+          Pick how much runs on this Mac. Everything below adapts to your choice — no jargon to untangle.
         </p>
       </div>
 
@@ -114,6 +114,18 @@ import { SettingsStore } from "../../settings.store";
             </span>
           </button>
         </div>
+
+        <!--
+          Plain-language meaning of the SELECTED posture (keyed on posture()),
+          so the choice reads in words, not jargon. Shown for every posture
+          incl. the derived "custom" state; hidden pre-load (null).
+        -->
+        @if (postureMeaning(); as meaning) {
+          <p class="posture-meaning">
+            <span class="posture-meaning-lead">{{ meaning.lead }}</span>
+            {{ meaning.body }}
+          </p>
+        }
 
         <!--
           Contextual state area — replaces the old static field-help and the
@@ -201,7 +213,6 @@ import { SettingsStore } from "../../settings.store";
               Staying on your current setup until it's ready.
             </span>
           } @else {
-            <p class="text-secondary posture-now">{{ postureStateLine() }}</p>
             @for (n of neededModels(); track n.role) {
               <span class="pill" [class.is-success]="n.model?.downloaded">
                 <span class="pill-dot"></span>{{ n.role === "notes" ? "Notes & Ask" : "Reactions" }}: {{ n.model?.name ?? "—" }}{{ n.model?.downloaded ? " ✓" : "" }}
@@ -334,16 +345,22 @@ import { SettingsStore } from "../../settings.store";
         line-height: 1.4;
       }
 
+      /* ── Selected-posture meaning line ── */
+      .posture-meaning {
+        margin: 0;
+        font-size: 0.9rem;
+        line-height: 1.6;
+      }
+      .posture-meaning-lead {
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+
       /* ── Contextual state area ── */
       .posture-state {
         display: flex;
         flex-direction: column;
         gap: var(--space-2);
-      }
-      .posture-now {
-        margin: 0;
-        font-size: 0.875rem;
-        line-height: 1.55;
       }
       /* Confirm-before-download card: an explicit opt-in, not an auto-fetch. */
       .posture-confirm-title {
@@ -442,7 +459,6 @@ export class BrainPostureBlockComponent {
   readonly pendingConfirm = this.store.pendingConfirm;
   readonly confirmModels = this.store.confirmModels;
   readonly confirmDownloadBytes = this.store.confirmDownloadBytes;
-  readonly postureStateLine = this.store.postureStateLine;
   readonly neededModels = this.store.neededModels;
   readonly brainDownloadingId = this.store.brainDownloadingId;
   readonly brainDownloadFrac = this.store.brainDownloadFrac;
@@ -453,6 +469,39 @@ export class BrainPostureBlockComponent {
 
   /** Full model list — used to resolve the downloading model's display name. */
   private readonly brainModels = this.store.brainModels;
+
+  /**
+   * Plain-language meaning of the selected posture — a `{ lead, body }` pair so
+   * the template can bold the lead. Null before the posture loads (no flash).
+   */
+  readonly postureMeaning = computed(
+    (): { lead: string; body: string } | null => {
+      switch (this.posture()) {
+        case "cloud":
+          return {
+            lead: "Cloud.",
+            body: "Your default engine writes your notes, answers and briefs — sent redacted after your consent. Recording, transcription, search and name-detection still happen only on this Mac.",
+          };
+        case "hybrid":
+          return {
+            lead: "Hybrid ⭐ — recommended.",
+            body: "Same cloud quality for notes & answers, but realtime in-meeting reactions run on a small model on this Mac, so nothing leaves live.",
+          };
+        case "fully_local":
+          return {
+            lead: "Fully local.",
+            body: "Every AI job runs on this Mac using built-in models. Nothing ever leaves. Bigger models are slower and need more RAM.",
+          };
+        case "custom":
+          return {
+            lead: "Custom mix.",
+            body: "You've routed features individually — see What runs where below, tune under Advanced.",
+          };
+        default:
+          return null;
+      }
+    },
+  );
 
   /**
    * Display name of the model currently downloading, looked up from
