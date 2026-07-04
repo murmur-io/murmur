@@ -562,7 +562,9 @@ body.bar-shell::after { display: none !important; }
 @media print {
   body.murmur-printing::before,
   body.murmur-printing::after { display: none !important; }
-  body.murmur-printing .app-sidebar { display: none !important; }
+  body.murmur-printing .app-sidebar,
+  body.murmur-printing .pill-bar,
+  body.murmur-printing .pill-drag { display: none !important; }
   body.murmur-printing .app-main { max-width: none; margin: 0; padding: 0; }
   body.murmur-printing { background: #fff !important; color: #000 !important; }
 }
@@ -577,35 +579,36 @@ body.bar-shell::after { display: none !important; }
    work everywhere). So the shell's CSS is global here, matched by class.
    See app-shell.component.ts for the full FOUC rationale.
 
-   Layout: a flex row — a fixed (collapsible) LEFT SIDEBAR + a centered
-   max-width main column. No top header; the window uses the Overlay title-bar
-   style, so the traffic lights float over `.sidebar-drag`. */
+   PROTOTYPE (Apple TV iPadOS shell): the chrome has two liquid-glass modes —
+   a FLOATING rounded sidebar panel (inset from the window edges), or a
+   floating top-center PILL BAR when collapsed. The window keeps the Overlay
+   title-bar style; the traffic lights float over `.sidebar-drag`/`.pill-drag`. */
 app-shell {
   display: flex;
   align-items: stretch;
   min-height: 100vh;
 }
 
-/* --- Sidebar (frosted, in-flow chrome — NOT a floating overlay) ------------ */
+/* --- Sidebar (Apple TV: a floating rounded liquid-glass panel) ------------- */
 .app-sidebar {
   position: sticky;
-  top: 0;
+  top: 10px;
   align-self: flex-start;
   z-index: 10;
   flex: none;
   display: flex;
   flex-direction: column;
-  width: 232px;
-  height: 100vh;
+  width: 236px;
+  height: calc(100vh - 20px);
+  margin: 10px 0 10px 10px;
   padding: 0 var(--space-3) var(--space-4);
   background: var(--surface-raised);
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  border-right: 1px solid var(--border-subtle);
-  box-shadow: var(--glass-highlight);
-  transition: width var(--transition);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-md), var(--glass-highlight);
 }
-.app-sidebar.collapsed { width: 68px; }
 
 /* Top strip that reserves room for the overlay traffic lights and moves the
    window (data-tauri-drag-region on the element). */
@@ -627,7 +630,6 @@ app-shell {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-.app-sidebar.collapsed .brand { justify-content: center; padding-left: 0; padding-right: 0; }
 .brand-mark {
   display: grid;
   place-items: center;
@@ -669,6 +671,28 @@ app-shell {
   color: var(--text-primary);
 }
 
+/* --- Quick actions (Search ⌘K / New note ⌘N) — pinned under the brand ------ */
+.sidebar-quick {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.quick-kbd {
+  flex: none;
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  line-height: 1.5;
+}
+
 /* --- Sidebar nav + footer rows (shared row shape) -------------------------- */
 .sidebar-nav {
   display: flex;
@@ -680,6 +704,7 @@ app-shell {
   padding-top: var(--space-2);
 }
 .sidebar-nav a,
+.quick-row,
 .sidebar-settings,
 .sidebar-collapse {
   display: flex;
@@ -702,12 +727,14 @@ app-shell {
   transition: color var(--transition), background var(--transition);
 }
 .sidebar-nav a:hover,
+.quick-row:hover,
 .sidebar-settings:hover,
 .sidebar-collapse:hover {
   color: var(--text-primary);
   background: var(--surface-hover);
 }
 .sidebar-nav a:focus-visible,
+.quick-row:focus-visible,
 .sidebar-settings:focus-visible,
 .sidebar-collapse:focus-visible {
   outline: none;
@@ -719,6 +746,7 @@ app-shell {
   color: var(--accent-hover);
   background: var(--accent-soft);
 }
+app-nav-icon { display: contents; } /* the glyph span below is the flex child */
 .nav-icon {
   display: grid;
   place-items: center;
@@ -734,24 +762,6 @@ app-shell {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-/* Collapsed: icons only — hide every text label + centre the glyphs. */
-.app-sidebar.collapsed .nav-label,
-.app-sidebar.collapsed .brand-word { display: none; }
-.app-sidebar.collapsed .sidebar-nav a,
-.app-sidebar.collapsed .sidebar-settings,
-.app-sidebar.collapsed .sidebar-collapse {
-  justify-content: center;
-  gap: 0;
-  padding-left: 0;
-  padding-right: 0;
-}
-.collapse-chevron {
-  transform-box: fill-box;
-  transform-origin: center;
-  transition: transform var(--transition);
-}
-.app-sidebar.collapsed .collapse-chevron { transform: rotate(180deg); }
-
 .sidebar-footer {
   display: flex;
   flex-direction: column;
@@ -780,10 +790,98 @@ app-shell {
   line-height: 1;
   white-space: nowrap;
 }
-.app-sidebar.collapsed .unlocked-pill { justify-content: center; padding: 0; }
 .unlocked-glyph { display: block; flex: none; }
 .unlocked-count { font-variant-numeric: tabular-nums; }
 .unlocked-label { color: var(--accent-hover); opacity: 0.85; }
+
+/* --- Pill bar (Apple TV collapsed chrome: floating top-center liquid pill) - */
+/* Invisible strip along the window's top edge: keeps the window draggable and
+   reserves room for the overlay traffic lights while the sidebar is away. */
+.pill-drag {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 34px;
+  z-index: 39;
+}
+.pill-bar {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  max-width: calc(100vw - 170px); /* clear the traffic lights on the left */
+  padding: 5px;
+  background: var(--surface-raised);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-md), var(--glass-highlight);
+}
+.pill-item {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 36px;
+  min-width: 36px;
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.86rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+.pill-item:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.pill-item:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* Apple TV pattern: icons only; the ACTIVE destination expands with its label. */
+.pill-item .nav-label { display: none; }
+.pill-item.active {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  padding: 0 var(--space-3);
+}
+.pill-item.active .nav-label { display: block; flex: none; }
+.pill-sep {
+  flex: none;
+  width: 1px;
+  height: 20px;
+  margin: 0 3px;
+  background: var(--border-subtle);
+}
+.pill-unlocked {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  margin-left: 3px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.76rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
 
 /* --- Main content column: centered max-width, beside the sidebar ----------- */
 .app-main {
@@ -793,6 +891,8 @@ app-shell {
   margin: 0 auto;
   padding: var(--space-7) var(--space-5) var(--space-8);
 }
+/* Pill mode: no sidebar in the flex row — clear the floating pill instead. */
+app-shell.pill-mode .app-main { padding-top: 84px; }
 .toast-viewport {
   position: fixed;
   right: var(--space-5);
