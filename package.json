@@ -7,7 +7,8 @@
     "tauri": "tauri",
     "dev": "tauri dev",
     "bundle": "tauri build",
-    "lint": "ng lint"
+    "lint": "ng lint",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@angular/animations": "^18.2.0",
@@ -30,6 +31,7 @@
     "@angular-devkit/build-angular": "^18.2.0",
     "@angular/cli": "^18.2.0",
     "@angular/compiler-cli": "^18.2.0",
+    "@playwright/test": "^1.61.1",
     "@tauri-apps/cli": "^2.0.0",
     "@types/dompurify": "^3.2.0",
     "angular-eslint": "18.4.3",
