@@ -4915,16 +4915,22 @@ pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Resul
 
 /// Testable core of [`select_brain_model`]: validate the id against the registry, persist it.
 fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), AppError> {
-    if crate::reason::brain_model_by_id(&model_id).is_none() {
-        return Err(AppError::InvalidArg(format!(
-            "unknown brain model id: {model_id}"
-        )));
-    }
+    let model = crate::reason::brain_model_by_id(&model_id)
+        .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
     let mut c = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    c.brain_model_id = Some(model_id);
+    // Keep the legacy single-model id (BrainBackend::Local + custom-path fallback) …
+    c.brain_model_id = Some(model_id.clone());
+    // … AND wire the CLASS handle so the Brain-Live `light()` / Fully-Local `heavy()` handles actually
+    // use what the user just selected. Without this, selecting a light model leaves `light()` pointing
+    // at the registry DEFAULT (a different, un-downloaded GGUF) → it silently resolves to the stub and
+    // Realtime Reactions never fire despite Brain Live being "on".
+    match model.class {
+        crate::reason::ModelClass::Light => c.brain_light_model_id = Some(model_id),
+        crate::reason::ModelClass::Heavy => c.brain_heavy_model_id = Some(model_id),
+    }
     c.save(&state.db)?;
     Ok(())
 }
@@ -9762,18 +9768,33 @@ mod lifecycle_tests {
             state.config.lock().unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
+        // Selecting a HEAVY model also wires the class handle so heavy()/Fully-Local uses it.
+        assert_eq!(
+            state.config.lock().unwrap().brain_heavy_model_id.as_deref(),
+            Some("bielik-11b-v3"),
+            "selecting a heavy model must set brain_heavy_model_id (else heavy() ignores the choice)"
+        );
         // Survives a reload from the settings table.
         assert_eq!(
             AppConfig::load(&state.db).unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
 
-        // Unknown id ⇒ InvalidArg, selection unchanged.
+        // Selecting a LIGHT model wires the light class handle (the Brain-Live path) — the bug this
+        // guards: a light selection that only set brain_model_id left light() on the registry default.
+        select_brain_model_inner(&state, "qwen3-1.7b".to_string()).unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().brain_light_model_id.as_deref(),
+            Some("qwen3-1.7b"),
+            "selecting a light model must set brain_light_model_id (else Realtime Reactions stay stub)"
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged (still the last valid pick, qwen3-1.7b).
         let err = select_brain_model_inner(&state, "not-a-real-model".to_string()).unwrap_err();
         assert!(matches!(err, AppError::InvalidArg(_)));
         assert_eq!(
             state.config.lock().unwrap().brain_model_id.as_deref(),
-            Some("bielik-11b-v3")
+            Some("qwen3-1.7b")
         );
     }
 
