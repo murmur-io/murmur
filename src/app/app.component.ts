@@ -13,6 +13,7 @@ import { filter, map } from "rxjs";
 import { IpcService } from "./core/ipc.service";
 import { NavHistoryService } from "./core/nav-history.service";
 import { FoldersService } from "./services/folders.service";
+import { GlassService } from "./services/glass.service";
 import { ScreenShareService } from "./services/screen-share.service";
 import { ThemeService } from "./services/theme.service";
 import { UpdateService } from "./services/update.service";
@@ -37,6 +38,8 @@ export class AppComponent implements OnInit {
   // Injected at bootstrap so the theme is applied (in the service constructor)
   // before the main window is revealed — no flash of the wrong theme.
   private readonly theme = inject(ThemeService);
+  // Same for the Liquid Glass level (--glass-user-alpha on <html>).
+  private readonly glass = inject(GlassService);
   private readonly updates = inject(UpdateService);
   // Injected at bootstrap purely so it starts observing router events from the
   // FIRST navigation — its "last non-settings route" (used by the settings
@@ -109,8 +112,9 @@ export class AppComponent implements OnInit {
    * The bar window does neither — it stays chromeless and side-effect-free.
    */
   async ngOnInit(): Promise<void> {
-    // Re-assert the chosen theme on startup (idempotent) for both windows.
+    // Re-assert the chosen theme + glass level on startup (idempotent) for both windows.
     this.theme.ensureApplied();
+    this.glass.ensureApplied();
 
     if (this.isBar()) return;
 

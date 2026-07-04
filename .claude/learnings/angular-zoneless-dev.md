@@ -33,6 +33,21 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-04] Settings auto-save — a type="number" input killed the save stream
+- **Pattern 1:** an `<input type="number">` bound to a STRING-typed form control commits a
+  NUMBER (or null when cleared) via NumberValueAccessor — any `.trim()`/string method on
+  `getRawValue()` then throws. Normalize (`raw == null ? "" : String(raw)`) before string ops.
+- **Pattern 2:** a synchronous throw inside a `.subscribe()` callback KILLS the subscription —
+  an auto-save wired as `valueChanges → debounce → subscribe(save)` dies silently for the whole
+  session on the first bad value. Wrap the callback body in try/catch and surface the error.
+- **Pattern 3:** replacing a Save button with debounced auto-save needs a destroy-flush: a
+  change made <debounce before navigation is otherwise dropped (`DestroyRef.onDestroy` +
+  pending flag). And legacy direct `save()` calls (select `(change)` handlers) double-save —
+  retire them.
+- **Caught by:** adversarial-verifier live pass (payload-capturing mock invoke); build+lint
+  green throughout.
+- **Status:** journaled
+
 ### [2026-07-04] Apple TV shell prototype — 2 findings the build/lint missed
 - **Pattern 1:** an `(keydown.escape)` bound on an overlay's scrim/panel only fires while focus
   sits INSIDE that subtree — click any non-focusable text and focus falls to `<body>`, Esc goes
