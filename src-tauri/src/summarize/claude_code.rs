@@ -17,7 +17,9 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Minimal, non-secret environment a child `claude` (and the `node` it spawns) needs. We start
 /// from an EMPTY environment (`env_clear`) and re-add ONLY these, so `MURMUR_DEV_*`, API keys,
 /// tokens, and anything else in the app's environment can NEVER be inherited by the child (F2).
-const PASSTHROUGH_ENV: &[&str] = &["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL"];
+const PASSTHROUGH_ENV: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL",
+];
 
 /// Vars that MUST NEVER reach the `claude` child even when the user opted into env inheritance: the
 /// DB encryption keys decrypt the ENTIRE library, and the child talks to the cloud — so they are
@@ -140,12 +142,10 @@ fn resolve_binary(binary: &str) -> crate::error::Result<String> {
 /// Reject a binary path unless it is a regular file, owned by the current uid, and not
 /// world-writable (F3). A symlink is resolved first so the *target's* metadata is what we check.
 fn vet_binary(path: &Path) -> crate::error::Result<()> {
-    let canonical = std::fs::canonicalize(path).map_err(|e| {
-        AppError::Unavailable(format!("claude binary path is not resolvable: {e}"))
-    })?;
-    let meta = std::fs::metadata(&canonical).map_err(|e| {
-        AppError::Unavailable(format!("cannot stat claude binary: {e}"))
-    })?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| AppError::Unavailable(format!("claude binary path is not resolvable: {e}")))?;
+    let meta = std::fs::metadata(&canonical)
+        .map_err(|e| AppError::Unavailable(format!("cannot stat claude binary: {e}")))?;
     if !meta.is_file() {
         return Err(AppError::Unavailable(
             "configured claude binary is not a regular file".to_string(),
@@ -257,7 +257,11 @@ impl SummarizerProvider for ClaudeCodeProvider {
     async fn availability(&self) -> Availability {
         let bin = match resolve_binary(&self.binary) {
             Ok(b) => b,
-            Err(e) => return Availability::Unavailable { reason: e.to_string() },
+            Err(e) => {
+                return Availability::Unavailable {
+                    reason: e.to_string(),
+                }
+            }
         };
         let mut cmd = Command::new(&bin);
         cmd.arg("--version")
@@ -305,8 +309,8 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true); // F6: a dropped future (cancel/panic) reaps the child.
-        // Brain/AI model override: only add `--model` when the user picked a specific model;
-        // an empty value lets the CLI use its own default.
+                                 // Brain/AI model override: only add `--model` when the user picked a specific model;
+                                 // an empty value lets the CLI use its own default.
         cmd.args(model_args(&self.model));
         harden_env(&mut cmd, self.inherit_env); // F2: env_clear + minimal PATH.
         let mut child = cmd
@@ -333,7 +337,9 @@ impl SummarizerProvider for ClaudeCodeProvider {
         let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
-                return Err(AppError::Summarize(format!("failed waiting on claude: {e}")))
+                return Err(AppError::Summarize(format!(
+                    "failed waiting on claude: {e}"
+                )))
             }
             Err(_elapsed) => {
                 // The future is dropped here → kill_on_drop(true) reaps the process.
@@ -389,7 +395,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true); // F6
-        // Brain/AI model override (mirrors `summarize`): add `--model` only when set.
+                                 // Brain/AI model override (mirrors `summarize`): add `--model` only when set.
         cmd.args(model_args(&self.model));
         harden_env(&mut cmd, self.inherit_env); // F2
         let mut child = cmd
@@ -413,7 +419,9 @@ impl SummarizerProvider for ClaudeCodeProvider {
         let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
-                return Err(AppError::Summarize(format!("failed waiting on claude: {e}")))
+                return Err(AppError::Summarize(format!(
+                    "failed waiting on claude: {e}"
+                )))
             }
             Err(_elapsed) => {
                 return Err(AppError::Summarize(format!(
@@ -546,9 +554,14 @@ mod tests {
 
     #[test]
     fn with_inherit_env_threads_the_flag() {
-        assert!(!ClaudeCodeProvider::with_binary("claude".into()).inherit_env, "default is hardened");
         assert!(
-            ClaudeCodeProvider::with_binary("claude".into()).with_inherit_env(true).inherit_env,
+            !ClaudeCodeProvider::with_binary("claude".into()).inherit_env,
+            "default is hardened"
+        );
+        assert!(
+            ClaudeCodeProvider::with_binary("claude".into())
+                .with_inherit_env(true)
+                .inherit_env,
             "opt-in flag is threaded"
         );
     }
@@ -574,7 +587,10 @@ mod tests {
         );
         // PATH is still pinned so a GUI-launched app can find `claude` + its `node`.
         let path = envs.get(std::ffi::OsStr::new("PATH"));
-        assert!(path.is_some() && path.unwrap().is_some(), "PATH is pinned in inherit mode");
+        assert!(
+            path.is_some() && path.unwrap().is_some(),
+            "PATH is pinned in inherit mode"
+        );
     }
 
     #[test]
@@ -582,8 +598,14 @@ mod tests {
         // The #1 real cause: a `--model` override the user's claude CLI / proxy doesn't know
         // (regression from the model picker). The error MUST name the model + the one-click fix.
         let m = claude_failure_message(1, "claude-sonnet-4-6", None);
-        assert!(m.contains("claude-sonnet-4-6"), "names the offending model: {m}");
-        assert!(m.contains("Default"), "offers the Model = Default workaround: {m}");
+        assert!(
+            m.contains("claude-sonnet-4-6"),
+            "names the offending model: {m}"
+        );
+        assert!(
+            m.contains("Default"),
+            "offers the Model = Default workaround: {m}"
+        );
         assert!(
             m.contains("MURMUR_DEBUG_CLAUDE_STDERR"),
             "tells the user how to capture the real stderr: {m}"
@@ -594,7 +616,10 @@ mod tests {
     fn failure_message_is_generic_without_a_model_override() {
         // No model picked ⇒ no model hint; point at the terminal auth check instead.
         let m = claude_failure_message(1, "   ", None);
-        assert!(!m.contains("selected model"), "no model hint when none set: {m}");
+        assert!(
+            !m.contains("selected model"),
+            "no model hint when none set: {m}"
+        );
         assert!(m.contains("claude -p"), "points at the terminal check: {m}");
     }
 
@@ -603,7 +628,10 @@ mod tests {
         // When MURMUR_DEBUG_CLAUDE_STDERR captured stderr, name the file instead of telling the
         // user to set the flag (they already did).
         let m = claude_failure_message(2, "", Some("/x/claude-stderr.log"));
-        assert!(m.contains("/x/claude-stderr.log"), "names the capture path: {m}");
+        assert!(
+            m.contains("/x/claude-stderr.log"),
+            "names the capture path: {m}"
+        );
         assert!(
             !m.contains("MURMUR_DEBUG_CLAUDE_STDERR"),
             "no 'set the flag' hint once already captured: {m}"

@@ -58,7 +58,10 @@ mod tests {
     fn normalizes_peaks_above_unit_instead_of_clamping() {
         let out = mix(&[0.75, 0.4], &[0.5, 0.1]);
         assert!((out[0] - 1.0).abs() < 1e-6);
-        assert!((out[1] - 0.5 / 1.25).abs() < 1e-6, "ratios preserved, not clamped");
+        assert!(
+            (out[1] - 0.5 / 1.25).abs() < 1e-6,
+            "ratios preserved, not clamped"
+        );
     }
 
     /// mix_aligned pads the delayed track with leading silence.

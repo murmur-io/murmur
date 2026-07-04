@@ -290,13 +290,20 @@ mod tests {
         assert_eq!(*a.sk_enc, *b.sk_enc);
         assert_eq!(*a.sk_sig, *b.sk_sig);
         // The derived X25519 public key matches sk_to_pk(sk_enc) (a valid HPKE keypair).
-        let sk =
-            <X25519HkdfSha256 as KemTrait>::PrivateKey::from_bytes(&*a.sk_enc).unwrap();
-        assert_eq!(a.pk_enc, to_arr32(&X25519HkdfSha256::sk_to_pk(&sk).to_bytes()).unwrap());
+        let sk = <X25519HkdfSha256 as KemTrait>::PrivateKey::from_bytes(&*a.sk_enc).unwrap();
+        assert_eq!(
+            a.pk_enc,
+            to_arr32(&X25519HkdfSha256::sk_to_pk(&sk).to_bytes()).unwrap()
+        );
         // A different generation, account, or MK yields a different identity (domain separation).
         assert_ne!(a.pk_sig, derive_identity(&mk, ACCT, 2).unwrap().pk_sig);
         assert_ne!(a.pk_sig, derive_identity(&mk, "other", 1).unwrap().pk_sig);
-        assert_ne!(a.pk_sig, derive_identity(&generate_master_key().unwrap(), ACCT, 1).unwrap().pk_sig);
+        assert_ne!(
+            a.pk_sig,
+            derive_identity(&generate_master_key().unwrap(), ACCT, 1)
+                .unwrap()
+                .pk_sig
+        );
     }
 
     #[test]

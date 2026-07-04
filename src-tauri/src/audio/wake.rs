@@ -99,7 +99,10 @@ fn make_hit(words: &[&str], idx: usize) -> WakeHit {
         .trim_start_matches(|c: char| !c.is_alphanumeric())
         .trim()
         .to_string();
-    WakeHit { matched_phrase: words[idx].to_string(), command }
+    WakeHit {
+        matched_phrase: words[idx].to_string(),
+        command,
+    }
 }
 
 /// Whether `cand` (already name-normalized) matches the distinctive Polish vocative of the
@@ -161,7 +164,11 @@ fn matches_wake(cand: &str) -> bool {
 /// ("klod"/"klode"/"klodku").
 fn normalize_name(token: &str) -> String {
     // Lowercase + letters only (drops commas, digits, etc.).
-    let mut s: String = token.to_lowercase().chars().filter(|c| c.is_alphabetic()).collect();
+    let mut s: String = token
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .collect();
 
     // Collapse the "Claude"-vowel diphthongs to a single 'o'. Longer forms first so e.g. "eau"
     // wins over a later "au". (ł/diacritics are still present here on purpose.)
@@ -238,7 +245,9 @@ pub fn is_assistant_directed(line: &str) -> bool {
 /// Filter a list of transcript LINES, dropping every one [`is_assistant_directed`] flags (a line the
 /// user spoke TO the assistant). Returns the kept lines in order. Pure + deterministic. Used to build
 /// the summarization input so assistant-directed utterances never reach the action-items extraction.
-pub fn strip_assistant_directed_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+pub fn strip_assistant_directed_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'a str> {
     lines
         .into_iter()
         .filter(|l| !is_assistant_directed(l))
@@ -363,7 +372,9 @@ pub fn parse_voice_intent(command: &str) -> VoiceIntent {
         return VoiceIntent::NoteAside { text: rest };
     }
 
-    VoiceIntent::Unknown { raw: raw.to_string() }
+    VoiceIntent::Unknown {
+        raw: raw.to_string(),
+    }
 }
 
 /// If `nwords` starts with any of `patterns` (matched on the normalized tokens), return the
@@ -388,7 +399,15 @@ fn match_prefix(nwords: &[&str], owords: &[&str], patterns: &[&[&str]]) -> Optio
 fn extract_due(body: &str) -> (String, Option<String>) {
     let otoks: Vec<&str> = body.split_whitespace().collect();
     const SINGLE: [&str; 9] = [
-        "jutro", "dzisiaj", "dzis", "pojutrze", "wieczorem", "rano", "tomorrow", "today", "tonight",
+        "jutro",
+        "dzisiaj",
+        "dzis",
+        "pojutrze",
+        "wieczorem",
+        "rano",
+        "tomorrow",
+        "today",
+        "tonight",
     ];
     for (i, ot) in otoks.iter().enumerate() {
         let t = strip_diacritics(&ot.to_lowercase());
@@ -398,7 +417,9 @@ fn extract_due(body: &str) -> (String, Option<String>) {
             return (body.to_string(), Some(clean.to_string()));
         }
         // "o 15" / "at 3pm" — a time preposition followed by a token containing a digit.
-        if (t == "o" || t == "at") && i + 1 < otoks.len() && otoks[i + 1].chars().any(|c| c.is_ascii_digit())
+        if (t == "o" || t == "at")
+            && i + 1 < otoks.len()
+            && otoks[i + 1].chars().any(|c| c.is_ascii_digit())
         {
             return (body.to_string(), Some(format!("{} {}", ot, otoks[i + 1])));
         }
@@ -473,14 +494,23 @@ mod tests {
         // "Claudku" (→ "klodku"/"kladku") — ONLY these fire. Index 0 (utterance start) and index 1
         // (after an interjection) are both covered. PL + EN command tails, code-switched.
         let cases: &[(&str, &str)] = &[
-            ("klałdku zrób research o konkurencji", "zrób research o konkurencji"),
+            (
+                "klałdku zrób research o konkurencji",
+                "zrób research o konkurencji",
+            ),
             ("klołdku zapisz to", "zapisz to"),
             ("klałdku, co wiemy o atlasie", "co wiemy o atlasie"),
             ("klaudku zrób research", "zrób research"),
             ("klodku do research on pricing", "do research on pricing"),
-            ("Klałdku, przypomnij mi o spotkaniu", "przypomnij mi o spotkaniu"),
+            (
+                "Klałdku, przypomnij mi o spotkaniu",
+                "przypomnij mi o spotkaniu",
+            ),
             // index 1: interjection + vocative.
-            ("hej klałdku wyszukaj w slacku raport", "wyszukaj w slacku raport"),
+            (
+                "hej klałdku wyszukaj w slacku raport",
+                "wyszukaj w slacku raport",
+            ),
             ("okej klaudku note that we shipped", "note that we shipped"),
             ("ok klodku przypomnij mi", "przypomnij mi"),
             // ── THE REAL ON-MIC VARIANTS (the missed d-less + -ko forms) ──
@@ -492,7 +522,8 @@ mod tests {
             ("ok klołku zapisz to", "zapisz to"), // interjection + d-less
         ];
         for (input, want_cmd) in cases {
-            let hit = detect_wake(input).unwrap_or_else(|| panic!("expected wake fire on {input:?}"));
+            let hit =
+                detect_wake(input).unwrap_or_else(|| panic!("expected wake fire on {input:?}"));
             assert_eq!(hit.command, *want_cmd, "wrong command tail for {input:?}");
         }
     }
@@ -507,8 +538,14 @@ mod tests {
         // command tail = everything after the vocative. (RED on the old index-0/interjection anchor.)
         let cases: &[(&str, &str)] = &[
             ("ok więc tak, klaudku zrób research", "zrób research"),
-            ("no dobra to teraz klołku co wiemy o atlasie", "co wiemy o atlasie"),
-            ("a jeszcze jedno klałdku przypomnij mi o spotkaniu", "przypomnij mi o spotkaniu"),
+            (
+                "no dobra to teraz klołku co wiemy o atlasie",
+                "co wiemy o atlasie",
+            ),
+            (
+                "a jeszcze jedno klałdku przypomnij mi o spotkaniu",
+                "przypomnij mi o spotkaniu",
+            ),
             // the demonstrated 2nd-ask shape: prior sentence + a fresh vocative deep in the tail.
             (
                 "zrobiłem już research o cenach klauku zrób research o konkurencji",
@@ -516,9 +553,12 @@ mod tests {
             ),
         ];
         for (input, want_cmd) in cases {
-            let hit =
-                detect_wake(input).unwrap_or_else(|| panic!("expected mid-tail wake fire on {input:?}"));
-            assert_eq!(hit.command, *want_cmd, "wrong command tail for mid-tail wake {input:?}");
+            let hit = detect_wake(input)
+                .unwrap_or_else(|| panic!("expected mid-tail wake fire on {input:?}"));
+            assert_eq!(
+                hit.command, *want_cmd,
+                "wrong command tail for mid-tail wake {input:?}"
+            );
         }
     }
 
@@ -527,14 +567,17 @@ mod tests {
         // Firing ANYWHERE must NOT re-open the near-collision false fires when they sit mid-sentence
         // (the shape-gate, not the position anchor, is what holds precision). All None.
         for n in [
-            "przejdźmy do kroku drugiego",              // "kroku" mid-sentence (step)
-            "wróćmy do klocka na stole",                // "klocka" mid-sentence (block)
-            "ok zamknij teraz tę kłódkę proszę",        // "kłódkę" mid-sentence (padlock)
-            "myślę że klaudia z hr to ogarnie",         // "klaudia" mid-sentence (name)
+            "przejdźmy do kroku drugiego",       // "kroku" mid-sentence (step)
+            "wróćmy do klocka na stole",         // "klocka" mid-sentence (block)
+            "ok zamknij teraz tę kłódkę proszę", // "kłódkę" mid-sentence (padlock)
+            "myślę że klaudia z hr to ogarnie",  // "klaudia" mid-sentence (name)
             "everything is moving to the cloud this year", // "cloud" mid-sentence
-            "i think we should close this deal today",  // "close" mid-sentence
+            "i think we should close this deal today", // "close" mid-sentence
         ] {
-            assert!(detect_wake(n).is_none(), "FALSE FIRE on mid-tail near-collision: {n:?}");
+            assert!(
+                detect_wake(n).is_none(),
+                "FALSE FIRE on mid-tail near-collision: {n:?}"
+            );
         }
     }
 
@@ -546,21 +589,21 @@ mod tests {
         // adversarial verifier reproduced, plus the hard near-collisions.
         let negatives: &[&str] = &[
             // ── NEW precision risk from accepting the d-less "kloku" vocative ──
-            "do kroku",            // krok/step → "kroku"; 1 edit from "kloku" — 'l' vs 'r' separates
-            "kroku",               // bare step word
-            "klocku",              // klocek/block → "klocku"; 'c' in nucleus kills it
-            "do klocka",           // block in a sentence → "klocka"
+            "do kroku",  // krok/step → "kroku"; 1 edit from "kloku" — 'l' vs 'r' separates
+            "kroku",     // bare step word
+            "klocku",    // klocek/block → "klocku"; 'c' in nucleus kills it
+            "do klocka", // block in a sentence → "klocka"
             // ── demonstrated false fires that MUST stay silent ──
-            "ok loud and clear",   // "loud"→"lod" used to match bare "klod"
-            "no loud and clear",   // "loud"→"lod" used to match bare "klod"
-            "kłódka",              // padlock → "klodka" (ends 'a', not the vocative 'u')
-            "kłódkę",              // padlock → "klodke" (ends 'e')
-            "ok zamknij kłódkę",   // padlock in a sentence
-            "cloud computing",     // "cloud"→"klod" (ends 'd')
+            "ok loud and clear", // "loud"→"lod" used to match bare "klod"
+            "no loud and clear", // "loud"→"lod" used to match bare "klod"
+            "kłódka",            // padlock → "klodka" (ends 'a', not the vocative 'u')
+            "kłódkę",            // padlock → "klodke" (ends 'e')
+            "ok zamknij kłódkę", // padlock in a sentence
+            "cloud computing",   // "cloud"→"klod" (ends 'd')
             "the cloud was down",
             "ok close the door",
             "hej close the laptop",
-            "applaud the team",    // "applaud"→"aplod"
+            "applaud the team", // "applaud"→"aplod"
             "claudia",
             "klaudia",
             "hej claudia",
@@ -622,19 +665,27 @@ mod tests {
     fn intent_research_pl_and_en() {
         assert_eq!(
             parse_voice_intent("zrób research o konkurencji"),
-            VoiceIntent::Research { topic: "konkurencji".into() }
+            VoiceIntent::Research {
+                topic: "konkurencji".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("zrob research na temat atlasa"),
-            VoiceIntent::Research { topic: "atlasa".into() }
+            VoiceIntent::Research {
+                topic: "atlasa".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("research the pricing model"),
-            VoiceIntent::Research { topic: "the pricing model".into() }
+            VoiceIntent::Research {
+                topic: "the pricing model".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("do research on competitor pricing"),
-            VoiceIntent::Research { topic: "competitor pricing".into() }
+            VoiceIntent::Research {
+                topic: "competitor pricing".into()
+            }
         );
     }
 
@@ -642,15 +693,21 @@ mod tests {
     fn intent_slack_pl_and_en() {
         assert_eq!(
             parse_voice_intent("wyszukaj w slacku raport q3"),
-            VoiceIntent::SlackSearch { query: "raport q3".into() }
+            VoiceIntent::SlackSearch {
+                query: "raport q3".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("slack deployment thread"),
-            VoiceIntent::SlackSearch { query: "deployment thread".into() }
+            VoiceIntent::SlackSearch {
+                query: "deployment thread".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("search slack for the incident"),
-            VoiceIntent::SlackSearch { query: "the incident".into() }
+            VoiceIntent::SlackSearch {
+                query: "the incident".into()
+            }
         );
     }
 
@@ -658,15 +715,21 @@ mod tests {
     fn intent_recall_pl_and_en() {
         assert_eq!(
             parse_voice_intent("co wiemy o atlasie"),
-            VoiceIntent::Recall { entity: "atlasie".into() }
+            VoiceIntent::Recall {
+                entity: "atlasie".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("recall project orion"),
-            VoiceIntent::Recall { entity: "project orion".into() }
+            VoiceIntent::Recall {
+                entity: "project orion".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("what do we know about acme"),
-            VoiceIntent::Recall { entity: "acme".into() }
+            VoiceIntent::Recall {
+                entity: "acme".into()
+            }
         );
     }
 
@@ -688,7 +751,10 @@ mod tests {
         );
         assert_eq!(
             parse_voice_intent("przypomnij mi żeby wysłać raport"),
-            VoiceIntent::CreateReminder { text: "żeby wysłać raport".into(), due: None }
+            VoiceIntent::CreateReminder {
+                text: "żeby wysłać raport".into(),
+                due: None
+            }
         );
     }
 
@@ -696,15 +762,21 @@ mod tests {
     fn intent_note_pl_and_en() {
         assert_eq!(
             parse_voice_intent("zapisz że deadline to piątek"),
-            VoiceIntent::NoteAside { text: "że deadline to piątek".into() }
+            VoiceIntent::NoteAside {
+                text: "że deadline to piątek".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("note that we shipped v2"),
-            VoiceIntent::NoteAside { text: "we shipped v2".into() }
+            VoiceIntent::NoteAside {
+                text: "we shipped v2".into()
+            }
         );
         assert_eq!(
             parse_voice_intent("notatka kolejny krok to deploy"),
-            VoiceIntent::NoteAside { text: "kolejny krok to deploy".into() }
+            VoiceIntent::NoteAside {
+                text: "kolejny krok to deploy".into()
+            }
         );
     }
 
@@ -712,9 +784,14 @@ mod tests {
     fn intent_unknown_for_gibberish_and_empty() {
         assert_eq!(
             parse_voice_intent("asdf qwer zxcv"),
-            VoiceIntent::Unknown { raw: "asdf qwer zxcv".into() }
+            VoiceIntent::Unknown {
+                raw: "asdf qwer zxcv".into()
+            }
         );
-        assert_eq!(parse_voice_intent("   "), VoiceIntent::Unknown { raw: String::new() });
+        assert_eq!(
+            parse_voice_intent("   "),
+            VoiceIntent::Unknown { raw: String::new() }
+        );
     }
 
     // ── SUMMARIZER EXCLUSION: assistant-directed line detection ──────────────
@@ -728,7 +805,10 @@ mod tests {
             "klauku zrób research o cenach", // d-less vocative
             "hej klałdku wyszukaj raport",
         ] {
-            assert!(is_assistant_directed(directed), "{directed:?} must be assistant-directed");
+            assert!(
+                is_assistant_directed(directed),
+                "{directed:?} must be assistant-directed"
+            );
         }
         // Ordinary meeting speech → NOT directed (must reach the summarizer).
         for ordinary in [
@@ -738,7 +818,10 @@ mod tests {
             "cloud computing is the future",
             "",
         ] {
-            assert!(!is_assistant_directed(ordinary), "{ordinary:?} must NOT be assistant-directed");
+            assert!(
+                !is_assistant_directed(ordinary),
+                "{ordinary:?} must NOT be assistant-directed"
+            );
         }
     }
 
@@ -752,7 +835,10 @@ mod tests {
         let kept = strip_assistant_directed_lines(lines.iter().copied());
         assert_eq!(
             kept,
-            vec!["Janek wyśle raport w piątek", "Ustaliliśmy termin na poniedziałek"],
+            vec![
+                "Janek wyśle raport w piątek",
+                "Ustaliliśmy termin na poniedziałek"
+            ],
             "assistant commands dropped; real meeting content kept in order"
         );
     }
@@ -763,7 +849,9 @@ mod tests {
         let hit = detect_wake("klałdku zrób research o konkurencji").unwrap();
         assert_eq!(
             parse_voice_intent(&hit.command),
-            VoiceIntent::Research { topic: "konkurencji".into() }
+            VoiceIntent::Research {
+                topic: "konkurencji".into()
+            }
         );
     }
 }

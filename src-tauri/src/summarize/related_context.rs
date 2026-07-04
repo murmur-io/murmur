@@ -52,22 +52,23 @@ pub(crate) fn is_stopword(t: &str) -> bool {
         "the", "and", "for", "are", "but", "not", "you", "your", "all", "can", "had", "her", "was",
         "one", "our", "out", "has", "him", "his", "how", "man", "new", "now", "old", "see", "two",
         "way", "who", "did", "get", "may", "she", "use", "that", "this", "with", "have", "from",
-        "they", "will", "would", "there", "their", "what", "about", "which", "when", "were", "been",
-        "them", "then", "than", "some", "into", "just", "like", "also", "well", "yeah", "okay",
-        "going", "gonna", "really", "actually", "think", "know", "want", "need", "let", "yes",
-        "kind", "sort", "thing", "things", "stuff", "much", "very", "more", "most", "such", "only",
-        // Polish
+        "they", "will", "would", "there", "their", "what", "about", "which", "when", "were",
+        "been", "them", "then", "than", "some", "into", "just", "like", "also", "well", "yeah",
+        "okay", "going", "gonna", "really", "actually", "think", "know", "want", "need", "let",
+        "yes", "kind", "sort", "thing", "things", "stuff", "much", "very", "more", "most", "such",
+        "only", // Polish
         "nie", "tak", "jest", "się", "sie", "tego", "tym", "tych", "tam", "jak", "czy", "ale",
         "lub", "albo", "oraz", "dla", "tylko", "też", "tez", "już", "juz", "bez", "być", "byc",
         "jako", "który", "ktory", "która", "ktora", "które", "ktore", "tutaj", "teraz", "wtedy",
-        "bardzo", "trochę", "troche", "może", "moze", "żeby", "zeby", "przez", "przy", "pod", "nad",
-        "tu", "to", "co", "na", "we", "do", "od", "po", "za", "ze", "oraz", "więc", "wiec",
+        "bardzo", "trochę", "troche", "może", "moze", "żeby", "zeby", "przez", "przy", "pod",
+        "nad", "tu", "to", "co", "na", "we", "do", "od", "po", "za", "ze", "oraz", "więc", "wiec",
         // Polish question words + the "być" copula's inflected forms — high-frequency function words
         // that over-constrain an exact-term FTS query for a spoken question ("jaka była pogoda" must
         // key off "pogoda", not the auxiliary "jaka"/"była"). Diacritic-stripped forms too.
         "jaka", "jaki", "jakie", "jacy", "jakas", "jakaś", "kto", "kogo", "kim", "gdzie", "kiedy",
         "ile", "dlaczego", "czyj", "czyja", "był", "byl", "była", "byla", "było", "bylo", "były",
-        "byly", "byłem", "bylem", "byłam", "bylam", "jestem", "jesteś", "jestes", "będzie", "bedzie",
+        "byly", "byłem", "bylem", "byłam", "bylam", "jestem", "jesteś", "jestes", "będzie",
+        "bedzie",
     ];
     STOP.contains(&t)
 }
@@ -282,7 +283,10 @@ mod tests {
         let q = salient_query(None, "Apollo migration migration migration deadline");
         // Most frequent content term ("migration") leads; deterministic for the same input.
         assert!(q.starts_with("migration"), "got: {q}");
-        assert_eq!(q, salient_query(None, "Apollo migration migration migration deadline"));
+        assert_eq!(
+            q,
+            salient_query(None, "Apollo migration migration migration deadline")
+        );
     }
 
     #[test]
@@ -298,20 +302,43 @@ mod tests {
     fn build_related_context_cites_visible_and_excludes_self() {
         let db = temp_db();
         // The meeting we're "summarizing" (its own note already exists in this test fixture).
-        seed_note(&db, "this", "Q3 Planning", "ACME quarterly planning roadmap", None);
+        seed_note(
+            &db,
+            "this",
+            "Q3 Planning",
+            "ACME quarterly planning roadmap",
+            None,
+        );
         // A genuinely related prior, open folder → visible.
-        seed_note(&db, "prior", "Q2 Planning", "ACME quarterly planning roadmap decisions", None);
+        seed_note(
+            &db,
+            "prior",
+            "Q2 Planning",
+            "ACME quarterly planning roadmap decisions",
+            None,
+        );
 
         let nothing = HashSet::new();
-        let (corpus, sources) =
-            build_related_context(&db, "this", "ACME quarterly planning", &nothing, "anthropic")
-                .unwrap();
+        let (corpus, sources) = build_related_context(
+            &db,
+            "this",
+            "ACME quarterly planning",
+            &nothing,
+            "anthropic",
+        )
+        .unwrap();
 
-        assert!(corpus.contains("[[Q2 Planning]]"), "related note must be cited");
+        assert!(
+            corpus.contains("[[Q2 Planning]]"),
+            "related note must be cited"
+        );
         assert!(corpus.contains("id:prior"));
         assert!(sources.iter().any(|s| s.meeting_id == "prior"));
         // Self-exclusion: the meeting being summarized is never in its own grounding corpus.
-        assert!(!corpus.contains("id:this"), "a note must never be grounded in itself");
+        assert!(
+            !corpus.contains("id:this"),
+            "a note must never be grounded in itself"
+        );
         assert!(sources.iter().all(|s| s.meeting_id != "this"));
     }
 
@@ -322,7 +349,13 @@ mod tests {
     #[test]
     fn build_related_context_excludes_sealed_until_unlocked() {
         let db = temp_db();
-        seed_note(&db, "this", "Acquisition Talk", "PROJECT atlas acquisition terms", None);
+        seed_note(
+            &db,
+            "this",
+            "Acquisition Talk",
+            "PROJECT atlas acquisition terms",
+            None,
+        );
         seed_folder(&db, "f-locked", false);
         seed_note(
             &db,
@@ -336,9 +369,14 @@ mod tests {
 
         // Not session-unlocked → the sealed related note MUST be absent from the cloud-bound corpus.
         let nothing = HashSet::new();
-        let (corpus, sources) =
-            build_related_context(&db, "this", "PROJECT atlas acquisition", &nothing, "anthropic")
-                .unwrap();
+        let (corpus, sources) = build_related_context(
+            &db,
+            "this",
+            "PROJECT atlas acquisition",
+            &nothing,
+            "anthropic",
+        )
+        .unwrap();
         assert!(
             !corpus.contains("SEALED-SECRET"),
             "sealed-not-unlocked related content leaked into the cloud grounding corpus (gate violation)"
@@ -348,10 +386,18 @@ mod tests {
         // Session-unlock the folder → the related note is now legitimately available + cited.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
-        let (corpus2, sources2) =
-            build_related_context(&db, "this", "PROJECT atlas acquisition", &unlocked, "anthropic")
-                .unwrap();
-        assert!(corpus2.contains("SEALED-SECRET"), "unlocked related content must reappear");
+        let (corpus2, sources2) = build_related_context(
+            &db,
+            "this",
+            "PROJECT atlas acquisition",
+            &unlocked,
+            "anthropic",
+        )
+        .unwrap();
+        assert!(
+            corpus2.contains("SEALED-SECRET"),
+            "unlocked related content must reappear"
+        );
         assert!(sources2.iter().any(|s| s.meeting_id == "sealed"));
     }
 

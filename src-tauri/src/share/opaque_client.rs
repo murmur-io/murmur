@@ -2,21 +2,14 @@
 //! never leaves the Mac (spec §3). The client's `export_key` is the ONLY output that reaches the
 //! crypto layer: `keys::derive_kek_pw(export_key)` turns it into the key that wraps `MK`.
 //!
-//! ⚠️  DUPLICATED-MUST-STAY-IN-SYNC TECH DEBT ⚠️
+//! CIPHERSUITE = SINGLE SHARED SOURCE
 //! ---------------------------------------------------------------------------------------------
-//! The `MurmurCipherSuite` below is a VERBATIM copy of the server's ciphersuite in
-//! `murmur-server/crates/murmur-server/src/auth/opaque.rs`:
-//!     OprfCs      = opaque_ke::Ristretto255
-//!     KeyExchange = opaque_ke::TripleDh<opaque_ke::Ristretto255, sha2::Sha512>
-//!     Ksf         = argon2::Argon2<'static>
-//! OPAQUE is a two-party protocol: the client and server MUST agree on this suite byte-for-byte or
-//! every registration/login silently produces mismatched wire messages and fails. It is copied here
-//! (rather than sharing a crate) DELIBERATELY: `opaque-ke` types are NOT in the permissive-licensed
-//! `murmur-protocol` crate (that crate does no account crypto — see its lib.rs), and standing up a
-//! shared client-crypto crate now would conflict with the concurrent server work. A future
-//! unification (a `murmur-opaque` crate or moving the suite into `murmur-protocol`) is deferred.
-//! The [`tests::opaque_client_server_round_trip`] test pins the invariant: if either side edits the
-//! suite, that in-process round-trip (client helpers here + server helpers there) fails.
+//! OPAQUE is a two-party protocol: the client and server MUST agree on the ciphersuite byte-for-byte
+//! or every registration/login silently produces mismatched wire messages and fails. The suite
+//! (`Ristretto255` OPRF + `TripleDh<Ristretto255, Sha512>` + `Argon2` KSF) is therefore defined ONCE
+//! in `murmur_protocol::opaque` (behind that crate's `opaque` feature) and re-used by BOTH sides —
+//! it is no longer duplicated, so the two cannot drift. The [`tests::opaque_client_server_round_trip`]
+//! test still pins the interop end-to-end (client helpers here + server helpers there).
 //!
 //! No `unwrap`/`expect` in non-test code (rust-tauri §1): the server's helpers `expect(...)` on
 //! client start/finish; ours return [`crate::error::Result`] with [`AppError::Auth`]. The password
@@ -29,18 +22,10 @@ use opaque_ke::{
 };
 use rand::rngs::OsRng;
 
-/// Murmur's OPAQUE ciphersuite — MUST equal the server's (see the module warning above).
-#[derive(Debug)]
-pub struct MurmurCipherSuite;
-
-impl opaque_ke::CipherSuite for MurmurCipherSuite {
-    type OprfCs = opaque_ke::Ristretto255;
-    type KeyExchange = opaque_ke::TripleDh<opaque_ke::Ristretto255, sha2::Sha512>;
-    type Ksf = argon2::Argon2<'static>;
-}
-
-/// Alias mirroring the server's `CS` so the OPAQUE message types read identically on both sides.
-pub type CS = MurmurCipherSuite;
+// The ciphersuite is now the SINGLE shared definition in `murmur-protocol` (behind its `opaque`
+// feature) — no longer duplicated here, so client and server cannot drift. The OPAQUE message types
+// below resolve to the same `CS` on both sides.
+pub use murmur_protocol::opaque::{MurmurCipherSuite, CS};
 
 fn opaque_err(ctx: &str) -> impl Fn(opaque_ke::errors::ProtocolError) -> AppError + '_ {
     move |_e| AppError::Auth(format!("OPAQUE {ctx} failed"))
@@ -141,9 +126,8 @@ mod tests {
     //! server contract.
     use super::*;
     use opaque_ke::{
-        RegistrationRequest, RegistrationUpload, ServerLogin, ServerLoginParameters,
-        ServerRegistration, ServerSetup,
-        CredentialRequest,
+        CredentialRequest, RegistrationRequest, RegistrationUpload, ServerLogin,
+        ServerLoginParameters, ServerRegistration, ServerSetup,
     };
 
     /// Full register→login round-trip against an in-process server driven by the identical `CS`.
@@ -164,7 +148,9 @@ mod tests {
         let (upload_bytes, reg_export_key) =
             client_registration_finish(creg.state, password, &sresp.serialize().to_vec()).unwrap();
         let upload = RegistrationUpload::<CS>::deserialize(&upload_bytes).unwrap();
-        let password_file = ServerRegistration::<CS>::finish(upload).serialize().to_vec();
+        let password_file = ServerRegistration::<CS>::finish(upload)
+            .serialize()
+            .to_vec();
 
         // --- Login (correct password) ---
         let clog = client_login_start(password).unwrap();
@@ -188,7 +174,10 @@ mod tests {
             .unwrap();
 
         assert!(!reg_export_key.is_empty());
-        assert_eq!(reg_export_key, login_export_key, "export_key must be stable");
+        assert_eq!(
+            reg_export_key, login_export_key,
+            "export_key must be stable"
+        );
         // Mutual auth: the client also derived a session key at login/finish. We assert the server
         // side completed without error (above) — a mismatched suite would have errored there.
         assert!(!srv_finish.session_key.to_vec().is_empty());

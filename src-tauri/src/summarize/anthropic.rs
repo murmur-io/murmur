@@ -286,10 +286,9 @@ impl AnthropicProvider {
             )));
         }
 
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| AppError::Summarize(format!("failed to read Anthropic response body: {e}")))?;
+        let body_text = resp.text().await.map_err(|e| {
+            AppError::Summarize(format!("failed to read Anthropic response body: {e}"))
+        })?;
 
         parse_messages_response(&body_text)
     }
@@ -327,9 +326,17 @@ mod tests {
         let (text, meta) = parse_messages_response(ANTHROPIC_FIXTURE).unwrap();
         assert_eq!(text, "Hello world");
         assert_eq!(meta.prompt_tokens, Some(11), "input_tokens → prompt_tokens");
-        assert_eq!(meta.completion_tokens, Some(22), "output_tokens → completion_tokens");
+        assert_eq!(
+            meta.completion_tokens,
+            Some(22),
+            "output_tokens → completion_tokens"
+        );
         assert_eq!(meta.total_tokens, Some(33), "total = 11 + 22");
-        assert_eq!(meta.cached_tokens, Some(5), "cache_read_input_tokens → cached_tokens");
+        assert_eq!(
+            meta.cached_tokens,
+            Some(5),
+            "cache_read_input_tokens → cached_tokens"
+        );
         assert_eq!(
             meta.model_served.as_deref(),
             Some("claude-opus-4-8"),

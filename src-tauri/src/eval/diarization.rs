@@ -190,7 +190,9 @@ fn accumulate_overlaps(atoms: &[Atom]) -> Overlaps {
 }
 
 fn cooc_weight(cooc: &BTreeMap<(String, String), f64>, r: &str, h: &str) -> f64 {
-    cooc.get(&(r.to_string(), h.to_string())).copied().unwrap_or(0.0)
+    cooc.get(&(r.to_string(), h.to_string()))
+        .copied()
+        .unwrap_or(0.0)
 }
 
 // ── DER (the NIST decomposition) ────────────────────────────────────────────────────────────────
@@ -296,15 +298,15 @@ fn optimal_speaker_mapping(
     // Enumerate over the smaller side; invert if hypothesis is smaller so the returned map is always
     // reference → hypothesis.
     if ref_labels.len() <= hyp_labels.len() {
-        for (ri, hi) in best_injective_assignment(ref_labels, hyp_labels, |r, h| {
-            cooc_weight(cooc, r, h)
-        }) {
+        for (ri, hi) in
+            best_injective_assignment(ref_labels, hyp_labels, |r, h| cooc_weight(cooc, r, h))
+        {
             out.insert(ref_labels[ri].clone(), hyp_labels[hi].clone());
         }
     } else {
-        for (hi, ri) in best_injective_assignment(hyp_labels, ref_labels, |h, r| {
-            cooc_weight(cooc, r, h)
-        }) {
+        for (hi, ri) in
+            best_injective_assignment(hyp_labels, ref_labels, |h, r| cooc_weight(cooc, r, h))
+        {
             out.insert(ref_labels[ri].clone(), hyp_labels[hi].clone());
         }
     }
@@ -675,11 +677,24 @@ pub fn format_der_report(der: &DerReport, pc: &PurityCoverage) -> String {
     ));
     out.push_str(&format!("{:<20} {:>10.4}\n", "DER", der.der));
     out.push_str(&format!("{:<20} {:>10.2}\n", "  miss (s)", der.miss));
-    out.push_str(&format!("{:<20} {:>10.2}\n", "  false alarm (s)", der.false_alarm));
-    out.push_str(&format!("{:<20} {:>10.2}\n", "  confusion (s)", der.confusion));
-    out.push_str(&format!("{:<20} {:>10}\n", "  matched speakers", der.mapping.len()));
+    out.push_str(&format!(
+        "{:<20} {:>10.2}\n",
+        "  false alarm (s)", der.false_alarm
+    ));
+    out.push_str(&format!(
+        "{:<20} {:>10.2}\n",
+        "  confusion (s)", der.confusion
+    ));
+    out.push_str(&format!(
+        "{:<20} {:>10}\n",
+        "  matched speakers",
+        der.mapping.len()
+    ));
     out.push_str(&format!("{:<20} {:>10.4}\n", "cluster purity", pc.purity));
-    out.push_str(&format!("{:<20} {:>10.4}\n", "cluster coverage", pc.coverage));
+    out.push_str(&format!(
+        "{:<20} {:>10.4}\n",
+        "cluster coverage", pc.coverage
+    ));
     out.push_str(&format!("{:<20} {:>10.4}\n", "purity/coverage F1", pc.f1));
     out
 }
@@ -704,7 +719,16 @@ pub fn format_sweep_table(
     for p in points {
         out.push_str(&format!(
             "{:>5.2} {:>4} {:>4} {:>4} {:>4} {:>7.4} {:>7.4} {:>7.4} {:>7.4} {:>7.4} {:>7.4}\n",
-            p.threshold, p.tp, p.fp, p.tn, p.fn_, p.precision, p.recall, p.f1, p.far, p.frr,
+            p.threshold,
+            p.tp,
+            p.fp,
+            p.tn,
+            p.fn_,
+            p.precision,
+            p.recall,
+            p.f1,
+            p.far,
+            p.frr,
             p.accuracy
         ));
     }
@@ -729,7 +753,8 @@ pub fn format_sweep_table(
 #[derive(Deserialize)]
 struct ReferenceFile {
     #[serde(default)]
-    #[allow(dead_code)] // manifest/documentation metadata; parse_reference reads only `reference`.
+    #[allow(dead_code)]
+    // manifest/documentation metadata; parse_reference reads only `reference`.
     meeting: String,
     reference: Vec<TurnJson>,
 }
@@ -810,7 +835,10 @@ mod tests {
         let r = diarization_error_rate(&reference, &hypothesis, 0.0);
         assert!((r.miss - 0.0).abs() < 1e-9);
         assert!((r.false_alarm - 0.0).abs() < 1e-9);
-        assert!((r.confusion - 5.0).abs() < 1e-9, "half the time is wrong-cluster");
+        assert!(
+            (r.confusion - 5.0).abs() < 1e-9,
+            "half the time is wrong-cluster"
+        );
         assert!((r.der - 0.5).abs() < 1e-9);
     }
 
@@ -842,7 +870,10 @@ mod tests {
         let r = diarization_error_rate(&reference, &hypothesis, 0.0);
         assert!((r.total_ref_time - 5.0).abs() < 1e-9);
         assert!((r.false_alarm - 10.0).abs() < 1e-9);
-        assert!((r.der - 2.0).abs() < 1e-9, "DER may exceed 1.0 under heavy false alarm");
+        assert!(
+            (r.der - 2.0).abs() < 1e-9,
+            "DER may exceed 1.0 under heavy false alarm"
+        );
     }
 
     #[test]
@@ -851,9 +882,15 @@ mod tests {
         // still reported in the components (honest).
         let hypothesis = turns(&[(0.0, 5.0, "others-0")]);
         let r = diarization_error_rate(&[], &hypothesis, 0.0);
-        assert!((r.der - 0.0).abs() < 1e-9, "empty reference ⇒ vacuous DER 0");
+        assert!(
+            (r.der - 0.0).abs() < 1e-9,
+            "empty reference ⇒ vacuous DER 0"
+        );
         assert!((r.total_ref_time - 0.0).abs() < 1e-9);
-        assert!((r.false_alarm - 5.0).abs() < 1e-9, "false-alarm seconds still reported");
+        assert!(
+            (r.false_alarm - 5.0).abs() < 1e-9,
+            "false-alarm seconds still reported"
+        );
     }
 
     // ── purity / coverage ─────────────────────────────────────────────────────────────────────────
@@ -875,7 +912,10 @@ mod tests {
         let hypothesis = turns(&[(0.0, 10.0, "others-0")]);
         let pc = cluster_purity_coverage(&reference, &hypothesis);
         assert!((pc.purity - 0.5).abs() < 1e-9, "cluster is half A, half B");
-        assert!((pc.coverage - 1.0).abs() < 1e-9, "each reference speaker fully in the cluster");
+        assert!(
+            (pc.coverage - 1.0).abs() < 1e-9,
+            "each reference speaker fully in the cluster"
+        );
     }
 
     #[test]
@@ -920,8 +960,14 @@ mod tests {
         // Adding a WRONG prediction (Bob for Alice) is an fp AND is excluded from tp ⇒ both drop.
         let with_wrong =
             reid_metrics(&[reid(Some("A"), Some("A")), reid(Some("Alice"), Some("Bob"))]);
-        assert!((with_wrong.precision - 0.5).abs() < 1e-9, "precision drops 1.0 → 0.5");
-        assert!((with_wrong.recall - 0.5).abs() < 1e-9, "recall drops 1.0 → 0.5");
+        assert!(
+            (with_wrong.precision - 0.5).abs() < 1e-9,
+            "precision drops 1.0 → 0.5"
+        );
+        assert!(
+            (with_wrong.recall - 0.5).abs() < 1e-9,
+            "recall drops 1.0 → 0.5"
+        );
     }
 
     // ── threshold sweep / EER / best-F1 ────────────────────────────────────────────────────────────
@@ -930,10 +976,22 @@ mod tests {
     fn sweep_far_frr_at_known_thresholds() {
         // genuine (same) scores {0.8, 0.6}; impostor (diff) scores {0.4, 0.2}.
         let pairs = vec![
-            VerificationPair { score: 0.8, same_speaker: true },
-            VerificationPair { score: 0.6, same_speaker: true },
-            VerificationPair { score: 0.4, same_speaker: false },
-            VerificationPair { score: 0.2, same_speaker: false },
+            VerificationPair {
+                score: 0.8,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.6,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.4,
+                same_speaker: false,
+            },
+            VerificationPair {
+                score: 0.2,
+                same_speaker: false,
+            },
         ];
         let pts = sweep_thresholds(&pairs, &[0.3, 0.5, 0.7]);
         // t=0.3: genuine both accept (tp 2, fn 0); impostor 0.4 accepted (fp 1), 0.2 rejected (tn 1).
@@ -950,8 +1008,14 @@ mod tests {
     #[test]
     fn sweep_edges_accept_all_and_reject_all() {
         let pairs = vec![
-            VerificationPair { score: 0.8, same_speaker: true },
-            VerificationPair { score: 0.3, same_speaker: false },
+            VerificationPair {
+                score: 0.8,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.3,
+                same_speaker: false,
+            },
         ];
         // threshold 0.0 accepts everything ⇒ far 1.0, frr 0.0.
         let lo = &sweep_thresholds(&pairs, &[0.0])[0];
@@ -966,34 +1030,79 @@ mod tests {
         // Overlapping (adversarial) distributions so FAR and FRR genuinely cross at a nonzero rate:
         // genuine {0.3,0.5,0.7}, impostor {0.4,0.6,0.8}. FAR==FRR==2/3 in the crossover band.
         let pairs = vec![
-            VerificationPair { score: 0.3, same_speaker: true },
-            VerificationPair { score: 0.5, same_speaker: true },
-            VerificationPair { score: 0.7, same_speaker: true },
-            VerificationPair { score: 0.4, same_speaker: false },
-            VerificationPair { score: 0.6, same_speaker: false },
-            VerificationPair { score: 0.8, same_speaker: false },
+            VerificationPair {
+                score: 0.3,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.5,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.7,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.4,
+                same_speaker: false,
+            },
+            VerificationPair {
+                score: 0.6,
+                same_speaker: false,
+            },
+            VerificationPair {
+                score: 0.8,
+                same_speaker: false,
+            },
         ];
         let (thr, err) = equal_error_rate(&pairs).expect("both genuine and impostor present");
-        assert!((err - 2.0 / 3.0).abs() < 1e-6, "EER error at the FAR/FRR crossover");
-        assert!((0.5..=0.62).contains(&thr), "crossover threshold band, got {thr}");
+        assert!(
+            (err - 2.0 / 3.0).abs() < 1e-6,
+            "EER error at the FAR/FRR crossover"
+        );
+        assert!(
+            (0.5..=0.62).contains(&thr),
+            "crossover threshold band, got {thr}"
+        );
         // No impostor ⇒ None; no genuine ⇒ None.
-        let genuine_only = vec![VerificationPair { score: 0.9, same_speaker: true }];
+        let genuine_only = vec![VerificationPair {
+            score: 0.9,
+            same_speaker: true,
+        }];
         assert!(equal_error_rate(&genuine_only).is_none());
-        let impostor_only = vec![VerificationPair { score: 0.1, same_speaker: false }];
+        let impostor_only = vec![VerificationPair {
+            score: 0.1,
+            same_speaker: false,
+        }];
         assert!(equal_error_rate(&impostor_only).is_none());
     }
 
     #[test]
     fn best_f1_picks_expected_point() {
         let pairs = vec![
-            VerificationPair { score: 0.8, same_speaker: true },
-            VerificationPair { score: 0.6, same_speaker: true },
-            VerificationPair { score: 0.4, same_speaker: false },
-            VerificationPair { score: 0.2, same_speaker: false },
+            VerificationPair {
+                score: 0.8,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.6,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.4,
+                same_speaker: false,
+            },
+            VerificationPair {
+                score: 0.2,
+                same_speaker: false,
+            },
         ];
         let pts = sweep_thresholds(&pairs, &[0.3, 0.5, 0.7]);
         let bf = best_f1(&pts).expect("non-empty");
-        assert!((bf.threshold - 0.5).abs() < 1e-6, "0.5 separates perfectly ⇒ F1 1.0");
+        assert!(
+            (bf.threshold - 0.5).abs() < 1e-6,
+            "0.5 separates perfectly ⇒ F1 1.0"
+        );
         assert!((bf.f1 - 1.0).abs() < 1e-9);
         assert!(best_f1(&[]).is_none());
     }
@@ -1002,7 +1111,10 @@ mod tests {
     fn default_threshold_grid_contains_050() {
         let grid = default_threshold_grid();
         assert_eq!(grid.len(), 51);
-        assert!(grid.contains(&0.5), "the 0.50 operating point must be on the grid");
+        assert!(
+            grid.contains(&0.5),
+            "the 0.50 operating point must be on the grid"
+        );
         assert!((grid[0] - 0.0).abs() < 1e-9);
         assert!((grid[50] - 1.0).abs() < 1e-9);
     }
@@ -1013,8 +1125,16 @@ mod tests {
     fn turns_from_spans_stringifies() {
         use crate::transcribe::diarize::SpeakerSpan;
         let spans = vec![
-            SpeakerSpan { start: 0.0, end: 2.0, speaker: 0 },
-            SpeakerSpan { start: 2.0, end: 5.0, speaker: 2 },
+            SpeakerSpan {
+                start: 0.0,
+                end: 2.0,
+                speaker: 0,
+            },
+            SpeakerSpan {
+                start: 2.0,
+                end: 5.0,
+                speaker: 2,
+            },
         ];
         let t = turns_from_spans(&spans, "others");
         assert_eq!(t[0].speaker, "others-0");
@@ -1029,13 +1149,26 @@ mod tests {
         let der = diarization_error_rate(&reference, &hypothesis, 0.0);
         let pc = cluster_purity_coverage(&reference, &hypothesis);
         let s = format_der_report(&der, &pc);
-        for needle in ["DER", "miss", "false alarm", "confusion", "purity", "coverage"] {
+        for needle in [
+            "DER",
+            "miss",
+            "false alarm",
+            "confusion",
+            "purity",
+            "coverage",
+        ] {
             assert!(s.contains(needle), "DER report missing '{needle}'");
         }
 
         let pairs = vec![
-            VerificationPair { score: 0.8, same_speaker: true },
-            VerificationPair { score: 0.2, same_speaker: false },
+            VerificationPair {
+                score: 0.8,
+                same_speaker: true,
+            },
+            VerificationPair {
+                score: 0.2,
+                same_speaker: false,
+            },
         ];
         let grid = default_threshold_grid();
         let points = sweep_thresholds(&pairs, &grid);
@@ -1088,7 +1221,8 @@ mod tests {
         use crate::audio::wav::{read_wav_mono, resample_to_16k};
         use crate::transcribe::diarize::Diarizer;
 
-        let wav = std::env::var("MURMUR_DER_WAV").expect("set MURMUR_DER_WAV to a system-stream WAV");
+        let wav =
+            std::env::var("MURMUR_DER_WAV").expect("set MURMUR_DER_WAV to a system-stream WAV");
         let ref_path =
             std::env::var("MURMUR_DER_REF").expect("set MURMUR_DER_REF to a reference JSON path");
         let seg = std::env::var("MURMUR_DIARIZE_SEG_MODEL")
@@ -1173,8 +1307,8 @@ mod tests {
             VOICEPRINT_MATCH_THRESHOLD,
         };
 
-        let manifest_path =
-            std::env::var("MURMUR_DER_MANIFEST").expect("set MURMUR_DER_MANIFEST to a manifest JSON");
+        let manifest_path = std::env::var("MURMUR_DER_MANIFEST")
+            .expect("set MURMUR_DER_MANIFEST to a manifest JSON");
         let seg = std::env::var("MURMUR_DIARIZE_SEG_MODEL").expect("set MURMUR_DIARIZE_SEG_MODEL");
         let emb = std::env::var("MURMUR_DIARIZE_EMB_MODEL").expect("set MURMUR_DIARIZE_EMB_MODEL");
         let manifest: Vec<ManifestEntry> = serde_json::from_str(
@@ -1182,7 +1316,8 @@ mod tests {
         )
         .expect("parse manifest json");
 
-        let labeled = gather_labeled_cluster_embeddings(&manifest, Path::new(&seg), Path::new(&emb));
+        let labeled =
+            gather_labeled_cluster_embeddings(&manifest, Path::new(&seg), Path::new(&emb));
         if labeled.len() < 2 {
             eprintln!("WARNING: fewer than 2 labeled clusters gathered — nothing to sweep");
             return;

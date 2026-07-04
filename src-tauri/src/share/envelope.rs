@@ -170,16 +170,31 @@ mod tests {
         // Trailing-space fence.
         let ts = "---  \ntitle: Board strategy\nparticipants:\n  - Alice Smith\n  - Bob Jones\n---\n# Body\n";
         let ts_clean = strip_frontmatter(ts);
-        assert!(!ts_clean.contains("participants"), "trailing-space fence must be stripped: {ts_clean:?}");
-        assert!(!ts_clean.contains("Alice Smith"), "attendee name must not leak: {ts_clean:?}");
-        assert!(!ts_clean.contains("Bob Jones"), "attendee name must not leak: {ts_clean:?}");
+        assert!(
+            !ts_clean.contains("participants"),
+            "trailing-space fence must be stripped: {ts_clean:?}"
+        );
+        assert!(
+            !ts_clean.contains("Alice Smith"),
+            "attendee name must not leak: {ts_clean:?}"
+        );
+        assert!(
+            !ts_clean.contains("Bob Jones"),
+            "attendee name must not leak: {ts_clean:?}"
+        );
         assert_eq!(ts_clean, "# Body\n");
 
         // CRLF fence (both open and close).
         let crlf = "---\r\ntitle: x\nattendees:\r\n  - Carol Danvers\r\n---\r\n# Notes\r\n";
         let crlf_clean = strip_frontmatter(crlf);
-        assert!(!crlf_clean.contains("attendees"), "CRLF fence must be stripped: {crlf_clean:?}");
-        assert!(!crlf_clean.contains("Carol Danvers"), "attendee name must not leak: {crlf_clean:?}");
+        assert!(
+            !crlf_clean.contains("attendees"),
+            "CRLF fence must be stripped: {crlf_clean:?}"
+        );
+        assert!(
+            !crlf_clean.contains("Carol Danvers"),
+            "attendee name must not leak: {crlf_clean:?}"
+        );
 
         // Full transform end-to-end: an attendee name under a trailing-space fence never survives.
         let clean = clean_note_body(ts);
@@ -192,14 +207,23 @@ mod tests {
     fn unterminated_frontmatter_fails_safe_and_leaks_nothing() {
         let md = "---\nattendees:\n  - Dana Scully\n(no closing fence, EOF)\n";
         let clean = strip_frontmatter(md);
-        assert!(!clean.contains("attendees"), "unterminated block must not leak: {clean:?}");
-        assert!(!clean.contains("Dana Scully"), "unterminated attendee must not leak: {clean:?}");
+        assert!(
+            !clean.contains("attendees"),
+            "unterminated block must not leak: {clean:?}"
+        );
+        assert!(
+            !clean.contains("Dana Scully"),
+            "unterminated attendee must not leak: {clean:?}"
+        );
         assert_eq!(clean, "");
     }
 
     #[test]
     fn flattens_plain_and_aliased_wikilinks() {
-        assert_eq!(flatten_wikilinks("see [[Alice Smith]] soon"), "see Alice Smith soon");
+        assert_eq!(
+            flatten_wikilinks("see [[Alice Smith]] soon"),
+            "see Alice Smith soon"
+        );
         assert_eq!(
             flatten_wikilinks("ping [[Project X|the project]] today"),
             "ping the project today"
@@ -222,7 +246,10 @@ mod tests {
     #[test]
     fn leaves_ordinary_brackets_and_text_alone() {
         // A single `[bracket]` (markdown link text) is not a wikilink.
-        assert_eq!(flatten_wikilinks("a [link](x) and text"), "a [link](x) and text");
+        assert_eq!(
+            flatten_wikilinks("a [link](x) and text"),
+            "a [link](x) and text"
+        );
         // An unterminated `[[` is copied verbatim (never panics, never eats the rest).
         assert_eq!(flatten_wikilinks("dangling [[oops"), "dangling [[oops");
     }
@@ -232,20 +259,45 @@ mod tests {
         // The `vault-titles-egress-leak` class, end to end: a note with frontmatter carrying other
         // people's names + a `[[Alice]]` wikilink + an obsidian:// ref → clean body with NONE of the
         // private vault structure.
-        let md = "---\nattendees:\n  - Alice Smith\n  - Bob Jones\naliases: [secret-project]\n---\n\
+        let md =
+            "---\nattendees:\n  - Alice Smith\n  - Bob Jones\naliases: [secret-project]\n---\n\
                   # Decisions\n\n- talked with [[Alice Smith]] about [[Project X|the roadmap]]\n\
                   - ref: obsidian://open?vault=Work&file=Roadmap\n";
         let clean = clean_note_body(md);
         // Frontmatter (attendees / aliases) is gone.
-        assert!(!clean.contains("attendees"), "frontmatter must be stripped: {clean:?}");
-        assert!(!clean.contains("aliases"), "frontmatter must be stripped: {clean:?}");
-        assert!(!clean.contains("Bob Jones"), "frontmatter attendee names must not leak: {clean:?}");
+        assert!(
+            !clean.contains("attendees"),
+            "frontmatter must be stripped: {clean:?}"
+        );
+        assert!(
+            !clean.contains("aliases"),
+            "frontmatter must be stripped: {clean:?}"
+        );
+        assert!(
+            !clean.contains("Bob Jones"),
+            "frontmatter attendee names must not leak: {clean:?}"
+        );
         // Wikilinks are flattened to their display text; the vault target markers are gone.
-        assert!(!clean.contains("[["), "wikilink markers must be flattened: {clean:?}");
-        assert!(clean.contains("Alice Smith"), "the visible display text is preserved: {clean:?}");
-        assert!(clean.contains("the roadmap"), "the alias is preserved: {clean:?}");
+        assert!(
+            !clean.contains("[["),
+            "wikilink markers must be flattened: {clean:?}"
+        );
+        assert!(
+            clean.contains("Alice Smith"),
+            "the visible display text is preserved: {clean:?}"
+        );
+        assert!(
+            clean.contains("the roadmap"),
+            "the alias is preserved: {clean:?}"
+        );
         // obsidian:// deep-links (which embed the vault name) are removed.
-        assert!(!clean.contains("obsidian://"), "obsidian:// refs must be stripped: {clean:?}");
-        assert!(!clean.contains("vault=Work"), "the vault name must not leak: {clean:?}");
+        assert!(
+            !clean.contains("obsidian://"),
+            "obsidian:// refs must be stripped: {clean:?}"
+        );
+        assert!(
+            !clean.contains("vault=Work"),
+            "the vault name must not leak: {clean:?}"
+        );
     }
 }
