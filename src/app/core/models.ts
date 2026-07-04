@@ -1199,3 +1199,43 @@ export interface MyShareEntry {
   revoked: boolean;
   downloadCount: number;
 }
+
+// ── M5-CLIENT: Murmur↔Murmur (mode B) ──
+
+/** Mirrors Rust `commands::RecipientPreview` — a read-only lookup of a recipient email. */
+export interface RecipientPreview {
+  /** The address is a registered Murmur account (else: suggest a protected link instead). */
+  registered: boolean;
+  /** The safety-word fingerprint of their current key (present iff registered). */
+  fingerprint: string | null;
+  /** First contact — show the fingerprint for out-of-band verification, then confirm to share. */
+  firstContact: boolean;
+  /** Their key CHANGED since you last shared — BLOCK + re-verify out of band (never click-through). */
+  keyChanged: boolean;
+}
+
+/** Mirrors Rust `commands::ShareToUserResult`. */
+export interface ShareToUserResult {
+  /** `"sent"` (registered → wrapped now) or `"invited"` (unregistered → pending invite). */
+  status: string;
+  /** The recipient's safety-word fingerprint (present for a registered recipient). */
+  fingerprint: string | null;
+}
+
+/** Mirrors Rust `commands::ShareInboxItem` — one incoming pending-accept share (content-free). */
+export interface ShareInboxItem {
+  shareId: string;
+  /** The sender's safety-word fingerprint (show for out-of-band verification on accept). */
+  senderFingerprint: string;
+  rev: number;
+  size: number;
+  createdAt: string;
+  /** Already accepted locally (idempotency) — render as done. */
+  alreadyAccepted: boolean;
+}
+
+/** Mirrors Rust `commands::AcceptedShare` — the new local meeting a share was accepted into. */
+export interface AcceptedShare {
+  meetingId: string;
+  title: string;
+}

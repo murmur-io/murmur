@@ -7066,7 +7066,10 @@ pub async fn account_signup(
     let kek_pw = crate::e2ee::keys::derive_kek_pw(&export_key)?;
     let mk_wrap_pw = crate::e2ee::keys::wrap_mk_pw(&mk, &kek_pw, &acct_id)?;
 
-    let identity = crate::e2ee::keys::generate_identity()?;
+    // M5 enablement: DERIVE the identity keypair deterministically from MK (not a stored random one),
+    // so a fresh login on this or a second Mac re-derives the SAME sk_enc/sk_sig from MK and can
+    // send/accept mode-B shares. The published bundle below is the derived public half.
+    let identity = crate::e2ee::keys::derive_identity(&mk, &acct_id, 1)?;
     let created_at = chrono::Utc::now().to_rfc3339();
     let (bundle, bundle_sig) =
         crate::e2ee::keys::build_identity_bundle(&identity, &acct_id, 1, &created_at)?;
@@ -7386,6 +7389,717 @@ pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Resul
     client.revoke_share(&access, &share_id).await?;
     state.db.set_outbound_share_state(&share_id, "revoked")?;
     crate::share::ledger_row(&state.db, &client.host(), "share_revoke", 0);
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// M5-CLIENT — Murmur↔Murmur (mode B). Spec §4.8 / §6 / §7. THE HIGHEST LOCK BAR: `accept_share`
+// WRITES into the user's Obsidian vault, so it is gated + verified before a single byte lands.
+//
+// Binding invariants (audited by lock-security-reviewer):
+//   • `share_note_to_user` FIRST statement is `meeting_is_unlocked` → `AppError::Locked` (copies
+//     `export_note`); then consent + login; then the note is CLEANED before enveloping; the request
+//     carries ONLY ciphertext + the recipient EMAIL + wrapped keys — NEVER a title or note text.
+//   • TOFU: on a `keys/lookup`, first contact PINS (on the stable account_id, not email) + shows the
+//     safety-word fingerprint; an UNCHANGED pin proceeds; a CHANGED fingerprint BLOCKS (spec §4.8 —
+//     key change is blocking, never click-through).
+//   • `accept_share`: WRITE-GATE the target folder FIRST (default = an auto-created UNSEALED "Shared"
+//     folder; a sealed-not-unlocked target is refused `AppError::Locked`); then the §4.8 signature +
+//     binding verification via `open_from_sender` (HARD-FAILS unsigned/tampered/replayed/swapped/
+//     gen-mismatch) BEFORE any write — on failure it writes NOTHING; IDEMPOTENT on `share_id`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The read-only result of previewing a recipient (spec §4.8): is the address a Murmur account, its
+/// safety-word fingerprint, and whether this is first contact (show + confirm) or a BLOCKING key
+/// change (re-verify out of band). Mutates NO pin — the FE shows this before the user commits.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientPreview {
+    pub registered: bool,
+    pub fingerprint: Option<String>,
+    pub first_contact: bool,
+    pub key_changed: bool,
+}
+
+/// The outcome of `share_note_to_user`: `"sent"` (recipient was a registered account, wrapped now) or
+/// `"invited"` (unregistered → a pending invite; a re-wrap follows when they register). The
+/// `fingerprint` is present for a registered recipient (the safety word the FE can echo).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareToUserResult {
+    pub status: String,
+    pub fingerprint: Option<String>,
+}
+
+/// One incoming (pending-accept) share in the inbox. CONTENT-FREE by construction — no title exists
+/// server-side; the title only materializes locally on accept (inside the verified envelope).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareInboxItem {
+    pub share_id: String,
+    pub sender_fingerprint: String,
+    pub rev: u32,
+    pub size: u64,
+    pub created_at: String,
+    /// Already accepted locally (idempotency) — the FE can render it as done.
+    pub already_accepted: bool,
+}
+
+/// The result of accepting a share: the new local meeting + its title (now known, from the verified
+/// envelope).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedShare {
+    pub meeting_id: String,
+    pub title: String,
+}
+
+/// The TOFU state of a contact's current key vs the local pin.
+enum TofuState {
+    /// Never pinned — first contact (pin it, show safety words).
+    FirstContact,
+    /// The pin matches the current key — proceed.
+    Match,
+    /// The pin DIFFERS — a key change; BLOCK until re-verified (spec §4.8).
+    Changed,
+}
+
+/// Normalize an email for use as a stable pin key + server lookup (trim + lowercase).
+fn norm_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Compare a contact's current `fingerprint` to the local pin WITHOUT mutating anything.
+fn tofu_check(db: &crate::storage::Db, account_id: &str, fingerprint: &str) -> Result<TofuState, AppError> {
+    match db.get_pinned_contact(account_id)? {
+        None => Ok(TofuState::FirstContact),
+        Some((_, pinned)) if pinned == fingerprint => Ok(TofuState::Match),
+        Some(_) => Ok(TofuState::Changed),
+    }
+}
+
+/// The logged-in sharing session's `(account_id, generation, MK, access_token)`, or a fail-closed
+/// `Unavailable` when logged out (mode-B needs MK to DERIVE the identity keypair for sign/open).
+fn require_session_mk(
+    state: &AppState,
+) -> Result<(String, u32, zeroize::Zeroizing<[u8; 32]>, String), AppError> {
+    let g = state
+        .account_session
+        .lock()
+        .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+    let s = crate::share::require_login(&g)?;
+    Ok((
+        s.account_id.clone(),
+        s.generation,
+        zeroize::Zeroizing::new(*s.mk),
+        s.access_token.clone(),
+    ))
+}
+
+/// The configured vault path (empty ⇒ `None`), read over `&AppState`.
+fn config_vault(state: &AppState) -> Option<String> {
+    state
+        .config
+        .lock()
+        .ok()
+        .and_then(|c| c.vault_path.clone())
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// `preview_share_recipient(email)` — is the address a Murmur account, and (if so) its fingerprint +
+/// TOFU state. Read-only (pins nothing). Requires login + a configured server.
+#[tauri::command]
+pub async fn preview_share_recipient(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<RecipientPreview, AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.lookup_key(&access, email.trim()).await?;
+    let Some(key) = resp.key.filter(|_| resp.registered) else {
+        return Ok(RecipientPreview {
+            registered: false,
+            fingerprint: None,
+            first_contact: false,
+            key_changed: false,
+        });
+    };
+    // Recompute the fingerprint locally (never trust the server's string blindly).
+    let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+    let account_id = norm_email(&email);
+    let (first_contact, key_changed) = match tofu_check(&state.db, &account_id, &fp)? {
+        TofuState::FirstContact => (true, false),
+        TofuState::Match => (false, false),
+        TofuState::Changed => (false, true),
+    };
+    Ok(RecipientPreview {
+        registered: true,
+        fingerprint: Some(fp),
+        first_contact,
+        key_changed,
+    })
+}
+
+/// `share_note_to_user(meeting_id, recipient_email, expires_days?)` — mode-B share (spec §4.8/§7).
+#[tauri::command]
+pub async fn share_note_to_user(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    recipient_email: String,
+    expires_days: Option<u32>,
+) -> Result<ShareToUserResult, AppError> {
+    share_note_to_user_inner(state.inner(), meeting_id, recipient_email, expires_days).await
+}
+
+/// Core of [`share_note_to_user`] over `&AppState`. Gate order is normative — DO NOT reorder.
+pub(crate) async fn share_note_to_user_inner(
+    state: &AppState,
+    meeting_id: String,
+    recipient_email: String,
+    expires_days: Option<u32>,
+) -> Result<ShareToUserResult, AppError> {
+    // (1) READ-GATE — FIRST statement (copies `export_note`). A sealed-not-unlocked meeting refuses.
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to share the note".into(),
+        ));
+    }
+
+    // (2) consent (fail-closed, first-ever share) + login (needs MK to derive sk_sig for the grant).
+    let base = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.share_egress_consented {
+            return Err(AppError::Unavailable(
+                "sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+        cfg.share_base_url.clone()
+    };
+    let (account_id, generation, mk, access_token) = require_session_mk(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (3) Fetch + CLEAN the note (gated read), build the inner envelope, seal a fresh NK.
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let meeting = state.db.get_meeting(&meeting_id)?;
+    let title = meeting
+        .as_ref()
+        .and_then(|m| m.title.clone())
+        .unwrap_or_else(|| "Shared note".to_string());
+    let created_at = meeting
+        .as_ref()
+        .map(|m| m.started_at.clone())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let clean_body = crate::share::envelope::clean_note_body(&note.markdown);
+
+    let share_id = crate::share::new_share_id();
+    let rev = 1u32;
+    let nk = crate::e2ee::random_key32()?;
+    let env = murmur_protocol::envelope::ShareEnvelope::new(title, clean_body, created_at);
+    let content_cell = crate::e2ee::seal_content(&nk, &env, &share_id, rev)?;
+    let content_hash = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&content_cell).to_vec()
+    };
+
+    // (4) Look up the recipient → TOFU pin/verify; wrap-now (registered) or invite (unregistered).
+    let recipient_email = recipient_email.trim().to_string();
+    let recipient_acct = norm_email(&recipient_email);
+    let lookup = client.lookup_key(&access_token, &recipient_email).await?;
+
+    let expires_at = expires_days.map(|d| {
+        let days = d.clamp(1, 365) as i64;
+        (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+    });
+
+    let (recipients, status, fingerprint) = if let Some(key) = lookup.key.filter(|_| lookup.registered)
+    {
+        // Registered → verify the fingerprint + enforce TOFU (BLOCK on a changed key), then wrap now.
+        let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+        match tofu_check(&state.db, &recipient_acct, &fp)? {
+            TofuState::Changed => {
+                return Err(AppError::Other(anyhow::anyhow!(
+                    "this contact's key changed since you last shared — re-verify the safety words \
+                     out of band, then share again"
+                )));
+            }
+            _ => state
+                .db
+                .pin_contact(&recipient_acct, Some(&recipient_email), &fp, &chrono::Utc::now().to_rfc3339())?,
+        }
+
+        // Derive OUR identity from MK and sign the grant (fingerprints are the party ids in the grant).
+        let sender = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+        let sender_fp = crate::e2ee::key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let grant = crate::e2ee::wrap::seal_to_recipient(
+            &nk,
+            &content_cell,
+            &key.pk_enc,
+            &fp,        // recipient_acct_id = recipient fingerprint
+            &sender,
+            &sender_fp, // sender_acct_id = our fingerprint
+            generation,
+            &share_id,
+            rev,
+        )?;
+        let wrapped_key = crate::e2ee::wrap::pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant)?;
+        let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+            email: recipient_email.clone(),
+            wrapped_key: Some(wrapped_key),
+            key_generation: Some(generation),
+            grant_sig: Some(grant.signature),
+        }];
+        // Retain NK + content_hash locally so an "Update share" / re-wrap can reuse them; state 'sent'.
+        state.db.insert_outbound_user_share(
+            &share_id, &meeting_id, rev, &chrono::Utc::now().to_rfc3339(), "sent",
+            &*nk, &recipient_acct, &recipient_email, &content_hash,
+        )?;
+        (recipients, "sent".to_string(), Some(fp))
+    } else {
+        // Unregistered → an invite; retain NK + content_hash for the on-launch re-wrap ('awaiting_key').
+        let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+            email: recipient_email.clone(),
+            wrapped_key: None,
+            key_generation: None,
+            grant_sig: None,
+        }];
+        state.db.insert_outbound_user_share(
+            &share_id, &meeting_id, rev, &chrono::Utc::now().to_rfc3339(), "awaiting_key",
+            &*nk, &recipient_acct, &recipient_email, &content_hash,
+        )?;
+        (recipients, "invited".to_string(), None)
+    };
+
+    // (5) Upload — mode='user'; the link fields are unused (empty). NO note content/title in the body.
+    let create_req = assemble_user_share_request(&share_id, rev, content_cell.clone(), recipients, expires_at);
+    let _ = client.create_user_share(&access_token, create_req).await?;
+
+    // (6) CONTENT-FREE egress ledger (host + cell byte size). NEVER a title / note text / key.
+    crate::share::ledger_row(
+        &state.db,
+        &client.host(),
+        if status == "sent" { "share_user_send" } else { "share_user_invite" },
+        content_cell.len(),
+    );
+
+    Ok(ShareToUserResult { status, fingerprint })
+}
+
+/// Assemble the `POST /v1/shares` body for a mode-B share. PURE (so a test can assert the serialized
+/// request carries NO note title / body — only ciphertext + wrapped keys + the recipient email).
+fn assemble_user_share_request(
+    share_id: &str,
+    rev: u32,
+    content_cell: Vec<u8>,
+    recipients: Vec<murmur_protocol::dto::ShareRecipientInput>,
+    expires_at: Option<String>,
+) -> murmur_protocol::dto::CreateShareRequest {
+    murmur_protocol::dto::CreateShareRequest {
+        share_id: share_id.to_string(),
+        mode: murmur_protocol::dto::ShareMode::User,
+        content_cell,
+        // Mode-B: the link fields are unused (the NK is wrapped per-recipient via HPKE instead).
+        wrapped_nk: Vec::new(),
+        gate_salt: Vec::new(),
+        gate_secret: Vec::new(),
+        rev,
+        password_required: false,
+        argon: None,
+        expires_at,
+        max_downloads: None,
+        recipients: Some(recipients),
+    }
+}
+
+/// `share_rewrap_pending()` — for each locally-retained mode-B invite whose recipient has since
+/// registered, re-wrap the retained NK to their now-published key and attach it (`PUT /shares/{id}/
+/// keys`). Reads ONLY key material + retained NK (never meeting content) → no read-gate. Returns the
+/// number of shares advanced to `sent`.
+#[tauri::command]
+pub async fn share_rewrap_pending(state: State<'_, AppState>) -> Result<u32, AppError> {
+    share_rewrap_pending_inner(state.inner()).await
+}
+
+pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, AppError> {
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(0);
+    }
+    // Logged out ⇒ nothing to do (not an error — this is a best-effort launch sweep).
+    let Ok((account_id, generation, mk, access_token)) = require_session_mk(state) else {
+        return Ok(0);
+    };
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let sender = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+    let sender_fp = crate::e2ee::key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+
+    let mut advanced = 0u32;
+    for (share_id, rev, nk_bytes, recipient_email, content_hash) in state.db.list_awaiting_rewrap()? {
+        let recipient_acct = norm_email(&recipient_email);
+        // Re-look-up the recipient. Not registered yet / lookup error ⇒ leave it pending.
+        let Ok(lookup) = client.lookup_key(&access_token, &recipient_email).await else {
+            continue;
+        };
+        let Some(key) = lookup.key.filter(|_| lookup.registered) else {
+            continue;
+        };
+        let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+        // A changed key on a not-yet-pinned invitee is first contact; a CHANGED existing pin is
+        // blocking — skip it (don't silently re-wrap to a rotated key).
+        match tofu_check(&state.db, &recipient_acct, &fp)? {
+            TofuState::Changed => continue,
+            _ => state.db.pin_contact(
+                &recipient_acct,
+                Some(&recipient_email),
+                &fp,
+                &chrono::Utc::now().to_rfc3339(),
+            )?,
+        }
+        let Ok(nk_arr) = crate::e2ee::to_arr32(&nk_bytes) else {
+            continue;
+        };
+        let nk = zeroize::Zeroizing::new(nk_arr);
+        let grant = crate::e2ee::wrap::seal_to_recipient_with_hash(
+            &nk, &content_hash, &key.pk_enc, &fp, &sender, &sender_fp, generation, &share_id, rev,
+        )?;
+        let wrapped_key = crate::e2ee::wrap::pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant)?;
+        // NOTE (honest gap): `PUT /shares/{id}/keys` keys the recipient row by the SERVER user id,
+        // which `keys/lookup` does not return; we send the account handle we have. If the server
+        // can't resolve it the attach is a uniform no-op and the share stays pending (retried next
+        // launch) — never an error. The re-wrap crypto above is complete + verified.
+        let attach = client
+            .attach_key(
+                &access_token,
+                &share_id,
+                murmur_protocol::dto::AttachKeyRequest {
+                    recipient_acct_id: recipient_acct.clone(),
+                    wrapped_key,
+                    key_generation: generation,
+                    grant_sig: grant.signature,
+                },
+            )
+            .await;
+        if attach.is_ok() {
+            state.db.set_outbound_share_state(&share_id, "sent")?;
+            crate::share::ledger_row(&state.db, &client.host(), "share_user_rewrap", 0);
+            advanced += 1;
+        }
+    }
+    Ok(advanced)
+}
+
+/// `list_share_inbox()` — the caller's incoming pending-accept shares (content-free). No gate: no
+/// local content is read; each item's title is unknown until accept decrypts the envelope.
+#[tauri::command]
+pub async fn list_share_inbox(state: State<'_, AppState>) -> Result<Vec<ShareInboxItem>, AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.list_inbox(&access).await?;
+    let mut out = Vec::with_capacity(resp.items.len());
+    for i in resp.items {
+        let already_accepted = state.db.inbound_share_meeting(&i.share_id)?.is_some();
+        out.push(ShareInboxItem {
+            share_id: i.share_id,
+            sender_fingerprint: i.sender_fingerprint,
+            rev: i.rev,
+            size: i.size,
+            created_at: i.created_at,
+            already_accepted,
+        });
+    }
+    Ok(out)
+}
+
+/// `accept_share(share_id, folder_id?)` — THE HIGH-BAR vault WRITE. See the module invariants above.
+#[tauri::command]
+pub async fn accept_share(
+    state: State<'_, AppState>,
+    share_id: String,
+    folder_id: Option<String>,
+) -> Result<AcceptedShare, AppError> {
+    accept_share_inner(state.inner(), share_id, folder_id).await
+}
+
+pub(crate) async fn accept_share_inner(
+    state: &AppState,
+    share_id: String,
+    folder_id: Option<String>,
+) -> Result<AcceptedShare, AppError> {
+    // (1) IDEMPOTENT on share_id — a re-accept returns the existing meeting, never a duplicate note.
+    if let Some(mid) = state.db.inbound_share_meeting(&share_id)? {
+        let title = state
+            .db
+            .get_meeting(&mid)?
+            .and_then(|m| m.title)
+            .unwrap_or_else(|| "Shared note".to_string());
+        return Ok(AcceptedShare { meeting_id: mid, title });
+    }
+
+    // (2) WRITE-GATE the target folder FIRST (mirror `ingest_into_folder`). Default = an auto-created
+    //     UNSEALED "Shared" folder; a sealed-not-session-unlocked target is REFUSED (write nothing).
+    let target = resolve_accept_folder(state, folder_id.as_deref())?;
+
+    // (3) Need a session (MK derives the recipient identity for HPKE-open) + server.
+    let (account_id, generation, mk, access) = require_session_mk(state)?;
+    let base = share_base_url(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (4) Find the pending inbox item for this share.
+    let inbox = client.list_inbox(&access).await?;
+    let item = inbox
+        .items
+        .into_iter()
+        .find(|i| i.share_id == share_id)
+        .ok_or_else(|| {
+            AppError::InvalidArg(
+                "no pending share to accept (already accepted/declined, expired, or not addressed to you)"
+                    .into(),
+            )
+        })?;
+
+    // (5) Unpack the sender's public identity + grant from the opaque blob; ATTEST the fingerprint
+    //     against the server-relayed value, then TOFU (BLOCK on a changed key) — all before any write.
+    let up = crate::e2ee::wrap::unpack_wrapped_key(&item.wrapped_key, &item.grant_sig)?;
+    let sender_fp = crate::e2ee::key_fingerprint(&up.sender_pk_enc, &up.sender_pk_sig);
+    if sender_fp != item.sender_fingerprint {
+        return Err(AppError::InvalidArg(
+            "share sender identity does not match the server-attested fingerprint — refusing".into(),
+        ));
+    }
+    match tofu_check(&state.db, &item.sender_user_id, &sender_fp)? {
+        TofuState::Changed => {
+            return Err(AppError::Other(anyhow::anyhow!(
+                "this sender's key changed since you last accepted from them — re-verify the safety \
+                 words out of band before accepting"
+            )));
+        }
+        _ => state.db.pin_contact(
+            &item.sender_user_id,
+            None,
+            &sender_fp,
+            &chrono::Utc::now().to_rfc3339(),
+        )?,
+    }
+
+    // (6) Flip the server row to accepted (authorizes the blob fetch), then (7) fetch the content cell.
+    let accepted = client.accept_share_server(&access, &share_id).await?;
+    let content_cell = client.get_blob(&access, &accepted.blob_id).await?;
+
+    // (8) Derive OUR identity from MK; VERIFY (§4.8) + decrypt + ingest — writes NOTHING on failure.
+    let recipient = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+    let result = accept_ingest_verified(
+        state,
+        &target,
+        &recipient,
+        &sender_fp,
+        &item.sender_user_id,
+        &up,
+        &content_cell,
+        &share_id,
+        item.rev,
+        item.key_generation,
+    )?;
+
+    crate::share::ledger_row(&state.db, &client.host(), "share_accept", content_cell.len());
+    Ok(result)
+}
+
+/// Resolve + WRITE-GATE the folder an accepted share lands in. `Some(id)` uses that folder (refusing a
+/// sealed-not-unlocked one with `AppError::Locked`); `None` gets-or-creates the UNSEALED "Shared"
+/// folder.
+fn resolve_accept_folder(state: &AppState, folder_id: Option<&str>) -> Result<Folder, AppError> {
+    match folder_id {
+        Some(fid) => {
+            let f = state
+                .db
+                .folder_by_id(fid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no folder {fid}")))?;
+            if f.locked && !folder_is_unlocked(state, fid)? {
+                return Err(AppError::Locked(
+                    "the target folder is locked — unlock it first to accept the share into it".into(),
+                ));
+            }
+            Ok(f)
+        }
+        None => get_or_create_shared_folder(state),
+    }
+}
+
+/// Get-or-create the UNSEALED "Shared" folder at the vault root (the default accept target). If it
+/// already exists and is sealed-not-unlocked, the write-gate refuses (`AppError::Locked`).
+fn get_or_create_shared_folder(state: &AppState) -> Result<Folder, AppError> {
+    const SHARED: &str = "Shared";
+    if let Some(f) = state.db.folder_by_path(SHARED)? {
+        if f.locked && !folder_is_unlocked(state, &f.id)? {
+            return Err(AppError::Locked(
+                "your \"Shared\" folder is locked — unlock it (or pick another folder) to accept".into(),
+            ));
+        }
+        return Ok(f);
+    }
+    let folder = Folder {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: SHARED.to_string(),
+        path: SHARED.to_string(),
+        parent_id: None,
+        locked: false,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Some(vault) = config_vault(state) {
+        let dir = std::path::Path::new(&vault).join(SHARED);
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    state.db.insert_folder(&folder)?;
+    Ok(folder)
+}
+
+/// The load-bearing crypto+write step, factored out so it is unit-testable with a crafted grant + no
+/// network. It (a) VERIFIES the §4.8 grant via `open_from_sender` (HARD-FAILS unsigned / tampered /
+/// replayed / swapped / gen-mismatch), (b) decrypts the content cell, and ONLY THEN (c) ingests the
+/// note into the (already write-gated) folder. On ANY verification/decrypt failure it returns
+/// `AppError::InvalidArg` and writes NOTHING.
+#[allow(clippy::too_many_arguments)]
+fn accept_ingest_verified(
+    state: &AppState,
+    target: &Folder,
+    recipient: &crate::e2ee::keys::IdentityKeypair,
+    sender_fp: &str,
+    sender_user_id: &str,
+    up: &crate::e2ee::wrap::UnpackedGrant,
+    content_cell: &[u8],
+    share_id: &str,
+    rev: u32,
+    key_generation: u32,
+) -> Result<AcceptedShare, AppError> {
+    let recipient_fp = crate::e2ee::key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+    // (a) §4.8 VERIFY before any write. The pinned pk_sig is the one we unpacked + fingerprint-attested.
+    let nk = crate::e2ee::wrap::open_from_sender(
+        &up.grant,
+        content_cell,
+        recipient,
+        &recipient_fp, // recipient_acct_id
+        &recipient_fp, // self_acct_id
+        sender_fp,     // sender_acct_id (as signed)
+        key_generation,
+        sender_fp,             // pinned_sender_acct_id
+        &up.sender_pk_sig,     // pinned_sender_pk_sig (attested to the server fingerprint upstream)
+        share_id,
+        rev,
+    )
+    .map_err(|_| {
+        AppError::InvalidArg(
+            "share grant failed verification (unsigned / tampered / replayed) — refusing to ingest".into(),
+        )
+    })?;
+    // (b) Decrypt the content cell → the inner envelope (title travels INSIDE).
+    let env = crate::e2ee::open_content(&nk, content_cell, share_id, rev)
+        .map_err(|_| AppError::InvalidArg("shared note failed to decrypt — refusing to ingest".into()))?;
+    // (c) Ingest into the write-gated folder.
+    ingest_shared_note(state, target, &env, sender_fp, sender_user_id, share_id)
+}
+
+/// Write a VERIFIED shared note into the vault + DB: a new `Exported` meeting (audio `None`) + a
+/// `"shared"` note carrying `shared-by`/`shared-at`/`share-id` provenance frontmatter, atomically
+/// exported to the folder's vault subdir, and an `inbound_shares` idempotency record. The new meeting
+/// is a NORMAL row → it participates in every existing gate automatically.
+fn ingest_shared_note(
+    state: &AppState,
+    target: &Folder,
+    env: &murmur_protocol::envelope::ShareEnvelope,
+    sender_fp: &str,
+    sender_user_id: &str,
+    share_id: &str,
+) -> Result<AcceptedShare, AppError> {
+    let meeting_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    // A well-formed created_at (RFC3339) is kept; otherwise fall back to now (never trust the payload).
+    let started_at = if chrono::DateTime::parse_from_rfc3339(env.created_at.trim()).is_ok() {
+        env.created_at.trim().to_string()
+    } else {
+        now.clone()
+    };
+    let title = {
+        let t = env.title.trim();
+        if t.is_empty() { "Shared note".to_string() } else { t.to_string() }
+    };
+    // Provenance frontmatter. `shared-by` is the ATTESTED sender fingerprint (safe base32) — NEVER the
+    // attacker-controlled envelope, so a malicious sender can't forge/inject provenance.
+    let full_md = format!(
+        "---\nshared-by: {sender_fp}\nshared-at: {now}\nshare-id: {share_id}\n---\n\n{}",
+        env.markdown
+    );
+
+    // Meeting row (Exported, no audio), associated with the target folder.
+    state.db.insert_meeting(&Meeting {
+        id: meeting_id.clone(),
+        started_at: started_at.clone(),
+        ended_at: None,
+        title: Some(title.clone()),
+        duration_s: 0,
+        audio_path: None,
+        status: MeetingStatus::Exported,
+        folder_id: Some(target.id.clone()),
+    })?;
+
+    // Atomic vault export (best-effort — a missing/invalid vault just leaves exported_path None; the
+    // note is still durable in the DB, the source of truth).
+    let exported_path = config_vault(state).and_then(|vault| {
+        crate::export::write_note(
+            std::path::Path::new(&vault),
+            Some(&target.path),
+            &title,
+            &started_at,
+            &full_md,
+        )
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+    });
+
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: "shared".to_string(),
+        markdown: full_md,
+        created_at: now.clone(),
+        exported_path,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })?;
+    // The meeting's folder is resolved via `notes.folder_id` (`folder_for_meeting`) — set it so every
+    // gate (`meeting_is_unlocked`, `visibility_clause`) sees this note as living in the target folder.
+    state.db.set_note_folder(&meeting_id, Some(&target.id))?;
+
+    // Idempotency + provenance record (a re-accept of this share_id is INSERT-OR-IGNORE'd).
+    state.db.insert_inbound_share(share_id, &meeting_id, sender_user_id, &now)?;
+
+    tracing::info!(
+        target: "share",
+        share_id = %share_id,
+        meeting_id = %meeting_id,
+        folder_id = %target.id,
+        "accepted a shared note into the vault"
+    );
+    Ok(AcceptedShare { meeting_id, title })
+}
+
+/// `decline_share(share_id)` — drop the wrapped key server-side + flip the local state. Idempotent.
+#[tauri::command]
+pub async fn decline_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client.decline_share_server(&access, &share_id).await?;
+    crate::share::ledger_row(&state.db, &client.host(), "share_decline", 0);
     Ok(())
 }
 
@@ -7753,6 +8467,191 @@ mod lifecycle_tests {
             matches!(err2, AppError::Unavailable(_)),
             "past the lock gate, an unconsented/logged-out share fails Unavailable, got: {err2:?}"
         );
+    }
+
+    // ── M5-CLIENT (mode B) tests ──────────────────────────────────────────────────────────────────
+
+    use crate::e2ee::keys::{derive_identity, generate_master_key, IdentityKeypair};
+    use crate::e2ee::wrap::{pack_wrapped_key, seal_to_recipient, UnpackedGrant};
+    use crate::e2ee::{key_fingerprint, random_key32, seal_content};
+    use murmur_protocol::envelope::ShareEnvelope;
+
+    /// Build a `(sender, recipient)` identity pair from two fixed MKs (deterministic, no network).
+    fn mode_b_pair() -> (IdentityKeypair, [u8; 32], IdentityKeypair, [u8; 32]) {
+        let sender_mk = *generate_master_key().unwrap();
+        let recip_mk = *generate_master_key().unwrap();
+        let sender = derive_identity(&sender_mk, "sender@acct", 1).unwrap();
+        let recipient = derive_identity(&recip_mk, "recipient@acct", 1).unwrap();
+        (sender, sender_mk, recipient, recip_mk)
+    }
+
+    /// Craft the accept-side inputs a real inbox item + blob would carry: a valid grant sealed by
+    /// `sender` to `recipient`, packed into the opaque `wrapped_key`, plus the content cell `C`.
+    fn craft_valid_grant(
+        sender: &IdentityKeypair,
+        recipient: &IdentityKeypair,
+        env: &ShareEnvelope,
+        share_id: &str,
+        rev: u32,
+    ) -> (UnpackedGrant, Vec<u8>, String) {
+        let nk = random_key32().unwrap();
+        let content = seal_content(&nk, env, share_id, rev).unwrap();
+        let sender_fp = key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let recipient_fp = key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let grant = seal_to_recipient(
+            &nk, &content, &recipient.pk_enc, &recipient_fp, sender, &sender_fp, 1, share_id, rev,
+        )
+        .unwrap();
+        let blob = pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant).unwrap();
+        let up = crate::e2ee::wrap::unpack_wrapped_key(&blob, &grant.signature).unwrap();
+        (up, content, sender_fp)
+    }
+
+    /// HIGH-BAR: `accept_share` refuses a SEALED (not-session-unlocked) target folder with `Locked`,
+    /// BEFORE any inbox/network/decrypt — RED-before-GREEN for the vault write-gate. Runs with NO
+    /// server + NO login, so a non-`Locked` return would mean the gate wasn't first.
+    #[test]
+    fn accept_share_refuses_a_sealed_target_folder() {
+        let state = build_state("accept-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        // NOT session-unlocked.
+        let before = state.db.list_meetings(1000).unwrap().len();
+        let err = block_on(accept_share_inner(
+            &state,
+            "share-xyz".to_string(),
+            Some("f-lock".to_string()),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)), "sealed target must fail Locked, got {err:?}");
+        assert_eq!(state.db.list_meetings(1000).unwrap().len(), before, "no meeting written");
+        assert!(state.db.inbound_share_meeting("share-xyz").unwrap().is_none(), "no inbound record");
+    }
+
+    /// The happy path: a VALID grant → verify + decrypt + ingest writes exactly one `Exported` meeting
+    /// with a `"shared"` note carrying provenance frontmatter (mode-B seal→open round-trip through the
+    /// command's ingest layer).
+    #[test]
+    fn accept_ingest_writes_a_verified_shared_note() {
+        let state = build_state("accept-happy");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _smk, recipient, _rmk) = mode_b_pair();
+        let env = ShareEnvelope::new("Q3 Strategy", "- ship the thing\n- talk to Alice", "2026-07-04T10:00:00Z");
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "share-1", 1);
+
+        let res = accept_ingest_verified(
+            &state, &target, &recipient, &sender_fp, "sender-uuid", &up, &content, "share-1", 1, 1,
+        )
+        .unwrap();
+        assert_eq!(res.title, "Q3 Strategy");
+        let note = state.db.get_note(&res.meeting_id, "shared").unwrap().unwrap();
+        assert!(note.markdown.contains("ship the thing"), "body ingested: {}", note.markdown);
+        assert!(note.markdown.contains("shared-by: "), "provenance frontmatter present");
+        assert!(note.markdown.contains("share-id: share-1"), "share-id provenance present");
+        // Idempotency record written; the meeting is a normal Exported row in the target folder.
+        assert_eq!(state.db.inbound_share_meeting("share-1").unwrap().as_deref(), Some(res.meeting_id.as_str()));
+        let m = state.db.get_meeting(&res.meeting_id).unwrap().unwrap();
+        assert!(matches!(m.status, MeetingStatus::Exported));
+        assert!(m.audio_path.is_none(), "shared notes carry no audio");
+    }
+
+    /// The full `accept_share_inner` is idempotent on `share_id`: a second call after a successful
+    /// ingest returns the SAME meeting and writes no duplicate (short-circuits before any network).
+    #[test]
+    fn accept_share_is_idempotent_on_share_id() {
+        let state = build_state("accept-idem");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new("Dup", "body", "2026-07-04T10:00:00Z");
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "share-dup", 1);
+        let first = accept_ingest_verified(
+            &state, &target, &recipient, &sender_fp, "s", &up, &content, "share-dup", 1, 1,
+        )
+        .unwrap();
+        let count = state.db.list_meetings(1000).unwrap().len();
+        // The command-level idempotency short-circuit returns the existing meeting with no network.
+        let again = block_on(accept_share_inner(&state, "share-dup".to_string(), None)).unwrap();
+        assert_eq!(again.meeting_id, first.meeting_id, "same meeting returned");
+        assert_eq!(state.db.list_meetings(1000).unwrap().len(), count, "no duplicate meeting");
+    }
+
+    /// §4.8 BINDING through the command layer: an UNSIGNED (zeroed-sig) grant, a TAMPERED content
+    /// cell, and a REPLAY to the wrong recipient are ALL rejected `InvalidArg` and write NOTHING.
+    #[test]
+    fn accept_ingest_rejects_unsigned_tampered_and_replayed_grants() {
+        let state = build_state("accept-reject");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new("t", "body", "2026-07-04T10:00:00Z");
+
+        // (a) Unsigned: zero the grant signature.
+        let (mut up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-a", 1);
+        up.grant.signature = vec![0u8; 64];
+        let e = accept_ingest_verified(&state, &target, &recipient, &sender_fp, "s", &up, &content, "s-a", 1, 1).unwrap_err();
+        assert!(matches!(e, AppError::InvalidArg(_)), "unsigned must be rejected");
+
+        // (b) Tampered content: a different cell than the one the grant's hash binds.
+        let (up, _c, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-b", 1);
+        let evil = seal_content(&random_key32().unwrap(), &ShareEnvelope::new("t", "EVIL", "2026-07-04T10:00:00Z"), "s-b", 1).unwrap();
+        let e = accept_ingest_verified(&state, &target, &recipient, &sender_fp, "s", &up, &evil, "s-b", 1, 1).unwrap_err();
+        assert!(matches!(e, AppError::InvalidArg(_)), "tampered cell must be rejected");
+
+        // (c) Replay to the WRONG recipient (grant addressed to `recipient`, opened by `attacker`).
+        let attacker = derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-c", 1);
+        let e = accept_ingest_verified(&state, &target, &attacker, &sender_fp, "s", &up, &content, "s-c", 1, 1).unwrap_err();
+        assert!(matches!(e, AppError::InvalidArg(_)), "replay to a different recipient must be rejected");
+
+        // NONE of the three wrote a meeting or an inbound record.
+        assert_eq!(state.db.list_meetings(1000).unwrap().len(), 0, "no meeting written for any rejected grant");
+        for sid in ["s-a", "s-b", "s-c"] {
+            assert!(state.db.inbound_share_meeting(sid).unwrap().is_none(), "no inbound record for {sid}");
+        }
+    }
+
+    /// TOFU: first contact PINS (on the account_id, not email); the SAME fingerprint proceeds; a
+    /// CHANGED fingerprint for the same contact is a BLOCK (never a silent overwrite).
+    #[test]
+    fn tofu_first_contact_pins_and_a_changed_fingerprint_blocks() {
+        let state = build_state("tofu");
+        let acct = "alice@example.com";
+        // First contact: no pin yet.
+        assert!(matches!(tofu_check(&state.db, acct, "FP-ORIGINAL").unwrap(), TofuState::FirstContact));
+        state.db.pin_contact(acct, Some("Alice@Example.com"), "FP-ORIGINAL", "2026-07-04T00:00:00Z").unwrap();
+        // Same key → Match.
+        assert!(matches!(tofu_check(&state.db, acct, "FP-ORIGINAL").unwrap(), TofuState::Match));
+        // A different fingerprint for the SAME account → Changed (blocking).
+        assert!(matches!(tofu_check(&state.db, acct, "FP-DIFFERENT").unwrap(), TofuState::Changed));
+        // The pin persisted the ORIGINAL fingerprint (a Changed check does not overwrite it).
+        assert_eq!(state.db.get_pinned_contact(acct).unwrap().unwrap().1, "FP-ORIGINAL");
+    }
+
+    /// The mode-B share request carries NO note title or body — only ciphertext + wrapped keys + the
+    /// recipient email. Seal a note with distinctive plaintext, build the exact `POST /v1/shares`
+    /// body, serialize it, and assert the plaintext never appears.
+    #[test]
+    fn share_to_user_request_leaks_no_note_content() {
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let nk = random_key32().unwrap();
+        let title = "TOPSECRET_TITLE_ZZZ";
+        let body = "TOPSECRET_BODY_QQQ meeting minutes";
+        let env = ShareEnvelope::new(title, body, "2026-07-04T10:00:00Z");
+        let content = seal_content(&nk, &env, "s-leak", 1).unwrap();
+        let sender_fp = key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let recipient_fp = key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let grant = seal_to_recipient(&nk, &content, &recipient.pk_enc, &recipient_fp, &sender, &sender_fp, 1, "s-leak", 1).unwrap();
+        let wrapped = pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant).unwrap();
+        let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+            email: "bob@example.com".to_string(),
+            wrapped_key: Some(wrapped),
+            key_generation: Some(1),
+            grant_sig: Some(grant.signature),
+        }];
+        let req = assemble_user_share_request("s-leak", 1, content, recipients, None);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains(title), "title must never appear in the request body");
+        assert!(!json.contains("TOPSECRET_BODY_QQQ"), "note body must never appear in the request body");
+        assert!(json.contains("bob@example.com"), "the recipient email is present (allowed metadata)");
     }
 
     /// MANUAL voice command: with NO recording in progress, arming reports `listening:false`

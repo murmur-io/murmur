@@ -12,10 +12,10 @@
 
 use crate::error::{AppError, Result};
 use murmur_protocol::dto::{
-    CreateShareRequest, CreateShareResponse, LoginFinishRequest, LoginFinishResponse,
-    LoginStartRequest, LoginStartResponse, ProvisionFinishRequest, ProvisionFinishResponse,
-    ProvisionRequest, ProvisionResponse, SharesResponse, SignupRequest, VerifyEmailRequest,
-    VerifyEmailResponse,
+    AcceptShareResponse, AttachKeyRequest, CreateShareRequest, CreateShareResponse, InboxResponse,
+    KeyLookupRequest, KeyLookupResponse, LoginFinishRequest, LoginFinishResponse, LoginStartRequest,
+    LoginStartResponse, ProvisionFinishRequest, ProvisionFinishResponse, ProvisionRequest,
+    ProvisionResponse, SharesResponse, SignupRequest, VerifyEmailRequest, VerifyEmailResponse,
 };
 use reqwest::StatusCode;
 
@@ -276,6 +276,130 @@ impl ShareClient {
         } else {
             Err(Self::status_err("revoke-share", resp.status()))
         }
+    }
+
+    // ─────────────────────── M5: Murmur↔Murmur (mode B) ───────────────────────
+
+    /// `POST /v1/keys/lookup {email}` (bearer, 20/day, audited) — is the address a registered account,
+    /// and if so its current identity key + safety-word fingerprint (spec §13/§6). The request carries
+    /// ONLY the recipient's email (never any note content).
+    pub async fn lookup_key(&self, access_token: &str, email: &str) -> Result<KeyLookupResponse> {
+        self.post_json(
+            "/v1/keys/lookup",
+            Some(access_token),
+            &KeyLookupRequest {
+                email: email.to_string(),
+            },
+            "keys-lookup",
+        )
+        .await
+    }
+
+    /// `POST /v1/shares` for mode='user' (bearer). Same endpoint as a link share; the request carries
+    /// the sealed content cell + per-recipient wrapped keys (opaque). Returns `{shareId, ...}`.
+    pub async fn create_user_share(
+        &self,
+        access_token: &str,
+        req: CreateShareRequest,
+    ) -> Result<CreateShareResponse> {
+        self.post_json("/v1/shares", Some(access_token), &req, "create-user-share")
+            .await
+    }
+
+    /// `PUT /v1/shares/{id}/keys` (bearer, owner) — attach a re-wrapped key after an invitee
+    /// registered (`awaiting_key`) or a key rotated (`stale_key`). Opaque bytes; server never verifies.
+    pub async fn attach_key(
+        &self,
+        access_token: &str,
+        share_id: &str,
+        req: AttachKeyRequest,
+    ) -> Result<()> {
+        if share_id.contains('/') || share_id.contains('?') {
+            return Err(AppError::InvalidArg("invalid share id".into()));
+        }
+        let url = self.url(&format!("/v1/shares/{share_id}/keys"))?;
+        let resp = self
+            .http
+            .put(url)
+            .bearer_auth(access_token)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|_| AppError::Unavailable("attach-key: could not reach the server".into()))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::status_err("attach-key", resp.status()))
+        }
+    }
+
+    /// `GET /v1/inbox` (bearer) — the caller's incoming `pending_accept` shares (content-free).
+    pub async fn list_inbox(&self, access_token: &str) -> Result<InboxResponse> {
+        self.get_json("/v1/inbox", access_token, "inbox").await
+    }
+
+    /// `POST /v1/shares/{id}/accept` (bearer, recipient) — flip the recipient row to `accepted` and
+    /// return the content blob id the recipient is now authorized to GET.
+    pub async fn accept_share_server(
+        &self,
+        access_token: &str,
+        share_id: &str,
+    ) -> Result<AcceptShareResponse> {
+        if share_id.contains('/') || share_id.contains('?') {
+            return Err(AppError::InvalidArg("invalid share id".into()));
+        }
+        self.post_json(
+            &format!("/v1/shares/{share_id}/accept"),
+            Some(access_token),
+            &serde_json::json!({}),
+            "accept-share",
+        )
+        .await
+    }
+
+    /// `POST /v1/shares/{id}/decline` (bearer, recipient) — drop the wrapped key server-side. 204.
+    pub async fn decline_share_server(&self, access_token: &str, share_id: &str) -> Result<()> {
+        if share_id.contains('/') || share_id.contains('?') {
+            return Err(AppError::InvalidArg("invalid share id".into()));
+        }
+        let url = self.url(&format!("/v1/shares/{share_id}/decline"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| AppError::Unavailable("decline-share: could not reach the server".into()))?;
+        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(Self::status_err("decline-share", resp.status()))
+        }
+    }
+
+    /// `GET /v1/blobs/{id}` (bearer) — fetch the raw ciphertext content cell `C` (octet-stream). The
+    /// server authorizes by recipiency (only after `accept` flips the row to `accepted`).
+    pub async fn get_blob(&self, access_token: &str, blob_id: &str) -> Result<Vec<u8>> {
+        if blob_id.contains('/') || blob_id.contains('?') {
+            return Err(AppError::InvalidArg("invalid blob id".into()));
+        }
+        let url = self.url(&format!("/v1/blobs/{blob_id}"))?;
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| AppError::Unavailable("get-blob: could not reach the server".into()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Self::status_err("get-blob", status));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|_| AppError::Unavailable("get-blob: malformed server response".into()))?;
+        Ok(bytes.to_vec())
     }
 }
 

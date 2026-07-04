@@ -593,6 +593,39 @@ impl Db {
         )
         .map_err(map_err)?;
 
+        // M5-CLIENT (spec §4.8/§7) — Murmur↔Murmur (mode B) local bookkeeping.
+        //
+        // `pinned_contacts` = TOFU key pins. Keyed on a STABLE `account_id` (NOT email, so a future
+        // email change doesn't strand the pin — spec §4.8) with the safety-word `fingerprint` as the
+        // pinned VALUE, so a CHANGED fingerprint for a known contact is detectable → BLOCKING re-verify
+        // (never click-through). Carries no key bytes, no note content.
+        //
+        // `inbound_shares` = the idempotency + provenance record for an ACCEPTED share (share_id →
+        // local meeting_id). A re-accept of the same share_id is a no-op (never a duplicate vault note).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pinned_contacts (
+               account_id  TEXT PRIMARY KEY,
+               email       TEXT,
+               fingerprint TEXT NOT NULL,
+               pinned_at   TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS inbound_shares (
+               share_id       TEXT PRIMARY KEY,
+               meeting_id     TEXT NOT NULL,
+               sender_acct_id TEXT,
+               accepted_at    TEXT NOT NULL
+             );",
+        )
+        .map_err(map_err)?;
+        // Additive columns on `outbound_shares` for mode B (spec §7 schema: `nk BLOB`,
+        // `recipient_acct_id?`). The retained `nk` + `content_hash` let `share_rewrap_pending` re-wrap
+        // to a newly-registered recipient WITHOUT re-reading meeting content (only key material). Both
+        // are protected at rest by the whole-DB SQLCipher DEK. Guarded so migrate() stays idempotent.
+        Self::add_column_if_missing(&conn, "outbound_shares", "nk", "BLOB")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "recipient_acct_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "recipient_email", "TEXT")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "content_hash", "BLOB")?;
+
         Ok(())
     }
 
@@ -1009,6 +1042,137 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    // ── M5-CLIENT: TOFU pins, mode-B outbound bookkeeping, inbound accept idempotency (spec §4.8/§7) ──
+
+    /// TOFU-pin a contact's identity fingerprint under a STABLE `account_id` (spec §4.8: pin on
+    /// account_id, not email). Idempotent upsert — the CALLER decides whether to pin (first contact) or
+    /// BLOCK (an existing pin with a different fingerprint), never a silent overwrite of a changed key.
+    pub fn pin_contact(
+        &self,
+        account_id: &str,
+        email: Option<&str>,
+        fingerprint: &str,
+        pinned_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO pinned_contacts (account_id, email, fingerprint, pinned_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET
+               email = excluded.email, fingerprint = excluded.fingerprint, pinned_at = excluded.pinned_at",
+            rusqlite::params![account_id, email, fingerprint, pinned_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The pinned `(email, fingerprint)` for a contact `account_id`, or `None` if never pinned
+    /// (first contact). The safety-word compare + the blocking key-change detection read this.
+    pub fn get_pinned_contact(&self, account_id: &str) -> Result<Option<(Option<String>, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT email, fingerprint FROM pinned_contacts WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Record a mode-B OUTBOUND share. Stores the retained note key `nk` + the `content_hash`
+    /// (SHA-256 of the sealed cell) so a later `share_rewrap_pending` can re-wrap to a newly-registered
+    /// recipient WITHOUT re-reading meeting content — plus `share_id`+`meeting_id` for the gated title
+    /// derivation (NO title column, spec §7). `state` = `'sent'` (registered) or `'awaiting_key'`
+    /// (invited/unregistered). `nk`/`content_hash` are at-rest-protected by the whole-DB SQLCipher DEK.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_outbound_user_share(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        rev: u32,
+        created_at: &str,
+        state: &str,
+        nk: &[u8],
+        recipient_acct_id: &str,
+        recipient_email: &str,
+        content_hash: &[u8],
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO outbound_shares
+               (share_id, meeting_id, mode, rev, state, created_at,
+                nk, recipient_acct_id, recipient_email, content_hash)
+             VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                share_id, meeting_id, rev as i64, state, created_at,
+                nk, recipient_acct_id, recipient_email, content_hash
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Every mode-B outbound share still `'awaiting_key'` (the recipient was unregistered at share
+    /// time). Returns `(share_id, rev, nk, recipient_email, content_hash)` for the on-launch re-wrap.
+    #[allow(clippy::type_complexity)]
+    pub fn list_awaiting_rewrap(&self) -> Result<Vec<(String, u32, Vec<u8>, String, Vec<u8>)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT share_id, rev, nk, recipient_email, content_hash
+                 FROM outbound_shares
+                 WHERE mode = 'user' AND state = 'awaiting_key'
+                   AND nk IS NOT NULL AND recipient_email IS NOT NULL AND content_hash IS NOT NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(map_err)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Record an ACCEPTED inbound share (idempotency + provenance). A duplicate `share_id` is ignored
+    /// (INSERT OR IGNORE) so a re-accept never writes a second vault note.
+    pub fn insert_inbound_share(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        sender_acct_id: &str,
+        accepted_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO inbound_shares (share_id, meeting_id, sender_acct_id, accepted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![share_id, meeting_id, sender_acct_id, accepted_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The local `meeting_id` a share was already accepted into, or `None` if never accepted. Drives
+    /// the `accept_share` idempotency check (spec §7 inv. 2: idempotent on `share_id`).
+    pub fn inbound_share_meeting(&self, share_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT meeting_id FROM inbound_shares WHERE share_id = ?1",
+            rusqlite::params![share_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
     }
 
     /// Aggregate the `egress_log` table over the last `days` calendar days and return a rich
