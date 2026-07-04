@@ -33,6 +33,17 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-04] Apple TV shell prototype — 2 findings the build/lint missed
+- **Pattern 1:** an `(keydown.escape)` bound on an overlay's scrim/panel only fires while focus
+  sits INSIDE that subtree — click any non-focusable text and focus falls to `<body>`, Esc goes
+  dead. A modal's Esc-to-close belongs on the shell's `(document:keydown)` host listener.
+- **Pattern 2:** a host class derived from a persisted mode (`[class.pill-mode]="pillMode()"`)
+  leaks its layout side-effects onto routes that hide the chrome — gate the binding on the same
+  route condition that hides the chrome (`pillMode() && !inDrilldown()`), not on the raw pref.
+- **Caught by:** adversarial-verifier live Playwright pass (RED observed pre-fix, GREEN post-fix);
+  `ng build`/`ng lint` were green the whole time.
+- **Status:** journaled
+
 ### [2026-07-02 seed] Distilled from angular-zoneless.md traps T1–T4
 - **Pattern:** the four Murmur-specific FE traps + the signals/IPC/template hard rules.
 - **Caught by:** operator (seeding the loop).
