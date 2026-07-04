@@ -50,6 +50,7 @@ import type {
   StartResult,
   StatusPayload,
   EchoSuppressedPayload,
+  RecordingCappedPayload,
   StopResult,
   TopicThread,
   VoiceActionResultPayload,
@@ -92,6 +93,8 @@ export const EVENT_REINDEX = "murmur://reindex-embeddings";
 export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 // Recording-storage: an AUTO-prune freed ≥1 old recording's audio to stay under the cap.
 export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
+// Recording hit the 4h hard TIME cap and self-stopped (distinct from the byte-based prune).
+export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -1055,6 +1058,19 @@ export class IpcService {
     return listen<{ freedBytes: number; prunedCount: number }>(
       EVENT_STORAGE_PRUNED,
       (e) => cb(e.payload),
+    );
+  }
+
+  /**
+   * Fires ONCE per recording when the 4h hard TIME cap (`MAX_RECORDING_SECONDS`)
+   * is reached and the capture self-stops. The FE surfaces a notice and finalizes
+   * the meeting via `stop_recording`. Length only, no PII.
+   */
+  onRecordingCapped(
+    cb: (p: RecordingCappedPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<RecordingCappedPayload>(EVENT_RECORDING_CAPPED, (e) =>
+      cb(e.payload),
     );
   }
 

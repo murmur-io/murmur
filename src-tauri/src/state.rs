@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::audio::listener::VoiceListener;
@@ -129,6 +130,12 @@ pub struct AppState {
     /// view of "what's being said right now" — the in-meeting assistant injects it so it can answer
     /// questions about the current meeting. Cleared at each recording start; bounded in size.
     pub live_transcript: Mutex<String>,
+    /// RISING-EDGE dedup for the 4h [`crate::audio::recorder::MAX_RECORDING_SECONDS`] cap notice.
+    /// The status poll (`recording_level`) checks `Recorder::cap_reached()` on every tick; this flag
+    /// makes the resulting [`crate::events::EVENT_RECORDING_CAPPED`] fire EXACTLY ONCE per recording.
+    /// Reset to `false` at each `start_recording`; latched `true` the first tick the cap is reached.
+    /// Distinct from the byte/size storage cap — this is the wall-clock TIME cap.
+    pub capped_notified: AtomicBool,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
     /// thread shares the SAME set as the command surface.
@@ -216,6 +223,7 @@ impl AppState {
             reasoner,
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            capped_notified: AtomicBool::new(false),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),
