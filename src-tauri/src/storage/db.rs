@@ -563,6 +563,36 @@ impl Db {
             )
             .map_err(map_err)?;
         }
+
+        // M3-CLIENT (spec §7) — local bookkeeping for OUTBOUND server shares. Stores ONLY the
+        // client-minted `share_id` + the local `meeting_id` (+ mode/rev/state/ts). There is
+        // DELIBERATELY NO title column: the share list derives the title via the GATED meeting read
+        // (`meeting_is_unlocked`), so a sealed meeting's title can never leak from this table. It
+        // never holds the link key `L`, `NK`, ciphertext, or any note text — those live server-side
+        // (encrypted) and in the URL fragment (which is never persisted here). Additive + guarded so
+        // migrate() stays idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS outbound_shares (
+               share_id   TEXT PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               mode       TEXT NOT NULL,
+               rev        INTEGER NOT NULL DEFAULT 1,
+               state      TEXT NOT NULL DEFAULT 'active',
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_outbound_shares_meeting ON outbound_shares(meeting_id);
+             -- Content-free egress ledger for SHARE uploads (§7 inv. 4): host + byte sizes only.
+             -- NEVER the share URL, the fragment key L, a title, or any note text.
+             CREATE TABLE IF NOT EXISTS share_egress_log (
+               id         INTEGER PRIMARY KEY AUTOINCREMENT,
+               ts         INTEGER NOT NULL,
+               host       TEXT NOT NULL,
+               kind       TEXT NOT NULL,
+               byte_count INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(map_err)?;
+
         Ok(())
     }
 
@@ -910,6 +940,72 @@ impl Db {
                 e.user_bytes as i64,
                 e.meeting_id.as_deref(),
             ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    // ── M3-CLIENT: outbound server-share bookkeeping + share egress ledger (spec §7) ─────────────
+
+    /// Record a newly-created OUTBOUND link share. Stores ONLY `share_id` + `meeting_id` (+
+    /// mode/rev/state/ts) — NO title (derived via the gated meeting read), no `L`, no ciphertext.
+    pub fn insert_outbound_share(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        mode: &str,
+        rev: u32,
+        created_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO outbound_shares (share_id, meeting_id, mode, rev, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+            rusqlite::params![share_id, meeting_id, mode, rev as i64, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The local `meeting_id` for an outbound share (so the share list can gate on the meeting's lock
+    /// state before revealing its title). `None` if we never created this share locally.
+    pub fn outbound_share_meeting(&self, share_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT meeting_id FROM outbound_shares WHERE share_id = ?1",
+            rusqlite::params![share_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Flip an outbound share's local state (e.g. `'revoked'`). Idempotent; a no-op if the share_id
+    /// is unknown locally (a share created on another device).
+    pub fn set_outbound_share_state(&self, share_id: &str, state: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE outbound_shares SET state = ?2 WHERE share_id = ?1",
+            rusqlite::params![share_id, state],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Append one CONTENT-FREE share-egress ledger row (§7 inv. 4): host + byte size + a `kind` label
+    /// (`"share_create"` / `"share_revoke"` / `"account_login"` …). NEVER the URL, `L`, a title, or
+    /// any note text. `ts` is a Unix epoch (seconds).
+    pub fn insert_share_egress(
+        &self,
+        ts: i64,
+        host: &str,
+        kind: &str,
+        byte_count: usize,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO share_egress_log (ts, host, kind, byte_count) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![ts, host, kind, byte_count as i64],
         )
         .map_err(map_err)?;
         Ok(())

@@ -137,6 +137,13 @@ pub struct AppState {
     /// `Zeroizing` so the bytes are wiped from RAM whenever the cached copy is dropped/replaced (C4),
     /// in addition to the explicit `zeroize()` on relock-all.
     pub master_kek: Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
+    /// M3-CLIENT (spec §3/§4) — the logged-in sharing account for THIS session, or `None` when logged
+    /// out. Holds the account id, the unwrapped account master key `MK` (zeroized on drop), the cached
+    /// device id, and the current identity generation. The MK never touches SQLite (it is unwrapped
+    /// from the server-stored `mk_wrap_pw` at login via the OPAQUE `export_key`); the session tokens
+    /// live in the Keychain (source of truth) — this cache only holds MK + non-secret metadata so a
+    /// share can be sealed without re-prompting for the password. Cleared on logout.
+    pub account_session: Mutex<Option<crate::share::AccountSession>>,
     /// BLK-1 coarse LIFECYCLE lock. Serializes the folder-lock state machine
     /// (`lock_folder` / `unlock_folder` / `relock_folder` / `relock_all_inner` / `remove_lock` /
     /// the seal half of `move_note`) so two of them can NEVER interleave their multi-step
@@ -218,6 +225,7 @@ impl AppState {
             live_transcript: Mutex::new(String::new()),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
+            account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
         })
     }

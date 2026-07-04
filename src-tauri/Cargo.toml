@@ -125,6 +125,10 @@ hkdf = "0.12"
 sha2 = "0.10"
 # BIP39 24-word recovery phrase (256-bit) for the recovery key RK (spec §4.3/§4.6).
 bip39 = "2"
+# OPAQUE (RFC 9807) CLIENT side (registration + login) for the sharing account (M3-CLIENT, spec §3).
+# The ciphersuite MUST match the server VERBATIM (Ristretto255 + TripleDh<…, Sha512> + Argon2 KSF) —
+# see `share/opaque_client.rs`. `argon2` feature = the Argon2id KSF. Same 4.0.1 the server resolves.
+opaque-ke = { version = "4", features = ["argon2"] }
 # CSPRNG source for HPKE seal / keypair generation (rand_core 0.6 ecosystem, matches hpke 0.12).
 rand = "0.8"
 

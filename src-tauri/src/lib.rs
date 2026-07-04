@@ -19,6 +19,7 @@ pub mod reason;
 pub mod screenshare;
 pub mod secrets;
 pub mod settings;
+pub mod share;
 pub mod state;
 pub mod storage;
 pub mod summarize;
@@ -106,6 +107,16 @@ pub fn run() {
             commands::consent_to_cloud_egress,
             commands::revoke_cloud_egress,
             commands::consent_to_web_search,
+            // M3-CLIENT — sharing account + zero-knowledge link shares (mode A).
+            commands::account_status,
+            commands::account_signup,
+            commands::account_login,
+            commands::account_logout,
+            commands::consent_to_share_egress,
+            commands::revoke_share_egress,
+            commands::share_note_to_link,
+            commands::list_my_shares,
+            commands::revoke_share,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::set_gateway_key,
