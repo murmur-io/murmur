@@ -225,7 +225,9 @@ where
 
     if downloaded == 0 {
         let _ = tokio::fs::remove_file(&part).await;
-        return Err(AppError::Transcribe("model download returned empty body".into()));
+        return Err(AppError::Transcribe(
+            "model download returned empty body".into(),
+        ));
     }
     tokio::fs::rename(&part, dest)
         .await

@@ -31,10 +31,7 @@ const ALLOWED_HOSTS: &[&str] = &["127.0.0.1:8765", "localhost:8765"];
 fn origin_allowed(origin: &str) -> bool {
     matches!(
         origin,
-        "http://127.0.0.1:8765"
-            | "http://localhost:8765"
-            | "http://127.0.0.1"
-            | "http://localhost"
+        "http://127.0.0.1:8765" | "http://localhost:8765" | "http://127.0.0.1" | "http://localhost"
     )
 }
 
@@ -130,7 +127,13 @@ fn run(db_path: PathBuf, unlocked: UnlockedSet, require_token: bool) {
             let reader = req.as_reader();
             let _ = reader.take(MAX_BODY_BYTES).read_to_string(&mut body);
         }
-        match handle_rpc(&db_path, &body, &unlocked, expected_token.as_deref(), auth.as_deref()) {
+        match handle_rpc(
+            &db_path,
+            &body,
+            &unlocked,
+            expected_token.as_deref(),
+            auth.as_deref(),
+        ) {
             Some(resp) => {
                 // The header pair is a compile-time ASCII constant so this never errors, but we do
                 // NOT unwrap on the per-request server loop (a panic here would kill the MCP thread
@@ -312,16 +315,32 @@ fn dispatch_tool(
     use crate::tools::ToolCall;
     let call = match name {
         "search_meetings" => ToolCall::SearchMeetings {
-            query: args.get("query").and_then(Value::as_str).unwrap_or("").to_string(),
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "search_semantic" => ToolCall::SearchSemantic {
-            query: args.get("query").and_then(Value::as_str).unwrap_or("").to_string(),
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "get_meeting" => ToolCall::GetMeeting {
-            meeting_id: args.get("meetingId").and_then(Value::as_str).unwrap_or("").to_string(),
+            meeting_id: args
+                .get("meetingId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "list_recent_meetings" => ToolCall::ListRecentMeetings {
-            limit: args.get("limit").and_then(Value::as_i64).unwrap_or(20).clamp(1, 100),
+            limit: args
+                .get("limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(20)
+                .clamp(1, 100),
         },
         "get_open_commitments" => ToolCall::GetOpenCommitments {
             owner: args
@@ -336,7 +355,9 @@ fn dispatch_tool(
             if entity.trim().is_empty() {
                 return Err((-32602, "missing required argument: entity".to_string()));
             }
-            ToolCall::GetEntityDossier { entity: entity.to_string() }
+            ToolCall::GetEntityDossier {
+                entity: entity.to_string(),
+            }
         }
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
@@ -345,7 +366,8 @@ fn dispatch_tool(
     // whose Tier 1 default is now flag ON — harmless: with no e5 model the hybrid `search_semantic`
     // leg degenerates to the SAME gated FTS (no leak, no crash), and every leg stays visibility-gated.
     let config = crate::settings::AppConfig::load(db).unwrap_or_default();
-    crate::tools::execute_tool(&call, db, unlocked_set, &config).map_err(|e| (-32000, e.to_string()))
+    crate::tools::execute_tool(&call, db, unlocked_set, &config)
+        .map_err(|e| (-32000, e.to_string()))
 }
 
 #[cfg(test)]
@@ -415,8 +437,9 @@ mod tests {
         // With enforcement OFF (expected_token = None), discovery still works without a token —
         // this preserves the no-token local connection when the user hasn't enabled the gate.
         assert!(rpc(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap()["result"].is_object());
-        assert!(rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap()["result"]
-            .is_object());
+        assert!(
+            rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap()["result"].is_object()
+        );
     }
 
     #[test]
@@ -431,10 +454,16 @@ mod tests {
             );
             // No Authorization header → unauthorized, BEFORE any dispatch/DB access.
             let unauth = rpc_auth(&body, Some("sekret"), None).unwrap();
-            assert_eq!(unauth["error"]["code"], -32001, "method {method} must be gated");
+            assert_eq!(
+                unauth["error"]["code"], -32001,
+                "method {method} must be gated"
+            );
             // Wrong token → unauthorized, also before dispatch.
             let wrong = rpc_auth(&body, Some("sekret"), Some("Bearer nope")).unwrap();
-            assert_eq!(wrong["error"]["code"], -32001, "method {method} wrong-token must be gated");
+            assert_eq!(
+                wrong["error"]["code"], -32001,
+                "method {method} wrong-token must be gated"
+            );
         }
         // A CORRECT token lets discovery through (no DB access on initialize/tools/list/ping).
         let ok = rpc_auth(
@@ -564,8 +593,20 @@ mod tests {
             created_at: "2026-06-26T00:00:00Z".to_string(),
         })
         .unwrap();
-        seed(&db, "open", "Open", "budget planning hiring quarter apollo", None);
-        seed(&db, "sealed", "Sealed", "budget planning hiring quarter secret", Some("f-lock"));
+        seed(
+            &db,
+            "open",
+            "Open",
+            "budget planning hiring quarter apollo",
+            None,
+        );
+        seed(
+            &db,
+            "sealed",
+            "Sealed",
+            "budget planning hiring quarter secret",
+            Some("f-lock"),
+        );
 
         let emb = crate::embed::active_embedder();
         db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
@@ -587,7 +628,10 @@ mod tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         let out2 = dispatch_tool(&db, "search_semantic", &args, &unlocked).unwrap();
-        assert!(out2.contains("id:sealed"), "unlocked meeting must reappear in semantic results");
+        assert!(
+            out2.contains("id:sealed"),
+            "unlocked meeting must reappear in semantic results"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -625,7 +669,10 @@ mod tests {
 
         // Not unlocked → only the open meeting's open item; sealed item invisible; done item dropped.
         let out = dispatch_tool(&db, "get_open_commitments", &json!({}), &HashSet::new()).unwrap();
-        assert!(out.contains("ship the deck"), "open commitment must surface");
+        assert!(
+            out.contains("ship the deck"),
+            "open commitment must surface"
+        );
         assert!(out.contains("[[Open Sync]]"), "source title must render");
         assert!(out.contains("due 2026-07-01"), "due date must render");
         assert!(out.contains("Anna"), "owner must render");
@@ -642,7 +689,10 @@ mod tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         let out2 = dispatch_tool(&db, "get_open_commitments", &json!({}), &unlocked).unwrap();
-        assert!(out2.contains("sign the contract"), "unlocked commitment must reappear");
+        assert!(
+            out2.contains("sign the contract"),
+            "unlocked commitment must reappear"
+        );
 
         // Owner filter (case-insensitive).
         let out3 = dispatch_tool(
@@ -652,7 +702,10 @@ mod tests {
             &unlocked,
         )
         .unwrap();
-        assert!(out3.contains("ship the deck"), "owner filter must keep Anna's item");
+        assert!(
+            out3.contains("ship the deck"),
+            "owner filter must keep Anna's item"
+        );
         assert!(
             !out3.contains("sign the contract"),
             "owner filter must drop Carol's item"
@@ -701,21 +754,36 @@ mod tests {
         // and its commitment, and EXCLUDES the sealed meeting's title, note body, and commitment.
         let args = json!({ "entity": "Atlas" });
         let out = dispatch_tool(&db, "get_entity_dossier", &args, &HashSet::new()).unwrap();
-        assert!(out.contains("DOSSIER for [[Atlas]]"), "overview header must render");
+        assert!(
+            out.contains("DOSSIER for [[Atlas]]"),
+            "overview header must render"
+        );
         assert!(out.contains("[[Kickoff]]"), "visible meeting must be cited");
-        assert!(out.contains("draft Atlas spec"), "visible open commitment must surface");
+        assert!(
+            out.contains("draft Atlas spec"),
+            "visible open commitment must surface"
+        );
         assert!(
             !out.contains("Secret Atlas Review") && !out.contains("LOCKED Atlas acquisition"),
             "sealed-not-unlocked meeting leaked into the dossier (gate violation)"
         );
-        assert!(!out.contains("sign"), "sealed commitment leaked into the dossier");
+        assert!(
+            !out.contains("sign"),
+            "sealed commitment leaked into the dossier"
+        );
 
         // Session-unlock → the sealed meeting + its content reappear.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         let out2 = dispatch_tool(&db, "get_entity_dossier", &args, &unlocked).unwrap();
-        assert!(out2.contains("[[Secret Atlas Review]]"), "unlocked meeting must reappear");
-        assert!(out2.contains("LOCKED Atlas acquisition"), "unlocked content must reappear");
+        assert!(
+            out2.contains("[[Secret Atlas Review]]"),
+            "unlocked meeting must reappear"
+        );
+        assert!(
+            out2.contains("LOCKED Atlas acquisition"),
+            "unlocked content must reappear"
+        );
 
         // Unknown entity → a friendly, non-leaking message (never an error).
         let none = dispatch_tool(
@@ -725,7 +793,10 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
-        assert!(none.contains("No visible entity"), "unknown entity → friendly message");
+        assert!(
+            none.contains("No visible entity"),
+            "unknown entity → friendly message"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

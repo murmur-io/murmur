@@ -144,7 +144,9 @@ mod tests {
         assert_eq!(hits[0].title, "Sprint Planning");
         // The snippet is the bounded CalendarContext block (Meeting / When / Attendees / Agenda).
         assert!(hits[0].snippet.contains("Meeting: Sprint Planning"));
-        assert!(hits[0].snippet.contains("Attendees: Alice, bob@example.com"));
+        assert!(hits[0]
+            .snippet
+            .contains("Attendees: Alice, bob@example.com"));
         assert!(hits[0].snippet.contains("velocity"));
         // LOUD: every hit is attributed to the calendar; local events have no URL.
         assert_eq!(hits[0].source_label, "calendar");

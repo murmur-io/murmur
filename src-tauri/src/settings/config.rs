@@ -203,6 +203,19 @@ pub struct AppConfig {
     /// by the purpose-built `consent_to_cloud_egress` / `revoke_cloud_egress` commands, so flipping
     /// it either way is an explicit, auditable user act.
     pub cloud_egress_consented: bool,
+    /// M3-CLIENT — one-time SHARE-egress consent (spec §7 inv. 5). The FIRST time the user would
+    /// upload an encrypted note to the sharing server, `share_note_to_link` refuses until this is
+    /// flipped `true` via the dedicated `consent_to_share_egress` command. Default OFF (fail-closed):
+    /// no note ciphertext leaves the device until the user has explicitly acknowledged the upload once.
+    /// This is a DIFFERENT consent class from `cloud_egress_consented` (LLM egress of REDACTED text):
+    /// a link share is a deliberate FULL-CONTENT transfer (E2EE, the redaction firewall is NOT applied
+    /// — the modal states this). Same discipline: round-trips through the DTO for DISPLAY, but
+    /// `dto_to_config`/`save_config` PRESERVE the stored value — the FE can never set/clear it as a
+    /// settings-save side effect; only `consent_to_share_egress` / `revoke_share_egress` mutate it.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`
+    /// (fail-closed — a pre-existing install has NOT consented to share egress).
+    #[serde(default)]
+    pub share_egress_consented: bool,
     /// brain2 RAG Tier 1 — master gate for the on-device semantic (vector) retrieval layer.
     /// Default ON (`#[serde(default = "default_true")]` ⇒ a config persisted before this field existed
     /// loads as `true`). SAFE to default on: when the e5 model is PRESENT, note chunks auto-index on
@@ -313,6 +326,12 @@ pub struct AppConfig {
     /// configs load as `""`.
     #[serde(default)]
     pub gateway_model: String,
+    /// M3-CLIENT — base URL of the Murmur sharing server (spec §7 inv. 9). Default `""` (unset ⇒ the
+    /// account/share commands fail closed `Unavailable`). Set in Settings → Account; validated at
+    /// `ShareClient::new` exactly like `gateway_base_url` (https required, http loopback-only, no
+    /// embedded creds). `#[serde(default)]` ⇒ pre-existing configs load as `""` — no behavior change.
+    #[serde(default)]
+    pub share_base_url: String,
     /// Proactive brain P1 — while recording, the deterministic ZERO-EGRESS matcher
     /// (`crate::proactive`) surfaces dismissible recall cards ("you discussed this on … →
     /// [[meeting]]", "open commitment: …") from the live-caption tail. Default ON (spec D2: the
@@ -426,6 +445,7 @@ impl Default for AppConfig {
             lock_require_biometric: true,
             relock_on_screenshare: true,
             cloud_egress_consented: false,
+            share_egress_consented: false,
             semantic_search_enabled: true,
             embed_model_id: None,
             brain_model_path: None,
@@ -441,6 +461,7 @@ impl Default for AppConfig {
             claude_code_inherit_env: false,
             gateway_base_url: String::new(),
             gateway_model: String::new(),
+            share_base_url: String::new(),
             proactive_hints_enabled: true,
             user_memory_enabled: true,
             ground_summary: false,
@@ -490,6 +511,7 @@ const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
 const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
+const K_SHARE_EGRESS_CONSENTED: &str = "share_egress_consented";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 const K_EMBED_MODEL_ID: &str = "embed_model_id";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
@@ -505,6 +527,7 @@ const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
+const K_SHARE_BASE_URL: &str = "share_base_url";
 const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
 const K_USER_MEMORY_ENABLED: &str = "user_memory_enabled";
 const K_GROUND_SUMMARY: &str = "ground_summary";
@@ -625,6 +648,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_CLOUD_EGRESS_CONSENTED)? {
             cfg.cloud_egress_consented = v == "true";
         }
+        if let Some(v) = db.get_setting(K_SHARE_EGRESS_CONSENTED)? {
+            cfg.share_egress_consented = v == "true";
+        }
         if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
             cfg.semantic_search_enabled = v == "true";
         }
@@ -667,6 +693,10 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_GATEWAY_MODEL)? {
             cfg.gateway_model = v;
+        }
+        // M3-CLIENT sharing-server base URL — `""` (unset) is valid; take it verbatim.
+        if let Some(v) = db.get_setting(K_SHARE_BASE_URL)? {
+            cfg.share_base_url = v;
         }
         if let Some(v) = db.get_setting(K_PROACTIVE_HINTS_ENABLED)? {
             cfg.proactive_hints_enabled = v == "true";
@@ -740,7 +770,11 @@ impl AppConfig {
         db.set_setting(K_INPUT_DEVICE, self.input_device.as_deref().unwrap_or(""))?;
         db.set_setting(
             K_CAPTURE_SYSTEM_AUDIO,
-            if self.capture_system_audio { "true" } else { "false" },
+            if self.capture_system_audio {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_VAD_ENABLED,
@@ -748,7 +782,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_KEEP_HIRES_MASTERS,
-            if self.keep_hires_masters { "true" } else { "false" },
+            if self.keep_hires_masters {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_DIARIZE_OTHERS,
@@ -756,7 +794,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_VOICEPRINT_ENABLED,
-            if self.voiceprint_enabled { "true" } else { "false" },
+            if self.voiceprint_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_AEC_ENABLED,
@@ -764,7 +806,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_POST_AEC_ENABLED,
-            if self.post_aec_enabled { "true" } else { "false" },
+            if self.post_aec_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         db.set_setting(
@@ -781,23 +827,51 @@ impl AppConfig {
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
         db.set_setting(
             K_MCP_REQUIRE_TOKEN,
-            if self.mcp_require_token { "true" } else { "false" },
+            if self.mcp_require_token {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_LOCK_REQUIRE_BIOMETRIC,
-            if self.lock_require_biometric { "true" } else { "false" },
+            if self.lock_require_biometric {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_RELOCK_ON_SCREENSHARE,
-            if self.relock_on_screenshare { "true" } else { "false" },
+            if self.relock_on_screenshare {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_CLOUD_EGRESS_CONSENTED,
-            if self.cloud_egress_consented { "true" } else { "false" },
+            if self.cloud_egress_consented {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_SHARE_EGRESS_CONSENTED,
+            if self.share_egress_consented {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_SEMANTIC_SEARCH_ENABLED,
-            if self.semantic_search_enabled { "true" } else { "false" },
+            if self.semantic_search_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_EMBED_MODEL_ID,
@@ -816,7 +890,11 @@ impl AppConfig {
         db.set_setting(K_BRAIN_BACKEND, self.brain_backend.as_str())?;
         db.set_setting(
             K_REALTIME_REACTIONS,
-            if self.realtime_reactions { "true" } else { "false" },
+            if self.realtime_reactions {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_BRAIN_LIVE, if self.brain_live { "true" } else { "false" })?;
         db.set_setting(
@@ -833,25 +911,46 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_WEB_SEARCH_ENABLED,
-            if self.web_search_enabled { "true" } else { "false" },
+            if self.web_search_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_WEB_SEARCH_CONSENTED,
-            if self.web_search_consented { "true" } else { "false" },
+            if self.web_search_consented {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_CLAUDE_CODE_INHERIT_ENV,
-            if self.claude_code_inherit_env { "true" } else { "false" },
+            if self.claude_code_inherit_env {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_GATEWAY_BASE_URL, &self.gateway_base_url)?;
         db.set_setting(K_GATEWAY_MODEL, &self.gateway_model)?;
+        db.set_setting(K_SHARE_BASE_URL, &self.share_base_url)?;
         db.set_setting(
             K_PROACTIVE_HINTS_ENABLED,
-            if self.proactive_hints_enabled { "true" } else { "false" },
+            if self.proactive_hints_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_USER_MEMORY_ENABLED,
-            if self.user_memory_enabled { "true" } else { "false" },
+            if self.user_memory_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_GROUND_SUMMARY,
@@ -914,6 +1013,24 @@ impl AppConfig {
     pub fn revoke_cloud_egress(&mut self, db: &Db) -> Result<()> {
         self.cloud_egress_consented = false;
         db.set_setting(K_CLOUD_EGRESS_CONSENTED, "false")
+    }
+
+    /// M3-CLIENT — record the user's one-time consent to upload an encrypted note to the sharing
+    /// server (spec §7 inv. 5). Mirrors [`grant_cloud_egress_consent`]: persist FIRST, flip the flag
+    /// ONLY on a durable write success (fail-closed — never egress on a consent that isn't recorded).
+    /// The ONLY mutator that sets this true, so it can never be granted as a settings-save side effect.
+    pub fn grant_share_egress_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_SHARE_EGRESS_CONSENTED, "true")?;
+        self.share_egress_consented = true;
+        Ok(())
+    }
+
+    /// M3-CLIENT — REVOKE the share-egress consent. Mirror of [`revoke_cloud_egress`]: flips the
+    /// in-memory flag FIRST, THEN persists (revoke's safe-failure direction is "stop egressing"), so
+    /// the next `share_note_to_link` is refused fail-closed until re-consented.
+    pub fn revoke_share_egress(&mut self, db: &Db) -> Result<()> {
+        self.share_egress_consented = false;
+        db.set_setting(K_SHARE_EGRESS_CONSENTED, "false")
     }
 
     /// brain2 connector framework — record the user's one-time consent to send the (redacted) web
@@ -1077,7 +1194,10 @@ mod tests {
     fn brain_backend_defaults_cloud_and_round_trips() {
         let db = temp_db();
         // Absent key ⇒ Cloud (the chosen default for fresh + pre-existing installs).
-        assert_eq!(AppConfig::load(&db).unwrap().brain_backend, BrainBackend::Cloud);
+        assert_eq!(
+            AppConfig::load(&db).unwrap().brain_backend,
+            BrainBackend::Cloud
+        );
 
         // AppleFoundation (WS2) joins the DB save/load round-trip loop — a persisted `apple` token
         // reloads as AppleFoundation, never the Cloud default.
@@ -1104,7 +1224,10 @@ mod tests {
         assert_eq!(BrainBackend::Off.as_str(), "off");
         // WS2 — AppleFoundation persists as the single token `apple`.
         assert_eq!(BrainBackend::AppleFoundation.as_str(), "apple");
-        assert_eq!(BrainBackend::from_str_or_default("local"), BrainBackend::Local);
+        assert_eq!(
+            BrainBackend::from_str_or_default("local"),
+            BrainBackend::Local
+        );
         assert_eq!(BrainBackend::from_str_or_default("off"), BrainBackend::Off);
         assert_eq!(
             BrainBackend::from_str_or_default("apple"),
@@ -1112,7 +1235,10 @@ mod tests {
         );
         // Unknown / empty falls back to the default brain — INCLUDING the un-renamed
         // `applefoundation` spelling, which an OLD build must NOT accidentally accept.
-        assert_eq!(BrainBackend::from_str_or_default("bogus"), BrainBackend::Cloud);
+        assert_eq!(
+            BrainBackend::from_str_or_default("bogus"),
+            BrainBackend::Cloud
+        );
         assert_eq!(BrainBackend::from_str_or_default(""), BrainBackend::Cloud);
         assert_eq!(
             BrainBackend::from_str_or_default("applefoundation"),
@@ -1172,8 +1298,14 @@ mod tests {
         let db = temp_db();
         // Fail-closed defaults: both OFF until explicitly set/granted.
         let cfg = AppConfig::load(&db).unwrap();
-        assert!(!cfg.web_search_enabled, "web search master toggle defaults OFF");
-        assert!(!cfg.web_search_consented, "web search egress consent fail-closed OFF");
+        assert!(
+            !cfg.web_search_enabled,
+            "web search master toggle defaults OFF"
+        );
+        assert!(
+            !cfg.web_search_consented,
+            "web search egress consent fail-closed OFF"
+        );
 
         // `web_search_enabled` is a settable flag; consent is granted via its dedicated method.
         let cfg = AppConfig {
@@ -1236,18 +1368,24 @@ mod tests {
         );
 
         // Explicit ON persists (a maintainer/user opt-in).
-        AppConfig { ground_summary: true, ..Default::default() }
-            .save(&db)
-            .unwrap();
+        AppConfig {
+            ground_summary: true,
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
         assert!(
             AppConfig::load(&db).unwrap().ground_summary,
             "an explicit ground_summary opt-in must persist"
         );
 
         // Explicit OFF persists.
-        AppConfig { ground_summary: false, ..Default::default() }
-            .save(&db)
-            .unwrap();
+        AppConfig {
+            ground_summary: false,
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
         assert!(!AppConfig::load(&db).unwrap().ground_summary);
     }
 
@@ -1267,7 +1405,10 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(!cfg.ground_summary, "serde default for ground_summary must be false (opt-in)");
+        assert!(
+            !cfg.ground_summary,
+            "serde default for ground_summary must be false (opt-in)"
+        );
     }
 
     #[test]
@@ -1320,7 +1461,10 @@ mod tests {
         cfg.grant_cloud_egress_consent(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().cloud_egress_consented);
         cfg.revoke_cloud_egress(&db).unwrap();
-        assert!(!cfg.cloud_egress_consented, "in-memory flag must flip immediately");
+        assert!(
+            !cfg.cloud_egress_consented,
+            "in-memory flag must flip immediately"
+        );
         // Survives a reload from the settings table.
         assert!(!AppConfig::load(&db).unwrap().cloud_egress_consented);
     }
@@ -1337,7 +1481,10 @@ mod tests {
         let mut cfg = AppConfig::load(&db).unwrap();
         // Pre-grant: neither side consents.
         assert!(!cfg.cloud_egress_consented);
-        assert_ne!(db.get_setting(K_CLOUD_EGRESS_CONSENTED).unwrap().as_deref(), Some("true"));
+        assert_ne!(
+            db.get_setting(K_CLOUD_EGRESS_CONSENTED).unwrap().as_deref(),
+            Some("true")
+        );
         // Grant: the durable record is written FIRST, then the flag flips — both true afterwards.
         cfg.grant_cloud_egress_consent(&db).unwrap();
         assert!(cfg.cloud_egress_consented, "session flag flipped");
@@ -1470,7 +1617,10 @@ mod tests {
     fn gateway_fields_default_empty() {
         // In-memory struct default.
         let cfg = AppConfig::default();
-        assert_eq!(cfg.gateway_base_url, "", "gateway_base_url must default to empty");
+        assert_eq!(
+            cfg.gateway_base_url, "",
+            "gateway_base_url must default to empty"
+        );
         assert_eq!(cfg.gateway_model, "", "gateway_model must default to empty");
 
         // Settings-table path: an empty DB (no key written) loads the defaults.
@@ -1491,14 +1641,13 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         let loaded = AppConfig::load(&db).unwrap();
-        assert_eq!(
-            loaded.gateway_base_url,
-            "https://my-gateway.example.com/v1"
-        );
+        assert_eq!(loaded.gateway_base_url, "https://my-gateway.example.com/v1");
         assert_eq!(loaded.gateway_model, "gpt-4o");
 
         // Clearing back to `""` (unset) also round-trips — not a one-way latch.
-        let cleared = AppConfig { ..Default::default() };
+        let cleared = AppConfig {
+            ..Default::default()
+        };
         cleared.save(&db).unwrap();
         let reloaded = AppConfig::load(&db).unwrap();
         assert_eq!(reloaded.gateway_base_url, "");
@@ -1528,10 +1677,16 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.proactive_hints_enabled, "an omitted key must default ON");
+        assert!(
+            cfg.proactive_hints_enabled,
+            "an omitted key must default ON"
+        );
 
         // Explicit OFF persists + reloads OFF (the backend-side mute).
-        let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
+        let cfg = AppConfig {
+            proactive_hints_enabled: false,
+            ..Default::default()
+        };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().proactive_hints_enabled);
     }
@@ -1562,7 +1717,10 @@ mod tests {
         assert!(cfg.user_memory_enabled, "an omitted key must default ON");
 
         // Explicit OFF persists + reloads OFF (the backend-side memory kill switch).
-        let cfg = AppConfig { user_memory_enabled: false, ..Default::default() };
+        let cfg = AppConfig {
+            user_memory_enabled: false,
+            ..Default::default()
+        };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().user_memory_enabled);
     }
@@ -1647,7 +1805,10 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.gateway_base_url, "", "serde default must be empty string");
+        assert_eq!(
+            cfg.gateway_base_url, "",
+            "serde default must be empty string"
+        );
         assert_eq!(cfg.gateway_model, "", "serde default must be empty string");
     }
 

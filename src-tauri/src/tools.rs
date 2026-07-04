@@ -294,7 +294,10 @@ pub fn execute_tool(
                         .collect::<Vec<_>>()
                         .join(" ");
                     match note {
-                        Some(n) => Ok(format!("NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}", n.markdown)),
+                        Some(n) => Ok(format!(
+                            "NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}",
+                            n.markdown
+                        )),
                         None if !transcript.is_empty() => Ok(format!("TRANSCRIPT:\n{transcript}")),
                         None => Ok(format!("No data for meeting {mid}.")),
                     }
@@ -403,9 +406,10 @@ pub async fn execute_web_search(query: &str, config: &AppConfig) -> Result<Strin
         Ok(hits) if hits.is_empty() => Ok(format!("No web results for \"{q}\".")),
         Ok(hits) => Ok(format_web_hits(&hits)),
         // Fail-closed / not-exposed → a graceful sentinel (NOT an error), so the brain just skips it.
-        Err(crate::connectors::ConnectorError::NeedsConsent) => {
-            Ok("Web search is not available (not enabled, not consented, or no API key set).".to_string())
-        }
+        Err(crate::connectors::ConnectorError::NeedsConsent) => Ok(
+            "Web search is not available (not enabled, not consented, or no API key set)."
+                .to_string(),
+        ),
         Err(crate::connectors::ConnectorError::Unconfigured(_)) => {
             Ok("Web search is not available (not configured).".to_string())
         }
@@ -513,7 +517,10 @@ fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
         .map(|h| {
             format!(
                 "- {} ({}) [id:{}] — {}",
-                h.meeting.title.clone().unwrap_or_else(|| "(untitled)".into()),
+                h.meeting
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "(untitled)".into()),
                 h.meeting.started_at,
                 h.meeting.id,
                 h.snippet
@@ -605,7 +612,9 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
     fn run(&self, name: &str, args: &serde_json::Value) -> Result<String> {
         // ENFORCE the allowlist: the model can NEVER run a tool we did not advertise this turn.
         if !self.specs().iter().any(|s| s.name == name) {
-            return Err(AppError::InvalidArg(format!("tool '{name}' is not available")));
+            return Err(AppError::InvalidArg(format!(
+                "tool '{name}' is not available"
+            )));
         }
         // RE-READ the live unlocked set on THIS call (C6): a folder relocked mid-loop is gated out
         // immediately, never seen through a snapshot taken at loop start.
@@ -614,35 +623,75 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             .lock()
             .map_err(|_| AppError::Other(anyhow::anyhow!("unlocked set mutex poisoned")))?
             .clone();
-        let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let s = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         match name {
-            "search_meetings" => {
-                execute_tool(&ToolCall::SearchMeetings { query: s("query") }, self.db, &unlocked, self.config)
-            }
-            "search_semantic" => {
-                execute_tool(&ToolCall::SearchSemantic { query: s("query") }, self.db, &unlocked, self.config)
-            }
-            "get_meeting" => {
-                execute_tool(&ToolCall::GetMeeting { meeting_id: s("meetingId") }, self.db, &unlocked, self.config)
-            }
+            "search_meetings" => execute_tool(
+                &ToolCall::SearchMeetings { query: s("query") },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
+            "search_semantic" => execute_tool(
+                &ToolCall::SearchSemantic { query: s("query") },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
+            "get_meeting" => execute_tool(
+                &ToolCall::GetMeeting {
+                    meeting_id: s("meetingId"),
+                },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
             "list_recent_meetings" => {
-                let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10).clamp(1, 100);
-                execute_tool(&ToolCall::ListRecentMeetings { limit }, self.db, &unlocked, self.config)
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(10)
+                    .clamp(1, 100);
+                execute_tool(
+                    &ToolCall::ListRecentMeetings { limit },
+                    self.db,
+                    &unlocked,
+                    self.config,
+                )
             }
             "get_open_commitments" => {
-                let owner = args.get("owner").and_then(|v| v.as_str()).map(str::to_string);
-                execute_tool(&ToolCall::GetOpenCommitments { owner }, self.db, &unlocked, self.config)
+                let owner = args
+                    .get("owner")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                execute_tool(
+                    &ToolCall::GetOpenCommitments { owner },
+                    self.db,
+                    &unlocked,
+                    self.config,
+                )
             }
-            "get_entity_dossier" => {
-                execute_tool(&ToolCall::GetEntityDossier { entity: s("entity") }, self.db, &unlocked, self.config)
-            }
+            "get_entity_dossier" => execute_tool(
+                &ToolCall::GetEntityDossier {
+                    entity: s("entity"),
+                },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
             "web_search" => match self.app {
                 Some(_) => block_on_tool(execute_web_search(&s("query"), self.config)),
                 None => Err(AppError::InvalidArg("web_search needs an AppHandle".into())),
             },
             "calendar_lookup" => match self.app {
                 Some(app) => block_on_tool(execute_calendar_search(&s("query"), app)),
-                None => Err(AppError::InvalidArg("calendar_lookup needs an AppHandle".into())),
+                None => Err(AppError::InvalidArg(
+                    "calendar_lookup needs an AppHandle".into(),
+                )),
             },
             // ── PROPOSE (always-on, NO DB side effect): the model signals the user asked for a note.
             //    Records the draft in interior-mutable scratch; the caller threads it onto the result so
@@ -652,7 +701,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             //    refused them otherwise). Each is GATED to a VISIBLE/unlocked meeting before it mutates.
             "save_note" => self.save_note(&s("text"), &unlocked),
             "create_reminder" => {
-                let due = args.get("due").and_then(|v| v.as_str()).filter(|d| !d.trim().is_empty());
+                let due = args
+                    .get("due")
+                    .and_then(|v| v.as_str())
+                    .filter(|d| !d.trim().is_empty());
                 self.create_reminder(&s("text"), due)
             }
             other => Err(AppError::InvalidArg(format!("unknown tool '{other}'"))),
@@ -740,16 +792,16 @@ impl GatedToolExecutor<'_> {
 /// `reason::block_on_complete` / `voice_action::web_search_blocking`: a dedicated scoped OS thread with
 /// its own current-thread runtime, so we never "start a runtime within a runtime" and the future never
 /// crosses a thread boundary (only the `Result<String>` does).
-fn block_on_tool(
-    fut: impl std::future::Future<Output = Result<String>> + Send,
-) -> Result<String> {
+fn block_on_tool(fut: impl std::future::Future<Output = Result<String>> + Send) -> Result<String> {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| AppError::Other(anyhow::anyhow!("tool runtime build failed: {e}")))?
+                    .map_err(|e| {
+                        AppError::Other(anyhow::anyhow!("tool runtime build failed: {e}"))
+                    })?
                     .block_on(fut)
             })
             .join()
@@ -785,7 +837,9 @@ mod tests {
         let nothing = HashSet::new();
         let cfg = AppConfig::default();
         let res = execute_tool(
-            &ToolCall::WebSearch { query: "weather".into() },
+            &ToolCall::WebSearch {
+                query: "weather".into(),
+            },
             &db,
             &nothing,
             &cfg,
@@ -824,7 +878,9 @@ mod tests {
         let nothing = HashSet::new();
         let cfg = AppConfig::default();
         let res = execute_tool(
-            &ToolCall::CalendarLookup { query: "standup".into() },
+            &ToolCall::CalendarLookup {
+                query: "standup".into(),
+            },
             &db,
             &nothing,
             &cfg,
@@ -842,7 +898,8 @@ mod tests {
         let hits = vec![
             crate::connectors::ConnectorHit {
                 title: "Sprint Planning".into(),
-                snippet: "Meeting: Sprint Planning\nAttendees: Alice, Bob\nAgenda:\n- velocity".into(),
+                snippet: "Meeting: Sprint Planning\nAttendees: Alice, Bob\nAgenda:\n- velocity"
+                    .into(),
                 url: String::new(),
                 source_label: "calendar".into(),
             },
@@ -854,10 +911,19 @@ mod tests {
             },
         ];
         let out = format_calendar_hits(&hits);
-        assert!(out.contains("[calendar] Sprint Planning"), "loud source label: {out}");
-        assert!(out.contains("Attendees: Alice, Bob"), "context block preserved: {out}");
+        assert!(
+            out.contains("[calendar] Sprint Planning"),
+            "loud source label: {out}"
+        );
+        assert!(
+            out.contains("Attendees: Alice, Bob"),
+            "context block preserved: {out}"
+        );
         assert!(out.contains("velocity"), "agenda preserved: {out}");
-        assert!(out.contains("[calendar] 1:1"), "every event labelled: {out}");
+        assert!(
+            out.contains("[calendar] 1:1"),
+            "every event labelled: {out}"
+        );
     }
 
     /// LOUD: web hits render with their source label + URL, so the answer is attributed "via web".
@@ -878,11 +944,20 @@ mod tests {
             },
         ];
         let out = format_web_hits(&hits);
-        assert!(out.contains("[web · Brave] Kraków weather"), "loud source label: {out}");
+        assert!(
+            out.contains("[web · Brave] Kraków weather"),
+            "loud source label: {out}"
+        );
         assert!(out.contains("Sunny, 22°C"), "snippet present: {out}");
-        assert!(out.contains("(https://w.example/krakow)"), "url present: {out}");
+        assert!(
+            out.contains("(https://w.example/krakow)"),
+            "url present: {out}"
+        );
         // A hit with no snippet/url still renders its labelled title.
-        assert!(out.contains("[web · Brave] No URL result"), "labelled even without url: {out}");
+        assert!(
+            out.contains("[web · Brave] No URL result"),
+            "labelled even without url: {out}"
+        );
     }
 
     // ── In-meeting WRITE tools: advertised only with allow_writes, executed, and GATED ──────────────
@@ -966,13 +1041,19 @@ mod tests {
             proposed_note: Mutex::new(None),
         };
         let names: Vec<&str> = writeable.specs().iter().map(|s| s.name).collect();
-        assert!(names.contains(&"save_note"), "the write loop must advertise save_note: {names:?}");
+        assert!(
+            names.contains(&"save_note"),
+            "the write loop must advertise save_note: {names:?}"
+        );
         assert!(
             names.contains(&"create_reminder"),
             "the write loop must advertise create_reminder: {names:?}"
         );
         // propose_note is always advertised (write: false), regardless of allow_writes.
-        assert!(names.contains(&"propose_note"), "propose_note must always be advertised: {names:?}");
+        assert!(
+            names.contains(&"propose_note"),
+            "propose_note must always be advertised: {names:?}"
+        );
 
         let readonly = GatedToolExecutor {
             db: &db,
@@ -986,7 +1067,9 @@ mod tests {
         };
         let ro_names: Vec<&str> = readonly.specs().iter().map(|s| s.name).collect();
         assert!(
-            !ro_names.iter().any(|n| *n == "save_note" || *n == "create_reminder"),
+            !ro_names
+                .iter()
+                .any(|n| *n == "save_note" || *n == "create_reminder"),
             "a read-only executor must NOT advertise write tools: {ro_names:?}"
         );
         // propose_note (write: false, no DB effect) is STILL advertised on a read-only executor — it is
@@ -1019,14 +1102,26 @@ mod tests {
 
         // First note SEEDS the empty buffer.
         let out = exec
-            .run("save_note", &serde_json::json!({ "text": "send the deck to Anna" }))
+            .run(
+                "save_note",
+                &serde_json::json!({ "text": "send the deck to Anna" }),
+            )
             .unwrap();
-        assert!(out.to_lowercase().contains("saved"), "confirmation text: {out}");
-        assert_eq!(db.get_manual_notes("live1").unwrap(), "send the deck to Anna");
+        assert!(
+            out.to_lowercase().contains("saved"),
+            "confirmation text: {out}"
+        );
+        assert_eq!(
+            db.get_manual_notes("live1").unwrap(),
+            "send the deck to Anna"
+        );
 
         // A second note APPENDS (newline-separated) — the buffer GROWS, the first note is preserved.
-        exec.run("save_note", &serde_json::json!({ "text": "follow up with QA on Friday" }))
-            .unwrap();
+        exec.run(
+            "save_note",
+            &serde_json::json!({ "text": "follow up with QA on Friday" }),
+        )
+        .unwrap();
         assert_eq!(
             db.get_manual_notes("live1").unwrap(),
             "send the deck to Anna\nfollow up with QA on Friday",
@@ -1121,7 +1216,10 @@ mod tests {
             note_drafts: true,
             proposed_note: Mutex::new(None),
         };
-        let res = exec.run("save_note", &serde_json::json!({ "text": "should not run" }));
+        let res = exec.run(
+            "save_note",
+            &serde_json::json!({ "text": "should not run" }),
+        );
         assert!(
             matches!(res, Err(AppError::InvalidArg(_))),
             "an un-advertised write tool must be refused by the allowlist: {res:?}"
@@ -1158,8 +1256,14 @@ mod tests {
                 "propose_note must be advertised with allow_writes={allow_writes}: {names:?}"
             );
             // It is a read tool (write: false), so it is NOT gated out on the read surface.
-            let spec = tool_specs().into_iter().find(|s| s.name == "propose_note").unwrap();
-            assert!(!spec.write, "propose_note must be write: false (no DB side effect)");
+            let spec = tool_specs()
+                .into_iter()
+                .find(|s| s.name == "propose_note")
+                .unwrap();
+            assert!(
+                !spec.write,
+                "propose_note must be write: false (no DB side effect)"
+            );
         }
     }
 
@@ -1184,12 +1288,21 @@ mod tests {
         };
 
         // Before any call the scratch is None ⇒ the reply would be a plain ANSWER.
-        assert!(exec.proposed_note.lock().unwrap().is_none(), "no proposal until propose_note is called");
+        assert!(
+            exec.proposed_note.lock().unwrap().is_none(),
+            "no proposal until propose_note is called"
+        );
 
         let out = exec
-            .run("propose_note", &serde_json::json!({ "content": "Decision: ship Friday; Anna owns QA." }))
+            .run(
+                "propose_note",
+                &serde_json::json!({ "content": "Decision: ship Friday; Anna owns QA." }),
+            )
             .unwrap();
-        assert!(out.to_lowercase().contains("draft"), "confirmation mentions a draft: {out}");
+        assert!(
+            out.to_lowercase().contains("draft"),
+            "confirmation mentions a draft: {out}"
+        );
 
         // The draft is RECORDED in scratch (this is what the caller threads onto the result).
         assert_eq!(
@@ -1228,7 +1341,12 @@ mod tests {
             proposed_note: Mutex::new(None),
         };
         // A plain read tool (the kind a question would use) does NOT set a proposal.
-        let _ = exec.run("search_meetings", &serde_json::json!({ "query": "anything" })).unwrap();
+        let _ = exec
+            .run(
+                "search_meetings",
+                &serde_json::json!({ "query": "anything" }),
+            )
+            .unwrap();
         assert!(
             exec.proposed_note.lock().unwrap().is_none(),
             "an answer turn (no propose_note) must leave proposed_note None"
@@ -1253,7 +1371,13 @@ mod tests {
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("propose_note", &serde_json::json!({ "content": "   " }));
-        assert!(matches!(res, Err(AppError::InvalidArg(_))), "empty proposal refused: {res:?}");
-        assert!(exec.proposed_note.lock().unwrap().is_none(), "no draft recorded for an empty proposal");
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "empty proposal refused: {res:?}"
+        );
+        assert!(
+            exec.proposed_note.lock().unwrap().is_none(),
+            "no draft recorded for an empty proposal"
+        );
     }
 }

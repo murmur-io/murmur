@@ -82,7 +82,11 @@ pub fn estimate_stream_offset(mic_16k: &[f32], sys_16k: &[f32]) -> Option<EchoLe
     if n < WINDOW_ENV / 2 {
         return None;
     }
-    let starts: [usize; 3] = [0, n.saturating_sub(WINDOW_ENV) / 2, n.saturating_sub(WINDOW_ENV)];
+    let starts: [usize; 3] = [
+        0,
+        n.saturating_sub(WINDOW_ENV) / 2,
+        n.saturating_sub(WINDOW_ENV),
+    ];
     let mut peaks: Vec<(i64, f32)> = Vec::new();
     for &s in &starts {
         let e = (s + WINDOW_ENV).min(n);
@@ -117,7 +121,10 @@ pub fn estimate_stream_offset(mic_16k: &[f32], sys_16k: &[f32]) -> Option<EchoLe
     if spread > MAX_SPREAD_S {
         return None; // windows disagree — do not feed a wrong pad into the mix
     }
-    Some(EchoLeak { offset_s: med_lag as f64 / ENV_RATE, correlation: med_corr })
+    Some(EchoLeak {
+        offset_s: med_lag as f64 / ENV_RATE,
+        correlation: med_corr,
+    })
 }
 
 /// Front-padding (in samples) for the archive mix: `(mic_delay, sys_delay)`.
@@ -137,10 +144,14 @@ pub fn archive_delays(
         };
     }
     match sys_started {
-        Some(sys) if sys >= mic_started => {
-            (0, to_samples(sys.saturating_duration_since(mic_started).as_secs_f64()))
-        }
-        Some(sys) => (to_samples(mic_started.saturating_duration_since(sys).as_secs_f64()), 0),
+        Some(sys) if sys >= mic_started => (
+            0,
+            to_samples(sys.saturating_duration_since(mic_started).as_secs_f64()),
+        ),
+        Some(sys) => (
+            to_samples(mic_started.saturating_duration_since(sys).as_secs_f64()),
+            0,
+        ),
         None => (0, 0),
     }
 }
@@ -156,7 +167,9 @@ mod tests {
     fn burst_signal(len: usize, seed: u64) -> Vec<f32> {
         let mut x = seed.wrapping_add(1);
         let next = |x: &mut u64| {
-            *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *x
         };
         let mut out = vec![0.0f32; len];
@@ -187,8 +200,16 @@ mod tests {
             *m += 0.02 * n;
         }
         let leak = estimate_stream_offset(&mic, &sys).expect("leak must be detected");
-        assert!((leak.offset_s - 0.24).abs() <= 0.03, "offset {} ≉ 0.24", leak.offset_s);
-        assert!(leak.correlation >= MIN_CORR, "correlation {} too weak", leak.correlation);
+        assert!(
+            (leak.offset_s - 0.24).abs() <= 0.03,
+            "offset {} ≉ 0.24",
+            leak.offset_s
+        );
+        assert!(
+            leak.correlation >= MIN_CORR,
+            "correlation {} too weak",
+            leak.correlation
+        );
     }
 
     /// Headphones case: mic is INDEPENDENT of sys → no reliable peak → None.
@@ -214,19 +235,34 @@ mod tests {
     fn archive_delays_prefers_measured_leak() {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
-        let leak = EchoLeak { offset_s: 0.5, correlation: 0.8 };
+        let leak = EchoLeak {
+            offset_s: 0.5,
+            correlation: 0.8,
+        };
         assert_eq!(
             archive_delays(Some(&leak), t0, Some(t0), 16_000),
             (0, 8_000),
             "positive offset ⇒ pad the system track"
         );
-        let leak_neg = EchoLeak { offset_s: -0.25, correlation: 0.8 };
-        assert_eq!(archive_delays(Some(&leak_neg), t0, Some(t0), 16_000), (4_000, 0));
+        let leak_neg = EchoLeak {
+            offset_s: -0.25,
+            correlation: 0.8,
+        };
+        assert_eq!(
+            archive_delays(Some(&leak_neg), t0, Some(t0), 16_000),
+            (4_000, 0)
+        );
         // No leak → wall-clock anchors: system started 0.8 s AFTER the mic ⇒ pad system.
         let sys_started = t0 + Duration::from_millis(800);
-        assert_eq!(archive_delays(None, t0, Some(sys_started), 16_000), (0, 12_800));
+        assert_eq!(
+            archive_delays(None, t0, Some(sys_started), 16_000),
+            (0, 12_800)
+        );
         // Mic started later ⇒ pad the mic.
-        assert_eq!(archive_delays(None, sys_started, Some(t0), 16_000), (12_800, 0));
+        assert_eq!(
+            archive_delays(None, sys_started, Some(t0), 16_000),
+            (12_800, 0)
+        );
         // No system stream at all → no padding.
         assert_eq!(archive_delays(None, t0, None, 16_000), (0, 0));
     }

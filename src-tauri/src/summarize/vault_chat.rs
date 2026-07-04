@@ -113,8 +113,12 @@ mod tests {
 
     #[test]
     fn includes_corpus_and_question() {
-        let (s, u) =
-            build("### [[Sync]] · 2026-07-01 · id:1\nWe shipped.", &[], "What shipped?", "");
+        let (s, u) = build(
+            "### [[Sync]] · 2026-07-01 · id:1\nWe shipped.",
+            &[],
+            "What shipped?",
+            "",
+        );
         assert!(s.contains("[[Sync]]"));
         assert!(u.contains("User: What shipped?"));
         assert!(u.trim_end().ends_with("Assistant:"));

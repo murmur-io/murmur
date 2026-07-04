@@ -39,8 +39,7 @@ pub fn sweep_stale_scratch() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let is_scratch = (name.starts_with("meetnotes-aec-")
-            || name.starts_with("meetnotes-sys-"))
+        let is_scratch = (name.starts_with("meetnotes-aec-") || name.starts_with("meetnotes-sys-"))
             && name.ends_with(".wav");
         if !is_scratch {
             continue;
@@ -66,7 +65,11 @@ pub fn sweep_stale_scratch() {
 /// without a clean Stop — a crash, a force-quit, or (in dev) a `tauri dev` hot-rebuild SIGKILLing
 /// the app mid-recording. An orphan reparents to launchd (ppid 1) and keeps capturing system audio
 /// to its temp WAV until its own 4h self-limit — gigabytes of dead-session audio.
-const CAPTURE_HELPERS: [&str; 3] = ["meetnotes-sysaudio", "meetnotes-audiocap", "meetnotes-aeccap"];
+const CAPTURE_HELPERS: [&str; 3] = [
+    "meetnotes-sysaudio",
+    "meetnotes-audiocap",
+    "meetnotes-aeccap",
+];
 
 /// SIGTERM any ORPHANED capture helper (a [`CAPTURE_HELPERS`] binary reparented to launchd) and
 /// delete its scratch WAV. Best-effort, called ONCE at startup. This closes the gap
@@ -190,8 +193,7 @@ impl AecRecorder {
         // only the minimal non-secret vars the sidecar needs, so MURMUR_DEV_* / API keys / tokens in
         // the app environment can never be inherited by this child. PATH is a fixed system list (the
         // sidecar runs no helpers), HOME is needed for the macOS per-user TCC/container context.
-        cmd.env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        cmd.env_clear().env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         for key in ["HOME", "USER", "LOGNAME", "TMPDIR"] {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
@@ -258,7 +260,12 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (5916, Some(PathBuf::from("/var/folders/sl/T/meetnotes-sys-83191e88.wav"))),
+                (
+                    5916,
+                    Some(PathBuf::from(
+                        "/var/folders/sl/T/meetnotes-sys-83191e88.wav"
+                    ))
+                ),
                 (8080, None),
             ]
         );
@@ -268,8 +275,14 @@ mod tests {
     fn never_reaps_a_live_child_helper() {
         // SAFETY INVARIANT: pid 7001 is a live capture helper of a RUNNING app (ppid 32431). It is
         // a byte-for-byte twin of the orphan except for its parent — it must NEVER be selected.
-        let ids: Vec<i32> = parse_orphan_helpers(PS).into_iter().map(|(p, _)| p).collect();
-        assert!(!ids.contains(&7001), "must not reap a helper still owned by a live app");
+        let ids: Vec<i32> = parse_orphan_helpers(PS)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert!(
+            !ids.contains(&7001),
+            "must not reap a helper still owned by a live app"
+        );
     }
 
     #[test]

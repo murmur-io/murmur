@@ -308,7 +308,8 @@ mod tests {
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn temp_db(label: &str) -> Db {
-        let p = crate::storage::db::unique_temp_path(&format!("murmur-orchestrate-{label}"), "sqlite");
+        let p =
+            crate::storage::db::unique_temp_path(&format!("murmur-orchestrate-{label}"), "sqlite");
         Db::open_with_key(&p, TEST_DEK).unwrap()
     }
 
@@ -390,8 +391,20 @@ mod tests {
     #[test]
     fn stub_orchestrate_is_byte_identical_to_deterministic() {
         let db = temp_db("stub-eq");
-        seed_note(&db, "m-self", "Budget Planning", "Budget planning and hiring runway.", None);
-        seed_note(&db, "m-prior", "Q2 Budget", "Budget planning and hiring runway decisions.", None);
+        seed_note(
+            &db,
+            "m-self",
+            "Budget Planning",
+            "Budget planning and hiring runway.",
+            None,
+        );
+        seed_note(
+            &db,
+            "m-prior",
+            "Q2 Budget",
+            "Budget planning and hiring runway decisions.",
+            None,
+        );
         let nothing = HashSet::new();
         let config = cfg();
 
@@ -413,11 +426,19 @@ mod tests {
             &config,
         );
 
-        assert_eq!(orch, det, "stub-shim must be byte-identical to the deterministic path");
-        assert!(orch.is_some(), "the related prior note should ground the new note");
+        assert_eq!(
+            orch, det,
+            "stub-shim must be byte-identical to the deterministic path"
+        );
+        assert!(
+            orch.is_some(),
+            "the related prior note should ground the new note"
+        );
         // The stub path must NOT write a flywheel correction (only the brain path does).
         assert_eq!(
-            db.list_corrections("context_plan", 100, &nothing).unwrap().len(),
+            db.list_corrections("context_plan", 100, &nothing)
+                .unwrap()
+                .len(),
             0,
             "stub path captures no context_plan correction"
         );
@@ -429,12 +450,26 @@ mod tests {
     fn brain_branch_runs_gated_tool_assembles_corpus_and_logs_one_plan() {
         let db = temp_db("brain");
         // Both notes match the search term; the self meeting must be filtered out of the corpus.
-        seed_note(&db, "m-self", "Budget Planning", "ACME budget planning and hiring runway.", None);
-        seed_note(&db, "m-prior", "Q2 Budget", "ACME budget planning and hiring runway decisions.", None);
+        seed_note(
+            &db,
+            "m-self",
+            "Budget Planning",
+            "ACME budget planning and hiring runway.",
+            None,
+        );
+        seed_note(
+            &db,
+            "m-prior",
+            "Q2 Budget",
+            "ACME budget planning and hiring runway decisions.",
+            None,
+        );
         let nothing = HashSet::new();
         let config = cfg();
 
-        let reasoner = MockReasoner { plan: plan_search("budget") };
+        let reasoner = MockReasoner {
+            plan: plan_search("budget"),
+        };
         let corpus = orchestrate_context(
             &reasoner,
             &db,
@@ -446,18 +481,31 @@ mod tests {
         )
         .expect("brain path should surface the related prior meeting");
 
-        assert!(corpus.contains("id:m-prior"), "related prior meeting must be cited: {corpus}");
-        assert!(!corpus.contains("id:m-self"), "the meeting being summarized must be self-excluded: {corpus}");
+        assert!(
+            corpus.contains("id:m-prior"),
+            "related prior meeting must be cited: {corpus}"
+        );
+        assert!(
+            !corpus.contains("id:m-self"),
+            "the meeting being summarized must be self-excluded: {corpus}"
+        );
 
         // Exactly ONE flywheel correction, attributed to this meeting, accepted, owner local.
         let corrs = db.list_corrections("context_plan", 100, &nothing).unwrap();
-        assert_eq!(corrs.len(), 1, "the brain path must capture exactly one context_plan correction");
+        assert_eq!(
+            corrs.len(),
+            1,
+            "the brain path must capture exactly one context_plan correction"
+        );
         let c = &corrs[0];
         assert_eq!(c.kind, "context_plan");
         assert_eq!(c.meeting_id.as_deref(), Some("m-self"));
         assert!(c.accepted);
         assert_eq!(c.owner_id, "local");
-        assert!(c.model_output.contains("retrieval_queries"), "plan JSON captured");
+        assert!(
+            c.model_output.contains("retrieval_queries"),
+            "plan JSON captured"
+        );
     }
 
     /// GATE: with the brain plan targeting a SEALED-not-unlocked related meeting, its content must
@@ -467,7 +515,13 @@ mod tests {
     #[test]
     fn brain_branch_gate_excludes_sealed_until_unlocked() {
         let db = temp_db("brain-gate");
-        seed_note(&db, "m-self", "Acquisition", "PROJECT atlas acquisition terms.", None);
+        seed_note(
+            &db,
+            "m-self",
+            "Acquisition",
+            "PROJECT atlas acquisition terms.",
+            None,
+        );
         db.insert_folder(&Folder {
             id: "f-lock".to_string(),
             name: "Secret".to_string(),
@@ -487,7 +541,9 @@ mod tests {
         db.set_folder_locked("f-lock", true, None).unwrap();
         let config = cfg();
 
-        let reasoner = MockReasoner { plan: plan_search("atlas acquisition") };
+        let reasoner = MockReasoner {
+            plan: plan_search("atlas acquisition"),
+        };
 
         // Sealed + not unlocked → the sealed meeting must not surface in the corpus.
         let nothing = HashSet::new();
@@ -501,7 +557,10 @@ mod tests {
             &config,
         );
         assert!(
-            sealed.as_deref().map(|c| !c.contains("SEALED-SECRET-XYZ") && !c.contains("id:m-sealed")).unwrap_or(true),
+            sealed
+                .as_deref()
+                .map(|c| !c.contains("SEALED-SECRET-XYZ") && !c.contains("id:m-sealed"))
+                .unwrap_or(true),
             "sealed-not-unlocked content leaked into the brain corpus (gate violation): {sealed:?}"
         );
 
@@ -518,7 +577,10 @@ mod tests {
             &config,
         );
         assert!(
-            opened.as_deref().map(|c| c.contains("id:m-sealed")).unwrap_or(false),
+            opened
+                .as_deref()
+                .map(|c| c.contains("id:m-sealed"))
+                .unwrap_or(false),
             "an unlocked folder's meeting must reappear in the brain corpus: {opened:?}"
         );
     }
@@ -529,8 +591,20 @@ mod tests {
     #[test]
     fn brain_error_falls_back_to_deterministic() {
         let db = temp_db("brain-err");
-        seed_note(&db, "m-self", "Budget Planning", "Budget planning and hiring runway.", None);
-        seed_note(&db, "m-prior", "Q2 Budget", "Budget planning and hiring runway decisions.", None);
+        seed_note(
+            &db,
+            "m-self",
+            "Budget Planning",
+            "Budget planning and hiring runway.",
+            None,
+        );
+        seed_note(
+            &db,
+            "m-prior",
+            "Q2 Budget",
+            "Budget planning and hiring runway decisions.",
+            None,
+        );
         let nothing = HashSet::new();
         let config = cfg();
 
@@ -552,10 +626,15 @@ mod tests {
             &config,
         );
 
-        assert_eq!(orch, det, "a reasoner error must fall back byte-identically to the deterministic floor");
+        assert_eq!(
+            orch, det,
+            "a reasoner error must fall back byte-identically to the deterministic floor"
+        );
         // The brain did not produce a plan → no flywheel correction.
         assert_eq!(
-            db.list_corrections("context_plan", 100, &nothing).unwrap().len(),
+            db.list_corrections("context_plan", 100, &nothing)
+                .unwrap()
+                .len(),
             0,
             "a failed brain must not capture a context_plan correction"
         );

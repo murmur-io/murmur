@@ -111,11 +111,16 @@ pub fn run_agentic_loop(
 
         if let Some(name) = v.get("tool").and_then(|t| t.as_str()) {
             let name = name.to_string();
-            let args = v.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let args = v
+                .get("args")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
             let key = format!("{name}:{args}");
             if seen.contains(&key) {
                 // Already retrieved this exact call — tell the model, don't burn the budget on a repeat.
-                transcript.push_str(&format!("\n\n[{name} already retrieved — choose a different tool or answer]"));
+                transcript.push_str(&format!(
+                    "\n\n[{name} already retrieved — choose a different tool or answer]"
+                ));
                 continue;
             }
             seen.push(key);
@@ -131,8 +136,14 @@ pub fn run_agentic_loop(
                     }
                     gathered.push_str(out);
                     gathered.push_str("\n\n");
-                    transcript.push_str(&format!("\n\n[{name} result]\n{}", truncate(out, RESULT_BUDGET)));
-                    steps.push(AgentStep { tool: name, ok: true });
+                    transcript.push_str(&format!(
+                        "\n\n[{name} result]\n{}",
+                        truncate(out, RESULT_BUDGET)
+                    ));
+                    steps.push(AgentStep {
+                        tool: name,
+                        ok: true,
+                    });
                 }
                 Err(e) => {
                     // PII rule: log the tool NAME + that it failed — never args/results.
@@ -140,8 +151,12 @@ pub fn run_agentic_loop(
                     if let Some(s) = sink {
                         s.tool_done(&name, false, 0);
                     }
-                    transcript.push_str(&format!("\n\n[{name} failed — try another tool or answer]"));
-                    steps.push(AgentStep { tool: name, ok: false });
+                    transcript
+                        .push_str(&format!("\n\n[{name} failed — try another tool or answer]"));
+                    steps.push(AgentStep {
+                        tool: name,
+                        ok: false,
+                    });
                 }
             }
             continue;
@@ -192,10 +207,14 @@ mod tests {
     }
     impl ScriptReasoner {
         fn ok(steps: Vec<Value>) -> Self {
-            Self { script: Mutex::new(steps.into_iter().map(Ok).collect()) }
+            Self {
+                script: Mutex::new(steps.into_iter().map(Ok).collect()),
+            }
         }
         fn with(seq: Vec<Result<Value>>) -> Self {
-            Self { script: Mutex::new(seq.into_iter().collect()) }
+            Self {
+                script: Mutex::new(seq.into_iter().collect()),
+            }
         }
     }
     impl LocalReasoner for ScriptReasoner {
@@ -235,7 +254,10 @@ mod tests {
             self.events.lock().unwrap().push(format!("run:{tool}"));
         }
         fn tool_done(&self, tool: &str, ok: bool, _n: usize) {
-            self.events.lock().unwrap().push(format!("done:{tool}:{ok}"));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("done:{tool}:{ok}"));
         }
     }
 
@@ -246,9 +268,16 @@ mod tests {
             serde_json::json!({ "answer": "Atlas ships Friday." }),
         ]);
         let sink = RecordingSink::default();
-        let out = run_agentic_loop(&r, "sys", "when does atlas ship?", &EchoExec, 4, Some(&sink as &dyn DeltaSink))
-            .unwrap()
-            .expect("converged → Some");
+        let out = run_agentic_loop(
+            &r,
+            "sys",
+            "when does atlas ship?",
+            &EchoExec,
+            4,
+            Some(&sink as &dyn DeltaSink),
+        )
+        .unwrap()
+        .expect("converged → Some");
         assert_eq!(out.answer, "Atlas ships Friday.");
         assert_eq!(out.steps.len(), 1);
         assert_eq!(out.steps[0].tool, "search_meetings");
@@ -256,7 +285,10 @@ mod tests {
         // The live trace streamed running→done for the one tool.
         assert_eq!(
             *sink.events.lock().unwrap(),
-            vec!["run:search_meetings".to_string(), "done:search_meetings:true".to_string()]
+            vec![
+                "run:search_meetings".to_string(),
+                "done:search_meetings:true".to_string()
+            ]
         );
     }
 
@@ -270,7 +302,10 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "b" } }),
         ]);
         let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 2, None).unwrap();
-        assert!(out.is_none(), "non-convergence must return Ok(None), not a fabricated answer");
+        assert!(
+            out.is_none(),
+            "non-convergence must return Ok(None), not a fabricated answer"
+        );
     }
 
     #[test]
@@ -279,7 +314,10 @@ mod tests {
         // so the caller can floor + emit needs_consent.
         let r = ScriptReasoner::with(vec![Err(AppError::Unavailable("no consent".into()))]);
         let res = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None);
-        assert!(matches!(res, Err(AppError::Unavailable(_))), "Unavailable must propagate");
+        assert!(
+            matches!(res, Err(AppError::Unavailable(_))),
+            "Unavailable must propagate"
+        );
     }
 
     #[test]
@@ -297,10 +335,15 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": {} }),
             serde_json::json!({ "answer": "done despite the error" }),
         ]);
-        let out = run_agentic_loop(&r, "sys", "q", &ErrExec, 4, None).unwrap().unwrap();
+        let out = run_agentic_loop(&r, "sys", "q", &ErrExec, 4, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(out.answer, "done despite the error");
         assert_eq!(out.steps.len(), 1);
-        assert!(!out.steps[0].ok, "a failed tool is recorded ok=false, never panics");
+        assert!(
+            !out.steps[0].ok,
+            "a failed tool is recorded ok=false, never panics"
+        );
     }
 
     #[test]
@@ -312,8 +355,14 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "x" } }),
             serde_json::json!({ "answer": "answered after a dedup" }),
         ]);
-        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 5, None).unwrap().unwrap();
+        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 5, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(out.answer, "answered after a dedup");
-        assert_eq!(out.steps.len(), 1, "the duplicate call must not be executed again");
+        assert_eq!(
+            out.steps.len(),
+            1,
+            "the duplicate call must not be executed again"
+        );
     }
 }

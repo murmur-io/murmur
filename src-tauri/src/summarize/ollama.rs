@@ -64,10 +64,7 @@ impl OllamaProvider {
             .send()
             .await
             .map_err(|e| {
-                AppError::Unavailable(format!(
-                    "Ollama not reachable at {} ({e})",
-                    self.base_url
-                ))
+                AppError::Unavailable(format!("Ollama not reachable at {} ({e})", self.base_url))
             })?;
 
         let status = resp.status();
@@ -241,7 +238,10 @@ mod tests {
     #[test]
     fn parse_tags_response_malformed_body_returns_empty() {
         let names = parse_tags_response("not json at all").unwrap();
-        assert!(names.is_empty(), "malformed body must degrade to an empty list");
+        assert!(
+            names.is_empty(),
+            "malformed body must degrade to an empty list"
+        );
     }
 
     /// An empty models array returns an empty list cleanly.

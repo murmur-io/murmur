@@ -167,7 +167,10 @@ pub fn annotate_unverified(note_markdown: &str, segments: &[Segment]) -> String 
 /// Distinct, lowercased, stopword-stripped content tokens (reusing the retrieval tokenizer +
 /// stopword list — one source of truth, PL-aware).
 fn content_tokens(s: &str) -> HashSet<String> {
-    tokenize(s).into_iter().filter(|t| !is_stopword(t)).collect()
+    tokenize(s)
+        .into_iter()
+        .filter(|t| !is_stopword(t))
+        .collect()
 }
 
 /// Strip a leading list / checklist / numbered marker from a trimmed line so the marker glyphs
@@ -189,7 +192,10 @@ fn unit_content(trimmed: &str) -> &str {
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
     if digits > 0 {
         let after = &trimmed[digits..];
-        if let Some(r) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+        if let Some(r) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
             return r;
         }
     }
@@ -308,7 +314,10 @@ mod tests {
     #[test]
     fn unsupported_action_item_gets_unverified() {
         let segments = vec![
-            seg("we shipped the login page and the payment flow this week", None),
+            seg(
+                "we shipped the login page and the payment flow this week",
+                None,
+            ),
             seg("the database migration is done", None),
         ];
         let note = "## Summary\n\nThe team shipped the login page.\n\n## Action items\n\n- [ ] Anna own the rollout by Friday\n";
@@ -320,7 +329,10 @@ mod tests {
             "unsupported action item must gain a plain `> unverified` line; got:\n{out}"
         );
         // No overlapping segment ⇒ NOT the low-audio variant.
-        assert!(!out.contains("low audio confidence"), "no segment overlaps ⇒ plain marker");
+        assert!(
+            !out.contains("low audio confidence"),
+            "no segment overlaps ⇒ plain marker"
+        );
         // The supported summary sentence (login/page/shipped are in the transcript) stays clean.
         assert!(
             out.contains("The team shipped the login page.\n\n## Action items"),
@@ -372,7 +384,10 @@ mod tests {
     #[test]
     fn action_item_parsing_unchanged_after_annotation() {
         use crate::summarize::action_items::parse_action_items;
-        let segments = vec![seg("we agreed to ship the invoice export next sprint", None)];
+        let segments = vec![seg(
+            "we agreed to ship the invoice export next sprint",
+            None,
+        )];
         let note = "## Action items\n\n- [ ] Bob — ship the invoice export next sprint\n- [ ] Zoltan — colonize the moon by Q3\n";
         let before = parse_action_items(note);
         let out = annotate_unverified(note, &segments);
@@ -394,8 +409,12 @@ mod tests {
     #[test]
     fn low_confidence_best_overlap_names_the_cause() {
         // The one segment overlaps the unit on "quarterly" but was decoded at low confidence.
-        let segments = vec![seg("mumbling something about the quarterly figures", Some(0.30))];
-        let note = "## Summary\n\nThe quarterly revenue tripled after the acquisition finally closed.\n";
+        let segments = vec![seg(
+            "mumbling something about the quarterly figures",
+            Some(0.30),
+        )];
+        let note =
+            "## Summary\n\nThe quarterly revenue tripled after the acquisition finally closed.\n";
         let out = annotate_unverified(note, &segments);
         assert!(
             out.contains("> unverified (low audio confidence)"),
@@ -409,7 +428,8 @@ mod tests {
     #[test]
     fn high_confidence_overlap_stays_plain() {
         let segments = vec![seg("something about the quarterly figures", Some(0.95))];
-        let note = "## Summary\n\nThe quarterly revenue tripled after the acquisition finally closed.\n";
+        let note =
+            "## Summary\n\nThe quarterly revenue tripled after the acquisition finally closed.\n";
         let out = annotate_unverified(note, &segments);
         assert!(out.contains("> unverified"));
         assert!(
@@ -422,9 +442,15 @@ mod tests {
     /// even if unsupported — avoids annotating bare labels / two-word bullets.
     #[test]
     fn short_unit_is_not_flagged() {
-        let segments = vec![seg("we discussed the budget and the roadmap at length", None)];
+        let segments = vec![seg(
+            "we discussed the budget and the roadmap at length",
+            None,
+        )];
         let note = "## Summary\n\n- Xanadu teleporter\n";
         let out = annotate_unverified(note, &segments);
-        assert_eq!(out, note, "a 2-token unsupported bullet is below the min and stays clean");
+        assert_eq!(
+            out, note,
+            "a 2-token unsupported bullet is below the min and stays clean"
+        );
     }
 }

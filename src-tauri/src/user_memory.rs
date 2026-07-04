@@ -107,7 +107,11 @@ impl UserMemory {
     /// by `get_user_memory` when the config gate is off so the FE can render a distinct "memory is
     /// off" affordance instead of an "empty memory" one — and NOTHING content-bearing is surfaced.
     pub fn disabled() -> Self {
-        Self { facts: Vec::new(), brief: String::new(), disabled: true }
+        Self {
+            facts: Vec::new(),
+            brief: String::new(),
+            disabled: true,
+        }
     }
 }
 
@@ -384,9 +388,18 @@ mod tests {
     #[test]
     fn candidates_from_raw_scopes_to_user_and_drops_empties() {
         let raw = vec![
-            RawUserFact { predicate: "prefers".into(), object: "Polish replies".into() },
-            RawUserFact { predicate: "".into(), object: "x".into() },
-            RawUserFact { predicate: "role".into(), object: "".into() },
+            RawUserFact {
+                predicate: "prefers".into(),
+                object: "Polish replies".into(),
+            },
+            RawUserFact {
+                predicate: "".into(),
+                object: "x".into(),
+            },
+            RawUserFact {
+                predicate: "role".into(),
+                object: "".into(),
+            },
         ];
         let cands = candidates_from_raw(raw);
         assert_eq!(cands.len(), 1);

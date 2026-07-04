@@ -588,7 +588,11 @@ mod tests {
         let buf = shared.samples.lock().unwrap();
         // 1 live frame + 3 muted frames (6 samples / 2 channels) = 4 samples, no dropped frames.
         assert_eq!(buf.len(), 4, "muted span must keep the stream full-length");
-        assert_eq!(&buf[1..], &[0.0f32, 0.0, 0.0], "muted frames must be silence");
+        assert_eq!(
+            &buf[1..],
+            &[0.0f32, 0.0, 0.0],
+            "muted frames must be silence"
+        );
         assert_eq!(shared.load_peak(), 0.0, "meter reads 0 while muted");
     }
 
@@ -608,7 +612,11 @@ mod tests {
         shared.set_muted(false);
         accumulate_frames(&shared, &[0.5f32], 1);
         let buf = shared.samples.lock().unwrap();
-        assert_eq!(&*buf, &[0.0f32, 0.5f32], "silence then real audio after unmute");
+        assert_eq!(
+            &*buf,
+            &[0.0f32, 0.5f32],
+            "silence then real audio after unmute"
+        );
     }
 
     /// S2 hard cap: once the buffer reaches `cap_samples` the accumulator stops growing it and
@@ -654,7 +662,11 @@ mod tests {
         for _ in 0..1000 {
             accumulate_frames(&shared, &[0.5f32], 1);
         }
-        assert_eq!(shared.samples.lock().unwrap().len(), 1000, "no cap applied at 0");
+        assert_eq!(
+            shared.samples.lock().unwrap().len(),
+            1000,
+            "no cap applied at 0"
+        );
         assert!(!shared.is_capped());
     }
 

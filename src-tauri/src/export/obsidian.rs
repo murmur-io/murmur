@@ -17,8 +17,7 @@ fn sanitize_title(title: &str) -> String {
     let replaced: String = title
         .chars()
         .map(|c| match c {
-            '*' | '"' | '\\' | '/' | '<' | '>' | ':' | '|' | '?' | '#' | '^' | '['
-            | ']' => ' ',
+            '*' | '"' | '\\' | '/' | '<' | '>' | ':' | '|' | '?' | '#' | '^' | '[' | ']' => ' ',
             // Control chars (incl. newlines/tabs) → space.
             c if c.is_control() => ' ',
             c => c,
@@ -58,7 +57,9 @@ fn date_prefix(date_iso: &str) -> Result<String> {
     let date_bits: Vec<&str> = date_part.split('-').collect();
     if date_bits.len() != 3
         || date_bits[0].len() != 4
-        || !date_bits.iter().all(|b| b.chars().all(|c| c.is_ascii_digit()))
+        || !date_bits
+            .iter()
+            .all(|b| b.chars().all(|c| c.is_ascii_digit()))
     {
         return Err(AppError::Export(format!(
             "date_iso is not YYYY-MM-DD: {date_iso}"
@@ -141,11 +142,7 @@ pub fn write_note(
     // Atomic write: write to a hidden temp dotfile in the SAME directory (so the
     // rename is a same-filesystem atomic operation), fsync, then rename over the
     // final path. The temp name is unique to avoid clobbering a concurrent write.
-    let tmp_name = format!(
-        ".{}.{}.tmp",
-        sanitize_for_tmp(&stem),
-        std::process::id()
-    );
+    let tmp_name = format!(".{}.{}.tmp", sanitize_for_tmp(&stem), std::process::id());
     let tmp_path = target_dir.join(tmp_name);
 
     write_and_sync(&tmp_path, markdown).inspect_err(|_| {
@@ -211,7 +208,13 @@ fn path_exists(path: &Path) -> Result<bool> {
 /// Make a stem safe to embed in the temp dotfile name (no path separators).
 fn sanitize_for_tmp(stem: &str) -> String {
     stem.chars()
-        .map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -269,8 +272,7 @@ fn collect_md_stems(dir: &Path, out: &mut Vec<String>) -> Result<()> {
     };
 
     for entry in entries {
-        let entry =
-            entry.map_err(|e| AppError::Export(format!("dir entry failed: {e}")))?;
+        let entry = entry.map_err(|e| AppError::Export(format!("dir entry failed: {e}")))?;
         let path = entry.path();
 
         // Skip hidden files/dirs (covers `.obsidian`, `.trash`, our `.tmp` files).
@@ -286,8 +288,7 @@ fn collect_md_stems(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 
         if file_type.is_dir() {
             collect_md_stems(&path, out)?;
-        } else if file_type.is_file() && path.extension().and_then(OsStr::to_str) == Some("md")
-        {
+        } else if file_type.is_file() && path.extension().and_then(OsStr::to_str) == Some("md") {
             if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
                 out.push(stem.to_string());
             }
@@ -441,11 +442,7 @@ pub fn detect_vaults_from(config_path: &Path) -> Result<Vec<DetectedVault>> {
     let bytes = match std::fs::read(config_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(AppError::Export(format!(
-                "read obsidian.json failed: {e}"
-            )))
-        }
+        Err(e) => return Err(AppError::Export(format!("read obsidian.json failed: {e}"))),
     };
 
     let config: ObsidianConfig = serde_json::from_slice(&bytes)
@@ -474,11 +471,7 @@ pub fn detect_vaults_from(config_path: &Path) -> Result<Vec<DetectedVault>> {
         .collect();
 
     // Stable ordering: open vaults first, then alphabetical by name.
-    vaults.sort_by(|a, b| {
-        b.is_open
-            .cmp(&a.is_open)
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    vaults.sort_by(|a, b| b.is_open.cmp(&a.is_open).then_with(|| a.name.cmp(&b.name)));
     Ok(vaults)
 }
 
@@ -706,7 +699,10 @@ mod tests {
 
     #[test]
     fn sanitize_strips_reserved_chars() {
-        assert_eq!(sanitize_title("Q3 Planning / Roadmap"), "Q3 Planning Roadmap");
+        assert_eq!(
+            sanitize_title("Q3 Planning / Roadmap"),
+            "Q3 Planning Roadmap"
+        );
         assert_eq!(sanitize_title("a:b|c?d*e"), "a b c d e");
         assert_eq!(sanitize_title("  weird   spaces  "), "weird spaces");
         assert_eq!(sanitize_title(""), "Untitled");
@@ -716,8 +712,7 @@ mod tests {
     #[test]
     fn write_note_creates_expected_filename() {
         let dir = tmp_dir("fname");
-        let path = write_note(&dir, None, "Team Sync", "2026-06-24T14:30:00Z", "# body")
-            .unwrap();
+        let path = write_note(&dir, None, "Team Sync", "2026-06-24T14:30:00Z", "# body").unwrap();
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),
             "2026-06-24 1430 - Team Sync.md"
@@ -728,14 +723,7 @@ mod tests {
     #[test]
     fn write_note_into_subfolder() {
         let dir = tmp_dir("sub");
-        let path = write_note(
-            &dir,
-            Some("Meetings"),
-            "Standup",
-            "2026-06-24",
-            "content",
-        )
-        .unwrap();
+        let path = write_note(&dir, Some("Meetings"), "Standup", "2026-06-24", "content").unwrap();
         assert!(path.starts_with(dir.join("Meetings")));
         assert!(path.exists());
     }
@@ -849,12 +837,22 @@ mod tests {
     #[test]
     fn inject_provenance_adds_keys_to_clean_frontmatter() {
         let md = "---\ntitle: Sprint Planning\ndate: 2026-06-30\n---\n# Sprint Planning\n\nBody.\n";
-        let out = inject_provenance_frontmatter(md, "gateway", Some("gpt-4o"), Some("gpt-4o-2024-11-20"));
-        assert!(out.contains("ai-provider: gateway"), "provider injected: {out}");
+        let out =
+            inject_provenance_frontmatter(md, "gateway", Some("gpt-4o"), Some("gpt-4o-2024-11-20"));
+        assert!(
+            out.contains("ai-provider: gateway"),
+            "provider injected: {out}"
+        );
         // model_served takes precedence over model_requested.
-        assert!(out.contains("ai-model: gpt-4o-2024-11-20"), "served model injected: {out}");
+        assert!(
+            out.contains("ai-model: gpt-4o-2024-11-20"),
+            "served model injected: {out}"
+        );
         // Original keys preserved.
-        assert!(out.contains("title: Sprint Planning"), "original key preserved: {out}");
+        assert!(
+            out.contains("title: Sprint Planning"),
+            "original key preserved: {out}"
+        );
         // Still a valid YAML fence.
         assert!(out.starts_with("---\n"), "fence preserved");
         assert!(out.contains("\n---\n"), "closing fence preserved");
@@ -865,7 +863,10 @@ mod tests {
     fn inject_provenance_falls_back_to_model_requested_when_served_absent() {
         let md = "---\ntitle: T\n---\nBody.";
         let out = inject_provenance_frontmatter(md, "anthropic", Some("claude-opus-4-8"), None);
-        assert!(out.contains("ai-model: claude-opus-4-8"), "fallback to requested: {out}");
+        assert!(
+            out.contains("ai-model: claude-opus-4-8"),
+            "fallback to requested: {out}"
+        );
         assert!(out.contains("ai-provider: anthropic"), "provider: {out}");
     }
 
@@ -874,8 +875,14 @@ mod tests {
     fn inject_provenance_provider_only_when_no_model() {
         let md = "---\ndate: 2026-06-30\n---\nBody.";
         let out = inject_provenance_frontmatter(md, "claude_code", None, None);
-        assert!(out.contains("ai-provider: claude_code"), "provider injected: {out}");
-        assert!(!out.contains("ai-model:"), "no model key when both absent: {out}");
+        assert!(
+            out.contains("ai-provider: claude_code"),
+            "provider injected: {out}"
+        );
+        assert!(
+            !out.contains("ai-model:"),
+            "no model key when both absent: {out}"
+        );
     }
 
     /// When provider is empty and both model fields are `None`, the markdown is returned UNCHANGED.
@@ -894,8 +901,16 @@ mod tests {
         let twice = inject_provenance_frontmatter(&once, "gateway", Some("gpt-4o"), None);
         assert_eq!(once, twice, "second inject is a no-op");
         // Only one occurrence of each key.
-        assert_eq!(once.matches("ai-provider:").count(), 1, "no duplicate provider key");
-        assert_eq!(once.matches("ai-model:").count(), 1, "no duplicate model key");
+        assert_eq!(
+            once.matches("ai-provider:").count(),
+            1,
+            "no duplicate provider key"
+        );
+        assert_eq!(
+            once.matches("ai-model:").count(),
+            1,
+            "no duplicate model key"
+        );
     }
 
     /// Notes WITHOUT a `---` frontmatter block are returned UNCHANGED.
@@ -915,8 +930,14 @@ mod tests {
         let close = out.find("\n---\n").expect("closing fence present");
         let fm_end = close;
         let fm = &out[..fm_end];
-        assert!(fm.contains("ai-provider: anthropic"), "provider key inside fm: {fm}");
-        assert!(fm.contains("ai-model: claude-opus-4-8"), "model key inside fm: {fm}");
+        assert!(
+            fm.contains("ai-provider: anthropic"),
+            "provider key inside fm: {fm}"
+        );
+        assert!(
+            fm.contains("ai-model: claude-opus-4-8"),
+            "model key inside fm: {fm}"
+        );
         // Body untouched.
         assert!(out.ends_with("# Body\n"), "body unchanged: {out}");
     }
@@ -929,9 +950,18 @@ mod tests {
     fn privacy_receipt_local_stamps_zero_cloud_calls_only() {
         let md = "---\ntitle: T\ndate: 2026-07-03\n---\n# T\n\nBody.\n";
         let out = inject_privacy_receipt_frontmatter(md, true, Some("api.anthropic.com"), Some(9));
-        assert!(out.contains("privacy-cloud-calls: 0"), "local headline present: {out}");
-        assert!(!out.contains("privacy-egress-host"), "no host for a local note: {out}");
-        assert!(!out.contains("privacy-pii-redacted"), "no pii key for a local note: {out}");
+        assert!(
+            out.contains("privacy-cloud-calls: 0"),
+            "local headline present: {out}"
+        );
+        assert!(
+            !out.contains("privacy-egress-host"),
+            "no host for a local note: {out}"
+        );
+        assert!(
+            !out.contains("privacy-pii-redacted"),
+            "no pii key for a local note: {out}"
+        );
     }
 
     /// CLOUD summary ⇒ the non-PII destination host + the real redaction count are stamped, and no
@@ -939,8 +969,12 @@ mod tests {
     #[test]
     fn privacy_receipt_cloud_stamps_host_and_pii_count() {
         let md = "---\ntitle: T\n---\nBody.";
-        let out = inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(14));
-        assert!(out.contains("privacy-egress-host: api.anthropic.com"), "host: {out}");
+        let out =
+            inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(14));
+        assert!(
+            out.contains("privacy-egress-host: api.anthropic.com"),
+            "host: {out}"
+        );
         assert!(out.contains("privacy-pii-redacted: 14"), "pii count: {out}");
         assert!(
             !out.contains("privacy-cloud-calls"),
@@ -957,14 +991,32 @@ mod tests {
         let out = inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(3));
         // It actually stamped something (not a no-op).
         assert_ne!(out, md, "the receipt was injected");
-        assert!(out.contains("privacy-egress-host: api.anthropic.com"), "host stamped: {out}");
-        assert!(out.contains("privacy-pii-redacted: 3"), "count stamped: {out}");
+        assert!(
+            out.contains("privacy-egress-host: api.anthropic.com"),
+            "host stamped: {out}"
+        );
+        assert!(
+            out.contains("privacy-pii-redacted: 3"),
+            "count stamped: {out}"
+        );
         // The body PII survives untouched (passthrough) — but NEVER inside an injected key.
-        assert!(out.contains("bob@example.com"), "body PII preserved as passthrough");
+        assert!(
+            out.contains("bob@example.com"),
+            "body PII preserved as passthrough"
+        );
         for line in out.lines().filter(|l| l.starts_with("privacy-")) {
-            assert!(!line.contains("bob@example.com"), "no email in a privacy key: {line}");
-            assert!(!line.contains("555 0199"), "no phone in a privacy key: {line}");
-            assert!(!line.contains("Board Sync"), "no title/body text in a privacy key: {line}");
+            assert!(
+                !line.contains("bob@example.com"),
+                "no email in a privacy key: {line}"
+            );
+            assert!(
+                !line.contains("555 0199"),
+                "no phone in a privacy key: {line}"
+            );
+            assert!(
+                !line.contains("Board Sync"),
+                "no title/body text in a privacy key: {line}"
+            );
         }
         // The ONLY lines present in the output but not the input are `privacy-*` keys.
         let input_lines: std::collections::HashSet<&str> = md.lines().collect();
@@ -983,15 +1035,22 @@ mod tests {
     #[test]
     fn privacy_receipt_keys_are_inside_the_frontmatter_block() {
         let md = "---\ntitle: T\ndate: 2026-07-03\n---\n# Body\n";
-        let out =
-            inject_privacy_receipt_frontmatter(md, false, Some("claude_code (Anthropic CLI)"), Some(2));
+        let out = inject_privacy_receipt_frontmatter(
+            md,
+            false,
+            Some("claude_code (Anthropic CLI)"),
+            Some(2),
+        );
         let close = out.find("\n---\n").expect("closing fence present");
         let fm = &out[..close];
         assert!(
             fm.contains("privacy-egress-host: claude_code (Anthropic CLI)"),
             "host key inside fm: {fm}"
         );
-        assert!(fm.contains("privacy-pii-redacted: 2"), "pii key inside fm: {fm}");
+        assert!(
+            fm.contains("privacy-pii-redacted: 2"),
+            "pii key inside fm: {fm}"
+        );
         assert!(out.ends_with("# Body\n"), "body unchanged: {out}");
     }
 
@@ -999,12 +1058,21 @@ mod tests {
     #[test]
     fn privacy_receipt_is_idempotent() {
         let md = "---\ntitle: T\n---\nBody.";
-        let once = inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(7));
+        let once =
+            inject_privacy_receipt_frontmatter(md, false, Some("api.anthropic.com"), Some(7));
         let twice =
             inject_privacy_receipt_frontmatter(&once, false, Some("api.anthropic.com"), Some(7));
         assert_eq!(once, twice, "second inject is a no-op");
-        assert_eq!(once.matches("privacy-egress-host:").count(), 1, "no duplicate host key");
-        assert_eq!(once.matches("privacy-pii-redacted:").count(), 1, "no duplicate pii key");
+        assert_eq!(
+            once.matches("privacy-egress-host:").count(),
+            1,
+            "no duplicate host key"
+        );
+        assert_eq!(
+            once.matches("privacy-pii-redacted:").count(),
+            1,
+            "no duplicate pii key"
+        );
     }
 
     /// Notes WITHOUT a `---` frontmatter block are returned byte-identical (even with PII in body).
@@ -1021,6 +1089,9 @@ mod tests {
     fn privacy_receipt_cloud_without_facts_is_noop() {
         let md = "---\ntitle: T\n---\nBody.";
         let out = inject_privacy_receipt_frontmatter(md, false, None, None);
-        assert_eq!(out, md, "cloud with no host/count → nothing to honestly stamp");
+        assert_eq!(
+            out, md,
+            "cloud with no host/count → nothing to honestly stamp"
+        );
     }
 }

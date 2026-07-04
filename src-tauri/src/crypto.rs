@@ -52,7 +52,13 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> 
     getrandom::getrandom(&mut nonce_bytes)
         .map_err(|e| AppError::Storage(format!("nonce RNG: {e}")))?;
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| AppError::Storage(format!("AES-GCM encrypt: {e}")))?;
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -144,8 +150,8 @@ pub fn decrypt_file(
     dest: &std::path::Path,
     aad: &[u8],
 ) -> Result<()> {
-    let blob = std::fs::read(src)
-        .map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
+    let blob =
+        std::fs::read(src).map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
     let plaintext = decrypt(key, &blob, aad)?;
     std::fs::write(dest, &plaintext)
         .map_err(|e| AppError::Storage(format!("write decrypted audio: {e}")))?;
@@ -170,8 +176,8 @@ pub fn decrypt_file_multi(
     dest: &std::path::Path,
     aads: &[&[u8]],
 ) -> Result<()> {
-    let blob = std::fs::read(src)
-        .map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
+    let blob =
+        std::fs::read(src).map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
     for aad in aads {
         if let Ok(pt) = decrypt(key, &blob, aad) {
             std::fs::write(dest, &pt)
@@ -193,7 +199,11 @@ mod tests {
         let k = random_key().unwrap();
         let pt = "locked note markdown 🔒".as_bytes();
         let blob = encrypt(&k, pt, b"folder-42").unwrap();
-        assert_ne!(&blob[NONCE_LEN..], pt, "ciphertext must differ from plaintext");
+        assert_ne!(
+            &blob[NONCE_LEN..],
+            pt,
+            "ciphertext must differ from plaintext"
+        );
         assert_eq!(decrypt(&k, &blob, b"folder-42").unwrap(), pt);
     }
 
@@ -227,10 +237,17 @@ mod tests {
         // New code reads it WITH a context AAD → must succeed via the empty-AAD fallback…
         let (out, used) = decrypt_with_aad(&k, &legacy_blob, b"folder-7|meeting-1").unwrap();
         assert_eq!(out, pt, "a pre-AAD blob must still decrypt (no bricking)");
-        assert_eq!(used, AadUsed::Legacy, "must report it read a legacy blob so caller re-binds");
+        assert_eq!(
+            used,
+            AadUsed::Legacy,
+            "must report it read a legacy blob so caller re-binds"
+        );
 
         // …and the plain `decrypt` wrapper agrees.
-        assert_eq!(decrypt(&k, &legacy_blob, b"folder-7|meeting-1").unwrap(), pt);
+        assert_eq!(
+            decrypt(&k, &legacy_blob, b"folder-7|meeting-1").unwrap(),
+            pt
+        );
     }
 
     /// A blob bound to context A must FAIL to decrypt when presented as context B (a swapped/replayed
@@ -245,7 +262,10 @@ mod tests {
         assert_eq!(decrypt(&k, &blob_a, b"folder-A").unwrap(), pt);
         // Wrong context (attacker moved the ciphertext into folder B) → fails closed.
         let res = decrypt(&k, &blob_a, b"folder-B");
-        assert!(res.is_err(), "a blob bound to folder A must not decrypt as folder B");
+        assert!(
+            res.is_err(),
+            "a blob bound to folder A must not decrypt as folder B"
+        );
         assert!(
             matches!(res, Err(AppError::Locked(_))),
             "context mismatch must fail closed with Locked, got {res:?}"
@@ -271,8 +291,15 @@ mod tests {
         // Now it is bound: correct context reads as Bound, wrong context fails.
         let (out2, used2) = decrypt_with_aad(&k, &rebound, b"ctx-real").unwrap();
         assert_eq!(out2, pt);
-        assert_eq!(used2, AadUsed::Bound, "after re-bind the blob is context-bound");
-        assert!(decrypt(&k, &rebound, b"ctx-wrong").is_err(), "re-bound blob rejects wrong context");
+        assert_eq!(
+            used2,
+            AadUsed::Bound,
+            "after re-bind the blob is context-bound"
+        );
+        assert!(
+            decrypt(&k, &rebound, b"ctx-wrong").is_err(),
+            "re-bound blob rejects wrong context"
+        );
     }
 
     fn temp_path(label: &str) -> std::path::PathBuf {
@@ -315,7 +342,11 @@ mod tests {
 
         // DECRYPT for the session → byte-identical (same AAD).
         decrypt_file(&key, &enc, &restored, aad).unwrap();
-        assert_eq!(std::fs::read(&restored).unwrap(), payload, "audio round-trips byte-identical");
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            payload,
+            "audio round-trips byte-identical"
+        );
 
         // Wrong key fails closed.
         assert!(decrypt_file(&random_key().unwrap(), &enc, &restored, aad).is_err());
@@ -354,7 +385,11 @@ mod tests {
         // (1) NEW role-bound mic master → decrypts on rung 1 of the mic ladder.
         encrypt_file(&key, &src, &enc, role_mic).unwrap();
         decrypt_file_multi(&key, &enc, &out, mic_ladder).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), payload, "role-bound master round-trips");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            payload,
+            "role-bound master round-trips"
+        );
         // …and a SYS ladder must NOT read a MIC file (swap rejected, fails closed).
         assert!(
             decrypt_file_multi(&key, &enc, &out, sys_ladder).is_err(),
@@ -364,12 +399,20 @@ mod tests {
         // (2) LEGACY role-LESS master (sealed before the stream role existed) → rung 2 reads it.
         encrypt_file(&key, &src, &enc, role_less).unwrap();
         decrypt_file_multi(&key, &enc, &out, mic_ladder).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), payload, "role-less legacy master still decrypts");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            payload,
+            "role-less legacy master still decrypts"
+        );
 
         // (3) PRE-AAD master (empty AAD) → the empty fallback inside rung 1 reads it.
         encrypt_file(&key, &src, &enc, b"").unwrap();
         decrypt_file_multi(&key, &enc, &out, mic_ladder).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), payload, "pre-AAD master still decrypts");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            payload,
+            "pre-AAD master still decrypts"
+        );
 
         // (4) Wrong KEY fails closed regardless of ladder.
         assert!(decrypt_file_multi(&random_key().unwrap(), &enc, &out, mic_ladder).is_err());

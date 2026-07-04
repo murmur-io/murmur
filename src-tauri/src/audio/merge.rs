@@ -186,7 +186,10 @@ fn token_lcs(a: &[String], b: &[String]) -> f32 {
 
 /// Is this segment on the clean (system) side? Diarization may have relabelled to others-N.
 fn is_others(seg: &Segment) -> bool {
-    seg.speaker.as_deref().map(|s| s != SPEAKER_ME).unwrap_or(false)
+    seg.speaker
+        .as_deref()
+        .map(|s| s != SPEAKER_ME)
+        .unwrap_or(false)
 }
 
 /// One candidate = a run of 1..=ECHO_CONCAT_MAX consecutive `others` segments (close in time).
@@ -348,7 +351,10 @@ mod tests {
         assert_eq!(out[3].start_s, 10.0); // bye
 
         // idx is re-indexed over the merged order.
-        assert_eq!(out.iter().map(|s| s.idx).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            out.iter().map(|s| s.idx).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     /// When the SYSTEM stream starts FIRST, it becomes the origin and the mic is shifted forward.
@@ -407,7 +413,7 @@ mod tests {
         let mic = StreamInput {
             segments: vec![
                 seg(0, 0.0, 1.0, "kept"),
-                seg(1, 1.0, 2.0, ""),     // empty (muted span → no speech)
+                seg(1, 1.0, 2.0, ""),    // empty (muted span → no speech)
                 seg(2, 2.0, 3.0, "   "), // whitespace-only
             ],
             started_at: origin,
@@ -470,17 +476,27 @@ mod tests {
         };
         let out = merge_streams(vec![mic, system]);
         // No content lost: both mic segments survive, in order, re-indexed.
-        assert_eq!(out.len(), 2, "mic transcript is complete despite the absent far side");
+        assert_eq!(
+            out.len(),
+            2,
+            "mic transcript is complete despite the absent far side"
+        );
         assert!(
             out.iter().all(|s| s.speaker.as_deref() == Some("me")),
             "with no system stream every segment is attributed to me"
         );
         assert_eq!(
             out.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
-            vec!["the whole call recorded on my mic", "second line survives too"]
+            vec![
+                "the whole call recorded on my mic",
+                "second line survives too"
+            ]
         );
         assert_eq!(out.iter().map(|s| s.idx).collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(out[0].start_s, 0.0, "no spurious time shift from the empty system stream");
+        assert_eq!(
+            out[0].start_s, 0.0,
+            "no spurious time shift from the empty system stream"
+        );
     }
 
     /// REGRESSION (mute × wall-clock alignment — the load-bearing Phase-B invariant).
@@ -515,10 +531,17 @@ mod tests {
 
         let out = merge_streams(vec![mic, system]);
 
-        assert_eq!(out.len(), 2, "no audio/content lost across the mute boundary");
+        assert_eq!(
+            out.len(),
+            2,
+            "no audio/content lost across the mute boundary"
+        );
         // "others" (spoken during the mute) MUST precede the post-unmute "me" segment.
         assert_eq!(out[0].speaker.as_deref(), Some("others"));
-        assert_eq!(out[0].start_s, 5.0, "others speech stays at its true wall-clock time");
+        assert_eq!(
+            out[0].start_s, 5.0,
+            "others speech stays at its true wall-clock time"
+        );
         assert_eq!(out[1].speaker.as_deref(), Some("me"));
         assert_eq!(
             out[1].start_s, 30.0,
@@ -534,10 +557,20 @@ mod tests {
     use crate::audio::align::EchoLeak;
 
     fn seg_sp(start_s: f64, end_s: f64, text: &str, speaker: &str) -> Segment {
-        Segment { idx: 0, start_s, end_s, text: text.into(), speaker: Some(speaker.into()), confidence: None }
+        Segment {
+            idx: 0,
+            start_s,
+            end_s,
+            text: text.into(),
+            speaker: Some(speaker.into()),
+            confidence: None,
+        }
     }
     fn leak(corr: f32) -> EchoLeak {
-        EchoLeak { offset_s: 0.3, correlation: corr }
+        EchoLeak {
+            offset_s: 0.3,
+            correlation: corr,
+        }
     }
 
     /// STRICT tier (no leak evidence needed): a ≥4-token near-identical "me" copy shortly
@@ -545,13 +578,22 @@ mod tests {
     #[test]
     fn strict_echo_pair_drops_the_me_copy() {
         let segs = vec![
-            seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
+            seg_sp(
+                5.0,
+                7.0,
+                "the contract is now signed by both parties",
+                "others",
+            ),
             seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
         ];
         let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
         assert_eq!(n, 1);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].speaker.as_deref(), Some("others"), "the clean copy survives");
+        assert_eq!(
+            out[0].speaker.as_deref(),
+            Some("others"),
+            "the clean copy survives"
+        );
         assert_eq!(out[0].idx, 0, "re-indexed");
     }
 
@@ -561,7 +603,12 @@ mod tests {
     #[test]
     fn no_dedup_without_leak_evidence() {
         let segs = vec![
-            seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
+            seg_sp(
+                5.0,
+                7.0,
+                "the contract is now signed by both parties",
+                "others",
+            ),
             seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
         ];
         let (out, n) = suppress_cross_stream_echo(segs, None);
@@ -569,7 +616,12 @@ mod tests {
         assert_eq!(out.len(), 2);
         // A weak leak below the arming threshold is also treated as no evidence.
         let segs2 = vec![
-            seg_sp(5.0, 7.0, "the contract is now signed by both parties", "others"),
+            seg_sp(
+                5.0,
+                7.0,
+                "the contract is now signed by both parties",
+                "others",
+            ),
             seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
         ];
         let (_, n2) = suppress_cross_stream_echo(segs2, Some(&leak(0.2)));
@@ -584,7 +636,12 @@ mod tests {
         let segs = vec![
             // me starts 1.5 s BEFORE the matching others → user spoke first.
             seg_sp(5.0, 6.5, "the contract is now signed by both parties", "me"),
-            seg_sp(6.5, 8.0, "the contract is now signed by both parties", "others"),
+            seg_sp(
+                6.5,
+                8.0,
+                "the contract is now signed by both parties",
+                "others",
+            ),
         ];
         let (out, n) = suppress_cross_stream_echo(segs, Some(&leak(0.9)));
         assert_eq!(n, 0, "a me line preceding the others match is not echo");
@@ -633,18 +690,37 @@ mod tests {
     /// Without leak evidence the relaxed tier is DISARMED and the segment survives.
     #[test]
     fn relaxed_tier_is_gated_on_leak_evidence() {
-        let make = || vec![
-            seg_sp(5.0, 7.0, "we should finalize the budget proposal by monday", "others"),
-            seg_sp(5.6, 7.4, "we should finalize the budget proposal monday", "me"),
-        ];
+        let make = || {
+            vec![
+                seg_sp(
+                    5.0,
+                    7.0,
+                    "we should finalize the budget proposal by monday",
+                    "others",
+                ),
+                seg_sp(
+                    5.6,
+                    7.4,
+                    "we should finalize the budget proposal monday",
+                    "me",
+                ),
+            ]
+        };
         let (out, n) = suppress_cross_stream_echo(make(), Some(&leak(0.9)));
         assert_eq!(n, 1, "garbled echo dropped under leak evidence");
         assert_eq!(out.len(), 1);
         // Force a relaxed-only pair (Jaccard < 0.85, coverage ≥ 0.7) to prove the gate:
-        let relaxed_only = || vec![
-            seg_sp(5.0, 7.0, "we should finalize the annual budget proposal by monday morning", "others"),
-            seg_sp(5.6, 7.4, "finalize the annual budget proposal monday", "me"),
-        ];
+        let relaxed_only = || {
+            vec![
+                seg_sp(
+                    5.0,
+                    7.0,
+                    "we should finalize the annual budget proposal by monday morning",
+                    "others",
+                ),
+                seg_sp(5.6, 7.4, "finalize the annual budget proposal monday", "me"),
+            ]
+        };
         let (_, n_gated) = suppress_cross_stream_echo(relaxed_only(), Some(&leak(0.9)));
         assert_eq!(n_gated, 1, "relaxed tier fires with evidence");
         let (out2, n2) = suppress_cross_stream_echo(relaxed_only(), None);
@@ -699,7 +775,12 @@ mod tests {
     #[test]
     fn genuine_paraphrase_with_shared_vocab_survives() {
         let segs = vec![
-            seg_sp(5.0, 8.0, "we need to finalize the budget by monday i think", "others"),
+            seg_sp(
+                5.0,
+                8.0,
+                "we need to finalize the budget by monday i think",
+                "others",
+            ),
             // Same words, reordered — the user genuinely agreeing, NOT an echo copy.
             seg_sp(6.0, 7.0, "i think we need the budget", "me"),
         ];
