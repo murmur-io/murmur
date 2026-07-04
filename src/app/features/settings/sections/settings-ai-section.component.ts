@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component } from "@angular/core";
 import { AiAdvancedBlockComponent } from "./ai/ai-advanced-block.component";
 import { AiPrivacyStripComponent } from "./ai/ai-privacy-strip.component";
+import { AiResolvedMapComponent } from "./ai/ai-resolved-map.component";
 import { BrainPostureBlockComponent } from "./ai/brain-posture-block.component";
 import { DuringMeetingsBlockComponent } from "./ai/during-meetings-block.component";
 import { OnDeviceIntelligenceBlockComponent } from "./ai/on-device-intelligence-block.component";
@@ -27,6 +28,7 @@ import { OnDeviceIntelligenceBlockComponent } from "./ai/on-device-intelligence-
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     BrainPostureBlockComponent,
+    AiResolvedMapComponent,
     AiAdvancedBlockComponent,
     DuringMeetingsBlockComponent,
     OnDeviceIntelligenceBlockComponent,
@@ -34,6 +36,7 @@ import { OnDeviceIntelligenceBlockComponent } from "./ai/on-device-intelligence-
   ],
   template: `
     <app-brain-posture-block />
+    <app-ai-resolved-map />
     <app-ai-advanced-block />
     <app-during-meetings-block />
     <app-on-device-intelligence-block />

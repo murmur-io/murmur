@@ -7,6 +7,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import { hostIsLoopback } from "../../core/loopback";
 import type {
+  AiMapRow,
   AppConfigDto,
   AppInfo,
   BrainBackend,
@@ -686,7 +687,7 @@ export class SettingsStore {
 
   /** Notes-row Inherit summary — Notes always falls back to the Default AI triple. */
   readonly notesInheritSummary = computed(
-    () => `Follows Default AI: ${this.defaultAiSummary()}`,
+    () => `Follows the Default engine: ${this.defaultAiSummary()}`,
   );
 
   /**
@@ -698,11 +699,11 @@ export class SettingsStore {
   readonly assistantInheritSummary = computed(() => {
     switch (this._brainBackendValue()) {
       case "local":
-        return "Follows the assistant fallback: Local model — on-device";
+        return "Follows the assistant fallback: Murmur Brain — on-device";
       case "off":
         return "Follows the assistant fallback: Off — retrieval only";
       default:
-        return `Follows Default AI: ${this.defaultAiSummary()}`;
+        return `Follows the Default engine: ${this.defaultAiSummary()}`;
     }
   });
 
@@ -822,6 +823,29 @@ export class SettingsStore {
   /** Surfaced if reading/applying the posture rejects. */
   private readonly _postureError = signal<string | null>(null);
   readonly postureError = this._postureError.asReadonly();
+
+  // ── "What runs where" resolved map ──────────────────────────────────────
+  /** The backend-resolved per-job routing rows (resolved_ai_map). */
+  private readonly _aiMap = signal<AiMapRow[]>([]);
+  readonly aiMap = this._aiMap.asReadonly();
+
+  /** Re-fetch the resolved map (load, after save, after a posture apply). Keeps last on failure. */
+  async refreshAiMap(): Promise<void> {
+    try {
+      this._aiMap.set(await this.ipc.resolvedAiMap());
+    } catch {
+      // keep the last known map — the card renders its loading/emptiness state
+    }
+  }
+
+  /**
+   * Advanced-disclosure open state, HOISTED from AiAdvancedBlockComponent so the
+   * map card's "Change" affordance can open it from outside.
+   */
+  readonly advancedExpanded = signal(false);
+  expandAdvanced(): void {
+    this.advancedExpanded.set(true);
+  }
 
   /**
    * The posture mid-download (drives the target-card progress indicator).
@@ -1112,7 +1136,9 @@ export class SettingsStore {
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
       await this.refreshBrainModels();
-      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
+      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement
+      // nudge. refreshPosture() also refreshes the resolved "what runs where"
+      // AI map, so no separate refreshAiMap() call is needed here.
       await this.refreshPosture();
       // Brain Live RAM headroom (best-effort; true = never warn behind a failed probe).
       this._brainLiveRamOk.set(
@@ -1280,6 +1306,10 @@ export class SettingsStore {
     this._retirementNudge.set(
       await this.ipc.brainModelRetirementNudge().catch(() => null),
     );
+    // Posture/roles just changed → the resolved "what runs where" map may have
+    // shifted. Refresh it here so every posture caller (setPosture, role/provider
+    // saves, retirement apply, load) keeps the map in sync.
+    void this.refreshAiMap();
   }
 
   /**
