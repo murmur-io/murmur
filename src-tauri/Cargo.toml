@@ -4,6 +4,10 @@ version = "0.6.4"
 description = "Murmur — local meeting capture, transcription, and AI notes for Obsidian"
 edition = "2021"
 rust-version = "1.77"
+# Murmur is a Tauri desktop app, never published to crates.io (it path-depends on
+# murmur-protocol, which crates.io disallows). Declaring this lets `cargo deny`'s
+# allow-wildcard-paths apply to the murmur-protocol path dep (bans check).
+publish = false
 
 [[bin]]
 name = "Murmur"
