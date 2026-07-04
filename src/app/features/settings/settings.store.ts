@@ -14,6 +14,7 @@ import type {
   GatewayHealth,
   GatewayModel,
   InputDeviceInfo,
+  ModelClass,
   Posture,
   ProviderStatus,
   ReindexResult,
@@ -814,6 +815,16 @@ export class SettingsStore {
   private readonly _postureError = signal<string | null>(null);
   readonly postureError = this._postureError.asReadonly();
 
+  /**
+   * The posture mid-download (drives the target-card progress indicator).
+   * Non-null only while `setPosture` is downloading absent needed models.
+   */
+  private readonly _pendingPosture = signal<Posture | null>(null);
+  readonly pendingPosture = this._pendingPosture.asReadonly();
+
+  /** Flip to true via `cancelPostureDownload()` to abort an in-flight download loop. */
+  private _cancelDownload = false;
+
   /** True while the one-tap "Enable Murmur Brain Live" flow (hybrid + light model) runs. */
   private readonly _enablingBrainLive = signal(false);
   readonly enablingBrainLive = this._enablingBrainLive.asReadonly();
@@ -827,6 +838,38 @@ export class SettingsStore {
    */
   private readonly _brainLiveRamOk = signal(true);
   readonly brainLiveRamOk = this._brainLiveRamOk.asReadonly();
+
+  /**
+   * What the ACTIVE posture needs on-device. Cloud → none; Hybrid → reactions
+   * (light); Fully local → notes (heavy) + reactions (light). Re-derives whenever
+   * `posture()` or `brainModels()` changes (the picker reads both).
+   */
+  readonly neededModels = computed(() =>
+    this.neededModelsFor(this.posture()),
+  );
+
+  /**
+   * The "right now" one-sentence summary for the active posture — for the
+   * posture state-line in the redesigned AI & Models block (Task 2).
+   *
+   * Returns "" when `posture()` is null (not yet loaded), so the template never
+   * shows "Custom" as a pre-load flash. "Custom" is returned only for the actual
+   * `"custom"` posture value.
+   */
+  readonly postureStateLine = computed((): string => {
+    switch (this.posture()) {
+      case "cloud":
+        return "Claude Code writes everything — notes, answers, briefs. Only transcription runs on this Mac.";
+      case "hybrid":
+        return "Claude writes notes; your Mac runs realtime reactions and keeps fact-extraction on-device.";
+      case "fully_local":
+        return "Everything runs on this Mac. Nothing leaves. @brain answers run on-device (private, a little slower live).";
+      case "custom":
+        return "Custom — some features run on-device, some in the cloud.";
+      default:
+        return ""; // null = posture not yet loaded — show nothing rather than a misleading "Custom"
+    }
+  });
 
   /**
    * The installed-base retirement nudge (`brain_model_retirement_nudge`), or null.
@@ -1230,25 +1273,145 @@ export class SettingsStore {
   }
 
   /**
-   * Apply a posture PRESET (`cloud` / `hybrid` / `fully_local`). Re-reads the
-   * derived posture afterwards so the display reflects what the backend actually
-   * stored (never an optimistic guess).
+   * Apply a posture PRESET (`cloud` / `hybrid` / `fully_local`).
+   *
+   * Auto-download flow: if any model needed by the target posture is absent
+   * (not yet downloaded), download each one first, select each newly-downloaded
+   * model, THEN commit the posture. If nothing is absent, commits immediately
+   * (today's fast path — no new IPC round-trips). On failure or cancel, clears
+   * `pendingPosture`, surfaces `postureError` (cancel is silent), and refreshes
+   * the displayed posture back to the unchanged backend value. Never commits an
+   * incomplete state.
+   *
+   * NOTE: re-patches the reactive form from the backend after every commit to
+   * prevent the posture-form-clobber regression (see `syncPostureFormFromBackend`).
    */
   async setPosture(p: Posture): Promise<void> {
     if (p === "custom") return; // derived-only label — never settable
     this._postureError.set(null);
     this._postureBusy.set(true);
-    try {
-      await this.ipc.setBrainPosture(p);
-      // Re-patch the form to the role/brainBackend keys the preset just wrote, or
-      // the next save() would clobber them back (silent zero-egress regression).
-      await this.syncPostureFormFromBackend();
-      await this.refreshPosture();
-    } catch (e) {
-      this._postureError.set(String(e));
-    } finally {
-      this._postureBusy.set(false);
+
+    const needed = this.neededModelsFor(p);
+    const absent = needed
+      .map((n) => n.model)
+      .filter((m): m is BrainModelDto => !!m && !m.downloaded);
+
+    if (absent.length === 0) {
+      // Fast path: all needed models already on disk — select them all, then commit.
+      // Selecting unconditionally ensures the backend role pins point at the
+      // auto-picked models, not the registry default (which may differ and be absent).
+      try {
+        await this.selectNeeded(needed);
+        await this.commitPosture(p);
+      } catch (e) {
+        this._postureError.set(String(e));
+      } finally {
+        this._postureBusy.set(false);
+      }
+      return;
     }
+
+    // Slow path: at least one model needs downloading before we can commit.
+    this._pendingPosture.set(p);
+    this._cancelDownload = false;
+    try {
+      for (const m of absent) {
+        if (this._cancelDownload) throw new Error("cancelled");
+        this._brainDownloadFrac.set(0);
+        this._brainDownloadingId.set(m.id);
+        try {
+          await this.ipc.downloadBrainModel(m.id);
+        } finally {
+          this._brainDownloadingId.set(null);
+        }
+      }
+      // Honor cancel between the last download and the select+commit, so a cancel
+      // during the only/final download does not still commit the posture.
+      if (this._cancelDownload) throw new Error("cancelled");
+      // Select ALL needed models (not just the newly-downloaded subset) so that a
+      // model that was already on disk but not selected also gets pinned to the
+      // right role before the posture commit.
+      await this.selectNeeded(needed);
+      await this.commitPosture(p);
+    } catch (e) {
+      // A cancel is a user action — silent; any real failure surfaces the message.
+      this._postureError.set(this._cancelDownload ? null : String(e));
+      // Reflect the unchanged backend posture so the card stays honest.
+      await this.refreshPosture();
+    } finally {
+      this._pendingPosture.set(null);
+      this._postureBusy.set(false);
+      this._cancelDownload = false;
+      // Refresh downloaded / selected flags after every attempt (success or fail).
+      await this.refreshBrainModels();
+    }
+  }
+
+  /** Abort an in-flight `setPosture` download loop. The posture stays unchanged. */
+  cancelPostureDownload(): void {
+    this._cancelDownload = true;
+  }
+
+  /**
+   * Select every model in `needed` (in `neededModelsFor` order: heavy first,
+   * then light) so the backend's role pins point at the auto-picked models before
+   * `set_brain_posture` commits. Called on BOTH the fast path (all on disk) and
+   * the slow path (after downloads complete) — the contract is identical.
+   */
+  private async selectNeeded(
+    needed: { role: "notes" | "reactions"; model: BrainModelDto | null }[],
+  ): Promise<void> {
+    for (const n of needed) {
+      if (n.model) await this.ipc.selectBrainModel(n.model.id);
+    }
+  }
+
+  /**
+   * Commit a posture to the backend: write it, re-patch the reactive form (to
+   * prevent the form-clobber regression), and refresh the derived posture display.
+   * Also re-checks RAM fitness after a posture change.
+   */
+  private async commitPosture(p: Posture): Promise<void> {
+    await this.ipc.setBrainPosture(p);
+    // Re-patch the form to the role/brainBackend keys the preset just wrote, or
+    // the next save() would clobber them back (silent zero-egress regression).
+    await this.syncPostureFormFromBackend();
+    await this.refreshPosture();
+    this._brainLiveRamOk.set(await this.ipc.brainLiveRamOk().catch(() => true));
+  }
+
+  /**
+   * Smallest model of `cls` that fits this Mac's RAM (family-agnostic).
+   * Prefers an already-downloaded model so we avoid needless downloads.
+   * Returns `null` when the registry has no fitting model of that class.
+   */
+  autoPickForClass(cls: ModelClass): BrainModelDto | null {
+    const candidates = this.brainModels().filter(
+      (m) => m.class === cls && m.fitsRam,
+    );
+    if (candidates.length === 0) return null;
+    const downloaded = candidates.filter((m) => m.downloaded);
+    const pool = downloaded.length ? downloaded : candidates;
+    return pool.reduce((a, b) => (b.approxSizeBytes < a.approxSizeBytes ? b : a));
+  }
+
+  /**
+   * What a given posture `p` needs on-device — the same logic as `neededModels`
+   * but evaluated for an ARBITRARY posture (used by `setPosture` to determine
+   * which models to download before committing).
+   */
+  private neededModelsFor(
+    p: Posture | null,
+  ): { role: "notes" | "reactions"; model: BrainModelDto | null }[] {
+    const light = this.autoPickForClass("light");
+    const heavy = this.autoPickForClass("heavy");
+    if (p === "hybrid") return [{ role: "reactions", model: light }];
+    if (p === "fully_local")
+      return [
+        { role: "notes", model: heavy },
+        { role: "reactions", model: light },
+      ];
+    return [];
   }
 
   /**
