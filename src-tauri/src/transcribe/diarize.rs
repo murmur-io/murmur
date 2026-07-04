@@ -105,6 +105,129 @@ pub fn relabel_others(segments: &mut [Segment], spans: &[SpeakerSpan]) {
     }
 }
 
+// ── Cluster ↔ display-label reconciliation (voiceprint chip + enroll reachability) ─────────────────
+//
+// The meeting timeline is LLM-generated: the summarizer maps each RAW diarization tag
+// (`me`/`others`/`others-N`) to a DISPLAY label ("Speaker 1"/"Speaker 2"/a real name) and the FE
+// renders one lane per display label. The voiceprint suggester keys by the raw cluster index and the
+// FE looks the chip up by the display label — two different key spaces that never match, so the
+// "Looks like Anna?" chip never renders and rename→enroll never fires. This reconciles the two
+// PURELY from segment↔turn TIME-OVERLAP (mirrors `relabel_others`'s max-overlap idea): no timeline
+// schema change, no seal-format change, no I/O here (the caller passes already-gated, this-meeting
+// data). It is bidirectional so BOTH the suggest key (cluster → label) and the enroll lookup
+// (label → cluster) resolve.
+
+/// A timeline turn viewed for reconciliation: its [start,end] seconds + the LLM DISPLAY label.
+#[derive(Clone, Copy)]
+pub struct TurnRef<'a> {
+    pub start_s: f64,
+    pub end_s: f64,
+    pub label: &'a str,
+}
+
+/// A resolved bidirectional map between diarization cluster indices (the `others-{n}` suffix, or 0
+/// for the single-cluster plain-`others` case) and the timeline's display labels, computed from
+/// segment↔turn time-overlap. Empty maps (no timeline, no segments, no overlap) degrade the caller
+/// to no-suggestion / no-enroll — never an error, never a fabricated cluster.
+#[derive(Debug, Default, Clone)]
+pub struct SpeakerReconciliation {
+    cluster_to_label: std::collections::HashMap<i64, String>,
+    label_to_cluster: std::collections::HashMap<String, i64>,
+}
+
+impl SpeakerReconciliation {
+    /// The DISPLAY label the FE lane shows for a diarized cluster index (max total overlap), if any
+    /// turn overlaps that cluster's segments. Drives the suggestion key so `suggestionByLabel().get`
+    /// matches the lane.
+    pub fn label_for_cluster(&self, cluster_index: i64) -> Option<&str> {
+        self.cluster_to_label.get(&cluster_index).map(String::as_str)
+    }
+
+    /// The dominant diarized cluster index under the turns carrying `label` (max total overlap), if
+    /// any of this meeting's segments overlap them. Drives enroll-on-rename from the display label.
+    /// Returns None for a label with no overlapping diarized cluster (e.g. the "me" lane, or a
+    /// non-diarized meeting) — enroll then fabricates nothing.
+    pub fn cluster_for_label(&self, label: &str) -> Option<i64> {
+        self.label_to_cluster.get(label).copied()
+    }
+}
+
+/// True iff `tag` is a NUMBERED diarized cluster tag (`others-N`, N an integer).
+fn tag_is_numbered_cluster(tag: &str) -> bool {
+    tag.strip_prefix(SPEAKER_OTHERS)
+        .and_then(|r| r.strip_prefix('-'))
+        .map(|n| n.parse::<i64>().is_ok())
+        .unwrap_or(false)
+}
+
+/// Map a raw diarization segment tag to its cluster index for reconciliation. `others-N` → N. Plain
+/// `others` → 0 ONLY when the meeting is single-cluster 1:1 — inferred from the tags PRESENT on the
+/// segments (`has_numbered == false`), NOT from the stored-voiceprint set. `me`, an unknown tag, or a
+/// stray plain `others` inside a multi-cluster meeting → None (never a fabricated cluster).
+fn cluster_index_of_tag(tag: &str, has_numbered: bool) -> Option<i64> {
+    if let Some(rest) = tag.strip_prefix(SPEAKER_OTHERS).and_then(|r| r.strip_prefix('-')) {
+        rest.parse::<i64>().ok()
+    } else if tag == SPEAKER_OTHERS && !has_numbered {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Reconcile diarization clusters ↔ timeline display labels from segment↔turn time-overlap. For each
+/// segment whose raw tag maps to a cluster, accumulate its overlap seconds against each turn's display
+/// label; then take the argmax per cluster (→ its label) and per label (→ its cluster). Deterministic:
+/// ties break to the lexicographically-smaller label (cluster → label) / the smaller cluster index
+/// (label → cluster). PURE (no I/O, no FFI) — the caller passes only this (unlocked) meeting's data.
+pub fn reconcile_speakers(segments: &[Segment], turns: &[TurnRef<'_>]) -> SpeakerReconciliation {
+    // Single-cluster 1:1 is inferred from the SEGMENT tags, not the voiceprint set (secondary-bug fix).
+    let has_numbered = segments
+        .iter()
+        .any(|s| s.speaker.as_deref().map(tag_is_numbered_cluster).unwrap_or(false));
+
+    // Total overlap seconds per (cluster_index, display_label).
+    let mut overlap: std::collections::HashMap<(i64, String), f64> = std::collections::HashMap::new();
+    for seg in segments {
+        let Some(tag) = seg.speaker.as_deref() else { continue };
+        let Some(cluster) = cluster_index_of_tag(tag, has_numbered) else { continue };
+        for turn in turns {
+            let ov = (seg.end_s.min(turn.end_s) - seg.start_s.max(turn.start_s)).max(0.0);
+            if ov > 0.0 {
+                *overlap.entry((cluster, turn.label.to_string())).or_insert(0.0) += ov;
+            }
+        }
+    }
+
+    // Deterministic argmax: sort (cluster asc, label asc) then keep the first-seen running-max, so
+    // ties resolve independent of HashMap iteration order.
+    let mut entries: Vec<((i64, String), f64)> = overlap.into_iter().collect();
+    entries.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.0 .1.cmp(&b.0 .1)));
+
+    let mut cluster_best: std::collections::HashMap<i64, (f64, String)> = std::collections::HashMap::new();
+    let mut label_best: std::collections::HashMap<String, (f64, i64)> = std::collections::HashMap::new();
+    for ((cluster, label), ov) in entries {
+        // cluster → best label (strictly-greater ⇒ first-seen wins a tie = smaller label).
+        match cluster_best.get(&cluster) {
+            Some((best, _)) if *best >= ov => {}
+            _ => {
+                cluster_best.insert(cluster, (ov, label.clone()));
+            }
+        }
+        // label → best cluster (strictly-greater ⇒ first-seen wins a tie = smaller cluster).
+        match label_best.get(&label) {
+            Some((best, _)) if *best >= ov => {}
+            _ => {
+                label_best.insert(label, (ov, cluster));
+            }
+        }
+    }
+
+    SpeakerReconciliation {
+        cluster_to_label: cluster_best.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+        label_to_cluster: label_best.into_iter().map(|(k, (_, v))| (k, v)).collect(),
+    }
+}
+
 // ── Voiceprints (opt-in): a per-cluster CAM++ speaker embedding for the diarized "others" ──────────
 //
 // PRIVACY: an embedding here is a VOICE BIOMETRIC of a remote participant. It is derived from the
@@ -366,6 +489,84 @@ mod tests {
             speaker: None,
             confidence: None,
         }
+    }
+
+    fn tagged(start_s: f64, end_s: f64, tag: &str) -> Segment {
+        Segment { speaker: Some(tag.into()), ..seg(start_s, end_s) }
+    }
+
+    #[test]
+    fn reconcile_multi_cluster_maps_tag_to_display_label() {
+        // The LLM timeline carries DISPLAY labels ("Speaker 1"/"Speaker 2"), NOT the raw tags; the
+        // segments carry the raw diarization tags. Reconcile via time-overlap.
+        let segs = vec![
+            tagged(0.0, 4.0, "others-0"),
+            tagged(5.0, 9.0, "others-1"),
+            tagged(2.0, 3.0, "me"), // ignored: "me" never maps to a cluster
+        ];
+        let turns = vec![
+            TurnRef { start_s: 0.0, end_s: 4.5, label: "Speaker 1" },
+            TurnRef { start_s: 4.5, end_s: 9.0, label: "Speaker 2" },
+        ];
+        let rec = reconcile_speakers(&segs, &turns);
+        // cluster → the display label the FE lane shows.
+        assert_eq!(rec.label_for_cluster(0), Some("Speaker 1"));
+        assert_eq!(rec.label_for_cluster(1), Some("Speaker 2"));
+        // display label → the diarized cluster (enroll direction).
+        assert_eq!(rec.cluster_for_label("Speaker 1"), Some(0));
+        assert_eq!(rec.cluster_for_label("Speaker 2"), Some(1));
+        // A label that overlaps no diarized cluster (e.g. a "me" lane) → nothing.
+        assert_eq!(rec.cluster_for_label("Nobody"), None);
+    }
+
+    #[test]
+    fn reconcile_single_cluster_plain_others_is_cluster_zero() {
+        // Single remote speaker → segments stay plain "others" (no suffix) + voiceprint cluster 0.
+        let segs = vec![tagged(0.0, 5.0, "others"), tagged(6.0, 9.0, "others")];
+        let turns = vec![TurnRef { start_s: 0.0, end_s: 9.0, label: "Anna" }];
+        let rec = reconcile_speakers(&segs, &turns);
+        assert_eq!(rec.label_for_cluster(0), Some("Anna"));
+        assert_eq!(rec.cluster_for_label("Anna"), Some(0));
+    }
+
+    #[test]
+    fn reconcile_plain_others_is_ignored_when_numbered_tags_present() {
+        // A stray unattributed plain "others" inside a MULTI-cluster meeting must NOT collapse to
+        // cluster 0 (single-cluster 1:1 is inferred from the tag shape).
+        let segs = vec![
+            tagged(0.0, 4.0, "others-1"),
+            tagged(10.0, 12.0, "others"), // stray unattributed → contributes no cluster mapping
+        ];
+        let turns = vec![
+            TurnRef { start_s: 0.0, end_s: 4.0, label: "Speaker 2" },
+            TurnRef { start_s: 10.0, end_s: 12.0, label: "Mystery" },
+        ];
+        let rec = reconcile_speakers(&segs, &turns);
+        assert_eq!(rec.label_for_cluster(1), Some("Speaker 2"));
+        assert_eq!(rec.cluster_for_label("Mystery"), None, "plain others → no cluster 0 here");
+        assert_eq!(rec.label_for_cluster(0), None);
+    }
+
+    #[test]
+    fn reconcile_empty_when_no_timeline_or_no_segments() {
+        // No timeline turns → empty maps (best-effort degrade, never fabricate).
+        let segs = vec![tagged(0.0, 4.0, "others-0")];
+        assert!(reconcile_speakers(&segs, &[]).label_for_cluster(0).is_none());
+        // No segments → empty maps.
+        let turns = vec![TurnRef { start_s: 0.0, end_s: 4.0, label: "Speaker 1" }];
+        assert!(reconcile_speakers(&[], &turns).cluster_for_label("Speaker 1").is_none());
+    }
+
+    #[test]
+    fn reconcile_picks_majority_overlap_label() {
+        // Cluster-0 segment 0..10 overlaps "Speaker 1" for 3s and "Speaker 2" for 7s → Speaker 2.
+        let segs = vec![tagged(0.0, 10.0, "others-0")];
+        let turns = vec![
+            TurnRef { start_s: 0.0, end_s: 3.0, label: "Speaker 1" },
+            TurnRef { start_s: 3.0, end_s: 10.0, label: "Speaker 2" },
+        ];
+        let rec = reconcile_speakers(&segs, &turns);
+        assert_eq!(rec.label_for_cluster(0), Some("Speaker 2"));
     }
 
     #[test]
