@@ -102,14 +102,18 @@ interface RoleRowVm {
                 (change)="onConnectionChange(row.role, $event)"
               >
                 <option value="">Inherit default</option>
-                <option value="claude_code">Claude Code</option>
-                <option value="anthropic">Anthropic API</option>
-                <option value="ollama">Ollama</option>
-                <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
                 @if (row.offersReasonerTargets) {
-                  <option value="local">Local model — on-device</option>
-                  <option value="off">Off — retrieval only</option>
+                  <optgroup label="Built-in (on this Mac)">
+                    <option value="local">Murmur Brain — on-device</option>
+                    <option value="off">Off — retrieval only</option>
+                  </optgroup>
                 }
+                <optgroup label="Your engines">
+                  <option value="claude_code">Claude Code</option>
+                  <option value="anthropic">Anthropic API</option>
+                  <option value="ollama">Ollama</option>
+                  <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
+                </optgroup>
               </select>
 
               @if (!row.conn) {

@@ -699,7 +699,7 @@ export class SettingsStore {
   readonly assistantInheritSummary = computed(() => {
     switch (this._brainBackendValue()) {
       case "local":
-        return "Follows the assistant fallback: Local model — on-device";
+        return "Follows the assistant fallback: Murmur Brain — on-device";
       case "off":
         return "Follows the assistant fallback: Off — retrieval only";
       default:
