@@ -7738,6 +7738,15 @@ pub struct MyShareEntry {
     pub expires_at: Option<String>,
     pub revoked: bool,
     pub download_count: u32,
+    /// The LOCAL meeting this share belongs to (so the FE can filter to THIS note). `None` when the
+    /// share was created on another device (no local `outbound_shares` row) — masked, same as `title`.
+    pub meeting_id: Option<String>,
+    /// The server-enforced open cap (`None` ⇒ uncapped); sourced from the server list row. Drives the
+    /// `X / Y opens` label. The server enforces the cap atomically on `/fetch`; this is display-only.
+    pub max_downloads: Option<u32>,
+    /// `link` (mode-A zero-knowledge link) vs `user` (mode-B Murmur↔Murmur grant). Lets the FE split
+    /// the "Active links" list from the person-share count. Serializes snake_case → "link"/"user".
+    pub mode: murmur_protocol::dto::ShareMode,
 }
 
 /// Read the configured sharing-server base URL from the live config (empty ⇒ unset).
@@ -8037,16 +8046,18 @@ pub async fn account_logout(state: State<'_, AppState>) -> Result<(), AppError> 
     Ok(())
 }
 
-/// `share_note_to_link(meeting_id, expires_days?, password?) -> String` — create a zero-knowledge
-/// mode-A link share of a note and return the share URL. See the LOCK-CRITICAL invariants above.
+/// `share_note_to_link(meeting_id, expires_days?, password?, max_downloads?) -> String` — create a
+/// zero-knowledge mode-A link share of a note and return the share URL. `max_downloads` sets an
+/// optional server-enforced open cap. See the LOCK-CRITICAL invariants above.
 #[tauri::command]
 pub async fn share_note_to_link(
     state: State<'_, AppState>,
     meeting_id: String,
     expires_days: Option<u32>,
     password: Option<String>,
+    max_downloads: Option<u32>,
 ) -> Result<String, AppError> {
-    share_note_to_link_inner(state.inner(), meeting_id, expires_days, password).await
+    share_note_to_link_inner(state.inner(), meeting_id, expires_days, password, max_downloads).await
 }
 
 /// Core of [`share_note_to_link`] over `&AppState` so the lock gate + consent gate are unit-testable
@@ -8056,6 +8067,7 @@ pub(crate) async fn share_note_to_link_inner(
     meeting_id: String,
     expires_days: Option<u32>,
     password: Option<String>,
+    max_downloads: Option<u32>,
 ) -> Result<String, AppError> {
     // (1) READ-GATE — FIRST statement (copies `export_note`). A sealed-not-unlocked meeting refuses.
     if !meeting_is_unlocked(state, &meeting_id)? {
@@ -8142,7 +8154,9 @@ pub(crate) async fn share_note_to_link_inner(
         password_required: pw_ref.is_some(),
         argon,
         expires_at,
-        max_downloads: None,
+        // Clamp a nonsensical 0 to 1 (mirrors the `expires_days` min(1) clamp); `None` ⇒ uncapped.
+        // The server enforces the cap atomically on `/fetch` — nothing else changes here.
+        max_downloads: max_downloads.map(|n| n.max(1)),
         // Mode A: no per-recipient wrapped keys (that is mode B / §4.8). Absent for link shares.
         recipients: None,
     };
@@ -8186,10 +8200,11 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
     let mut out = Vec::with_capacity(resp.shares.len());
     for s in resp.shares {
         // Resolve the local meeting for this share (None ⇒ created on another device ⇒ masked).
-        let (title, locked) = match state.db.outbound_share_meeting(&s.share_id)? {
+        let local_meeting = state.db.outbound_share_meeting(&s.share_id)?;
+        let (title, locked) = match &local_meeting {
             Some(meeting_id) => {
-                if meeting_is_unlocked(state.inner(), &meeting_id)? {
-                    let t = state.db.get_meeting(&meeting_id)?.and_then(|m| m.title);
+                if meeting_is_unlocked(state.inner(), meeting_id)? {
+                    let t = state.db.get_meeting(meeting_id)?.and_then(|m| m.title);
                     (t, false)
                 } else {
                     // Sealed-and-not-unlocked ⇒ MASK the title.
@@ -8207,6 +8222,9 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
             expires_at: s.expires_at,
             revoked: s.revoked_at.is_some(),
             download_count: s.download_count,
+            meeting_id: local_meeting,
+            max_downloads: s.max_downloads,
+            mode: s.mode,
         });
     }
     Ok(out)
@@ -9397,6 +9415,7 @@ mod lifecycle_tests {
             "m-locked".to_string(),
             None,
             None,
+            None,
         ))
         .unwrap_err();
         assert!(
@@ -9414,6 +9433,7 @@ mod lifecycle_tests {
         let err2 = block_on(share_note_to_link_inner(
             &state,
             "m-locked".to_string(),
+            None,
             None,
             None,
         ))
