@@ -344,6 +344,12 @@ pub async fn start_recording(
         }
     }
 
+    // Fresh recording ⇒ re-arm the 4h-cap rising-edge notice (see `recording_level`). If a previous
+    // recording hit the cap and set this, the next recording must be able to fire the notice again.
+    state
+        .capped_notified
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
@@ -570,14 +576,47 @@ fn compute_duration_s(
     }
 }
 
-/// Current mic peak level 0.0..=1.0 for the meter (0.0 when idle). Cheap, polled by UI.
+/// Current mic peak level 0.0..=1.0 for the meter (0.0 when idle). Cheap, polled by UI ~10x/s.
+///
+/// This is ALSO the detection site for the 4h `MAX_RECORDING_SECONDS` hard TIME cap. The live-caption
+/// loop (`transcribe::live`) is only spawned when a whisper model resolves — a user with no model
+/// downloaded gets no live loop, yet the recording (and the cap) still happen — so the live loop is
+/// NOT a reliable place to detect the cap. The FE polls THIS command every 100 ms while recording
+/// (`recorder.store.ts` `level`), unconditionally, for the whole recording — making it the site that
+/// ALWAYS runs. On the RISING edge (cap reached, notice not yet emitted this recording) we emit
+/// [`crate::events::EVENT_RECORDING_CAPPED`] exactly once so the FE can surface the notice and call
+/// `stop_recording` to finalize the meeting (the capped buffer is intact — Stop still yields a note).
+/// Best-effort: a failed emit only warns; the meter read is unaffected.
 #[tauri::command]
-pub fn recording_level(state: State<'_, AppState>) -> Result<f32, AppError> {
+pub fn recording_level(app: AppHandle, state: State<'_, AppState>) -> Result<f32, AppError> {
     let recorder = state
         .recorder
         .lock()
         .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-    Ok(recorder.as_ref().map(|r| r.level()).unwrap_or(0.0))
+    let Some(r) = recorder.as_ref() else {
+        return Ok(0.0);
+    };
+    let level = r.level();
+    // 4h TIME cap: fire the "maximum recording length reached" notice exactly ONCE per recording,
+    // on the false→true transition. `capped_notified` is the per-recording rising-edge latch,
+    // re-armed at each `start_recording`.
+    if r.cap_reached() {
+        let already = state
+            .capped_notified
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if crate::audio::recorder::should_emit_cap_notice(true, already) {
+            state
+                .capped_notified
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // PII rule (§8): log the flag only — never any content.
+            tracing::warn!(
+                target: "audio",
+                "maximum recording length reached — surfacing cap notice to finalize the meeting"
+            );
+            crate::events::emit_recording_capped(&app);
+        }
+    }
+    Ok(level)
 }
 
 /// Live-toggle the microphone mute mid-recording (no stream teardown). While muted, the cpal
@@ -7392,6 +7431,7 @@ mod lifecycle_tests {
             reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            capped_notified: std::sync::atomic::AtomicBool::new(false),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),

@@ -107,6 +107,7 @@ export class RecorderStore {
   private unlistenLive: UnlistenFn | null = null;
   private unlistenEcho: UnlistenFn | null = null;
   private unlistenStoragePruned: UnlistenFn | null = null;
+  private unlistenCapped: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -136,6 +137,19 @@ export class RecorderStore {
       this.toast.info(
         `Freed ${humanBytes(p.freedBytes)} — removed ${p.prunedCount} old recording${p.prunedCount === 1 ? "" : "s"} to stay under your storage limit`,
       );
+    });
+    // 4h TIME-cap notice: the backend capture self-stopped at MAX_RECORDING_SECONDS and everything
+    // spoken past it is dropped. Surface the notice + AUTO-FINALIZE via the existing stop() action so
+    // the meeting still produces a note (the capped buffer is intact). IDEMPOTENT: only dispatch stop()
+    // while we're still in the "recording" stage — a second cap event or a user Stop already in flight
+    // has moved the stage past "recording", so this becomes a no-op (no double stop_recording).
+    this.unlistenCapped = await this.ipc.onRecordingCapped(() => {
+      this.toast.info(
+        "Maximum recording length (4 h) reached — recording stopped; generating your note…",
+      );
+      if (this._stage() === "recording") {
+        void this.stop();
+      }
     });
     await this.refreshLastNote();
   }
