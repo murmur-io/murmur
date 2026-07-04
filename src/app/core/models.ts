@@ -1144,11 +1144,6 @@ export interface CalendarContext {
   text: string;
 }
 
-export interface BriefResult {
-  markdown: string;
-  sources: VaultSource[];
-}
-
 /**
  * AI Gateway (Phase 3) — one selectable model from the gateway's `/v1/models`
  * catalog (`list_gateway_models`). Mirrors the Rust `GatewayModel` DTO (camelCase).

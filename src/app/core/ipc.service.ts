@@ -20,7 +20,6 @@ import type {
   AskVaultResult,
   AssistantThreadRow,
   BrainOverview,
-  BriefResult,
   BuiltinRecipe,
   CalendarEvent,
   CalendarEventFull,
@@ -598,11 +597,6 @@ export class IpcService {
   /** Export a meeting as an Obsidian Canvas (.canvas) board. Returns the written path. */
   exportCanvas(meetingId: string): Promise<string> {
     return invoke<string>("export_canvas", { meetingId });
-  }
-
-  /** Pre-Meeting Brief: grounded prep card for an upcoming meeting subject, from history. */
-  preMeetingBrief(subject: string): Promise<BriefResult> {
-    return invoke<BriefResult>("pre_meeting_brief", { subject });
   }
 
   /** Best-effort next macOS Calendar event (title) in the next hour, or null. */
