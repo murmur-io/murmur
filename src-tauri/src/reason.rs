@@ -807,26 +807,16 @@ fn local_reasoner_resolved(
 /// so a rambling on-device generation can't saturate Metal for tens of seconds — the sampler cap is
 /// the ONLY real per-call bound (an in-flight generation is not cancellable). `enable_thinking=false`
 /// keeps qwen3 thinking traces out of structured extraction (a no-op on non-thinking models).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct GenOptions {
     /// Hard decode cap (mistralrs `set_sampler_max_len`). `None` = the model's own default (today's
     /// behavior). Load-bearing for the realtime path.
     pub max_tokens: Option<usize>,
     /// Sampling temperature. `None` = the model's default sampler.
     pub temperature: Option<f64>,
-    /// Whether to allow qwen3 "thinking" traces. Default `false` — we never want thinking in
-    /// structured extraction; on non-thinking models this is a no-op.
+    /// Whether to allow qwen3 "thinking" traces. Default `false` (the derived bool default) — we never
+    /// want thinking in structured extraction; on non-thinking models this is a no-op.
     pub enable_thinking: bool,
-}
-
-impl Default for GenOptions {
-    fn default() -> Self {
-        Self {
-            max_tokens: None,
-            temperature: None,
-            enable_thinking: false,
-        }
-    }
 }
 
 impl GenOptions {

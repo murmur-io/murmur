@@ -53,11 +53,14 @@ use crate::reason::{parse_first_json, GenOptions, LocalReasoner};
 /// §3.3). REFUSE-don't-evict at the cap (see the module header).
 const MODEL_CACHE_CAP: usize = 2;
 
-/// The process-global loaded-model cache: canonical GGUF path → engine. Shared by every
-/// [`MistralReasoner`] instance (and, later, the LocalSummarizerProvider), so a model's weights load
-/// exactly once. A `Vec` (not a map) keeps the cap trivially enforceable and preserves load order.
-fn model_cache() -> &'static Mutex<Vec<(PathBuf, Arc<Model>)>> {
-    static CACHE: OnceLock<Mutex<Vec<(PathBuf, Arc<Model>)>>> = OnceLock::new();
+/// The resident-model list: (canonical GGUF path → loaded engine), capped at [`MODEL_CACHE_CAP`].
+type ResidentModels = Vec<(PathBuf, Arc<Model>)>;
+
+/// The process-global loaded-model cache. Shared by every [`MistralReasoner`] instance (and the
+/// LocalSummarizerProvider), so a model's weights load exactly once. A `Vec` (not a map) keeps the
+/// cap trivially enforceable and preserves load order.
+fn model_cache() -> &'static Mutex<ResidentModels> {
+    static CACHE: OnceLock<Mutex<ResidentModels>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
