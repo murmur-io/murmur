@@ -11,7 +11,6 @@ pub mod anthropic;
 pub mod egress_log;
 pub mod gateway;
 pub mod meta;
-pub mod brief;
 pub mod chat;
 pub mod claude_code;
 pub mod digest;

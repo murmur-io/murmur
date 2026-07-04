@@ -8,7 +8,7 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BrainOverview, BriefResult, BuiltinRecipe,
+    ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe,
     CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
@@ -3314,44 +3314,6 @@ pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<S
     std::fs::write(&path, canvas)
         .map_err(|e| AppError::Export(format!("write canvas failed: {e}")))?;
     Ok(path.to_string_lossy().to_string())
-}
-
-/// Pre-Meeting Brief: grounded prep card for an upcoming meeting `subject`, built from related
-/// past meeting notes.
-#[tauri::command]
-pub async fn pre_meeting_brief(
-    state: State<'_, AppState>,
-    subject: String,
-) -> Result<BriefResult, AppError> {
-    if subject.trim().is_empty() {
-        return Err(AppError::InvalidArg("subject is empty".into()));
-    }
-    let config = {
-        state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
-            .clone()
-    };
-    // Pass the LIVE session unlock set (E9), same as ask_vault: session-unlocked folders included,
-    // sealed-and-not-unlocked excluded.
-    let unlocked = unlocked_snapshot(state.inner())?;
-    // NOTES role (a written brief); the corpus budget keys on the same resolved connection the
-    // corpus egresses to (identical to `provider_id` while role keys are absent).
-    let notes_conn =
-        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
-            .connection;
-    let (corpus, sources) = crate::summarize::vault_context::build_vault_context_visible(
-        &state.db,
-        &subject,
-        &notes_conn,
-        &unlocked,
-    )?;
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
-    let (system, user) =
-        crate::summarize::brief::build_brief_prompt(&corpus, &subject, &config.note_language);
-    let markdown = provider.complete(&system, &user).await?;
-    Ok(BriefResult { markdown, sources })
 }
 
 /// Best-effort: the soonest macOS Calendar event in the next 60 minutes (title only). Returns
