@@ -851,6 +851,10 @@ export class SettingsStore {
   /**
    * The "right now" one-sentence summary for the active posture — for the
    * posture state-line in the redesigned AI & Models block (Task 2).
+   *
+   * Returns "" when `posture()` is null (not yet loaded), so the template never
+   * shows "Custom" as a pre-load flash. "Custom" is returned only for the actual
+   * `"custom"` posture value.
    */
   readonly postureStateLine = computed((): string => {
     switch (this.posture()) {
@@ -860,8 +864,10 @@ export class SettingsStore {
         return "Claude writes notes; your Mac runs realtime reactions and keeps fact-extraction on-device.";
       case "fully_local":
         return "Everything runs on this Mac. Nothing leaves. @brain answers run on-device (private, a little slower live).";
-      default:
+      case "custom":
         return "Custom — some features run on-device, some in the cloud.";
+      default:
+        return ""; // null = posture not yet loaded — show nothing rather than a misleading "Custom"
     }
   });
 
@@ -1291,8 +1297,11 @@ export class SettingsStore {
       .filter((m): m is BrainModelDto => !!m && !m.downloaded);
 
     if (absent.length === 0) {
-      // Fast path: all needed models already on disk — commit immediately.
+      // Fast path: all needed models already on disk — select them all, then commit.
+      // Selecting unconditionally ensures the backend role pins point at the
+      // auto-picked models, not the registry default (which may differ and be absent).
       try {
+        await this.selectNeeded(needed);
         await this.commitPosture(p);
       } catch (e) {
         this._postureError.set(String(e));
@@ -1316,10 +1325,13 @@ export class SettingsStore {
           this._brainDownloadingId.set(null);
         }
       }
-      // Select each model that was just downloaded so the backend registers it.
-      for (const m of absent) {
-        await this.ipc.selectBrainModel(m.id);
-      }
+      // Honor cancel between the last download and the select+commit, so a cancel
+      // during the only/final download does not still commit the posture.
+      if (this._cancelDownload) throw new Error("cancelled");
+      // Select ALL needed models (not just the newly-downloaded subset) so that a
+      // model that was already on disk but not selected also gets pinned to the
+      // right role before the posture commit.
+      await this.selectNeeded(needed);
       await this.commitPosture(p);
     } catch (e) {
       // A cancel is a user action — silent; any real failure surfaces the message.
@@ -1338,6 +1350,20 @@ export class SettingsStore {
   /** Abort an in-flight `setPosture` download loop. The posture stays unchanged. */
   cancelPostureDownload(): void {
     this._cancelDownload = true;
+  }
+
+  /**
+   * Select every model in `needed` (in `neededModelsFor` order: heavy first,
+   * then light) so the backend's role pins point at the auto-picked models before
+   * `set_brain_posture` commits. Called on BOTH the fast path (all on disk) and
+   * the slow path (after downloads complete) — the contract is identical.
+   */
+  private async selectNeeded(
+    needed: { role: "notes" | "reactions"; model: BrainModelDto | null }[],
+  ): Promise<void> {
+    for (const n of needed) {
+      if (n.model) await this.ipc.selectBrainModel(n.model.id);
+    }
   }
 
   /**
