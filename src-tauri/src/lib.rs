@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod audio;
+pub mod brain_reactions;
 pub mod calendar;
 pub mod commands;
 pub mod connectors;
@@ -174,6 +175,8 @@ pub fn run() {
             commands::brain_model_retirement_nudge,
             commands::brain_posture,
             commands::set_brain_posture,
+            commands::brain_reactions_shadow_count,
+            commands::set_brain_contradiction_cards,
             commands::select_brain_model,
             commands::download_brain_model,
             commands::afm_available,

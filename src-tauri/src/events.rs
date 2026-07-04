@@ -110,6 +110,15 @@ pub struct AssistantToolPayload {
 /// `proactive_hints_enabled` backend mute), so the FE never has to rate-limit it.
 pub const EVENT_PROACTIVE_HINT: &str = "murmur://proactive-hint";
 
+/// Realtime Reactions (spec §4) — a private in-meeting "whisper" the user alone sees: the far side
+/// just asserted something that CONTRADICTS a fact you already recorded. The payload is a
+/// [`crate::brain_reactions::WhisperCard`] (neutral summary + the EXTRACTIVE old-fact citation + the
+/// source `[[meeting]]`), built on-device from the LIGHT engine + the deterministic reconcile. Only
+/// fires when Brain Live is ON, the light model is present, and the contradiction sub-toggle is on
+/// (else the detection runs in SHADOW mode and nothing is emitted). Ephemeral — never persisted; the
+/// FE rail must purge it on lock/screen-share transitions (lock-model, product #2).
+pub const EVENT_WHISPER_CARD: &str = "murmur://whisper-card";
+
 /// Payload for [`EVENT_PROACTIVE_HINT`]. IDs + a SHORT title from an already-VISIBLE row only —
 /// never sealed content, never content bodies. `kind` is `"past_meeting"` | `"open_commitment"`
 /// | `"fact"`; `target_id` is the dedup/click-through id (the meeting id for past-meeting and

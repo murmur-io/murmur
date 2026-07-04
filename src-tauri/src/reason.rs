@@ -713,6 +713,23 @@ impl ReasonerCell {
         }
     }
 
+    /// The reasoner for FACT / user-memory / pre-analysis EXTRACTION. When Brain Live is ON it is the
+    /// LOCAL light engine ([`light`](Self::light) — local-or-stub, NEVER cloud), so fact extraction
+    /// stops egressing (the enablement card's "facts go fully local" promise; spec §3.4). When OFF it
+    /// is the role-resolved Notes reasoner EXACTLY as today (cloud by default). Rechecked per call.
+    pub fn extraction_reasoner(&self) -> Arc<dyn LocalReasoner> {
+        let brain_live = self
+            .config
+            .lock()
+            .map(|c| c.brain_live)
+            .unwrap_or(false);
+        if brain_live {
+            self.light()
+        } else {
+            self.current_for(Role::Notes)
+        }
+    }
+
     /// The LOCAL dispatch: reuse the cached instance while the resolved GGUF path is unchanged;
     /// rebuild (inside the cache lock, so concurrent callers never double-load a model) only when
     /// it changes. Resolution is a cheap filesystem probe per call — never a model load.
@@ -1925,5 +1942,33 @@ mod tests {
                 "class handle must NEVER be a cloud reasoner (anti-egress), got {id}"
             );
         }
+    }
+
+    /// P2 (spec §3.4): fact / user-memory / pre-analysis extraction routes to the LOCAL light engine
+    /// when Brain Live is ON (facts stop egressing) and to the cloud Notes reasoner when OFF (today's
+    /// behavior). The ON path must NEVER be a cloud reasoner.
+    #[test]
+    fn extraction_reasoner_is_local_when_brain_live_and_cloud_otherwise() {
+        // OFF (default) ⇒ the legacy Notes dispatch (cloud under the default backend).
+        let off = shared(AppConfig {
+            brain_backend: BrainBackend::Cloud,
+            ..Default::default()
+        });
+        assert!(
+            ReasonerCell::new(off).extraction_reasoner().id().starts_with("cloud:"),
+            "Brain Live OFF keeps the legacy cloud Notes extraction"
+        );
+        // ON ⇒ the local light engine (local-or-stub), never cloud — even with cloud consent.
+        let on = shared(AppConfig {
+            brain_live: true,
+            brain_backend: BrainBackend::Cloud,
+            cloud_egress_consented: true,
+            ..Default::default()
+        });
+        let id = ReasonerCell::new(on).extraction_reasoner().id().to_string();
+        assert!(
+            !id.starts_with("cloud:"),
+            "Brain Live ON must route fact extraction LOCAL, never cloud (got {id})"
+        );
     }
 }

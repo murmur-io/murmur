@@ -258,6 +258,12 @@ pub struct AppConfig {
     /// (the default) ⇒ the registry's default heavy model. `#[serde(default)]`.
     #[serde(default)]
     pub brain_heavy_model_id: Option<String>,
+    /// Realtime Reactions CONTRADICTION sub-toggle (spec §4.2). Default OFF: contradiction detection
+    /// runs in SHADOW mode (counts would-have-fired, emits nothing), so precision is calibrated on the
+    /// user's OWN meetings before the ⚠ cards are shown. Flipped ON per-user once the shadow bar clears.
+    /// Only meaningful while `brain_live` is on. `#[serde(default)]` ⇒ pre-existing configs load OFF.
+    #[serde(default)]
+    pub brain_contradiction_cards: bool,
     /// Phase E (Flow B) — the in-meeting VOICE ACTION DISPATCH master gate. When ON, a wake-word
     /// hit in a live caption ("Claudku, zrób research o X") DISPATCHES the parsed action against the
     /// gated vault (research/recall/reminder/note) and emits a live result. OPT-IN, default OFF
@@ -428,6 +434,7 @@ impl Default for AppConfig {
             brain_live: false,
             brain_light_model_id: None,
             brain_heavy_model_id: None,
+            brain_contradiction_cards: false,
             realtime_reactions: false,
             web_search_enabled: false,
             web_search_consented: false,
@@ -492,6 +499,7 @@ const K_REALTIME_REACTIONS: &str = "realtime_reactions";
 const K_BRAIN_LIVE: &str = "brain_live";
 const K_BRAIN_LIGHT_MODEL_ID: &str = "brain_light_model_id";
 const K_BRAIN_HEAVY_MODEL_ID: &str = "brain_heavy_model_id";
+const K_BRAIN_CONTRADICTION_CARDS: &str = "brain_contradiction_cards";
 const K_WEB_SEARCH_ENABLED: &str = "web_search_enabled";
 const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
@@ -640,6 +648,9 @@ impl AppConfig {
         }
         cfg.brain_light_model_id = opt(db.get_setting(K_BRAIN_LIGHT_MODEL_ID)?);
         cfg.brain_heavy_model_id = opt(db.get_setting(K_BRAIN_HEAVY_MODEL_ID)?);
+        if let Some(v) = db.get_setting(K_BRAIN_CONTRADICTION_CARDS)? {
+            cfg.brain_contradiction_cards = v == "true";
+        }
         if let Some(v) = db.get_setting(K_WEB_SEARCH_ENABLED)? {
             cfg.web_search_enabled = v == "true";
         }
@@ -815,6 +826,10 @@ impl AppConfig {
         db.set_setting(
             K_BRAIN_HEAVY_MODEL_ID,
             self.brain_heavy_model_id.as_deref().unwrap_or(""),
+        )?;
+        db.set_setting(
+            K_BRAIN_CONTRADICTION_CARDS,
+            if self.brain_contradiction_cards { "true" } else { "false" },
         )?;
         db.set_setting(
             K_WEB_SEARCH_ENABLED,

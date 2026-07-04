@@ -349,6 +349,10 @@ pub async fn start_recording(
     state
         .capped_notified
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Fresh recording ⇒ reset the Realtime-Reactions shadow counter (per-recording calibration).
+    state
+        .reactions_shadow_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
@@ -2137,10 +2141,13 @@ fn persist_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner
     //    is re-resolved from the LIVE config, so a consent/backend change applies without restart.
     let candidates = crate::facts::extract_fact_candidates(
-        &*state.reasoner.current_for(crate::summarize::roles::Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine (facts stop egressing); OFF ⇒ today's Notes reasoner.
+        &*state.reasoner.extraction_reasoner(),
         title,
         markdown,
         entity_refs,
+        // Post-call extraction over the full note: no tight cap (the realtime path uses a capped preset).
+        crate::reason::GenOptions::default(),
     );
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
@@ -2195,7 +2202,8 @@ fn persist_user_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner is
     //    re-resolved from the LIVE config so a consent/backend change applies without restart.
     let candidates = crate::user_memory::extract_user_fact_candidates(
-        &*state.reasoner.current_for(crate::summarize::roles::Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine (user facts stop egressing); OFF ⇒ today's reasoner.
+        &*state.reasoner.extraction_reasoner(),
         title,
         markdown,
         &typed_notes,
@@ -3698,6 +3706,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         brain_live: current.brain_live,
         brain_light_model_id: current.brain_light_model_id.clone(),
         brain_heavy_model_id: current.brain_heavy_model_id.clone(),
+        brain_contradiction_cards: current.brain_contradiction_cards,
         // Phase H (brain backend): which reasoner powers the brain (cloud/local/off) IS taken from
         // the DTO (the Settings UI owns the toggle). `BrainBackend` deserializes an unknown/omitted
         // token to the default `Cloud`, so the value here is always a valid enum variant.
@@ -4863,6 +4872,33 @@ pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     crate::settings::postures::apply_posture(&mut c, p);
+    c.save(&state.db)?;
+    Ok(())
+}
+
+/// The Realtime-Reactions SHADOW counter (spec §4.2): how many contradiction cards WOULD have fired
+/// this recording while the sub-toggle is OFF. Lets the FE offer "the brain would have flagged N —
+/// enable?" (user-local calibration, no telemetry). Read-only; resets each `start_recording`.
+#[tauri::command]
+pub fn brain_reactions_shadow_count(state: State<'_, AppState>) -> Result<u64, AppError> {
+    Ok(state
+        .reactions_shadow_count
+        .load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Flip the Realtime-Reactions CONTRADICTION-card sub-toggle (spec §4.2). Default OFF (shadow mode);
+/// the FE offers this only once the user's OWN shadow count clears a bar. Dedicated command (not the
+/// raw settings save, which preserves it) so a partial/older save can never silently enable ⚠ cards.
+#[tauri::command]
+pub fn set_brain_contradiction_cards(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    c.brain_contradiction_cards = enabled;
     c.save(&state.db)?;
     Ok(())
 }
@@ -7616,6 +7652,7 @@ mod lifecycle_tests {
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),
