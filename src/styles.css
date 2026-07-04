@@ -492,6 +492,117 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
   line-height: 1;
 }
 
+/* --- Segmented control (tabs / range toggles) ------------------------------ */
+.seg {
+  display: inline-flex;
+  padding: 3px;
+  gap: 3px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  flex: none;
+}
+.seg-btn {
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.seg-btn:hover:not(.is-active):not(:disabled) { background: var(--surface-hover); color: var(--text-primary); }
+.seg-btn.is-active { background: var(--accent-soft); color: var(--accent-hover); }
+.seg-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-ring); }
+.seg-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+
+/* --- Page-scale tab bar (the note-detail Note/Audio/Share tabs). Reuses the
+   .seg/.seg-btn primitives above at full width with a larger touch target. --- */
+.tabbar { display: flex; width: 100%; }
+.tabbar .seg-btn {
+  flex: 1 1 0;
+  padding: var(--space-3) var(--space-4);
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+/* --- Uniform section label (Analysis / Speakers / Transcript / Active links) - */
+.section-label {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* --- L1 calm content card: a raised surface with a hairline border and NO
+   shadow (depth reads through luminance + border, not a blur stack). The
+   frosted .card stays the floating/in-flow default; .panel-card is the quiet
+   in-panel block the redesign leans on. --- */
+.panel-card {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+}
+
+/* --- Opaque overflow/action menu (the ⋯ More popover, and any floating menu).
+   Floats OVER content → MUST be opaque (--surface-overlay), NOT the frosted
+   .card, or the note behind it bleeds through (trap T3). --- */
+.menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 240px;
+  padding: var(--space-2);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.menu-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.menu-group + .menu-group { margin-top: var(--space-1); padding-top: var(--space-2); border-top: 1px solid var(--border-subtle); }
+.menu-group-label {
+  padding: var(--space-1) var(--space-3) 2px;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.menu-item:hover:not(:disabled) { background: var(--surface-hover); }
+.menu-item:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-ring); }
+.menu-item:disabled { cursor: default; opacity: 0.45; }
+.menu-item-danger { color: var(--danger); }
+.menu-item-danger:hover:not(:disabled) { background: var(--danger-soft); }
+
 /* --- Empty / loading wells (shared across list + detail + analytics) -------- */
 .state-card { padding: var(--space-6); }
 .empty-state {
