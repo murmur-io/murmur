@@ -854,6 +854,29 @@ export class SettingsStore {
   private readonly _pendingPosture = signal<Posture | null>(null);
   readonly pendingPosture = this._pendingPosture.asReadonly();
 
+  /**
+   * A posture the user PICKED that needs an on-device download, awaiting explicit
+   * confirmation. Non-null shows the confirm card (what model, size, what it does
+   * + a Download button) — nothing downloads until `confirmPostureDownload()`. This
+   * is the deliberate opt-in step: a multi-GB download never starts on a single tap.
+   */
+  private readonly _pendingConfirm = signal<Posture | null>(null);
+  readonly pendingConfirm = this._pendingConfirm.asReadonly();
+
+  /** The models the pending-confirm posture would download (name/size for the card). */
+  readonly confirmModels = computed(() => {
+    const p = this._pendingConfirm();
+    return p ? this.neededModelsFor(p) : [];
+  });
+
+  /** Total bytes the pending-confirm download would fetch (absent models only). */
+  readonly confirmDownloadBytes = computed(() =>
+    this.confirmModels()
+      .map((n) => n.model)
+      .filter((m): m is BrainModelDto => !!m && !m.downloaded)
+      .reduce((sum, m) => sum + m.approxSizeBytes, 0),
+  );
+
   /** Flip to true via `cancelPostureDownload()` to abort an in-flight download loop. */
   private _cancelDownload = false;
 
@@ -1329,7 +1352,7 @@ export class SettingsStore {
   async setPosture(p: Posture): Promise<void> {
     if (p === "custom") return; // derived-only label — never settable
     this._postureError.set(null);
-    this._postureBusy.set(true);
+    this._pendingConfirm.set(null);
 
     const needed = this.neededModelsFor(p);
     const absent = needed
@@ -1337,9 +1360,11 @@ export class SettingsStore {
       .filter((m): m is BrainModelDto => !!m && !m.downloaded);
 
     if (absent.length === 0) {
-      // Fast path: all needed models already on disk — select them all, then commit.
-      // Selecting unconditionally ensures the backend role pins point at the
-      // auto-picked models, not the registry default (which may differ and be absent).
+      // Fast path: all needed models already on disk (Cloud, or a local posture whose
+      // models are present) — select them all, then commit immediately. Selecting
+      // unconditionally pins the backend roles at the auto-picked models, not the
+      // registry default (which may differ and be absent).
+      this._postureBusy.set(true);
       try {
         await this.selectNeeded(needed);
         await this.commitPosture(p);
@@ -1351,7 +1376,36 @@ export class SettingsStore {
       return;
     }
 
-    // Slow path: at least one model needs downloading before we can commit.
+    // Needs a download → ASK FIRST. Show the confirm card (model, size, what it does
+    // + a Download button); nothing downloads until confirmPostureDownload(). A
+    // multi-GB fetch must never start on a single tap.
+    this._pendingConfirm.set(p);
+  }
+
+  /** Dismiss the pending-confirm card without downloading. The posture stays unchanged. */
+  cancelPendingPosture(): void {
+    this._pendingConfirm.set(null);
+  }
+
+  /**
+   * Confirm the pending posture: download its absent on-device models (progress via
+   * `pendingPosture`/`brainDownloadFrac`), then select all needed models and commit.
+   * On failure/cancel, clears state, surfaces `postureError` (cancel is silent), and
+   * refreshes the display back to the unchanged backend posture. Never commits an
+   * incomplete state.
+   */
+  async confirmPostureDownload(): Promise<void> {
+    const p = this._pendingConfirm();
+    if (!p) return;
+    this._pendingConfirm.set(null);
+    this._postureError.set(null);
+    this._postureBusy.set(true);
+
+    const needed = this.neededModelsFor(p);
+    const absent = needed
+      .map((n) => n.model)
+      .filter((m): m is BrainModelDto => !!m && !m.downloaded);
+
     this._pendingPosture.set(p);
     this._cancelDownload = false;
     try {
@@ -1368,9 +1422,8 @@ export class SettingsStore {
       // Honor cancel between the last download and the select+commit, so a cancel
       // during the only/final download does not still commit the posture.
       if (this._cancelDownload) throw new Error("cancelled");
-      // Select ALL needed models (not just the newly-downloaded subset) so that a
-      // model that was already on disk but not selected also gets pinned to the
-      // right role before the posture commit.
+      // Select ALL needed models (not just the newly-downloaded subset) so a model
+      // already on disk but unselected also gets pinned to the right role first.
       await this.selectNeeded(needed);
       await this.commitPosture(p);
     } catch (e) {
@@ -1387,7 +1440,7 @@ export class SettingsStore {
     }
   }
 
-  /** Abort an in-flight `setPosture` download loop. The posture stays unchanged. */
+  /** Abort an in-flight download loop. The posture stays unchanged. */
   cancelPostureDownload(): void {
     this._cancelDownload = true;
   }
