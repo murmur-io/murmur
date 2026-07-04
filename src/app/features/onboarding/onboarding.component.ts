@@ -1784,13 +1784,18 @@ export class OnboardingComponent implements OnInit {
       ollamaModel: base?.ollamaModel ?? "llama3.1",
       claudeBinary: base?.claudeBinary ?? "claude",
       inputDevice: base?.inputDevice ?? null,
-      captureSystemAudio: base?.captureSystemAudio ?? false,
+      // Mirrors backend default capture_system_audio = true (settings/config.rs; #167).
+      captureSystemAudio: base?.captureSystemAudio ?? true,
       vadEnabled: base?.vadEnabled ?? true,
       keepHiresMasters: base?.keepHiresMasters ?? false,
       diarizeOthers: base?.diarizeOthers ?? false,
       voiceprintEnabled: base?.voiceprintEnabled ?? false,
       aecEnabled: base?.aecEnabled ?? false,
       postAecEnabled: base?.postAecEnabled ?? false,
+      // Recording-storage cap + opt-in auto-prune — preserve-only here (the Settings
+      // Storage section owns them); round-trip the snapshot, defaults = no cap / off.
+      audioStorageLimitGb: base?.audioStorageLimitGb ?? null,
+      audioAutoPrune: base?.audioAutoPrune ?? false,
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
@@ -1820,8 +1825,9 @@ export class OnboardingComponent implements OnInit {
       proactiveHintsEnabled: base?.proactiveHintsEnabled ?? true,
       // Cross-meeting user memory — round-trip the snapshot, default ON (fresh install).
       userMemoryEnabled: base?.userMemoryEnabled ?? true,
-      // brain2 RAG — semantic-search master flag; round-trip the snapshot, default off.
-      semanticSearchEnabled: base?.semanticSearchEnabled ?? false,
+      // brain2 RAG — semantic-search master flag; round-trip the snapshot.
+      // Mirrors backend default semantic_search_enabled = true (settings/config.rs; #159/#160).
+      semanticSearchEnabled: base?.semanticSearchEnabled ?? true,
       // brain2 connectors — web-search toggle + its preserve-only consent; round-trip
       // the snapshot so onboarding never resets them, both default off (no egress).
       webSearchEnabled: base?.webSearchEnabled ?? false,

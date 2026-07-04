@@ -204,6 +204,32 @@ pub fn restore(text: &str, map: &HashMap<String, String>) -> String {
     s
 }
 
+/// Scrub a CONNECTOR (external-tool) query through the SAME two-layer firewall the cloud provider
+/// path applies, and return the scrubbed query + the content-free redaction counts.
+///
+/// This is the FRAMEWORK-level scrub used by [`crate::connectors::ConnectorRegistry::search`] so an
+/// outgoing web-search query is masked exactly as a cloud-bound prompt would be:
+/// - regex layer (email/card/phone) via [`redact_into`], then
+/// - the on-device NER name layer (`names`; the no-op when no model is installed → byte-identical),
+///
+/// mirroring the ordering in [`RedactingProvider::summarize_with_meta`] (regex map first, then
+/// `redact_names`). Unlike the provider path, a connector query is NEVER de-tokenized (web results
+/// are attributed to the source as-is), so BOTH restore maps are discarded here — the caller gets
+/// only the scrubbed string plus the [`RedactionCounts`] for the content-free egress ledger.
+pub(crate) fn redact_connector_query(
+    query: &str,
+    names: &dyn NameRedactor,
+) -> (String, RedactionCounts) {
+    let mut map = HashMap::new();
+    let mut rev = HashMap::new();
+    let regex_scrubbed = redact_into(query, &mut map, &mut rev);
+    // NER name layer (no-op → unchanged when no model is present). The token→name pairs are
+    // discarded: connector queries are never restored.
+    let (scrubbed, name_pairs) = names.redact_names(&regex_scrubbed);
+    let counts = count_redactions(&map, name_pairs.len());
+    (scrubbed, counts)
+}
+
 /// Seam for on-device personal-NAME redaction (Phase 3a).
 ///
 /// The regex scrubbers above catch emails / cards / phones with high confidence, but personal

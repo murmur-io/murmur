@@ -3880,8 +3880,20 @@ export class DetailComponent implements OnInit {
           bg: "rgba(157, 123, 255, 0.16)",
           fg: "#b9a4ff",
         };
-      default:
+      default: {
+        // A diarized remote cluster tag ("others-{n}") → a "Speaker {n+1}" chip (same neutral
+        // violet as "Others"). Presentational only; independent of the timeline lanes' LLM/renamed
+        // labels. Any other/legacy value stays unlabeled (null).
+        const m = /^others-(\d+)$/.exec(speaker ?? "");
+        if (m) {
+          return {
+            label: `Speaker ${Number(m[1]) + 1}`,
+            bg: "rgba(157, 123, 255, 0.16)",
+            fg: "#b9a4ff",
+          };
+        }
         return null;
+      }
     }
   }
 

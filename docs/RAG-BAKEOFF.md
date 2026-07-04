@@ -1,7 +1,7 @@
 <!-- Turnkey protocol for validating retrieval quality on YOUR real Mac + vault. Decides whether the vector/brain stack earns its keep, or FTS5 (already shipped) is enough. -->
 # RAG bake-off — does the vector layer earn its keep? (run on your Mac)
 
-The lock-safe vector + GraphRAG-lite stack is merged but **dormant in prod** (behind the default-off `semantic_search_enabled` flag, with a stub embedder). Before we invest in the real embedder + the local reasoning brain, this protocol answers — **on your real vault** — the one question headless tests can't:
+The lock-safe vector + GraphRAG-lite stack ships and is **on by default** (`semantic_search_enabled` defaults ON since #159/#160). The real on-device embedder (multilingual-e5-small, ~470 MB) is downloaded from Settings and activates on model-presence; until it's downloaded, retrieval falls back to keyword (FTS) search backed by a deterministic stub embedder. This protocol answers — **on your real vault** — the one question headless tests can't:
 
 > **Is the shipped FTS5 search already "a brain", or do paraphrase / cross-lingual / entity-spread questions genuinely need the vector + graph layer?**
 

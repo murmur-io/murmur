@@ -15,6 +15,17 @@ import type { NoteDto, Stage, StatusPayload } from "./models";
 import { ToastService } from "../services/toast.service";
 
 /**
+ * Human byte label (binary), matching the Storage settings section's `mb()`:
+ * ≥1 GiB → "x.xx GB", else "N MB". Kept module-local so the toast copy and the
+ * Storage-section chip round identically.
+ */
+function humanBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024)
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  return Math.round(bytes / (1024 * 1024)) + " MB";
+}
+
+/**
  * Signal-based recorder state: status stage, last note, and last error.
  * Subscribes to the EVENT_STATUS stream from the Rust core.
  */
@@ -95,6 +106,8 @@ export class RecorderStore {
   private unlistenToggle: UnlistenFn | null = null;
   private unlistenLive: UnlistenFn | null = null;
   private unlistenEcho: UnlistenFn | null = null;
+  private unlistenStoragePruned: UnlistenFn | null = null;
+  private unlistenCapped: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -117,6 +130,27 @@ export class RecorderStore {
       this.toast.info(
         `Removed ${s} echoed line${s === 1 ? "" : "s"} from the transcript — wear headphones for best results 🎧`,
       );
+    });
+    // Storage auto-prune notice: old recordings' audio was deleted to stay under the cap.
+    // Honest feedback that content (audio only — notes are kept) was removed.
+    this.unlistenStoragePruned = await this.ipc.onStoragePruned((p) => {
+      this.toast.info(
+        `Freed ${humanBytes(p.freedBytes)} — removed ${p.prunedCount} old recording${p.prunedCount === 1 ? "" : "s"} to stay under your storage limit`,
+      );
+    });
+    // 4h TIME-cap notice: the backend capture self-stopped at MAX_RECORDING_SECONDS and everything
+    // spoken past it is dropped. Surface the notice + AUTO-FINALIZE via the existing stop() action so
+    // the meeting still produces a note (the capped buffer is intact). IDEMPOTENT: only dispatch stop()
+    // while we're still in the "recording" stage — a second cap event or a user Stop already in flight
+    // has moved the stage past "recording", so this becomes a no-op (no double stop_recording).
+    this.unlistenCapped = await this.ipc.onRecordingCapped((p) => {
+      const hours = Math.round(p.limitSeconds / 3600);
+      this.toast.info(
+        `Maximum recording length (${hours} h) reached — recording stopped; generating your note…`,
+      );
+      if (this._stage() === "recording") {
+        void this.stop();
+      }
     });
     await this.refreshLastNote();
   }

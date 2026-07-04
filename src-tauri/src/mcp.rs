@@ -52,7 +52,9 @@ pub type UnlockedSet = Arc<Mutex<HashSet<String>>>;
 
 /// Spawn the MCP server on a background thread. Best-effort: a bind failure is logged; the app
 /// continues normally. `unlocked` is shared with the command surface so visibility tracks the
-/// live session state. `require_token` gates `tools/call` behind a bearer token (default off).
+/// live session state. `require_token` gates `tools/call` behind a bearer token (default ON —
+/// `AppConfig::mcp_require_token` defaults `true`, and `lib.rs` fails CLOSED to `true` on a
+/// poisoned/unreadable config).
 pub fn spawn(db_path: PathBuf, unlocked: UnlockedSet, require_token: bool) {
     let _ = std::thread::Builder::new()
         .name("murmur-mcp".into())
@@ -607,8 +609,8 @@ mod tests {
         );
 
         let emb = crate::embed::active_embedder();
-        db.index_meeting_chunks("open", emb.as_ref()).unwrap();
-        db.index_meeting_chunks("sealed", emb.as_ref()).unwrap();
+        db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", &[], emb.as_ref()).unwrap();
         // Seal the folder AFTER indexing (a stray vec row now exists for a sealed meeting).
         db.set_folder_locked("f-lock", true, None).unwrap();
 
