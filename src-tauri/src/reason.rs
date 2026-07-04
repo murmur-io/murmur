@@ -1,15 +1,24 @@
-//! Local on-device reasoning seam (Phase 3a — PROD-INERT).
+//! Local on-device reasoning seam — WIRED into production.
 //!
-//! [`LocalReasoner`] is the trait the heavy local reasoner (mistral.rs with grammar-constrained
-//! decoding, Phase 3b) will implement. This increment ships ONLY the seam plus a deterministic
-//! [`StubReasoner`] and a robust JSON extractor — NO ML crate, NO model download. The real impl is
-//! a one-line swap at the construction site; nothing here is wired into a production path yet
-//! (`graph.rs`/`timeline.rs` keep their existing brittle parse until a later increment).
+//! [`LocalReasoner`] is the trait the whole brain reasons through. It is NO longer inert: the live
+//! dispatch runs through [`ReasonerCell`] (held on `AppState.reasoner`) and drives the shipped
+//! reasoning paths — the agentic tool-choice loop ([`crate::agent`]), the retrieval planner
+//! ([`crate::orchestrate`]), fact/user-memory extraction ([`crate::facts`] / [`crate::user_memory`]),
+//! voice-intent interpretation ([`crate::voice_action`]), and the note/Ask commands
+//! (`ask_vault`, note synthesis in `commands.rs` / `pipeline.rs`). [`active_reasoner`] selects the
+//! concrete impl at runtime from the configured [`BrainBackend`]: the cloud provider
+//! ([`CloudReasoner`], claude_code / anthropic / gateway / local Ollama), the on-device GGUF
+//! ([`mistral::MistralReasoner`], selected when a model resolves on disk), the experimental Apple
+//! Foundation sidecar ([`afm::AfmReasoner`]), or the dependency-free [`StubReasoner`] fallback.
 //!
 //! The [`LocalReasoner::structured`] method is the load-bearing seam: it is where reliable
-//! tool-call / NER-classification JSON comes from. A real impl constrains decoding to the schema;
-//! the stub fakes it but still routes its output through [`extract_first_json`] so the
-//! recover-JSON-from-noisy-text path is exercised and testable.
+//! tool-call / NER-classification / retrieval-plan JSON comes from. NONE of the shipped reasoners
+//! grammar-constrain the decode — the on-device GGUF path DELIBERATELY abandoned
+//! `Constraint::JsonSchema` (it overflowed the model context on Bielik-11B; see
+//! [`mistral::MistralReasoner::structured`]) and instead INSTRUCTS the JSON schema in the prompt,
+//! recovering the object with [`extract_first_json`], the SAME schema-in-prompt approach
+//! [`CloudReasoner`] uses. The robust recover-JSON-from-noisy-text path is therefore load-bearing
+//! for every backend, and every reasoner (stub included) routes through it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -467,8 +476,11 @@ pub trait LocalReasoner: Send + Sync {
     fn reason(&self, system: &str, user: &str) -> Result<String>;
 
     /// Structured reasoning: run `system` + `user` and return a JSON value. `json_schema` is the
-    /// shape the output must conform to — a real impl constrains decoding to it; the stub ignores
-    /// the constraint but still returns valid JSON recovered via [`extract_first_json`].
+    /// shape the output must conform to. NONE of the shipped impls hard-constrain the decode: the
+    /// GGUF path (`MistralReasoner`) and the cloud path (`CloudReasoner`) both INSTRUCT the schema in
+    /// the prompt and recover the object via [`extract_first_json`] (mistral.rs abandoned
+    /// `Constraint::JsonSchema` — it overflowed the context on Bielik-11B); the stub likewise ignores
+    /// the schema but still returns valid JSON through the same extractor.
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value>;
 }
 
