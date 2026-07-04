@@ -10,6 +10,10 @@
 //!   and the authoritative final transcript produced at stop are unaffected.
 //! - Live quality/latency depends on the chosen model (use a small model for snappy
 //!   captions); a slow tick just means less frequent captions, never a broken recording.
+//! - MIC-ONLY until Stop: this loop transcribes the LOCAL MIC tail alone. The system-audio
+//!   (far-side / other participants) stream is captured separately and is batch-transcribed only
+//!   in the post-Stop `pipeline.rs` dual-stream merge — so the live captions AND the live `@brain`
+//!   context reflect what YOU say during the call; the other side is folded in only after Stop.
 
 use std::path::PathBuf;
 use std::time::Duration;

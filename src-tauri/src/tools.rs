@@ -32,13 +32,16 @@ use crate::error::{AppError, Result};
 use crate::settings::AppConfig;
 use crate::storage::Db;
 
-/// A single read-only tool invocation. The six MCP tools are implemented today; the commented
-/// variants below are the Phase-E extension points (voice-intent-driven WRITE actions) — they are
-/// deliberately NOT yet part of the enum so no surface can dispatch them before the brain lands.
+/// A single read-only tool INVOCATION. This enum holds the 8 read-only calls the brain can run
+/// against the vault: the 6 the MCP surface advertises (`mcp.rs::tools_spec`) — `search_meetings`,
+/// `get_meeting`, `list_recent_meetings`, `search_semantic`, `get_open_commitments`,
+/// `get_entity_dossier` — plus the 2 consent-gated CONNECTOR tools (`WebSearch`, `CalendarLookup`),
+/// which dispatch through the async connector executors rather than the synchronous `execute_tool`.
 ///
-/// Room for future (Phase E, NOT implemented here):
-///   - `NoteAside { text: String }`        — append an aside to the live note.
-///   - `CreateReminder { text, due }`       — create a reminder.
+/// The FULL model-facing catalog is [`tool_specs`] — 11 entries: these 8 read tools, the DB-free
+/// `propose_note` draft tool, and the 2 gated WRITE tools (`save_note`, `create_reminder`). The
+/// writes live on [`GatedToolExecutor`] (dispatched ONLY when it was built with `allow_writes`), NOT
+/// on this enum — so no read-only surface (e.g. MCP) can ever dispatch a write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCall {
     /// Full-text search across titles/transcripts/notes.

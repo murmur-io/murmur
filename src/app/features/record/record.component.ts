@@ -109,6 +109,42 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
             }
           </p>
 
+          <!-- Honesty hint: live captions are mic-only until Stop (matches the
+               README "Live captions are mic-only until you stop"). The other
+               side's system audio is captured in parallel and folded into the
+               full Me / Others transcript only after you stop. Compact + muted +
+               flex:none so it never crowds the ticker (which absorbs the flex). -->
+          <span
+            class="cc-scope"
+            role="note"
+            title="Live captions show your side (your microphone) during the meeting. The other participants are captured now and added to the full Me / Others transcript after you stop."
+          >
+            <svg
+              class="cc-scope-ico"
+              viewBox="0 0 16 16"
+              width="12"
+              height="12"
+              aria-hidden="true"
+            >
+              <circle
+                cx="8"
+                cy="8"
+                r="6.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M8 7.2v4"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+              <circle cx="8" cy="4.6" r="0.9" fill="currentColor" />
+            </svg>
+            <span class="cc-scope-text">Your side · full transcript after Stop</span>
+          </span>
+
           <!-- Mic-mute: silences only the local mic; system audio keeps recording.
                Compact (icon-only) so the strip stays uncrowded. -->
           <app-mic-mute-toggle [compact]="true" #micToggle />
@@ -857,6 +893,28 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
       .cc-idle {
         color: var(--text-muted);
         font-style: italic;
+      }
+      /* Live-captions honesty hint — muted, non-shrinking (flex:none) so the
+         ticker keeps absorbing the free space. Not part of the ticker itself. */
+      .cc-scope {
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-1);
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        white-space: nowrap;
+        cursor: default;
+      }
+      .cc-scope-ico {
+        flex: none;
+        opacity: 0.8;
+      }
+      /* On tighter widths drop the label; the ⓘ icon + tooltip still carry it. */
+      @media (max-width: 720px) {
+        .cc-scope-text {
+          display: none;
+        }
       }
       @keyframes cc-in {
         from {
