@@ -345,7 +345,72 @@ interface ParsedNote {
                   >
                     {{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}
                   </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    (click)="shareAsLink(d.meeting.id)"
+                    [disabled]="editing() || sharing()"
+                  >
+                    {{ sharing() ? "Sharing…" : "Share as link" }}
+                  </button>
                 </div>
+              }
+
+              <!-- Share-as-link: one-time egress consent panel, the created
+                   link, or an inline error. The consent panel is IN-FLOW (not a
+                   floating overlay) so a frosted .card is correct here. -->
+              @if (needsShareConsent()) {
+                <div class="card share-consent" role="group">
+                  <p class="share-consent-copy">
+                    This uploads the encrypted note to your sharing server. The
+                    note is end-to-end encrypted — the server can't read it — but
+                    it does leave this Mac.
+                  </p>
+                  <div class="share-consent-actions">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="confirmShareConsent()"
+                    >
+                      Confirm &amp; share
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      (click)="cancelShareConsent()"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              }
+              @if (shareUrl(); as url) {
+                <div class="share-result" role="group" aria-label="Share link">
+                  <div class="share-link-row">
+                    <input
+                      type="text"
+                      class="share-link-input"
+                      [value]="url"
+                      readonly
+                      aria-label="Share link"
+                    />
+                    <button
+                      type="button"
+                      class="btn"
+                      (click)="copyShareLink()"
+                    >
+                      {{ shareLinkCopied() ? "Copied" : "Copy link" }}
+                    </button>
+                  </div>
+                  <p class="share-link-note text-secondary">
+                    Anyone with this link can read the note. The link's
+                    <code>#…</code> part is the decryption key and never reached
+                    the server.
+                  </p>
+                </div>
+              }
+              @if (shareError(); as err) {
+                <span class="msg msg-error" role="alert">{{ err }}</span>
               }
 
               <!-- HI-RES MASTERS: retrieve the faithful per-stream float32 WAV
@@ -1119,6 +1184,51 @@ interface ParsedNote {
         height: 36px;
         padding: 0 var(--space-3);
         font-size: 0.875rem;
+      }
+
+      /* --- Share as link (M3-CLIENT) --- */
+      .share-consent,
+      .share-result {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        flex-basis: 100%;
+        max-width: 36rem;
+      }
+      .share-consent {
+        gap: var(--space-3);
+        padding: var(--space-4);
+      }
+      .share-consent-copy,
+      .share-link-note {
+        margin: 0;
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+      .share-consent-actions,
+      .share-link-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+      }
+      .share-link-input {
+        flex: 1 1 20rem;
+        min-width: 0;
+        height: 36px;
+        padding: 0 var(--space-3);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 0.85rem;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .share-link-row .btn {
+        flex: none;
       }
       /* Pin toast reuses .saved-toast box (accent variant). */
       .pin-toast {
@@ -1970,6 +2080,23 @@ export class DetailComponent implements OnInit {
   readonly exportError = signal("");
   /** Tracked so we can cancel the pending export-label reset on destroy. */
   private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // --- Share as link (M3-CLIENT: zero-knowledge note link share) -----------
+  /** True while a `shareNoteToLink` IPC call is in flight (disables the button). */
+  readonly sharing = signal(false);
+  /** The created share URL; the `#…` fragment holds the decryption key (kept local). */
+  readonly shareUrl = signal<string | null>(null);
+  /** Inline error surfaced when sharing fails or is refused (not logged in, etc.). */
+  readonly shareError = signal<string | null>(null);
+  /**
+   * True after the first-share check finds share-egress consent NOT yet granted:
+   * the template shows an inline one-time consent panel before the upload runs.
+   * The meeting id is stashed so Confirm can proceed without re-plumbing it.
+   */
+  readonly needsShareConsent = signal(false);
+  private pendingShareMeetingId: string | null = null;
+  /** Brief "Copied" confirmation for the share-link copy button. */
+  readonly shareLinkCopied = signal(false);
 
   /**
    * Whether this install keeps high-fidelity per-stream master archives (the
@@ -2965,6 +3092,109 @@ export class DetailComponent implements OnInit {
         clearTimeout(this.exportResetTimer);
       }
     });
+  }
+
+  // --- Share as link (zero-knowledge note link share) ----------------------
+
+  /**
+   * Create a zero-knowledge link share of this note and copy the URL. Guards
+   * first on the sharing-account session (server set? logged in + unlocked?),
+   * then on the one-time share-egress consent: the FIRST share pauses on an
+   * inline consent panel ({@link needsShareConsent}) until the user confirms.
+   *
+   * The returned URL is NEVER logged — its `#…` fragment is the decryption key
+   * and only ever lands in the signal + clipboard.
+   */
+  async shareAsLink(meetingId: string): Promise<void> {
+    if (this.editing() || this.sharing()) {
+      return;
+    }
+    this.shareError.set(null);
+    this.shareUrl.set(null);
+    let st;
+    try {
+      st = await this.ipc.accountStatus();
+    } catch (e) {
+      this.shareError.set(String(e));
+      return;
+    }
+    if (!st.serverConfigured) {
+      this.shareError.set("Set a sharing server in Settings → Account first.");
+      return;
+    }
+    if (!st.loggedIn || !st.unlockedForSharing) {
+      this.shareError.set(
+        "Sign in to your sharing account first (Settings → Account).",
+      );
+      return;
+    }
+    if (!st.shareConsented) {
+      // First share — surface the inline one-time consent panel and stop here.
+      this.pendingShareMeetingId = meetingId;
+      this.needsShareConsent.set(true);
+      return;
+    }
+    await this.doShare(meetingId);
+  }
+
+  /** Confirm the one-time share-egress consent, then proceed with the pending share. */
+  async confirmShareConsent(): Promise<void> {
+    const id = this.pendingShareMeetingId;
+    this.needsShareConsent.set(false);
+    this.pendingShareMeetingId = null;
+    if (!id) {
+      return;
+    }
+    this.shareError.set(null);
+    try {
+      await this.ipc.consentToShareEgress();
+    } catch (e) {
+      this.shareError.set(String(e));
+      return;
+    }
+    await this.doShare(id);
+  }
+
+  /** Cancel the pending first-share (dismiss the consent panel, upload nothing). */
+  cancelShareConsent(): void {
+    this.needsShareConsent.set(false);
+    this.pendingShareMeetingId = null;
+  }
+
+  /**
+   * Perform the actual upload + copy. Consent/login are already verified by the
+   * caller. The URL goes to the signal + clipboard only (never the console).
+   */
+  private async doShare(meetingId: string): Promise<void> {
+    this.sharing.set(true);
+    try {
+      const url = await this.ipc.shareNoteToLink(meetingId);
+      this.shareUrl.set(url);
+      try {
+        await navigator.clipboard.writeText(url);
+        this.shareLinkCopied.set(true);
+      } catch {
+        // Clipboard unavailable — the URL stays visible + selectable to copy.
+      }
+    } catch (e) {
+      this.shareError.set(String(e));
+    } finally {
+      this.sharing.set(false);
+    }
+  }
+
+  /** Copy the created share link to the clipboard (the readonly-field button). */
+  async copyShareLink(): Promise<void> {
+    const url = this.shareUrl();
+    if (!url) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      this.shareLinkCopied.set(true);
+    } catch {
+      // Clipboard unavailable — the URL stays visible + selectable.
+    }
   }
 
   /** Build a filesystem-safe filename stem from a meeting title. */

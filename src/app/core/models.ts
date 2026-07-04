@@ -198,6 +198,19 @@ export interface AppConfigDto {
    */
   gatewayModel: string;
   /**
+   * M3-CLIENT — base URL of the Murmur sharing server (self-host or hosted).
+   * Default `""` (unset ⇒ account/share commands fail closed). Mirrors Rust
+   * `AppConfigDto.share_base_url`. Validated like `gatewayBaseUrl`.
+   */
+  shareBaseUrl: string;
+  /**
+   * M3-CLIENT — one-time SHARE-egress consent. DISPLAY-ONLY on this DTO (like
+   * `cloudEgressConsented`): carried OUT so the FE can show consent status, but
+   * PRESERVE-ONLY on `saveConfig` — mutated only by `consentToShareEgress` /
+   * `revokeShareEgress`. Mirrors Rust `AppConfigDto.share_egress_consented`.
+   */
+  shareEgressConsented: boolean;
+  /**
    * Proactive brain (P2) — the GLOBAL MUTE for in-meeting recall hints
    * (`EVENT_PROACTIVE_HINT` cards). Off silences the event source in the
    * BACKEND (the live-loop matcher never runs), and the FE additionally never
@@ -1155,4 +1168,34 @@ export interface EgressLedger {
   totalRedactions: RedactionCounts;
   /** Most-recent calls (newest first, capped server-side). */
   recent: EgressRow[];
+}
+
+// ── M3-CLIENT: sharing account + zero-knowledge link shares (mode A) ──
+
+/** Mirrors Rust `commands::AccountStatus` — the sharing-account session state. */
+export interface AccountStatus {
+  /** A session is present (logged in this session, or restorable from the Keychain). */
+  loggedIn: boolean;
+  /** The account email, when logged in. */
+  email: string | null;
+  /** MK is in the session so a share can actually be sealed without re-auth. */
+  unlockedForSharing: boolean;
+  /** The one-time share-egress consent has been granted. */
+  shareConsented: boolean;
+  /** A sharing server base URL is configured (sharing is impossible without one). */
+  serverConfigured: boolean;
+}
+
+/** Mirrors Rust `commands::MyShareEntry` — one row of the user's shares. Content-free: `title` is
+ * present ONLY when the local meeting is unlocked (a sealed meeting is masked `locked:true`). */
+export interface MyShareEntry {
+  shareId: string;
+  /** The local meeting title, or `null` when the meeting is sealed/unknown (then `locked:true`). */
+  title: string | null;
+  locked: boolean;
+  rev: number;
+  createdAt: string;
+  expiresAt: string | null;
+  revoked: boolean;
+  downloadCount: number;
 }

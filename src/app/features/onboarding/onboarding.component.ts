@@ -1844,6 +1844,12 @@ export class OnboardingComponent implements OnInit {
       roleLiveConnection: base?.roleLiveConnection ?? "",
       roleLiveModel: base?.roleLiveModel ?? "",
       roleLiveEffort: base?.roleLiveEffort ?? "",
+      // M3-CLIENT sharing — preserve-only here (the Settings → Account section
+      // owns them); round-trip the snapshot so onboarding never clears a set
+      // sharing server or the preserve-only share-egress consent. Defaults
+      // mirror a fresh install (no server, no consent → no egress).
+      shareBaseUrl: base?.shareBaseUrl ?? "",
+      shareEgressConsented: base?.shareEgressConsented ?? false,
     };
     await this.ipc.saveConfig(cfg);
     // Keep the snapshot current so successive saves don't clobber fresh choices.
