@@ -76,7 +76,7 @@ import { SettingsStore } from "../settings.store";
               recordings in locked folders are never touched.
             </span>
           </span>
-          <input type="checkbox" formControlName="audioAutoPrune" />
+          <input class="switch" type="checkbox" formControlName="audioAutoPrune" />
         </label>
       </div>
 

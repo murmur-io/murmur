@@ -123,7 +123,7 @@ export interface ConnectionCardVm {
                     never passed through.
                   </span>
                 </span>
-                <input type="checkbox" formControlName="claudeCodeInheritEnv" />
+                <input class="switch" type="checkbox" formControlName="claudeCodeInheritEnv" />
               </label>
             }
             @case ("anthropic") {

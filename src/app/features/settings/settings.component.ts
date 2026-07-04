@@ -195,18 +195,16 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
           }
         </nav>
 
-        <!-- Save applies the whole form regardless of the visible section. -->
-        <div class="sidebar-footer">
-          <button type="button" class="btn btn-primary sidebar-save" (click)="save()">
-            Save settings
-          </button>
-          @if (saved()) {
+        <!-- Auto-save: every change persists on its own (no Save button);
+             the pill is the passive "all changes saved" confirmation. -->
+        @if (saved()) {
+          <div class="sidebar-footer">
             <span class="pill is-success saved-pill">
               <span class="pill-dot"></span>
               Saved
             </span>
-          }
-        </div>
+          </div>
+        }
       </aside>
 
       <!-- Right pane: the selected section's controls. -->
@@ -467,9 +465,6 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         padding-top: var(--space-3);
         border-top: 1px solid var(--border-subtle);
       }
-      .sidebar-save {
-        flex: 1 1 auto;
-      }
       .saved-pill {
         flex: none;
       }
@@ -485,11 +480,13 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         overflow-y: auto;
         padding: var(--space-7) var(--space-6) var(--space-8);
       }
-      /* Cap the reading width so cards don't stretch across an ultrawide window. */
+      /* Cap the reading width AND center the column — the same centered
+         max-width reading column as the main pages (.app-main). */
       .content-header,
       .section-body {
         width: 100%;
         max-width: var(--content-max);
+        margin: 0 auto;
       }
       .content-header h2 {
         margin: 0;
@@ -637,10 +634,5 @@ export class SettingsComponent implements OnInit {
     // Pre-split this was an async ngOnInit whose promise Angular ignored;
     // `void` keeps identical fire-and-forget semantics.
     void this.store.load();
-  }
-
-  /** Save applies the whole form regardless of the visible section. */
-  save(): void {
-    void this.store.save();
   }
 }

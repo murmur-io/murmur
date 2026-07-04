@@ -186,7 +186,7 @@ import { SettingsStore } from "../settings.store";
                         to stop learning and inject nothing.
                       </span>
                     </span>
-                    <input type="checkbox" formControlName="userMemoryEnabled" />
+                    <input class="switch" type="checkbox" formControlName="userMemoryEnabled" />
                   </label>
                 </div>
 

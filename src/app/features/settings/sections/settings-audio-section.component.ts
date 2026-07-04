@@ -43,7 +43,7 @@ import { SettingsStore } from "../settings.store";
                       your mic — needs the Screen Recording permission on first use.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="captureSystemAudio" />
+                  <input class="switch" type="checkbox" formControlName="captureSystemAudio" />
                 </label>
               </div>
 
@@ -57,7 +57,7 @@ import { SettingsStore } from "../settings.store";
                       transcripts (voice-activity detection). Recommended.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="vadEnabled" />
+                  <input class="switch" type="checkbox" formControlName="vadEnabled" />
                 </label>
               </div>
 
@@ -72,7 +72,7 @@ import { SettingsStore } from "../settings.store";
                       use per meeting.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="keepHiresMasters" />
+                  <input class="switch" type="checkbox" formControlName="keepHiresMasters" />
                 </label>
               </div>
 
@@ -88,7 +88,7 @@ import { SettingsStore } from "../settings.store";
                       ~40 MB of models on first use.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="diarizeOthers" />
+                  <input class="switch" type="checkbox" formControlName="diarizeOthers" />
                 </label>
               </div>
 
@@ -104,7 +104,7 @@ import { SettingsStore } from "../settings.store";
                       individual speakers” above.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="voiceprintEnabled" />
+                  <input class="switch" type="checkbox" formControlName="voiceprintEnabled" />
                 </label>
 
                 <!-- Management list — the captured voiceprints, each forgettable. -->
@@ -157,7 +157,7 @@ import { SettingsStore } from "../settings.store";
                       voice when recording on speakers. Runs fully on-device.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="postAecEnabled" />
+                  <input class="switch" type="checkbox" formControlName="postAecEnabled" />
                 </label>
               </div>
 
@@ -171,7 +171,7 @@ import { SettingsStore } from "../settings.store";
                       with your Whisper model while idle.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="voiceTrigger" />
+                  <input class="switch" type="checkbox" formControlName="voiceTrigger" />
                 </label>
               </div>
     </div>
