@@ -127,9 +127,55 @@ import { SettingsStore } from "../../settings.store";
           neededModels() in the pending branch.
         -->
         <div class="posture-state">
-          @if (pendingPosture(); as pend) {
+          @if (pendingConfirm(); as confirm) {
+            <!--
+              CONFIRM step (opt-in): the picked posture needs an on-device model, so
+              we ASK before fetching — what model, how big, what it does + a button.
+              A multi-GB download never starts on a single tap.
+            -->
+            <p class="posture-confirm-title">
+              {{ pendingLabel(confirm) }} needs
+              {{ confirmModels().length > 1 ? "models" : "a model" }} on your Mac
+            </p>
+            @for (n of confirmModels(); track n.role) {
+              <span class="pill" [class.is-success]="n.model?.downloaded">
+                <span class="pill-dot"></span>{{ n.role === "notes" ? "Notes &amp; Ask" : "Reactions" }}: {{ n.model?.name ?? "—" }}@if (n.model) { · {{ sizeLabel(n.model.approxSizeBytes) }} }@if (n.model?.downloaded) { ✓ ready }
+              </span>
+            }
+            <span class="text-secondary posture-confirm-copy">
+              {{ confirmDescription(confirm) }}
+            </span>
+            @if (confirmDownloadBytes() > 0) {
+              <span class="text-muted brain-live-note">
+                One-time {{ sizeLabel(confirmDownloadBytes()) }} download from Hugging
+                Face — it stays on this Mac.
+              </span>
+            }
+            @if (!brainLiveRamOk()) {
+              <span class="brain-live-ram-warn">
+                ⚠ Your Mac may not have enough RAM to run this smoothly alongside
+                recording.
+              </span>
+            }
+            <div class="posture-confirm-actions">
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="confirmPostureDownload()"
+              >
+                Download &amp; enable {{ pendingLabel(confirm) }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="cancelPendingPosture()"
+              >
+                Cancel
+              </button>
+            </div>
+          } @else if (pendingPosture()) {
             <p class="text-secondary">
-              {{ pendingLabel(pend) }} — downloading on-device models…
+              {{ downloadingLabel() }} — downloading on-device models…
             </p>
             @if (brainDownloadingId()) {
               <div class="semantic-progress" role="status">
@@ -299,6 +345,29 @@ import { SettingsStore } from "../../settings.store";
         font-size: 0.875rem;
         line-height: 1.55;
       }
+      /* Confirm-before-download card: an explicit opt-in, not an auto-fetch. */
+      .posture-confirm-title {
+        margin: 0;
+        font-size: 0.95rem;
+        font-weight: 600;
+      }
+      .posture-confirm-copy {
+        font-size: 0.85rem;
+        line-height: 1.55;
+      }
+      .posture-confirm-actions {
+        display: flex;
+        gap: var(--space-2);
+        flex-wrap: wrap;
+        margin-top: var(--space-1);
+      }
+      .posture-confirm-actions .btn {
+        flex: none;
+      }
+      .brain-live-note {
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
       .brain-live-ram-warn {
         font-size: 0.8125rem;
         line-height: 1.5;
@@ -370,6 +439,9 @@ export class BrainPostureBlockComponent {
   readonly postureBusy = this.store.postureBusy;
   readonly postureError = this.store.postureError;
   readonly pendingPosture = this.store.pendingPosture;
+  readonly pendingConfirm = this.store.pendingConfirm;
+  readonly confirmModels = this.store.confirmModels;
+  readonly confirmDownloadBytes = this.store.confirmDownloadBytes;
   readonly postureStateLine = this.store.postureStateLine;
   readonly neededModels = this.store.neededModels;
   readonly brainDownloadingId = this.store.brainDownloadingId;
@@ -398,6 +470,12 @@ export class BrainPostureBlockComponent {
     return this.brainModels().find((m) => m.id === id)?.name ?? id;
   });
 
+  /** Label of the posture currently downloading (the `@else if` block can't alias it). */
+  readonly downloadingLabel = computed((): string => {
+    const p = this.pendingPosture();
+    return p ? this.pendingLabel(p) : "";
+  });
+
   // ── Actions ───────────────────────────────────────────────────────────────
 
   /** Apply a Murmur Brain posture preset (`cloud` / `hybrid` / `fully_local`). */
@@ -408,6 +486,33 @@ export class BrainPostureBlockComponent {
   /** Abort an in-flight posture download; the committed posture is unchanged. */
   cancelPostureDownload(): void {
     this.store.cancelPostureDownload();
+  }
+
+  /** Confirm the pending posture → start the on-device download, then commit. */
+  confirmPostureDownload(): void {
+    void this.store.confirmPostureDownload();
+  }
+
+  /** Dismiss the confirm card without downloading; the posture stays unchanged. */
+  cancelPendingPosture(): void {
+    this.store.cancelPendingPosture();
+  }
+
+  /** Format a byte count as a friendly "~1.1 GB" / "~620 MB" size label. */
+  sizeLabel(bytes: number): string {
+    const gb = 1024 * 1024 * 1024;
+    return bytes >= gb
+      ? "~" + (bytes / gb).toFixed(1) + " GB"
+      : "~" + Math.round(bytes / (1024 * 1024)) + " MB";
+  }
+
+  /** One-line description of what a posture runs on-device (for the confirm card). */
+  confirmDescription(p: Posture): string {
+    if (p === "hybrid")
+      return "Your Default AI keeps writing all notes; your Mac runs realtime reactions and keeps fact-extraction on-device.";
+    if (p === "fully_local")
+      return "Everything runs on this Mac — notes, answers, and reactions. Nothing leaves.";
+    return "";
   }
 
   /** Download + select the Apache-licensed replacement for the retired model. */
