@@ -22,6 +22,15 @@ export interface EchoSuppressedPayload {
 }
 
 /**
+ * Payload of murmur://recording-capped — the 4h `MAX_RECORDING_SECONDS` hard
+ * TIME cap was reached and the capture self-stopped. Length only, NO PII (no
+ * content, meeting id, or path). Fires once per recording (rising edge).
+ */
+export interface RecordingCappedPayload {
+  limitSeconds: number;
+}
+
+/**
  * GitHub-release update check (`check_for_update`). Mirrors the Rust `UpdateInfo`
  * (serde camelCase). `updateAvailable` is the sole "should we nudge" flag;
  * `releaseName` / `releaseNotes` are null when GitHub omits them. The command
