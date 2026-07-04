@@ -1,24 +1,26 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
-import { AiRoleRowsComponent } from "./ai-role-rows.component";
 
 /**
- * AI & Models → Block B: WHAT MURMUR USES. The "Default AI" row (the Provider
- * select moved from General) + the Default-model picker (options fetched via
- * `list_models` — the backend constant is the single source of truth, no more
- * hardcoded Claude ids) + reasoning effort, then the Stage-4 "Customize per
- * feature" override rows (AiRoleRowsComponent — the Ask row SUPERSEDES the old
- * "Assistant backend" select, and the GGUF registry lives there now), then
- * "Live during meetings" (the voice-assistant + proactive toggles, unchanged)
- * and "On-device intelligence" (fixed always-on-device badges + semantic
- * search).
+ * AI & Models → Block C: LIVE DURING MEETINGS + ON-DEVICE INTELLIGENCE.
+ *
+ * After Task 4 the Default AI / Default model / reasoning effort and the
+ * per-feature role rows moved to `AiAdvancedBlockComponent`. This card now
+ * owns the two always-visible sections that are NOT behind the Advanced
+ * disclosure:
+ *
+ *  • "Live during meetings" — in-meeting voice assistant + proactive hints
+ *    toggles, plus the cloud-egress consent warning when needed.
+ *  • "On-device intelligence" — fixed always-on-device badges
+ *    (Embeddings / Name redaction / Transcription) + the semantic-search
+ *    toggle, embedding-model download, and re-index controls.
  */
 @Component({
   selector: "app-ai-defaults-block",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, AiRoleRowsComponent],
+  imports: [ReactiveFormsModule],
   template: `
     <div class="card defaults-card" [formGroup]="form">
       <div class="defaults-head">
@@ -28,124 +30,6 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
           can run differently below.
         </p>
       </div>
-
-      <label class="field">
-        <span class="field-label">Default AI</span>
-        <select formControlName="providerId" (change)="onDefaultAiChanged($event)">
-          <option value="claude_code">Claude Code (default)</option>
-          <option value="anthropic">Anthropic API</option>
-          <option value="ollama">Ollama</option>
-          <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
-        </select>
-        <span class="field-help text-muted">
-          Used for everything Murmur writes: notes, answers, digests, briefs.
-          Set the connection up in the Providers block above.
-        </span>
-      </label>
-
-      <!--
-        Model + reasoning-effort overrides. providerModel steers ONLY the
-        claude_code/anthropic arms (gateway/ollama read gateway_model /
-        ollama_model instead), so the dropdown renders only for those two —
-        for gateway/ollama we point at the connection card that actually holds
-        the model. The old "Anthropic model" free-text is intentionally
-        UNRENDERED (its FormControl still round-trips in the store).
-      -->
-      <div class="brain-tuning">
-        @switch (form.controls.providerId.value) {
-          @case ("gateway") {
-            <p class="brain-note text-muted">
-              The model for Kong AI Gateway is set in its connection card above.
-            </p>
-          }
-          @case ("ollama") {
-            <p class="brain-note text-muted">
-              The model for Ollama is set in its connection card above.
-            </p>
-          }
-          @default {
-            <!-- div.field (not label) — the control sits in a nested row div,
-                 same as the gateway card's Model field. -->
-            <div class="field">
-              <span class="field-label">Default model</span>
-              <!--
-                Options come from list_models (the backend Claude-id constant —
-                single source of truth, no hardcoded ids here). Empty catalog
-                (fetch failed / older backend) → free-text fallback; a saved
-                model missing from the catalog stays selectable as "(custom)"
-                — the gateway picker's keep-manually-typed pattern.
-              -->
-              <div class="default-model-row">
-                @if (defaultModelCatalog().length > 0) {
-                  <select
-                    formControlName="providerModel"
-                    class="default-model-select"
-                  >
-                    <option value="">Default (provider's pick)</option>
-                    @for (id of defaultModelCatalog(); track id) {
-                      <option [value]="id">{{ id }}</option>
-                    }
-                    @if (defaultModelIsCustom()) {
-                      <option [value]="form.controls.providerModel.value">
-                        {{ form.controls.providerModel.value }} (custom)
-                      </option>
-                    }
-                  </select>
-                } @else {
-                  <input
-                    formControlName="providerModel"
-                    placeholder="Model id (blank = provider's pick)"
-                    autocomplete="off"
-                    spellcheck="false"
-                    class="default-model-input"
-                  />
-                }
-                <button
-                  type="button"
-                  class="btn btn-ghost default-model-refresh"
-                  (click)="refreshDefaultModels()"
-                  [disabled]="defaultModelsLoading()"
-                  title="Fetch this provider's model list"
-                >
-                  @if (defaultModelsLoading()) {
-                    Loading…
-                  } @else {
-                    ↻ Refresh
-                  }
-                </button>
-              </div>
-              <span class="field-help text-muted">
-                Used for everything Murmur writes with AI: meeting notes,
-                answers, digests and briefs. Default lets the provider choose.
-              </span>
-            </div>
-          }
-        }
-
-        @if (form.controls.providerId.value === "anthropic") {
-          <label class="field">
-            <span class="field-label">Reasoning effort</span>
-            <select formControlName="providerEffort">
-              <option value="">Default</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-            </select>
-            <span class="field-help text-muted">
-              Applies to the Anthropic provider — higher effort spends more
-              thinking on harder questions.
-            </span>
-          </label>
-        }
-      </div>
-
-      <!--
-        Stage 4 — per-feature overrides (Notes / Ask / Live). The Ask row is
-        the SUCCESSOR of the old "Assistant backend" select (removed from this
-        block): Local/Off are selectable targets there, and the GGUF registry
-        renders inside the rows block when a row picks Local.
-      -->
-      <app-ai-role-rows />
 
       <!-- ── Live during meetings ────────────────────────────────────── -->
       <div class="use-group">
@@ -389,7 +273,7 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
         line-height: 1.55;
       }
 
-      /* Light regrouping headings (Ask & assistant / Live / On-device). */
+      /* Light regrouping headings (Live / On-device). */
       .use-group {
         display: flex;
         flex-direction: column;
@@ -404,12 +288,6 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
         text-transform: uppercase;
       }
 
-      .brain-tuning {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-4);
-      }
-
       /* #20 — proactive cloud-egress consent warning under the assistant toggle. */
       .realtime-consent {
         flex-direction: column;
@@ -418,31 +296,9 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
       .realtime-consent-copy {
         line-height: 1.55;
       }
-      .brain-note {
-        margin: 0;
-        font-size: 0.8125rem;
-        line-height: 1.5;
-      }
       .brain-error {
         margin: 0;
         font-size: 0.85rem;
-      }
-
-      /* Default-model picker — select-or-input + the catalog refresh. */
-      .default-model-row {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        flex-wrap: wrap;
-      }
-      .default-model-select,
-      .default-model-input {
-        flex: 1 1 220px;
-        min-width: 0;
-      }
-      .default-model-refresh {
-        flex: none;
-        white-space: nowrap;
       }
 
       /* Fixed always-on-device badges (not controls). */
@@ -517,22 +373,6 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
       }
       .semantic-done-pill {
         align-self: flex-start;
-      }
-
-      /* --- Stacked label + control --- */
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-1);
-      }
-      .field-label {
-        color: var(--text-secondary);
-        font-size: 0.9rem;
-        font-weight: 550;
-      }
-      .field-help {
-        font-size: 0.8125rem;
-        line-height: 1.5;
       }
 
       /* --- Toggle rows --- */
@@ -611,9 +451,6 @@ export class AiDefaultsBlockComponent {
   readonly consenting = this.store.consenting;
   readonly consentError = this.store.consentError;
   readonly liveTargetIsCloud = this.store.liveTargetIsCloud;
-  readonly defaultModelCatalog = this.store.defaultModelCatalog;
-  readonly defaultModelsLoading = this.store.defaultModelsLoading;
-  readonly defaultModelIsCustom = this.store.defaultModelIsCustom;
   readonly embedModelPresent = this.store.embedModelPresent;
   readonly downloadingEmbedModel = this.store.downloadingEmbedModel;
   readonly embedDownloadFrac = this.store.embedDownloadFrac;
@@ -627,19 +464,6 @@ export class AiDefaultsBlockComponent {
 
   allowCloudProcessing(): void {
     void this.store.allowCloudProcessing();
-  }
-
-  /** Prefetch the newly-picked Default AI's model catalog (claude_code/anthropic only). */
-  onDefaultAiChanged(e: Event): void {
-    const id = (e.target as HTMLSelectElement).value;
-    if (id === "claude_code" || id === "anthropic") {
-      void this.store.ensureModels(id);
-    }
-  }
-
-  /** Re-fetch the Default-model catalog for the current provider. */
-  refreshDefaultModels(): void {
-    void this.store.refreshModels(this.form.controls.providerId.value);
   }
 
   downloadEmbedModel(): void {
