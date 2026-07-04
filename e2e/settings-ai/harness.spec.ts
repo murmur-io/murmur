@@ -10,5 +10,7 @@ test("harness boots the settings page under the mocked Tauri invoke", async ({
   await expect(page.getByText("AI & Models").first()).toBeVisible();
   // Open the AI & Models section; its block header proves the section rendered.
   await page.getByText("AI & Models").first().click();
-  await expect(page.getByText("What Murmur uses")).toBeVisible();
+  // "Live during meetings" is the group label in DuringMeetingsBlockComponent —
+  // proves the section rendered after the monolith was split in Task 5.
+  await expect(page.getByText("Live during meetings")).toBeVisible();
 });

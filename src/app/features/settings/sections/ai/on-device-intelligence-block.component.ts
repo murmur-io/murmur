@@ -3,111 +3,22 @@ import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
 
 /**
- * AI & Models → Block C: LIVE DURING MEETINGS + ON-DEVICE INTELLIGENCE.
+ * AI & Models → "On-device intelligence" block (Task 5).
  *
- * After Task 4 the Default AI / Default model / reasoning effort and the
- * per-feature role rows moved to `AiAdvancedBlockComponent`. This card now
- * owns the two always-visible sections that are NOT behind the Advanced
- * disclosure:
+ * Extracted verbatim from AiDefaultsBlockComponent as a standalone card.
+ * Owns the always-on-device honesty badges (Embeddings / Name redaction /
+ * Transcription), the semantic-search toggle, the embedding-model download
+ * flow, and the re-index controls.
  *
- *  • "Live during meetings" — in-meeting voice assistant + proactive hints
- *    toggles, plus the cloud-egress consent warning when needed.
- *  • "On-device intelligence" — fixed always-on-device badges
- *    (Embeddings / Name redaction / Transcription) + the semantic-search
- *    toggle, embedding-model download, and re-index controls.
+ * All work is on-device — no cloud calls, no consent requirement.
  */
 @Component({
-  selector: "app-ai-defaults-block",
+  selector: "app-on-device-intelligence-block",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   template: `
-    <div class="card defaults-card" [formGroup]="form">
-      <div class="defaults-head">
-        <h3>What Murmur uses</h3>
-        <p class="text-secondary defaults-sub">
-          One default AI powers everything Murmur writes; individual features
-          can run differently below.
-        </p>
-      </div>
-
-      <!-- ── Live during meetings ────────────────────────────────────── -->
-      <div class="use-group">
-        <span class="use-group-label text-muted">Live during meetings</span>
-
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">In-meeting voice assistant</span>
-            <span class="text-secondary toggle-sub">
-              Listen for your wake phrase during a recording and answer
-              grounded questions live, with sources. Off by default — it adds
-              listening and (for cloud) sends audio-derived text mid-meeting.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="realtimeReactions" />
-        </label>
-
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">Proactive brain hints</span>
-            <span class="text-secondary toggle-sub">
-              While recording, surface a dismissible recall card when the
-              conversation touches a past meeting, an open commitment, or a
-              known fact. 100% on-device — no cloud calls; at most one card
-              every two minutes.
-            </span>
-          </span>
-          <input type="checkbox" formControlName="proactiveHintsEnabled" />
-        </label>
-
-        <!--
-          Proactive cloud-egress consent (issue 20). The in-meeting assistant
-          dispatches voice actions through the LIVE role's resolved target —
-          since Stage 4 that need not be brainBackend/the default provider, so
-          the condition keys on liveTargetIsCloud (the store's resolver
-          mirror: explicit roleLiveConnection wins, "" falls back to the
-          brainBackend mapping, ollama is cloud only off-loopback). Surface
-          the requirement at enable time: realtime on, live target
-          cloud-classified, not consented. Reuses the existing consent flow
-          (allowCloudProcessing). In-flow warning, so the frosted banner is
-          correct (no opaque overlay needed).
-        -->
-        @if (
-          form.controls.realtimeReactions.value &&
-          liveTargetIsCloud() &&
-          !cloudConsented()
-        ) {
-          <div class="banner is-warning realtime-consent">
-            <span class="realtime-consent-copy">
-              ⚠ The in-meeting assistant sends live meeting context to your
-              provider's cloud (redacted first). Allow cloud processing once,
-              or live answers stay off.
-            </span>
-            <div class="cloud-consent-row">
-              <button
-                type="button"
-                class="btn btn-primary"
-                (click)="allowCloudProcessing()"
-                [disabled]="consenting()"
-              >
-                @if (consenting()) {
-                  <span class="spin-ring" aria-hidden="true"></span>
-                  Enabling…
-                } @else {
-                  Allow
-                }
-              </button>
-              <span class="text-muted cloud-consent-hint">
-                One-time, redacted first. Same consent as cloud summaries.
-              </span>
-            </div>
-            @if (consentError(); as cerr) {
-              <p class="text-danger privacy-note">{{ cerr }}</p>
-            }
-          </div>
-        }
-      </div>
-
+    <div class="card ondevice-card" [formGroup]="form">
       <!-- ── On-device intelligence ──────────────────────────────────── -->
       <div class="use-group">
         <span class="use-group-label text-muted">On-device intelligence</span>
@@ -254,51 +165,23 @@ import { SettingsStore } from "../../settings.store";
         display: contents;
       }
 
-      .defaults-card {
+      .ondevice-card {
         display: flex;
         flex-direction: column;
         gap: var(--space-4);
       }
-      .defaults-head {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-1);
-      }
-      .defaults-head h3 {
-        margin: 0;
-      }
-      .defaults-sub {
-        margin: 0;
-        font-size: 0.875rem;
-        line-height: 1.55;
-      }
 
-      /* Light regrouping headings (Live / On-device). */
+      /* Light regrouping heading. */
       .use-group {
         display: flex;
         flex-direction: column;
         gap: var(--space-3);
-        padding-top: var(--space-3);
-        border-top: 1px solid var(--border-subtle);
       }
       .use-group-label {
         font-size: 0.8125rem;
         font-weight: 550;
         letter-spacing: 0.01em;
         text-transform: uppercase;
-      }
-
-      /* #20 — proactive cloud-egress consent warning under the assistant toggle. */
-      .realtime-consent {
-        flex-direction: column;
-        gap: var(--space-3);
-      }
-      .realtime-consent-copy {
-        line-height: 1.55;
-      }
-      .brain-error {
-        margin: 0;
-        font-size: 0.85rem;
       }
 
       /* Fixed always-on-device badges (not controls). */
@@ -312,7 +195,7 @@ import { SettingsStore } from "../../settings.store";
         font-size: 0.8125rem;
         line-height: 1.5;
       }
-      .defaults-card .btn-sm {
+      .btn-sm {
         height: 32px;
         padding: 0 var(--space-3);
         font-size: 0.8125rem;
@@ -374,8 +257,12 @@ import { SettingsStore } from "../../settings.store";
       .semantic-done-pill {
         align-self: flex-start;
       }
+      .brain-error {
+        margin: 0;
+        font-size: 0.85rem;
+      }
 
-      /* --- Toggle rows --- */
+      /* Toggle row (for semantic-search checkbox). */
       .toggle-row {
         display: flex;
         align-items: center;
@@ -397,28 +284,7 @@ import { SettingsStore } from "../../settings.store";
         font-size: 0.85rem;
       }
 
-      /* Cloud-processing consent — button + reassurance. */
-      .cloud-consent-row {
-        display: flex;
-        align-items: center;
-        gap: var(--space-3);
-        flex-wrap: wrap;
-        margin-top: var(--space-1);
-      }
-      .cloud-consent-row .btn {
-        flex: none;
-      }
-      .cloud-consent-hint {
-        font-size: 0.85rem;
-        line-height: 1.5;
-      }
-      .privacy-note {
-        margin: 0;
-        font-size: 0.9rem;
-        line-height: 1.55;
-      }
-
-      /* Inline spinner on the Download button (matches the onboarding wizard). */
+      /* Inline spinner on the Re-indexing button. */
       .spin-ring {
         width: 15px;
         height: 15px;
@@ -443,14 +309,10 @@ import { SettingsStore } from "../../settings.store";
     `,
   ],
 })
-export class AiDefaultsBlockComponent {
+export class OnDeviceIntelligenceBlockComponent {
   private readonly store = inject(SettingsStore);
 
   readonly form = this.store.form;
-  readonly cloudConsented = this.store.cloudConsented;
-  readonly consenting = this.store.consenting;
-  readonly consentError = this.store.consentError;
-  readonly liveTargetIsCloud = this.store.liveTargetIsCloud;
   readonly embedModelPresent = this.store.embedModelPresent;
   readonly downloadingEmbedModel = this.store.downloadingEmbedModel;
   readonly embedDownloadFrac = this.store.embedDownloadFrac;
@@ -461,10 +323,6 @@ export class AiDefaultsBlockComponent {
   readonly reindexPct = this.store.reindexPct;
   readonly reindexResult = this.store.reindexResult;
   readonly reindexError = this.store.reindexError;
-
-  allowCloudProcessing(): void {
-    void this.store.allowCloudProcessing();
-  }
 
   downloadEmbedModel(): void {
     void this.store.downloadEmbedModel();
