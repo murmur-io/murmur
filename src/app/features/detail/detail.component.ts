@@ -21,6 +21,7 @@ import type {
   GraphPayload,
   MeetingDetail,
   MeetingTimeline,
+  RecipientPreview,
   Segment,
   SpeakerSuggestion,
 } from "../../core/models";
@@ -38,12 +39,22 @@ import { MeetingChatComponent } from "./meeting-chat.component";
 import { MeetingRecipesComponent } from "./meeting-recipes.component";
 import { MeetingTimelineComponent } from "./meeting-timeline.component";
 import { RelatedMeetingsComponent } from "./related-meetings.component";
+import {
+  ShareVerifySheetComponent,
+  type ShareVerifyMode,
+} from "./share-verify-sheet.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
   done: boolean;
   text: string;
 }
+
+/**
+ * M5-CLIENT — the step the in-flow "Share with a person" panel is showing.
+ * The floating fingerprint sheet is tracked separately (`verifyMode`).
+ */
+type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
 
 /** A parsed `## Heading` section of the note body. */
 interface NoteSection {
@@ -112,6 +123,7 @@ interface ParsedNote {
     MarkdownComponent,
     AssistantSourcesComponent,
     RelatedMeetingsComponent,
+    ShareVerifySheetComponent,
   ],
   template: `
     <section class="detail">
@@ -353,6 +365,14 @@ interface ParsedNote {
                   >
                     {{ sharing() ? "Sharing…" : "Share as link" }}
                   </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost export-btn"
+                    (click)="openPersonShare(d.meeting.id)"
+                    [disabled]="editing() || personBusy()"
+                  >
+                    Share with a person
+                  </button>
                 </div>
               }
 
@@ -411,6 +431,142 @@ interface ParsedNote {
               }
               @if (shareError(); as err) {
                 <span class="msg msg-error" role="alert">{{ err }}</span>
+              }
+
+              <!-- Share WITH A PERSON (M5-CLIENT: Murmur↔Murmur, mode B). The
+                   email-entry / suggest-link / consent / result steps are all
+                   IN-FLOW (a frosted .card is correct); the fingerprint
+                   verification SHEET floats OVER the note → it is OPAQUE (trap
+                   T3), rendered by <app-share-verify-sheet>. -->
+              @if (personShareOpen()) {
+                <div
+                  class="card person-share"
+                  role="group"
+                  aria-label="Share with a person"
+                >
+                  @switch (personStep()) {
+                    @case ("email") {
+                      <p class="share-consent-copy">
+                        Share this note directly with another Murmur user. It's
+                        end-to-end encrypted to their account key.
+                      </p>
+                      <div class="person-row">
+                        <input
+                          type="email"
+                          class="person-input"
+                          [value]="personEmail()"
+                          (input)="onPersonEmailInput($event)"
+                          (keydown.enter)="submitPersonEmail()"
+                          placeholder="colleague@example.com"
+                          autocomplete="off"
+                          spellcheck="false"
+                          aria-label="Recipient email"
+                          [disabled]="personBusy()"
+                        />
+                        <button
+                          type="button"
+                          class="btn btn-primary"
+                          (click)="submitPersonEmail()"
+                          [disabled]="personBusy() || !personEmail().trim()"
+                        >
+                          {{ personBusy() ? "Checking…" : "Continue" }}
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="closePersonShare()"
+                          [disabled]="personBusy()"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    }
+                    @case ("suggest-link") {
+                      <p class="share-consent-copy">
+                        They don't use Murmur yet — send a protected link
+                        instead?
+                        <span class="pill is-accent">Recommended</span>
+                      </p>
+                      <div class="person-row">
+                        <button
+                          type="button"
+                          class="btn btn-primary"
+                          (click)="sendProtectedLinkInstead()"
+                          [disabled]="personBusy()"
+                        >
+                          Send a protected link
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="inviteAnyway()"
+                          [disabled]="personBusy()"
+                        >
+                          {{ personBusy() ? "Inviting…" : "Invite them anyway" }}
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="closePersonShare()"
+                          [disabled]="personBusy()"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    }
+                    @case ("consent") {
+                      <p class="share-consent-copy">
+                        This uploads the encrypted note to your sharing server.
+                        The note is end-to-end encrypted — the server can't read
+                        it — but it does leave this Mac.
+                      </p>
+                      <div class="person-row">
+                        <button
+                          type="button"
+                          class="btn btn-primary"
+                          (click)="confirmPersonShareConsent()"
+                          [disabled]="personBusy()"
+                        >
+                          {{ personBusy() ? "Sharing…" : "Confirm & share" }}
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="closePersonShare()"
+                          [disabled]="personBusy()"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    }
+                    @case ("result") {
+                      <p class="person-result">{{ personResult() }}</p>
+                      <div class="person-row">
+                        <button
+                          type="button"
+                          class="btn"
+                          (click)="closePersonShare()"
+                        >
+                          Done
+                        </button>
+                      </div>
+                    }
+                  }
+                  @if (personError(); as perr) {
+                    <span class="msg msg-error" role="alert">{{ perr }}</span>
+                  }
+                </div>
+              }
+              @if (verifyMode(); as mode) {
+                <app-share-verify-sheet
+                  [email]="personEmail()"
+                  [fingerprint]="personPreview()?.fingerprint ?? ''"
+                  [mode]="mode"
+                  [busy]="personBusy()"
+                  [error]="personError()"
+                  (confirm)="confirmVerifiedSend()"
+                  (cancelled)="closePersonShare()"
+                />
               }
 
               <!-- HI-RES MASTERS: retrieve the faithful per-stream float32 WAV
@@ -1186,16 +1342,18 @@ interface ParsedNote {
         font-size: 0.875rem;
       }
 
-      /* --- Share as link (M3-CLIENT) --- */
+      /* --- Share as link (M3-CLIENT) + share with a person (M5-CLIENT) --- */
       .share-consent,
-      .share-result {
+      .share-result,
+      .person-share {
         display: flex;
         flex-direction: column;
         gap: var(--space-2);
         flex-basis: 100%;
         max-width: 36rem;
       }
-      .share-consent {
+      .share-consent,
+      .person-share {
         gap: var(--space-3);
         padding: var(--space-4);
       }
@@ -1207,11 +1365,15 @@ interface ParsedNote {
         line-height: 1.5;
       }
       .share-consent-actions,
-      .share-link-row {
+      .share-link-row,
+      .person-row {
         display: flex;
         align-items: center;
         gap: var(--space-2);
         flex-wrap: wrap;
+      }
+      .person-row .btn {
+        flex: none;
       }
       .share-link-input {
         flex: 1 1 20rem;
@@ -1230,6 +1392,36 @@ interface ParsedNote {
       .share-link-row .btn {
         flex: none;
       }
+
+      /* --- Share with a person (M5-CLIENT, mode B) — reuses the share-as-link
+         layout selectors above; only the email input + result line are new. --- */
+      .person-input {
+        flex: 1 1 18rem;
+        min-width: 0;
+        height: 36px;
+        padding: 0 var(--space-3);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text-primary);
+        font: inherit;
+        font-size: 0.9rem;
+      }
+      .person-input::placeholder {
+        color: var(--text-muted);
+      }
+      .person-input:focus-visible {
+        outline: none;
+        border-color: var(--accent-hover);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .person-result {
+        margin: 0;
+        color: var(--text-primary);
+        font-size: 0.9rem;
+        line-height: 1.55;
+      }
+
       /* Pin toast reuses .saved-toast box (accent variant). */
       .pin-toast {
         background: var(--accent-soft);
@@ -2097,6 +2289,29 @@ export class DetailComponent implements OnInit {
   private pendingShareMeetingId: string | null = null;
   /** Brief "Copied" confirmation for the share-link copy button. */
   readonly shareLinkCopied = signal(false);
+
+  // --- Share with a person (M5-CLIENT: Murmur↔Murmur, mode B) ---------------
+  /** The meeting being shared (captured when the person flow opens). */
+  private personShareMeetingId: string | null = null;
+  /** Whether the in-flow person-share panel (email/suggest-link/consent/result) is open. */
+  readonly personShareOpen = signal(false);
+  /** The panel's current step. `verifyMode` drives the separate floating sheet. */
+  readonly personStep = signal<PersonShareStep>("email");
+  /** The recipient email being entered/shared (input event → signal). */
+  readonly personEmail = signal("");
+  /** The last recipient preview (carries the fingerprint for the verify sheet). */
+  readonly personPreview = signal<RecipientPreview | null>(null);
+  /** True while a preview / share IPC call for the person flow is in flight. */
+  readonly personBusy = signal(false);
+  /** Inline error for the person flow (also fed to the verify sheet). */
+  readonly personError = signal<string | null>(null);
+  /** The success line shown at the 'result' step ("Sent" / "Invited — …"). */
+  readonly personResult = signal<string | null>(null);
+  /**
+   * When non-null, the floating OPAQUE fingerprint verification SHEET is open in
+   * this mode (first contact vs a changed key). Null = closed.
+   */
+  readonly verifyMode = signal<ShareVerifyMode | null>(null);
 
   /**
    * Whether this install keeps high-fidelity per-stream master archives (the
@@ -3194,6 +3409,182 @@ export class DetailComponent implements OnInit {
       this.shareLinkCopied.set(true);
     } catch {
       // Clipboard unavailable — the URL stays visible + selectable.
+    }
+  }
+
+  // --- Share with a person (M5-CLIENT: invite a colleague by email) ---------
+
+  /** Open the in-flow person-share panel at the email step (resets prior state). */
+  openPersonShare(meetingId: string): void {
+    if (this.editing()) {
+      return;
+    }
+    this.personShareMeetingId = meetingId;
+    this.personEmail.set("");
+    this.personPreview.set(null);
+    this.personError.set(null);
+    this.personResult.set(null);
+    this.personStep.set("email");
+    this.verifyMode.set(null);
+    this.personShareOpen.set(true);
+  }
+
+  /** Fully close the person flow (panel + any floating sheet) and clear its state. */
+  closePersonShare(): void {
+    this.personShareOpen.set(false);
+    this.verifyMode.set(null);
+    this.personStep.set("email");
+    this.personEmail.set("");
+    this.personPreview.set(null);
+    this.personError.set(null);
+    this.personResult.set(null);
+  }
+
+  /** Bind the recipient-email input into its signal. */
+  onPersonEmailInput(event: Event): void {
+    this.personEmail.set((event.target as HTMLInputElement).value);
+  }
+
+  /**
+   * Preview the recipient, then branch: unregistered → suggest a protected
+   * link; first contact / changed key → the floating verification sheet;
+   * otherwise send straight away. Gates on the sharing account first (server
+   * configured + signed in + unlocked), mirroring {@link shareAsLink}.
+   */
+  async submitPersonEmail(): Promise<void> {
+    if (this.personBusy()) {
+      return;
+    }
+    const email = this.personEmail().trim();
+    if (!email) {
+      this.personError.set("Enter an email address.");
+      return;
+    }
+    this.personError.set(null);
+    this.personBusy.set(true);
+    try {
+      const st = await this.ipc.accountStatus();
+      if (!st.serverConfigured) {
+        this.personError.set(
+          "Set a sharing server in Settings → Account first.",
+        );
+        return;
+      }
+      if (!st.loggedIn || !st.unlockedForSharing) {
+        this.personError.set(
+          "Sign in to your sharing account first (Settings → Account).",
+        );
+        return;
+      }
+      const preview = await this.ipc.previewShareRecipient(email);
+      this.personPreview.set(preview);
+      if (!preview.registered) {
+        this.personStep.set("suggest-link");
+      } else if (preview.keyChanged) {
+        // BLOCKING re-verify: never a silent send on a changed key.
+        this.personShareOpen.set(false);
+        this.verifyMode.set("key-changed");
+      } else if (preview.firstContact) {
+        this.personShareOpen.set(false);
+        this.verifyMode.set("first-contact");
+      } else {
+        // Known, verified recipient — share directly.
+        await this.sendToUser();
+      }
+    } catch (e) {
+      this.personError.set(String(e));
+    } finally {
+      this.personBusy.set(false);
+    }
+  }
+
+  /** The "suggest-link" primary: fall back to the existing protected-link flow. */
+  sendProtectedLinkInstead(): void {
+    const id = this.personShareMeetingId;
+    this.closePersonShare();
+    if (id) {
+      void this.shareAsLink(id);
+    }
+  }
+
+  /** The "suggest-link" secondary: invite the (unregistered) recipient anyway. */
+  async inviteAnyway(): Promise<void> {
+    if (this.personBusy()) {
+      return;
+    }
+    this.personBusy.set(true);
+    try {
+      await this.sendToUser();
+    } finally {
+      this.personBusy.set(false);
+    }
+  }
+
+  /** The verify-sheet confirm: the user verified out of band → send. */
+  async confirmVerifiedSend(): Promise<void> {
+    if (this.personBusy()) {
+      return;
+    }
+    this.personBusy.set(true);
+    try {
+      await this.sendToUser();
+    } finally {
+      this.personBusy.set(false);
+    }
+  }
+
+  /** Grant the one-time share-egress consent, then retry the pending person share. */
+  async confirmPersonShareConsent(): Promise<void> {
+    if (this.personBusy()) {
+      return;
+    }
+    this.personBusy.set(true);
+    this.personError.set(null);
+    try {
+      await this.ipc.consentToShareEgress();
+      await this.sendToUser();
+    } catch (e) {
+      this.personError.set(String(e));
+    } finally {
+      this.personBusy.set(false);
+    }
+  }
+
+  /**
+   * Perform the actual `shareNoteToUser` call and render the outcome. Callers own
+   * the `personBusy` toggle. A thrown "not consented" surfaces the in-flow
+   * consent step (mirroring the link flow's one-time consent); any other throw
+   * (a locked meeting, a server-side changed-key BLOCK) surfaces inline —
+   * never a silent proceed.
+   */
+  private async sendToUser(): Promise<void> {
+    const id = this.personShareMeetingId;
+    if (!id) {
+      return;
+    }
+    const email = this.personEmail().trim();
+    this.personError.set(null);
+    try {
+      const res = await this.ipc.shareNoteToUser(id, email);
+      this.verifyMode.set(null);
+      this.personShareOpen.set(true);
+      this.personStep.set("result");
+      this.personResult.set(
+        res.status === "invited"
+          ? `Invited — they'll get it when they join Murmur. Ask them to install Murmur (macOS) and sign in with ${email}.`
+          : "Sent.",
+      );
+    } catch (e) {
+      const msg = String(e);
+      if (/consent/i.test(msg)) {
+        // First share needs the one-time egress consent — surface it in-flow.
+        this.verifyMode.set(null);
+        this.personShareOpen.set(true);
+        this.personStep.set("consent");
+        this.personError.set(null);
+      } else {
+        this.personError.set(msg);
+      }
     }
   }
 

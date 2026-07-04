@@ -111,6 +111,18 @@ pub(crate) fn unwrap_key32(key: &[u8; 32], cell_bytes: &[u8], aad: &[u8]) -> Res
     Ok(out)
 }
 
+/// The human-comparable safety-word fingerprint of an identity key pair (spec §6/§4.8):
+/// `Crockford-base32(SHA-256(pk_enc || pk_sig)[..10])`. Computed identically by the server (which
+/// hashes the stored keys) and the client (which hashes the pinned/looked-up keys), so both sides
+/// derive byte-identical safety words. This is the value TOFU-pinned + shown for out-of-band compare.
+pub fn key_fingerprint(pk_enc: &[u8], pk_sig: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(pk_enc);
+    h.update(pk_sig);
+    murmur_protocol::identity::fingerprint_from_digest(&h.finalize())
+}
+
 /// Seal the inner plaintext envelope (title travels INSIDE) under the note key `NK`, bound to
 /// `aad::share_content(share_id, rev)`. Returns the content cell `C` = `nonce(12)||ct||tag(16)`.
 pub fn seal_content(

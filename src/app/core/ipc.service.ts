@@ -7,6 +7,10 @@ import type {
   Analytics,
   AppConfigDto,
   MyShareEntry,
+  RecipientPreview,
+  ShareToUserResult,
+  ShareInboxItem,
+  AcceptedShare,
   BrainDownloadProgress,
   BrainModelDto,
   EmbedDownloadProgress,
@@ -257,6 +261,57 @@ export class IpcService {
   /** Revoke a share: DELETE the server ciphertext + flip the local state. Idempotent. */
   revokeShare(shareId: string): Promise<void> {
     return invoke<void>("revoke_share", { shareId });
+  }
+
+  // ── M5-CLIENT: Murmur↔Murmur (mode B) — invite a colleague + accept into the vault ──
+
+  /**
+   * Read-only preview of a recipient email: is it a registered Murmur account, its safety-word
+   * fingerprint, and the TOFU state (first contact → show + confirm; key changed → BLOCK). Mutates
+   * no pin. The FE uses this to DEFAULT to a protected link when the recipient isn't registered.
+   */
+  previewShareRecipient(email: string): Promise<RecipientPreview> {
+    return invoke<RecipientPreview>("preview_share_recipient", { email });
+  }
+
+  /**
+   * Share a note to a colleague by email (mode B). Registered → wrapped + `"sent"`; unregistered →
+   * a pending invite + `"invited"`. Refuses (`Locked`) a sealed meeting; BLOCKS on a changed key.
+   */
+  shareNoteToUser(
+    meetingId: string,
+    recipientEmail: string,
+    expiresDays?: number,
+  ): Promise<ShareToUserResult> {
+    return invoke<ShareToUserResult>("share_note_to_user", {
+      meetingId,
+      recipientEmail,
+      expiresDays,
+    });
+  }
+
+  /** Re-wrap any pending invites whose recipient has since registered. Returns the count advanced. */
+  shareRewrapPending(): Promise<number> {
+    return invoke<number>("share_rewrap_pending");
+  }
+
+  /** The incoming (pending-accept) share inbox (content-free; titles only appear on accept). */
+  listShareInbox(): Promise<ShareInboxItem[]> {
+    return invoke<ShareInboxItem[]>("list_share_inbox");
+  }
+
+  /**
+   * Accept an incoming share into the vault. Verifies the sender's signature + binding, then writes a
+   * new meeting + note into `folderId` (default: an auto-created unsealed "Shared" folder). Refuses a
+   * sealed target (`Locked`); rejects a tampered/unsigned grant; idempotent on `shareId`.
+   */
+  acceptShare(shareId: string, folderId?: string): Promise<AcceptedShare> {
+    return invoke<AcceptedShare>("accept_share", { shareId, folderId });
+  }
+
+  /** Decline an incoming share: drop the wrapped key server-side. Idempotent. */
+  declineShare(shareId: string): Promise<void> {
+    return invoke<void>("decline_share", { shareId });
   }
 
   setAnthropicKey(key: string): Promise<void> {

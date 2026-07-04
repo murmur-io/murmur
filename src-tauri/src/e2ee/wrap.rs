@@ -40,6 +40,64 @@ pub struct SealedGrant {
     pub signature: Vec<u8>,
 }
 
+/// The X25519 HPKE encapsulated-key length (fixed by DHKEM(X25519)). The opaque `wrapped_key` blob
+/// frames a fixed 32-byte `pk_enc || pk_sig || hpke_enc` prefix; the remainder is `wrapped_nk`.
+pub const HPKE_ENC_LEN: usize = 32;
+
+/// Pack the sender's public identity + the sealed grant into the ONE opaque `wrapped_key` blob the
+/// server relays (spec: the server treats it as an inert byte string, never inspected). Framing:
+/// `[sender_pk_enc(32) || sender_pk_sig(32) || hpke_enc(32) || wrapped_nk]`.
+///
+/// The sender's public keys travel INSIDE so the recipient — whose inbox item carries only the
+/// server-attested `sender_fingerprint`, not the raw keys — can (1) recompute the fingerprint and
+/// require it EQUALS the server's attested value (anti-substitution binding) and (2) verify the
+/// Ed25519 grant signature against `sender_pk_sig`. The `grant_sig` rides beside this blob.
+pub fn pack_wrapped_key(sender_pk_enc: &[u8], sender_pk_sig: &[u8], grant: &SealedGrant) -> Result<Vec<u8>> {
+    if sender_pk_enc.len() != 32 || sender_pk_sig.len() != 32 || grant.hpke_enc.len() != HPKE_ENC_LEN {
+        return Err(AppError::InvalidArg(
+            "wrapped-key framing expects 32-byte pk_enc/pk_sig/hpke_enc".into(),
+        ));
+    }
+    let mut v = Vec::with_capacity(96 + grant.wrapped_nk.len());
+    v.extend_from_slice(sender_pk_enc);
+    v.extend_from_slice(sender_pk_sig);
+    v.extend_from_slice(&grant.hpke_enc);
+    v.extend_from_slice(&grant.wrapped_nk);
+    Ok(v)
+}
+
+/// The recipient side of [`pack_wrapped_key`]: `sender_pk_enc`, `sender_pk_sig`, and a [`SealedGrant`]
+/// reconstructed from the framed blob + the detached `grant_sig`. Malformed framing → `InvalidArg`
+/// (fail closed, write NOTHING upstream).
+pub struct UnpackedGrant {
+    pub sender_pk_enc: [u8; 32],
+    pub sender_pk_sig: [u8; 32],
+    pub grant: SealedGrant,
+}
+
+/// Parse the opaque `wrapped_key` blob + the detached `grant_sig` back into the sender's public keys
+/// and a [`SealedGrant`]. Requires at least the 96-byte fixed prefix.
+pub fn unpack_wrapped_key(wrapped_key: &[u8], grant_sig: &[u8]) -> Result<UnpackedGrant> {
+    if wrapped_key.len() < 96 {
+        return Err(AppError::InvalidArg(
+            "wrapped-key blob is too short (need ≥96-byte framed prefix)".into(),
+        ));
+    }
+    let sender_pk_enc = to_arr32(&wrapped_key[0..32])?;
+    let sender_pk_sig = to_arr32(&wrapped_key[32..64])?;
+    let hpke_enc = wrapped_key[64..96].to_vec();
+    let wrapped_nk = wrapped_key[96..].to_vec();
+    Ok(UnpackedGrant {
+        sender_pk_enc,
+        sender_pk_sig,
+        grant: SealedGrant {
+            hpke_enc,
+            wrapped_nk,
+            signature: grant_sig.to_vec(),
+        },
+    })
+}
+
 /// Seal `NK` to `recipient_pk_enc` under HPKE-Base with `info = hpke_info(share_id)`, then sign the
 /// canonical share-grant (binding the SHA-256 of the content cell `C`) with the sender's `sk_sig`.
 ///
@@ -51,6 +109,36 @@ pub struct SealedGrant {
 pub fn seal_to_recipient(
     nk: &[u8; 32],
     content_cell: &[u8],
+    recipient_pk_enc: &[u8],
+    recipient_acct_id: &str,
+    sender: &IdentityKeypair,
+    sender_acct_id: &str,
+    sender_generation: u32,
+    share_id: &str,
+    rev: u32,
+) -> Result<SealedGrant> {
+    let ct_hash = Sha256::digest(content_cell);
+    seal_to_recipient_with_hash(
+        nk,
+        ct_hash.as_slice(),
+        recipient_pk_enc,
+        recipient_acct_id,
+        sender,
+        sender_acct_id,
+        sender_generation,
+        share_id,
+        rev,
+    )
+}
+
+/// Like [`seal_to_recipient`] but signs a PRECOMPUTED `content_hash` (`SHA-256(C)`) instead of
+/// re-hashing the cell. Used by the on-launch re-wrap (`share_rewrap_pending`): the sender retains
+/// only `NK` + `content_hash` locally, so it can produce a fresh grant to a newly-registered
+/// recipient WITHOUT reading the meeting content again (no gate needed — only key material).
+#[allow(clippy::too_many_arguments)]
+pub fn seal_to_recipient_with_hash(
+    nk: &[u8; 32],
+    content_hash: &[u8],
     recipient_pk_enc: &[u8],
     recipient_acct_id: &str,
     sender: &IdentityKeypair,
@@ -73,7 +161,6 @@ pub fn seal_to_recipient(
     .map_err(map_hpke)?;
 
     let hpke_enc = encapped.to_bytes().to_vec();
-    let ct_hash = Sha256::digest(content_cell);
     let view = ShareGrantSignedView {
         sender_acct_id,
         sender_generation,
@@ -82,7 +169,7 @@ pub fn seal_to_recipient(
         share_id,
         rev,
         hpke_enc: &hpke_enc,
-        ciphertext_hash: ct_hash.as_slice(),
+        ciphertext_hash: content_hash,
     };
     let sig = sender.signing_key().sign(&view.canonical());
 
@@ -228,6 +315,63 @@ mod tests {
             crate::e2ee::open_content(&opened_nk, &content, SHARE_ID, REV).unwrap(),
             env
         );
+    }
+
+    /// The opaque `wrapped_key` blob round-trips: pack the sender's public keys + the sealed grant,
+    /// unpack them, and the recipient opens NK exactly as from an unframed grant. Proves the framing
+    /// carries the sender's identity so the recipient (who only gets a fingerprint from the server) can
+    /// verify + open.
+    #[test]
+    fn wrapped_key_blob_round_trips_through_pack_unpack() {
+        let alice = generate_identity().unwrap();
+        let bob = generate_identity().unwrap();
+        let nk = random_key32().unwrap();
+        let env = ShareEnvelope::new("Secret", "- body", "2026-07-04T10:00:00Z");
+        let content = seal_content(&nk, &env, SHARE_ID, REV).unwrap();
+        let grant = seal_to_recipient(
+            &nk, &content, &bob.pk_enc, BOB, &alice, ALICE, 1, SHARE_ID, REV,
+        )
+        .unwrap();
+
+        // Sender packs → server relays an opaque blob + grant_sig.
+        let blob = pack_wrapped_key(&alice.pk_enc, &alice.pk_sig, &grant).unwrap();
+        let up = unpack_wrapped_key(&blob, &grant.signature).unwrap();
+        assert_eq!(up.sender_pk_enc, alice.pk_enc);
+        assert_eq!(up.sender_pk_sig, alice.pk_sig);
+
+        // The recipient opens NK from the UNPACKED grant, verifying against the unpacked sender key.
+        let opened = open_from_sender(
+            &up.grant, &content, &bob, BOB, BOB, ALICE, 1, ALICE, &up.sender_pk_sig, SHARE_ID, REV,
+        )
+        .unwrap();
+        assert_eq!(*opened, *nk);
+        // A too-short blob fails closed.
+        assert!(matches!(unpack_wrapped_key(&[0u8; 10], &grant.signature), Err(AppError::InvalidArg(_))));
+    }
+
+    /// The retained-NK re-wrap path (`share_rewrap_pending`): a grant signed over a precomputed
+    /// content hash opens identically to one signed over the cell — so the sender can re-wrap to a
+    /// newly-registered recipient WITHOUT re-reading the meeting content.
+    #[test]
+    fn seal_with_hash_matches_seal_over_cell() {
+        use sha2::{Digest, Sha256};
+        let alice = generate_identity().unwrap();
+        let bob = generate_identity().unwrap();
+        let nk = random_key32().unwrap();
+        let content = seal_content(
+            &nk, &ShareEnvelope::new("t", "m", "2026-07-04T10:00:00Z"), SHARE_ID, REV,
+        )
+        .unwrap();
+        let hash = Sha256::digest(&content);
+        let grant = seal_to_recipient_with_hash(
+            &nk, hash.as_slice(), &bob.pk_enc, BOB, &alice, ALICE, 1, SHARE_ID, REV,
+        )
+        .unwrap();
+        let opened = open_from_sender(
+            &grant, &content, &bob, BOB, BOB, ALICE, 1, ALICE, &alice.pk_sig, SHARE_ID, REV,
+        )
+        .unwrap();
+        assert_eq!(*opened, *nk);
     }
 
     /// BINDING: a valid signature from an UNPINNED (wrong) key is rejected before any HPKE open.
