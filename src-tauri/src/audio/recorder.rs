@@ -81,6 +81,17 @@ impl Shared {
 /// 4 hours comfortably covers any real meeting while bounding worst-case memory.
 pub const MAX_RECORDING_SECONDS: u64 = 4 * 60 * 60;
 
+/// Pure RISING-EDGE decision for the "maximum recording length reached" notice: given the current
+/// [`Recorder::cap_reached`] state and whether the notice was ALREADY emitted for this recording,
+/// decide whether to emit it NOW. Emit iff the cap is reached AND it hasn't been emitted yet — so a
+/// status poll that ticks many times a second surfaces the notice exactly ONCE per recording (on the
+/// false→true transition), never re-firing while it stays capped and never firing when not capped.
+///
+/// Extracted as a pure fn so the rising-edge logic is headless-testable without a live capture.
+pub fn should_emit_cap_notice(capped: bool, already_emitted: bool) -> bool {
+    capped && !already_emitted
+}
+
 /// Message sent from the capture thread back to the owner once the stream is built.
 struct StartInfo {
     source_sample_rate: u32,
@@ -256,6 +267,51 @@ impl Recorder {
         };
         let start = offset.min(guard.len());
         guard[start..].to_vec()
+    }
+
+    /// A cheap, cloneable READ-ONLY handle onto this recording's live sample buffer, handed to the
+    /// STAGE-2 crash-salvage spill writer (`crate::audio::spill`). It shares the SAME `Arc<Shared>`
+    /// the cpal callback appends to, so the writer reads the growing buffer DIRECTLY — never touching
+    /// the real-time data callback, never draining, lock-guarded (best-effort on a poisoned lock).
+    pub fn sample_reader(&self) -> SampleReader {
+        SampleReader {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+/// Read-only view onto a live recording's mono sample buffer for the crash-salvage spill writer.
+/// Holds a clone of the recorder's `Arc<Shared>`; every read is lock-guarded and NON-draining, so it
+/// can run on a separate (NON-real-time) thread without disturbing capture or the final `stop()`
+/// buffer. Never mutates anything — the RT cpal callback remains the sole writer of `samples`.
+pub struct SampleReader {
+    shared: Arc<Shared>,
+}
+
+impl SampleReader {
+    /// Clone the samples from `offset` to the current end (no drain). Empty past-the-end or on a
+    /// poisoned lock — mirrors [`Recorder::snapshot_from`].
+    pub fn snapshot_from(&self, offset: usize) -> Vec<f32> {
+        let Ok(guard) = self.shared.samples.lock() else {
+            return Vec::new();
+        };
+        let start = offset.min(guard.len());
+        guard[start..].to_vec()
+    }
+
+    /// Test-only: a reader over a fixed sample buffer (no live recorder / device), so the spill
+    /// writer's incremental-mirror logic is exercisable headless.
+    #[cfg(test)]
+    pub(crate) fn from_samples(samples: Vec<f32>) -> Self {
+        let shared = Arc::new(Shared::new());
+        *shared.samples.lock().unwrap() = samples;
+        Self { shared }
+    }
+
+    /// Test-only: append more samples to simulate ongoing capture between flushes.
+    #[cfg(test)]
+    pub(crate) fn push_for_test(&self, more: &[f32]) {
+        self.shared.samples.lock().unwrap().extend_from_slice(more);
     }
 }
 
@@ -628,5 +684,39 @@ mod tests {
             first,
             "anchor must never move after the first frame"
         );
+    }
+
+    /// The 4h-cap NOTICE fires exactly ONCE per recording, on the RISING edge (capped false→true).
+    /// This is the rule that makes the status poll surface "max recording length reached" once —
+    /// never re-firing while it stays capped, never firing when not capped.
+    #[test]
+    fn cap_notice_emits_only_on_rising_edge() {
+        // Not capped → never emit, regardless of the emitted flag.
+        assert!(!should_emit_cap_notice(false, false), "not capped: no emit");
+        assert!(!should_emit_cap_notice(false, true), "not capped: no emit even if flagged");
+
+        // Rising edge: capped and NOT yet emitted → emit ONCE.
+        assert!(should_emit_cap_notice(true, false), "rising edge: capped + not yet emitted → emit");
+
+        // Stays capped after the emit → do NOT re-emit (the flag suppresses the repeat).
+        assert!(!should_emit_cap_notice(true, true), "already emitted while still capped → no re-emit");
+    }
+
+    /// Simulate the per-recording poll loop: many ticks, the cap trips partway, the notice must be
+    /// emitted on exactly one tick. Mirrors how `recording_level` polls `should_emit_cap_notice`
+    /// against a per-recording `capped_notified` flag.
+    #[test]
+    fn cap_notice_fires_once_across_a_poll_loop() {
+        let mut already_emitted = false;
+        let mut emits = 0;
+        // Ticks 0..3 uncapped, then capped from tick 3 onward (the 4h cap trips at tick 3).
+        for tick in 0..10 {
+            let capped = tick >= 3;
+            if should_emit_cap_notice(capped, already_emitted) {
+                emits += 1;
+                already_emitted = true;
+            }
+        }
+        assert_eq!(emits, 1, "the cap notice must fire exactly once across the whole recording");
     }
 }

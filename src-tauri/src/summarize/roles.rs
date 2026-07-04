@@ -109,6 +109,15 @@ impl RoleTarget {
     pub fn is_reasoner_only(&self) -> bool {
         self.connection == CONN_LOCAL || self.connection == CONN_OFF || self.connection == CONN_AFM
     }
+
+    /// `true` when this target builds NO `SummarizerProvider` — `off` (stub) / `apple` (AFM sidecar).
+    /// The predicate split (spec §3.2, review code-truth #8): `local` is reasoner-only for the
+    /// AGENTIC-eligibility gate ([`is_reasoner_only`]) BUT it now DOES build a provider (the on-device
+    /// [`crate::summarize::local::LocalSummarizerProvider`]), so it is NOT included here. This is the
+    /// predicate `provider_for` refuses on — decoupled from agentic eligibility, which stays cloud-only.
+    pub fn builds_no_provider(&self) -> bool {
+        self.connection == CONN_OFF || self.connection == CONN_AFM
+    }
 }
 
 /// The raw role keys for `role` (connection, model, effort) — `""` everywhere = "inherit"

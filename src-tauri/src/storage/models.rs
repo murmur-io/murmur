@@ -554,14 +554,6 @@ impl CalendarContext {
     }
 }
 
-/// A pre-meeting brief: grounded markdown + the source meetings used.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BriefResult {
-    pub markdown: String,
-    pub sources: Vec<VaultSource>,
-}
-
 /// One occurrence of a topic in a meeting (a node in a Topic Thread).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

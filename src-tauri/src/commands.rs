@@ -8,10 +8,11 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BrainOverview, BriefResult, BuiltinRecipe,
-    CalendarContext, CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult,
-    DocumentInfo, EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus,
-    MeetingTimeline, NoteRecord, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
+    ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe,
+    CalendarContext,
+    CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
+    EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
+    NoteRecord, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -127,6 +128,12 @@ pub struct AppConfigDto {
     pub aec_enabled: bool,
     #[serde(default = "default_true")]
     pub post_aec_enabled: bool,
+    /// Recording-storage cap in GB (`None` = no cap). Mirrors `AppConfig::audio_storage_limit_gb`.
+    #[serde(default)]
+    pub audio_storage_limit_gb: Option<u32>,
+    /// Auto-delete oldest recordings' audio over the cap. Opt-in, default false.
+    #[serde(default)]
+    pub audio_auto_prune: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -351,6 +358,20 @@ pub async fn start_recording(
         }
     }
 
+    // Fresh recording ⇒ re-arm the 4h-cap rising-edge notice (see `recording_level`). If a previous
+    // recording hit the cap and set this, the next recording must be able to fire the notice again.
+    state
+        .capped_notified
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Fresh recording ⇒ reset the Realtime-Reactions shadow counter (per-recording calibration) and
+    // the per-recording whisper-card dedup set (each recording surfaces a contradiction at most once).
+    state
+        .reactions_shadow_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut e) = state.reactions_emitted.lock() {
+        e.clear();
+    }
+
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
@@ -385,6 +406,10 @@ pub async fn start_recording(
         .ok()
         .and_then(|c| c.input_device.clone());
     let recorder = Recorder::start(input_device)?;
+    // STAGE 2 crash-salvage: grab a read-only handle onto the live buffer + the device rate BEFORE the
+    // recorder is moved into state — the spill writer mirrors this handle (never the RT callback).
+    let sample_reader = recorder.sample_reader();
+    let src_rate = recorder.source_sample_rate();
     {
         let mut slot = state
             .recorder
@@ -402,6 +427,9 @@ pub async fn start_recording(
 
     // Optionally capture system audio (the other side of the call) alongside the mic.
     // Best-effort: if it can't start, we log and record mic-only — never fail recording.
+    // `sys_scratch_for_spill` remembers the far-side scratch path so the crash-salvage sidecar can
+    // pair the "others" track at next launch (only set when the system recorder actually started).
+    let mut sys_scratch_for_spill: Option<std::path::PathBuf> = None;
     {
         let enabled = state
             .config
@@ -410,8 +438,9 @@ pub async fn start_recording(
             .unwrap_or(false);
         if enabled && crate::audio::system::is_available(&app) {
             let sys_wav = std::env::temp_dir().join(format!("meetnotes-sys-{meeting_id}.wav"));
-            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav) {
+            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav.clone()) {
                 Ok(rec) => {
+                    sys_scratch_for_spill = Some(sys_wav);
                     if let Ok(mut slot) = state.system_recorder.lock() {
                         *slot = Some(rec);
                     }
@@ -424,8 +453,30 @@ pub async fn start_recording(
         }
     }
 
+    // STAGE 2 crash-salvage: mirror the growing RAM mic buffer to an on-disk spill (+ a sidecar naming
+    // the rate + the paired far-side scratch) so a crash / SIGKILL mid-record is recoverable at next
+    // launch (see `audio::spill`). Its own NON-RT writer thread; best-effort — a spill start failure
+    // NEVER fails the recording (the RAM buffer stays the sole primary source until Stop).
+    match crate::audio::spill::SpillWriter::start(
+        &meeting_id,
+        sample_reader,
+        src_rate,
+        sys_scratch_for_spill,
+    ) {
+        Ok(w) => {
+            if let Ok(mut slot) = state.spill_writer.lock() {
+                *slot = Some(w);
+            }
+        }
+        Err(e) => tracing::warn!(
+            target: "audio", error = %e,
+            "crash-salvage spill unavailable; recording on the RAM buffer only"
+        ),
+    }
+
     // NOTE: the live VPIO echo-cancel helper (aeccap) is intentionally NEVER spawned anymore.
-    // It is superseded by the OFFLINE AEC pass (`post_aec_enabled`, default on) which cancels
+    // It is superseded by the OFFLINE AEC pass (`post_aec_enabled`, default OFF — opt-in in
+    // Settings → Audio) which cancels
     // echo after Stop using the captured system track as a perfect far-end reference — with zero
     // effect on the live call. On a real Mac VPIO (a) cancelled ~nothing (macOS gives an input-
     // only voice-processing unit no downlink reference) and (b) DUCKED all other apps' audio
@@ -437,11 +488,35 @@ pub async fn start_recording(
     // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
     // during recording (see transcribe::live). Never affects the recording or final note.
     if let Some(cfg) = state.config.lock().ok().map(|c| c.clone()) {
-        if let Ok(Some(model_path)) = crate::transcribe::model::resolve_model_path(
-            cfg.whisper_model_path.as_deref().map(std::path::Path::new),
-            &cfg.model_size,
-            cfg.language.as_deref().unwrap_or(""),
-        ) {
+        let lang = cfg.language.as_deref().unwrap_or("");
+        let configured = || {
+            crate::transcribe::model::resolve_model_path(
+                cfg.whisper_model_path.as_deref().map(std::path::Path::new),
+                &cfg.model_size,
+                lang,
+            )
+            .ok()
+            .flatten()
+        };
+        // D1 (spec §4.3): while Realtime Reactions (Brain Live) is on, pin the LIVE tick to `small`
+        // when present — a large-v3 live tick alone can saturate the Metal GPU the light reasoner also
+        // needs. If `small` is NOT on disk, fall back to the configured model + warn (pinning to an
+        // absent file would kill the live loop). The post-call ACCURATE pass is unaffected.
+        let live_model = if cfg.brain_live {
+            match crate::transcribe::model::resolve_model_path(None, "small", lang) {
+                Ok(Some(p)) => Some(p),
+                _ => {
+                    tracing::warn!(
+                        target: "live",
+                        "reactions on but ggml-small absent; live tick uses the configured whisper model (may contend with the light reasoner)"
+                    );
+                    configured()
+                }
+            }
+        } else {
+            configured()
+        };
+        if let Some(model_path) = live_model {
             crate::transcribe::live::spawn(app.clone(), model_path, cfg.language.clone());
         }
     }
@@ -474,6 +549,20 @@ pub async fn stop_recording(
         slot.take()
             .ok_or_else(|| AppError::Audio("not recording".into()))?
     };
+
+    // STAGE 2 crash-salvage: take the spill writer into a guard whose `Drop` stops the writer thread
+    // and DELETES the plaintext spill + sidecar on EVERY exit path of this Stop (success, `?`-error,
+    // panic) — mirroring `pipeline::ScratchWav`. It is held across `run_after_stop` below (dropped at
+    // end of scope), so it survives until the archive WAV is written; after a normal Stop the spill is
+    // gone. ONLY a crash (this function never runs) leaves it behind for next-launch salvage.
+    // A POISONED `spill_writer` mutex (`.lock().ok()` ⇒ None) merely DEFERS this clean-stop cleanup:
+    // the spill lingers to next launch, where `claim_inflight` sees the row is no longer RECORDING and
+    // DiscardOrphans it — benign (no leak, no content loss), so tolerating the poison here is correct.
+    let _spill_guard = state
+        .spill_writer
+        .lock()
+        .ok()
+        .and_then(|mut s| s.take());
 
     // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
     // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
@@ -580,14 +669,47 @@ fn compute_duration_s(
     }
 }
 
-/// Current mic peak level 0.0..=1.0 for the meter (0.0 when idle). Cheap, polled by UI.
+/// Current mic peak level 0.0..=1.0 for the meter (0.0 when idle). Cheap, polled by UI ~10x/s.
+///
+/// This is ALSO the detection site for the 4h `MAX_RECORDING_SECONDS` hard TIME cap. The live-caption
+/// loop (`transcribe::live`) is only spawned when a whisper model resolves — a user with no model
+/// downloaded gets no live loop, yet the recording (and the cap) still happen — so the live loop is
+/// NOT a reliable place to detect the cap. The FE polls THIS command every 100 ms while recording
+/// (`recorder.store.ts` `level`), unconditionally, for the whole recording — making it the site that
+/// ALWAYS runs. On the RISING edge (cap reached, notice not yet emitted this recording) we emit
+/// [`crate::events::EVENT_RECORDING_CAPPED`] exactly once so the FE can surface the notice and call
+/// `stop_recording` to finalize the meeting (the capped buffer is intact — Stop still yields a note).
+/// Best-effort: a failed emit only warns; the meter read is unaffected.
 #[tauri::command]
-pub fn recording_level(state: State<'_, AppState>) -> Result<f32, AppError> {
+pub fn recording_level(app: AppHandle, state: State<'_, AppState>) -> Result<f32, AppError> {
     let recorder = state
         .recorder
         .lock()
         .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-    Ok(recorder.as_ref().map(|r| r.level()).unwrap_or(0.0))
+    let Some(r) = recorder.as_ref() else {
+        return Ok(0.0);
+    };
+    let level = r.level();
+    // 4h TIME cap: fire the "maximum recording length reached" notice exactly ONCE per recording,
+    // on the false→true transition. `capped_notified` is the per-recording rising-edge latch,
+    // re-armed at each `start_recording`.
+    if r.cap_reached() {
+        let already = state
+            .capped_notified
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if crate::audio::recorder::should_emit_cap_notice(true, already) {
+            state
+                .capped_notified
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // PII rule (§8): log the flag only — never any content.
+            tracing::warn!(
+                target: "audio",
+                "maximum recording length reached — surfacing cap notice to finalize the meeting"
+            );
+            crate::events::emit_recording_capped(&app);
+        }
+    }
+    Ok(level)
 }
 
 /// Live-toggle the microphone mute mid-recording (no stream teardown). While muted, the cpal
@@ -2071,12 +2193,13 @@ fn persist_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner
     //    is re-resolved from the LIVE config, so a consent/backend change applies without restart.
     let candidates = crate::facts::extract_fact_candidates(
-        &*state
-            .reasoner
-            .current_for(crate::summarize::roles::Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine (facts stop egressing); OFF ⇒ today's Notes reasoner.
+        &*state.reasoner.extraction_reasoner(),
         title,
         markdown,
         entity_refs,
+        // Post-call extraction over the full note: no tight cap (the realtime path uses a capped preset).
+        crate::reason::GenOptions::default(),
     );
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
@@ -2131,9 +2254,8 @@ fn persist_user_facts_for_meeting(
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner is
     //    re-resolved from the LIVE config so a consent/backend change applies without restart.
     let candidates = crate::user_memory::extract_user_fact_candidates(
-        &*state
-            .reasoner
-            .current_for(crate::summarize::roles::Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine (user facts stop egressing); OFF ⇒ today's reasoner.
+        &*state.reasoner.extraction_reasoner(),
         title,
         markdown,
         &typed_notes,
@@ -3398,44 +3520,6 @@ pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<S
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Pre-Meeting Brief: grounded prep card for an upcoming meeting `subject`, built from related
-/// past meeting notes.
-#[tauri::command]
-pub async fn pre_meeting_brief(
-    state: State<'_, AppState>,
-    subject: String,
-) -> Result<BriefResult, AppError> {
-    if subject.trim().is_empty() {
-        return Err(AppError::InvalidArg("subject is empty".into()));
-    }
-    let config = {
-        state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
-            .clone()
-    };
-    // Pass the LIVE session unlock set (E9), same as ask_vault: session-unlocked folders included,
-    // sealed-and-not-unlocked excluded.
-    let unlocked = unlocked_snapshot(state.inner())?;
-    // NOTES role (a written brief); the corpus budget keys on the same resolved connection the
-    // corpus egresses to (identical to `provider_id` while role keys are absent).
-    let notes_conn =
-        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
-            .connection;
-    let (corpus, sources) = crate::summarize::vault_context::build_vault_context_visible(
-        &state.db,
-        &subject,
-        &notes_conn,
-        &unlocked,
-    )?;
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
-    let (system, user) =
-        crate::summarize::brief::build_brief_prompt(&corpus, &subject, &config.note_language);
-    let markdown = provider.complete(&system, &user).await?;
-    Ok(BriefResult { markdown, sources })
-}
-
 /// Best-effort: the soonest macOS Calendar event in the next 60 minutes (title only). Returns
 /// None if Calendar access is denied or there's nothing upcoming — never errors the UI.
 #[tauri::command]
@@ -3524,6 +3608,30 @@ pub fn save_config(
     config: AppConfigDto,
 ) -> Result<(), AppError> {
     save_config_inner(state.inner(), config)?;
+    // Enforce the cap immediately when a save leaves auto-prune ON with a cap set (e.g. the
+    // user just lowered the limit). Best-effort; the config lock is already released. Runs
+    // BEFORE `restart_voice_listener` (which consumes `app`) so `app.emit` stays valid.
+    let (limit_gb, auto) = match state.config.lock() {
+        Ok(c) => (c.audio_storage_limit_gb, c.audio_auto_prune),
+        Err(_) => (None, false),
+    };
+    if let Ok(dir) = crate::pipeline::audio_dir() {
+        // Hold the seal lifecycle guard across the prune (config lock already released above, so
+        // the lock order is lifecycle ⊃ db, never config held while holding lifecycle) so the
+        // prune can never interleave with a folder seal.
+        let _lifecycle = lifecycle_guard(state.inner());
+        if let Ok(s) = crate::storage::usage::maybe_prune(&state.db, &dir, limit_gb, auto, None) {
+            if s.freed_bytes > 0 {
+                let _ = app.emit(
+                    crate::events::EVENT_STORAGE_PRUNED,
+                    crate::events::StoragePrunedPayload {
+                        freed_bytes: s.freed_bytes,
+                        pruned_count: s.pruned_count,
+                    },
+                );
+            }
+        }
+    }
     // Reconcile the voice-trigger listener with the new config (AppHandle-dependent; runs after
     // the config lock is released by `save_config_inner`).
     restart_voice_listener(app);
@@ -3629,6 +3737,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         voiceprint_enabled: c.voiceprint_enabled,
         aec_enabled: c.aec_enabled,
         post_aec_enabled: c.post_aec_enabled,
+        audio_storage_limit_gb: c.audio_storage_limit_gb,
+        audio_auto_prune: c.audio_auto_prune,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -3699,6 +3809,11 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         voiceprint_enabled: d.voiceprint_enabled,
         aec_enabled: d.aec_enabled,
         post_aec_enabled: d.post_aec_enabled,
+        // Recording-storage cap + auto-prune ARE settable from the DTO (the Storage UI owns them).
+        // Plain settable fields — an omitted cap deserializes to `None`, auto-prune to `false`
+        // (`#[serde(default)]`), so a partial/older save can never silently enable pruning.
+        audio_storage_limit_gb: d.audio_storage_limit_gb,
+        audio_auto_prune: d.audio_auto_prune,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a
@@ -3766,6 +3881,13 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             Some(id) if crate::reason::brain_model_by_id(id).is_some() => d.brain_model_id.clone(),
             _ => current.brain_model_id.clone(),
         },
+        // Murmur Brain postures: `brain_live` + the light/heavy class model ids are set by the
+        // dedicated posture / Brain-Live commands (like `cloud_egress_consented`), NEVER by the raw
+        // settings save — so a partial/older DTO can neither enable Brain Live nor repoint an engine.
+        brain_live: current.brain_live,
+        brain_light_model_id: current.brain_light_model_id.clone(),
+        brain_heavy_model_id: current.brain_heavy_model_id.clone(),
+        brain_contradiction_cards: current.brain_contradiction_cards,
         // Phase H (brain backend): which reasoner powers the brain (cloud/local/off) IS taken from
         // the DTO (the Settings UI owns the toggle). `BrainBackend` deserializes an unknown/omitted
         // token to the default `Cloud`, so the value here is always a valid enum variant.
@@ -3824,6 +3946,103 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
 #[tauri::command]
 pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppError> {
     Ok(crate::audio::list_input_devices())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReportDto {
+    pub audio_dir: String,
+    pub used_bytes: u64,
+    pub limit_bytes: Option<u64>,
+    pub playback_bytes: u64,
+    pub masters_bytes: u64,
+    pub sealed_bytes: u64,
+    pub recording_count: u64,
+    pub auto_prune: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneSummaryDto {
+    pub freed_bytes: u64,
+    pub pruned_count: u64,
+    pub masters_deleted: u64,
+}
+
+/// Recording-storage usage report: on-disk audio path, byte totals bucketed by category,
+/// recording count, and the current cap + auto-prune flag. Sizes only — no content.
+#[tauri::command]
+pub fn get_storage_report(state: State<'_, AppState>) -> Result<StorageReportDto, AppError> {
+    let (limit_bytes, auto_prune) = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        (
+            c.audio_storage_limit_gb
+                .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB),
+            c.audio_auto_prune,
+        )
+    };
+    let dir = crate::pipeline::audio_dir()?;
+    let u = crate::storage::usage::scan_audio_usage(&dir)?;
+    Ok(StorageReportDto {
+        audio_dir: dir.to_string_lossy().into_owned(),
+        used_bytes: u.used_bytes,
+        limit_bytes,
+        playback_bytes: u.playback_bytes,
+        masters_bytes: u.masters_bytes,
+        sealed_bytes: u.sealed_bytes,
+        recording_count: u.recording_count,
+        auto_prune,
+    })
+}
+
+/// Manual "Free up space": prune oldest recordings to the cap NOW (works even when auto-prune
+/// is off). Requires a cap — with none set it is an inert zero summary (the FE disables the
+/// button). Never touches notes or locked audio.
+#[tauri::command]
+pub fn free_up_space(state: State<'_, AppState>) -> Result<PruneSummaryDto, AppError> {
+    let limit_bytes = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.audio_storage_limit_gb
+            // `Some(0)` is not a "delete everything" cap → no cap (mirrors `AppConfig::load`).
+            .filter(|g| *g > 0)
+            .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB)
+    };
+    let Some(limit) = limit_bytes else {
+        return Ok(PruneSummaryDto {
+            freed_bytes: 0,
+            pruned_count: 0,
+            masters_deleted: 0,
+        });
+    };
+    let dir = crate::pipeline::audio_dir()?;
+    // Hold the seal lifecycle guard across the prune so it can never interleave with a folder
+    // seal (`lock_folder`) — the same guard every other multi-step audio-path mutator holds.
+    // Acquired AFTER the config lock is released (single lock order: lifecycle ⊃ db, never
+    // config held while holding lifecycle).
+    let _lifecycle = lifecycle_guard(state.inner());
+    let s = crate::storage::usage::prune_to_limit(&state.db, &dir, limit, None)?;
+    Ok(PruneSummaryDto {
+        freed_bytes: s.freed_bytes,
+        pruned_count: s.pruned_count,
+        masters_deleted: s.masters_deleted,
+    })
+}
+
+/// Reveal the recordings folder in Finder (macOS `open`). No content read.
+#[tauri::command]
+pub fn reveal_audio_dir() -> Result<(), AppError> {
+    let dir = crate::pipeline::audio_dir()?;
+    std::process::Command::new("open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| AppError::Storage(format!("reveal audio dir: {e}")))?;
+    Ok(())
 }
 
 /// Whether the CURRENT default audio output is the built-in speakers (echo risk while
@@ -4314,6 +4533,16 @@ pub(crate) fn rename_speaker_inner(
         .ok_or_else(|| AppError::InvalidArg("no timeline for this meeting yet".into()))?;
     let mut tl: crate::storage::models::MeetingTimeline = serde_json::from_str(&json)
         .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
+
+    // Reconstruct the diarized CLUSTER for the OLD label BEFORE the rename rewrites it away. The FE
+    // passes the DISPLAY label the lane shows ("Speaker 1"), not the raw `others-N` tag, so first try
+    // the raw-tag parse (legacy / a raw-tag timeline), then fall back to segment↔turn overlap against
+    // the still-original turns. A label with no overlapping diarized cluster (the "me" lane, or a
+    // non-diarized meeting with no segments) → None → enroll nothing.
+    let old_cluster = parse_others_cluster(old_label).or_else(|| {
+        reconcile_meeting_speakers(state, meeting_id, Some(&tl.speakers)).cluster_for_label(old_label)
+    });
+
     for turn in &mut tl.speakers {
         if turn.speaker == old_label {
             turn.speaker = new_label.to_string();
@@ -4323,13 +4552,14 @@ pub(crate) fn rename_speaker_inner(
         .map_err(|e| AppError::Storage(format!("serialize timeline: {e}")))?;
     state.db.set_timeline_data(meeting_id, &updated)?;
 
-    // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label is a diarized cluster (`others-{n}`) and
+    // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label resolves to a diarized cluster (either a
+    // raw `others-{n}` tag or, via the reconciliation above, the display label the FE lane showed) and
     // the meeting produced a voiceprint for that cluster, bind the new person name to it so the next
-    // meeting can re-identify this voice. Best-effort + no-op when: the opt-in is off, `others-{n}`
-    // doesn't parse, or no voiceprint exists for that cluster (pre-opt-in recording). The rename
-    // itself already succeeded regardless — a failed/absent enroll never fails the command. The WRITE
-    // is anchored to THIS (already-unlocked) meeting; no other meeting's voiceprint is read/written.
-    if let Some(cluster_index) = parse_others_cluster(old_label) {
+    // meeting can re-identify this voice. Best-effort + no-op when: the opt-in is off, the label maps
+    // to no cluster, or no voiceprint exists for that cluster (pre-opt-in recording). The rename itself
+    // already succeeded regardless — a failed/absent enroll never fails the command. The WRITE is
+    // anchored to THIS (already-unlocked) meeting; no other meeting's voiceprint is read/written.
+    if let Some(cluster_index) = old_cluster {
         let enabled = state
             .config
             .lock()
@@ -4446,18 +4676,59 @@ pub(crate) fn suggest_speaker_labels_inner(
 
     let suggestions =
         suggest_voiceprint_labels(&cluster_refs, &labeled_refs, VOICEPRINT_MATCH_THRESHOLD);
+
+    // RE-KEY by the DISPLAY label the FE lane actually shows: the timeline is LLM-generated, so lane
+    // `speaker` = "Speaker 1"/a real name, NOT the raw `others-N` tag. Reconcile the cluster → that
+    // display label via segment↔turn time-overlap so `suggestionByLabel().get(lane.speaker)` matches
+    // for both multi-cluster and single-cluster 1:1. Best-effort: if the meeting has no timeline / no
+    // segments (legacy, sealed-then-unlocked), reconciliation yields nothing → fall back to the raw
+    // `others-N` tag (harmless — a legacy raw-tag timeline still matches; an LLM one just won't chip).
+    let reconciliation = reconcile_meeting_speakers(state, meeting_id, None);
     Ok(suggestions
         .into_iter()
-        .map(|s| SpeakerSuggestion {
-            speaker: format!(
-                "{}-{}",
-                crate::audio::merge::SPEAKER_OTHERS,
-                s.cluster_index
-            ),
-            suggested_label: s.label,
-            score: s.score,
+        .map(|s| {
+            let cluster = s.cluster_index as i64;
+            let speaker = reconciliation
+                .label_for_cluster(cluster)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("{}-{}", crate::audio::merge::SPEAKER_OTHERS, s.cluster_index)
+                });
+            SpeakerSuggestion { speaker, suggested_label: s.label, score: s.score }
         })
         .collect())
+}
+
+/// Build the cluster↔display-label reconciliation for THIS meeting from segment↔turn time-overlap.
+/// Best-effort + gated by the caller (both call sites first pass `meeting_is_unlocked`): reads ONLY
+/// this meeting's segments + its stored (or supplied) timeline turns — never another meeting's data,
+/// so an enroll can never reach a sealed/other cluster. A missing timeline or missing segments (a
+/// legacy or sealed-then-unlocked meeting) yields an empty reconciliation → no-suggestion / no-enroll,
+/// never an error, never a fabricated cluster. Pass `turns` when the caller already parsed the
+/// timeline (avoids a redundant DB read); pass `None` to load it from the DB. NO PII is logged.
+fn reconcile_meeting_speakers(
+    state: &AppState,
+    meeting_id: &str,
+    turns: Option<&[crate::storage::models::SpeakerTurn]>,
+) -> crate::transcribe::diarize::SpeakerReconciliation {
+    use crate::transcribe::diarize::{reconcile_speakers, TurnRef};
+    let segments = state.db.get_segments(meeting_id).unwrap_or_default();
+    // Own the turns when we have to load them, so the borrow outlives the ref view below.
+    let loaded: Vec<crate::storage::models::SpeakerTurn> = match turns {
+        Some(_) => Vec::new(),
+        None => match state.db.get_timeline_data(meeting_id) {
+            Ok(Some(json)) => serde_json::from_str::<MeetingTimeline>(&json)
+                .map(|t| t.speakers)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+    };
+    let turns = turns.unwrap_or(&loaded);
+    let turn_refs: Vec<TurnRef<'_>> = turns
+        .iter()
+        .map(|t| TurnRef { start_s: t.start_s, end_s: t.end_s, label: &t.speaker })
+        .collect();
+    reconcile_speakers(&segments, &turn_refs)
 }
 
 /// List stored voiceprints for a management view (label + source meeting + cluster + dim), GATED —
@@ -4768,6 +5039,98 @@ pub fn list_brain_models(
     ))
 }
 
+/// The installed-base migration nudge: `Some` when the persisted `brain_model_id` points at a RETIRED
+/// model (e.g. the non-commercial `qwen2.5-3b`), telling the FE to offer the Apache-licensed
+/// replacement. `None` for an active/absent selection. Read-only capability probe (no content, no
+/// egress) — like [`brain_model_present`]. The retired GGUF keeps working until the user switches;
+/// nothing is changed silently.
+#[tauri::command]
+pub fn brain_model_retirement_nudge(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::reason::RetiredModelNudge>, AppError> {
+    let selected = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.brain_model_id.clone()
+    };
+    let dir = crate::transcribe::models_dir()?;
+    Ok(crate::reason::retired_model_nudge(selected.as_deref(), &dir))
+}
+
+/// The DERIVED Murmur Brain posture (spec §2.1) for the Settings display — computed from the live
+/// config (resolved role targets + `brain_live`), NEVER stored. `custom` when the dispatch keys match
+/// no preset, so the label can never lie about egress. Read-only capability probe (no content).
+#[tauri::command]
+pub fn brain_posture(state: State<'_, AppState>) -> Result<crate::settings::Posture, AppError> {
+    let c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(crate::settings::postures::derive_posture(&c))
+}
+
+/// Apply a Murmur Brain posture PRESET (`cloud` / `hybrid` / `fully_local`) and persist it. `custom`
+/// is a derived-only label and is rejected (`InvalidArg`). This is the SINGLE writer of the posture
+/// presets — the raw settings save preserves `brain_live` + the posture role keys (see
+/// `dto_to_config`), so a partial save can never change the posture. The Hybrid preset deliberately
+/// leaves `role_live_*` untouched (the @brain assistant stays intact).
+#[tauri::command]
+pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<(), AppError> {
+    let p = crate::settings::Posture::from_settable(&posture)
+        .ok_or_else(|| AppError::InvalidArg(format!("not a settable posture: {posture}")))?;
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    crate::settings::postures::apply_posture(&mut c, p);
+    c.save(&state.db)?;
+    Ok(())
+}
+
+/// Whether the machine has enough RAM to run Realtime Reactions (the light engine) alongside a live
+/// recording — the combined-residency guard (spec §3.3), including a KV estimate + call-overhead. Lets
+/// the Brain Live card warn / gate before enabling. `true` when total RAM can't be read (never block
+/// behind a failed probe). Read-only capability probe.
+#[tauri::command]
+pub fn brain_live_ram_ok() -> Result<bool, AppError> {
+    let light = crate::reason::default_model_for_class(crate::reason::ModelClass::Light);
+    let models: Vec<&crate::reason::BrainModel> = light.into_iter().collect();
+    Ok(crate::reason::residency_fits(
+        &models,
+        total_ram_gb(),
+        crate::reason::CALL_OVERHEAD_GB,
+    ))
+}
+
+/// The Realtime-Reactions SHADOW counter (spec §4.2): how many contradiction cards WOULD have fired
+/// this recording while the sub-toggle is OFF. Lets the FE offer "the brain would have flagged N —
+/// enable?" (user-local calibration, no telemetry). Read-only; resets each `start_recording`.
+#[tauri::command]
+pub fn brain_reactions_shadow_count(state: State<'_, AppState>) -> Result<u64, AppError> {
+    Ok(state
+        .reactions_shadow_count
+        .load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Flip the Realtime-Reactions CONTRADICTION-card sub-toggle (spec §4.2). Default OFF (shadow mode);
+/// the FE offers this only once the user's OWN shadow count clears a bar. Dedicated command (not the
+/// raw settings save, which preserves it) so a partial/older save can never silently enable ⚠ cards.
+#[tauri::command]
+pub fn set_brain_contradiction_cards(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let mut c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    c.brain_contradiction_cards = enabled;
+    c.save(&state.db)?;
+    Ok(())
+}
+
 /// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
 /// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the reasoner dispatch
 /// (`ReasonerCell`) re-resolves per call, so the model takes effect on the next reasoning call
@@ -4780,16 +5143,22 @@ pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Resul
 
 /// Testable core of [`select_brain_model`]: validate the id against the registry, persist it.
 fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), AppError> {
-    if crate::reason::brain_model_by_id(&model_id).is_none() {
-        return Err(AppError::InvalidArg(format!(
-            "unknown brain model id: {model_id}"
-        )));
-    }
+    let model = crate::reason::brain_model_by_id(&model_id)
+        .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
     let mut c = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    c.brain_model_id = Some(model_id);
+    // Keep the legacy single-model id (BrainBackend::Local + custom-path fallback) …
+    c.brain_model_id = Some(model_id.clone());
+    // … AND wire the CLASS handle so the Brain-Live `light()` / Fully-Local `heavy()` handles actually
+    // use what the user just selected. Without this, selecting a light model leaves `light()` pointing
+    // at the registry DEFAULT (a different, un-downloaded GGUF) → it silently resolves to the stub and
+    // Realtime Reactions never fire despite Brain Live being "on".
+    match model.class {
+        crate::reason::ModelClass::Light => c.brain_light_model_id = Some(model_id),
+        crate::reason::ModelClass::Heavy => c.brain_heavy_model_id = Some(model_id),
+    }
     c.save(&state.db)?;
     Ok(())
 }
@@ -4818,10 +5187,14 @@ pub async fn download_brain_model(app: AppHandle, model_id: String) -> Result<St
         return Ok(dest.to_string_lossy().to_string());
     }
 
+    // The pinned integrity hash for this model (None until the registry entry is pinned — the
+    // downloader then verifies before promoting the file, or warns + skips when None).
+    let expected_sha = crate::reason::brain_model_by_id(&model_id).and_then(|m| m.sha256);
+
     // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
     const EMIT_EVERY: u64 = 8 * 1024 * 1024;
     let mut last_emit: u64 = 0;
-    crate::reason::download_brain_model(url, &dest, |downloaded, total| {
+    crate::reason::download_brain_model(url, &dest, expected_sha, |downloaded, total| {
         if downloaded - last_emit >= EMIT_EVERY {
             last_emit = downloaded;
             let _ = app.emit(
@@ -5155,9 +5528,19 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
         // Defense-in-depth: only index a meeting whose latest note is currently visible.
         match db.get_note_if_visible(&m.id, unlocked) {
             Ok(Some(_note)) => {
-                if let Err(e) = db.index_meeting_chunks(&m.id, embedder) {
-                    // Never abort the whole backfill on one bad note — log (no PII) and continue.
-                    tracing::warn!(target: "rag", error = %e, "reindex: indexing one meeting failed (skipped)");
+                // The meeting is visible ⇒ its segments are restored plaintext; index BOTH the note-
+                // summary and the transcript chunks. A read failure on segments is logged + skipped
+                // (never aborts the whole backfill).
+                match db.get_segments(&m.id) {
+                    Ok(segments) => {
+                        if let Err(e) = db.index_meeting_chunks(&m.id, &segments, embedder) {
+                            // Never abort the whole backfill on one bad note — log (no PII) and continue.
+                            tracing::warn!(target: "rag", error = %e, "reindex: indexing one meeting failed (skipped)");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "rag", error = %e, "reindex: reading segments failed (skipped)");
+                    }
                 }
             }
             Ok(None) => {
@@ -5861,8 +6244,11 @@ pub async fn unlock_folder(
     }
 
     // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
-    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK.
-    unseal_folder_extras(state.inner(), &folder_id, &ck)?;
+    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK. The
+    // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
+    // re-indexes the folder's meetings so semantic / related-meetings recover in-session.
+    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    unseal_folder_extras(state.inner(), &folder_id, &ck, meeting_embedder.as_deref())?;
 
     // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
     {
@@ -6085,8 +6471,11 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     }
 
     // Phase 0.5 — permanently restore the TRANSCRIPT + TIMELINE plaintext (clear *_blob columns)
-    // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio.
-    unseal_folder_extras_permanent(state, &folder_id, &ck)?;
+    // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio. The
+    // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
+    // re-indexes the now-open folder's meetings so semantic / related-meetings work again.
+    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    unseal_folder_extras_permanent(state, &folder_id, &ck, meeting_embedder.as_deref())?;
 
     // Flip the folder back to OPEN + drop it from the session set.
     state.db.set_folder_locked(&folder_id, false, None)?;
@@ -6782,7 +7171,73 @@ fn seal_meeting_extras(
 /// SESSION-unlock: decrypt every governed meeting's transcript + timeline back into the plaintext
 /// columns and materialize a playable WAV (decrypt <file>.enc → <file>) re-pointing audio_path at
 /// it. Keeps the `.enc` + the `*_blob` columns (folder is still locked on disk).
-fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+/// Re-index a just-unsealed folder's MEETINGS into `note_chunks` + `vec_chunks` so semantic search /
+/// related-meetings recover after an unlock. Keyword search over meeting notes already recovers on
+/// its own — the `fts_notes` UPDATE trigger fires when `restore_note_markdown` writes the plaintext
+/// back; `note_chunks` have NO independent FTS index (unlike `doc_chunks`/`fts_doc_chunks`), they are
+/// purely the plaintext substrate paired 1:1 with the (semantic) `vec_chunks`.
+///
+/// SYMMETRY / PRECEDENT: documents are ALREADY re-embedded on unseal (`index_document_chunks`, just
+/// above the call sites) and re-purged on relock (`purge_doc_chunks_tx` inside
+/// `blank_sealed_notes_in_folders` / `reblank_folder_extras`). MEETINGS were purged on lock
+/// (`purge_chunks_for_meetings` / `blank_sealed_notes_in_folders` → `purge_chunks_tx`) but were
+/// NEVER re-indexed on unlock — this closes that gap so meetings behave identically to documents. On
+/// relock the SAME `blank_sealed_notes_in_folders` → `purge_chunks_tx` re-purges these rebuilt rows,
+/// so a re-sealed folder still leaves NO meeting vector at rest.
+///
+/// MODEL POLICY — mirrors the MEETING half of `reindex_embeddings_inner` and the pipeline auto-index
+/// (`should_auto_index`) EXACTLY: `Db::index_meeting_chunks` writes chunks AND vectors together (there
+/// is no chunk-only mode, unlike `index_document_chunks(None)`), so it runs ONLY when the REAL e5
+/// model is present — i.e. `embedder == Some`. Model ABSENT (`None`) ⇒ write NOTHING: never a stub
+/// vector (the absolute no-stub-vector invariant), and a model-less install has nothing semantic to
+/// restore anyway (and chunkless-of-vector `note_chunks` rows would have no FTS role). Callers pass
+/// `embed_model_present().then(active_embedder)` — identical to the document re-index idiom.
+///
+/// ORDERING: the caller MUST have already restored each meeting's note plaintext markdown (via
+/// `restore_note_markdown`) before this runs — `index_meeting_chunks` chunks the plaintext note. Both
+/// production callers do (`unlock_folder` / `remove_lock_inner` restore markdown before the extras).
+///
+/// BEST-EFFORT: a per-meeting indexing failure WARNs (IDs/stage only, no PII) and continues — the
+/// unlock/restore has already succeeded and MUST NOT be failed by a re-index hiccup.
+fn reindex_meetings_after_unseal(
+    state: &AppState,
+    meeting_ids: &[String],
+    embedder: Option<&dyn crate::embed::Embedder>,
+) {
+    let Some(embedder) = embedder else {
+        // Model absent: meetings are not chunked (no chunk-only mode → would be stub vectors).
+        // Exactly the pipeline / manual-reindex behavior; note_chunks stay purged until a real reindex.
+        return;
+    };
+    for mid in meeting_ids {
+        // The caller (`unseal_folder_extras`) has ALREADY restored each meeting's segment plaintext
+        // (`restore_segment_text`) and note markdown BEFORE this runs, so the transcript chunks re-derive
+        // from restored plaintext. A segments read failure is logged + skipped (never fails the unlock).
+        let segments = match state.db.get_segments(mid) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "rag", error = %e, "meeting re-index on unlock: reading segments failed (skipped)");
+                continue;
+            }
+        };
+        if let Err(e) = state.db.index_meeting_chunks(mid, &segments, embedder) {
+            tracing::warn!(target: "rag", error = %e, "meeting re-index on unlock failed (note plaintext already restored)");
+        }
+    }
+}
+
+/// `meeting_embedder` is the model-gated embedder for the MEETING re-index, resolved by the CALLER
+/// (`embed_model_present().then(active_embedder)`) and passed in — `Some(real e5)` re-indexes the
+/// folder's meetings, `None` (model absent) writes nothing (never a stub vector). It is injected
+/// (rather than resolved internally like the document re-index below) so the model-PRESENT re-index
+/// is deterministically testable without a real model on disk — meetings have no model-absent
+/// chunk-only path, unlike documents.
+fn unseal_folder_extras(
+    state: &AppState,
+    folder_id: &str,
+    ck: &[u8; 32],
+    meeting_embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<(), AppError> {
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     for mid in &meeting_ids {
         for s in state.db.raw_segments(mid)? {
@@ -6862,6 +7317,11 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
             }
         }
     }
+    // MEETINGS: re-index the folder's meetings into note_chunks + vec_chunks so semantic /
+    // related-meetings recover in-session (their note markdown was restored by `unlock_folder`
+    // BEFORE this call). The caller supplies the model-gated `meeting_embedder` — never a stub
+    // vector; mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
+    reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
     Ok(())
 }
 
@@ -6919,10 +7379,13 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
 /// clear the `*_blob` columns, and permanently restore the plaintext WAV (decrypt .enc → file,
 /// remove the .enc). NEVER lose audio — the plaintext is written + the file decrypts before the
 /// `.enc` is removed.
+/// `meeting_embedder`: the caller-resolved, model-gated embedder for the MEETING re-index (see
+/// [`unseal_folder_extras`] for why it is injected rather than resolved internally).
 fn unseal_folder_extras_permanent(
     state: &AppState,
     folder_id: &str,
     ck: &[u8; 32],
+    meeting_embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<(), AppError> {
     for mid in state.db.meeting_ids_in_folder(folder_id)? {
         // Transcript: restore each segment from its blob (or keep the in-memory text if the folder
@@ -7014,6 +7477,12 @@ fn unseal_folder_extras_permanent(
             }
         }
     }
+    // MEETINGS: the folder is now permanently OPEN (plaintext + `.md` restored above), so there is no
+    // privacy rationale to skip re-indexing its meetings. Re-embed them into note_chunks + vec_chunks
+    // (caller-supplied model-gated embedder — never a stub vector) so semantic / related-meetings work
+    // again. Mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
+    let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+    reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
     Ok(())
 }
 
@@ -8769,6 +9238,7 @@ mod lifecycle_tests {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
             aec_recorder: Mutex::new(None),
+            spill_writer: Mutex::new(None),
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
             db,
@@ -8776,6 +9246,9 @@ mod lifecycle_tests {
             reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
             current_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            capped_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),
@@ -9761,6 +10234,198 @@ mod lifecycle_tests {
         );
     }
 
+    /// Insert diarization-tagged segments + an LLM-DISPLAY-labeled timeline for a meeting (overwrites
+    /// `seed_meeting`'s placeholder segments/timeline). Each `(start, end, tag)` segment carries the
+    /// RAW diarization tag; each `(start, end, label)` turn carries the LLM DISPLAY label the FE lane
+    /// renders — the two key spaces the reconciler must bridge.
+    fn seed_diarized(
+        db: &Db,
+        mid: &str,
+        segs: &[(f64, f64, &str)],
+        turns: &[(f64, f64, &str)],
+    ) {
+        let segments: Vec<Segment> = segs
+            .iter()
+            .enumerate()
+            .map(|(idx, (s, e, tag))| Segment {
+                idx: idx as i64,
+                start_s: *s,
+                end_s: *e,
+                text: "x".to_string(),
+                speaker: Some((*tag).to_string()),
+                confidence: None,
+            })
+            .collect();
+        db.insert_segments(mid, &segments).unwrap();
+        let speakers: String = turns
+            .iter()
+            .map(|(s, e, l)| format!("{{\"speaker\":\"{l}\",\"startS\":{s},\"endS\":{e}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.set_timeline_data(mid, &format!("{{\"topics\":[],\"speakers\":[{speakers}]}}"))
+            .unwrap();
+    }
+
+    /// CRUX (RED-before-GREEN): the timeline is LLM-generated, so the FE lane's `speaker` is the
+    /// DISPLAY label ("Speaker 2"), NOT the raw `others-N` tag. The suggestion MUST be keyed by that
+    /// display label so `suggestionByLabel().get(lane.speaker)` matches and the "Looks like Anna?"
+    /// chip renders. The OLD tag-keyed code emits `speaker == "others-1"` → the FE lookup misses →
+    /// the chip never renders. This asserts the reconciled display-label key.
+    #[test]
+    fn suggest_speaker_labels_keys_by_llm_display_label() {
+        let state = build_state("vp-suggest-display");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // A prior LABELED voiceprint ("Anna").
+        seed_meeting(&state.db, "prior", "prior", None);
+        let anna = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-prior", "prior", 0, Some("Anna"), &anna, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Current meeting: diarized cluster 1 (segments tagged `others-1`), whose timeline lane the
+        // LLM labeled "Speaker 2"; its voiceprint is near-identical to Anna's.
+        seed_meeting(&state.db, "cur", "cur", None);
+        seed_diarized(
+            &state.db,
+            "cur",
+            &[(0.0, 5.0, "others-1")],
+            &[(0.0, 5.0, "Speaker 2")],
+        );
+        let cur = vec![0.99f32, 0.14, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 1, None, &cur, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg.len(), 1, "the prior match surfaces one suggestion");
+        assert_eq!(
+            sugg[0].speaker, "Speaker 2",
+            "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
+        );
+        assert_eq!(sugg[0].suggested_label, "Anna");
+    }
+
+    /// ENROLL via the DISPLAY label: the FE passes the lane label "Speaker 2" (not `others-1`), so
+    /// enroll must reconstruct cluster 1 from segment↔turn overlap. The OLD
+    /// `parse_others_cluster("Speaker 2") = None` code enrolls nothing (RED).
+    #[test]
+    fn rename_speaker_enrolls_via_display_label() {
+        let state = build_state("vp-enroll-display");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        seed_diarized(
+            &state.db,
+            "m1",
+            &[(0.0, 5.0, "others-1")],
+            &[(0.0, 5.0, "Speaker 2")],
+        );
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 1, None, &[0.6f32, 0.8], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Rename the DISPLAY-labeled lane "Speaker 2" → "Anna": cluster 1 gets enrolled.
+        let tl = rename_speaker_inner(&state, "m1", "Speaker 2", "Anna").unwrap();
+        assert!(
+            tl.speakers.iter().any(|t| t.speaker == "Anna"),
+            "the display rename still persists in the timeline"
+        );
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].label.as_deref(),
+            Some("Anna"),
+            "enroll reconstructed cluster 1 from the display label via overlap"
+        );
+        assert_eq!(listed[0].cluster_index, 1);
+    }
+
+    /// Single-cluster 1:1 end-to-end: plain `others` segments ↔ cluster 0, LLM lane "Speaker 1".
+    /// Both suggest (keyed by "Speaker 1") and enroll (reconstruct cluster 0) work — and the 1:1 case
+    /// is inferred from the SEGMENT tag shape, not the {0}-only voiceprint set.
+    #[test]
+    fn suggest_and_enroll_single_cluster_1to1() {
+        let state = build_state("vp-1to1");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // Prior labeled "Sam".
+        seed_meeting(&state.db, "prior", "prior", None);
+        let sam = vec![0.0f32, 1.0, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-prior", "prior", 0, Some("Sam"), &sam, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Current single-cluster meeting: plain `others` segments, LLM lane "Speaker 1", cluster 0.
+        seed_meeting(&state.db, "cur", "cur", None);
+        seed_diarized(
+            &state.db,
+            "cur",
+            &[(0.0, 6.0, "others"), (7.0, 9.0, "others")],
+            &[(0.0, 9.0, "Speaker 1")],
+        );
+        let cur = vec![0.02f32, 0.99, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 0, None, &cur, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        // Suggest is keyed by the display label.
+        let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg.len(), 1);
+        assert_eq!(sugg[0].speaker, "Speaker 1", "1:1 suggestion keyed by the display label");
+        assert_eq!(sugg[0].suggested_label, "Sam");
+
+        // Enroll via the display label reconstructs cluster 0.
+        rename_speaker_inner(&state, "cur", "Speaker 1", "Sam").unwrap();
+        let cur_row = list_voiceprints_inner(&state)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.meeting_id == "cur")
+            .unwrap();
+        assert_eq!(cur_row.label.as_deref(), Some("Sam"), "1:1 enroll bound cluster 0");
+        assert_eq!(cur_row.cluster_index, 0);
+    }
+
+    /// Renaming a lane that maps to NO diarized cluster (the "me" lane / a non-diarized display label)
+    /// enrolls NOTHING — no fabricated cluster — while a real diarized lane in the same meeting still
+    /// enrolls. Guards against the reconciler over-reaching.
+    #[test]
+    fn rename_speaker_non_diarized_lane_enrolls_nothing() {
+        let state = build_state("vp-me-lane");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        // A diarized cluster 0 lane ("Speaker 1") AND a disjoint "me" lane the LLM labeled "Jakub".
+        seed_diarized(
+            &state.db,
+            "m1",
+            &[(0.0, 4.0, "others-0"), (4.0, 8.0, "me")],
+            &[(0.0, 4.0, "Speaker 1"), (4.0, 8.0, "Jakub")],
+        );
+        state
+            .db
+            .insert_voiceprint("vp0", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Renaming the "me"-mapped lane "Jakub" enrolls nothing (it overlaps only "me"/None segments).
+        rename_speaker_inner(&state, "m1", "Jakub", "Jakub K").unwrap();
+        assert!(
+            list_voiceprints_inner(&state).unwrap()[0].label.is_none(),
+            "a non-diarized (me) lane must never fabricate/enroll a cluster"
+        );
+
+        // The real diarized lane still enrolls (positive control).
+        rename_speaker_inner(&state, "m1", "Speaker 1", "Anna").unwrap();
+        assert_eq!(
+            list_voiceprints_inner(&state).unwrap()[0].label.as_deref(),
+            Some("Anna"),
+            "the diarized lane still enrolls its cluster"
+        );
+    }
+
     /// list/forget/clear management commands are gated (list) and idempotent (forget/clear).
     #[test]
     fn voiceprint_management_list_forget_clear() {
@@ -9944,7 +10609,7 @@ mod lifecycle_tests {
         let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
-        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
 
         assert_eq!(
             state.db.get_manual_notes("m1").unwrap(),
@@ -10303,7 +10968,7 @@ mod lifecycle_tests {
         let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
-        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
 
         let restored = state
             .db
@@ -10566,7 +11231,7 @@ mod lifecycle_tests {
         let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
-        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
         assert!(
             state.db.doc_chunk_count(&id).unwrap() >= 1,
             "unlock must re-chunk the document even without the e5 model"
@@ -10574,6 +11239,187 @@ mod lifecycle_tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         assert_leg_visibility(&unlocked, true, "session-unlocked");
+    }
+
+    /// Mirror `unlock_folder`'s own note-markdown restore (KEK → unwrap CK → decrypt each sealed
+    /// provider row's `content_blob` back into its plaintext markdown column) — the step
+    /// `unlock_folder` runs BEFORE `unseal_folder_extras`, so the meeting re-index has plaintext to
+    /// chunk. Returns the unwrapped CK for the follow-on `unseal_folder_extras` call.
+    fn restore_notes_and_ck(state: &AppState, folder_id: &str) -> [u8; 32] {
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(folder_id).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        for n in state.db.notes_in_folder(folder_id).unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
+                let md = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
+                    .unwrap();
+            }
+        }
+        ck
+    }
+
+    /// REGRESSION (the reported bug): locking a folder PURGES its meetings' `note_chunks`/`vec_chunks`
+    /// (`purge_chunks_for_meetings`), but session-unlock (`unseal_folder_extras`) previously re-indexed
+    /// ONLY documents and NEVER the meetings — so semantic / related-meetings stayed DEAD for those
+    /// meetings until a manual full re-index. This asserts the fix on the PRODUCTION unlock path.
+    ///
+    /// RED-before-GREEN (deterministic, machine-independent): the meeting embedder is now injected, so
+    /// the model-PRESENT branch is driven by passing `Some(&StubEmbedder)` (the same stand-in every
+    /// meeting-chunk test uses) into the PRODUCTION `unseal_folder_extras`. On the pre-fix code
+    /// `unseal_folder_extras` had no meeting re-index at all (`index_meeting_chunks`'s only production
+    /// callers were the pipeline + the manual reindex command, grep-confirmed), so `note_chunk_count`
+    /// would stay 0 even with `Some` — RED. The `None` call proves the ABSOLUTE no-stub-vector /
+    /// mirror-the-pipeline invariant: model-absent unlock writes ZERO meeting chunks AND vectors.
+    #[test]
+    fn unlock_reindexes_folder_meetings_and_never_stub_vectors() {
+        let state = build_state("unlock-reindex-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Q3 plan\n\nbudget planning and hiring across the org",
+            Some("f-lock"),
+        );
+        // Index while the folder is OPEN (the stub stands in for a present model, as every other
+        // meeting-chunk test does) → chunks + vectors present.
+        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
+        assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectored while open");
+
+        // LOCK (production seal) → meeting chunks + vectors purged.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "note_chunks purged on lock");
+        assert_eq!(state.db.note_vec_count("m1").unwrap(), 0, "vec_chunks purged on lock");
+
+        // Restore note markdown exactly as `unlock_folder` does BEFORE `unseal_folder_extras`.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+
+        // MODEL-ABSENT (embedder = None): the PRODUCTION unlock must write NOTHING for meetings — no
+        // chunk-only mode → any write would be a forbidden stub vector. Mirrors the pipeline exactly.
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "model-absent unlock writes NO meeting note_chunks (mirrors the pipeline/reindex policy)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "ABSOLUTE no-stub-vector: model-absent unlock never writes a meeting vector"
+        );
+
+        // MODEL-PRESENT (embedder = Some): the PRODUCTION unlock re-indexes the folder's meetings.
+        // RED on the pre-fix code (unseal_folder_extras had no meeting re-index → stayed 0).
+        unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "production unlock re-indexes meeting vec_chunks when the e5 model is present"
+        );
+    }
+
+    /// REMOVE-LOCK analogue: permanently opening a folder (`remove_lock_inner` →
+    /// `unseal_folder_extras_permanent`) restores plaintext + `.md` for every meeting; the folder is
+    /// then permanently OPEN, so there is no privacy rationale to skip re-indexing — meetings must
+    /// re-index exactly like documents. Same deterministic RED-before-GREEN shape as the session-unlock
+    /// test, driving the PRODUCTION `unseal_folder_extras_permanent` with `None` then `Some`.
+    #[test]
+    fn remove_lock_reindexes_folder_meetings_and_never_stub_vectors() {
+        let state = build_state("remove-lock-reindex-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Roadmap\n\nrevisit auth and the billing migration next sprint",
+            Some("f-lock"),
+        );
+        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "purged on lock");
+
+        // `remove_lock_inner` restores the note markdown (Step 1) BEFORE `unseal_folder_extras_permanent`.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+
+        // MODEL-ABSENT (None): permanent unseal writes NO meeting chunks/vectors (no stub vectors).
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "model-absent remove-lock writes NO meeting note_chunks (mirrors the pipeline policy)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "ABSOLUTE no-stub-vector: model-absent remove-lock never writes a meeting vector"
+        );
+
+        // MODEL-PRESENT (Some): permanent unseal re-indexes the now-open folder's meetings. RED on the
+        // pre-fix code (unseal_folder_extras_permanent had no meeting re-index → stayed 0).
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+        );
+        assert!(state.db.note_vec_count("m1").unwrap() > 0, "remove-lock re-indexes meeting vec_chunks");
+    }
+
+    /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
+    /// must leave ZERO meeting chunks/vectors at rest — `relock_folder` → `blank_sealed_notes_in_folders`
+    /// → `purge_chunks_tx` covers the rows the unlock re-index rebuilt, so a re-sealed folder never
+    /// leaves a meeting vector at rest.
+    #[test]
+    fn lock_unlock_relock_leaves_zero_meeting_chunks() {
+        let state = build_state("relock-repurge-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Notes\n\nlaunch on the 14th; hire two engineers",
+            Some("f-lock"),
+        );
+        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
+
+        // Lock → purge.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "purged on lock");
+
+        // Session-unlock: restore markdown + the PRODUCTION unseal with a present (stub) model, which
+        // rebuilds the meeting chunks — so the relock below has something to re-purge.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+        unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: meeting re-indexed while session-unlocked"
+        );
+        assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectors rebuilt");
+
+        // RELOCK → re-purge. Zero meeting chunks AND zero vectors at rest.
+        relock_all_inner(&state).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "relock must re-purge the meeting note_chunks the unlock re-index rebuilt"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "relock must re-purge the rebuilt meeting vec_chunks (no invertible vector at rest)"
+        );
     }
 
     /// REINDEX BACKFILL (PR B): `reindex_embeddings_inner` covers documents. Model ABSENT →
@@ -11078,7 +11924,7 @@ mod lifecycle_tests {
             let current = AppConfig {
                 brain_backend: BrainBackend::Cloud,
                 realtime_reactions: false,
-                brain_model_id: Some("qwen2.5-3b".to_string()),
+                brain_model_id: Some("qwen3-4b-instruct-2507".to_string()),
                 ..AppConfig::default()
             };
             let merged = dto_to_config(dto, &current);
@@ -11245,7 +12091,9 @@ mod lifecycle_tests {
     /// `brain_backend` deserializes to the default `Cloud` rather than crashing the save.
     #[test]
     fn dto_unknown_brain_model_id_preserved_and_unknown_backend_defaults_cloud() {
-        // (a) unknown model id ⇒ ignored, current selection preserved.
+        // (a) unknown model id ⇒ ignored, current selection preserved. The `current` here is the now
+        // RETIRED `qwen2.5-3b`, so this doubles as the installed-base guarantee: a settings save must
+        // not wipe a persisted retired selection (its on-disk GGUF keeps resolving; see reason.rs).
         let mut dto = config_to_dto(&AppConfig::default());
         dto.brain_model_id = Some("totally-made-up-model".to_string());
         let current = AppConfig {
@@ -11356,6 +12204,12 @@ mod lifecycle_tests {
             state.config.lock().unwrap().brain_model_id.as_deref(),
             Some("bielik-11b-v3")
         );
+        // Selecting a HEAVY model also wires the class handle so heavy()/Fully-Local uses it.
+        assert_eq!(
+            state.config.lock().unwrap().brain_heavy_model_id.as_deref(),
+            Some("bielik-11b-v3"),
+            "selecting a heavy model must set brain_heavy_model_id (else heavy() ignores the choice)"
+        );
         // Survives a reload from the settings table.
         assert_eq!(
             AppConfig::load(&state.db)
@@ -11365,12 +12219,21 @@ mod lifecycle_tests {
             Some("bielik-11b-v3")
         );
 
-        // Unknown id ⇒ InvalidArg, selection unchanged.
+        // Selecting a LIGHT model wires the light class handle (the Brain-Live path) — the bug this
+        // guards: a light selection that only set brain_model_id left light() on the registry default.
+        select_brain_model_inner(&state, "qwen3-1.7b".to_string()).unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().brain_light_model_id.as_deref(),
+            Some("qwen3-1.7b"),
+            "selecting a light model must set brain_light_model_id (else Realtime Reactions stay stub)"
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged (still the last valid pick, qwen3-1.7b).
         let err = select_brain_model_inner(&state, "not-a-real-model".to_string()).unwrap_err();
         assert!(matches!(err, AppError::InvalidArg(_)));
         assert_eq!(
             state.config.lock().unwrap().brain_model_id.as_deref(),
-            Some("bielik-11b-v3")
+            Some("qwen3-1.7b")
         );
     }
 
@@ -11433,12 +12296,18 @@ mod lifecycle_tests {
             brain_download_target("bogus-id"),
             Err(AppError::InvalidArg(_))
         ));
-        let (url, dest) = brain_download_target("qwen2.5-3b").unwrap();
+        // A RETIRED id is also rejected by the download target (un-selectable / un-downloadable fresh;
+        // the installed-base file, if present, is only RESOLVED, never re-fetched).
+        assert!(matches!(
+            brain_download_target("qwen2.5-3b"),
+            Err(AppError::InvalidArg(_))
+        ));
+        let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
         assert_eq!(
             url,
-            "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
         );
-        assert!(dest.ends_with("Qwen2.5-3B-Instruct-Q4_K_M.gguf"));
+        assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
     }
 
     // ── rename_folder / delete_folder (folder lifecycle) ────────────────────────────────────────
@@ -12098,5 +12967,31 @@ mod gateway_key_tests {
             crate::summarize::gateway::validate_gateway_url("http://127.0.0.1:4000/v1").is_ok(),
             "loopback http gateway URL must be accepted"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_cmd_tests {
+    use super::*;
+
+    #[test]
+    fn free_up_space_is_noop_without_a_cap() {
+        let p = crate::storage::db::unique_temp_path("murmur-cmd-storage", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let state = AppState::init_at(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        // No limit set (default None) → free_up_space must be an inert zero summary.
+        let s = crate::storage::usage::prune_to_limit(
+            &state.db,
+            &crate::pipeline::audio_dir().unwrap(),
+            u64::MAX,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.freed_bytes, 0);
+        let _ = std::fs::remove_file(&p);
     }
 }

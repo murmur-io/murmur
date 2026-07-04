@@ -33,7 +33,7 @@ fn budget_for(provider_id: &str) -> usize {
 /// Backward-compatible entry point (original 3-arg signature). Delegates to the
 /// visibility-aware [`build_vault_context_visible`] with an EMPTY unlock set, i.e. it is
 /// **fail-closed**: every sealed folder is treated as not-unlocked, so no sealed content can
-/// reach the cloud prompt (E9). The live callers (`ask_vault` / `pre_meeting_brief`) now call
+/// reach the cloud prompt (E9). The live caller (`ask_vault`) now calls
 /// [`build_vault_context_visible`] directly with the live `state.unlocked_folders` snapshot, so
 /// session-unlocked folders ARE included; this empty-set shim remains only as a fail-closed
 /// default for any caller that does not have an unlock set to pass.
@@ -333,8 +333,8 @@ mod tests {
         // Index BEFORE sealing (content visible) so a vec_chunks row for the sealed meeting exists —
         // proving the READ-time gate (not just absence of an index row) excludes it.
         let emb = crate::embed::active_embedder();
-        db.index_meeting_chunks("open", emb.as_ref()).unwrap();
-        db.index_meeting_chunks("sealed", emb.as_ref()).unwrap();
+        db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", &[], emb.as_ref()).unwrap();
         db.set_folder_locked("f-locked", true, None).unwrap();
 
         let qv = emb

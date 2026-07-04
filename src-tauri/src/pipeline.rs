@@ -87,7 +87,7 @@ fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
 }
 
 /// `<app-data>/<app_dir_name()>/audio`, created if absent (`MeetNotes` release, `MeetNotes-dev` dev).
-fn audio_dir() -> Result<PathBuf> {
+pub(crate) fn audio_dir() -> Result<PathBuf> {
     let base = dirs::data_dir()
         .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
     let dir = base.join(crate::state::app_dir_name()).join(AUDIO_SUBDIR);
@@ -389,6 +389,42 @@ async fn run_inner(
                 tracing::warn!(target: "audio", error = %e, "persisting system master path failed");
             }
         }
+    }
+
+    // Storage retention (opt-in): if the user set a cap + enabled auto-prune, delete the
+    // OLDEST recordings' audio to stay under it — never THIS recording (excluded), never a
+    // locked folder's, never notes/transcripts. Best-effort: a prune error never fails the
+    // recording.
+    let prune_result = {
+        // Hold the seal lifecycle guard across the SYNCHRONOUS prune ONLY — a std Mutex guard must
+        // never be held across an `.await`, so it is scoped to this block and dropped before the
+        // next await below. Same guard `lock_folder`/`unlock_folder`/`relock_*` hold, so the prune
+        // can never interleave with a folder seal (poison-tolerant, like `commands::lifecycle_guard`).
+        let _lifecycle = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::storage::usage::maybe_prune(
+            &state.db,
+            &wav_dir,
+            config.audio_storage_limit_gb,
+            config.audio_auto_prune,
+            Some(meeting_id),
+        )
+    };
+    match prune_result {
+        Ok(s) if s.freed_bytes > 0 => {
+            tracing::info!(target: "storage", freed = s.freed_bytes, count = s.pruned_count, "auto-pruned old recordings to stay under the storage cap");
+            let _ = app.emit(
+                crate::events::EVENT_STORAGE_PRUNED,
+                crate::events::StoragePrunedPayload {
+                    freed_bytes: s.freed_bytes,
+                    pruned_count: s.pruned_count,
+                },
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(target: "storage", error = %e, "auto-prune failed (non-fatal)"),
     }
 
     // ── 2 + 3. Transcribe EACH stream separately, then MERGE by wall-clock ────
@@ -892,7 +928,10 @@ async fn summarize_and_export(
     // salient-query path stays the FALLBACK FLOOR. The reasoner call is synchronous, so this keeps
     // the existing inline shape (no extra await). Best-effort + GATED: same egress/consent envelope.
     let related_context = crate::orchestrate::orchestrate_context(
-        &*state.reasoner.current_for(Role::Notes),
+        // Brain Live ON ⇒ the LOCAL light engine for retrieval planning (no egress); a missing light
+        // model degrades to the stub ⇒ the deterministic `build_grounding_context` floor below — never
+        // silently to cloud (spec §3.4). OFF ⇒ today's Notes reasoner.
+        &*state.reasoner.extraction_reasoner(),
         &state.db,
         meeting_id,
         related_title.as_deref(),
@@ -1263,7 +1302,11 @@ pub(crate) fn index_meeting_if_enabled(
     if !db.meeting_is_visible(meeting_id, unlocked)? {
         return Ok(()); // sealed-not-unlocked: never index its plaintext.
     }
-    db.index_meeting_chunks(meeting_id, embedder)
+    // Load the meeting's RESTORED/visible plaintext segments so transcript chunks (source_type=
+    // 'transcript') are indexed alongside the note-summary chunks. A sealed meeting is already excluded
+    // above, so these are visible plaintext; an empty transcript simply yields zero transcript chunks.
+    let segments = db.get_segments(meeting_id)?;
+    db.index_meeting_chunks(meeting_id, &segments, embedder)
 }
 
 /// brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION (ALWAYS ON). Build the GATED corpus of

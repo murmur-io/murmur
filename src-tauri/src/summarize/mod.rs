@@ -8,19 +8,19 @@ use crate::summarize::provider::SummarizerProvider;
 
 pub mod action_items;
 pub mod anthropic;
-pub mod brief;
+pub mod egress_log;
+pub mod gateway;
+pub mod meta;
 pub mod chat;
 pub mod claude_code;
 pub mod digest;
 pub mod dossier;
-pub mod egress_log;
-pub mod gateway;
 pub mod graph;
 /// Tier 3b (B) anti-hallucination — DETERMINISTIC GROUNDING of the generated note against its own
 /// transcript segments. Pure, on-device, zero-egress; annotates unsupported summary units with a
 /// non-destructive `> unverified` marker.
 pub mod grounding;
-pub mod meta;
+pub mod local;
 /// The REAL on-device PERSON-name NER redactor (Phase D). ALWAYS compiled; the real impl is selected
 /// at runtime by `redact::active_name_redactor` when the NER model dir is present, else the
 /// byte-identical `NoopNameRedactor` (so a no-model build's name egress is unchanged).
@@ -70,6 +70,11 @@ pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
             Ok(u) => !gateway::host_is_loopback(&u),
             Err(_) => true, // unparseable → fail safe (treat as cloud)
         },
+        // On-device connections egress NOTHING (spec §3.2; review code-truth #3 — load-bearing):
+        // without this explicit arm the `_ => true` default would classify a `local` note as cloud,
+        // demanding phantom consent, writing phantom ledger rows, and stamping a cloud host on the
+        // Privacy Receipt. `off`/`apple` never reach the factory but are on-device by definition.
+        roles::CONN_LOCAL | roles::CONN_OFF | roles::CONN_AFM => false,
         _ => true, // any future provider id defaults to cloud
     }
 }
@@ -116,7 +121,9 @@ pub fn provider_for(
     config: &AppConfig,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     let target = roles::provider_target(role, config);
-    if target.is_reasoner_only() {
+    // Refuse ONLY the targets that build no provider (off/apple). `local` now builds the on-device
+    // LocalSummarizerProvider in `make_provider_resolved` (spec §3.2), so it is NOT refused here.
+    if target.builds_no_provider() {
         return Err(crate::error::AppError::Unavailable(format!(
             "the {} role targets the on-device reasoner ({}); no summarizer provider is available \
              for it",
@@ -211,9 +218,7 @@ fn make_provider_resolved(
                 ));
             }
             // R3 — resolve the GATEWAY key only; NEVER falls back to the Anthropic key.
-            let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT)
-                .ok()
-                .flatten();
+            let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
             let model = if target.model.trim().is_empty() {
                 config.gateway_model.clone()
             } else {
@@ -226,6 +231,32 @@ fn make_provider_resolved(
                 api_key,
             )?)
             // Falls through to the RedactingProvider wrap below (R2).
+        }
+        c if c == roles::CONN_LOCAL => {
+            // FullyLocal Notes/Ask (spec §3.2): the on-device HEAVY engine as a provider. Resolve the
+            // class model (target.model = the heavy id under the preset; else the persisted
+            // brain_model_id). ABSENT ⇒ Unavailable — the note lands in Error + the recovery UX (P1),
+            // NEVER a silent cloud fallback. Weights load once via the shared MODEL_CACHE. Returned
+            // UNWRAPPED (no redaction, no ledger) like a loopback Ollama — `egress_is_cloud(local)` is
+            // false, so the consent gate above was skipped and nothing egresses.
+            let model_id = if target.model.trim().is_empty() {
+                config.brain_model_id.clone()
+            } else {
+                Some(target.model.clone())
+            };
+            let configured = config.brain_model_path.as_deref().map(std::path::Path::new);
+            match crate::reason::resolve_brain_model(configured, model_id.as_deref())? {
+                Some(path) => {
+                    let reasoner: Arc<dyn crate::reason::LocalReasoner> =
+                        Arc::new(crate::reason::mistral::MistralReasoner::new(path)?);
+                    return Ok(Arc::new(local::LocalSummarizerProvider::new(reasoner)));
+                }
+                None => {
+                    return Err(crate::error::AppError::Unavailable(
+                        "the on-device model for local notes is not downloaded".into(),
+                    ));
+                }
+            }
         }
         other => {
             return Err(crate::error::AppError::InvalidArg(format!(
@@ -314,9 +345,7 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
     ];
     // Gateway: include only when configured; a bad URL is omitted, never a panic.
     if !config.gateway_base_url.trim().is_empty() {
-        let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT)
-            .ok()
-            .flatten();
+        let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
         if let Ok(gw) = crate::summarize::gateway::OpenAiCompatProvider::new(
             config.gateway_base_url.clone(),
             config.gateway_model.clone(),
@@ -362,6 +391,31 @@ mod tests {
 
         // Unknown provider ids default to cloud (fail-safe).
         assert!(egress_is_cloud("unknown-provider", &cfg));
+
+        // On-device connections egress NOTHING (spec §3.2) — load-bearing for the Privacy Receipt:
+        // a local note must never be classified cloud (else phantom consent/ledger/receipt-lie).
+        assert!(!egress_is_cloud(roles::CONN_LOCAL, &cfg));
+        assert!(!egress_is_cloud(roles::CONN_OFF, &cfg));
+        assert!(!egress_is_cloud(roles::CONN_AFM, &cfg));
+    }
+
+    #[test]
+    fn predicate_split_local_builds_a_provider_but_stays_agentic_ineligible() {
+        use roles::{RoleTarget, CONN_AFM, CONN_LOCAL, CONN_OFF};
+        let t = |c: &str| RoleTarget {
+            connection: c.to_string(),
+            model: String::new(),
+            effort: String::new(),
+        };
+        // local: reasoner-only (NOT agentic-eligible) BUT now builds a provider (not refused).
+        assert!(t(CONN_LOCAL).is_reasoner_only());
+        assert!(!t(CONN_LOCAL).builds_no_provider());
+        // off / apple: reasoner-only AND build no provider (still refused by provider_for).
+        assert!(t(CONN_OFF).builds_no_provider());
+        assert!(t(CONN_AFM).builds_no_provider());
+        // cloud: neither.
+        assert!(!t(PROVIDER_CLAUDE_CODE).is_reasoner_only());
+        assert!(!t(PROVIDER_CLAUDE_CODE).builds_no_provider());
     }
 
     #[test]
@@ -461,10 +515,7 @@ mod tests {
         }
         for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
             assert!(
-                matches!(
-                    provider_for(role, &cfg),
-                    Err(crate::error::AppError::Unavailable(_))
-                ),
+                matches!(provider_for(role, &cfg), Err(crate::error::AppError::Unavailable(_))),
                 "provider_for {role:?} must refuse after revoke"
             );
         }
@@ -576,10 +627,7 @@ mod tests {
         let cfg = AppConfig::default(); // consent OFF
         for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
             assert!(
-                matches!(
-                    provider_for(role, &cfg),
-                    Err(crate::error::AppError::Unavailable(_))
-                ),
+                matches!(provider_for(role, &cfg), Err(crate::error::AppError::Unavailable(_))),
                 "fallback {role:?} must be consent-gated"
             );
         }
@@ -588,12 +636,8 @@ mod tests {
         let cases: [(&str, ConfigTweak); 4] = [
             ("claude_code", |_| {}),
             ("anthropic", |_| {}),
-            ("gateway", |c| {
-                c.gateway_base_url = "http://127.0.0.1:4000/v1".into()
-            }),
-            ("ollama", |c| {
-                c.ollama_base_url = "https://ollama.remote.example/api".into()
-            }),
+            ("gateway", |c| c.gateway_base_url = "http://127.0.0.1:4000/v1".into()),
+            ("ollama", |c| c.ollama_base_url = "https://ollama.remote.example/api".into()),
         ];
         for (conn, extra) in cases {
             let mut cfg = AppConfig {
@@ -671,26 +715,14 @@ mod tests {
             effort: String::new(),
         };
         // An explicit resolved model always wins.
-        assert_eq!(
-            effective_model_requested(&t("anthropic", "claude-sonnet-4-6"), &cfg),
-            "claude-sonnet-4-6"
-        );
+        assert_eq!(effective_model_requested(&t("anthropic", "claude-sonnet-4-6"), &cfg), "claude-sonnet-4-6");
         // Empty model → the connection's own default (THE anthropic fix).
-        assert_eq!(
-            effective_model_requested(&t("anthropic", ""), &cfg),
-            "claude-opus-4-8"
-        );
-        assert_eq!(
-            effective_model_requested(&t("ollama", ""), &cfg),
-            "llama3.1"
-        );
+        assert_eq!(effective_model_requested(&t("anthropic", ""), &cfg), "claude-opus-4-8");
+        assert_eq!(effective_model_requested(&t("ollama", ""), &cfg), "llama3.1");
         assert_eq!(effective_model_requested(&t("gateway", ""), &cfg), "gpt-4o");
         // claude_code's default is the CLI's own — unknowable here, stays "".
         assert_eq!(effective_model_requested(&t("claude_code", ""), &cfg), "");
-        assert_eq!(
-            effective_model_requested(&t("claude_code", "claude-haiku-4-5"), &cfg),
-            "claude-haiku-4-5"
-        );
+        assert_eq!(effective_model_requested(&t("claude_code", "claude-haiku-4-5"), &cfg), "claude-haiku-4-5");
     }
 
     /// Task 1.3 — `egress_is_cloud` explicitly classifies `PROVIDER_GATEWAY` as cloud.

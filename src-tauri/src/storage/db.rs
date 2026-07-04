@@ -29,6 +29,17 @@ pub struct LockedMeetingAudio {
     pub sys_master_path: Option<String>,
 }
 
+/// One meeting eligible for storage prune: NOT in a locked folder, with its three audio paths.
+/// Ordered oldest-first by [`Db::prunable_audio_candidates`]. Any column may be `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunableAudio {
+    pub meeting_id: String,
+    pub started_at: String,
+    pub audio_path: Option<String>,
+    pub mic_master_path: Option<String>,
+    pub sys_master_path: Option<String>,
+}
+
 impl MeetingStatus {
     /// Stable SCREAMING_SNAKE_CASE string used as the on-disk `status` column value.
     /// Kept in sync with the serde `rename_all = "SCREAMING_SNAKE_CASE"` on the enum.
@@ -630,6 +641,37 @@ impl Db {
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_email", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "content_hash", "BLOB")?;
 
+        // WS8 / capture-default: one-time flip of the SYSTEM-AUDIO-CAPTURE default to ON for the
+        // INSTALLED base (fresh installs already default ON via `AppConfig::default().capture_system_audio`
+        // — the default flipped OFF→ON in #167). This reaches DBs that persisted the historical 'false'.
+        // RATIONALE: that stored 'false' comes from onboarding round-tripping the OLD (pre-#167) default,
+        // NOT a deliberate opt-out — so, exactly as the `semantic_default_v1` precedent did for a
+        // historical default, we flip it ON once. Sentinel-guarded (`capture_default_v1`) so it runs
+        // EXACTLY once and never re-fires: a user who turns capture OFF *after* this migration stays off.
+        // Uses the HELD `conn` directly (self.get_setting/set_setting would re-lock `self.lock()` and
+        // DEADLOCK). Config-only settings key, additive, idempotent, and reversible via Settings → Audio
+        // — it touches NO meeting content, crypto, or seal state.
+        let capture_default_applied: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'capture_default_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if capture_default_applied.is_none() {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('capture_system_audio', 'true')
+                 ON CONFLICT(key) DO UPDATE SET value = 'true'",
+                [],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('capture_default_v1', '1')",
+                [],
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -1479,6 +1521,17 @@ impl Db {
     /// live recording a second call reconciles 0. Non-`RECORDING` rows (Complete/Error/…) are left
     /// untouched by the `WHERE status = 'RECORDING'` guard. Logs only meeting UUIDs + a count (no PII).
     pub fn reconcile_stuck_recordings(&self) -> Result<usize> {
+        self.reconcile_stuck_recordings_except(&[])
+    }
+
+    /// [`Self::reconcile_stuck_recordings`], but SKIPPING every meeting id in `claimed` — the rows the
+    /// STAGE-2 crash-salvage (`audio::spill`) is handling THIS launch. Salvage runs BEFORE reconcile
+    /// in setup and CLAIMS the recoverable ghosts (reconstructing their audio + running the pipeline,
+    /// which sets their final status itself); reconcile must NOT clobber a claimed row to `ERROR` in
+    /// the window before the async salvage worker transitions it. Every OTHER stuck `RECORDING` ghost
+    /// (no spill / not recoverable) is still flipped to the terminal `ERROR` state exactly as before.
+    /// Idempotent + additive (the per-row `AND status = RECORDING` guard). Logs ids + counts, no PII.
+    pub fn reconcile_stuck_recordings_except(&self, claimed: &[String]) -> Result<usize> {
         let conn = self.lock();
         // Collect the ghost ids first (UUIDs — not PII) so the reconcile is auditable in the log.
         let ids: Vec<String> = {
@@ -1493,22 +1546,30 @@ impl Db {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(map_err)?
         };
-        if ids.is_empty() {
+        // Exclude the rows salvage claimed this launch — it owns their final status.
+        let to_reconcile: Vec<&String> =
+            ids.iter().filter(|id| !claimed.contains(id)).collect();
+        if to_reconcile.is_empty() {
             return Ok(0);
         }
-        let n = conn
-            .execute(
-                "UPDATE meetings SET status = ?2 WHERE status = ?1",
-                rusqlite::params![
-                    MeetingStatus::Recording.as_str(),
-                    MeetingStatus::Error.as_str()
-                ],
-            )
-            .map_err(map_err)?;
+        let mut n = 0usize;
+        for id in &to_reconcile {
+            n += conn
+                .execute(
+                    "UPDATE meetings SET status = ?2 WHERE id = ?1 AND status = ?3",
+                    rusqlite::params![
+                        id,
+                        MeetingStatus::Error.as_str(),
+                        MeetingStatus::Recording.as_str()
+                    ],
+                )
+                .map_err(map_err)?;
+        }
         tracing::info!(
             target: "startup",
             reconciled = n,
-            ids = ?ids,
+            skipped_for_salvage = claimed.len(),
+            ids = ?to_reconcile,
             "reconciled stuck RECORDING meetings to ERROR (crash recovery)"
         );
         Ok(n)
@@ -1779,38 +1840,70 @@ impl Db {
     /// (meeting_id, provider_id, chunk_idx)). Caller MUST only invoke this for visible/unlocked
     /// content — a sealed note's plaintext is blank, so this becomes a no-op if it is ever called on
     /// one (nothing to chunk), but the contract is "visible only".
-    pub fn index_meeting_chunks(&self, meeting_id: &str, embedder: &dyn Embedder) -> Result<()> {
-        // Resolve title + date + latest note markdown (all plaintext = visible content).
+    /// Index a meeting's plaintext into the semantic vector layer as two chunk classes, BOTH written
+    /// in ONE clean-replace transaction (purge-then-reinsert so a re-index replaces both classes):
+    ///   - `source_type = 'voice'` — the note-summary chunks ([`crate::embed::chunk_note`]);
+    ///   - `source_type = 'transcript'` — speaker-turn / sliding-window chunks of the SEGMENTS
+    ///     ([`crate::embed::chunk_transcript`]), so paraphrase queries about things SAID-but-not-
+    ///     summarized are retrievable (the note-only chunks miss them; keyword over the transcript
+    ///     already works via the segments FTS table).
+    ///
+    /// `segments` are the meeting's transcript segments; the caller passes the RESTORED/unsealed
+    /// plaintext (a sealed meeting is never indexed — see the gated callers). Vectors are the e5
+    /// `passage:` embedding of both chunk classes; NEVER a stub vector at rest — the CALLERS only reach
+    /// this when the real embed model is present (`embed_model_present()`; mirrors the note path and
+    /// `reindex_meetings_after_unseal`). A meeting with no note AND no segments ends with zero chunks.
+    pub fn index_meeting_chunks(
+        &self,
+        meeting_id: &str,
+        segments: &[Segment],
+        embedder: &dyn Embedder,
+    ) -> Result<()> {
+        // Resolve title + date (plaintext = visible metadata). Note markdown is optional — a meeting
+        // may have transcript segments but no note yet (or vice versa); each class indexes on its own.
         let meeting = self.get_meeting(meeting_id)?;
         let Some(meeting) = meeting else {
             return Ok(()); // unknown meeting — nothing to index.
         };
-        let Some(note) = self.get_latest_note_for_meeting(meeting_id)? else {
-            return Ok(()); // no note yet.
-        };
-        let title = meeting
-            .title
-            .clone()
-            .unwrap_or_else(|| "(untitled)".to_string());
+        let title = meeting.title.clone().unwrap_or_else(|| "(untitled)".to_string());
         let date = meeting
             .started_at
             .split(['T', ' '])
             .next()
             .unwrap_or("")
             .to_string();
-        let chunks = crate::embed::chunk_note(&title, &date, &note.markdown);
 
-        // Always purge this meeting's prior rows first (clean replace), then insert the fresh set in
-        // ONE transaction. A meeting with a now-empty note simply ends up with zero chunks.
-        let provider_id = note.provider_id.clone();
-        // DOCUMENT side: chunks are passages → use the e5 `passage:` prefix convention. The stub
-        // ignores the prefix; the real CandleBertEmbedder needs it for retrieval recall.
-        let vectors = if chunks.is_empty() {
+        // The note is optional now (transcript chunks index even without a note). `provider_id` is
+        // needed for the note_chunks row; when there is no note we tag chunks with a stable sentinel.
+        let note = self.get_latest_note_for_meeting(meeting_id)?;
+        let provider_id = note
+            .as_ref()
+            .map(|n| n.provider_id.clone())
+            .unwrap_or_else(|| "transcript".to_string());
+
+        // NOTE-SUMMARY chunks (source_type='voice') — unchanged chunking + header.
+        let note_chunks = match note.as_ref() {
+            Some(n) => crate::embed::chunk_note(&title, &date, &n.markdown),
+            None => Vec::new(),
+        };
+        // TRANSCRIPT chunks (source_type='transcript') — speaker-turn / sliding-window with provenance.
+        let transcript_chunks = crate::embed::chunk_transcript(&title, &date, segments);
+
+        // Chunks are passages → e5 `passage:` prefix convention. The stub ignores the prefix; the real
+        // CandleBertEmbedder needs it for retrieval recall. Embed each class only when non-empty.
+        let note_vectors = if note_chunks.is_empty() {
             Vec::new()
         } else {
-            embedder.embed_passage(&chunks)?
+            embedder.embed_passage(&note_chunks)?
+        };
+        let transcript_vectors = if transcript_chunks.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed_passage(&transcript_chunks)?
         };
 
+        // Always purge this meeting's prior rows first (clean replace of BOTH classes), then insert the
+        // fresh set in ONE transaction.
         let this_meeting = [meeting_id.to_string()];
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
@@ -1820,28 +1913,36 @@ impl Db {
                 .prepare(
                     "INSERT INTO note_chunks
                        (meeting_id, provider_id, chunk_idx, source_type, text, content_hash)
-                     VALUES (?1, ?2, ?3, 'voice', ?4, ?5)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .map_err(map_err)?;
             let mut ins_vec = tx
                 .prepare("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
                 .map_err(map_err)?;
-            for (idx, (text, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
-                let content_hash = format!("{:016x}", chunk_hash(text));
-                ins_chunk
-                    .execute(rusqlite::params![
-                        meeting_id,
-                        provider_id,
-                        idx as i64,
-                        text,
-                        content_hash
-                    ])
-                    .map_err(map_err)?;
-                let chunk_id = tx.last_insert_rowid();
-                let blob = crate::embed::vec_to_blob(vector);
-                ins_vec
-                    .execute(rusqlite::params![chunk_id, blob])
-                    .map_err(map_err)?;
+            // `chunk_idx` is a per-class ordinal; the two classes are distinguished by `source_type`.
+            let classes = [
+                ("voice", &note_chunks, &note_vectors),
+                ("transcript", &transcript_chunks, &transcript_vectors),
+            ];
+            for (source_type, chunks, vectors) in classes {
+                for (idx, (text, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
+                    let content_hash = format!("{:016x}", chunk_hash(text));
+                    ins_chunk
+                        .execute(rusqlite::params![
+                            meeting_id,
+                            provider_id,
+                            idx as i64,
+                            source_type,
+                            text,
+                            content_hash
+                        ])
+                        .map_err(map_err)?;
+                    let chunk_id = tx.last_insert_rowid();
+                    let blob = crate::embed::vec_to_blob(vector);
+                    ins_vec
+                        .execute(rusqlite::params![chunk_id, blob])
+                        .map_err(map_err)?;
+                }
             }
         }
         tx.commit().map_err(map_err)?;
@@ -2331,6 +2432,36 @@ impl Db {
             "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN
                (SELECT id FROM doc_chunks WHERE document_id = ?1)",
             rusqlite::params![document_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Number of `note_chunks` rows currently indexed for a MEETING (0 when never indexed or purged
+    /// on lock). The meeting analogue of [`Db::doc_chunk_count`] — used by the lock tests to assert
+    /// purge-on-lock / re-index-on-unlock without reaching the private connection. Test-only.
+    #[cfg(test)]
+    pub(crate) fn note_chunk_count(&self, meeting_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM note_chunks WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Number of `vec_chunks` rows currently indexed for a MEETING. Lets the tests assert the absolute
+    /// no-stub-vector contract on the unlock re-index path (model-absent ⇒ ZERO meeting vectors). The
+    /// count JOINs through `note_chunks` (vec0 is FK-less) and is meeting-scoped. Test-only.
+    #[cfg(test)]
+    pub(crate) fn note_vec_count(&self, meeting_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM vec_chunks v
+               JOIN note_chunks nc ON nc.id = v.chunk_id
+              WHERE nc.meeting_id = ?1",
+            rusqlite::params![meeting_id],
             |r| r.get(0),
         )
         .map_err(map_err)
@@ -3758,6 +3889,40 @@ impl Db {
         .map(Option::flatten)
     }
 
+    /// Meetings whose audio may be auto-pruned: every meeting NOT in a locked folder
+    /// (a meeting's folder = its `notes.folder_id`), OLDEST FIRST. A locked folder's audio
+    /// is exempt — it is the sealed `.enc` at rest and must never be deleted by prune.
+    pub fn prunable_audio_candidates(&self) -> Result<Vec<PrunableAudio>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, started_at, audio_path, mic_master_path, sys_master_path \
+                   FROM meetings \
+                  WHERE id NOT IN ( \
+                      SELECT DISTINCT meeting_id FROM notes \
+                       WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1) \
+                  ) \
+                  ORDER BY started_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PrunableAudio {
+                    meeting_id: r.get(0)?,
+                    started_at: r.get(1)?,
+                    audio_path: r.get(2)?,
+                    mic_master_path: r.get(3)?,
+                    sys_master_path: r.get(4)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// The RAW segment rows of a meeting (idx, plaintext text, sealed `text_blob`), regardless of
     /// seal state — for the seal/unseal lifecycle (NOT a user-facing read; that is `get_segments`).
     pub fn raw_segments(&self, meeting_id: &str) -> Result<Vec<RawSegment>> {
@@ -3924,6 +4089,44 @@ impl Db {
         conn.execute(
             "UPDATE meetings SET sys_master_path = ?2 WHERE id = ?1",
             rusqlite::params![meeting_id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Race-safe clear of `audio_path`: NULL it ONLY if it still equals `expected` (the plaintext
+    /// path the prune snapshotted). If a concurrent seal re-pointed it to `.enc` in between, the
+    /// `AND audio_path = ?2` fails to match → no-op → the freshly-sealed pointer SURVIVES. Used by
+    /// the storage prune, which snapshots candidates OUTSIDE the seal lifecycle lock (TOCTOU-safe).
+    pub fn clear_meeting_audio_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET audio_path = NULL WHERE id = ?1 AND audio_path = ?2",
+            rusqlite::params![meeting_id, expected],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Race-safe clear of `mic_master_path`: NULL it ONLY if it still equals `expected`. Mirrors
+    /// [`Db::clear_meeting_audio_path_if`] — a concurrent seal that re-pointed it survives.
+    pub fn clear_meeting_mic_master_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET mic_master_path = NULL WHERE id = ?1 AND mic_master_path = ?2",
+            rusqlite::params![meeting_id, expected],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Race-safe clear of `sys_master_path`: NULL it ONLY if it still equals `expected`. Mirrors
+    /// [`Db::clear_meeting_audio_path_if`] — a concurrent seal that re-pointed it survives.
+    pub fn clear_meeting_sys_master_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET sys_master_path = NULL WHERE id = ?1 AND sys_master_path = ?2",
+            rusqlite::params![meeting_id, expected],
         )
         .map_err(map_err)?;
         Ok(())
@@ -5795,6 +5998,35 @@ mod tests {
         );
     }
 
+    /// WS8 installed-base flip (mirrors the `semantic_default_v1` precedent): `migrate()` sets
+    /// `capture_system_audio='true'` + the `capture_default_v1` sentinel exactly ONCE; a later opt-out
+    /// (`false`) survives a re-migrate (the sentinel guards the block so it never re-fires). Config-only,
+    /// idempotent, reversible.
+    #[test]
+    fn capture_default_migration_runs_once_and_opt_out_persists() {
+        let db = mem_db();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_setting("capture_default_v1").unwrap().as_deref(),
+            Some("1"),
+            "sentinel is set after the migration"
+        );
+        assert_eq!(
+            db.get_setting("capture_system_audio").unwrap().as_deref(),
+            Some("true"),
+            "installed base is flipped ON once"
+        );
+        // A user turns system-audio capture OFF after the migration; re-running migrate() must NOT
+        // flip it back.
+        db.set_setting("capture_system_audio", "false").unwrap();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_setting("capture_system_audio").unwrap().as_deref(),
+            Some("false"),
+            "sentinel-guarded: a post-migration opt-out persists across re-migrate"
+        );
+    }
+
     // ── Phase 2b: egress_log ─────────────────────────────────────────────────
 
     fn sample_egress_entry() -> crate::summarize::egress_log::EgressEntry {
@@ -6960,6 +7192,50 @@ mod tests {
         );
     }
 
+    /// The load-bearing skip invariant the STAGE-2 crash-salvage ordering depends on:
+    /// `reconcile_stuck_recordings_except(&[claimed])` must LEAVE the claimed ghost in RECORDING
+    /// (salvage owns its final status), while every OTHER stuck RECORDING ghost still flips to ERROR.
+    /// Without this skip, reconcile would clobber a claimed row to ERROR in the window before the async
+    /// salvage worker transitions it — corrupting the salvage.
+    #[test]
+    fn reconcile_stuck_recordings_except_leaves_the_claimed_row_recording() {
+        let db = mem_db();
+
+        // Two crash ghosts, both stuck in RECORDING.
+        db.insert_meeting(&sample_meeting("claimed", "2026-07-04T09:00:00Z"))
+            .unwrap();
+        db.update_meeting_status("claimed", MeetingStatus::Recording)
+            .unwrap();
+        db.insert_meeting(&sample_meeting("unclaimed", "2026-07-04T09:05:00Z"))
+            .unwrap();
+        db.update_meeting_status("unclaimed", MeetingStatus::Recording)
+            .unwrap();
+
+        // Reconcile, EXCEPTing the salvage-claimed id: exactly the one un-claimed ghost flips.
+        let claimed = vec!["claimed".to_string()];
+        assert_eq!(db.reconcile_stuck_recordings_except(&claimed).unwrap(), 1);
+
+        // The claimed row is SKIPPED — still RECORDING, so the async salvage worker owns its fate.
+        assert_eq!(
+            db.get_meeting("claimed").unwrap().unwrap().status,
+            MeetingStatus::Recording,
+            "the claimed ghost must stay RECORDING for salvage to own its final status"
+        );
+        // The un-claimed ghost is reconciled to the terminal ERROR exactly as before.
+        assert_eq!(
+            db.get_meeting("unclaimed").unwrap().unwrap().status,
+            MeetingStatus::Error
+        );
+
+        // Idempotent: re-running with the same exclusion reconciles nothing (the claimed row is
+        // still RECORDING but skipped, the unclaimed one is already ERROR).
+        assert_eq!(db.reconcile_stuck_recordings_except(&claimed).unwrap(), 0);
+        assert_eq!(
+            db.get_meeting("claimed").unwrap().unwrap().status,
+            MeetingStatus::Recording
+        );
+    }
+
     #[test]
     fn latest_meeting_orders_by_started_at() {
         let db = mem_db();
@@ -7621,6 +7897,45 @@ mod tests {
         );
     }
 
+    /// GATE (hybrid): the fused FTS+semantic+graph reader also excludes a sealed-not-session-unlocked
+    /// meeting — with BOTH the FTS query term AND a query vector that match its (deliberately-surviving)
+    /// chunk, so exclusion can ONLY come from the shared `visibility_clause`, not purge. Companion to
+    /// `vec_semantic_search_is_gated_by_visibility`; asserts the unlock re-index change did not weaken
+    /// the hybrid gate. RED if the gate inside `search_semantic_visible`/`search_visible` were removed.
+    #[test]
+    fn vec_hybrid_search_is_gated_by_visibility() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "sealed", "claude_code", "quarterly budget secret body");
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+        insert_known_chunk(&db, "sealed", "quarterly budget secret body", &one_hot(0));
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let query_vec = one_hot(0);
+        // Empty unlock set → the sealed meeting is absent through the whole fused reader.
+        let nothing = std::collections::HashSet::new();
+        let hidden = db
+            .search_hybrid_visible("budget", &query_vec, 10, &nothing)
+            .unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed-not-unlocked meeting leaked through the hybrid gate"
+        );
+
+        // Session-unlock → it reappears in the fused results.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db
+            .search_hybrid_visible("budget", &query_vec, 10, &unlocked)
+            .unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "sealed"),
+            "session-unlocked meeting must reappear in hybrid results"
+        );
+    }
+
     // ── document ingestion (documents + doc_chunks + doc_vec0) ────────────────
 
     /// IMPORT/INDEX round-trip at the DB layer: an inserted document chunks + embeds (via the stub so
@@ -8011,8 +8326,7 @@ mod tests {
         db.set_note_folder("target", Some("f-open")).unwrap();
         db.set_note_folder("sealed", Some("f-locked")).unwrap();
         for id in ["source", "target", "sealed"] {
-            db.index_meeting_chunks(id, &crate::embed::StubEmbedder)
-                .unwrap();
+            db.index_meeting_chunks(id, &[], &crate::embed::StubEmbedder).unwrap();
         }
         // Lock the sealed folder WITHOUT purging — its chunk row survives, so any exclusion must be
         // the gate doing its job.
@@ -8060,8 +8374,7 @@ mod tests {
             db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z"))
                 .unwrap();
             note_for(&db, id, "claude_code", body);
-            db.index_meeting_chunks(id, &crate::embed::StubEmbedder)
-                .unwrap();
+            db.index_meeting_chunks(id, &[], &crate::embed::StubEmbedder).unwrap();
         }
         let stub = crate::embed::StubEmbedder;
         let nothing = std::collections::HashSet::new();
@@ -8118,7 +8431,7 @@ mod tests {
         db.set_note_folder("m1", Some("f-locked")).unwrap();
 
         // Index while visible (open folder) with the deterministic stub embedder.
-        db.index_meeting_chunks("m1", &crate::embed::StubEmbedder)
+        db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
             .unwrap();
         assert!(chunk_count(&db, "m1") > 0, "expected chunks after indexing");
         assert!(vec_count(&db, "m1") > 0, "expected vectors after indexing");
@@ -8142,6 +8455,233 @@ mod tests {
         );
     }
 
+    // ── transcript chunks (source_type='transcript') ──────────────────────────
+
+    /// Count `note_chunks` of a given `source_type` for a meeting.
+    fn chunk_count_of(db: &Db, meeting_id: &str, source_type: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE meeting_id = ?1 AND source_type = ?2",
+                rusqlite::params![meeting_id, source_type],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn tseg(idx: i64, start: f64, end: f64, speaker: &str, text: &str) -> Segment {
+        Segment {
+            idx,
+            start_s: start,
+            end_s: end,
+            text: text.to_string(),
+            speaker: Some(speaker.to_string()),
+            confidence: None,
+        }
+    }
+
+    /// `index_meeting_chunks` writes BOTH classes: note-summary (`voice`) AND transcript
+    /// (`transcript`), 1:1-paired with vec rows, in one clean-replace tx.
+    #[test]
+    fn index_meeting_chunks_writes_transcript_class() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "Summary paragraph about the budget.");
+        let segs = [
+            tseg(0, 0.0, 3.0, "me", "so what did we decide on the migration"),
+            tseg(1, 3.0, 8.0, "others", "we agreed to defer it to next quarter"),
+        ];
+        db.index_meeting_chunks("m1", &segs, &crate::embed::StubEmbedder)
+            .unwrap();
+
+        assert!(chunk_count_of(&db, "m1", "voice") > 0, "note-summary chunks must be written");
+        assert!(
+            chunk_count_of(&db, "m1", "transcript") > 0,
+            "transcript chunks must be written from segments"
+        );
+        // vec rows are 1:1 with note_chunks rows (both classes).
+        assert_eq!(chunk_count(&db, "m1"), vec_count(&db, "m1"), "every chunk (both classes) has a vector");
+    }
+
+    /// RE-INDEX is a CLEAN REPLACE of BOTH classes: re-running with different segments/note leaves no
+    /// stale rows of either class.
+    #[test]
+    fn index_meeting_chunks_reindex_replaces_both_classes() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "First note.");
+        let segs1 = [tseg(0, 0.0, 3.0, "me", "first pass transcript content")];
+        db.index_meeting_chunks("m1", &segs1, &crate::embed::StubEmbedder).unwrap();
+        let v1 = chunk_count_of(&db, "m1", "transcript");
+        assert!(v1 > 0);
+
+        // Re-index with EMPTY segments → transcript class must go to zero (clean replace, no orphans).
+        db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
+        assert_eq!(
+            chunk_count_of(&db, "m1", "transcript"),
+            0,
+            "re-index with no segments must leave zero stale transcript chunks"
+        );
+        assert!(chunk_count_of(&db, "m1", "voice") > 0, "note class still present after re-index");
+        assert_eq!(chunk_count(&db, "m1"), vec_count(&db, "m1"), "1:1 vec pairing preserved after re-index");
+    }
+
+    /// EMPTY segments → no transcript chunks (the "sealed meeting is never chunked" property in the
+    /// db layer: the gated callers pass the RESTORED plaintext; a sealed meeting whose segments are
+    /// blanked yields the empty slice ⇒ zero transcript chunks).
+    #[test]
+    fn index_meeting_chunks_no_segments_writes_no_transcript_class() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "Only a note, no transcript.");
+        db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
+        assert_eq!(chunk_count_of(&db, "m1", "transcript"), 0, "blank/sealed transcript ⇒ no transcript chunks");
+        assert!(chunk_count_of(&db, "m1", "voice") > 0, "note class still indexes independently");
+    }
+
+    /// GATE (semantic): a sealed-and-not-session-unlocked meeting's TRANSCRIPT chunks surface ZERO
+    /// through `search_semantic_visible`. Mirrors `vec_semantic_search_is_gated_by_visibility` but
+    /// with a real transcript-source chunk that is deliberately left in place (folder flipped to
+    /// locked WITHOUT purge) — so exclusion can ONLY come from `visibility_clause`. RED if the gate
+    /// were removed OR if transcript chunks bypassed the shared reader.
+    #[test]
+    fn transcript_chunks_are_gated_by_visibility_semantic() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "sealed", "claude_code", "note body");
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+        // Insert a REAL transcript-source chunk (source_type='transcript') + its vector, then lock the
+        // folder WITHOUT purging — the row survives so any exclusion is the gate.
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO note_chunks (meeting_id, provider_id, chunk_idx, source_type, text)
+                 VALUES ('sealed', 'transcript', 0, 'transcript', ?1)",
+                rusqlite::params!["Secret · 2026-06-24\n[00:00-00:05] (others)\nthe secret merger price is confidential"],
+            )
+            .unwrap();
+            let chunk_id = conn.last_insert_rowid();
+            let blob = crate::embed::vec_to_blob(&one_hot(0));
+            conn.execute(
+                "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, blob],
+            )
+            .unwrap();
+        }
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let query = one_hot(0);
+        let nothing = std::collections::HashSet::new();
+        let hidden = db.search_semantic_visible(&query, 10, &nothing).unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed meeting's TRANSCRIPT chunk leaked through the semantic gate"
+        );
+        // Session-unlock → it reappears (proves the row + gate, not purge).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db.search_semantic_visible(&query, 10, &unlocked).unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "sealed"),
+            "session-unlocked meeting's transcript chunk must reappear in semantic results"
+        );
+    }
+
+    /// GATE (hybrid): the same sealed meeting's transcript chunk is ALSO absent through the fused
+    /// FTS+semantic+graph reader — with BOTH an FTS term AND a matching query vector — so exclusion
+    /// is the shared `visibility_clause`, not purge. Companion to `vec_hybrid_search_is_gated_by_visibility`.
+    #[test]
+    fn transcript_chunks_are_gated_by_visibility_hybrid() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "sealed", "claude_code", "quarterly merger note body");
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO note_chunks (meeting_id, provider_id, chunk_idx, source_type, text)
+                 VALUES ('sealed', 'transcript', 0, 'transcript', ?1)",
+                rusqlite::params!["Secret · 2026-06-24\n[00:00-00:05] (others)\nthe merger budget is confidential"],
+            )
+            .unwrap();
+            let chunk_id = conn.last_insert_rowid();
+            let blob = crate::embed::vec_to_blob(&one_hot(0));
+            conn.execute(
+                "INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, blob],
+            )
+            .unwrap();
+        }
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let query_vec = one_hot(0);
+        let nothing = std::collections::HashSet::new();
+        let hidden = db.search_hybrid_visible("merger", &query_vec, 10, &nothing).unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed meeting's TRANSCRIPT chunk leaked through the hybrid gate"
+        );
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db.search_hybrid_visible("merger", &query_vec, 10, &unlocked).unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "sealed"),
+            "session-unlocked meeting's transcript chunk must reappear in hybrid results"
+        );
+    }
+
+    /// PURGE-ON-SEAL covers transcript chunks: index BOTH classes while visible, then seal the folder
+    /// → ZERO transcript-source chunks remain at rest AND the sealed meeting surfaces ZERO through
+    /// both `search_semantic_visible` and `search_hybrid_visible`. RED if the seal purge missed the
+    /// transcript class.
+    #[test]
+    fn transcript_chunks_purged_on_seal() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "budget summary note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        let segs = [
+            tseg(0, 0.0, 4.0, "me", "budget discussion said aloud but not summarized"),
+            tseg(1, 4.0, 9.0, "others", "we will cut the marketing line item next quarter"),
+        ];
+        db.index_meeting_chunks("m1", &segs, &crate::embed::StubEmbedder).unwrap();
+        assert!(chunk_count_of(&db, "m1", "transcript") > 0, "transcript chunks present before seal");
+
+        // Seal the folder (blank note + relock blanker → purge_chunks_tx).
+        db.seal_note("m1", "claude_code", b"ciphertext").unwrap();
+        let mut folders = std::collections::HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        assert_eq!(
+            chunk_count_of(&db, "m1", "transcript"),
+            0,
+            "transcript chunks must be purged on seal (no said-content at rest)"
+        );
+        assert_eq!(chunk_count(&db, "m1"), 0, "ALL chunk classes purged on seal");
+        assert_eq!(vec_count(&db, "m1"), 0, "all vectors purged on seal");
+
+        // And they surface nowhere through either gated reader.
+        let query = one_hot(0);
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            !db.search_semantic_visible(&query, 10, &nothing).unwrap().iter().any(|h| h.meeting.id == "m1"),
+            "sealed meeting must not surface via semantic search after purge"
+        );
+        assert!(
+            !db.search_hybrid_visible("marketing", &query, 10, &nothing).unwrap().iter().any(|h| h.meeting.id == "m1"),
+            "sealed meeting must not surface via hybrid search after purge"
+        );
+    }
+
     /// `delete_meeting` must also purge the vec0 layer. `vec_chunks` is an FK-less vec0 vtab, so the
     /// `meetings` ON DELETE CASCADE reaches `note_chunks` but NOT `vec_chunks` — without an explicit
     /// purge the deleted meeting's invertible embeddings ORPHAN at rest (and a reused rowid could
@@ -8159,7 +8699,7 @@ mod tests {
             "claude_code",
             "First budget paragraph.\n\nSecond hiring paragraph.",
         );
-        db.index_meeting_chunks("m1", &crate::embed::StubEmbedder)
+        db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
             .unwrap();
         let raw_vecs = |db: &Db| -> i64 {
             db.lock()
@@ -8456,6 +8996,97 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn prunable_candidates_are_oldest_first_and_exclude_locked_folders() {
+        const GOOD_KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let p = unique_temp_path("murmur-prunable", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
+
+        // Two meetings in an OPEN vault-root (folder_id NULL), one in a LOCKED folder.
+        for (id, at) in [
+            ("old", "2026-01-01T00:00:00Z"),
+            ("new", "2026-06-01T00:00:00Z"),
+            ("secret", "2026-03-01T00:00:00Z"),
+        ] {
+            db.insert_meeting(&crate::storage::Meeting {
+                id: id.into(),
+                started_at: at.into(),
+                ended_at: None,
+                title: Some("t".into()),
+                duration_s: 1,
+                audio_path: Some(format!("/a/{id}.wav")),
+                status: crate::storage::MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+            db.upsert_note(&crate::storage::NoteRecord {
+                meeting_id: id.into(),
+                provider_id: "claude_code".into(),
+                markdown: "m".into(),
+                created_at: at.into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        }
+        db.insert_folder(&crate::storage::Folder {
+            id: "f".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.set_note_folder("secret", Some("f")).unwrap();
+
+        let cands = db.prunable_audio_candidates().unwrap();
+        let ids: Vec<&str> = cands.iter().map(|c| c.meeting_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["old", "new"],
+            "locked 'secret' excluded; oldest-first order"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Race-safety regression (TOCTOU: prune snapshots a plaintext path, a concurrent seal
+    /// re-points the column to `.enc`, prune must NOT null the sealed pointer). The conditional
+    /// clear only nulls when the column still holds the snapshotted plaintext path.
+    #[test]
+    fn clear_meeting_audio_path_if_only_nulls_a_matching_path() {
+        let db = mem_db();
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "M".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: None,
+            title: Some("t".into()),
+            duration_s: 1,
+            audio_path: Some("/d/M.wav".into()),
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+
+        // Sealed-in-between case: the column was re-pointed to `/d/M.wav.enc` by a concurrent
+        // seal; the prune's stale snapshot `/d/M.wav.enc` != current would wrongly match the OLD
+        // unconditional NULL. The conditional clear (expected != current plaintext) must NO-OP.
+        db.clear_meeting_audio_path_if("M", "/d/M.wav.enc").unwrap();
+        assert_eq!(
+            db.get_meeting("M").unwrap().unwrap().audio_path,
+            Some("/d/M.wav".to_string()),
+            "mismatched expected path must NOT null the column (sealed-in-between case)"
+        );
+
+        // Matching snapshot (no concurrent seal) → clears.
+        db.clear_meeting_audio_path_if("M", "/d/M.wav").unwrap();
+        assert_eq!(db.get_meeting("M").unwrap().unwrap().audio_path, None);
     }
 }
 
