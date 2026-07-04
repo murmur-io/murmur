@@ -40,6 +40,15 @@ pub const ACCOUNT_GATEWAY_KEY: &str = "gateway_api_key";
 /// Callers may override per call-site (e.g. "Unlock this folder").
 pub const KEK_DEFAULT_REASON: &str = "Unlock this folder";
 
+/// Keychain account holding the BIOMETRIC-GATED cache of the sharing-account master key (MK).
+///
+/// The sharing account's MK lives in RAM for the session ([`crate::share::AccountSession`]); it is
+/// lost on restart, forcing a password re-login. Caching it here — behind a `kSecAttrAccessControl`
+/// requiring user presence, exactly like [`ACCOUNT_MASTER_KEK`] — lets a single Touch ID tap restore
+/// the session ([`cache_account_mk_biometric`] / [`read_account_mk_biometric`]). SEPARATE from the
+/// folder-lock KEK item (different account) so the two never collide. Cleared on logout.
+pub const ACCOUNT_SHARE_MK: &str = "murmur_account_mk";
+
 /// Return the SQLCipher DEK as a 64-char hex string (32 random bytes), creating + persisting it
 /// in the Keychain on first use. Released at launch with no biometric prompt — this layer
 /// protects against database FILE theft, not against an attacker on the unlocked machine
@@ -130,6 +139,300 @@ pub fn get_or_create_master_kek_with_reason(reason: &str) -> Result<[u8; 32]> {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         set_secret(ACCOUNT_MASTER_KEK, &hex)?;
         Ok(bytes)
+    }
+}
+
+// ─────────────────────── biometric-gated sharing-account MK cache (public API) ───────────────────────
+//
+// "Keep me unlocked for sharing with Touch ID": the sharing-account master key (MK) normally lives
+// only in RAM ([`crate::share::AccountSession`]) and is lost on restart. These four functions cache it
+// behind a biometric-gated keychain item so a single Touch ID tap can restore the session instead of a
+// full password re-login. WRITE + existence-probe never prompt; only READ presents Touch ID (signed
+// build). The MK is NEVER logged.
+//
+// DEBUG builds (`tauri dev`, `cargo test`): mirror the MURMUR_DEV_DEK / MURMUR_DEV_KEK posture — an
+// unsigned dev binary can neither satisfy Touch ID nor reliably read a biometric-ACL item across
+// rebuilds. So a debug build persists the MK (hex) in the plaintext DEV file store (the same store the
+// non-gated dev secrets use), with an optional fixed `MURMUR_DEV_ACCOUNT_MK` (64-hex) env hatch. That
+// keeps the session restorable across dev rebuilds WITHOUT a Touch ID prompt. This whole debug path is
+// compiled out of release; a signed release uses the biometric-gated data-protection item below.
+
+/// Cache the sharing-account master key (MK) so a later restart can restore the session with one Touch
+/// ID tap. WRITE — MUST NOT prompt Touch ID. Idempotent (create-or-replace). Never logs the MK.
+pub fn cache_account_mk_biometric(mk: &[u8; 32]) -> Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        cache_account_mk_at(&dev_secrets_path()?, mk)
+    }
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        dp_biometric_write(ACCOUNT_SHARE_MK, mk)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
+    {
+        // Non-macOS release never ships; keep the legacy keyring path so CI cross-builds compile.
+        let hex: String = mk.iter().map(|b| format!("{b:02x}")).collect();
+        legacy_set_secret(ACCOUNT_SHARE_MK, &hex)
+    }
+}
+
+/// Release the cached sharing-account MK. READ — presents the Touch ID / passcode sheet with `reason`
+/// on a signed build. Fails closed ([`AppError::Unavailable`] when no cache exists,
+/// [`AppError::BiometricFailed`] when the tap is cancelled/fails) so the FE can fall back to password.
+pub fn read_account_mk_biometric(reason: &str) -> Result<[u8; 32]> {
+    #[cfg(debug_assertions)]
+    {
+        let _ = reason;
+        // Fixed env hatch wins (no Touch ID, survives rebuilds), then the dev file store.
+        if let Ok(dev) = std::env::var("MURMUR_DEV_ACCOUNT_MK") {
+            if let Some(k) = hex_to_key32(&dev) {
+                return Ok(k);
+            }
+        }
+        read_account_mk_at(&dev_secrets_path()?)
+    }
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        dp_biometric_read(ACCOUNT_SHARE_MK, reason)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
+    {
+        let _ = reason;
+        match legacy_get_secret(ACCOUNT_SHARE_MK)? {
+            Some(hex) => {
+                hex_to_key32(&hex).ok_or_else(|| AppError::Secrets("cached account MK is malformed".into()))
+            }
+            None => Err(AppError::Unavailable("no cached account key to unlock".into())),
+        }
+    }
+}
+
+/// Does a cached account MK exist? NO Touch ID prompt (existence probe only) — for
+/// `account_status.biometric_unlock_available` so the FE can show/hide the "Unlock with Touch ID" button.
+pub fn account_mk_cached() -> Result<bool> {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(dev) = std::env::var("MURMUR_DEV_ACCOUNT_MK") {
+            if hex_to_key32(&dev).is_some() {
+                return Ok(true);
+            }
+        }
+        account_mk_cached_at(&dev_secrets_path()?)
+    }
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        dp_biometric_exists(ACCOUNT_SHARE_MK)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
+    {
+        Ok(legacy_get_secret(ACCOUNT_SHARE_MK)?.is_some())
+    }
+}
+
+/// Remove the cached account MK (logout / account reset). Idempotent; never prompts.
+pub fn clear_account_mk() -> Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        clear_account_mk_at(&dev_secrets_path()?)
+    }
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        dp_biometric_delete(ACCOUNT_SHARE_MK)
+    }
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
+    {
+        legacy_delete_secret(ACCOUNT_SHARE_MK)
+    }
+}
+
+// DEBUG dev-file-store helpers for the account MK (explicit-path test seam, mirrors the non-gated
+// dev-secret `*_at` helpers). No env hatch here — that is handled by the public wrappers — so these
+// are a pure file round-trip a test can drive against a temp path.
+#[cfg(debug_assertions)]
+fn cache_account_mk_at(path: &std::path::Path, mk: &[u8; 32]) -> Result<()> {
+    let hex: String = mk.iter().map(|b| format!("{b:02x}")).collect();
+    dev_set_secret_at(path, ACCOUNT_SHARE_MK, &hex)
+}
+#[cfg(debug_assertions)]
+fn read_account_mk_at(path: &std::path::Path) -> Result<[u8; 32]> {
+    match dev_get_secret_at(path, ACCOUNT_SHARE_MK)? {
+        Some(hex) => {
+            hex_to_key32(&hex).ok_or_else(|| AppError::Secrets("cached account MK is malformed".into()))
+        }
+        None => Err(AppError::Unavailable("no cached account key to unlock".into())),
+    }
+}
+#[cfg(debug_assertions)]
+fn account_mk_cached_at(path: &std::path::Path) -> Result<bool> {
+    Ok(dev_get_secret_at(path, ACCOUNT_SHARE_MK)?.is_some())
+}
+#[cfg(debug_assertions)]
+fn clear_account_mk_at(path: &std::path::Path) -> Result<()> {
+    dev_delete_secret_at(path, ACCOUNT_SHARE_MK)
+}
+
+// Generic biometric-gated data-protection ops parameterized by account (release macOS only). Mirror
+// the `MacKekStore` methods exactly but for an arbitrary account, so the sharing-account MK cache
+// reuses the proven user-presence pattern WITHOUT touching the folder-lock KEK path. Compiled only in
+// a release macOS build (the debug/test path uses the dev file store above), which also keeps them
+// dead-code-free in debug.
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn dp_biometric_write(account: &str, key: &[u8; 32]) -> Result<()> {
+    use core_foundation::base::TCFType;
+    use core_foundation::data::CFData;
+    use security_framework::access_control::{ProtectionMode, SecAccessControl};
+    use security_framework_sys::access_control::kSecAccessControlUserPresence;
+    use security_framework_sys::base::{errSecDuplicateItem, errSecSuccess};
+    use security_framework_sys::item::{kSecAttrAccessControl, kSecValueData};
+    use security_framework_sys::keychain_item::SecItemAdd;
+
+    let access = SecAccessControl::create_with_protection(
+        Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+        kSecAccessControlUserPresence,
+    )
+    .map_err(|e| AppError::Secrets(format!("build account-MK access control: {e}")))?;
+
+    let data = CFData::from_buffer(key);
+    let add = |access: &SecAccessControl| -> i32 {
+        let mut q = dp_base_query(account);
+        unsafe {
+            q.add(&(kSecAttrAccessControl as *const _), &access.as_CFTypeRef());
+            q.add(&(kSecValueData as *const _), &data.as_CFTypeRef());
+        }
+        let dict = q.to_immutable();
+        let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+        let s = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), &mut out) };
+        if !out.is_null() {
+            unsafe { drop(core_foundation::base::CFType::wrap_under_create_rule(out)) };
+        }
+        s
+    };
+
+    let status = add(&access);
+    if status == errSecSuccess {
+        return Ok(());
+    }
+    if status == errSecDuplicateItem {
+        dp_biometric_delete(account)?;
+        let status2 = add(&access);
+        if status2 == errSecSuccess {
+            return Ok(());
+        }
+        return Err(map_osstatus("add account-MK item (after replace)", status2));
+    }
+    Err(map_osstatus("add account-MK item", status))
+}
+
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn dp_biometric_read(account: &str, reason: &str) -> Result<[u8; 32]> {
+    use crate::secrets::keychain::sec_consts::{
+        ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_USER_CANCELED,
+    };
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::string::CFString;
+    use security_framework_sys::base::{errSecAuthFailed, errSecSuccess};
+    use security_framework_sys::item::{kSecMatchLimit, kSecReturnData};
+    use security_framework_sys::keychain_item::SecItemCopyMatching;
+
+    let prompt = CFString::new(reason);
+    let mut q = dp_base_query(account);
+    unsafe {
+        q.add(
+            &(kSecReturnData as *const _),
+            &CFBoolean::true_value().as_CFTypeRef(),
+        );
+        q.add(
+            &(kSecMatchLimit as *const _),
+            &(sec_consts::kSecMatchLimitOne as *const _),
+        );
+        q.add(
+            &(sec_consts::kSecUseOperationPrompt as *const _),
+            &prompt.as_CFTypeRef(),
+        );
+    }
+    let dict = q.to_immutable();
+    let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out) };
+
+    if status != errSecSuccess {
+        if !out.is_null() {
+            unsafe { drop(CFType::wrap_under_create_rule(out)) };
+        }
+        return match status {
+            s if s == ERR_SEC_USER_CANCELED => {
+                Err(AppError::BiometricFailed("Touch ID was cancelled".into()))
+            }
+            s if s == errSecAuthFailed => {
+                Err(AppError::BiometricFailed("authentication failed".into()))
+            }
+            s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Err(AppError::BiometricFailed(
+                "interaction not allowed (no UI context to present Touch ID)".into(),
+            )),
+            other => Err(map_osstatus("read account-MK item", other)),
+        };
+    }
+    if out.is_null() {
+        return Err(AppError::Secrets(
+            "account-MK read returned success but no data".into(),
+        ));
+    }
+    let data = unsafe { CFData::wrap_under_create_rule(out as *const _) };
+    let bytes = data.bytes();
+    let k: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| AppError::Secrets("cached account MK has wrong length".into()))?;
+    Ok(k)
+}
+
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn dp_biometric_exists(account: &str) -> Result<bool> {
+    use crate::secrets::keychain::sec_consts::ERR_SEC_INTERACTION_NOT_ALLOWED;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
+    use security_framework_sys::item::kSecUseAuthenticationUISkip;
+    use security_framework_sys::item::{kSecReturnAttributes, kSecUseAuthenticationUI};
+    use security_framework_sys::keychain_item::SecItemCopyMatching;
+
+    let mut q = dp_base_query(account);
+    unsafe {
+        q.add(
+            &(kSecReturnAttributes as *const _),
+            &CFBoolean::true_value().as_CFTypeRef(),
+        );
+        q.add(
+            &(kSecUseAuthenticationUI as *const _),
+            &(kSecUseAuthenticationUISkip as *const _),
+        );
+    }
+    let dict = q.to_immutable();
+    let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out) };
+    if !out.is_null() {
+        unsafe { drop(CFType::wrap_under_create_rule(out)) };
+    }
+    match status {
+        s if s == errSecSuccess => Ok(true),
+        s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Ok(true),
+        s if s == errSecItemNotFound => Ok(false),
+        other => Err(map_osstatus("probe account-MK item", other)),
+    }
+}
+
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn dp_biometric_delete(account: &str) -> Result<()> {
+    use core_foundation::base::TCFType;
+    use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
+    use security_framework_sys::keychain_item::SecItemDelete;
+
+    let dict = dp_base_query(account).to_immutable();
+    let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
+    if status == errSecSuccess || status == errSecItemNotFound {
+        Ok(())
+    } else {
+        Err(map_osstatus("delete account-MK item", status))
     }
 }
 
@@ -1192,6 +1495,49 @@ mod tests {
         assert!(ct_eq(&a, &b));
         b[17] ^= 0x01;
         assert!(!ct_eq(&a, &b));
+    }
+
+    /// Debug-path (dev file store) round-trip for the biometric sharing-account MK cache. A LIVE
+    /// biometric read can't run headlessly, so this exercises the debug seam the same way a dev build
+    /// caches/restores the MK: cache → `cached()` true → read back byte-identical → clear → `cached()`
+    /// false → a subsequent read fails closed with `Unavailable`. Runs against an explicit temp path
+    /// (hermetic — never touches the real dev-secrets file).
+    #[test]
+    fn account_mk_dev_cache_round_trips() {
+        let dir = std::env::temp_dir().join(format!("murmur-mk-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dev-secrets.json");
+
+        let mk: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+
+        // Absent to start.
+        assert!(!account_mk_cached_at(&path).unwrap());
+        assert!(matches!(
+            read_account_mk_at(&path),
+            Err(AppError::Unavailable(_))
+        ));
+
+        // Cache → present → reads back byte-identical.
+        cache_account_mk_at(&path, &mk).unwrap();
+        assert!(account_mk_cached_at(&path).unwrap());
+        assert_eq!(read_account_mk_at(&path).unwrap(), mk);
+
+        // Overwrite is idempotent (create-or-replace).
+        let mk2: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_add(1));
+        cache_account_mk_at(&path, &mk2).unwrap();
+        assert_eq!(read_account_mk_at(&path).unwrap(), mk2);
+
+        // Clear → absent → fails closed.
+        clear_account_mk_at(&path).unwrap();
+        assert!(!account_mk_cached_at(&path).unwrap());
+        assert!(matches!(
+            read_account_mk_at(&path),
+            Err(AppError::Unavailable(_))
+        ));
+        // Clear is idempotent.
+        clear_account_mk_at(&path).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Migration value-preservation tests (the keychain calls behind a thin seam) ──

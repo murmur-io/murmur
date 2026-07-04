@@ -117,6 +117,7 @@ pub fn run() {
             commands::account_send_code,
             commands::account_login,
             commands::account_logout,
+            commands::unlock_sharing_with_biometric,
             commands::consent_to_share_egress,
             commands::revoke_share_egress,
             commands::mark_sharing_choice_made,
