@@ -21,8 +21,6 @@ import type {
   GraphPayload,
   MeetingDetail,
   MeetingTimeline,
-  RecipientPreview,
-  Segment,
   SpeakerSuggestion,
 } from "../../core/models";
 import {
@@ -30,82 +28,26 @@ import {
   type FolderExposure,
 } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
-import { MarkdownComponent } from "../../shared/markdown.component";
-import { AssistantSourcesComponent } from "../../shared/assistant-sources.component";
 import { LockBadgeComponent } from "../folders/lock-badge.component";
-import { MoveToMenuComponent } from "../folders/move-to-menu.component";
-import { MeetingActionsComponent } from "./meeting-actions.component";
-import { MeetingChatComponent } from "./meeting-chat.component";
-import { MeetingRecipesComponent } from "./meeting-recipes.component";
-import { MeetingTimelineComponent } from "./meeting-timeline.component";
-import { RelatedMeetingsComponent } from "./related-meetings.component";
+import { AudioPanelComponent } from "./audio-panel.component";
 import {
-  ShareVerifySheetComponent,
-  type ShareVerifyMode,
-} from "./share-verify-sheet.component";
+  DetailTabsComponent,
+  type DetailTab,
+  type DetailTabDef,
+} from "./detail-tabs.component";
+import {
+  NotePanelComponent,
+  type AssistantQa,
+  type NoteSection,
+  type ParsedCitation,
+  type ParsedNote,
+} from "./note-panel.component";
+import { SharePanelComponent } from "./share-panel.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
   done: boolean;
   text: string;
-}
-
-/**
- * M5-CLIENT — the step the in-flow "Share with a person" panel is showing.
- * The floating fingerprint sheet is tracked separately (`verifyMode`).
- */
-type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
-
-/** A parsed `## Heading` section of the note body. */
-interface NoteSection {
-  heading: string;
-  /** Normalised kind drives which renderer the template uses. */
-  kind: "actions" | "bullets" | "prose";
-  /** Plain prose paragraphs (kind === 'prose'). */
-  paragraphs: string[];
-  /** Bullet lines, leading marker stripped (kind === 'bullets'). */
-  bullets: string[];
-  /** Checklist entries (kind === 'actions'). */
-  actions: ActionItem[];
-}
-
-/**
- * One grounding citation, parsed from the persisted `string[]` the backend
- * stores per interaction. The backend writes `[[Title]]` for a vault source and
- * a `(web)` / `(https://…)` form for a web source — we split the two so the FE
- * can render `[[vault]]` chips vs distinct "via web" links (mirroring the live
- * assistant-actions card, whose live store carries structured citations).
- */
-interface ParsedCitation {
-  kind: "vault" | "web";
-  /** Display label (vault title, or the host/label for a web source). */
-  label: string;
-  /** Resolved URL for a web source; null for a vault citation. */
-  url: string | null;
-}
-
-/** A persisted assistant Q&A interaction enriched with parsed citations. */
-interface AssistantQa {
-  /** Stable id for `@for` tracking (createdAt + index — interactions are append-only). */
-  id: string;
-  command: string;
-  answer: string;
-  citations: ParsedCitation[];
-  status: string;
-  sourceLabel: string | null;
-  createdAt: string;
-}
-
-/** The whole note, decomposed into front-matter + body sections. */
-interface ParsedNote {
-  tags: string[];
-  participants: string[];
-  sections: NoteSection[];
-  /** Set only when the body contained no `## ` sections — raw fallback. */
-  raw: string | null;
-  /** ENHANCE-MY-NOTES: true when the backend stamped `murmur_enhanced: true` (the note's
-   *  skeleton was the user's typed notes). Derived ONLY from note.markdown — lock-safe. */
-  enhanced: boolean;
 }
 
 @Component({
@@ -114,16 +56,11 @@ interface ParsedNote {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
-    MeetingTimelineComponent,
-    MeetingActionsComponent,
-    MeetingChatComponent,
-    MeetingRecipesComponent,
     LockBadgeComponent,
-    MoveToMenuComponent,
-    MarkdownComponent,
-    AssistantSourcesComponent,
-    RelatedMeetingsComponent,
-    ShareVerifySheetComponent,
+    DetailTabsComponent,
+    NotePanelComponent,
+    AudioPanelComponent,
+    SharePanelComponent,
   ],
   template: `
     <section class="detail">
@@ -246,451 +183,22 @@ interface ParsedNote {
               }
             }
           </div>
-
-          @if (!locked()) {
-            <div class="actions">
-              <button
-                type="button"
-                class="btn btn-primary"
-                (click)="resummarize(d.meeting.id)"
-                [disabled]="busy() || renaming()"
-              >
-                Re-summarize
-              </button>
-              @if (!renaming()) {
-                <button
-                  type="button"
-                  class="btn btn-ghost"
-                  (click)="startRename()"
-                  [disabled]="busy()"
-                >
-                  Rename
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-danger"
-                  (click)="askDelete()"
-                  [disabled]="busy()"
-                >
-                  Delete
-                </button>
-
-                <!-- MOVE TO FOLDER: opens the folder picker popover. The picker
-                   itself owns the load-bearing encrypt/decrypt confirm. Layout
-                   is inline (no component-stylesheet rule) so it stays anchored
-                   to its trigger without growing the per-component style budget. -->
-                <div style="position: relative; display: inline-flex">
-                  <button
-                    type="button"
-                    class="btn btn-ghost"
-                    [attr.aria-expanded]="moveOpen()"
-                    aria-haspopup="menu"
-                    (click)="toggleMove()"
-                    [disabled]="busy()"
-                  >
-                    Move to folder
-                  </button>
-                  @if (moveOpen()) {
-                    <div
-                      style="position: absolute; top: calc(100% + 8px); left: 0; z-index: 30"
-                    >
-                      <app-move-to-menu
-                        [meetingId]="d.meeting.id"
-                        [currentFolderId]="d.meeting.folderId ?? null"
-                        (moved)="onMoved($event)"
-                        (close)="closeMove()"
-                      />
-                    </div>
-                  }
-                </div>
-              }
-
-              <!-- EXPORT menu: copy / save note / save audio / print-to-PDF.
-                 Gated on a parsed note existing; disabled while editing it. -->
-              @if (note() && !renaming()) {
-                <div class="export" role="group" aria-label="Export">
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="copyMarkdown()"
-                    [disabled]="editing() || busy()"
-                  >
-                    {{
-                      exportMsg() === "md-copied" ? "Copied" : "Copy Markdown"
-                    }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="saveMarkdown(d.meeting.id, d.meeting.title)"
-                    [disabled]="editing() || exporting()"
-                  >
-                    {{
-                      exportMsg() === "md-saved" ? "Saved" : "Save Markdown…"
-                    }}
-                  </button>
-                  @if (audioSrc()) {
-                    <button
-                      type="button"
-                      class="btn btn-ghost export-btn"
-                      (click)="saveAudio(d.meeting.id, d.meeting.title)"
-                      [disabled]="editing() || exporting()"
-                    >
-                      {{
-                        exportMsg() === "audio-saved" ? "Saved" : "Save audio…"
-                      }}
-                    </button>
-                  }
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="saveAsPdf()"
-                    [disabled]="editing()"
-                  >
-                    Save as PDF
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="exportCanvas(d.meeting.id)"
-                    [disabled]="editing() || exportingCanvas()"
-                  >
-                    {{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="shareAsLink(d.meeting.id)"
-                    [disabled]="editing() || sharing()"
-                  >
-                    {{ sharing() ? "Sharing…" : "Share as link" }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="openPersonShare(d.meeting.id)"
-                    [disabled]="editing() || personBusy()"
-                  >
-                    Share with a person
-                  </button>
-                </div>
-                <!-- Optional password for the NEXT "Share as link". Mixed into the link key on
-                     device (Argon2id) — the server never sees it; the viewer prompts for it. -->
-                <div class="share-pw-row">
-                  <input
-                    #pwField
-                    type="password"
-                    class="share-pw-input"
-                    [value]="sharePassword()"
-                    (input)="sharePassword.set(pwField.value)"
-                    placeholder="Link password (optional)"
-                    autocomplete="off"
-                    aria-label="Optional password for the share link"
-                  />
-                  <span class="share-pw-hint text-secondary">
-                    Set a password → recipients must enter it to open the link. Share
-                    the password separately.
-                  </span>
-                </div>
-              }
-
-              <!-- Share-as-link: one-time egress consent panel, the created
-                   link, or an inline error. The consent panel is IN-FLOW (not a
-                   floating overlay) so a frosted .card is correct here. -->
-              @if (needsShareConsent()) {
-                <div class="card share-consent" role="group">
-                  <p class="share-consent-copy">
-                    This uploads the encrypted note to your sharing server. The
-                    note is end-to-end encrypted — the server can't read it — but
-                    it does leave this Mac.
-                  </p>
-                  <div class="share-consent-actions">
-                    <button
-                      type="button"
-                      class="btn btn-primary"
-                      (click)="confirmShareConsent()"
-                    >
-                      Confirm &amp; share
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-ghost"
-                      (click)="cancelShareConsent()"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              }
-              @if (shareUrl(); as url) {
-                <div class="share-result" role="group" aria-label="Share link">
-                  @if (sharedWithPassword()) {
-                    <span class="pill is-success share-pw-badge">
-                      🔒 Password-protected
-                    </span>
-                  }
-                  <div class="share-link-row">
-                    <input
-                      type="text"
-                      class="share-link-input"
-                      [value]="url"
-                      readonly
-                      aria-label="Share link"
-                    />
-                    <button
-                      type="button"
-                      class="btn"
-                      (click)="copyShareLink()"
-                    >
-                      {{ shareLinkCopied() ? "Copied" : "Copy link" }}
-                    </button>
-                  </div>
-                  <p class="share-link-note text-secondary">
-                    Anyone with this link can read the note. The link's
-                    <code>#…</code> part is the decryption key and never reached
-                    the server.
-                  </p>
-                  @if (sharedWithPassword()) {
-                    <p class="share-link-note text-secondary">
-                      🔒 Password-protected — send the password to the recipient
-                      <strong>separately</strong> (not in the same message).
-                    </p>
-                  }
-                </div>
-              }
-              @if (shareError(); as err) {
-                <span class="msg msg-error" role="alert">{{ err }}</span>
-              }
-
-              <!-- Share WITH A PERSON (M5-CLIENT: Murmur↔Murmur, mode B). The
-                   email-entry / suggest-link / consent / result steps are all
-                   IN-FLOW (a frosted .card is correct); the fingerprint
-                   verification SHEET floats OVER the note → it is OPAQUE (trap
-                   T3), rendered by <app-share-verify-sheet>. -->
-              @if (personShareOpen()) {
-                <div
-                  class="card person-share"
-                  role="group"
-                  aria-label="Share with a person"
-                >
-                  @switch (personStep()) {
-                    @case ("email") {
-                      <p class="share-consent-copy">
-                        Share this note directly with another Murmur user. It's
-                        end-to-end encrypted to their account key.
-                      </p>
-                      <div class="person-row">
-                        <input
-                          type="email"
-                          class="person-input"
-                          [value]="personEmail()"
-                          (input)="onPersonEmailInput($event)"
-                          (keydown.enter)="submitPersonEmail()"
-                          placeholder="colleague@example.com"
-                          autocomplete="off"
-                          spellcheck="false"
-                          aria-label="Recipient email"
-                          [disabled]="personBusy()"
-                        />
-                        <button
-                          type="button"
-                          class="btn btn-primary"
-                          (click)="submitPersonEmail()"
-                          [disabled]="personBusy() || !personEmail().trim()"
-                        >
-                          {{ personBusy() ? "Checking…" : "Continue" }}
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost"
-                          (click)="closePersonShare()"
-                          [disabled]="personBusy()"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    }
-                    @case ("suggest-link") {
-                      <p class="share-consent-copy">
-                        They don't use Murmur yet — send a protected link
-                        instead?
-                        <span class="pill is-accent">Recommended</span>
-                      </p>
-                      <div class="person-row">
-                        <button
-                          type="button"
-                          class="btn btn-primary"
-                          (click)="sendProtectedLinkInstead()"
-                          [disabled]="personBusy()"
-                        >
-                          Send a protected link
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost"
-                          (click)="inviteAnyway()"
-                          [disabled]="personBusy()"
-                        >
-                          {{ personBusy() ? "Inviting…" : "Invite them anyway" }}
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost"
-                          (click)="closePersonShare()"
-                          [disabled]="personBusy()"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    }
-                    @case ("consent") {
-                      <p class="share-consent-copy">
-                        This uploads the encrypted note to your sharing server.
-                        The note is end-to-end encrypted — the server can't read
-                        it — but it does leave this Mac.
-                      </p>
-                      <div class="person-row">
-                        <button
-                          type="button"
-                          class="btn btn-primary"
-                          (click)="confirmPersonShareConsent()"
-                          [disabled]="personBusy()"
-                        >
-                          {{ personBusy() ? "Sharing…" : "Confirm & share" }}
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost"
-                          (click)="closePersonShare()"
-                          [disabled]="personBusy()"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    }
-                    @case ("result") {
-                      <p class="person-result">{{ personResult() }}</p>
-                      <div class="person-row">
-                        <button
-                          type="button"
-                          class="btn"
-                          (click)="closePersonShare()"
-                        >
-                          Done
-                        </button>
-                      </div>
-                    }
-                  }
-                  @if (personError(); as perr) {
-                    <span class="msg msg-error" role="alert">{{ perr }}</span>
-                  }
-                </div>
-              }
-              @if (verifyMode(); as mode) {
-                <app-share-verify-sheet
-                  [email]="personEmail()"
-                  [fingerprint]="personPreview()?.fingerprint ?? ''"
-                  [mode]="mode"
-                  [busy]="personBusy()"
-                  [error]="personError()"
-                  (confirm)="confirmVerifiedSend()"
-                  (cancelled)="closePersonShare()"
-                />
-              }
-
-              <!-- HI-RES MASTERS: retrieve the faithful per-stream float32 WAV
-                   archives. Shown only when this install keeps masters AND the
-                   meeting has audio; the backend is the source of truth and fails
-                   closed (Locked when sealed, "no master for that stream" when a
-                   given stream wasn't archived) — both surfaced as friendly inline
-                   messages, never a crash. -->
-              @if (keepsMasters() && audioSrc() && !renaming()) {
-                <div
-                  class="export"
-                  role="group"
-                  aria-label="Export hi-res master"
-                >
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    title="Save the faithful float32 mic archive (kept because high-fidelity masters is on)."
-                    (click)="exportMaster('mic', d.meeting.id, d.meeting.title)"
-                    [disabled]="editing() || exporting()"
-                  >
-                    {{
-                      exportMsg() === "mic-master-saved"
-                        ? "Saved"
-                        : "Export master (mic)…"
-                    }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    title="Save the faithful float32 system-audio archive (when the other side was captured)."
-                    (click)="exportMaster('sys', d.meeting.id, d.meeting.title)"
-                    [disabled]="editing() || exporting()"
-                  >
-                    {{
-                      exportMsg() === "sys-master-saved"
-                        ? "Saved"
-                        : "Export master (system)…"
-                    }}
-                  </button>
-                </div>
-              }
-              @if (canvasMsg(); as path) {
-                <div class="saved-toast canvas-toast" role="status">
-                  <span class="saved-toast-check" aria-hidden="true"></span>
-                  Canvas saved · {{ path }}
-                </div>
-              }
-              @if (canvasError(); as err) {
-                <span class="msg msg-error" role="alert">{{ err }}</span>
-              }
-
-              <!-- CONNECT TO GRAPH: resolve people + projects into vault stubs.
-                 Gated on a parsed note existing; disabled while editing it. -->
-              @if (note() && !renaming()) {
-                <div class="graph-connect" role="group" aria-label="Graph">
-                  <button
-                    type="button"
-                    class="btn btn-ghost export-btn"
-                    (click)="linkGraph()"
-                    [disabled]="editing() || linking()"
-                  >
-                    {{ linking() ? "Linking…" : "Link people &amp; projects" }}
-                  </button>
-                </div>
-              }
-
-              @if (exportError(); as err) {
-                <span class="msg msg-error" role="alert">{{ err }}</span>
-              }
-              @if (msg()) {
-                <span class="msg">{{ msg() }}</span>
-              }
-            </div>
-          }
         </header>
 
         <!-- ============================================================= -->
-        <!-- PHASE 0.5 LOCK GATE — shown when the backend masked this       -->
-        <!-- meeting (sealed, not-session-unlocked folder). Replaces the    -->
-        <!-- note/transcript/audio/timeline/actions with a single frosted   -->
-        <!-- card + a biometric Unlock action. The masked "🔒 Locked" title -->
-        <!-- bar above still shows; the back-to-Meetings nav stays.         -->
+        <!-- LOCK GATE — shown when the backend masked this meeting (sealed, -->
+        <!-- not-session-unlocked folder). Replaces the tab bar + panels    -->
+        <!-- with a single card + a biometric Unlock action. The masked     -->
+        <!-- "🔒 Locked" identity header above still shows; the back-to-     -->
+        <!-- Meetings nav stays. Content masking is enforced server-side.    -->
         <!-- ============================================================= -->
         @if (locked()) {
           <div
-            class="card empty-state"
+            class="card empty-state lock-gate"
             role="group"
             aria-labelledby="lock-gate-title"
-            style="animation: rise 420ms var(--transition) both"
           >
-            <span
-              aria-hidden="true"
-              style="display: inline-flex; align-items: center; justify-content: center; width: 64px; height: 64px; margin-bottom: var(--space-2); border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent-hover)"
-            >
+            <span aria-hidden="true" class="lock-gate-mark">
               <svg viewBox="0 0 24 24" width="28" height="28" fill="none">
                 <rect
                   x="4.5"
@@ -713,499 +221,119 @@ interface ParsedNote {
             <p id="lock-gate-title" class="empty-title">
               This meeting is locked
             </p>
-            <p class="empty" style="max-width: 42ch">
+            <p class="empty lock-gate-copy">
               It lives in a locked folder. Unlock to view the note, transcript
               and audio.
             </p>
             <button
               #unlockButton
               type="button"
-              class="btn btn-primary"
-              style="margin-top: var(--space-2)"
+              class="btn btn-primary lock-gate-btn"
               (click)="unlock()"
               [disabled]="unlocking()"
             >
               {{ unlocking() ? "Unlocking…" : "🔒 Unlock (Touch ID)" }}
             </button>
           </div>
-        }
-
-        @if (!locked()) {
-          <!-- Graph link result: resolved people + projects as chips + caption. -->
-          @if (graphError(); as err) {
-            <div class="card graph-card graph-card--error" role="alert">
-              {{ err }}
-            </div>
-          }
-          @if (graph(); as g) {
-            <div class="card graph-card" role="status">
-              @if (g.people.length || g.projects.length) {
-                <div class="graph-groups">
-                  @if (g.people.length) {
-                    <div class="graph-group">
-                      <span class="graph-group-label">People</span>
-                      <div class="graph-pills">
-                        @for (p of g.people; track p) {
-                          <span class="pill tag">{{ p }}</span>
-                        }
-                      </div>
-                    </div>
-                  }
-                  @if (g.projects.length) {
-                    <div class="graph-group">
-                      <span class="graph-group-label">Projects</span>
-                      <div class="graph-pills">
-                        @for (pr of g.projects; track pr) {
-                          <span class="pill tag graph-pill--project">{{
-                            pr
-                          }}</span>
-                        }
-                      </div>
-                    </div>
-                  }
-                </div>
-                <p class="graph-caption">
-                  Added to your Obsidian vault graph (People/ &amp; Projects/)
-                </p>
-              } @else {
-                <p class="graph-caption">No people or projects to link yet.</p>
-              }
-            </div>
-          }
-
-          <!-- In-app delete confirmation (signal-driven; no window.confirm) ----- -->
-          @if (confirmingDelete()) {
-            <div
-              class="card confirm"
-              role="alertdialog"
-              aria-label="Delete meeting"
-            >
-              <div class="confirm-text">
-                <p class="confirm-title">Delete this meeting?</p>
-                <p class="confirm-copy">
-                  This permanently removes the recording, transcript, summary
-                  and the note in your vault. This can’t be undone.
-                </p>
-                @if (deleteError(); as err) {
-                  <p class="confirm-error" role="alert">{{ err }}</p>
-                }
-              </div>
-              <div class="confirm-actions">
-                <button
-                  type="button"
-                  class="btn btn-ghost"
-                  (click)="cancelDelete()"
-                  [disabled]="deleting()"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-danger"
-                  (click)="confirmDelete(d.meeting.id)"
-                  [disabled]="deleting()"
-                >
-                  {{ deleting() ? "Deleting…" : "Delete" }}
-                </button>
-              </div>
-            </div>
-          }
-
-          <!-- 1) AUDIO PLAYER ------------------------------------------------ -->
-          @if (audioSrc(); as src) {
-            <div class="card player" [style.animation-delay.ms]="40">
-              <audio
-                #player
-                [src]="src"
-                preload="metadata"
-                (loadedmetadata)="onLoaded()"
-                (timeupdate)="onTimeUpdate()"
-                (play)="playing.set(true)"
-                (pause)="playing.set(false)"
-                (ended)="onEnded()"
-              ></audio>
-
-              <button
-                type="button"
-                class="play"
-                (click)="togglePlay()"
-                [attr.aria-label]="playing() ? 'Pause' : 'Play'"
-                [class.is-playing]="playing()"
-              >
-                @if (playing()) {
-                  <span class="icon-pause" aria-hidden="true"></span>
-                } @else {
-                  <span class="icon-play" aria-hidden="true"></span>
-                }
-              </button>
-
-              <div class="player-body">
-                <div
-                  class="track"
-                  role="slider"
-                  tabindex="0"
-                  aria-label="Seek"
-                  [attr.aria-valuemin]="0"
-                  [attr.aria-valuemax]="Math.round(duration())"
-                  [attr.aria-valuenow]="Math.round(currentTime())"
-                  (click)="seekFromEvent($event)"
-                  (keydown)="onTrackKey($event)"
-                >
-                  <div class="track-fill" [style.width.%]="progressPct()">
-                    <span class="track-knob"></span>
-                  </div>
-                </div>
-                <div class="times">
-                  <span class="time">{{ fmt(currentTime()) }}</span>
-                  <span class="time time-total">{{ fmt(duration()) }}</span>
-                </div>
-              </div>
-            </div>
-          } @else {
-            <div class="card player player--empty">
-              <span class="audio-off" aria-hidden="true"></span>
-              <span class="audio-off-text">Audio not available</span>
-            </div>
-          }
-
-          <!-- 1b) INTERACTIVE TIMELINE (speakers + topics, shared playhead) -- -->
-          <app-meeting-timeline
-            [timeline]="timeline()"
-            [total]="timelineTotal()"
-            [currentTime]="currentTime()"
-            [loading]="timelineLoading()"
-            [error]="timelineError()"
-            [hasAudio]="!!audioSrc()"
-            [suggestions]="speakerSuggestions()"
-            (seek)="seekTo($event)"
-            (retry)="loadTimeline()"
-            (pin)="onPin($event)"
-            (renameSpeaker)="onRenameSpeaker($event)"
+        } @else {
+          <!-- TAB BAR (Note · Audio · Share) — page-scale segmented control. -->
+          <app-detail-tabs
+            [tabs]="detailTabs"
+            [active]="activeTab()"
+            (tabChange)="activeTab.set($event)"
           />
 
-          <!-- Pin confirmation / error (driven by the timeline's (pin) output). -->
-          @if (pinMsg(); as m) {
-            <div class="saved-toast pin-toast" role="status">
-              <span class="pin-toast-dot" aria-hidden="true"></span>
-              {{ m }}
-            </div>
-          }
-          @if (pinError(); as err) {
-            <div class="saved-toast pin-toast pin-toast--error" role="alert">
-              {{ err }}
-            </div>
-          }
-
-          <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
-          <section class="block print-keep" [class.is-resummarizing]="busy()">
-            <div class="block-head">
-              <h3>Analysis</h3>
-              @if (!editing() && note()?.tags?.length) {
-                <div class="tags">
-                  @for (t of note()!.tags; track t) {
-                    <span class="pill tag">{{ t }}</span>
-                  }
-                </div>
-              }
-              <!-- Phase 5: model-provenance badge — shown only when the backend
-                   recorded which model produced this note. Hidden for locked meetings
-                   (provenance null) and for legacy meetings without CallMeta. -->
-              @if (provenanceLabel(); as prov) {
-                <span
-                  class="provenance-badge"
-                  [attr.title]="prov.provider ? 'Provider: ' + prov.provider : null"
-                  [attr.aria-label]="'Generated by ' + (prov.model || prov.provider)"
-                >
-                  <svg
-                    viewBox="0 0 16 16"
-                    width="12"
-                    height="12"
-                    fill="none"
-                    aria-hidden="true"
-                    class="provenance-icon"
-                  >
-                    <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.4" />
-                    <path d="M5.5 8.5 7.2 10.2 10.5 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                  @if (prov.model) {
-                    <span>{{ prov.model }}</span>
-                  }
-                  @if (prov.model && prov.provider) {
-                    <span class="provenance-sep" aria-hidden="true">·</span>
-                  }
-                  @if (prov.provider) {
-                    <span>{{ prov.provider }}</span>
-                  }
-                </span>
-              }
-              @if (note() && !editing()) {
-                <button
-                  type="button"
-                  class="btn btn-ghost edit-btn"
-                  (click)="startEdit()"
-                >
-                  Edit
-                </button>
-              }
-            </div>
-
-            @if (note(); as n) {
-              @if (editing()) {
-                <!-- In-app note editor (raw markdown → re-written to the vault) -->
-                <article class="card editor">
-                  <textarea
-                    class="editor-area"
-                    spellcheck="false"
-                    autocapitalize="off"
-                    autocomplete="off"
-                    aria-label="Note markdown"
-                    [value]="draft()"
-                    [disabled]="saving()"
-                    (input)="onDraftInput($event)"
-                  ></textarea>
-
-                  @if (saveError(); as err) {
-                    <p class="editor-error" role="alert">{{ err }}</p>
-                  }
-
-                  <div class="editor-foot">
-                    <span class="editor-hint"
-                      >Markdown · saved to your vault</span
-                    >
-                    <div class="editor-actions">
-                      <button
-                        type="button"
-                        class="btn btn-ghost"
-                        (click)="cancelEdit()"
-                        [disabled]="saving()"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        class="btn btn-primary"
-                        (click)="saveNote()"
-                        [disabled]="saving()"
-                      >
-                        {{ saving() ? "Saving…" : "Save" }}
-                      </button>
-                    </div>
-                  </div>
-                </article>
-              } @else {
-                @if (n.participants.length) {
-                  <div class="card meta-card" [style.animation-delay.ms]="80">
-                    <span class="meta-card-label">Participants</span>
-                    <div class="people">
-                      @for (p of n.participants; track p) {
-                        <span class="person">{{ p }}</span>
-                      }
-                    </div>
-                  </div>
-                }
-
-                @if (n.sections.length) {
-                  @for (sec of n.sections; track sec.heading; let i = $index) {
-                    <article
-                      class="card section"
-                      [style.animation-delay.ms]="120 + i * 60"
-                    >
-                      <h4 class="section-head">{{ sec.heading }}</h4>
-
-                      @switch (sec.kind) {
-                        @case ("actions") {
-                          <ul class="checklist">
-                            @for (a of sec.actions; track $index) {
-                              <li class="check" [class.is-done]="a.done">
-                                <span
-                                  class="check-box"
-                                  [class.is-done]="a.done"
-                                  aria-hidden="true"
-                                ></span>
-                                <span class="check-text">{{ a.text }}</span>
-                              </li>
-                            }
-                          </ul>
-                        }
-                        @case ("bullets") {
-                          <ul class="bullets">
-                            @for (b of sec.bullets; track $index) {
-                              <li class="bullet">{{ b }}</li>
-                            }
-                          </ul>
-                        }
-                        @default {
-                          <div class="prose">
-                            @for (para of sec.paragraphs; track $index) {
-                              <p>{{ para }}</p>
-                            }
-                          </div>
-                        }
-                      }
-                    </article>
-                  }
-                } @else if (n.raw) {
-                  <article
-                    class="card section"
-                    [style.animation-delay.ms]="120"
-                  >
-                    <pre class="note-body">{{ n.raw }}</pre>
-                  </article>
-                }
-
-                @if (justSaved()) {
-                  <div class="saved-toast" role="status">
-                    <span class="saved-toast-check" aria-hidden="true"></span>
-                    Saved
-                  </div>
-                }
-
-                @if (d.note?.exportedPath; as path) {
-                  <div class="card saved" [style.animation-delay.ms]="160">
-                    <span class="saved-icon" aria-hidden="true"></span>
-                    <div class="saved-body">
-                      <span class="saved-label">Saved to vault</span>
-                      <span class="saved-path">{{ path }}</span>
-                    </div>
-                    <button
-                      type="button"
-                      class="btn btn-ghost copy-btn"
-                      (click)="copy(path)"
-                    >
-                      {{ copied() ? "Copied" : "Copy path" }}
-                    </button>
-                  </div>
-                }
-              }
-            } @else {
-              <div class="card empty-card empty-state">
-                <span class="empty-mark" aria-hidden="true"></span>
-                <p class="empty-title">No analysis yet</p>
-                <p class="empty">
-                  Re-summarize this meeting to generate a structured note.
-                </p>
-              </div>
+          <!-- One panel per active tab. Each owns its own inline styles (the
+               reason for the split) + hosts the reused sub-components. -->
+          @switch (activeTab()) {
+            @case ("note") {
+              <app-note-panel
+                [meetingId]="d.meeting.id"
+                [folderId]="d.meeting.folderId ?? null"
+                [note]="note()"
+                [interactions]="interactions()"
+                [exportedPath]="d.note?.exportedPath ?? null"
+                [provenanceLabel]="provenanceLabel()"
+                [busy]="busy()"
+                [renaming]="renaming()"
+                [editing]="editing()"
+                [saving]="saving()"
+                [exporting]="exporting()"
+                [exportingCanvas]="exportingCanvas()"
+                [linking]="linking()"
+                [keepsMasters]="keepsMasters()"
+                [hasAudio]="!!audioSrc()"
+                [moveOpen]="moveOpen()"
+                [msg]="msg()"
+                [exportMsg]="exportMsg()"
+                [exportError]="exportError()"
+                [canvasMsg]="canvasMsg()"
+                [canvasError]="canvasError()"
+                [graph]="graph()"
+                [graphError]="graphError()"
+                [justSaved]="justSaved()"
+                [pathCopied]="copied()"
+                [draft]="draft()"
+                [saveError]="saveError()"
+                [confirmingDelete]="confirmingDelete()"
+                [deleting]="deleting()"
+                [deleteError]="deleteError()"
+                (resummarize)="resummarize(d.meeting.id)"
+                (rename)="startRename()"
+                (move)="toggleMove()"
+                (moved)="onMoved($event)"
+                (closeMove)="closeMove()"
+                (delete)="askDelete()"
+                (cancelDelete)="cancelDelete()"
+                (confirmDelete)="confirmDelete(d.meeting.id)"
+                (copyMd)="copyMarkdown()"
+                (saveMd)="saveMarkdown(d.meeting.id, d.meeting.title)"
+                (savePdf)="saveAsPdf()"
+                (exportCanvas)="exportCanvas(d.meeting.id)"
+                (saveAudio)="saveAudio(d.meeting.id, d.meeting.title)"
+                (exportMaster)="
+                  exportMaster($event, d.meeting.id, d.meeting.title)
+                "
+                (linkGraph)="linkGraph()"
+                (edit)="startEdit()"
+                (cancelEdit)="cancelEdit()"
+                (saveNote)="saveNote()"
+                (draftInput)="draft.set($event)"
+                (copyPath)="copy(d.note?.exportedPath ?? '')"
+                (openRelated)="openRelated($event)"
+              />
             }
-          </section>
-
-          <!-- 2·25) ASSISTANT Q&A (persisted in-meeting voice exchanges) ------- -->
-          @if (interactions().length) {
-            <section class="block print-keep">
-              <div class="block-head">
-                <h3>🎙 Asystent — Q&amp;A</h3>
-                <span class="count">{{ interactions().length }}</span>
-              </div>
-
-              <ul class="qa-list">
-                @for (q of interactions(); track q.id) {
-                  <li
-                    class="card qa-row"
-                    [class.is-pending]="q.status === 'pending'"
-                  >
-                    <div class="qa-heard">
-                      <span class="qa-ico" aria-hidden="true">🎙</span>
-                      <span class="qa-heard-text">
-                        Pytałeś:
-                        <strong>{{ q.command || "…" }}</strong>
-                      </span>
-                      @if (qaStatusLabel(q.status)) {
-                        <span class="pill" [class]="qaStatusPillClass(q.status)">
-                          <span class="pill-dot"></span>
-                          {{ qaStatusLabel(q.status) }}
-                        </span>
-                      }
-                    </div>
-
-                    @if (q.answer) {
-                      <app-markdown
-                        class="qa-answer"
-                        [markdown]="q.answer"
-                        compact
-                      />
-                    }
-
-                    @if (q.citations.length) {
-                      <app-assistant-sources [citations]="q.citations" />
-                    }
-
-                    @if (q.sourceLabel) {
-                      <span class="qa-source text-muted">{{
-                        q.sourceLabel
-                      }}</span>
-                    }
-                  </li>
-                }
-              </ul>
-            </section>
-          }
-
-          <!-- 2·5) ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none) - -->
-          <app-meeting-actions [meetingId]="d.meeting.id" />
-
-          <!-- 2a) RECIPES / GENERATE (grounded one-tap generations over text) - -->
-          <section class="block">
-            <div class="block-head">
-              <h3>Recipes</h3>
-            </div>
-            <app-meeting-recipes [meetingId]="d.meeting.id" />
-          </section>
-
-          <!-- 2b) CHAT WITH THIS MEETING (grounded Q&A over the transcript) -- -->
-          <section class="block">
-            <app-meeting-chat [meetingId]="d.meeting.id" />
-          </section>
-
-          <!-- 3) CLICK-TO-SEEK TRANSCRIPT ----------------------------------- -->
-          <section class="block">
-            <div class="block-head">
-              <h3>Transcript</h3>
-              @if (d.segments.length) {
-                <span class="count">{{ d.segments.length }}</span>
-              }
-            </div>
-
-            @if (d.segments.length) {
-              <div
-                class="card transcript-card"
-                [style.animation-delay.ms]="200"
-              >
-                <ul class="segs">
-                  @for (s of d.segments; track s.idx) {
-                    <li>
-                      <button
-                        type="button"
-                        class="seg"
-                        [class.is-active]="isActiveSegment(s.startS, s.endS)"
-                        [disabled]="!audioSrc()"
-                        (click)="seekTo(s.startS)"
-                      >
-                        <span class="seg-time">{{ fmt(s.startS) }}</span>
-                        @if (speakerChip(s.speaker); as chip) {
-                          <span
-                            class="seg-speaker"
-                            [style.background]="chip.bg"
-                            [style.color]="chip.fg"
-                            >{{ chip.label }}</span
-                          >
-                        }
-                        <span class="seg-text">{{ s.text }}</span>
-                      </button>
-                    </li>
-                  }
-                </ul>
-              </div>
-            } @else {
-              <div class="card empty-card">
-                <p class="empty">No transcript.</p>
-              </div>
+            @case ("audio") {
+              <app-audio-panel
+                [audioSrc]="audioSrc()"
+                [segments]="d.segments"
+                [timeline]="timeline()"
+                [timelineTotal]="timelineTotal()"
+                [timelineLoading]="timelineLoading()"
+                [timelineError]="timelineError()"
+                [speakerSuggestions]="speakerSuggestions()"
+                [pinMsg]="pinMsg()"
+                [pinError]="pinError()"
+                (retryTimeline)="loadTimeline()"
+                (pin)="onPin($event)"
+                (renameSpeaker)="onRenameSpeaker($event)"
+              />
             }
-          </section>
-
-          <!-- 4) RELATED BY MEANING (semantic neighbors; silent when empty) -- -->
-          <app-related-meetings
-            [meetingId]="d.meeting.id"
-            (open)="openRelated($event)"
-          />
+            @case ("share") {
+              <!-- Password-FIRST link-share flow (Configure → Created →
+                   Manage) + precondition gate + mode-B person share, all
+                   self-contained in app-share-panel (owns its own IpcService
+                   + share state, spec §6). The link key L lives ONLY in the
+                   panel's transient session signal. -->
+              <app-share-panel
+                [meetingId]="d.meeting.id"
+                [active]="activeTab() === 'share'"
+                [editing]="editing()"
+                [locked]="locked()"
+                (setupSharing)="goToSharingSettings()"
+              />
+            }
+          }
         }
       } @else if (loading()) {
         <div class="card state-card">
@@ -1340,161 +468,6 @@ interface ParsedNote {
         font-size: 0.8125rem;
       }
 
-      /* Read-only folder + lock badge in the meta row. */
-      .actions {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: var(--space-3);
-      }
-      .msg {
-        color: var(--text-secondary);
-        font-size: 0.85rem;
-      }
-      .msg-error {
-        color: var(--danger);
-      }
-
-      /* --- Export menu + graph-connect (ghost buttons; leading divider) --- */
-      .export,
-      .graph-connect {
-        display: inline-flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: var(--space-1);
-        padding-left: var(--space-3);
-        border-left: 1px solid var(--border-subtle);
-      }
-      .export-btn {
-        height: 36px;
-        padding: 0 var(--space-3);
-        font-size: 0.875rem;
-      }
-      .share-pw-row {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-1);
-        flex-basis: 100%;
-        max-width: 36rem;
-        margin-top: var(--space-1);
-      }
-      .share-pw-input {
-        flex: none;
-        width: 100%;
-        height: 36px;
-        padding: 0 var(--space-3);
-        border: 1px solid var(--border);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        color: var(--text-primary);
-        font-size: 0.85rem;
-      }
-      .share-pw-hint {
-        margin: 0;
-        font-size: 0.8125rem;
-        color: var(--text-secondary);
-      }
-
-      /* --- Share as link (M3-CLIENT) + share with a person (M5-CLIENT) --- */
-      .share-consent,
-      .share-result,
-      .person-share {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        flex-basis: 100%;
-        max-width: 36rem;
-      }
-      .share-consent,
-      .person-share {
-        gap: var(--space-3);
-        padding: var(--space-4);
-      }
-      .share-consent-copy,
-      .share-link-note {
-        margin: 0;
-        color: var(--text-secondary);
-        font-size: 0.85rem;
-        line-height: 1.5;
-      }
-      .share-consent-actions,
-      .share-link-row,
-      .person-row {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        flex-wrap: wrap;
-      }
-      .person-row .btn {
-        flex: none;
-      }
-      .share-link-input {
-        flex: 1 1 20rem;
-        min-width: 0;
-        height: 36px;
-        padding: 0 var(--space-3);
-        border: 1px solid var(--border);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        color: var(--text-primary);
-        font-family: var(--font-mono);
-        font-size: 0.85rem;
-        user-select: text;
-        -webkit-user-select: text;
-      }
-      .share-link-row .btn {
-        flex: none;
-      }
-
-      /* --- Share with a person (M5-CLIENT, mode B) — reuses the share-as-link
-         layout selectors above; only the email input + result line are new. --- */
-      .person-input {
-        flex: 1 1 18rem;
-        min-width: 0;
-        height: 36px;
-        padding: 0 var(--space-3);
-        border: 1px solid var(--border);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        color: var(--text-primary);
-        font: inherit;
-        font-size: 0.9rem;
-      }
-      .person-input::placeholder {
-        color: var(--text-muted);
-      }
-      .person-input:focus-visible {
-        outline: none;
-        border-color: var(--accent-hover);
-        box-shadow: 0 0 0 3px var(--accent-soft);
-      }
-      .person-result {
-        margin: 0;
-        color: var(--text-primary);
-        font-size: 0.9rem;
-        line-height: 1.55;
-      }
-
-      /* Pin toast reuses .saved-toast box (accent variant). */
-      .pin-toast {
-        background: var(--accent-soft);
-        color: var(--accent-hover);
-      }
-      .pin-toast--error,
-      .graph-card--error {
-        background: var(--danger-soft);
-        color: var(--danger);
-      }
-      .graph-groups {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-4) var(--space-5);
-      }
-      .graph-pill--project {
-        background: var(--success-soft);
-        color: var(--success);
-      }
-
       /* --- Inline title rename --- */
       .rename {
         display: flex;
@@ -1521,681 +494,46 @@ interface ParsedNote {
         font-size: 0.875rem;
       }
 
-      /* --- In-app delete confirmation --- */
-      .confirm {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-4);
-        border-color: rgba(255, 107, 107, 0.3);
-        animation: rise 240ms var(--transition) both;
-      }
-      .confirm-text {
-        min-width: 0;
-        flex: 1 1 20rem;
-      }
-      .confirm-title {
-        margin: 0 0 var(--space-1);
-        color: var(--text-primary);
-        font-weight: 600;
-      }
-      .confirm-copy {
-        margin: 0;
-        color: var(--text-secondary);
-        font-size: 0.875rem;
-        line-height: 1.55;
-      }
-      .confirm-error {
-        margin: var(--space-2) 0 0;
-        color: var(--danger);
-        font-size: 0.85rem;
-      }
-      .confirm-actions,
-      .editor-actions {
-        display: flex;
-        align-items: center;
-        gap: var(--space-2);
-        margin-left: auto;
-      }
-
-      /* --- Section blocks --- */
-      .block {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
-      }
-      .block-head {
-        display: flex;
-        align-items: center;
-        gap: var(--space-3);
-      }
-      .block-head h3 {
-        margin: 0;
-      }
-
-      /* Phase 5 — model-provenance ghost chip (Analysis header). */
-      .provenance-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-1);
-        padding: 2px var(--space-2);
-        border-radius: var(--radius-pill);
-        border: 1px solid var(--border-subtle);
-        color: var(--text-muted);
-        font-size: 0.6875rem;
-        font-weight: 500;
-        white-space: nowrap;
-        margin-left: auto;
-      }
-      .provenance-icon { flex: none; opacity: 0.7; }
-      .provenance-sep { opacity: 0.5; }
-
-      /* ========================================================== */
-      /* 1) Audio player                                            */
-      /* ========================================================== */
-      .player {
-        display: flex;
-        align-items: center;
-        gap: var(--space-4);
-        padding: var(--space-4) var(--space-5);
+      /* --- Lock gate (masked meeting; replaces the tabs + panels) --- */
+      .lock-gate {
         animation: rise 420ms var(--transition) both;
       }
-      .player--empty {
-        justify-content: flex-start;
-        gap: var(--space-3);
-        color: var(--text-muted);
-      }
-      .audio-off {
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        background: var(--text-muted);
-        opacity: 0.6;
-        flex: none;
-      }
-      .audio-off-text {
-        font-size: 0.875rem;
-      }
-
-      /* Big accent play/pause */
-      .play {
-        flex: none;
+      .lock-gate-mark {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 56px;
-        height: 56px;
-        border: none;
+        width: 64px;
+        height: 64px;
+        margin-bottom: var(--space-2);
         border-radius: var(--radius-pill);
-        background: var(--accent-gradient);
-        color: var(--text-on-accent);
-        cursor: pointer;
-        box-shadow: var(--shadow-accent), var(--glass-highlight);
-        transition:
-          transform var(--transition-fast),
-          filter var(--transition),
-          box-shadow var(--transition);
-      }
-      .play:hover {
-        filter: brightness(1.08);
-        transform: translateY(-1px);
-      }
-      .play:active {
-        transform: translateY(0) scale(0.96);
-      }
-      .play:focus-visible {
-        outline: none;
-        box-shadow:
-          0 0 0 3px var(--accent-ring),
-          var(--shadow-accent);
-      }
-      .play.is-playing {
-        box-shadow:
-          0 0 0 1px var(--accent-ring),
-          0 10px 34px rgba(110, 118, 255, 0.5);
-      }
-      /* Pure-CSS glyphs (no icon dependency) */
-      .icon-play {
-        width: 0;
-        height: 0;
-        margin-left: 3px;
-        border-style: solid;
-        border-width: 9px 0 9px 15px;
-        border-color: transparent transparent transparent currentColor;
-      }
-      .icon-pause {
-        width: 14px;
-        height: 16px;
-        border-left: 5px solid currentColor;
-        border-right: 5px solid currentColor;
-        box-sizing: content-box;
-      }
-
-      .player-body {
-        flex: 1 1 auto;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        min-width: 0;
-      }
-
-      /* Clickable seek/progress bar */
-      .track {
-        position: relative;
-        height: 8px;
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border-subtle);
-        cursor: pointer;
-        transition: height var(--transition);
-      }
-      .track:hover,
-      .track:focus-visible {
-        height: 10px;
-        outline: none;
-      }
-      .track:focus-visible {
-        box-shadow: 0 0 0 3px var(--accent-ring);
-      }
-      .track-fill {
-        position: absolute;
-        inset: 0 auto 0 0;
-        height: 100%;
-        min-width: 2px;
-        border-radius: var(--radius-pill);
-        background: var(--accent-gradient);
-      }
-      .track-knob {
-        position: absolute;
-        right: 0;
-        top: 50%;
-        width: 14px;
-        height: 14px;
-        transform: translate(50%, -50%);
-        border-radius: 50%;
-        background: var(--text-on-accent);
-        box-shadow: var(--shadow-sm);
-        opacity: 0;
-        transition:
-          opacity var(--transition),
-          transform var(--transition-fast);
-      }
-      .track:hover .track-knob,
-      .track:focus-visible .track-knob {
-        opacity: 1;
-      }
-
-      .times {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--space-3);
-      }
-      .time {
-        color: var(--text-secondary);
-        font-family: var(--font-mono);
-        font-size: 0.8125rem;
-        font-variant-numeric: tabular-nums;
-        letter-spacing: -0.01em;
-      }
-      .time-total {
-        color: var(--text-muted);
-      }
-
-      /* ========================================================== */
-      /* 2) Rich analysis                                           */
-      /* ========================================================== */
-      .tags,
-      .people,
-      .graph-pills {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-      }
-      .tag {
-        height: 24px;
-        padding: var(--space-1) var(--space-3);
         background: var(--accent-soft);
-        border-color: transparent;
-        color: var(--accent-hover);
-        font-size: 0.75rem;
-        font-weight: 600;
-      }
-
-      .meta-card,
-      .graph-card {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
-        padding: var(--space-4) var(--space-5);
-        animation: rise 420ms var(--transition) both;
-      }
-      .meta-card-label,
-      .graph-group-label {
-        color: var(--text-muted);
-        font-size: 0.75rem;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-      }
-      .person {
-        display: inline-flex;
-        align-items: center;
-        padding: var(--space-1) var(--space-3);
-        border-radius: var(--radius-pill);
-        background: var(--surface-input);
-        border: 1px solid var(--border);
-        color: var(--text-secondary);
-        font-size: 0.8125rem;
-        font-weight: 550;
-      }
-
-      .section {
-        padding: var(--space-5);
-        animation: rise 420ms var(--transition) both;
-        transition:
-          transform var(--transition),
-          border-color var(--transition);
-      }
-      .section:hover {
-        border-color: var(--border-strong);
-      }
-
-      .prose p {
-        margin: 0 0 var(--space-3);
-        color: var(--text-secondary);
-        line-height: 1.7;
-        max-width: 68ch;
-      }
-      .prose p:last-child {
-        margin-bottom: 0;
-      }
-
-      .bullets {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-      }
-      .bullet {
-        position: relative;
-        padding-left: var(--space-5);
-        color: var(--text-secondary);
-        line-height: 1.6;
-      }
-      .bullet::before {
-        content: "";
-        position: absolute;
-        left: 4px;
-        top: 0.62em;
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: var(--accent);
-      }
-
-      /* Read-only action-item checklist */
-      .checklist {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
-      }
-      .check {
-        display: flex;
-        align-items: flex-start;
-        gap: var(--space-3);
-        line-height: 1.5;
-      }
-      .check-box {
-        flex: none;
-        position: relative;
-        width: 20px;
-        height: 20px;
-        margin-top: 0.05em;
-        border: 1px solid var(--border-strong);
-        border-radius: var(--radius-sm);
-        background: var(--surface-input);
-      }
-      .check-box.is-done {
-        background: var(--accent-gradient);
-        border-color: transparent;
-      }
-      .check-box.is-done::after {
-        content: "";
-        position: absolute;
-        left: 6px;
-        top: 2px;
-        width: 5px;
-        height: 10px;
-        border: solid var(--text-on-accent);
-        border-width: 0 2px 2px 0;
-        transform: rotate(45deg);
-      }
-      .check-text,
-      .seg-text {
-        color: var(--text-secondary);
-        min-width: 0;
-      }
-      .check.is-done .check-text {
-        color: var(--text-muted);
-        text-decoration: line-through;
-        text-decoration-color: var(--text-muted);
-      }
-
-      /* Raw-markdown fallback */
-      .note-body {
-        margin: 0;
-        white-space: pre-wrap;
-        background: var(--surface-input);
-        border: 1px solid var(--border-subtle);
-        color: var(--text-secondary);
-        padding: var(--space-4);
-        border-radius: var(--radius-md);
-        max-height: 420px;
-        overflow: auto;
-        font-size: 0.9rem;
-        line-height: 1.7;
-      }
-
-      /* Assistant — Q&A section (mirrors the live assistant-actions card) */
-      .qa-list {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
-      }
-      .qa-row {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        padding: var(--space-3) var(--space-4);
-        animation: rise 360ms var(--transition) both;
-      }
-      .qa-heard {
-        display: flex;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: var(--space-2);
-      }
-      .qa-heard-text {
-        color: var(--text-secondary);
-        font-size: 0.875rem;
-      }
-      .qa-heard-text strong {
-        color: var(--text-primary);
-        font-weight: 600;
-      }
-      .qa-heard .pill {
-        margin-left: auto;
-      }
-      /* The answer is now rendered by app-markdown; just give the block room. */
-      .qa-answer {
-        display: block;
-        font-size: 0.9rem;
-      }
-      .qa-source {
-        font-size: 0.72rem;
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
-      }
-      @media (prefers-reduced-motion: reduce) {
-        .qa-row {
-          animation: none;
-        }
-      }
-
-      /* Saved-to-vault line */
-      .saved {
-        display: flex;
-        align-items: center;
-        gap: var(--space-3);
-        padding: var(--space-3) var(--space-4);
-        animation: rise 420ms var(--transition) both;
-      }
-      .saved-icon,
-      .pin-toast-dot {
-        flex: none;
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: var(--success);
-        box-shadow: 0 0 0 4px var(--success-soft);
-      }
-      .pin-toast-dot {
-        background: var(--accent);
-        box-shadow: 0 0 0 4px var(--accent-soft);
-      }
-      .saved-body {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        min-width: 0;
-        flex: 1 1 auto;
-      }
-      .saved-label {
-        color: var(--text-secondary);
-        font-size: 0.8125rem;
-        font-weight: 600;
-      }
-      .saved-path {
-        color: var(--text-muted);
-        font-family: var(--font-mono);
-        font-size: 0.75rem;
-        word-break: break-all;
-      }
-      .copy-btn {
-        flex: none;
-        height: 32px;
-        padding: 0 var(--space-3);
-        font-size: 0.8125rem;
-      }
-
-      /* Edit affordance in the Analysis header */
-      .edit-btn {
-        margin-left: auto;
-        height: 32px;
-        padding: 0 var(--space-3);
-        font-size: 0.8125rem;
-      }
-
-      /* In-app note editor (glassmorphism, full-height monospace textarea) */
-      .editor {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-3);
-        padding: var(--space-4);
-        animation: rise 420ms var(--transition) both;
-      }
-      .editor-area {
-        width: 100%;
-        min-height: 360px;
-        flex: 1 1 auto;
-        padding: var(--space-4);
-        border: 1px solid var(--border-subtle);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        color: var(--text-primary);
-        font-family: var(--font-mono);
-        font-size: 0.875rem;
-        font-variant-numeric: tabular-nums;
-        line-height: 1.7;
-        resize: vertical;
-        tab-size: 2;
-      }
-      .editor-error {
-        margin: 0;
-        padding: var(--space-2) var(--space-3);
-        border: 1px solid rgba(255, 107, 107, 0.3);
-        border-radius: var(--radius-sm);
-        background: var(--danger-soft);
-        color: var(--text-primary);
-        font-size: 0.85rem;
-      }
-      .editor-foot {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-3);
-      }
-      .editor-hint,
-      .graph-caption {
-        margin: 0;
-        color: var(--text-muted);
-        font-size: 0.8125rem;
-      }
-
-      /* Transient "Saved" confirmation */
-      .saved-toast {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--space-2);
-        align-self: flex-start;
-        padding: var(--space-1) var(--space-3);
-        min-height: 28px;
-        border-radius: var(--radius-pill);
-        background: var(--success-soft);
-        color: var(--success);
-        font-size: 0.8125rem;
-        font-weight: 600;
-        animation: rise 280ms var(--transition) both;
-      }
-      .canvas-toast {
-        word-break: break-all;
-      }
-      .saved-toast-check {
-        position: relative;
-        width: 14px;
-        height: 14px;
-        flex: none;
-      }
-      .saved-toast-check::after {
-        content: "";
-        position: absolute;
-        left: 4px;
-        top: 0;
-        width: 4px;
-        height: 9px;
-        border: solid currentColor;
-        border-width: 0 2px 2px 0;
-        transform: rotate(45deg);
-      }
-
-      /* ========================================================== */
-      /* 3) Transcript                                              */
-      /* ========================================================== */
-      .transcript-card {
-        padding: var(--space-2);
-        max-height: 480px;
-        overflow: auto;
-        animation: rise 420ms var(--transition) both;
-      }
-      .segs {
-        list-style: none;
-        padding: 0;
-        margin: 0;
-      }
-      .segs li + li {
-        border-top: 1px solid var(--border-subtle);
-      }
-      .seg {
-        display: flex;
-        gap: var(--space-3);
-        width: 100%;
-        padding: var(--space-3);
-        border: none;
-        border-radius: var(--radius-md);
-        background: transparent;
-        color: inherit;
-        font: inherit;
-        text-align: left;
-        cursor: pointer;
-        line-height: 1.6;
-        transition:
-          background var(--transition),
-          transform var(--transition-fast);
-      }
-      .seg:hover:not(:disabled) {
-        background: var(--surface-hover);
-      }
-      .seg:active:not(:disabled) {
-        transform: translateY(1px);
-      }
-      .seg:focus-visible {
-        outline: none;
-        box-shadow: 0 0 0 3px var(--accent-ring);
-      }
-      .seg:disabled {
-        cursor: default;
-      }
-      .seg.is-active {
-        background: var(--accent-soft);
-      }
-      .seg.is-active .seg-text {
-        color: var(--text-primary);
-      }
-      .seg.is-active .seg-time {
         color: var(--accent-hover);
       }
-      .seg-time {
-        flex: none;
-        color: var(--text-muted);
-        font-family: var(--font-mono);
-        font-size: 0.8125rem;
-        font-variant-numeric: tabular-nums;
-        padding-top: 0.1em;
+      .lock-gate-copy {
+        max-width: 42ch;
+      }
+      .lock-gate-btn {
+        margin-top: var(--space-2);
       }
 
-      /* Speaker chip: an optional Me/Others tag between the time + text
-         (colours bound inline). Legacy/null segments render unlabeled. */
-      .seg-speaker {
-        flex: none;
-        padding: 2px var(--space-2);
-        border-radius: var(--radius-pill);
-        font-size: 0.6875rem;
-        font-weight: 700;
-        line-height: 1.5;
-      }
-
-      /* --- Empty / loading wells (.count/.state-card/.empty* are global) --- */
-      .empty-card {
-        padding: var(--space-5);
-      }
-
-      @media (max-width: 720px) {
-        .player {
-          flex-wrap: wrap;
-        }
-      }
-
-      /* Print / Save-as-PDF — isolate the note + analysis. Driven by
-         window.print(); the app chrome (header/nav, aurora) that lives outside
-         this component is hidden globally via body.murmur-printing. */
+      /* Print / Save-as-PDF — isolate the note. Invoked from the Note tab's
+         ⋯ menu, so <app-note-panel> is always present. Driven by
+         window.print(); the app chrome outside this component is hidden
+         globally via body.murmur-printing. The note panel carries its own
+         @media print rules for its internal affordances. */
       @media print {
-        /* Hide the whole detail view, then re-reveal only title + analysis. */
-        .detail > * {
+        /* Hide the shell's own children, then re-reveal the identity header
+           + the note panel host. */
+        .detail > *,
+        .back {
           display: none !important;
         }
-        .detail > .print-keep {
-          display: flex !important;
-        }
-        /* Within the kept regions, drop the interactive affordances. */
-        .head .actions,
-        .head .export,
-        .head .msg,
-        .block .edit-btn,
-        .block .saved,
-        .block .saved-toast {
-          display: none !important;
+        .detail > .print-keep,
+        .detail app-note-panel {
+          display: block !important;
         }
         .head.print-keep {
+          display: flex !important;
           justify-content: flex-start;
         }
         /* Flatten frosted cards + force ink-friendly dark text. */
@@ -2216,11 +554,11 @@ interface ParsedNote {
         }
       }
 
-      /* ── ENHANCE-MY-NOTES: re-summarize working overlay ── */
-      .is-resummarizing {
-        opacity: .55;
-        pointer-events: none;
-        transition: opacity var(--transition);
+      @media (prefers-reduced-motion: reduce) {
+        .detail,
+        .lock-gate {
+          animation: none;
+        }
       }
     `,
   ],
@@ -2233,9 +571,6 @@ export class DetailComponent implements OnInit {
   private readonly destroyRef = inject(DestroyRef);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
-
-  /** Exposed so the template can format aria values. */
-  protected readonly Math = Math;
 
   readonly detail = signal<MeetingDetail | null>(null);
   readonly loading = signal(true);
@@ -2326,51 +661,17 @@ export class DetailComponent implements OnInit {
   /** Tracked so we can cancel the pending export-label reset on destroy. */
   private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // --- Share as link (M3-CLIENT: zero-knowledge note link share) -----------
-  /** True while a `shareNoteToLink` IPC call is in flight (disables the button). */
-  readonly sharing = signal(false);
-  /** The created share URL; the `#…` fragment holds the decryption key (kept local). */
-  readonly shareUrl = signal<string | null>(null);
-  /** Optional password for the NEXT link share — recipients must enter it in the viewer to decrypt.
-   * Transient: mixed into the link key (Argon2id) at share time and cleared right after. */
-  readonly sharePassword = signal("");
-  /** True when the last-created link was password-protected (drives the "share the password
-   * separately" hint). */
-  readonly sharedWithPassword = signal(false);
-  /** Inline error surfaced when sharing fails or is refused (not logged in, etc.). */
-  readonly shareError = signal<string | null>(null);
-  /**
-   * True after the first-share check finds share-egress consent NOT yet granted:
-   * the template shows an inline one-time consent panel before the upload runs.
-   * The meeting id is stashed so Confirm can proceed without re-plumbing it.
-   */
-  readonly needsShareConsent = signal(false);
-  private pendingShareMeetingId: string | null = null;
-  /** Brief "Copied" confirmation for the share-link copy button. */
-  readonly shareLinkCopied = signal(false);
-
-  // --- Share with a person (M5-CLIENT: Murmur↔Murmur, mode B) ---------------
-  /** The meeting being shared (captured when the person flow opens). */
-  private personShareMeetingId: string | null = null;
-  /** Whether the in-flow person-share panel (email/suggest-link/consent/result) is open. */
-  readonly personShareOpen = signal(false);
-  /** The panel's current step. `verifyMode` drives the separate floating sheet. */
-  readonly personStep = signal<PersonShareStep>("email");
-  /** The recipient email being entered/shared (input event → signal). */
-  readonly personEmail = signal("");
-  /** The last recipient preview (carries the fingerprint for the verify sheet). */
-  readonly personPreview = signal<RecipientPreview | null>(null);
-  /** True while a preview / share IPC call for the person flow is in flight. */
-  readonly personBusy = signal(false);
-  /** Inline error for the person flow (also fed to the verify sheet). */
-  readonly personError = signal<string | null>(null);
-  /** The success line shown at the 'result' step ("Sent" / "Invited — …"). */
-  readonly personResult = signal<string | null>(null);
-  /**
-   * When non-null, the floating OPAQUE fingerprint verification SHEET is open in
-   * this mode (first contact vs a changed key). Null = closed.
-   */
-  readonly verifyMode = signal<ShareVerifyMode | null>(null);
+  // --- Page tabs (Note · Audio · Share) ------------------------------------
+  /** The tab bar entries (order = display order). Extensible: add an id + a
+   *  shell `@switch` branch. Each id has a matching `@case` panel in the
+   *  template, so no tab renders blank. */
+  readonly detailTabs: DetailTabDef[] = [
+    { id: "note", label: "Note" },
+    { id: "audio", label: "Audio" },
+    { id: "share", label: "Share" },
+  ];
+  /** The active detail tab (Note default). Reset per meeting in `loadMeeting`. */
+  readonly activeTab = signal<DetailTab>("note");
 
   /**
    * Whether this install keeps high-fidelity per-stream master archives (the
@@ -2402,26 +703,21 @@ export class DetailComponent implements OnInit {
   /** Inline error surfaced when a tag add/remove fails. */
   readonly tagsError = signal("");
 
-  // --- Audio player state (driven by the <audio> event bindings) ----------
-  private readonly audio = viewChild<ElementRef<HTMLAudioElement>>("player");
-  readonly currentTime = signal(0);
-  readonly duration = signal(0);
-  readonly playing = signal(false);
+  /**
+   * Whether the "Copy path" button in the note panel just copied (feeds the
+   * panel's `pathCopied` input). Playback state (currentTime/duration/playing)
+   * now lives in `app-audio-panel`, which owns the `<audio>` element.
+   */
   readonly copied = signal(false);
 
-  /** Asset-protocol URL for the recording, or null when there is no audio. */
+  /**
+   * Asset-protocol URL for the recording, or null when there is no audio.
+   * Passed to the audio panel (the player) and, as `!!audioSrc()`, to the note
+   * panel (gates Save-audio / master exports).
+   */
   readonly audioSrc = computed(() => {
     const path = this.detail()?.meeting.audioPath;
     return path ? convertFileSrc(path) : null;
-  });
-
-  /** Progress as a 0–100 percentage for the seek-bar fill. */
-  readonly progressPct = computed(() => {
-    const dur = this.duration();
-    if (dur <= 0) {
-      return 0;
-    }
-    return Math.min(100, (this.currentTime() / dur) * 100);
   });
 
   /** The note's markdown decomposed into front-matter + body sections. */
@@ -2535,6 +831,15 @@ export class DetailComponent implements OnInit {
   }
 
   /**
+   * The Share-panel precondition gate's CTA — route to Settings (the Account
+   * section hosts the sharing server / sign-in / unlock controls). Fired via the
+   * panel's `setupSharing` output.
+   */
+  async goToSharingSettings(): Promise<void> {
+    await this.router.navigate(["/settings"]);
+  }
+
+  /**
    * Load (or reload) a meeting by id into the view. Resets the per-meeting
    * signals that aren't derived from `detail()` so an in-place reload never
    * shows the previous meeting's timeline/tags/graph or a stale open editor.
@@ -2554,11 +859,11 @@ export class DetailComponent implements OnInit {
     this.renaming.set(false);
     this.moveOpen.set(false);
     this.confirmingDelete.set(false);
-    // Reset audio-playback signals so an in-place meeting→meeting nav never shows the
-    // previous meeting's position/play-state until a media event self-corrects.
-    this.playing.set(false);
-    this.currentTime.set(0);
-    this.duration.set(0);
+    // Land on the Note tab for every meeting (identity-first default).
+    this.activeTab.set("note");
+    // (Audio-playback state now lives in <app-audio-panel>, which owns the
+    // <audio> element + currentTime/duration/playing signals. The panel is
+    // re-instantiated per active tab, so there is nothing to reset here.)
     try {
       this.detail.set(await this.ipc.getMeetingDetail(id));
     } finally {
@@ -3041,118 +1346,6 @@ export class DetailComponent implements OnInit {
     }
   }
 
-  // --- Audio player controls ----------------------------------------------
-
-  private get el(): HTMLAudioElement | null {
-    return this.audio()?.nativeElement ?? null;
-  }
-
-  togglePlay(): void {
-    const el = this.el;
-    if (!el) {
-      return;
-    }
-    if (el.paused) {
-      void el.play();
-    } else {
-      el.pause();
-    }
-  }
-
-  onLoaded(): void {
-    const el = this.el;
-    if (el && Number.isFinite(el.duration)) {
-      this.duration.set(el.duration);
-    }
-  }
-
-  onTimeUpdate(): void {
-    const el = this.el;
-    if (el) {
-      this.currentTime.set(el.currentTime);
-    }
-  }
-
-  onEnded(): void {
-    this.playing.set(false);
-    this.currentTime.set(this.duration());
-  }
-
-  /** Seek to a click position on the progress track. */
-  seekFromEvent(event: MouseEvent): void {
-    const el = this.el;
-    const dur = this.duration();
-    if (!el || dur <= 0) {
-      return;
-    }
-    const bar = event.currentTarget as HTMLElement;
-    const rect = bar.getBoundingClientRect();
-    const ratio = Math.min(
-      1,
-      Math.max(0, (event.clientX - rect.left) / rect.width),
-    );
-    el.currentTime = ratio * dur;
-    this.currentTime.set(el.currentTime);
-  }
-
-  /** Keyboard seeking on the focusable track (← / → by 5s, Home/End). */
-  onTrackKey(event: KeyboardEvent): void {
-    const el = this.el;
-    const dur = this.duration();
-    if (!el || dur <= 0) {
-      return;
-    }
-    let next: number | null = null;
-    switch (event.key) {
-      case "ArrowLeft":
-        next = Math.max(0, el.currentTime - 5);
-        break;
-      case "ArrowRight":
-        next = Math.min(dur, el.currentTime + 5);
-        break;
-      case "Home":
-        next = 0;
-        break;
-      case "End":
-        next = dur;
-        break;
-      case " ":
-      case "Enter":
-        event.preventDefault();
-        this.togglePlay();
-        return;
-      default:
-        return;
-    }
-    event.preventDefault();
-    el.currentTime = next;
-    this.currentTime.set(next);
-  }
-
-  /**
-   * Click-to-seek from a transcript row or a timeline block: jump to `startS`
-   * + play. With no audio element (audioPath null) we still advance the
-   * `currentTime` signal so the timeline highlight + playhead respond.
-   */
-  seekTo(startS: number): void {
-    const el = this.el;
-    if (!el) {
-      const total = this.timelineTotal();
-      const clamped = total > 0 ? Math.min(total, Math.max(0, startS)) : startS;
-      this.currentTime.set(clamped);
-      return;
-    }
-    el.currentTime = startS;
-    this.currentTime.set(startS);
-    void el.play();
-  }
-
-  /** True when playback is inside [startS, endS) — highlights the live row. */
-  isActiveSegment(startS: number, endS: number): boolean {
-    const t = this.currentTime();
-    return t >= startS && t < endS;
-  }
-
   /** Copy a path to the clipboard (no external <a href> navigation). */
   async copy(text: string): Promise<void> {
     try {
@@ -3368,292 +1561,6 @@ export class DetailComponent implements OnInit {
     });
   }
 
-  // --- Share as link (zero-knowledge note link share) ----------------------
-
-  /**
-   * Create a zero-knowledge link share of this note and copy the URL. Guards
-   * first on the sharing-account session (server set? logged in + unlocked?),
-   * then on the one-time share-egress consent: the FIRST share pauses on an
-   * inline consent panel ({@link needsShareConsent}) until the user confirms.
-   *
-   * The returned URL is NEVER logged — its `#…` fragment is the decryption key
-   * and only ever lands in the signal + clipboard.
-   */
-  async shareAsLink(meetingId: string): Promise<void> {
-    if (this.editing() || this.sharing()) {
-      return;
-    }
-    this.shareError.set(null);
-    this.shareUrl.set(null);
-    let st;
-    try {
-      st = await this.ipc.accountStatus();
-    } catch (e) {
-      this.shareError.set(String(e));
-      return;
-    }
-    if (!st.serverConfigured) {
-      this.shareError.set("Set a sharing server in Settings → Account first.");
-      return;
-    }
-    if (!st.loggedIn || !st.unlockedForSharing) {
-      this.shareError.set(
-        "Sign in to your sharing account first (Settings → Account).",
-      );
-      return;
-    }
-    if (!st.shareConsented) {
-      // First share — surface the inline one-time consent panel and stop here.
-      this.pendingShareMeetingId = meetingId;
-      this.needsShareConsent.set(true);
-      return;
-    }
-    await this.doShare(meetingId);
-  }
-
-  /** Confirm the one-time share-egress consent, then proceed with the pending share. */
-  async confirmShareConsent(): Promise<void> {
-    const id = this.pendingShareMeetingId;
-    this.needsShareConsent.set(false);
-    this.pendingShareMeetingId = null;
-    if (!id) {
-      return;
-    }
-    this.shareError.set(null);
-    try {
-      await this.ipc.consentToShareEgress();
-    } catch (e) {
-      this.shareError.set(String(e));
-      return;
-    }
-    await this.doShare(id);
-  }
-
-  /** Cancel the pending first-share (dismiss the consent panel, upload nothing). */
-  cancelShareConsent(): void {
-    this.needsShareConsent.set(false);
-    this.pendingShareMeetingId = null;
-  }
-
-  /**
-   * Perform the actual upload + copy. Consent/login are already verified by the
-   * caller. The URL goes to the signal + clipboard only (never the console).
-   */
-  private async doShare(meetingId: string): Promise<void> {
-    this.sharing.set(true);
-    const pw = this.sharePassword().trim();
-    try {
-      const url = await this.ipc.shareNoteToLink(
-        meetingId,
-        undefined,
-        pw.length > 0 ? pw : undefined,
-      );
-      this.shareUrl.set(url);
-      this.sharedWithPassword.set(pw.length > 0);
-      this.sharePassword.set(""); // clear the transient password once it's baked into the link
-      try {
-        await navigator.clipboard.writeText(url);
-        this.shareLinkCopied.set(true);
-      } catch {
-        // Clipboard unavailable — the URL stays visible + selectable to copy.
-      }
-    } catch (e) {
-      this.shareError.set(String(e));
-    } finally {
-      this.sharing.set(false);
-    }
-  }
-
-  /** Copy the created share link to the clipboard (the readonly-field button). */
-  async copyShareLink(): Promise<void> {
-    const url = this.shareUrl();
-    if (!url) {
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(url);
-      this.shareLinkCopied.set(true);
-    } catch {
-      // Clipboard unavailable — the URL stays visible + selectable.
-    }
-  }
-
-  // --- Share with a person (M5-CLIENT: invite a colleague by email) ---------
-
-  /** Open the in-flow person-share panel at the email step (resets prior state). */
-  openPersonShare(meetingId: string): void {
-    if (this.editing()) {
-      return;
-    }
-    this.personShareMeetingId = meetingId;
-    this.personEmail.set("");
-    this.personPreview.set(null);
-    this.personError.set(null);
-    this.personResult.set(null);
-    this.personStep.set("email");
-    this.verifyMode.set(null);
-    this.personShareOpen.set(true);
-  }
-
-  /** Fully close the person flow (panel + any floating sheet) and clear its state. */
-  closePersonShare(): void {
-    this.personShareOpen.set(false);
-    this.verifyMode.set(null);
-    this.personStep.set("email");
-    this.personEmail.set("");
-    this.personPreview.set(null);
-    this.personError.set(null);
-    this.personResult.set(null);
-  }
-
-  /** Bind the recipient-email input into its signal. */
-  onPersonEmailInput(event: Event): void {
-    this.personEmail.set((event.target as HTMLInputElement).value);
-  }
-
-  /**
-   * Preview the recipient, then branch: unregistered → suggest a protected
-   * link; first contact / changed key → the floating verification sheet;
-   * otherwise send straight away. Gates on the sharing account first (server
-   * configured + signed in + unlocked), mirroring {@link shareAsLink}.
-   */
-  async submitPersonEmail(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    const email = this.personEmail().trim();
-    if (!email) {
-      this.personError.set("Enter an email address.");
-      return;
-    }
-    this.personError.set(null);
-    this.personBusy.set(true);
-    try {
-      const st = await this.ipc.accountStatus();
-      if (!st.serverConfigured) {
-        this.personError.set(
-          "Set a sharing server in Settings → Account first.",
-        );
-        return;
-      }
-      if (!st.loggedIn || !st.unlockedForSharing) {
-        this.personError.set(
-          "Sign in to your sharing account first (Settings → Account).",
-        );
-        return;
-      }
-      const preview = await this.ipc.previewShareRecipient(email);
-      this.personPreview.set(preview);
-      if (!preview.registered) {
-        this.personStep.set("suggest-link");
-      } else if (preview.keyChanged) {
-        // BLOCKING re-verify: never a silent send on a changed key.
-        this.personShareOpen.set(false);
-        this.verifyMode.set("key-changed");
-      } else if (preview.firstContact) {
-        this.personShareOpen.set(false);
-        this.verifyMode.set("first-contact");
-      } else {
-        // Known, verified recipient — share directly.
-        await this.sendToUser();
-      }
-    } catch (e) {
-      this.personError.set(String(e));
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /** The "suggest-link" primary: fall back to the existing protected-link flow. */
-  sendProtectedLinkInstead(): void {
-    const id = this.personShareMeetingId;
-    this.closePersonShare();
-    if (id) {
-      void this.shareAsLink(id);
-    }
-  }
-
-  /** The "suggest-link" secondary: invite the (unregistered) recipient anyway. */
-  async inviteAnyway(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    this.personBusy.set(true);
-    try {
-      await this.sendToUser();
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /** The verify-sheet confirm: the user verified out of band → send. */
-  async confirmVerifiedSend(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    this.personBusy.set(true);
-    try {
-      await this.sendToUser();
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /** Grant the one-time share-egress consent, then retry the pending person share. */
-  async confirmPersonShareConsent(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    this.personBusy.set(true);
-    this.personError.set(null);
-    try {
-      await this.ipc.consentToShareEgress();
-      await this.sendToUser();
-    } catch (e) {
-      this.personError.set(String(e));
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /**
-   * Perform the actual `shareNoteToUser` call and render the outcome. Callers own
-   * the `personBusy` toggle. A thrown "not consented" surfaces the in-flow
-   * consent step (mirroring the link flow's one-time consent); any other throw
-   * (a locked meeting, a server-side changed-key BLOCK) surfaces inline —
-   * never a silent proceed.
-   */
-  private async sendToUser(): Promise<void> {
-    const id = this.personShareMeetingId;
-    if (!id) {
-      return;
-    }
-    const email = this.personEmail().trim();
-    this.personError.set(null);
-    try {
-      const res = await this.ipc.shareNoteToUser(id, email);
-      this.verifyMode.set(null);
-      this.personShareOpen.set(true);
-      this.personStep.set("result");
-      this.personResult.set(
-        res.status === "invited"
-          ? `Invited — they'll get it when they join Murmur. Ask them to install Murmur (macOS) and sign in with ${email}.`
-          : "Sent.",
-      );
-    } catch (e) {
-      const msg = String(e);
-      if (/consent/i.test(msg)) {
-        // First share needs the one-time egress consent — surface it in-flow.
-        this.verifyMode.set(null);
-        this.personShareOpen.set(true);
-        this.personStep.set("consent");
-        this.personError.set(null);
-      } else {
-        this.personError.set(msg);
-      }
-    }
-  }
-
   /** Build a filesystem-safe filename stem from a meeting title. */
   private sanitizeTitle(title: string | null): string {
     const cleaned = (title || "")
@@ -3725,43 +1632,6 @@ export class DetailComponent implements OnInit {
       return new URL(url).host;
     } catch {
       return null;
-    }
-  }
-
-  /** Map an interaction status to a global `.pill` variant (mirrors the live card). */
-  protected qaStatusPillClass(status: string): string {
-    switch (status) {
-      case "ok":
-        return "is-success";
-      case "needs_consent":
-        return "is-warning";
-      case "unavailable":
-      case "unrecognized":
-        return "is-accent";
-      case "nothing_heard":
-        return "";
-      default:
-        return "is-danger";
-    }
-  }
-
-  /** Short human label for the status pill. */
-  protected qaStatusLabel(status: string): string {
-    switch (status) {
-      case "ok":
-        return "Odpowiedziano";
-      case "needs_consent":
-        return "Wymaga zgody";
-      case "unavailable":
-        return "Niedostępne";
-      case "unrecognized":
-        return "Nierozpoznane";
-      case "nothing_heard":
-        return "Nic nie usłyszano";
-      case "error":
-        return "Błąd";
-      default:
-        return status;
     }
   }
 
@@ -3918,57 +1788,6 @@ export class DetailComponent implements OnInit {
   /** Strip surrounding quotes/whitespace from a YAML scalar. */
   private cleanScalar(s: string): string {
     return s.trim().replace(/^["']/, "").replace(/["']$/, "").trim();
-  }
-
-  /**
-   * Map a transcript segment's `speaker` to a small presentational chip:
-   * "Me" (the local mic, accent) vs "Others" (captured system audio, neutral/
-   * violet). Returns null for legacy / mic-only segments (`null` / unknown) so
-   * they render unlabeled exactly as before. This is independent of the AI
-   * timeline's manual speaker-rename — that feature relabels timeline lanes, not
-   * these per-segment Me/Others tags.
-   */
-  speakerChip(
-    speaker: Segment["speaker"],
-  ): { label: string; bg: string; fg: string } | null {
-    switch (speaker) {
-      case "me":
-        // Local mic — the calm accent.
-        return {
-          label: "Me",
-          bg: "var(--accent-soft)",
-          fg: "var(--accent-hover)",
-        };
-      case "others":
-        // Captured system audio — a neutral violet, distinct from "Me".
-        return {
-          label: "Others",
-          bg: "rgba(157, 123, 255, 0.16)",
-          fg: "#b9a4ff",
-        };
-      default: {
-        // A diarized remote cluster tag ("others-{n}") → a "Speaker {n+1}" chip (same neutral
-        // violet as "Others"). Presentational only; independent of the timeline lanes' LLM/renamed
-        // labels. Any other/legacy value stays unlabeled (null).
-        const m = /^others-(\d+)$/.exec(speaker ?? "");
-        if (m) {
-          return {
-            label: `Speaker ${Number(m[1]) + 1}`,
-            bg: "rgba(157, 123, 255, 0.16)",
-            fg: "#b9a4ff",
-          };
-        }
-        return null;
-      }
-    }
-  }
-
-  /** Seconds → m:ss for timestamps + player times. */
-  fmt(s: number): string {
-    const total = Math.max(0, Math.floor(s || 0));
-    const m = Math.floor(total / 60);
-    const sec = total % 60;
-    return `${m}:${sec.toString().padStart(2, "0")}`;
   }
 
   /** Maps a meeting status to a status-pill state modifier (presentation only). */
