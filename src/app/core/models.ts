@@ -1288,6 +1288,13 @@ export interface AccountStatus {
   shareConsented: boolean;
   /** A sharing server base URL is configured (sharing is impossible without one). */
   serverConfigured: boolean;
+  /**
+   * A one-tap Touch ID unlock is possible: logged in AND a cached account key
+   * exists on this device, so `unlock_sharing_with_biometric` can restore the
+   * session MK with a single biometric sheet (no password re-entry). When false,
+   * fall back to the password sign-in flow to re-unlock for sharing.
+   */
+  biometricUnlockAvailable: boolean;
 }
 
 /** Mirrors Rust `commands::MyShareEntry` — one row of the user's shares. Content-free: `title` is

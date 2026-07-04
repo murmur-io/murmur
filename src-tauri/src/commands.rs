@@ -7721,6 +7721,11 @@ pub struct AccountStatus {
     pub share_consented: bool,
     /// Whether a sharing server is configured (a share is impossible without one).
     pub server_configured: bool,
+    /// True iff logged in AND a biometric-gated MK cache exists — so a locked session can be restored
+    /// with one Touch ID tap (`unlock_sharing_with_biometric`) instead of a password re-login. The FE
+    /// shows the "Unlock with Touch ID" button only when this is set (and `unlockedForSharing` is not).
+    /// NO Touch ID prompt is presented to compute this (existence probe only).
+    pub biometric_unlock_available: bool,
 }
 
 /// One row of `list_my_shares` (camelCase). Content-free by construction — the server holds no
@@ -7775,6 +7780,8 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
             None => (false, None, false),
         },
     };
+    // Existence-only probe (NO Touch ID prompt): can a locked session be restored biometrically?
+    let biometric_unlock_available = logged_in && crate::secrets::keychain::account_mk_cached()?;
     let cfg = state
         .config
         .lock()
@@ -7785,6 +7792,7 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
         unlocked_for_sharing: unlocked,
         share_consented: cfg.share_egress_consented,
         server_configured: !cfg.share_base_url.trim().is_empty(),
+        biometric_unlock_available,
     })
 }
 
@@ -7997,13 +8005,14 @@ pub async fn account_login(
     let mk = crate::e2ee::keys::unwrap_mk_pw(&key_material.mk_wrap_pw, &kek_pw, &acct_id)?;
     let generation = key_material.current_generation.unwrap_or(1);
 
-    // Persist tokens to the Keychain (never SQLite, never logged).
+    // Persist tokens + the non-secret generation to the Keychain (never SQLite, never logged).
     crate::share::store_tokens(&crate::share::PersistedTokens {
         access_token: access_token.clone(),
         refresh_token,
         device_id: device_id.clone(),
         email: acct_id.clone(),
         account_id: acct_id.clone(),
+        generation,
     })?;
 
     // Cache the session (MK in RAM, zeroized on drop).
@@ -8020,6 +8029,18 @@ pub async fn account_login(
             generation,
             access_token,
         });
+    }
+
+    // Cache the MK biometric-gated (WRITE — no Touch ID prompt) so a later restart restores the session
+    // with one Touch ID tap (`unlock_sharing_with_biometric`) instead of a password re-login. Non-fatal:
+    // a cache failure just means the FE won't offer the Touch ID button — login still succeeds. The MK
+    // is never logged.
+    if let Err(e) = crate::secrets::keychain::cache_account_mk_biometric(&mk) {
+        tracing::warn!(
+            target: "share",
+            error = %e,
+            "could not cache the account key for biometric unlock (non-fatal — password unlock still works)"
+        );
     }
 
     crate::share::ledger_row(&state.db, &client.host(), "account_login", 0);
@@ -8039,11 +8060,55 @@ pub async fn account_logout(state: State<'_, AppState>) -> Result<(), AppError> 
             }
         }
     }
-    crate::share::clear_tokens()?;
+    // Drop the in-RAM session FIRST so a fallible keychain clear below can't early-return (`?`) and
+    // leave the live MK sitting in memory (lock-security review, 2026-07-05).
     if let Ok(mut session) = state.account_session.lock() {
         *session = None; // drops the AccountSession → zeroizes MK.
     }
+    crate::share::clear_tokens()?;
+    crate::secrets::keychain::clear_account_mk()?; // drop the biometric MK cache too (idempotent).
     Ok(())
+}
+
+/// `unlock_sharing_with_biometric() -> AccountStatus` — restore a logged-in-but-locked sharing session
+/// (the MK is lost on restart, held only in RAM) by releasing the biometric-cached account master key
+/// with a single Touch ID tap, instead of re-typing the account password.
+///
+/// Rebuilds the in-RAM [`crate::share::AccountSession`] from the persisted tokens + the biometric-
+/// released MK + the persisted `generation`. Fails CLOSED — [`AppError::Unavailable`] when not signed
+/// in or no MK is cached, [`AppError::BiometricFailed`] on a cancelled/failed tap — so the FE can fall
+/// back to the password login. The MK never touches the log.
+#[tauri::command]
+pub async fn unlock_sharing_with_biometric(
+    state: State<'_, AppState>,
+) -> Result<AccountStatus, AppError> {
+    // Must be logged in (tokens present) to have anything to restore.
+    let tokens = crate::share::load_tokens()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+
+    // Release the cached MK behind a Touch ID prompt (signed build). Held zeroizing from here on;
+    // fails closed if no cache exists or the user cancels the sheet.
+    let mk = Zeroizing::new(crate::secrets::keychain::read_account_mk_biometric(
+        "Unlock Murmur sharing",
+    )?);
+
+    // Rebuild the session from the persisted tokens + released MK (MK moved in, zeroized on drop).
+    {
+        let mut session = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        *session = Some(crate::share::AccountSession {
+            account_id: tokens.account_id,
+            email: tokens.email,
+            device_id: tokens.device_id,
+            mk,
+            generation: tokens.generation,
+            access_token: tokens.access_token,
+        });
+    }
+
+    account_status(state)
 }
 
 /// `share_note_to_link(meeting_id, expires_days?, password?, max_downloads?) -> String` — create a
