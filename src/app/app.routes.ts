@@ -88,6 +88,16 @@ export const routes: Routes = [
             (m) => m.OnboardingComponent,
           ),
       },
+      {
+        // First-run SHARING gateway (a shell child, router-mounted so the
+        // packaged WKWebView style-resolves it — trap T4). Shown after the
+        // onboarding gate when `!sharingChoiceMade && !accountStatus.loggedIn`.
+        path: "welcome",
+        loadComponent: () =>
+          import("./features/sharing/sharing-gateway.component").then(
+            (m) => m.SharingGatewayComponent,
+          ),
+      },
       { path: "", pathMatch: "full", redirectTo: "record" },
       { path: "**", redirectTo: "record" },
     ],

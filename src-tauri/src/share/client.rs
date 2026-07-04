@@ -63,11 +63,16 @@ impl ShareClient {
     }
 
     /// Map a response status to a typed error WITHOUT surfacing the reqwest Display (which can echo
-    /// the URL). 401 → Auth (re-login), 404/uniform → Unavailable("not found"), else Unavailable.
+    /// the URL). A 4xx is a REQUEST problem (bad/expired code, used token) → `InvalidArg`, so the UI
+    /// never renders it as "can't reach the server" — only a genuine connection failure (the `.send()`
+    /// map_err → `Unavailable`) or a 5xx is unavailability. 401 → Auth (re-login).
     fn status_err(ctx: &str, status: StatusCode) -> AppError {
         match status {
             StatusCode::UNAUTHORIZED => AppError::Auth(format!("{ctx}: not authenticated")),
-            StatusCode::NOT_FOUND => AppError::Unavailable(format!("{ctx}: not found")),
+            StatusCode::TOO_MANY_REQUESTS => {
+                AppError::InvalidArg(format!("{ctx}: too many attempts — wait a bit and try again"))
+            }
+            s if s.is_client_error() => AppError::InvalidArg(format!("{ctx}: rejected ({})", s.as_u16())),
             s => AppError::Unavailable(format!("{ctx}: server returned {}", s.as_u16())),
         }
     }
