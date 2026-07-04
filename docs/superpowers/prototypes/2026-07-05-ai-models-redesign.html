@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur · AI &amp; Models — posture-driven redesign (prototype)</title>
+<style>
+  :root {
+    --surface-base:#07070b; --surface-raised:rgba(255,255,255,0.045);
+    --surface-overlay:#1b1b24; --surface-input:rgba(255,255,255,0.035);
+    --surface-solid:#111118; --surface-hover:rgba(255,255,255,0.06);
+    --glass-border:rgba(255,255,255,0.10);
+    --text-primary:#f6f6fa; --text-secondary:#a6a6b6; --text-muted:#6c6c7d; --text-on-accent:#fff;
+    --accent:#6e76ff; --accent-hover:#8a90ff; --accent-active:#5b63f0;
+    --accent-soft:rgba(110,118,255,0.16); --accent-ring:rgba(110,118,255,0.5);
+    --accent-gradient:linear-gradient(135deg,#6e76ff 0%,#9d7bff 100%);
+    --border:rgba(255,255,255,0.09); --border-strong:rgba(255,255,255,0.16); --border-subtle:rgba(255,255,255,0.055);
+    --success:#4ade80; --success-soft:rgba(74,222,128,0.15);
+    --warning:#f5b14c; --warning-soft:rgba(245,177,76,0.14); --danger:#ff6b6b;
+    --radius-sm:9px; --radius-md:13px; --radius-lg:18px; --radius-pill:999px;
+    --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px;
+    --shadow-md:0 16px 40px rgba(0,0,0,0.42); --shadow-lg:0 28px 70px rgba(0,0,0,0.55);
+    --transition:200ms cubic-bezier(0.32,0.72,0,1);
+    --font-sans:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:
+      radial-gradient(1200px 700px at 80% -10%, rgba(110,118,255,0.10), transparent 60%),
+      radial-gradient(900px 600px at -10% 20%, rgba(157,123,255,0.08), transparent 55%),
+      var(--surface-base);
+    color:var(--text-primary); font-family:var(--font-sans);
+    -webkit-font-smoothing:antialiased; line-height:1.5; padding:40px 20px 120px;
+  }
+  .shell { max-width:720px; margin:0 auto; }
+  .proto-note {
+    max-width:720px; margin:0 auto var(--space-5); font-size:0.8rem; color:var(--text-muted);
+    border:1px dashed var(--border-strong); border-radius:var(--radius-md); padding:10px 14px;
+  }
+  .proto-note b { color:var(--text-secondary); }
+  h1.page { font-size:1.7rem; font-weight:700; margin:0 0 var(--space-5); letter-spacing:-0.01em; }
+  h3 { margin:0; font-size:1.05rem; font-weight:650; letter-spacing:-0.01em; }
+  .text-secondary { color:var(--text-secondary); }
+  .text-muted { color:var(--text-muted); }
+  .card {
+    background:var(--surface-raised); border:1px solid var(--glass-border);
+    border-radius:var(--radius-lg); padding:var(--space-5); margin-bottom:var(--space-4);
+    backdrop-filter:blur(30px) saturate(135%);
+  }
+  .head-copy { display:flex; flex-direction:column; gap:6px; margin-bottom:var(--space-4); }
+  .sub { margin:0; font-size:0.875rem; }
+
+  /* ── posture segmented ── */
+  .posture-seg { display:flex; gap:var(--space-2); flex-wrap:wrap; }
+  .posture-opt {
+    display:flex; flex-direction:column; gap:3px; flex:1 1 150px; min-width:0; text-align:left;
+    padding:12px 14px; border:1px solid var(--border-subtle); border-radius:var(--radius-md);
+    background:var(--surface-input); color:var(--text-primary); cursor:pointer;
+    transition:border-color var(--transition), background var(--transition);
+  }
+  .posture-opt:hover { border-color:var(--border-strong); }
+  .posture-opt.is-active { border-color:var(--accent); background:var(--accent-soft); box-shadow:0 0 0 1px var(--accent); }
+  .posture-opt-title { font-size:0.95rem; font-weight:650; }
+  .posture-opt-sub { font-size:0.78rem; line-height:1.4; }
+  .posture-meaning { margin:var(--space-4) 0 0; font-size:0.9rem; line-height:1.6; }
+  .posture-meaning .lead { color:var(--text-primary); font-weight:600; }
+
+  /* ── setup fields ── */
+  .setup-card + .setup-card { margin-top:var(--space-3); }
+  .field { display:flex; flex-direction:column; gap:6px; }
+  .field + .field { margin-top:var(--space-4); }
+  .field-label { font-size:0.9rem; font-weight:600; color:var(--text-secondary); }
+  .field-help { font-size:0.8125rem; color:var(--text-muted); line-height:1.5; }
+  select, input[type=text] {
+    appearance:none; background:var(--surface-input); color:var(--text-primary);
+    border:1px solid var(--border-subtle); border-radius:var(--radius-sm);
+    padding:9px 12px; font:inherit; font-size:0.9rem; width:100%;
+    background-image:url("data:image/svg+xml,%3Csvg width='10' height='6' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23a6a6b6' stroke-width='1.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 12px center; padding-right:32px;
+  }
+  select:focus, input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-ring); }
+  option { background:var(--surface-overlay); color:var(--text-primary); }
+  .row { display:flex; gap:var(--space-3); align-items:flex-end; flex-wrap:wrap; }
+  .row .field { flex:1 1 220px; }
+  .inline-row { display:flex; gap:var(--space-2); align-items:center; }
+  .inline-row select { flex:1; }
+
+  .btn { border:none; border-radius:var(--radius-sm); font:inherit; font-size:0.875rem; font-weight:600;
+    padding:9px 16px; cursor:pointer; transition:background var(--transition), border-color var(--transition); white-space:nowrap; }
+  .btn-primary { background:var(--accent-gradient); color:var(--text-on-accent); box-shadow:0 8px 24px rgba(110,118,255,0.35); }
+  .btn-primary:hover { filter:brightness(1.06); }
+  .btn-ghost { background:transparent; color:var(--text-secondary); border:1px solid var(--border-subtle); }
+  .btn-ghost:hover { border-color:var(--border-strong); color:var(--text-primary); background:var(--surface-hover); }
+  .btn-sm { padding:6px 12px; font-size:0.8125rem; }
+
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:0.8rem; font-weight:600;
+    padding:3px 10px; border-radius:var(--radius-pill); border:1px solid var(--border-subtle);
+    background:var(--surface-input); color:var(--text-secondary); }
+  .pill-dot { width:7px; height:7px; border-radius:50%; background:currentColor; opacity:0.8; }
+  .pill.is-success { color:var(--success); background:var(--success-soft); border-color:transparent; }
+  .pill.is-warn { color:var(--warning); background:var(--warning-soft); border-color:transparent; }
+  .pill.is-cloud { color:var(--text-secondary); }
+
+  /* ── the honest map ── */
+  .map-group + .map-group { margin-top:var(--space-4); padding-top:var(--space-4); border-top:1px solid var(--border-subtle); }
+  .map-group-label { font-size:0.78rem; font-weight:650; text-transform:uppercase; letter-spacing:0.03em; color:var(--text-muted); margin:0 0 var(--space-2); display:flex; align-items:center; gap:8px; }
+  .map-row { display:grid; grid-template-columns:minmax(120px,0.6fr) 1fr auto auto; align-items:center; gap:var(--space-3); padding:9px 0; border-top:1px solid var(--border-subtle); }
+  .map-group .map-row:first-of-type { border-top:none; }
+  .map-title { font-size:0.875rem; font-weight:550; color:var(--text-secondary); }
+  .map-engine { font-size:0.875rem; }
+  .map-engine .m-model { color:var(--text-muted); font-size:0.8125rem; }
+  .map-row.is-off .map-title, .map-row.is-off .map-engine { opacity:0.5; }
+  .change-spacer { width:1px; }
+  .empty-cloud { font-size:0.875rem; color:var(--success); display:flex; align-items:center; gap:8px; padding:4px 0; }
+
+  /* ── advanced ── */
+  .adv-toggle { display:flex; align-items:center; gap:var(--space-2); width:100%; text-align:left;
+    padding:14px 16px; background:var(--surface-input); border:1px solid var(--border-subtle);
+    border-radius:var(--radius-md); color:var(--text-secondary); font:inherit; font-size:0.9rem; font-weight:600; cursor:pointer; }
+  .adv-toggle:hover { border-color:var(--border-strong); color:var(--text-primary); }
+  .adv-toggle.is-open { border-bottom-left-radius:0; border-bottom-right-radius:0; border-bottom-color:transparent; }
+  .chev { transition:transform var(--transition); }
+  .chev.is-open { transform:rotate(90deg); }
+  .adv-body { border:1px solid var(--border-subtle); border-top:none; border-radius:0 0 var(--radius-md) var(--radius-md);
+    background:var(--surface-input); padding:var(--space-5); display:none; flex-direction:column; gap:var(--space-4); }
+  .adv-body.is-open { display:flex; }
+  .adv-sub-label { font-size:0.78rem; font-weight:650; text-transform:uppercase; letter-spacing:0.03em; color:var(--text-muted); margin:0; }
+  .eng-row { display:flex; align-items:center; justify-content:space-between; gap:var(--space-3);
+    padding:12px 14px; background:var(--surface-raised); border:1px solid var(--border-subtle); border-radius:var(--radius-md); }
+  .eng-name { font-weight:600; font-size:0.9rem; display:flex; align-items:center; gap:10px; }
+  .eng-desc { font-size:0.8rem; color:var(--text-muted); margin-top:2px; }
+  .role-row { padding:12px 14px; background:var(--surface-raised); border:1px solid var(--border-subtle); border-radius:var(--radius-md); }
+  .role-row + .role-row { margin-top:var(--space-2); }
+  .role-row.hl { animation:flash 1.6s ease; border-color:var(--accent); }
+  @keyframes flash { 0%,100% { box-shadow:none; } 25% { box-shadow:0 0 0 3px var(--accent-ring); } }
+
+  .divider { height:1px; background:var(--border-subtle); margin:var(--space-3) 0; }
+  .save-bar { position:fixed; left:0; right:0; bottom:0; padding:14px 20px; background:linear-gradient(0deg,var(--surface-base),transparent);
+    display:flex; justify-content:center; }
+</style>
+</head>
+<body>
+
+<div class="proto-note">
+  <b>Prototyp (nie apka).</b> Klikaj karty <b>Where your AI runs</b> — sekcje „Your setup" i „What runs where" przebudowują się na żywo, dokładnie jak zrobi to realny silnik.
+  „Change" scrolluje + podświetla właściwy wiersz w Advanced. Silniki chmury / modele lokalne / RAM — realne dane z rejestru.
+</div>
+
+<div class="shell">
+  <h1 class="page">AI &amp; Models</h1>
+
+  <!-- ─────────────────────────────── A. WHERE YOUR AI RUNS ─────────────────────────────── -->
+  <div class="card">
+    <div class="head-copy">
+      <h3>Where your AI runs</h3>
+      <p class="sub text-secondary">Pick how much runs on this Mac. Everything below adapts to your choice — no jargon to untangle.</p>
+    </div>
+    <div class="posture-seg" id="postureSeg">
+      <button class="posture-opt" data-posture="cloud">
+        <span class="posture-opt-title">Cloud</span>
+        <span class="posture-opt-sub text-muted">Fast &amp; smart. Your cloud engine writes everything.</span>
+      </button>
+      <button class="posture-opt" data-posture="hybrid">
+        <span class="posture-opt-title">Hybrid ⭐</span>
+        <span class="posture-opt-sub text-muted">Cloud notes + realtime reactions on this Mac.</span>
+      </button>
+      <button class="posture-opt" data-posture="fully_local">
+        <span class="posture-opt-title">Fully local</span>
+        <span class="posture-opt-sub text-muted">Nothing leaves this Mac. Ever.</span>
+      </button>
+    </div>
+    <p class="posture-meaning" id="postureMeaning"></p>
+  </div>
+
+  <!-- ─────────────────────────────── B. YOUR SETUP (adaptive) ─────────────────────────────── -->
+  <div id="setupHost"></div>
+
+  <!-- ─────────────────────────────── C. WHAT RUNS WHERE (honest map) ─────────────────────────────── -->
+  <div class="card">
+    <div class="head-copy">
+      <h3>What runs where</h3>
+      <p class="sub text-secondary">Every AI job and the engine serving it right now — grouped by where your words go.</p>
+    </div>
+    <div id="mapHost"></div>
+  </div>
+
+  <!-- ─────────────────────────────── D. ADVANCED ─────────────────────────────── -->
+  <div class="adv-toggle" id="advToggle">
+    <svg class="chev" id="advChev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+      <path d="M4 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    Advanced — per-feature overrides &amp; all engines
+  </div>
+  <div class="adv-body" id="advBody">
+    <div>
+      <p class="adv-sub-label">Per-feature overrides</p>
+      <p class="field-help" style="margin:4px 0 12px">Send one feature to a different engine than your posture. Blank = follow the posture above.</p>
+      <div class="role-row" id="role-notes">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+          <div><div style="font-weight:600;font-size:0.9rem">Meeting notes</div><div class="eng-desc">Summaries, digests, briefs, graph</div></div>
+          <select style="flex:0 1 240px"><option>Follow posture (default)</option><option>Claude Code</option><option>Anthropic API</option><option>Ollama</option><option>Kong AI Gateway</option></select>
+        </div>
+      </div>
+      <div class="role-row" id="role-ask">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+          <div><div style="font-weight:600;font-size:0.9rem">Ask &amp; chat</div><div class="eng-desc">Vault Q&amp;A + meeting chat</div></div>
+          <select style="flex:0 1 240px"><option>Follow posture (default)</option><option>On this Mac — built-in</option><option>Off — retrieval only</option><option>Claude Code</option><option>Anthropic API</option><option>Ollama</option><option>Kong AI Gateway</option></select>
+        </div>
+      </div>
+      <div class="role-row" id="role-live">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+          <div><div style="font-weight:600;font-size:0.9rem">Live during meetings</div><div class="eng-desc">@brain threads + voice assistant</div></div>
+          <select style="flex:0 1 240px"><option>Follow posture (default)</option><option>On this Mac — built-in</option><option>Off — retrieval only</option><option>Claude Code</option><option>Anthropic API</option><option>Ollama</option><option>Kong AI Gateway</option></select>
+        </div>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div>
+      <p class="adv-sub-label">All engines — set up once</p>
+      <p class="field-help" style="margin:4px 0 12px">Where models <em>can</em> run. Configure once; posture and overrides pick which one is used.</p>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div class="eng-row"><div><div class="eng-name">On this Mac <span class="pill is-success"><span class="pill-dot"></span>Ready</span></div><div class="eng-desc">Built-in models — nothing leaves this Mac. Powers realtime reactions &amp; Fully local.</div></div><button class="btn btn-ghost btn-sm">Manage models</button></div>
+        <div class="eng-row"><div><div class="eng-name">Ollama <span class="pill is-success"><span class="pill-dot"></span>Ready</span></div><div class="eng-desc">Your own local model server — separate from the built-in models.</div></div><button class="btn btn-ghost btn-sm">Configure</button></div>
+        <div class="eng-row"><div><div class="eng-name">Claude Code <span class="pill is-success"><span class="pill-dot"></span>Ready</span></div><div class="eng-desc">Cloud — redacted first.</div></div><button class="btn btn-ghost btn-sm">Configure</button></div>
+        <div class="eng-row"><div><div class="eng-name">Anthropic API <span class="pill is-warn"><span class="pill-dot"></span>Needs setup</span></div><div class="eng-desc">Cloud — redacted first. No API key set in Keychain.</div></div><button class="btn btn-ghost btn-sm">Configure</button></div>
+        <div class="eng-row"><div><div class="eng-name">Kong AI Gateway <span class="pill is-success"><span class="pill-dot"></span>Ready</span></div><div class="eng-desc">Cloud — redacted first. OpenAI-compatible.</div></div><button class="btn btn-ghost btn-sm">Configure</button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="save-bar"><button class="btn btn-primary" style="padding:11px 28px">Save settings</button></div>
+
+<script>
+/* ── real model registry (from reason::BRAIN_MODELS + engine list) ── */
+const CLOUD_ENGINES = {
+  claude_code: { name:"Claude Code", models:["default","claude-sonnet-4-6","claude-opus-4-8","claude-haiku-4-5"], status:"ready" },
+  anthropic:   { name:"Anthropic API", models:["claude-opus-4-8","claude-sonnet-4-6","claude-haiku-4-5"], status:"needs" },
+  gateway:     { name:"Kong AI Gateway", models:["gpt-4o","gpt-4o-mini","(your model id)"], status:"ready" },
+};
+const HEAVY = {
+  "qwen3-4b-instruct-2507": { name:"Qwen3 4B Instruct 2507", tag:"multilingual", size:"2.3 GB", ram:"≥6 GB RAM", downloaded:true },
+  "bielik-4.5b-v3":         { name:"Bielik 4.5B v3", tag:"Polish-native", size:"4.6 GB", ram:"≥10 GB RAM", downloaded:false },
+  "bielik-11b-v3":          { name:"Bielik 11B v3", tag:"Polish-native", size:"6.7 GB", ram:"≥10 GB RAM", downloaded:true },
+  "qwen3-14b":              { name:"Qwen3 14B", tag:"multilingual", size:"9.0 GB", ram:"≥14 GB RAM", downloaded:false },
+};
+const LIGHT = {
+  "qwen3-1.7b":     { name:"Qwen3 1.7B", tag:"multilingual", size:"1.0 GB", ram:"≥4 GB RAM", downloaded:true },
+  "bielik-1.5b-v3": { name:"Bielik 1.5B v3", tag:"Polish-native", size:"1.5 GB", ram:"≥4 GB RAM", downloaded:false },
+};
+
+/* ── UI state ── */
+const state = {
+  posture: "cloud",
+  cloudEngine: "claude_code",
+  cloudModel: "default",
+  heavyModel: "bielik-11b-v3",
+  lightModel: "qwen3-1.7b",
+};
+
+const MEANING = {
+  cloud: `<span class="lead">Cloud.</span> Your cloud engine writes your notes, answers and briefs — sent redacted (names stripped) after your consent. Recording, transcription, search and name-detection still happen only on this Mac.`,
+  hybrid: `<span class="lead">Hybrid ⭐ — recommended.</span> Same cloud quality for notes &amp; answers, but realtime in-meeting reactions run on a small model on this Mac, so nothing leaves live.`,
+  fully_local: `<span class="lead">Fully local.</span> Every AI job runs on this Mac using built-in models. Nothing ever leaves — no cloud, no consent needed. Bigger models are slower and need more RAM.`,
+};
+
+function opt(map, sel){ return Object.entries(map).map(([id,m])=>{
+  const dl = m.downloaded ? "" : " · ⬇ download";
+  return `<option value="${id}" ${id===sel?"selected":""}>${m.name} · ${m.tag} · ${m.size}${dl}</option>`;
+}).join(""); }
+
+function cloudEngineCard(){
+  const e = CLOUD_ENGINES[state.cloudEngine];
+  const needs = e.status==="needs";
+  return `
+  <div class="card setup-card">
+    <div class="head-copy"><h3>Your cloud engine</h3>
+      <p class="sub text-secondary">Writes notes, answers and briefs. Text is redacted before it leaves.</p></div>
+    <div class="row">
+      <div class="field"><span class="field-label">Engine</span>
+        <select id="cloudEngineSel">
+          <option value="claude_code" ${state.cloudEngine==="claude_code"?"selected":""}>Claude Code</option>
+          <option value="anthropic" ${state.cloudEngine==="anthropic"?"selected":""}>Anthropic API</option>
+          <option value="gateway" ${state.cloudEngine==="gateway"?"selected":""}>Kong AI Gateway (OpenAI-compatible)</option>
+        </select>
+      </div>
+      <div class="field"><span class="field-label">Model</span>
+        <select id="cloudModelSel">${e.models.map(m=>`<option ${m===state.cloudModel?"selected":""}>${m}</option>`).join("")}</select>
+      </div>
+      <button class="btn btn-ghost" style="height:38px">Test</button>
+    </div>
+    ${needs ? `<p class="field-help" style="color:var(--warning);margin-top:12px">⚠ Needs setup — add your API key under Advanced → All engines.</p>`
+            : `<p class="field-help" style="margin-top:12px"><span class="pill is-cloud"><span class="pill-dot"></span>Cloud — redacted first</span></p>`}
+  </div>`;
+}
+
+function reactionsCard(){
+  const m = LIGHT[state.lightModel];
+  return `
+  <div class="card setup-card">
+    <div class="head-copy"><h3>On-device model — realtime reactions</h3>
+      <p class="sub text-secondary">A small model runs live during meetings for instant reactions &amp; fact-spotting. Stays on this Mac.</p></div>
+    <div class="inline-row">
+      <select id="lightSel">${opt(LIGHT, state.lightModel)}</select>
+      ${m.downloaded ? `<span class="pill is-success"><span class="pill-dot"></span>Ready</span>`
+                     : `<button class="btn btn-primary btn-sm">Download ${m.size}</button>`}
+    </div>
+    <p class="field-help" style="margin-top:10px">${m.ram} · one-time download from Hugging Face, then fully offline.</p>
+  </div>`;
+}
+
+function localModelsCard(){
+  const h = HEAVY[state.heavyModel], l = LIGHT[state.lightModel];
+  const ramWarn = (state.heavyModel==="bielik-11b-v3"||state.heavyModel==="qwen3-14b");
+  return `
+  <div class="card setup-card">
+    <div class="head-copy"><h3>Your on-device models</h3>
+      <p class="sub text-secondary">Everything runs here. Pick the models Murmur uses — bigger = better notes but slower &amp; more RAM.</p></div>
+    <div class="field"><span class="field-label">Notes &amp; Ask <span class="text-muted" style="font-weight:400">— heavy model, runs after the meeting</span></span>
+      <div class="inline-row">
+        <select id="heavySel">${opt(HEAVY, state.heavyModel)}</select>
+        ${h.downloaded ? `<span class="pill is-success"><span class="pill-dot"></span>Ready</span>` : `<button class="btn btn-primary btn-sm">Download ${h.size}</button>`}
+      </div>
+    </div>
+    <div class="field"><span class="field-label">Live &amp; realtime reactions <span class="text-muted" style="font-weight:400">— light model, runs during the meeting</span></span>
+      <div class="inline-row">
+        <select id="lightSel">${opt(LIGHT, state.lightModel)}</select>
+        ${l.downloaded ? `<span class="pill is-success"><span class="pill-dot"></span>Ready</span>` : `<button class="btn btn-primary btn-sm">Download ${l.size}</button>`}
+      </div>
+    </div>
+    ${ramWarn ? `<p class="field-help" style="color:var(--warning);margin-top:12px">⚠ ${h.name} needs ${h.ram} — may be slow alongside recording on a smaller Mac.</p>` : ``}
+  </div>`;
+}
+
+/* ── the honest map: two groups, cloud vs on-mac ── */
+function mapRows(){
+  const ce = CLOUD_ENGINES[state.cloudEngine];
+  const cloudEngineLabel = ce.name;
+  const cloudModelLabel = state.cloudModel==="default" ? "" : state.cloudModel;
+  const heavy = HEAVY[state.heavyModel].name;
+  const light = LIGHT[state.lightModel].name;
+
+  let cloud=[], mac=[];
+  if(state.posture==="cloud"){
+    cloud=[["Notes & summaries",cloudEngineLabel,cloudModelLabel],["Ask & chat",cloudEngineLabel,cloudModelLabel],["Live @brain",cloudEngineLabel,cloudModelLabel]];
+    mac=[["Realtime reactions","— off in Cloud","",true],["Transcription","Whisper","large-v3"],["Search index","Multilingual E5 Small",""],["Name redaction","On-device NER",""]];
+  } else if(state.posture==="hybrid"){
+    cloud=[["Notes & summaries",cloudEngineLabel,cloudModelLabel],["Ask & chat",cloudEngineLabel,cloudModelLabel],["Live @brain",cloudEngineLabel,cloudModelLabel]];
+    mac=[["Realtime reactions",light,""],["Transcription","Whisper","large-v3"],["Search index","Multilingual E5 Small",""],["Name redaction","On-device NER",""]];
+  } else {
+    cloud=[];
+    mac=[["Notes & summaries",heavy,""],["Ask & chat",heavy,""],["Live @brain",light,""],["Realtime reactions",light,""],["Transcription","Whisper","large-v3"],["Search index","Multilingual E5 Small",""],["Name redaction","On-device NER",""]];
+  }
+
+  const routable = new Set(["Notes & summaries","Ask & chat","Live @brain"]);
+  const rowHtml = (r, loc)=>{
+    const off = r[3];
+    const changeBtn = routable.has(r[0]) ? `<button class="btn btn-ghost btn-sm" data-change="${r[0]}">Change</button>` : `<span class="change-spacer"></span>`;
+    return `<div class="map-row ${off?"is-off":""}">
+      <span class="map-title">${r[0]}</span>
+      <span class="map-engine">${r[1]} ${r[2]?`<span class="m-model">· ${r[2]}</span>`:""}</span>
+      <span class="pill ${loc==="mac"?"is-success":"is-cloud"}"><span class="pill-dot"></span>${loc==="mac"?"On this Mac":"Cloud · redacted"}</span>
+      ${changeBtn}
+    </div>`;
+  };
+
+  let html = "";
+  html += `<div class="map-group"><p class="map-group-label">☁ Goes to the cloud — redacted first</p>`;
+  html += cloud.length ? cloud.map(r=>rowHtml(r,"cloud")).join("") : `<div class="empty-cloud">✓ Nothing leaves this Mac in Fully local.</div>`;
+  html += `</div>`;
+  html += `<div class="map-group"><p class="map-group-label">🖥 Stays on your Mac — always private</p>`;
+  html += mac.map(r=>rowHtml(r,"mac")).join("");
+  html += `</div>`;
+  return html;
+}
+
+function renderSetup(){
+  let html="";
+  if(state.posture==="cloud") html = cloudEngineCard();
+  else if(state.posture==="hybrid") html = cloudEngineCard() + reactionsCard();
+  else html = localModelsCard();
+  document.getElementById("setupHost").innerHTML = html;
+  wireSetup();
+}
+function renderMap(){ document.getElementById("mapHost").innerHTML = mapRows(); wireChange(); }
+function renderMeaning(){ document.getElementById("postureMeaning").innerHTML = MEANING[state.posture]; }
+function renderPostureSeg(){
+  document.querySelectorAll(".posture-opt").forEach(b=>{
+    b.classList.toggle("is-active", b.dataset.posture===state.posture);
+  });
+}
+function renderAll(){ renderPostureSeg(); renderMeaning(); renderSetup(); renderMap(); }
+
+function wireSetup(){
+  const ce = document.getElementById("cloudEngineSel");
+  if(ce) ce.onchange = e => { state.cloudEngine = e.target.value; state.cloudModel = CLOUD_ENGINES[state.cloudEngine].models[0]; renderSetup(); renderMap(); };
+  const cm = document.getElementById("cloudModelSel");
+  if(cm) cm.onchange = e => { state.cloudModel = e.target.value; renderMap(); };
+  const hs = document.getElementById("heavySel");
+  if(hs) hs.onchange = e => { state.heavyModel = e.target.value; renderSetup(); renderMap(); };
+  const ls = document.getElementById("lightSel");
+  if(ls) ls.onchange = e => { state.lightModel = e.target.value; renderSetup(); renderMap(); };
+}
+function wireChange(){
+  document.querySelectorAll("[data-change]").forEach(btn=>{
+    btn.onclick = ()=>{
+      const map = {"Notes & summaries":"role-notes","Ask & chat":"role-ask","Live @brain":"role-live"};
+      const id = map[btn.dataset.change];
+      openAdvanced();
+      const el = document.getElementById(id);
+      el.scrollIntoView({behavior:"smooth", block:"center"});
+      el.classList.remove("hl"); void el.offsetWidth; el.classList.add("hl");
+    };
+  });
+}
+
+/* advanced */
+let advOpen=false;
+function openAdvanced(){ advOpen=true; syncAdv(); }
+function syncAdv(){
+  document.getElementById("advBody").classList.toggle("is-open", advOpen);
+  document.getElementById("advToggle").classList.toggle("is-open", advOpen);
+  document.getElementById("advChev").classList.toggle("is-open", advOpen);
+}
+document.getElementById("advToggle").onclick = ()=>{ advOpen=!advOpen; syncAdv(); };
+
+document.getElementById("postureSeg").addEventListener("click", e=>{
+  const b = e.target.closest(".posture-opt"); if(!b) return;
+  state.posture = b.dataset.posture; renderAll();
+});
+
+renderAll();
+</script>
+</body>
+</html>
