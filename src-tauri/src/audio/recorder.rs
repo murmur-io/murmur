@@ -81,6 +81,17 @@ impl Shared {
 /// 4 hours comfortably covers any real meeting while bounding worst-case memory.
 pub const MAX_RECORDING_SECONDS: u64 = 4 * 60 * 60;
 
+/// Pure RISING-EDGE decision for the "maximum recording length reached" notice: given the current
+/// [`Recorder::cap_reached`] state and whether the notice was ALREADY emitted for this recording,
+/// decide whether to emit it NOW. Emit iff the cap is reached AND it hasn't been emitted yet — so a
+/// status poll that ticks many times a second surfaces the notice exactly ONCE per recording (on the
+/// false→true transition), never re-firing while it stays capped and never firing when not capped.
+///
+/// Extracted as a pure fn so the rising-edge logic is headless-testable without a live capture.
+pub fn should_emit_cap_notice(capped: bool, already_emitted: bool) -> bool {
+    capped && !already_emitted
+}
+
 /// Message sent from the capture thread back to the owner once the stream is built.
 struct StartInfo {
     source_sample_rate: u32,
@@ -616,5 +627,39 @@ mod tests {
             first,
             "anchor must never move after the first frame"
         );
+    }
+
+    /// The 4h-cap NOTICE fires exactly ONCE per recording, on the RISING edge (capped false→true).
+    /// This is the rule that makes the status poll surface "max recording length reached" once —
+    /// never re-firing while it stays capped, never firing when not capped.
+    #[test]
+    fn cap_notice_emits_only_on_rising_edge() {
+        // Not capped → never emit, regardless of the emitted flag.
+        assert!(!should_emit_cap_notice(false, false), "not capped: no emit");
+        assert!(!should_emit_cap_notice(false, true), "not capped: no emit even if flagged");
+
+        // Rising edge: capped and NOT yet emitted → emit ONCE.
+        assert!(should_emit_cap_notice(true, false), "rising edge: capped + not yet emitted → emit");
+
+        // Stays capped after the emit → do NOT re-emit (the flag suppresses the repeat).
+        assert!(!should_emit_cap_notice(true, true), "already emitted while still capped → no re-emit");
+    }
+
+    /// Simulate the per-recording poll loop: many ticks, the cap trips partway, the notice must be
+    /// emitted on exactly one tick. Mirrors how `recording_level` polls `should_emit_cap_notice`
+    /// against a per-recording `capped_notified` flag.
+    #[test]
+    fn cap_notice_fires_once_across_a_poll_loop() {
+        let mut already_emitted = false;
+        let mut emits = 0;
+        // Ticks 0..3 uncapped, then capped from tick 3 onward (the 4h cap trips at tick 3).
+        for tick in 0..10 {
+            let capped = tick >= 3;
+            if should_emit_cap_notice(capped, already_emitted) {
+                emits += 1;
+                already_emitted = true;
+            }
+        }
+        assert_eq!(emits, 1, "the cap notice must fire exactly once across the whole recording");
     }
 }
