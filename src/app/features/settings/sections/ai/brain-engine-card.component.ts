@@ -25,7 +25,7 @@ import { LocalModelsListComponent } from "./local-models-list.component";
     <div class="brain-card">
       <div class="brain-row">
         <div class="brain-main">
-          <span class="brain-name">Murmur Brain</span>
+          <span class="brain-name">On this Mac — built-in models</span>
           @if (ready()) {
             <span class="pill is-success">
               <span class="pill-dot"></span>
