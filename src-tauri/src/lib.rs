@@ -156,7 +156,6 @@ pub fn run() {
             commands::generate_digest,
             commands::topic_threads,
             commands::export_canvas,
-            commands::pre_meeting_brief,
             commands::next_calendar_event,
             commands::list_calendar_events,
             commands::calendar_context_for,

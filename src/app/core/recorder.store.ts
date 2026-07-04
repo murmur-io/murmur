@@ -143,9 +143,10 @@ export class RecorderStore {
     // the meeting still produces a note (the capped buffer is intact). IDEMPOTENT: only dispatch stop()
     // while we're still in the "recording" stage — a second cap event or a user Stop already in flight
     // has moved the stage past "recording", so this becomes a no-op (no double stop_recording).
-    this.unlistenCapped = await this.ipc.onRecordingCapped(() => {
+    this.unlistenCapped = await this.ipc.onRecordingCapped((p) => {
+      const hours = Math.round(p.limitSeconds / 3600);
       this.toast.info(
-        "Maximum recording length (4 h) reached — recording stopped; generating your note…",
+        `Maximum recording length (${hours} h) reached — recording stopped; generating your note…`,
       );
       if (this._stage() === "recording") {
         void this.stop();
