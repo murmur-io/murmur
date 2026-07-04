@@ -637,6 +637,25 @@ app-shell {
   min-height: 100vh;
 }
 
+/* --- THE one sidebar panel (Apple TV: floating rounded liquid glass) -------
+   Shared by the primary rail (.app-sidebar) AND every drill-down rail
+   (.drill-rail — Settings sections, Meetings folders): identical inset,
+   radius, glass fill and edge treatment, so the app has ONE sidebar look. */
+.drill-rail {
+  display: flex;
+  flex-direction: column;
+  height: calc(100% - 20px);
+  margin: 10px 0 10px 10px;
+  padding: 0 var(--space-3) var(--space-4);
+  background: var(--shell-glass-bg);
+  -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+  backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+  border: 1px solid var(--shell-glass-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-md), var(--shell-glass-inner);
+  overflow: hidden;
+}
+
 /* --- Sidebar (Apple TV: a floating rounded liquid-glass panel) ------------- */
 .app-sidebar {
   position: sticky;

@@ -523,9 +523,12 @@ import { FolderDropDirective } from "./folder-drop.directive";
         outline: none;
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
+      /* Selected: the shell's neutral glass-on-glass pill (accent on the
+         glyph/label only — matches every other rail in the app). */
       .folder.is-selected {
-        color: var(--accent-hover);
-        background: var(--accent-soft);
+        color: var(--shell-active-text);
+        background: var(--shell-active-bg);
+        box-shadow: var(--shell-active-shadow);
       }
       .folder-icon {
         display: inline-flex;
@@ -533,7 +536,7 @@ import { FolderDropDirective } from "./folder-drop.directive";
         color: var(--text-muted);
       }
       .folder.is-selected .folder-icon {
-        color: var(--accent-hover);
+        color: var(--shell-active-text);
       }
       .folder-name {
         overflow: hidden;

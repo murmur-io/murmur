@@ -86,7 +86,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   template: `
     <section class="settings-shell">
       <!-- macOS-style left rail: Back, search over sections, then the section list. -->
-      <aside class="settings-sidebar" aria-label="Settings">
+      <aside class="settings-sidebar drill-rail" aria-label="Settings">
         <!-- Drag strip mirrors the primary rail so the overlay traffic lights
              stay clear of the Back button when the rail is flush to the edge. -->
         <div class="rail-drag" data-tauri-drag-region></div>
@@ -288,23 +288,11 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         height: 100dvh;
       }
 
-      /* Left rail — PROTOTYPE (Apple TV shell): the same floating rounded
-         liquid-glass panel as the primary rail (inset from the window edges),
-         so the drill-down chrome matches the shell it replaces. */
+      /* Left rail — the shared floating liquid-glass panel (global .drill-rail
+         in styles.css carries the panel look; only layout + the enter glide
+         live here). */
       .settings-sidebar {
-        display: flex;
-        flex-direction: column;
         gap: var(--space-3);
-        height: calc(100% - 20px);
-        margin: 10px 0 10px 10px;
-        padding: 0 var(--space-3) var(--space-4);
-        background: var(--shell-glass-bg);
-        -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
-        backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
-        border: 1px solid var(--shell-glass-border);
-        border-radius: var(--radius-xl);
-        box-shadow: var(--shadow-md), var(--shell-glass-inner);
-        overflow: hidden;
         animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
       }
 

@@ -55,7 +55,7 @@ interface SnippetPart {
   template: `
     <section class="library">
       <!-- ============ LEFT PANE — folder tree (lock-aware) ============ -->
-      <aside class="folders-pane" aria-label="Folders">
+      <aside class="folders-pane drill-rail" aria-label="Folders">
         <!-- Drag strip mirrors the primary rail so the overlay traffic lights
              stay clear of the Back button when the rail is flush to the edge. -->
         <div class="rail-drag" data-tauri-drag-region></div>
@@ -654,28 +654,19 @@ interface SnippetPart {
          Collapses to stacked rows on narrow widths so the list never squeezes. */
       .library {
         display: grid;
-        grid-template-columns: 248px minmax(0, 1fr);
+        /* Same shared .drill-rail panel; a touch wider than the other rails so
+           nested folder names + count/lock badges don't truncate. */
+        grid-template-columns: 268px minmax(0, 1fr);
         height: 100vh;
         height: 100dvh;
       }
 
       /* --- Left pane: folder tree (lock-aware) ---
-         A first-class full-height column flush to the window edge, same visual
-         weight as the primary rail it replaces (frosted in-flow chrome, right
-         border, NOT a floating card). Mirrors .settings-sidebar. */
+         The shared floating liquid-glass panel (global .drill-rail in
+         styles.css carries the panel look; only layout + the enter glide live
+         here). Mirrors .settings-sidebar. */
       .folders-pane {
-        display: flex;
-        flex-direction: column;
         gap: var(--space-2);
-        height: 100%;
-        padding: 0 var(--space-3) var(--space-4);
-        background: var(--surface-raised);
-        -webkit-backdrop-filter: blur(var(--glass-blur))
-          saturate(var(--glass-saturate));
-        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-        border-right: 1px solid var(--border-subtle);
-        box-shadow: var(--glass-highlight);
-        overflow: hidden;
         animation: library-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
       }
 
@@ -1418,8 +1409,8 @@ interface SnippetPart {
           grid-template-rows: auto minmax(0, 1fr);
         }
         .folders-pane {
-          border-right: 0;
-          border-bottom: 1px solid var(--border-subtle);
+          height: auto;
+          margin: 10px 10px 0;
         }
         .meetings-pane {
           padding: var(--space-5) var(--space-4) var(--space-6);
