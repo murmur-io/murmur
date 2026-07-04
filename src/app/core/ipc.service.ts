@@ -231,6 +231,33 @@ export class IpcService {
   }
 
   /**
+   * THE missing send-code step of the sign-up flow. Builds a `ShareClient` from
+   * the configured `shareBaseUrl` and calls `POST /v1/auth/signup {email}` → 202,
+   * which triggers the server to EMAIL the 6-digit verification code. Resolves
+   * regardless of whether the email exists (the server always 202s for
+   * anti-enumeration), so a resolved promise means "the code was sent if the
+   * address is valid" — surface a neutral "check your inbox" notice, never a
+   * "user exists" signal. Rejects (`InvalidArg`) on an empty email, and
+   * (`Unavailable`) when the server is unreachable. Do NOT call
+   * {@link accountSignup} to send the code — that command consumes the
+   * single-use signup token. Mirrors {@link accountLogin} in shape.
+   */
+  accountSendCode(email: string): Promise<void> {
+    return invoke<void>("account_send_code", { email });
+  }
+
+  /**
+   * Persist that the user resolved the first-run sharing decision (local-only OR
+   * the account door), so the init gateway (`/welcome`) never shows again. The
+   * SOLE mutator that flips `sharingChoiceMade` true (a one-way latch — a normal
+   * `saveConfig` can never set/clear it, PRESERVE-ONLY, exactly like the consent
+   * flags). Idempotent, unit return. Mirrors {@link consentToShareEgress}.
+   */
+  markSharingChoiceMade(): Promise<void> {
+    return invoke<void>("mark_sharing_choice_made");
+  }
+
+  /**
    * Create a sharing account. Runs the OPAQUE client registration on-device (the password never
    * leaves the Mac), generates the account key material + (skippable) recovery phrase, and uploads
    * it. `code` is the 6-digit email verification code. Returns the 24-word recovery phrase ONLY when
