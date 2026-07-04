@@ -1,0 +1,52 @@
+{
+  "note": "murmur link-share interop vector (spec T2.3). Cell = AES-256-GCM nonce(12)||ct||tag(16); KEK_link = HKDF-SHA256(ikm, salt=gateSalt, info=linkNkAad); ikm = L (no password) or L || Argon2id(password, argonSalt). All byte fields are base64url (no padding).",
+  "aad": {
+    "content": "murmur-share/v1|11111111-1111-4111-8111-111111111111|1",
+    "linkNk": "murmur-link/v1|11111111-1111-4111-8111-111111111111|1",
+    "gate": "murmur-link/v1:gate"
+  },
+  "hkdf": {
+    "hash": "SHA-256",
+    "outputBytes": 32
+  },
+  "noPassword": {
+    "shareId": "11111111-1111-4111-8111-111111111111",
+    "rev": 1,
+    "lB64": "YJ3Qfo6B0AoWKEA-XXP1LcpWMCFW5tJPvrAdejTLQ68",
+    "gateSaltB64": "Nujtxc8uIuO7quEGbBxCHg",
+    "gateSecretB64": "3kK_AoYoGcyaqxI462SILmV2dbAbg1PvHeLo9b0gMao",
+    "wrappedNkB64": "mc22vNdz2dMdW-GKdm6NF3vsMVw3Ihttiu_o_qNq0jzJ_1lxLRNaqnIWpDyJH-MNI5cdf5Ie6sKAkO6E",
+    "ciphertextCellB64": "jtc2fnl1SDXdltqD67b1UETBsOm_xXLqGjc3hJC3mC7xet9_CqgWnvf7wOb9uWfqTAn9zeDouJ3NVzmIepufInVNHzr8PCyxoh0YGs8OdW5uKzt-LyfJaGLWTLyr6qY5wKQQ6Xjpt-0sD5tqUx-5pKRB8_rBGtPz9R8rnsorwePXDSoaultEygWcfU4oxURE4QLHLhsG-VSY9_Xfhc3JYwXkrB4",
+    "expected": {
+      "v": 1,
+      "title": "Weekly sync",
+      "markdown": "- shipped the E2EE core\n- next: wire the server endpoints",
+      "createdAt": "2026-07-04T10:00:00Z"
+    }
+  },
+  "withPassword": {
+    "shareId": "11111111-1111-4111-8111-111111111111",
+    "rev": 1,
+    "password": "correct horse battery staple",
+    "lB64": "-xCVgxfFeogA5VKw420VNDZOEPTczaTuqKw3gzVJlGg",
+    "gateSaltB64": "3u79Zr2Fpb06DntNaB1Utg",
+    "argonSaltB64": "TSAkUYahDtypFiZ2f7YhGA",
+    "argon": {
+      "type": "argon2id",
+      "version": 19,
+      "mCostKib": 65536,
+      "tCost": 3,
+      "pCost": 1,
+      "outputBytes": 32,
+      "ikm": "L || argon2id(password, argonSalt)"
+    },
+    "wrappedNkB64": "dR8-HNKjoUtKSk9EAs8J9_Xpkmu05TNogqm0t9WBemSN2UA_-2Pq72TfytIkj_qjK2ZsA90ztNFvV8Dr",
+    "ciphertextCellB64": "yQ1KAI82NR-KL1YcNUrbYXHj01vnrBThTZENdVGxP46RsJ0dso0tCXZr8D2cqicf2w2_4ChuNPiyoyXib2WwxZmfgnmOqY1lfNuYLTTwf6uAhFcNtvGcnysOJJoSEVlyUKlVA9aWncagvmdKY-DV2IlLZleEzVu2qWtxbfeoEHvUDfm2bUouey-XdNoFWQcYlHtmaE8bl63cnhM00u8Ux8pNR2M",
+    "expected": {
+      "v": 1,
+      "title": "Weekly sync",
+      "markdown": "- shipped the E2EE core\n- next: wire the server endpoints",
+      "createdAt": "2026-07-04T10:00:00Z"
+    }
+  }
+}
