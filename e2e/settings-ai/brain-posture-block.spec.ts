@@ -71,16 +71,21 @@ test.describe("brain-posture-block", () => {
     await expect(page.getByText("Enable Murmur Brain Live")).toHaveCount(0);
   });
 
-  test("(c) clicking Fully local shows progress bar for Qwen3 4B + Cancel button", async ({
+  test("(c) Fully local ASKS first (names the model), then confirming shows the download + Cancel", async ({
     page,
   }) => {
     await page.getByRole("button", { name: /Fully local/ }).click();
-    // The stalled download keeps brainDownloadingId = "qwen3-4b"; the component
-    // looks up the name in brainModels() → "Qwen3 4B" appears in the label.
-    await expect(page.getByText(/Qwen3 4B/)).toBeVisible({ timeout: 10_000 });
+    // Confirm-first: the card appears and names the model + size — nothing downloads yet.
+    await expect(page.getByText(/Fully local needs/)).toBeVisible();
+    await expect(page.getByText(/Qwen3 4B/)).toBeVisible();
+    // Explicit opt-in → the stalled download keeps brainDownloadingId set → the
+    // download state (progress + a Cancel button) appears.
+    await page
+      .getByRole("button", { name: /Download .* enable Fully local/ })
+      .click();
     await expect(
       page.getByRole("button", { name: "Cancel" }),
-    ).toBeVisible();
+    ).toBeVisible({ timeout: 10_000 });
   });
 
   test("(d) cloud right-now line renders postureStateLine copy", async ({
