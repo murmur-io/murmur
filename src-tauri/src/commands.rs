@@ -4286,6 +4286,16 @@ pub(crate) fn rename_speaker_inner(
         .ok_or_else(|| AppError::InvalidArg("no timeline for this meeting yet".into()))?;
     let mut tl: crate::storage::models::MeetingTimeline = serde_json::from_str(&json)
         .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
+
+    // Reconstruct the diarized CLUSTER for the OLD label BEFORE the rename rewrites it away. The FE
+    // passes the DISPLAY label the lane shows ("Speaker 1"), not the raw `others-N` tag, so first try
+    // the raw-tag parse (legacy / a raw-tag timeline), then fall back to segment↔turn overlap against
+    // the still-original turns. A label with no overlapping diarized cluster (the "me" lane, or a
+    // non-diarized meeting with no segments) → None → enroll nothing.
+    let old_cluster = parse_others_cluster(old_label).or_else(|| {
+        reconcile_meeting_speakers(state, meeting_id, Some(&tl.speakers)).cluster_for_label(old_label)
+    });
+
     for turn in &mut tl.speakers {
         if turn.speaker == old_label {
             turn.speaker = new_label.to_string();
@@ -4295,13 +4305,14 @@ pub(crate) fn rename_speaker_inner(
         .map_err(|e| AppError::Storage(format!("serialize timeline: {e}")))?;
     state.db.set_timeline_data(meeting_id, &updated)?;
 
-    // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label is a diarized cluster (`others-{n}`) and
+    // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label resolves to a diarized cluster (either a
+    // raw `others-{n}` tag or, via the reconciliation above, the display label the FE lane showed) and
     // the meeting produced a voiceprint for that cluster, bind the new person name to it so the next
-    // meeting can re-identify this voice. Best-effort + no-op when: the opt-in is off, `others-{n}`
-    // doesn't parse, or no voiceprint exists for that cluster (pre-opt-in recording). The rename
-    // itself already succeeded regardless — a failed/absent enroll never fails the command. The WRITE
-    // is anchored to THIS (already-unlocked) meeting; no other meeting's voiceprint is read/written.
-    if let Some(cluster_index) = parse_others_cluster(old_label) {
+    // meeting can re-identify this voice. Best-effort + no-op when: the opt-in is off, the label maps
+    // to no cluster, or no voiceprint exists for that cluster (pre-opt-in recording). The rename itself
+    // already succeeded regardless — a failed/absent enroll never fails the command. The WRITE is
+    // anchored to THIS (already-unlocked) meeting; no other meeting's voiceprint is read/written.
+    if let Some(cluster_index) = old_cluster {
         let enabled = state
             .config
             .lock()
@@ -4410,14 +4421,59 @@ pub(crate) fn suggest_speaker_labels_inner(
 
     let suggestions =
         suggest_voiceprint_labels(&cluster_refs, &labeled_refs, VOICEPRINT_MATCH_THRESHOLD);
+
+    // RE-KEY by the DISPLAY label the FE lane actually shows: the timeline is LLM-generated, so lane
+    // `speaker` = "Speaker 1"/a real name, NOT the raw `others-N` tag. Reconcile the cluster → that
+    // display label via segment↔turn time-overlap so `suggestionByLabel().get(lane.speaker)` matches
+    // for both multi-cluster and single-cluster 1:1. Best-effort: if the meeting has no timeline / no
+    // segments (legacy, sealed-then-unlocked), reconciliation yields nothing → fall back to the raw
+    // `others-N` tag (harmless — a legacy raw-tag timeline still matches; an LLM one just won't chip).
+    let reconciliation = reconcile_meeting_speakers(state, meeting_id, None);
     Ok(suggestions
         .into_iter()
-        .map(|s| SpeakerSuggestion {
-            speaker: format!("{}-{}", crate::audio::merge::SPEAKER_OTHERS, s.cluster_index),
-            suggested_label: s.label,
-            score: s.score,
+        .map(|s| {
+            let cluster = s.cluster_index as i64;
+            let speaker = reconciliation
+                .label_for_cluster(cluster)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("{}-{}", crate::audio::merge::SPEAKER_OTHERS, s.cluster_index)
+                });
+            SpeakerSuggestion { speaker, suggested_label: s.label, score: s.score }
         })
         .collect())
+}
+
+/// Build the cluster↔display-label reconciliation for THIS meeting from segment↔turn time-overlap.
+/// Best-effort + gated by the caller (both call sites first pass `meeting_is_unlocked`): reads ONLY
+/// this meeting's segments + its stored (or supplied) timeline turns — never another meeting's data,
+/// so an enroll can never reach a sealed/other cluster. A missing timeline or missing segments (a
+/// legacy or sealed-then-unlocked meeting) yields an empty reconciliation → no-suggestion / no-enroll,
+/// never an error, never a fabricated cluster. Pass `turns` when the caller already parsed the
+/// timeline (avoids a redundant DB read); pass `None` to load it from the DB. NO PII is logged.
+fn reconcile_meeting_speakers(
+    state: &AppState,
+    meeting_id: &str,
+    turns: Option<&[crate::storage::models::SpeakerTurn]>,
+) -> crate::transcribe::diarize::SpeakerReconciliation {
+    use crate::transcribe::diarize::{reconcile_speakers, TurnRef};
+    let segments = state.db.get_segments(meeting_id).unwrap_or_default();
+    // Own the turns when we have to load them, so the borrow outlives the ref view below.
+    let loaded: Vec<crate::storage::models::SpeakerTurn> = match turns {
+        Some(_) => Vec::new(),
+        None => match state.db.get_timeline_data(meeting_id) {
+            Ok(Some(json)) => serde_json::from_str::<MeetingTimeline>(&json)
+                .map(|t| t.speakers)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+    };
+    let turns = turns.unwrap_or(&loaded);
+    let turn_refs: Vec<TurnRef<'_>> = turns
+        .iter()
+        .map(|t| TurnRef { start_s: t.start_s, end_s: t.end_s, label: &t.speaker })
+        .collect();
+    reconcile_speakers(&segments, &turn_refs)
 }
 
 /// List stored voiceprints for a management view (label + source meeting + cluster + dim), GATED —
@@ -7899,6 +7955,198 @@ mod lifecycle_tests {
         assert!(
             list_voiceprints_inner(&state).unwrap()[0].label.is_none(),
             "opt-in OFF ⇒ no enroll"
+        );
+    }
+
+    /// Insert diarization-tagged segments + an LLM-DISPLAY-labeled timeline for a meeting (overwrites
+    /// `seed_meeting`'s placeholder segments/timeline). Each `(start, end, tag)` segment carries the
+    /// RAW diarization tag; each `(start, end, label)` turn carries the LLM DISPLAY label the FE lane
+    /// renders — the two key spaces the reconciler must bridge.
+    fn seed_diarized(
+        db: &Db,
+        mid: &str,
+        segs: &[(f64, f64, &str)],
+        turns: &[(f64, f64, &str)],
+    ) {
+        let segments: Vec<Segment> = segs
+            .iter()
+            .enumerate()
+            .map(|(idx, (s, e, tag))| Segment {
+                idx: idx as i64,
+                start_s: *s,
+                end_s: *e,
+                text: "x".to_string(),
+                speaker: Some((*tag).to_string()),
+                confidence: None,
+            })
+            .collect();
+        db.insert_segments(mid, &segments).unwrap();
+        let speakers: String = turns
+            .iter()
+            .map(|(s, e, l)| format!("{{\"speaker\":\"{l}\",\"startS\":{s},\"endS\":{e}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.set_timeline_data(mid, &format!("{{\"topics\":[],\"speakers\":[{speakers}]}}"))
+            .unwrap();
+    }
+
+    /// CRUX (RED-before-GREEN): the timeline is LLM-generated, so the FE lane's `speaker` is the
+    /// DISPLAY label ("Speaker 2"), NOT the raw `others-N` tag. The suggestion MUST be keyed by that
+    /// display label so `suggestionByLabel().get(lane.speaker)` matches and the "Looks like Anna?"
+    /// chip renders. The OLD tag-keyed code emits `speaker == "others-1"` → the FE lookup misses →
+    /// the chip never renders. This asserts the reconciled display-label key.
+    #[test]
+    fn suggest_speaker_labels_keys_by_llm_display_label() {
+        let state = build_state("vp-suggest-display");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // A prior LABELED voiceprint ("Anna").
+        seed_meeting(&state.db, "prior", "prior", None);
+        let anna = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-prior", "prior", 0, Some("Anna"), &anna, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Current meeting: diarized cluster 1 (segments tagged `others-1`), whose timeline lane the
+        // LLM labeled "Speaker 2"; its voiceprint is near-identical to Anna's.
+        seed_meeting(&state.db, "cur", "cur", None);
+        seed_diarized(
+            &state.db,
+            "cur",
+            &[(0.0, 5.0, "others-1")],
+            &[(0.0, 5.0, "Speaker 2")],
+        );
+        let cur = vec![0.99f32, 0.14, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 1, None, &cur, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg.len(), 1, "the prior match surfaces one suggestion");
+        assert_eq!(
+            sugg[0].speaker, "Speaker 2",
+            "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
+        );
+        assert_eq!(sugg[0].suggested_label, "Anna");
+    }
+
+    /// ENROLL via the DISPLAY label: the FE passes the lane label "Speaker 2" (not `others-1`), so
+    /// enroll must reconstruct cluster 1 from segment↔turn overlap. The OLD
+    /// `parse_others_cluster("Speaker 2") = None` code enrolls nothing (RED).
+    #[test]
+    fn rename_speaker_enrolls_via_display_label() {
+        let state = build_state("vp-enroll-display");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        seed_diarized(
+            &state.db,
+            "m1",
+            &[(0.0, 5.0, "others-1")],
+            &[(0.0, 5.0, "Speaker 2")],
+        );
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 1, None, &[0.6f32, 0.8], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Rename the DISPLAY-labeled lane "Speaker 2" → "Anna": cluster 1 gets enrolled.
+        let tl = rename_speaker_inner(&state, "m1", "Speaker 2", "Anna").unwrap();
+        assert!(
+            tl.speakers.iter().any(|t| t.speaker == "Anna"),
+            "the display rename still persists in the timeline"
+        );
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].label.as_deref(),
+            Some("Anna"),
+            "enroll reconstructed cluster 1 from the display label via overlap"
+        );
+        assert_eq!(listed[0].cluster_index, 1);
+    }
+
+    /// Single-cluster 1:1 end-to-end: plain `others` segments ↔ cluster 0, LLM lane "Speaker 1".
+    /// Both suggest (keyed by "Speaker 1") and enroll (reconstruct cluster 0) work — and the 1:1 case
+    /// is inferred from the SEGMENT tag shape, not the {0}-only voiceprint set.
+    #[test]
+    fn suggest_and_enroll_single_cluster_1to1() {
+        let state = build_state("vp-1to1");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // Prior labeled "Sam".
+        seed_meeting(&state.db, "prior", "prior", None);
+        let sam = vec![0.0f32, 1.0, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-prior", "prior", 0, Some("Sam"), &sam, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Current single-cluster meeting: plain `others` segments, LLM lane "Speaker 1", cluster 0.
+        seed_meeting(&state.db, "cur", "cur", None);
+        seed_diarized(
+            &state.db,
+            "cur",
+            &[(0.0, 6.0, "others"), (7.0, 9.0, "others")],
+            &[(0.0, 9.0, "Speaker 1")],
+        );
+        let cur = vec![0.02f32, 0.99, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 0, None, &cur, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        // Suggest is keyed by the display label.
+        let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg.len(), 1);
+        assert_eq!(sugg[0].speaker, "Speaker 1", "1:1 suggestion keyed by the display label");
+        assert_eq!(sugg[0].suggested_label, "Sam");
+
+        // Enroll via the display label reconstructs cluster 0.
+        rename_speaker_inner(&state, "cur", "Speaker 1", "Sam").unwrap();
+        let cur_row = list_voiceprints_inner(&state)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.meeting_id == "cur")
+            .unwrap();
+        assert_eq!(cur_row.label.as_deref(), Some("Sam"), "1:1 enroll bound cluster 0");
+        assert_eq!(cur_row.cluster_index, 0);
+    }
+
+    /// Renaming a lane that maps to NO diarized cluster (the "me" lane / a non-diarized display label)
+    /// enrolls NOTHING — no fabricated cluster — while a real diarized lane in the same meeting still
+    /// enrolls. Guards against the reconciler over-reaching.
+    #[test]
+    fn rename_speaker_non_diarized_lane_enrolls_nothing() {
+        let state = build_state("vp-me-lane");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        // A diarized cluster 0 lane ("Speaker 1") AND a disjoint "me" lane the LLM labeled "Jakub".
+        seed_diarized(
+            &state.db,
+            "m1",
+            &[(0.0, 4.0, "others-0"), (4.0, 8.0, "me")],
+            &[(0.0, 4.0, "Speaker 1"), (4.0, 8.0, "Jakub")],
+        );
+        state
+            .db
+            .insert_voiceprint("vp0", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Renaming the "me"-mapped lane "Jakub" enrolls nothing (it overlaps only "me"/None segments).
+        rename_speaker_inner(&state, "m1", "Jakub", "Jakub K").unwrap();
+        assert!(
+            list_voiceprints_inner(&state).unwrap()[0].label.is_none(),
+            "a non-diarized (me) lane must never fabricate/enroll a cluster"
+        );
+
+        // The real diarized lane still enrolls (positive control).
+        rename_speaker_inner(&state, "m1", "Speaker 1", "Anna").unwrap();
+        assert_eq!(
+            list_voiceprints_inner(&state).unwrap()[0].label.as_deref(),
+            Some("Anna"),
+            "the diarized lane still enrolls its cluster"
         );
     }
 
