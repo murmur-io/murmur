@@ -4,7 +4,6 @@ import {
   computed,
   effect,
   inject,
-  signal,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
@@ -327,8 +326,8 @@ export class AiAdvancedBlockComponent {
 
   readonly form = this.store.form;
 
-  /** Whether the Advanced disclosure region is open. Collapsed by default. */
-  readonly expanded = signal(false);
+  /** Whether the Advanced disclosure is open — store-owned so the map's "Change" opens it. */
+  readonly expanded = this.store.advancedExpanded;
 
   /** True when the committed posture is "fully_local" — disables the Default-AI select. */
   readonly fullyLocal = computed(() => this.store.posture() === "fully_local");
@@ -347,7 +346,7 @@ export class AiAdvancedBlockComponent {
         this.store.roleLiveConnValue() ||
         this.store.brainBackendValue() === "local"
       ) {
-        this.expanded.set(true);
+        this.store.advancedExpanded.set(true);
       }
     },
     { allowSignalWrites: true },
@@ -374,7 +373,7 @@ export class AiAdvancedBlockComponent {
   });
 
   toggle(): void {
-    this.expanded.update((v) => !v);
+    this.store.advancedExpanded.update((v) => !v);
   }
 
   /** Prefetch the newly-picked Default AI's model catalog (claude_code/anthropic only). */
