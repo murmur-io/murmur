@@ -127,9 +127,12 @@ interface FolderOption {
 
         @if (status(); as st) {
           @if (st.loggedIn) {
-            <!-- (2a) Signed-in state -->
+            <!-- (2a) Signed-in state. IDENTITY (who you are) is separated from
+                 the SESSION share-key state (loaded this run or not) — the two
+                 used to be conflated into a contradictory "signed in / sign in
+                 to share". -->
             <div class="account-section">
-              <span class="account-section-label text-muted">Signed in</span>
+              <span class="account-section-label text-muted">Signed in as</span>
               <div class="signed-in-row">
                 <span class="pill is-success signed-pill">
                   <span class="pill-dot"></span>
@@ -148,20 +151,48 @@ interface FolderOption {
                 Your notes live on this Mac. Signing out only turns off sharing —
                 it never deletes, moves, or uploads a note.
               </p>
-              @if (!st.unlockedForSharing) {
+
+              <!-- SESSION share-key state — distinct from identity above. -->
+              @if (st.unlockedForSharing) {
+                <span class="pill is-success signed-pill">
+                  <span class="pill-dot"></span>
+                  Ready to share this session
+                </span>
+              } @else {
                 <p class="text-secondary account-note">
-                  Sign in again to share — your account key isn't loaded in this
-                  session.
+                  @if (canBiometricUnlock()) {
+                    Sharing is locked this session — unlock with Touch ID to
+                    share without re-entering your password.
+                  } @else {
+                    Sharing is locked this session — sign in again to load your
+                    account key.
+                  }
                 </p>
                 <div class="account-actions">
-                  <button
-                    type="button"
-                    class="btn btn-primary"
-                    (click)="openFlow()"
-                  >
-                    Sign in to share
-                  </button>
+                  @if (canBiometricUnlock()) {
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="unlockWithBiometric()"
+                      [disabled]="unlocking()"
+                    >
+                      {{ unlocking() ? "Unlocking…" : "Unlock with Touch ID" }}
+                    </button>
+                  } @else {
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="openFlow()"
+                    >
+                      Sign in to share
+                    </button>
+                  }
                 </div>
+                @if (unlockError(); as uerr) {
+                  <p class="text-secondary account-note" role="status">
+                    {{ uerr }}
+                  </p>
+                }
               }
             </div>
           } @else {
@@ -645,6 +676,37 @@ export class SettingsAccountSectionComponent {
   private readonly _accountError = signal<string | null>(null);
   readonly accountError = this._accountError.asReadonly();
 
+  /** True while the one-tap Touch ID unlock IPC is in flight ("Unlocking…"). */
+  private readonly _unlocking = signal(false);
+  readonly unlocking = this._unlocking.asReadonly();
+
+  /** A friendly, non-crashy message shown when the Touch ID unlock fails. */
+  private readonly _unlockError = signal<string | null>(null);
+  readonly unlockError = this._unlockError.asReadonly();
+
+  /**
+   * Latches true when a Touch ID unlock attempt fails, so the row falls back to
+   * the password "Sign in to share" path instead of looping the biometric sheet.
+   * Cleared on the next status reload (a fresh state re-enables Touch ID).
+   */
+  private readonly _biometricFailed = signal(false);
+
+  /**
+   * Whether to offer the one-tap Touch ID unlock: logged in, NOT yet unlocked
+   * this session, a cached account key exists, and no prior attempt just failed.
+   * When false the password sign-in flow is the fallback.
+   */
+  readonly canBiometricUnlock = computed(() => {
+    const st = this._status();
+    return (
+      !!st &&
+      st.loggedIn &&
+      !st.unlockedForSharing &&
+      st.biometricUnlockAvailable &&
+      !this._biometricFailed()
+    );
+  });
+
   /** Whether the reusable-flow modal is open. */
   private readonly _showFlow = signal(false);
   readonly showFlow = this._showFlow.asReadonly();
@@ -709,6 +771,9 @@ export class SettingsAccountSectionComponent {
 
   /** Load the current account status + seed the server URL input from config. */
   private async reload(): Promise<void> {
+    // A fresh status re-enables the Touch ID path (drops any prior fail latch).
+    this._biometricFailed.set(false);
+    this._unlockError.set(null);
     let st: AccountStatus | null = null;
     try {
       st = await this.ipc.accountStatus();
@@ -797,6 +862,42 @@ export class SettingsAccountSectionComponent {
     } finally {
       this._savingServer.set(false);
     }
+  }
+
+  /**
+   * One-tap Touch ID unlock for sharing: presents a single biometric sheet,
+   * restores the session MK, and flips the row to "Ready to share". On ANY
+   * failure it fails closed to the password sign-in flow (latch the fallback +
+   * surface a friendly message) — never a dead end.
+   */
+  async unlockWithBiometric(): Promise<void> {
+    if (this._unlocking()) return;
+    this._unlocking.set(true);
+    this._unlockError.set(null);
+    try {
+      const st = await this.ipc.unlockSharingWithBiometric();
+      this._status.set(st);
+      if (!st.unlockedForSharing) {
+        // Resolved but still locked — fall back to the password path.
+        this._biometricFailed.set(true);
+        this._unlockError.set(
+          "Couldn't unlock this session. Sign in with your password to share.",
+        );
+      }
+    } catch (e) {
+      this._biometricFailed.set(true);
+      this._unlockError.set(this.friendlyUnlockError(String(e)));
+    } finally {
+      this._unlocking.set(false);
+    }
+  }
+
+  /** Turn a raw biometric-unlock error into a friendly fall-back message. */
+  private friendlyUnlockError(raw: string): string {
+    if (/cancel/i.test(raw)) {
+      return "Touch ID was cancelled. Sign in with your password to share instead.";
+    }
+    return "Couldn't unlock with Touch ID. Sign in with your password to share instead.";
   }
 
   /** Sign out (server family-revoke + clear tokens + drop session MK), then reload. */

@@ -40,18 +40,28 @@ const KC_DEVICE_ID: &str = "murmur_share_device_id";
 const KC_ACCOUNT_EMAIL: &str = "murmur_share_account_email";
 /// Keychain account name for the account id (server user id).
 const KC_ACCOUNT_ID: &str = "murmur_share_account_id";
+/// Keychain account name for the identity-key GENERATION (non-secret key-rotation counter). Persisted
+/// alongside the tokens so a biometric session restore can rebuild the identity-slot AAD without a
+/// re-login — the MK itself is cached separately + biometric-gated (see `secrets::keychain`).
+const KC_GENERATION: &str = "murmur_share_generation";
 
 /// The persisted (Keychain) half of a login: what survives an app restart so a share can be created
-/// without re-logging-in, as long as the MK can be recovered. NOTE: the MK is NOT persisted here — it
-/// is unwrapped fresh from the server key material at login. After a restart, `account_status` reports
-/// "logged in but locked" until the user re-authenticates to re-derive MK (a follow-up refinement can
-/// wrap MK under the biometric account KEK for silent restore, per spec §4.2; deferred here).
+/// without re-logging-in, as long as the MK can be recovered. NOTE: the MK is NOT persisted here — the
+/// secret MK is cached SEPARATELY behind a biometric-gated keychain item
+/// (`secrets::keychain::cache_account_mk_biometric`). After a restart, `account_status` reports
+/// "logged in but locked"; the user restores the session with a single Touch ID tap
+/// (`unlock_sharing_with_biometric`), which pairs the biometric-released MK with the non-secret
+/// `generation` persisted here — or falls back to a full password re-login.
 pub struct PersistedTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub device_id: String,
     pub email: String,
     pub account_id: String,
+    /// The identity-key generation at login (non-secret rotation counter). Needed to rebuild the
+    /// `AccountSession` on a biometric restore; defaults to 1 for sessions persisted before this field
+    /// existed (see `load_tokens`).
+    pub generation: u32,
 }
 
 /// Persist the session tokens + device id + account identity to the Keychain (delete-before-add
@@ -62,6 +72,7 @@ pub fn store_tokens(t: &PersistedTokens) -> Result<()> {
     crate::secrets::set_secret(KC_DEVICE_ID, &t.device_id)?;
     crate::secrets::set_secret(KC_ACCOUNT_EMAIL, &t.email)?;
     crate::secrets::set_secret(KC_ACCOUNT_ID, &t.account_id)?;
+    crate::secrets::set_secret(KC_GENERATION, &t.generation.to_string())?;
     Ok(())
 }
 
@@ -76,12 +87,21 @@ pub fn load_tokens() -> Result<Option<PersistedTokens>> {
     ) else {
         return Ok(None);
     };
+    // `generation` is persisted since the biometric-restore feature. A session stored before it existed
+    // has no entry → default to 1 (the pre-rotation generation). This never misleads the biometric
+    // restore: that path only trusts `generation` when an MK was ALSO cached, and MK-caching + the
+    // generation write happen in the SAME post-feature login (`account_login`), so whenever a cached MK
+    // exists so does its matching generation.
+    let generation = crate::secrets::get_secret(KC_GENERATION)?
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
     Ok(Some(PersistedTokens {
         access_token,
         refresh_token,
         device_id,
         email,
         account_id,
+        generation,
     }))
 }
 
@@ -97,6 +117,7 @@ pub fn clear_tokens() -> Result<()> {
     crate::secrets::delete_secret(KC_DEVICE_ID)?;
     crate::secrets::delete_secret(KC_ACCOUNT_EMAIL)?;
     crate::secrets::delete_secret(KC_ACCOUNT_ID)?;
+    crate::secrets::delete_secret(KC_GENERATION)?;
     Ok(())
 }
 

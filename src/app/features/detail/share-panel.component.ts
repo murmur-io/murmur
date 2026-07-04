@@ -98,9 +98,23 @@ export interface LinkShareRow {
           @if (gateError(); as err) {
             <p class="msg msg-error" role="alert">{{ err }}</p>
           }
-          <button type="button" class="btn btn-primary" (click)="setupSharing.emit()">
-            {{ gateCta() }}
-          </button>
+          <!-- When the ONLY missing precondition is the session share-key and a
+               cached account key exists, offer a one-tap Touch ID unlock inline;
+               otherwise route to the password path via the shell (setupSharing). -->
+          @if (canBiometricUnlock()) {
+            <button
+              type="button"
+              class="btn btn-primary"
+              (click)="unlockWithBiometric()"
+              [disabled]="unlocking()"
+            >
+              {{ unlocking() ? "Unlocking…" : "Unlock with Touch ID" }}
+            </button>
+          } @else {
+            <button type="button" class="btn btn-primary" (click)="setupSharing.emit()">
+              {{ gateCta() }}
+            </button>
+          }
         </div>
       } @else {
         <!-- ============================================================== -->
@@ -533,7 +547,10 @@ export interface LinkShareRow {
         flex-direction: column;
         /* §5 rhythm: --space-6 between top-level sections (calm whitespace). */
         gap: var(--space-6);
-        max-width: 40rem;
+        /* Fill the note-detail content column (like the Note panel) — no inset
+           cap, so the Share cards + controls use the full width instead of
+           leaving dead space on the right. */
+        width: 100%;
         animation: rise 320ms var(--transition) both;
       }
       .panel-card {
@@ -951,11 +968,38 @@ export class SharePanelComponent {
   private readonly accountStatus = signal<AccountStatus | null>(null);
   readonly loading = signal(false);
   readonly gateError = signal<string | null>(null);
+  /** True while the one-tap Touch ID unlock IPC is in flight ("Unlocking…"). */
+  readonly unlocking = signal(false);
+  /**
+   * Latches true when a Touch ID unlock attempt fails, so the gate falls back to
+   * the password CTA instead of re-offering the biometric sheet. Cleared on the
+   * next `refresh()` (a fresh gate state re-enables Touch ID).
+   */
+  private readonly _biometricFailed = signal(false);
 
   /** Sharing can actually happen: server set + signed in + unlocked for sharing. */
   readonly gateReady = computed(() => {
     const s = this.accountStatus();
     return !this.locked() && !!s && s.serverConfigured && s.loggedIn && s.unlockedForSharing;
+  });
+
+  /**
+   * Offer the one-tap Touch ID unlock in the gate: the ONLY blocker is the
+   * session share-key (server set + signed in, just not unlocked this run) AND a
+   * cached account key exists AND no prior attempt just failed. Otherwise the
+   * password CTA (`setupSharing`) is the fallback.
+   */
+  readonly canBiometricUnlock = computed(() => {
+    const s = this.accountStatus();
+    return (
+      !this.locked() &&
+      !!s &&
+      s.serverConfigured &&
+      s.loggedIn &&
+      !s.unlockedForSharing &&
+      s.biometricUnlockAvailable &&
+      !this._biometricFailed()
+    );
   });
   /** Whether the one-time share-egress consent is granted (drives the inline consent). */
   readonly shareConsented = computed(() => this.accountStatus()?.shareConsented ?? false);
@@ -1141,6 +1185,8 @@ export class SharePanelComponent {
     }
     this.listError.set(null);
     this.gateError.set(null);
+    // A fresh gate state re-enables the Touch ID path (drop any prior fail latch).
+    this._biometricFailed.set(false);
     this.loading.set(true);
     try {
       const st = await this.ipc.accountStatus();
@@ -1163,6 +1209,45 @@ export class SharePanelComponent {
     } finally {
       this.loading.set(false);
     }
+  }
+
+  /**
+   * One-tap Touch ID unlock from the gate: presents a single biometric sheet,
+   * restores the session MK, then re-reads status + loads this note's shares so
+   * the gate opens straight into the share UI. On ANY failure it fails closed to
+   * the password CTA (latch the fallback + surface a friendly gate message).
+   */
+  async unlockWithBiometric(): Promise<void> {
+    if (this.unlocking()) {
+      return;
+    }
+    this.unlocking.set(true);
+    this.gateError.set(null);
+    try {
+      await this.ipc.unlockSharingWithBiometric();
+      // Re-read the (now unlocked) status + load the shares for this note.
+      await this.refresh();
+      if (!this.accountStatus()?.unlockedForSharing) {
+        // Resolved but still locked — fall back to the password path.
+        this._biometricFailed.set(true);
+        this.gateError.set(
+          "Couldn't unlock this session. Use Unlock for sharing to unlock with your password.",
+        );
+      }
+    } catch (e) {
+      this._biometricFailed.set(true);
+      this.gateError.set(this.friendlyUnlockError(String(e)));
+    } finally {
+      this.unlocking.set(false);
+    }
+  }
+
+  /** Turn a raw biometric-unlock error into a friendly fall-back message. */
+  private friendlyUnlockError(raw: string): string {
+    if (/cancel/i.test(raw)) {
+      return "Touch ID was cancelled. Use Unlock for sharing to unlock with your password.";
+    }
+    return "Couldn't unlock with Touch ID. Use Unlock for sharing to unlock with your password.";
   }
 
   // --- CONFIGURE handlers ---------------------------------------------------
