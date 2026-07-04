@@ -21,10 +21,21 @@
 - **Standalone only.** No `NgModule`. `standalone: true` on every `@Component`.
 - **`OnPush` always.** `changeDetection: ChangeDetectionStrategy.OnPush`. Under
   zoneless this is effectively mandatory; omitting it does not buy you anything.
-- **Inline `template` + inline `styles: [\`…\`]`.** No `templateUrl`, no
-  `styleUrl`/`styleUrls` — the whole tree is single-file components (see any
-  `src/app/features/**/*.component.ts`). The ESLint `processInlineTemplates`
-  processor lints the inline template, so template rules apply.
+- **Directory per component, split files** (convention CHANGED 2026-07-04 with
+  explicit user approval — supersedes the former inline-single-file rule):
+  every component lives in its own directory as `name/name.component.ts` +
+  `name.component.html` (`templateUrl`) + `name.component.scss` (`styleUrl`).
+  Exemplars: `src/app/design-system/nav-icon/`, `src/app/design-system/quick-search/`.
+  ESLint lints external templates via the `**/*.html` block in
+  `eslint.config.js` (templateRecommended + templateAccessibility).
+  EXCEPTION: the app-shell CHROME CSS stays GLOBAL in `styles.css` (the
+  WKWebView cold-launch FOUC fix — see app-shell.component.ts) — never move it
+  into component styles.
+- **Design system & tokens:** reusable UI primitives live in
+  `src/app/design-system/` (components in their own directories + the shared
+  `primitives.css` control language); every design variable lives in
+  `src/design-tokens/*.css` (imported at the top of `styles.css`) — components
+  consume `var(--token)` only, never a raw value.
 - **`inject()` only.** No constructor injection. `private readonly ipc = inject(IpcService);`.
 - **Selectors are `app-` kebab-case** for components and **`app` camelCase** for
   directives — enforced by `@angular-eslint/component-selector` /
@@ -164,7 +175,7 @@
 | `setTimeout` / `requestAnimationFrame` in a component | `afterNextRender(fn, { injector })` |
 | Ad-hoc `ResizeObserver`/`MutationObserver` in a component | a directive with `DestroyRef.onDestroy()` |
 | `invoke('cmd', …)` from a component | a typed method on `IpcService` |
-| `templateUrl` / `styleUrl` | inline `template` + `styles: [\`…\`]` |
+| single-file component (inline `template`/`styles`) | a component DIRECTORY: `name/name.component.{ts,html,scss}` (changed 2026-07-04, user-approved) |
 | Hardcoded hex / spacing / radius / shadow | `var(--token)` from `src/styles.css` |
 | New npm package (FE) | ask the user; reuse `@angular/*` / `rxjs` / `@tauri-apps/api` |
 | `NgModule`, NgRx, a new facade/store abstraction | standalone component + `IpcService` + signals |

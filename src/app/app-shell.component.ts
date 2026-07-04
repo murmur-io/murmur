@@ -4,7 +4,6 @@ import {
   computed,
   effect,
   inject,
-  input,
   signal,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
@@ -17,119 +16,22 @@ import {
 } from "@angular/router";
 import { filter, map } from "rxjs";
 import { isDrilldownRoute } from "./core/nav-history.service";
-import { QuickSearchComponent } from "./quick-search.component";
+import {
+  NavIconComponent,
+  type ShellIcon,
+} from "./design-system/nav-icon/nav-icon.component";
+import { QuickSearchComponent } from "./design-system/quick-search/quick-search.component";
 import { FoldersService } from "./services/folders.service";
 import { ToastService, type Toast } from "./services/toast.service";
 
 /** localStorage key for the chrome mode: "1" = pill bar, "0" = sidebar. */
 const SIDEBAR_KEY = "murmur-sidebar-collapsed";
 
-/** Every glyph the shell chrome can render (nav + quick actions + chrome). */
-type ShellIcon =
-  | "record"
-  | "meetings"
-  | "analytics"
-  | "graph"
-  | "people"
-  | "brain"
-  | "ask"
-  | "settings"
-  | "search"
-  | "plus"
-  | "sidebar";
-
 /** A primary navigation destination. `icon` selects the inline SVG. */
 interface NavItem {
   readonly path: string;
   readonly label: string;
   readonly icon: ShellIcon;
-}
-
-/**
- * PROTOTYPE (Apple TV shell) — one inline-SVG glyph, shared by the floating
- * sidebar and the pill bar so the big icon @switch lives in exactly one place.
- */
-@Component({
-  selector: "app-nav-icon",
-  standalone: true,
-  changeDetection: ChangeDetectionStrategy.OnPush,
-  template: `
-    <span class="nav-icon" aria-hidden="true">
-      @switch (icon()) {
-        @case ("record") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <circle cx="10" cy="10" r="4.5" fill="currentColor" />
-            <circle cx="10" cy="10" r="7.25" stroke="currentColor" stroke-width="1.4" opacity="0.5" />
-          </svg>
-        }
-        @case ("meetings") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <rect x="3.25" y="3.75" width="13.5" height="12.5" rx="2.2" stroke="currentColor" stroke-width="1.4" />
-            <path d="M6.5 7.5h7M6.5 10.5h7M6.5 13.25h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-          </svg>
-        }
-        @case ("analytics") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <path d="M4 16V9M8 16V5m4 11v-7m4 7V7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-          </svg>
-        }
-        @case ("graph") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <circle cx="5" cy="6" r="2.1" stroke="currentColor" stroke-width="1.4" />
-            <circle cx="15" cy="7.5" r="2.1" stroke="currentColor" stroke-width="1.4" />
-            <circle cx="9" cy="15" r="2.1" stroke="currentColor" stroke-width="1.4" />
-            <path d="M6.7 7.3l5.2 6.2M6.9 6.6l6-.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-          </svg>
-        }
-        @case ("people") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <circle cx="7.3" cy="7.5" r="2.6" stroke="currentColor" stroke-width="1.4" />
-            <path d="M2.8 15.5c.4-2.4 2.3-3.9 4.5-3.9s4.1 1.5 4.5 3.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-            <path d="M13 5.2a2.3 2.3 0 0 1 0 4.4M14.4 11.9c1.6.4 2.7 1.7 3 3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-          </svg>
-        }
-        @case ("brain") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <path d="M10 4.2c-1.9-1.6-5-.6-5 1.9 0 .5-1.2.9-1.2 2.6 0 1.1.8 1.6.8 2.3 0 1.9 2.1 3 4 2.3M10 4.2c1.9-1.6 5-.6 5 1.9 0 .5 1.2.9 1.2 2.6 0 1.1-.8 1.6-.8 2.3 0 1.9-2.1 3-4 2.3M10 4.2v11.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        }
-        @case ("ask") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <path d="M16.5 10.5A6 6 0 1 1 9.5 4.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-            <path d="M7.9 8.1a2.2 2.2 0 1 1 3.1 2.4c-.7.4-1 .8-1 1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-            <circle cx="10" cy="14.4" r="0.95" fill="currentColor" />
-          </svg>
-        }
-        @case ("settings") {
-          <!-- A real toothed cog (the previous circle-with-rays read as a sun). -->
-          <svg viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.7" />
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        }
-        @case ("search") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <circle cx="9" cy="9" r="5.2" stroke="currentColor" stroke-width="1.5" />
-            <path d="m13.2 13.2 3.3 3.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-          </svg>
-        }
-        @case ("plus") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-          </svg>
-        }
-        @case ("sidebar") {
-          <svg viewBox="0 0 20 20" fill="none">
-            <rect x="3" y="4.25" width="14" height="11.5" rx="2.2" stroke="currentColor" stroke-width="1.4" />
-            <path d="M8 4.5v11" stroke="currentColor" stroke-width="1.4" />
-          </svg>
-        }
-      }
-    </span>
-  `,
-})
-export class NavIconComponent {
-  readonly icon = input.required<ShellIcon>();
 }
 
 /**
