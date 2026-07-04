@@ -21,6 +21,7 @@ pub mod graph;
 /// transcript segments. Pure, on-device, zero-egress; annotates unsupported summary units with a
 /// non-destructive `> unverified` marker.
 pub mod grounding;
+pub mod local;
 /// The REAL on-device PERSON-name NER redactor (Phase D). ALWAYS compiled; the real impl is selected
 /// at runtime by `redact::active_name_redactor` when the NER model dir is present, else the
 /// byte-identical `NoopNameRedactor` (so a no-model build's name egress is unchanged).
@@ -70,6 +71,11 @@ pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
             Ok(u) => !gateway::host_is_loopback(&u),
             Err(_) => true, // unparseable → fail safe (treat as cloud)
         },
+        // On-device connections egress NOTHING (spec §3.2; review code-truth #3 — load-bearing):
+        // without this explicit arm the `_ => true` default would classify a `local` note as cloud,
+        // demanding phantom consent, writing phantom ledger rows, and stamping a cloud host on the
+        // Privacy Receipt. `off`/`apple` never reach the factory but are on-device by definition.
+        roles::CONN_LOCAL | roles::CONN_OFF | roles::CONN_AFM => false,
         _ => true, // any future provider id defaults to cloud
     }
 }
@@ -116,7 +122,9 @@ pub fn provider_for(
     config: &AppConfig,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     let target = roles::provider_target(role, config);
-    if target.is_reasoner_only() {
+    // Refuse ONLY the targets that build no provider (off/apple). `local` now builds the on-device
+    // LocalSummarizerProvider in `make_provider_resolved` (spec §3.2), so it is NOT refused here.
+    if target.builds_no_provider() {
         return Err(crate::error::AppError::Unavailable(format!(
             "the {} role targets the on-device reasoner ({}); no summarizer provider is available \
              for it",
@@ -224,6 +232,32 @@ fn make_provider_resolved(
                 api_key,
             )?)
             // Falls through to the RedactingProvider wrap below (R2).
+        }
+        c if c == roles::CONN_LOCAL => {
+            // FullyLocal Notes/Ask (spec §3.2): the on-device HEAVY engine as a provider. Resolve the
+            // class model (target.model = the heavy id under the preset; else the persisted
+            // brain_model_id). ABSENT ⇒ Unavailable — the note lands in Error + the recovery UX (P1),
+            // NEVER a silent cloud fallback. Weights load once via the shared MODEL_CACHE. Returned
+            // UNWRAPPED (no redaction, no ledger) like a loopback Ollama — `egress_is_cloud(local)` is
+            // false, so the consent gate above was skipped and nothing egresses.
+            let model_id = if target.model.trim().is_empty() {
+                config.brain_model_id.clone()
+            } else {
+                Some(target.model.clone())
+            };
+            let configured = config.brain_model_path.as_deref().map(std::path::Path::new);
+            match crate::reason::resolve_brain_model(configured, model_id.as_deref())? {
+                Some(path) => {
+                    let reasoner: Arc<dyn crate::reason::LocalReasoner> =
+                        Arc::new(crate::reason::mistral::MistralReasoner::new(path)?);
+                    return Ok(Arc::new(local::LocalSummarizerProvider::new(reasoner)));
+                }
+                None => {
+                    return Err(crate::error::AppError::Unavailable(
+                        "the on-device model for local notes is not downloaded".into(),
+                    ));
+                }
+            }
         }
         other => {
             return Err(crate::error::AppError::InvalidArg(format!(
@@ -358,6 +392,31 @@ mod tests {
 
         // Unknown provider ids default to cloud (fail-safe).
         assert!(egress_is_cloud("unknown-provider", &cfg));
+
+        // On-device connections egress NOTHING (spec §3.2) — load-bearing for the Privacy Receipt:
+        // a local note must never be classified cloud (else phantom consent/ledger/receipt-lie).
+        assert!(!egress_is_cloud(roles::CONN_LOCAL, &cfg));
+        assert!(!egress_is_cloud(roles::CONN_OFF, &cfg));
+        assert!(!egress_is_cloud(roles::CONN_AFM, &cfg));
+    }
+
+    #[test]
+    fn predicate_split_local_builds_a_provider_but_stays_agentic_ineligible() {
+        use roles::{RoleTarget, CONN_AFM, CONN_LOCAL, CONN_OFF};
+        let t = |c: &str| RoleTarget {
+            connection: c.to_string(),
+            model: String::new(),
+            effort: String::new(),
+        };
+        // local: reasoner-only (NOT agentic-eligible) BUT now builds a provider (not refused).
+        assert!(t(CONN_LOCAL).is_reasoner_only());
+        assert!(!t(CONN_LOCAL).builds_no_provider());
+        // off / apple: reasoner-only AND build no provider (still refused by provider_for).
+        assert!(t(CONN_OFF).builds_no_provider());
+        assert!(t(CONN_AFM).builds_no_provider());
+        // cloud: neither.
+        assert!(!t(PROVIDER_CLAUDE_CODE).is_reasoner_only());
+        assert!(!t(PROVIDER_CLAUDE_CODE).builds_no_provider());
     }
 
     #[test]
