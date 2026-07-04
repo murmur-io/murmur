@@ -711,7 +711,11 @@ impl AppConfig {
         db.set_setting(K_INPUT_DEVICE, self.input_device.as_deref().unwrap_or(""))?;
         db.set_setting(
             K_CAPTURE_SYSTEM_AUDIO,
-            if self.capture_system_audio { "true" } else { "false" },
+            if self.capture_system_audio {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_VAD_ENABLED,
@@ -719,7 +723,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_KEEP_HIRES_MASTERS,
-            if self.keep_hires_masters { "true" } else { "false" },
+            if self.keep_hires_masters {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_DIARIZE_OTHERS,
@@ -727,7 +735,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_VOICEPRINT_ENABLED,
-            if self.voiceprint_enabled { "true" } else { "false" },
+            if self.voiceprint_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_AEC_ENABLED,
@@ -735,7 +747,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_POST_AEC_ENABLED,
-            if self.post_aec_enabled { "true" } else { "false" },
+            if self.post_aec_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         db.set_setting(
@@ -752,27 +768,51 @@ impl AppConfig {
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
         db.set_setting(
             K_MCP_REQUIRE_TOKEN,
-            if self.mcp_require_token { "true" } else { "false" },
+            if self.mcp_require_token {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_LOCK_REQUIRE_BIOMETRIC,
-            if self.lock_require_biometric { "true" } else { "false" },
+            if self.lock_require_biometric {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_RELOCK_ON_SCREENSHARE,
-            if self.relock_on_screenshare { "true" } else { "false" },
+            if self.relock_on_screenshare {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_CLOUD_EGRESS_CONSENTED,
-            if self.cloud_egress_consented { "true" } else { "false" },
+            if self.cloud_egress_consented {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_SHARE_EGRESS_CONSENTED,
-            if self.share_egress_consented { "true" } else { "false" },
+            if self.share_egress_consented {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_SEMANTIC_SEARCH_ENABLED,
-            if self.semantic_search_enabled { "true" } else { "false" },
+            if self.semantic_search_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_EMBED_MODEL_ID,
@@ -791,30 +831,54 @@ impl AppConfig {
         db.set_setting(K_BRAIN_BACKEND, self.brain_backend.as_str())?;
         db.set_setting(
             K_REALTIME_REACTIONS,
-            if self.realtime_reactions { "true" } else { "false" },
+            if self.realtime_reactions {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_WEB_SEARCH_ENABLED,
-            if self.web_search_enabled { "true" } else { "false" },
+            if self.web_search_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_WEB_SEARCH_CONSENTED,
-            if self.web_search_consented { "true" } else { "false" },
+            if self.web_search_consented {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_CLAUDE_CODE_INHERIT_ENV,
-            if self.claude_code_inherit_env { "true" } else { "false" },
+            if self.claude_code_inherit_env {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_GATEWAY_BASE_URL, &self.gateway_base_url)?;
         db.set_setting(K_GATEWAY_MODEL, &self.gateway_model)?;
         db.set_setting(K_SHARE_BASE_URL, &self.share_base_url)?;
         db.set_setting(
             K_PROACTIVE_HINTS_ENABLED,
-            if self.proactive_hints_enabled { "true" } else { "false" },
+            if self.proactive_hints_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_USER_MEMORY_ENABLED,
-            if self.user_memory_enabled { "true" } else { "false" },
+            if self.user_memory_enabled {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_GROUND_SUMMARY,
@@ -1047,7 +1111,10 @@ mod tests {
     fn brain_backend_defaults_cloud_and_round_trips() {
         let db = temp_db();
         // Absent key ⇒ Cloud (the chosen default for fresh + pre-existing installs).
-        assert_eq!(AppConfig::load(&db).unwrap().brain_backend, BrainBackend::Cloud);
+        assert_eq!(
+            AppConfig::load(&db).unwrap().brain_backend,
+            BrainBackend::Cloud
+        );
 
         // AppleFoundation (WS2) joins the DB save/load round-trip loop — a persisted `apple` token
         // reloads as AppleFoundation, never the Cloud default.
@@ -1074,7 +1141,10 @@ mod tests {
         assert_eq!(BrainBackend::Off.as_str(), "off");
         // WS2 — AppleFoundation persists as the single token `apple`.
         assert_eq!(BrainBackend::AppleFoundation.as_str(), "apple");
-        assert_eq!(BrainBackend::from_str_or_default("local"), BrainBackend::Local);
+        assert_eq!(
+            BrainBackend::from_str_or_default("local"),
+            BrainBackend::Local
+        );
         assert_eq!(BrainBackend::from_str_or_default("off"), BrainBackend::Off);
         assert_eq!(
             BrainBackend::from_str_or_default("apple"),
@@ -1082,7 +1152,10 @@ mod tests {
         );
         // Unknown / empty falls back to the default brain — INCLUDING the un-renamed
         // `applefoundation` spelling, which an OLD build must NOT accidentally accept.
-        assert_eq!(BrainBackend::from_str_or_default("bogus"), BrainBackend::Cloud);
+        assert_eq!(
+            BrainBackend::from_str_or_default("bogus"),
+            BrainBackend::Cloud
+        );
         assert_eq!(BrainBackend::from_str_or_default(""), BrainBackend::Cloud);
         assert_eq!(
             BrainBackend::from_str_or_default("applefoundation"),
@@ -1142,8 +1215,14 @@ mod tests {
         let db = temp_db();
         // Fail-closed defaults: both OFF until explicitly set/granted.
         let cfg = AppConfig::load(&db).unwrap();
-        assert!(!cfg.web_search_enabled, "web search master toggle defaults OFF");
-        assert!(!cfg.web_search_consented, "web search egress consent fail-closed OFF");
+        assert!(
+            !cfg.web_search_enabled,
+            "web search master toggle defaults OFF"
+        );
+        assert!(
+            !cfg.web_search_consented,
+            "web search egress consent fail-closed OFF"
+        );
 
         // `web_search_enabled` is a settable flag; consent is granted via its dedicated method.
         let cfg = AppConfig {
@@ -1206,18 +1285,24 @@ mod tests {
         );
 
         // Explicit ON persists (a maintainer/user opt-in).
-        AppConfig { ground_summary: true, ..Default::default() }
-            .save(&db)
-            .unwrap();
+        AppConfig {
+            ground_summary: true,
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
         assert!(
             AppConfig::load(&db).unwrap().ground_summary,
             "an explicit ground_summary opt-in must persist"
         );
 
         // Explicit OFF persists.
-        AppConfig { ground_summary: false, ..Default::default() }
-            .save(&db)
-            .unwrap();
+        AppConfig {
+            ground_summary: false,
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
         assert!(!AppConfig::load(&db).unwrap().ground_summary);
     }
 
@@ -1237,7 +1322,10 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(!cfg.ground_summary, "serde default for ground_summary must be false (opt-in)");
+        assert!(
+            !cfg.ground_summary,
+            "serde default for ground_summary must be false (opt-in)"
+        );
     }
 
     #[test]
@@ -1290,7 +1378,10 @@ mod tests {
         cfg.grant_cloud_egress_consent(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().cloud_egress_consented);
         cfg.revoke_cloud_egress(&db).unwrap();
-        assert!(!cfg.cloud_egress_consented, "in-memory flag must flip immediately");
+        assert!(
+            !cfg.cloud_egress_consented,
+            "in-memory flag must flip immediately"
+        );
         // Survives a reload from the settings table.
         assert!(!AppConfig::load(&db).unwrap().cloud_egress_consented);
     }
@@ -1307,7 +1398,10 @@ mod tests {
         let mut cfg = AppConfig::load(&db).unwrap();
         // Pre-grant: neither side consents.
         assert!(!cfg.cloud_egress_consented);
-        assert_ne!(db.get_setting(K_CLOUD_EGRESS_CONSENTED).unwrap().as_deref(), Some("true"));
+        assert_ne!(
+            db.get_setting(K_CLOUD_EGRESS_CONSENTED).unwrap().as_deref(),
+            Some("true")
+        );
         // Grant: the durable record is written FIRST, then the flag flips — both true afterwards.
         cfg.grant_cloud_egress_consent(&db).unwrap();
         assert!(cfg.cloud_egress_consented, "session flag flipped");
@@ -1440,7 +1534,10 @@ mod tests {
     fn gateway_fields_default_empty() {
         // In-memory struct default.
         let cfg = AppConfig::default();
-        assert_eq!(cfg.gateway_base_url, "", "gateway_base_url must default to empty");
+        assert_eq!(
+            cfg.gateway_base_url, "",
+            "gateway_base_url must default to empty"
+        );
         assert_eq!(cfg.gateway_model, "", "gateway_model must default to empty");
 
         // Settings-table path: an empty DB (no key written) loads the defaults.
@@ -1461,14 +1558,13 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         let loaded = AppConfig::load(&db).unwrap();
-        assert_eq!(
-            loaded.gateway_base_url,
-            "https://my-gateway.example.com/v1"
-        );
+        assert_eq!(loaded.gateway_base_url, "https://my-gateway.example.com/v1");
         assert_eq!(loaded.gateway_model, "gpt-4o");
 
         // Clearing back to `""` (unset) also round-trips — not a one-way latch.
-        let cleared = AppConfig { ..Default::default() };
+        let cleared = AppConfig {
+            ..Default::default()
+        };
         cleared.save(&db).unwrap();
         let reloaded = AppConfig::load(&db).unwrap();
         assert_eq!(reloaded.gateway_base_url, "");
@@ -1498,10 +1594,16 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.proactive_hints_enabled, "an omitted key must default ON");
+        assert!(
+            cfg.proactive_hints_enabled,
+            "an omitted key must default ON"
+        );
 
         // Explicit OFF persists + reloads OFF (the backend-side mute).
-        let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
+        let cfg = AppConfig {
+            proactive_hints_enabled: false,
+            ..Default::default()
+        };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().proactive_hints_enabled);
     }
@@ -1532,7 +1634,10 @@ mod tests {
         assert!(cfg.user_memory_enabled, "an omitted key must default ON");
 
         // Explicit OFF persists + reloads OFF (the backend-side memory kill switch).
-        let cfg = AppConfig { user_memory_enabled: false, ..Default::default() };
+        let cfg = AppConfig {
+            user_memory_enabled: false,
+            ..Default::default()
+        };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().user_memory_enabled);
     }
@@ -1617,7 +1722,10 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.gateway_base_url, "", "serde default must be empty string");
+        assert_eq!(
+            cfg.gateway_base_url, "",
+            "serde default must be empty string"
+        );
         assert_eq!(cfg.gateway_model, "", "serde default must be empty string");
     }
 }

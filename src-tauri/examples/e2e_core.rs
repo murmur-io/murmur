@@ -54,7 +54,11 @@ async fn main() {
     );
 
     let vault_titles = export::list_vault_titles(vault).unwrap_or_default();
-    let duration_s = transcript.segments.last().map(|s| s.end_s as i64).unwrap_or(0);
+    let duration_s = transcript
+        .segments
+        .last()
+        .map(|s| s.end_s as i64)
+        .unwrap_or(0);
     let req = SummarizeRequest {
         transcript: transcript.full_text.clone(),
         meta: MeetingMeta {

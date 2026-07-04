@@ -80,7 +80,9 @@ fn build_client() -> reqwest::Client {
 
 /// Strip a single leading `v`/`V` from a release tag to get the bare version string.
 fn strip_v(tag: &str) -> &str {
-    tag.strip_prefix('v').or_else(|| tag.strip_prefix('V')).unwrap_or(tag)
+    tag.strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag)
 }
 
 /// Parse a version string into `(major, minor, patch)`. Splits on `.`; for each of the first three

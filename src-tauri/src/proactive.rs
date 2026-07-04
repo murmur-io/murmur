@@ -216,7 +216,9 @@ fn find_last_run(hay: &[char], needle: &[char]) -> Option<usize> {
     if needle.is_empty() || needle.len() > hay.len() {
         return None;
     }
-    (0..=hay.len() - needle.len()).rev().find(|&i| hay[i..i + needle.len()] == needle[..])
+    (0..=hay.len() - needle.len())
+        .rev()
+        .find(|&i| hay[i..i + needle.len()] == needle[..])
 }
 
 /// Per-recording state of the proactive scanner: the tick/cooldown clock, the session dedup set,
@@ -278,7 +280,11 @@ impl ProactiveState {
             .into_iter()
             .filter(|c| c.score >= SCORE_THRESHOLD)
             .filter(|c| !self.emitted.contains(&(c.kind, c.target_id.clone())))
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))?;
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
         self.emitted.insert((best.kind, best.target_id.clone()));
         self.cooldown = COOLDOWN_TICKS;
         Some(best.into_payload())
@@ -317,7 +323,14 @@ pub fn scan_tick(
         .lock()
         .map(|b| b.clone())
         .unwrap_or_default();
-    state.step(enabled, &app_state.db, &unlocked, &meeting_id, &buf, Utc::now())
+    state.step(
+        enabled,
+        &app_state.db,
+        &unlocked,
+        &meeting_id,
+        &buf,
+        Utc::now(),
+    )
 }
 
 // ── Candidate gathering (D3: every read through an EXISTING gated helper) ─────────────────────
@@ -406,13 +419,15 @@ pub fn gather_candidates(
             // this on …".
             match db.entity_mentions_visible(&entity.id, unlocked) {
                 Ok(mentions) => {
-                    if let Some(m) =
-                        mentions.iter().find(|m| m.meeting_id != current_meeting_id)
-                    {
+                    if let Some(m) = mentions.iter().find(|m| m.meeting_id != current_meeting_id) {
                         candidates.push(HintCandidate {
                             kind: HintKind::PastMeeting,
                             title: truncate_chars(
-                                if m.title.trim().is_empty() { "(untitled)" } else { &m.title },
+                                if m.title.trim().is_empty() {
+                                    "(untitled)"
+                                } else {
+                                    &m.title
+                                },
                                 TITLE_MAX_CHARS,
                             ),
                             target_id: m.meeting_id.clone(),
@@ -546,18 +561,105 @@ fn extract_rare_terms(delta: &str, n: usize) -> Vec<String> {
 /// query, never a leak.
 const STOPWORDS: &[&str] = &[
     // English
-    "about", "above", "actually", "after", "again", "always", "anything", "because", "before",
-    "being", "below", "between", "could", "different", "doing", "during", "every", "everything",
-    "first", "going", "gonna", "having", "little", "maybe", "might", "nothing", "other", "people",
-    "pretty", "probably", "really", "right", "should", "since", "something", "sometimes", "still",
-    "their", "there", "these", "thing", "things", "think", "those", "through", "today", "under",
-    "until", "where", "which", "while", "would",
+    "about",
+    "above",
+    "actually",
+    "after",
+    "again",
+    "always",
+    "anything",
+    "because",
+    "before",
+    "being",
+    "below",
+    "between",
+    "could",
+    "different",
+    "doing",
+    "during",
+    "every",
+    "everything",
+    "first",
+    "going",
+    "gonna",
+    "having",
+    "little",
+    "maybe",
+    "might",
+    "nothing",
+    "other",
+    "people",
+    "pretty",
+    "probably",
+    "really",
+    "right",
+    "should",
+    "since",
+    "something",
+    "sometimes",
+    "still",
+    "their",
+    "there",
+    "these",
+    "thing",
+    "things",
+    "think",
+    "those",
+    "through",
+    "today",
+    "under",
+    "until",
+    "where",
+    "which",
+    "while",
+    "would",
     // Polish (folded: diacritics stripped)
-    "bardzo", "bedzie", "bedziemy", "chyba", "czyli", "dlatego", "dobra", "dobrze", "dzisiaj",
-    "jakas", "jakies", "jakis", "jednak", "jeszcze", "jutro", "kazdy", "kiedy", "ktora", "ktore",
-    "ktorego", "ktorej", "ktory", "mozemy", "mozna", "musimy", "nawet", "potem", "przeciez",
-    "robimy", "rowniez", "sobie", "swoje", "szybko", "takze", "teraz", "troche", "trzeba",
-    "tutaj", "wiadomo", "wlasciwie", "wlasnie", "wszyscy", "wszystko", "wtedy", "zaraz", "zeby",
+    "bardzo",
+    "bedzie",
+    "bedziemy",
+    "chyba",
+    "czyli",
+    "dlatego",
+    "dobra",
+    "dobrze",
+    "dzisiaj",
+    "jakas",
+    "jakies",
+    "jakis",
+    "jednak",
+    "jeszcze",
+    "jutro",
+    "kazdy",
+    "kiedy",
+    "ktora",
+    "ktore",
+    "ktorego",
+    "ktorej",
+    "ktory",
+    "mozemy",
+    "mozna",
+    "musimy",
+    "nawet",
+    "potem",
+    "przeciez",
+    "robimy",
+    "rowniez",
+    "sobie",
+    "swoje",
+    "szybko",
+    "takze",
+    "teraz",
+    "troche",
+    "trzeba",
+    "tutaj",
+    "wiadomo",
+    "wlasciwie",
+    "wlasnie",
+    "wszyscy",
+    "wszystko",
+    "wtedy",
+    "zaraz",
+    "zeby",
 ];
 
 // ── Scoring helpers ────────────────────────────────────────────────────────────────────────────
@@ -569,12 +671,19 @@ fn recency(started_at: &str, now: DateTime<Utc>) -> f32 {
         return RECENCY_FLOOR;
     };
     let age_days = (now - t.with_timezone(&Utc)).num_seconds().max(0) as f32 / 86_400.0;
-    0.5f32.powf(age_days / RECENCY_HALF_LIFE_DAYS).max(RECENCY_FLOOR)
+    0.5f32
+        .powf(age_days / RECENCY_HALF_LIFE_DAYS)
+        .max(RECENCY_FLOOR)
 }
 
 /// Short display title for a meeting row (already visible — it came out of a gated reader).
 fn meeting_title(m: &Meeting) -> String {
-    let t = m.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("(untitled)");
+    let t = m
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("(untitled)");
     truncate_chars(t, TITLE_MAX_CHARS)
 }
 
@@ -700,16 +809,28 @@ mod tests {
         // Sealed meeting about Kraken (lock the folder flag directly — the rows survive at rest,
         // so this proves the READ GATE, independent of purge-on-seal).
         seed_folder(&db, "f-lock", "Secret");
-        seed_note(&db, "m-sealed", "Kraken sync", "Kraken pricing plan", Some("f-lock"));
+        seed_note(
+            &db,
+            "m-sealed",
+            "Kraken sync",
+            "Kraken pricing plan",
+            Some("f-lock"),
+        );
         seed_entity(&db, "Kraken", "m-sealed");
         db.set_folder_locked("f-lock", true, None).unwrap();
 
         let delta = "we should sync on Atlas and Kraken pricing this week";
         let sealed_set = HashSet::new();
         let candidates = gather_candidates(&db, &sealed_set, "m-cur", delta, now());
-        assert!(!candidates.is_empty(), "the visible Atlas candidate must be found");
+        assert!(
+            !candidates.is_empty(),
+            "the visible Atlas candidate must be found"
+        );
         for c in &candidates {
-            assert_ne!(c.target_id, "m-sealed", "sealed meeting id leaked as a target");
+            assert_ne!(
+                c.target_id, "m-sealed",
+                "sealed meeting id leaked as a target"
+            );
             assert_ne!(
                 c.meeting_id.as_deref(),
                 Some("m-sealed"),
@@ -727,7 +848,9 @@ mod tests {
         unlocked.insert("f-lock".to_string());
         let candidates = gather_candidates(&db, &unlocked, "m-cur", delta, now());
         assert!(
-            candidates.iter().any(|c| c.meeting_id.as_deref() == Some("m-sealed")),
+            candidates
+                .iter()
+                .any(|c| c.meeting_id.as_deref() == Some("m-sealed")),
             "an unlocked folder's meeting must be eligible again"
         );
     }
@@ -739,9 +862,21 @@ mod tests {
     #[test]
     fn cooldown_enforces_forty_ticks_between_emissions() {
         let db = tmp_db("cooldown");
-        seed_note(&db, "m-a", "Anna 1:1", "- [ ] Anna — send the pricing document", None);
+        seed_note(
+            &db,
+            "m-a",
+            "Anna 1:1",
+            "- [ ] Anna — send the pricing document",
+            None,
+        );
         seed_entity(&db, "Anna", "m-a");
-        seed_note(&db, "m-b", "Robert 1:1", "- [ ] Robert — prepare the budget review", None);
+        seed_note(
+            &db,
+            "m-b",
+            "Robert 1:1",
+            "- [ ] Robert — prepare the budget review",
+            None,
+        );
         seed_entity(&db, "Robert", "m-b");
 
         let mut st = ProactiveState::default();
@@ -767,7 +902,10 @@ mod tests {
         );
         assert_eq!(emissions[0].1.kind, "open_commitment");
         assert_eq!(emissions[0].1.target_id, "m-a");
-        assert_eq!(emissions[1].1.target_id, "m-b", "the delta-scoped scan surfaces Robert next");
+        assert_eq!(
+            emissions[1].1.target_id, "m-b",
+            "the delta-scoped scan surfaces Robert next"
+        );
     }
 
     // ── D2: session dedup by (kind, target_id) ─────────────────────────────────────────────────
@@ -778,18 +916,21 @@ mod tests {
     fn session_dedup_never_reemits_same_kind_and_target() {
         let mut st = ProactiveState::default();
         assert!(
-            st.pick(vec![cand(HintKind::OpenCommitment, "m-1", 1.0)]).is_some(),
+            st.pick(vec![cand(HintKind::OpenCommitment, "m-1", 1.0)])
+                .is_some(),
             "first emission goes out"
         );
         st.cooldown = 0; // force the cooldown out of the way — this test isolates dedup.
         assert!(
-            st.pick(vec![cand(HintKind::OpenCommitment, "m-1", 1.0)]).is_none(),
+            st.pick(vec![cand(HintKind::OpenCommitment, "m-1", 1.0)])
+                .is_none(),
             "the SAME (kind, target_id) must never emit twice in one recording"
         );
         // A different KIND for the same target is a different dedup key (a meeting card and a
         // commitment card about the same meeting are different information).
         assert!(
-            st.pick(vec![cand(HintKind::PastMeeting, "m-1", 0.9)]).is_some(),
+            st.pick(vec![cand(HintKind::PastMeeting, "m-1", 0.9)])
+                .is_some(),
             "a different kind for the same target is not deduped"
         );
     }
@@ -799,7 +940,13 @@ mod tests {
     #[test]
     fn session_dedup_holds_across_repeated_mentions() {
         let db = tmp_db("dedup");
-        seed_note(&db, "m-a", "Anna 1:1", "- [ ] Anna — send the pricing document", None);
+        seed_note(
+            &db,
+            "m-a",
+            "Anna 1:1",
+            "- [ ] Anna — send the pricing document",
+            None,
+        );
         seed_entity(&db, "Anna", "m-a");
 
         let mut st = ProactiveState::default();
@@ -814,7 +961,10 @@ mod tests {
                 emitted_keys.push((p.kind.clone(), p.target_id.clone()));
             }
         }
-        assert!(!emitted_keys.is_empty(), "the repeated mention emits at least once");
+        assert!(
+            !emitted_keys.is_empty(),
+            "the repeated mention emits at least once"
+        );
         let unique: HashSet<_> = emitted_keys.iter().cloned().collect();
         assert_eq!(
             unique.len(),
@@ -830,7 +980,13 @@ mod tests {
     #[test]
     fn flag_off_never_scans_and_delta_is_not_consumed() {
         let db = tmp_db("flag-off");
-        seed_note(&db, "m-a", "Anna 1:1", "- [ ] Anna — send the pricing document", None);
+        seed_note(
+            &db,
+            "m-a",
+            "Anna 1:1",
+            "- [ ] Anna — send the pricing document",
+            None,
+        );
         seed_entity(&db, "Anna", "m-a");
 
         let mut st = ProactiveState::default();
@@ -838,11 +994,15 @@ mod tests {
         let buf = "Anna wspominała o dokumencie cenowym".to_string();
         for _ in 1..=40u32 {
             assert!(
-                st.step(false, &db, &unlocked, "m-cur", &buf, now()).is_none(),
+                st.step(false, &db, &unlocked, "m-cur", &buf, now())
+                    .is_none(),
                 "flag OFF must never emit"
             );
         }
-        assert!(st.emitted.is_empty(), "flag OFF must not record any emission state");
+        assert!(
+            st.emitted.is_empty(),
+            "flag OFF must not record any emission state"
+        );
         // Flipping the flag ON mid-recording: the very next scan tick sees the text accrued while
         // muted as its delta — proof the muted ticks never consumed it.
         let mut emitted = None;
@@ -865,7 +1025,13 @@ mod tests {
     #[test]
     fn unchanged_buffer_yields_no_second_event() {
         let db = tmp_db("empty-delta");
-        seed_note(&db, "m-a", "Anna 1:1", "- [ ] Anna — send the pricing document", None);
+        seed_note(
+            &db,
+            "m-a",
+            "Anna 1:1",
+            "- [ ] Anna — send the pricing document",
+            None,
+        );
         let anna = seed_entity(&db, "Anna", "m-a");
         seed_fact(&db, &anna, "role", "QA owner", "m-a");
 
@@ -878,7 +1044,11 @@ mod tests {
                 emissions.push((tick, p));
             }
         }
-        assert_eq!(emissions.len(), 1, "an UNCHANGED buffer must never produce a second event");
+        assert_eq!(
+            emissions.len(),
+            1,
+            "an UNCHANGED buffer must never produce a second event"
+        );
         assert_eq!(emissions[0].0, 10);
     }
 
@@ -906,14 +1076,23 @@ mod tests {
         );
         seed_entity(&db, "Anna", "m-a");
 
-        let candidates =
-            gather_candidates(&db, &HashSet::new(), "m-cur", "co z dokumentem od Anna?", now());
+        let candidates = gather_candidates(
+            &db,
+            &HashSet::new(),
+            "m-cur",
+            "co z dokumentem od Anna?",
+            now(),
+        );
         let commitment = candidates
             .iter()
             .find(|c| c.kind == HintKind::OpenCommitment)
             .expect("the entity match must surface its OPEN commitment");
         assert_eq!(commitment.target_id, "m-a");
-        assert!(commitment.title.contains("pricing document"), "title: {}", commitment.title);
+        assert!(
+            commitment.title.contains("pricing document"),
+            "title: {}",
+            commitment.title
+        );
         assert!(
             commitment.score >= SCORE_THRESHOLD,
             "an open commitment for an exact entity match must clear the threshold"
@@ -927,9 +1106,14 @@ mod tests {
         let mut st = ProactiveState::default();
         let mut payload = None;
         for _ in 1..=10u32 {
-            if let Some(p) =
-                st.step(true, &db, &HashSet::new(), "m-cur", "co z dokumentem od Anna?", now())
-            {
+            if let Some(p) = st.step(
+                true,
+                &db,
+                &HashSet::new(),
+                "m-cur",
+                "co z dokumentem od Anna?",
+                now(),
+            ) {
                 payload = Some(p);
             }
         }
@@ -946,12 +1130,18 @@ mod tests {
     fn sub_threshold_match_is_rejected_and_not_dedup_poisoned() {
         let mut st = ProactiveState::default();
         assert!(
-            st.pick(vec![cand(HintKind::PastMeeting, "m-1", SCORE_THRESHOLD - 0.01)]).is_none(),
+            st.pick(vec![cand(
+                HintKind::PastMeeting,
+                "m-1",
+                SCORE_THRESHOLD - 0.01
+            )])
+            .is_none(),
             "a sub-threshold candidate must not emit"
         );
         // The rejection did NOT record the pair — a later, stronger signal still surfaces it.
         assert!(
-            st.pick(vec![cand(HintKind::PastMeeting, "m-1", 0.9)]).is_some(),
+            st.pick(vec![cand(HintKind::PastMeeting, "m-1", 0.9)])
+                .is_some(),
             "a rejected candidate must stay eligible for a stronger later match"
         );
     }
@@ -961,7 +1151,13 @@ mod tests {
     #[test]
     fn term_leg_scores_rank_zero_above_threshold_and_rank_one_below() {
         let db = tmp_db("term");
-        seed_note(&db, "m-t", "Q3 planning", "the Kwantyfikator initiative kickoff", None);
+        seed_note(
+            &db,
+            "m-t",
+            "Q3 planning",
+            "the Kwantyfikator initiative kickoff",
+            None,
+        );
 
         let candidates = gather_candidates(
             &db,
@@ -974,9 +1170,16 @@ mod tests {
             .iter()
             .find(|c| c.kind == HintKind::PastMeeting && c.target_id == "m-t")
             .expect("the rare term must surface the meeting through gated FTS");
-        assert!(hit.score >= SCORE_THRESHOLD, "rank-0 recent term hit clears: {}", hit.score);
+        assert!(
+            hit.score >= SCORE_THRESHOLD,
+            "rank-0 recent term hit clears: {}",
+            hit.score
+        );
         // Rank 1 with the same recency is halved — under the threshold by construction.
-        assert!(hit.score / 2.0 < SCORE_THRESHOLD, "a rank-1 term hit must fall under");
+        assert!(
+            hit.score / 2.0 < SCORE_THRESHOLD,
+            "a rank-1 term hit must fall under"
+        );
     }
 
     // ── Delta tracker: append, cap, front-trim relocation, reset ───────────────────────────────
@@ -987,8 +1190,16 @@ mod tests {
         let a = "alpha bravo charlie".to_string();
         assert_eq!(t.take_delta(&a), a, "first scan sees everything");
         let b = format!("{a} delta echo");
-        assert_eq!(t.take_delta(&b), " delta echo", "second scan sees only the appended tail");
-        assert_eq!(t.take_delta(&b), "", "unchanged buffer yields an empty delta");
+        assert_eq!(
+            t.take_delta(&b),
+            " delta echo",
+            "second scan sees only the appended tail"
+        );
+        assert_eq!(
+            t.take_delta(&b),
+            "",
+            "unchanged buffer yields an empty delta"
+        );
     }
 
     /// The live buffer front-trims at its 16k cap: the old offset then points at the WRONG text.
@@ -1008,7 +1219,10 @@ mod tests {
             "FRESH tail here",
             "only the new tail after relocation, got {delta:?}"
         );
-        assert!(!delta.contains("word"), "no already-scanned text re-surfaced as new: {delta:?}");
+        assert!(
+            !delta.contains("word"),
+            "no already-scanned text re-surfaced as new: {delta:?}"
+        );
     }
 
     #[test]
@@ -1027,7 +1241,11 @@ mod tests {
         let _ = t.take_delta("start");
         let huge = format!("start{}", " x".repeat(3 * MAX_DELTA_CHARS));
         let delta = t.take_delta(&huge);
-        assert_eq!(delta.chars().count(), MAX_DELTA_CHARS, "delta bounded to the recent window");
+        assert_eq!(
+            delta.chars().count(),
+            MAX_DELTA_CHARS,
+            "delta bounded to the recent window"
+        );
     }
 
     // ── Pure matching helpers ──────────────────────────────────────────────────────────────────
@@ -1040,13 +1258,26 @@ mod tests {
             kind: EntityKind::Project,
             mention_count: 1,
         };
-        let entities = vec![node("e1", "Atlas"), node("e2", "Gawroński"), node("e3", "Anna Kowalska")];
+        let entities = vec![
+            node("e1", "Atlas"),
+            node("e2", "Gawroński"),
+            node("e3", "Anna Kowalska"),
+        ];
         // Case-insensitive token match.
-        assert_eq!(match_entities("mówiliśmy o atlas wczoraj", &entities).len(), 1);
+        assert_eq!(
+            match_entities("mówiliśmy o atlas wczoraj", &entities).len(),
+            1
+        );
         // Diacritic-insensitive both ways.
-        assert_eq!(match_entities("dzwonił Gawronski rano", &entities)[0].id, "e2");
+        assert_eq!(
+            match_entities("dzwonił Gawronski rano", &entities)[0].id,
+            "e2"
+        );
         // Multi-token names need the contiguous in-order run.
-        assert_eq!(match_entities("spotkanie z Anna Kowalska jutro", &entities)[0].id, "e3");
+        assert_eq!(
+            match_entities("spotkanie z Anna Kowalska jutro", &entities)[0].id,
+            "e3"
+        );
         assert!(match_entities("Kowalska Anna odwrotnie", &entities).is_empty());
         // NEVER a substring: "atlasian" must not match "Atlas".
         assert!(match_entities("we use atlasian tools", &entities).is_empty());
@@ -1058,22 +1289,48 @@ mod tests {
             "Właśnie rozmawiamy o Kwantyfikator i jeszcze about 12345 harmonogramie",
             3,
         );
-        assert_eq!(terms[0], "Kwantyfikator", "capitalized proper noun ranked first: {terms:?}");
-        assert!(terms.contains(&"harmonogramie".to_string()), "long plain token kept: {terms:?}");
-        assert!(!terms.contains(&"Właśnie".to_string()), "stopword dropped (folded match)");
+        assert_eq!(
+            terms[0], "Kwantyfikator",
+            "capitalized proper noun ranked first: {terms:?}"
+        );
+        assert!(
+            terms.contains(&"harmonogramie".to_string()),
+            "long plain token kept: {terms:?}"
+        );
+        assert!(
+            !terms.contains(&"Właśnie".to_string()),
+            "stopword dropped (folded match)"
+        );
         assert!(!terms.contains(&"about".to_string()), "EN stopword dropped");
-        assert!(!terms.contains(&"12345".to_string()), "all-numeric token dropped");
+        assert!(
+            !terms.contains(&"12345".to_string()),
+            "all-numeric token dropped"
+        );
         assert!(terms.len() <= 3, "top-N cap respected");
     }
 
     #[test]
     fn recency_decays_with_floor_and_handles_garbage() {
         let n = now();
-        assert!(recency("2026-07-02T11:00:00Z", n) > 0.99, "an hour old ≈ no decay");
+        assert!(
+            recency("2026-07-02T11:00:00Z", n) > 0.99,
+            "an hour old ≈ no decay"
+        );
         let quarter = recency("2026-04-03T12:00:00Z", n); // ~90 days = one half-life
-        assert!((0.45..0.55).contains(&quarter), "one half-life ≈ 0.5, got {quarter}");
-        assert_eq!(recency("2020-01-01T00:00:00Z", n), RECENCY_FLOOR, "ancient hits the floor");
-        assert_eq!(recency("not-a-date", n), RECENCY_FLOOR, "garbage timestamp = floor, no panic");
+        assert!(
+            (0.45..0.55).contains(&quarter),
+            "one half-life ≈ 0.5, got {quarter}"
+        );
+        assert_eq!(
+            recency("2020-01-01T00:00:00Z", n),
+            RECENCY_FLOOR,
+            "ancient hits the floor"
+        );
+        assert_eq!(
+            recency("not-a-date", n),
+            RECENCY_FLOOR,
+            "garbage timestamp = floor, no panic"
+        );
     }
 
     // ── Payload contract (FE consumes verbatim) ────────────────────────────────────────────────
@@ -1082,11 +1339,17 @@ mod tests {
     fn payload_serializes_camel_case_for_the_fe() {
         let p = cand(HintKind::OpenCommitment, "m-1", 0.8).into_payload();
         let json = serde_json::to_value(&p).unwrap();
-        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("open_commitment"));
+        assert_eq!(
+            json.get("kind").and_then(|v| v.as_str()),
+            Some("open_commitment")
+        );
         assert_eq!(json.get("targetId").and_then(|v| v.as_str()), Some("m-1"));
         assert_eq!(json.get("meetingId").and_then(|v| v.as_str()), Some("m-1"));
         assert!(json.get("title").is_some());
         assert!(json.get("score").is_some());
-        assert!(json.get("target_id").is_none(), "snake_case must not leak over IPC");
+        assert!(
+            json.get("target_id").is_none(),
+            "snake_case must not leak over IPC"
+        );
     }
 }

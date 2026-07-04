@@ -98,7 +98,9 @@ mod tests {
 
     #[test]
     fn has_builtin_recipes() {
-        assert!(BUILTIN_RECIPES.iter().any(|(id, _, _)| *id == "grounded-email"));
+        assert!(BUILTIN_RECIPES
+            .iter()
+            .any(|(id, _, _)| *id == "grounded-email"));
         assert!(BUILTIN_RECIPES.len() >= 5);
     }
 }

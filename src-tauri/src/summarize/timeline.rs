@@ -40,7 +40,13 @@ pub async fn generate(
             // Feed the canonical diarization tag (me / others / others-N) so the LLM-derived
             // timeline AGREES with the segment speaker labels instead of inventing its own.
             let who = s.speaker.as_deref().unwrap_or("?");
-            format!("[{:.1}-{:.1}] ({}) {}", s.start_s, s.end_s, who, s.text.trim())
+            format!(
+                "[{:.1}-{:.1}] ({}) {}",
+                s.start_s,
+                s.end_s,
+                who,
+                s.text.trim()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -83,7 +89,9 @@ pub async fn generate(
     });
     let v = provider.complete_json(SYSTEM, &transcript, &schema).await?;
     let mut tl: MeetingTimeline = serde_json::from_value(v).map_err(|e| {
-        crate::error::AppError::Summarize(format!("timeline: invalid JSON shape from provider: {e}"))
+        crate::error::AppError::Summarize(format!(
+            "timeline: invalid JSON shape from provider: {e}"
+        ))
     })?;
     // The provider prompt asks it to "cover the whole timeline", but in practice — especially on
     // SPARSE transcripts with silence gaps, and on smaller/local models — it drops the trailing
@@ -264,16 +272,30 @@ mod tests {
     /// (< 0.9× the 45s recording → the FE zooms the axis to ~0:14). After, both tracks reach 44.5.
     #[test]
     fn repair_extends_short_timeline_to_last_segment() {
-        let segments = vec![seg(0.2, 3.9), seg(9.9, 13.7), seg(29.4, 31.6), seg(43.5, 44.5)];
+        let segments = vec![
+            seg(0.2, 3.9),
+            seg(9.9, 13.7),
+            seg(29.4, 31.6),
+            seg(43.5, 44.5),
+        ];
         let mut tl = MeetingTimeline {
             speakers: vec![turn(0.2, 3.9), turn(9.9, 13.7)],
-            topics: vec![topic("Test Brain Note", 0.2, 7.9), topic("Architecture Issue", 7.9, 13.7)],
+            topics: vec![
+                topic("Test Brain Note", 0.2, 7.9),
+                topic("Architecture Issue", 7.9, 13.7),
+            ],
         };
         repair_coverage(&mut tl, &segments);
         let sp_max = tl.speakers.iter().map(|t| t.end_s).fold(0.0, f64::max);
         let tp_max = tl.topics.iter().map(|t| t.end_s).fold(0.0, f64::max);
-        assert!((sp_max - 44.5).abs() < 1e-6, "speakers should reach 44.5, got {sp_max}");
-        assert!((tp_max - 44.5).abs() < 1e-6, "topics should reach 44.5, got {tp_max}");
+        assert!(
+            (sp_max - 44.5).abs() < 1e-6,
+            "speakers should reach 44.5, got {sp_max}"
+        );
+        assert!(
+            (tp_max - 44.5).abs() < 1e-6,
+            "topics should reach 44.5, got {tp_max}"
+        );
         // Labels + earlier spans are preserved; only the LAST span was extended.
         assert_eq!(tl.topics.len(), 2);
         assert_eq!(tl.topics[0].end_s, 7.9);
@@ -333,9 +355,16 @@ mod tests {
             topics: vec![topic("Real", 0.0, 8.0), topic("Ghost", 50.0, 60.0)],
         };
         repair_coverage(&mut tl, &segments);
-        assert_eq!(tl.topics.len(), 1, "the beyond-content ghost span is dropped");
+        assert_eq!(
+            tl.topics.len(),
+            1,
+            "the beyond-content ghost span is dropped"
+        );
         assert_eq!(tl.topics[0].label, "Real");
-        assert!((tl.topics[0].end_s - 20.0).abs() < 1e-6, "the surviving span covers to 20.0");
+        assert!(
+            (tl.topics[0].end_s - 20.0).abs() < 1e-6,
+            "the surviving span covers to 20.0"
+        );
     }
 
     /// No segments (or all zero-length) → nothing to anchor to → the timeline is left untouched

@@ -108,7 +108,7 @@ subtle = "2"
 # ── Client E2EE (Milestone M2 — sharing) ──
 # Shared wire-format + envelope codec, compiled into BOTH the app and the server so format drift is
 # a COMPILE error (spec §2/§4). Path-dep on the murmur-server workspace crate (permissive-licensed).
-murmur-protocol = { path = "../../murmur-server/crates/murmur-protocol" }
+murmur-protocol = { path = "../../murmur-server/crates/murmur-protocol", features = ["opaque"] }
 # HPKE RFC 9180 Base mode for the mode-B recipient NK wrap (DHKEM(X25519,HKDF-SHA256)+HKDF-SHA256+
 # AES-256-GCM). rozbb/rust-hpke — Cloudflare-reviewed; pinned suite (spec §4.6/§4.8).
 hpke = "0.12"

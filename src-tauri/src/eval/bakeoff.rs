@@ -27,9 +27,7 @@ use std::collections::HashSet;
 
 use crate::embed::{rrf_fuse, Embedder, RRF_K};
 use crate::error::{AppError, Result};
-use crate::eval::{
-    aggregate_metrics, BakeoffReport, LabeledSet, ModeMetrics, RetrievalMode,
-};
+use crate::eval::{aggregate_metrics, BakeoffReport, LabeledSet, ModeMetrics, RetrievalMode};
 use crate::storage::Db;
 
 /// Retrieve the FTS meeting-id ranking for one query (BM25 order, deduped, visibility-gated).
@@ -128,8 +126,14 @@ mod tests {
         let sem = vec!["m3".to_string(), "m2".to_string(), "m1".to_string()];
         let fused = hybrid_ranked(&fts, &sem);
         let pos = |id: &str| fused.iter().position(|x| x == id).unwrap();
-        assert!(pos("m2") < pos("m3"), "m2 (both legs) must outrank m3 (one leg)");
-        assert!(pos("m1") < pos("m3"), "m1 (both legs) must outrank m3 (one leg)");
+        assert!(
+            pos("m2") < pos("m3"),
+            "m2 (both legs) must outrank m3 (one leg)"
+        );
+        assert!(
+            pos("m1") < pos("m3"),
+            "m1 (both legs) must outrank m3 (one leg)"
+        );
         // Dedup: every id appears once.
         assert_eq!(fused.len(), 3);
     }
@@ -142,7 +146,10 @@ mod tests {
         assert_eq!(fused, vec!["a".to_string(), "b".to_string()]);
         // FTS leg empty → hybrid preserves the semantic order.
         let sem = vec!["x".to_string(), "y".to_string()];
-        assert_eq!(hybrid_ranked(&[], &sem), vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(
+            hybrid_ranked(&[], &sem),
+            vec!["x".to_string(), "y".to_string()]
+        );
         // Both empty → empty.
         assert!(hybrid_ranked(&[], &[]).is_empty());
     }
@@ -176,7 +183,10 @@ mod tests {
         assert_eq!(report.k, 5);
         assert_eq!(report.queries, 1);
         for m in &report.modes {
-            assert_eq!(m.recall_at_k, 0.0, "empty vault ⇒ nothing retrieved ⇒ recall 0");
+            assert_eq!(
+                m.recall_at_k, 0.0,
+                "empty vault ⇒ nothing retrieved ⇒ recall 0"
+            );
             assert_eq!(m.mrr, 0.0);
         }
         let table = crate::eval::format_report_table(&report);
@@ -231,7 +241,10 @@ mod tests {
     /// A migrated, empty SQLCipher Db under the fixed test DEK (headless-safe temp file).
     fn throwaway_db(label: &str) -> Db {
         let mut p = std::env::temp_dir();
-        p.push(format!("murmur-bakeoff-{label}-{}.sqlite", std::process::id()));
+        p.push(format!(
+            "murmur-bakeoff-{label}-{}.sqlite",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&p);
         Db::open_with_key(&p, TEST_DEK).unwrap()
     }

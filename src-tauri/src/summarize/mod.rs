@@ -8,19 +8,19 @@ use crate::summarize::provider::SummarizerProvider;
 
 pub mod action_items;
 pub mod anthropic;
-pub mod egress_log;
-pub mod gateway;
-pub mod meta;
 pub mod brief;
 pub mod chat;
 pub mod claude_code;
 pub mod digest;
 pub mod dossier;
+pub mod egress_log;
+pub mod gateway;
 pub mod graph;
 /// Tier 3b (B) anti-hallucination — DETERMINISTIC GROUNDING of the generated note against its own
 /// transcript segments. Pure, on-device, zero-egress; annotates unsupported summary units with a
 /// non-destructive `> unverified` marker.
 pub mod grounding;
+pub mod meta;
 /// The REAL on-device PERSON-name NER redactor (Phase D). ALWAYS compiled; the real impl is selected
 /// at runtime by `redact::active_name_redactor` when the NER model dir is present, else the
 /// byte-identical `NoopNameRedactor` (so a no-model build's name egress is unchanged).
@@ -211,7 +211,9 @@ fn make_provider_resolved(
                 ));
             }
             // R3 — resolve the GATEWAY key only; NEVER falls back to the Anthropic key.
-            let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+            let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT)
+                .ok()
+                .flatten();
             let model = if target.model.trim().is_empty() {
                 config.gateway_model.clone()
             } else {
@@ -312,7 +314,9 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
     ];
     // Gateway: include only when configured; a bad URL is omitted, never a panic.
     if !config.gateway_base_url.trim().is_empty() {
-        let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT).ok().flatten();
+        let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT)
+            .ok()
+            .flatten();
         if let Ok(gw) = crate::summarize::gateway::OpenAiCompatProvider::new(
             config.gateway_base_url.clone(),
             config.gateway_model.clone(),
@@ -457,7 +461,10 @@ mod tests {
         }
         for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
             assert!(
-                matches!(provider_for(role, &cfg), Err(crate::error::AppError::Unavailable(_))),
+                matches!(
+                    provider_for(role, &cfg),
+                    Err(crate::error::AppError::Unavailable(_))
+                ),
                 "provider_for {role:?} must refuse after revoke"
             );
         }
@@ -569,7 +576,10 @@ mod tests {
         let cfg = AppConfig::default(); // consent OFF
         for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
             assert!(
-                matches!(provider_for(role, &cfg), Err(crate::error::AppError::Unavailable(_))),
+                matches!(
+                    provider_for(role, &cfg),
+                    Err(crate::error::AppError::Unavailable(_))
+                ),
                 "fallback {role:?} must be consent-gated"
             );
         }
@@ -578,8 +588,12 @@ mod tests {
         let cases: [(&str, ConfigTweak); 4] = [
             ("claude_code", |_| {}),
             ("anthropic", |_| {}),
-            ("gateway", |c| c.gateway_base_url = "http://127.0.0.1:4000/v1".into()),
-            ("ollama", |c| c.ollama_base_url = "https://ollama.remote.example/api".into()),
+            ("gateway", |c| {
+                c.gateway_base_url = "http://127.0.0.1:4000/v1".into()
+            }),
+            ("ollama", |c| {
+                c.ollama_base_url = "https://ollama.remote.example/api".into()
+            }),
         ];
         for (conn, extra) in cases {
             let mut cfg = AppConfig {
@@ -657,14 +671,26 @@ mod tests {
             effort: String::new(),
         };
         // An explicit resolved model always wins.
-        assert_eq!(effective_model_requested(&t("anthropic", "claude-sonnet-4-6"), &cfg), "claude-sonnet-4-6");
+        assert_eq!(
+            effective_model_requested(&t("anthropic", "claude-sonnet-4-6"), &cfg),
+            "claude-sonnet-4-6"
+        );
         // Empty model → the connection's own default (THE anthropic fix).
-        assert_eq!(effective_model_requested(&t("anthropic", ""), &cfg), "claude-opus-4-8");
-        assert_eq!(effective_model_requested(&t("ollama", ""), &cfg), "llama3.1");
+        assert_eq!(
+            effective_model_requested(&t("anthropic", ""), &cfg),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            effective_model_requested(&t("ollama", ""), &cfg),
+            "llama3.1"
+        );
         assert_eq!(effective_model_requested(&t("gateway", ""), &cfg), "gpt-4o");
         // claude_code's default is the CLI's own — unknowable here, stays "".
         assert_eq!(effective_model_requested(&t("claude_code", ""), &cfg), "");
-        assert_eq!(effective_model_requested(&t("claude_code", "claude-haiku-4-5"), &cfg), "claude-haiku-4-5");
+        assert_eq!(
+            effective_model_requested(&t("claude_code", "claude-haiku-4-5"), &cfg),
+            "claude-haiku-4-5"
+        );
     }
 
     /// Task 1.3 — `egress_is_cloud` explicitly classifies `PROVIDER_GATEWAY` as cloud.

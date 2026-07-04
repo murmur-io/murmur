@@ -321,7 +321,10 @@ mod tests {
             .find("## Related prior notes (context only — do not copy, cite as [[Title]])")
             .expect("related block present");
         let transcript_at = out.find("\nTRANSCRIPT\n").expect("transcript present");
-        assert!(block_at < transcript_at, "related block must precede the transcript");
+        assert!(
+            block_at < transcript_at,
+            "related block must precede the transcript"
+        );
         assert!(out.contains("Q2 Planning"));
         assert!(out.contains("We decided to delay launch."));
     }
@@ -357,16 +360,26 @@ mod tests {
     /// carries the notes verbatim, and instructs the `## Also discussed` / no-`My notes` contract.
     #[test]
     fn user_notes_block_renders_between_related_and_transcript() {
-        let mut r = req(Some("### [[Prior]] · 2026-06-01 · id:x\nprior body".to_string()));
+        let mut r = req(Some(
+            "### [[Prior]] · 2026-06-01 · id:x\nprior body".to_string(),
+        ));
         r.user_notes = Some("ship Friday\nAnna owns QA".to_string());
         let s = render_user_content(&r);
-        let related_at = s.find("## Related prior notes").expect("related block present");
+        let related_at = s
+            .find("## Related prior notes")
+            .expect("related block present");
         let notes_at = s.find("ship Friday\nAnna owns QA").expect("notes verbatim");
         let transcript_at = s.find("\nTRANSCRIPT\n").expect("transcript section");
         assert!(related_at < notes_at, "skeleton after related notes");
         assert!(notes_at < transcript_at, "skeleton before transcript");
-        assert!(s.contains("## Also discussed"), "instructs the Also discussed section");
-        assert!(s.contains("Never output a section titled"), "forbids a My notes section");
+        assert!(
+            s.contains("## Also discussed"),
+            "instructs the Also discussed section"
+        );
+        assert!(
+            s.contains("Never output a section titled"),
+            "forbids a My notes section"
+        );
     }
 
     /// TIER 0: the speaker-attribution directive is appended ONLY when `labeled`, and the
@@ -381,13 +394,22 @@ mod tests {
         );
         // Unlabeled (the default solo-`me` meeting): byte-identical to the legacy prompt.
         let unlabeled = build_template("standard", "auto", false);
-        assert_eq!(unlabeled, base, "unlabeled must be byte-identical to the pre-Tier-0 prompt");
+        assert_eq!(
+            unlabeled, base,
+            "unlabeled must be byte-identical to the pre-Tier-0 prompt"
+        );
         assert!(!unlabeled.contains("SPEAKER ATTRIBUTION"));
         // Labeled: the unlabeled prompt PLUS the attribution directive instructing owner/speaker.
         let labeled = build_template("standard", "auto", true);
-        assert!(labeled.starts_with(&base), "labeled prompt extends the base prompt");
+        assert!(
+            labeled.starts_with(&base),
+            "labeled prompt extends the base prompt"
+        );
         assert!(labeled.contains("SPEAKER ATTRIBUTION"));
-        assert!(labeled.contains("OWNER"), "instructs action-item OWNER attribution");
+        assert!(
+            labeled.contains("OWNER"),
+            "instructs action-item OWNER attribution"
+        );
         assert!(labeled.contains("(speaker)") && labeled.contains("others"));
     }
 }

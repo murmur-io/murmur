@@ -162,16 +162,20 @@ impl Embedder for CandleBertEmbedder {
     /// const). e5 and mmlw share `"passage: "`, so this is behavior-identical for both bundled models
     /// while correctly generalizing to any future model whose convention differs.
     fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let prefixed: Vec<String> =
-            texts.iter().map(|t| format!("{}{t}", self.passage_prefix)).collect();
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{}{t}", self.passage_prefix))
+            .collect();
         self.embed(&prefixed)
     }
 
     /// Override the trait default so the SELECTED model's query prefix is applied. See
     /// [`Self::embed_passage`].
     fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let prefixed: Vec<String> =
-            texts.iter().map(|t| format!("{}{t}", self.query_prefix)).collect();
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{}{t}", self.query_prefix))
+            .collect();
         self.embed(&prefixed)
     }
 
@@ -190,7 +194,11 @@ impl Embedder for CandleBertEmbedder {
 
         let mut id_rows: Vec<Vec<u32>> = Vec::with_capacity(encodings.len());
         let mut mask_rows: Vec<Vec<u32>> = Vec::with_capacity(encodings.len());
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
         for enc in &encodings {
             let mut ids = enc.get_ids().to_vec();
             let mut mask = enc.get_attention_mask().to_vec();
@@ -248,12 +256,10 @@ impl Embedder for CandleBertEmbedder {
 /// by its attention mask, to a `[batch, hidden]` tensor. Pad tokens (mask 0) contribute nothing.
 fn mean_pool(sequence: &Tensor, attention_mask: &Tensor) -> candle_core::Result<Tensor> {
     // mask: [batch, seq] → [batch, seq, 1] float, broadcast over hidden.
-    let mask = attention_mask
-        .to_dtype(DTYPE)?
-        .unsqueeze(2)?; // [batch, seq, 1]
+    let mask = attention_mask.to_dtype(DTYPE)?.unsqueeze(2)?; // [batch, seq, 1]
     let masked = sequence.broadcast_mul(&mask)?; // [batch, seq, hidden]
     let summed = masked.sum(1)?; // [batch, hidden]
-    // Per-row token count (clamped to >=1 to avoid div-by-zero on an all-pad row).
+                                 // Per-row token count (clamped to >=1 to avoid div-by-zero on an all-pad row).
     let counts = mask.sum(1)?; // [batch, 1]
     let counts = counts.clamp(1f32, f32::INFINITY)?;
     summed.broadcast_div(&counts)
@@ -262,7 +268,7 @@ fn mean_pool(sequence: &Tensor, attention_mask: &Tensor) -> candle_core::Result<
 /// L2-normalize each row of a `[batch, hidden]` tensor (e5 vectors are unit-length; cosine == dot).
 fn l2_normalize(x: &Tensor) -> candle_core::Result<Tensor> {
     let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?; // [batch, 1]
-    // Clamp the norm away from 0 so an all-zero row stays finite (no NaN).
+                                                 // Clamp the norm away from 0 so an all-zero row stays finite (no NaN).
     let norm = norm.clamp(1e-12f32, f32::INFINITY)?;
     x.broadcast_div(&norm)
 }
@@ -299,7 +305,11 @@ mod smoke {
         assert_eq!(pv[0].len(), EMBED_DIM, "wrong embedding dim");
 
         let norm: f32 = pv[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        println!("dim={} L2-norm={norm:.4} first5={:?}", pv[0].len(), &pv[0][..5]);
+        println!(
+            "dim={} L2-norm={norm:.4} first5={:?}",
+            pv[0].len(),
+            &pv[0][..5]
+        );
         assert!((norm - 1.0).abs() < 0.05, "not L2-normalized: {norm}");
 
         // Semantic sanity: a Polish query about the meeting should be closer to the Polish
@@ -310,7 +320,9 @@ mod smoke {
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         let sim_related = cos(&q[0], &pv[0]);
         let sim_unrelated = cos(&q[0], &pv[1]);
-        println!("cos(query, PL-meeting)={sim_related:.4}  cos(query, EN-budget)={sim_unrelated:.4}");
+        println!(
+            "cos(query, PL-meeting)={sim_related:.4}  cos(query, EN-budget)={sim_unrelated:.4}"
+        );
         assert!(
             sim_related > sim_unrelated,
             "PL query should rank the PL meeting passage above the unrelated EN passage"

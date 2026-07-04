@@ -13,9 +13,10 @@
 use crate::error::{AppError, Result};
 use murmur_protocol::dto::{
     AcceptShareResponse, AttachKeyRequest, CreateShareRequest, CreateShareResponse, InboxResponse,
-    KeyLookupRequest, KeyLookupResponse, LoginFinishRequest, LoginFinishResponse, LoginStartRequest,
-    LoginStartResponse, ProvisionFinishRequest, ProvisionFinishResponse, ProvisionRequest,
-    ProvisionResponse, SharesResponse, SignupRequest, VerifyEmailRequest, VerifyEmailResponse,
+    KeyLookupRequest, KeyLookupResponse, LoginFinishRequest, LoginFinishResponse,
+    LoginStartRequest, LoginStartResponse, ProvisionFinishRequest, ProvisionFinishResponse,
+    ProvisionRequest, ProvisionResponse, SharesResponse, SignupRequest, VerifyEmailRequest,
+    VerifyEmailResponse,
 };
 use reqwest::StatusCode;
 
@@ -251,7 +252,8 @@ impl ShareClient {
 
     /// `GET /v1/shares` (bearer) — the caller's shares (content-free; no titles server-side).
     pub async fn list_shares(&self, access_token: &str) -> Result<SharesResponse> {
-        self.get_json("/v1/shares", access_token, "list-shares").await
+        self.get_json("/v1/shares", access_token, "list-shares")
+            .await
     }
 
     /// `DELETE /v1/shares/{id}` (bearer, owner-only) — revoke. A non-owner/missing share is the same
@@ -369,7 +371,9 @@ impl ShareClient {
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|_| AppError::Unavailable("decline-share: could not reach the server".into()))?;
+            .map_err(|_| {
+                AppError::Unavailable("decline-share: could not reach the server".into())
+            })?;
         if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
             Ok(())
         } else {
@@ -430,6 +434,9 @@ mod tests {
         let c = ShareClient::new("https://api.murmur.example/v1/base").unwrap();
         let h = c.host();
         assert!(!h.contains('/'), "host must not carry a path: {h:?}");
-        assert!(!h.starts_with("http"), "host must not carry a scheme: {h:?}");
+        assert!(
+            !h.starts_with("http"),
+            "host must not carry a scheme: {h:?}"
+        );
     }
 }
