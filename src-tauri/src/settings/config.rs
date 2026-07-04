@@ -146,6 +146,16 @@ pub struct AppConfig {
     /// (the safe default) instead of resetting the whole config.
     #[serde(default)]
     pub post_aec_enabled: bool,
+    /// Recording-storage cap in GB (`None` = no cap). Drives auto-prune of the OLDEST
+    /// recordings' audio when exceeded; notes/transcripts are never touched.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `None`.
+    #[serde(default)]
+    pub audio_storage_limit_gb: Option<u32>,
+    /// When true AND a cap is set, delete the oldest recordings' audio after each
+    /// recording / on save to stay under the cap. OPT-IN, default OFF.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`.
+    #[serde(default)]
+    pub audio_auto_prune: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
     /// "large-v3". Default "small" (~466 MB) — a RAM-safe default: `large-v3` is ~3 GB and swaps
     /// on 8 GB Macs, and onboarding already preselects `small`. All sizes (incl. `large-v3`, best
@@ -233,7 +243,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub brain_model_path: Option<String>,
     /// Phase B (model registry) — the SELECTED on-device brain model id (from `reason::BRAIN_MODELS`,
-    /// e.g. `bielik-11b-v3` / `qwen3-14b` / `qwen2.5-3b`). `None` (the default) means no model is
+    /// e.g. `qwen3-1.7b` / `qwen3-4b-instruct-2507` / `bielik-11b-v3`). `None` (the default) means no model is
     /// chosen ⇒ the resolver falls back to the `StubReasoner`. Set via the `select_brain_model`
     /// command. Consulted at runtime when `brain_backend == Local`. `#[serde(default)]` ⇒ a config
     /// persisted before this field existed loads as `None`.
@@ -245,6 +255,28 @@ pub struct AppConfig {
     /// existed loads as `Cloud`. See [`BrainBackend`].
     #[serde(default)]
     pub brain_backend: BrainBackend,
+    /// Murmur Brain LIVE master switch (spec §2.2). When ON, the on-device LIGHT engine powers
+    /// Realtime Reactions + local fact extraction, and the enablement flow downloads the light model.
+    /// OPT-IN, default OFF. DISTINCT from `realtime_reactions` (the wake-word voice-action gate) — this
+    /// gates the model-driven whisper layer and re-routes fact extraction fully on-device. When OFF the
+    /// brain behaves EXACTLY as today. `#[serde(default)]` ⇒ a pre-existing config loads as `false`.
+    #[serde(default)]
+    pub brain_live: bool,
+    /// The selected LIGHT-class on-device model id (realtime reactions / fact extraction). `None`
+    /// (the default) ⇒ the registry's default light model (`reason::default_model_for_class`). Resolved
+    /// LOCAL-or-stub, NEVER cloud (P1 invariant). `#[serde(default)]`.
+    #[serde(default)]
+    pub brain_light_model_id: Option<String>,
+    /// The selected HEAVY-class on-device model id (local Notes/Ask + post-call analysis). `None`
+    /// (the default) ⇒ the registry's default heavy model. `#[serde(default)]`.
+    #[serde(default)]
+    pub brain_heavy_model_id: Option<String>,
+    /// Realtime Reactions CONTRADICTION sub-toggle (spec §4.2). Default OFF: contradiction detection
+    /// runs in SHADOW mode (counts would-have-fired, emits nothing), so precision is calibrated on the
+    /// user's OWN meetings before the ⚠ cards are shown. Flipped ON per-user once the shadow bar clears.
+    /// Only meaningful while `brain_live` is on. `#[serde(default)]` ⇒ pre-existing configs load OFF.
+    #[serde(default)]
+    pub brain_contradiction_cards: bool,
     /// Phase E (Flow B) — the in-meeting VOICE ACTION DISPATCH master gate. When ON, a wake-word
     /// hit in a live caption ("Claudku, zrób research o X") DISPATCHES the parsed action against the
     /// gated vault (research/recall/reminder/note) and emits a live result. OPT-IN, default OFF
@@ -400,6 +432,8 @@ impl Default for AppConfig {
             voiceprint_enabled: false,
             aec_enabled: false,
             post_aec_enabled: false,
+            audio_storage_limit_gb: None,
+            audio_auto_prune: false,
             model_size: "small".to_string(),
             voice_trigger: false,
             onboarded: false,
@@ -417,6 +451,10 @@ impl Default for AppConfig {
             brain_model_path: None,
             brain_model_id: None,
             brain_backend: BrainBackend::default(),
+            brain_live: false,
+            brain_light_model_id: None,
+            brain_heavy_model_id: None,
+            brain_contradiction_cards: false,
             realtime_reactions: false,
             web_search_enabled: false,
             web_search_consented: false,
@@ -460,6 +498,8 @@ const K_DIARIZE_OTHERS: &str = "diarize_others";
 const K_VOICEPRINT_ENABLED: &str = "voiceprint_enabled";
 const K_AEC_ENABLED: &str = "aec_enabled";
 const K_POST_AEC_ENABLED: &str = "post_aec_enabled";
+const K_AUDIO_STORAGE_LIMIT_GB: &str = "audio_storage_limit_gb";
+const K_AUDIO_AUTO_PRUNE: &str = "audio_auto_prune";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
@@ -478,6 +518,10 @@ const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
 const K_BRAIN_BACKEND: &str = "brain_backend";
 const K_REALTIME_REACTIONS: &str = "realtime_reactions";
+const K_BRAIN_LIVE: &str = "brain_live";
+const K_BRAIN_LIGHT_MODEL_ID: &str = "brain_light_model_id";
+const K_BRAIN_HEAVY_MODEL_ID: &str = "brain_heavy_model_id";
+const K_BRAIN_CONTRADICTION_CARDS: &str = "brain_contradiction_cards";
 const K_WEB_SEARCH_ENABLED: &str = "web_search_enabled";
 const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
@@ -625,6 +669,14 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_REALTIME_REACTIONS)? {
             cfg.realtime_reactions = v == "true";
         }
+        if let Some(v) = db.get_setting(K_BRAIN_LIVE)? {
+            cfg.brain_live = v == "true";
+        }
+        cfg.brain_light_model_id = opt(db.get_setting(K_BRAIN_LIGHT_MODEL_ID)?);
+        cfg.brain_heavy_model_id = opt(db.get_setting(K_BRAIN_HEAVY_MODEL_ID)?);
+        if let Some(v) = db.get_setting(K_BRAIN_CONTRADICTION_CARDS)? {
+            cfg.brain_contradiction_cards = v == "true";
+        }
         if let Some(v) = db.get_setting(K_WEB_SEARCH_ENABLED)? {
             cfg.web_search_enabled = v == "true";
         }
@@ -683,6 +735,13 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_ROLE_LIVE_EFFORT)? {
             cfg.role_live_effort = v;
+        }
+        cfg.audio_storage_limit_gb = db
+            .get_setting(K_AUDIO_STORAGE_LIMIT_GB)?
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        if let Some(v) = db.get_setting(K_AUDIO_AUTO_PRUNE)? {
+            cfg.audio_auto_prune = v == "true";
         }
 
         Ok(cfg)
@@ -837,6 +896,19 @@ impl AppConfig {
                 "false"
             },
         )?;
+        db.set_setting(K_BRAIN_LIVE, if self.brain_live { "true" } else { "false" })?;
+        db.set_setting(
+            K_BRAIN_LIGHT_MODEL_ID,
+            self.brain_light_model_id.as_deref().unwrap_or(""),
+        )?;
+        db.set_setting(
+            K_BRAIN_HEAVY_MODEL_ID,
+            self.brain_heavy_model_id.as_deref().unwrap_or(""),
+        )?;
+        db.set_setting(
+            K_BRAIN_CONTRADICTION_CARDS,
+            if self.brain_contradiction_cards { "true" } else { "false" },
+        )?;
         db.set_setting(
             K_WEB_SEARCH_ENABLED,
             if self.web_search_enabled {
@@ -893,6 +965,17 @@ impl AppConfig {
         db.set_setting(K_ROLE_LIVE_CONNECTION, &self.role_live_connection)?;
         db.set_setting(K_ROLE_LIVE_MODEL, &self.role_live_model)?;
         db.set_setting(K_ROLE_LIVE_EFFORT, &self.role_live_effort)?;
+        db.set_setting(
+            K_AUDIO_STORAGE_LIMIT_GB,
+            &self
+                .audio_storage_limit_gb
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        )?;
+        db.set_setting(
+            K_AUDIO_AUTO_PRUNE,
+            if self.audio_auto_prune { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -1727,5 +1810,29 @@ mod tests {
             "serde default must be empty string"
         );
         assert_eq!(cfg.gateway_model, "", "serde default must be empty string");
+    }
+
+    #[test]
+    fn audio_storage_settings_round_trip() {
+        let p = crate::storage::db::unique_temp_path("murmur-cfg-storage", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let db = Db::open_with_key(&p, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+
+        // Defaults: no cap, auto-prune OFF (fail-safe).
+        let def = AppConfig::default();
+        assert_eq!(def.audio_storage_limit_gb, None);
+        assert!(!def.audio_auto_prune);
+
+        let cfg = AppConfig {
+            audio_storage_limit_gb: Some(2),
+            audio_auto_prune: true,
+            ..AppConfig::default()
+        };
+        cfg.save(&db).unwrap();
+
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.audio_storage_limit_gb, Some(2));
+        assert!(loaded.audio_auto_prune);
+        let _ = std::fs::remove_file(&p);
     }
 }

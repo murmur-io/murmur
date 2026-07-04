@@ -1,17 +1,32 @@
-import { Injectable, computed, inject, signal } from "@angular/core";
+import { Injectable, computed, effect, inject, signal } from "@angular/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
+import { FoldersService } from "../services/folders.service";
 import type {
   AssistantThreadRow,
   AssistantToolPayload,
   ChatMsg,
+  FolderNode,
   ProactiveHintPayload,
   VoiceActionResultPayload,
   VoiceActionStatus,
   VoiceCommandListeningPayload,
   VoiceCommandProcessingPayload,
   WakeDetectedPayload,
+  WhisperCard,
 } from "./models";
+
+/**
+ * One Realtime-Reactions "whisper" contradiction card on the record-screen rail,
+ * wrapping the backend {@link WhisperCard} with a stable id for `@for` tracking.
+ * EPHEMERAL — never persisted, and PURGED from the rail on any lock transition
+ * (screen-share auto-relock / Lock all / a fresh seal), the FE analogue of the
+ * `convertFileSrc` gate so a card citing a just-sealed meeting never lingers.
+ */
+export interface RailWhisperCard extends WhisperCard {
+  /** Stable id for `@for` tracking (never key a card on $index). */
+  id: number;
+}
 
 /**
  * The 4-state visual model of the assistant orb (industry-convergent
@@ -197,6 +212,7 @@ function coerceStatus(s: string): VoiceActionStatus {
 @Injectable({ providedIn: "root" })
 export class MeetingConversationStore {
   private readonly ipc = inject(IpcService);
+  private readonly folders = inject(FoldersService);
 
   /** The user's NOTES — the main flow (oldest → newest). Each item may host a thread. */
   private readonly _notes = signal<NoteItem[]>([]);
@@ -312,6 +328,81 @@ export class MeetingConversationStore {
    */
   private readonly dismissedHints = new Set<string>();
 
+  /**
+   * The Realtime-Reactions "whisper" contradiction cards (`EVENT_WHISPER_CARD`) —
+   * the SECOND rail lane beside the recall {@link hint}. Bounded (newest first,
+   * capped) + deduped so a repeated contradiction doesn't stack. Ephemeral: never
+   * persisted, cleared on a new recording / meeting change / lock transition.
+   */
+  private readonly _whisperCards = signal<RailWhisperCard[]>([]);
+  readonly whisperCards = this._whisperCards.asReadonly();
+  /** Keep the rail slim — at most this many contradiction cards at once. */
+  private static readonly MAX_WHISPER_CARDS = 3;
+  /** Monotonic id source for whisper cards (stable `@for` keys). */
+  private nextWhisperId = 1;
+
+  /**
+   * Shadow-mode calibration (spec §4.2). The contradiction sub-toggle ships OFF;
+   * the backend still COUNTS how many contradiction cards WOULD have fired this
+   * recording (`brain_reactions_shadow_count`, resets per recording). Once the
+   * user's OWN count clears a small bar we offer "the brain would have flagged N —
+   * show them live?" → `set_brain_contradiction_cards(true)`. A nonzero count
+   * already implies the toggle is OFF (shadow mode only counts while off), so no
+   * separate toggle read is needed. Carries a COUNT only (no meeting content) — it
+   * is therefore NOT gated content and is not purged on a lock transition.
+   */
+  private readonly _shadowCount = signal(0);
+  readonly shadowCount = this._shadowCount.asReadonly();
+  /** Hidden once the user enables / dismisses the calibration this recording. */
+  private readonly _shadowDismissed = signal(false);
+  /** Offer the calibration only once the shadow count clears this bar. */
+  private static readonly SHADOW_THRESHOLD = 2;
+  /** Whether to show the shadow-mode calibration card in the rail. */
+  readonly showShadowCalibration = computed(
+    () =>
+      !this._shadowDismissed() &&
+      this._shadowCount() >= MeetingConversationStore.SHADOW_THRESHOLD,
+  );
+
+  /**
+   * PURGE the whole reactions rail (recall hint + whisper cards) whenever a folder
+   * gets MORE locked — a relock/seal makes its content invisible again, and a
+   * card that already crossed to the FE (a recall title / a contradiction's
+   * `[[sourceMeeting]]`) must not outlive that gate. This is the FE analogue of
+   * nulling `audio_path` for a sealed meeting (the `convertFileSrc` leak): the
+   * content already left the backend, so the FE must drop it on the lock edge. It
+   * fires on Lock all, single relock, a fresh seal, AND the screen-share auto-
+   * relock (defense in depth over {@link ScreenShareService}'s direct call).
+   *
+   * The trigger is a DROP in the number of folders whose content is currently
+   * visible (`!locked || unlocked`), mirroring the graph's `_refetchOnLock`
+   * folder-tree effect. `{ allowSignalWrites: true }` — the effect writes the rail
+   * signals via {@link clearRail} (trap T1 / NG0600).
+   */
+  private prevVisibleFolderCount: number | null = null;
+  private readonly _purgeRailOnLock = effect(
+    () => {
+      const visible = this.countVisibleFolders(this.folders.tree());
+      const prev = this.prevVisibleFolderCount;
+      this.prevVisibleFolderCount = visible;
+      if (prev !== null && visible < prev) this.clearRail();
+    },
+    { allowSignalWrites: true },
+  );
+
+  /** Count folders whose content is currently visible to this session (`!locked || unlocked`). */
+  private countVisibleFolders(nodes: FolderNode[]): number {
+    let n = 0;
+    const walk = (list: FolderNode[]): void => {
+      for (const node of list) {
+        if (!node.locked || node.unlocked) n++;
+        if (node.children?.length) walk(node.children);
+      }
+    };
+    walk(nodes);
+    return n;
+  }
+
   /** Monotonic id source for note items (stable `@for` keys). */
   private nextNoteId = 1;
   /** Monotonic id source for thread turns (stable `@for` keys). */
@@ -326,6 +417,7 @@ export class MeetingConversationStore {
   private unlistenTool: UnlistenFn | null = null;
   private unlistenChatTool: UnlistenFn | null = null;
   private unlistenHint: UnlistenFn | null = null;
+  private unlistenWhisper: UnlistenFn | null = null;
   /** Synchronous re-entrancy guard so two concurrent init() calls can't double-subscribe. */
   private initializing = false;
 
@@ -349,6 +441,8 @@ export class MeetingConversationStore {
     this.unlistenTool = await this.ipc.onAssistantTool((p) => this.onTool(p));
     this.unlistenChatTool = await this.ipc.onChatTool((p) => this.onTool(p));
     this.unlistenHint = await this.ipc.onProactiveHint((p) => this.onHint(p));
+    // Realtime Reactions — the whisper contradiction lane of the rail.
+    this.unlistenWhisper = await this.ipc.onWhisperCard((p) => this.onWhisper(p));
   }
 
   /** Release the event subscriptions (e.g. on app teardown). */
@@ -360,6 +454,7 @@ export class MeetingConversationStore {
     this.unlistenTool?.();
     this.unlistenChatTool?.();
     this.unlistenHint?.();
+    this.unlistenWhisper?.();
     this.unlistenWake = null;
     this.unlistenResult = null;
     this.unlistenListening = null;
@@ -367,13 +462,14 @@ export class MeetingConversationStore {
     this.unlistenTool = null;
     this.unlistenChatTool = null;
     this.unlistenHint = null;
+    this.unlistenWhisper = null;
   }
 
-  /** Empty the notes + threads + the proactive hint (called on each new recording). */
+  /** Empty the notes + threads + the whole reactions rail (called on each new recording). */
   clear(): void {
     this._notes.set([]);
     this.voiceTargetNoteId = null;
-    this._hint.set(null);
+    this.clearRail();
   }
 
   /**
@@ -401,9 +497,14 @@ export class MeetingConversationStore {
     // record effect mis-fired on re-mount because its edge state reset to false).
     this._notes.set([]);
     this.voiceTargetNoteId = null;
-    // A stale recall hint must not carry into the new meeting's conversation
-    // (dismissedHints stays — a dismissal is session-scoped, like the backend dedup).
-    this._hint.set(null);
+    // A stale recall hint / whisper card must not carry into the new meeting's
+    // conversation (dismissedHints stays — a dismissal is session-scoped, like the
+    // backend dedup).
+    this.clearRail();
+    // A new recording resets the backend shadow counter — reset the FE mirror +
+    // re-arm the calibration prompt for the fresh session.
+    this._shadowCount.set(0);
+    this._shadowDismissed.set(false);
     this._loaded.set(false);
     void this.hydrate(id, token);
   }
@@ -1182,18 +1283,84 @@ export class MeetingConversationStore {
   private onHint(p: ProactiveHintPayload): void {
     if (this.dismissedHints.has(`${p.kind}:${p.targetId}`)) return;
     this._hint.set(p);
+    // Piggyback a shadow-count refresh on the (throttled, during-recording) recall
+    // stream so the calibration can update mid-meeting without a FE timer.
+    void this.refreshShadowCount();
+  }
+
+  /** Read the per-recording contradiction SHADOW count (best-effort; count-only, no PII). */
+  async refreshShadowCount(): Promise<void> {
+    try {
+      this._shadowCount.set(await this.ipc.brainReactionsShadowCount());
+    } catch {
+      // No shadow counter (older backend) — leave the calibration hidden.
+    }
   }
 
   /**
-   * Hide the visible recall hint WITHOUT marking it dismissed (unlike
-   * {@link dismissHint}). Called by the screen-share privacy guard
+   * Enable the realtime contradiction (⚠ whisper) cards from the shadow-mode
+   * calibration prompt, then hide the prompt for this recording. Persists via the
+   * dedicated command (not the raw settings save).
+   */
+  async enableContradictionCards(): Promise<void> {
+    this._shadowDismissed.set(true);
+    try {
+      await this.ipc.setBrainContradictionCards(true);
+    } catch {
+      // Best-effort — the toggle stays off; the prompt is already hidden.
+    }
+  }
+
+  /** Dismiss the shadow-mode calibration prompt for this recording (no state change). */
+  dismissShadowCalibration(): void {
+    this._shadowDismissed.set(true);
+  }
+
+  /**
+   * A realtime "whisper" contradiction card landed. Prepend it (newest first),
+   * dedupe by `entity:predicate:oldQuote` so a repeated contradiction doesn't
+   * stack, and cap the rail to {@link MAX_WHISPER_CARDS}.
+   */
+  private onWhisper(p: WhisperCard): void {
+    const key = `${p.entity}:${p.predicate}:${p.oldQuote}`;
+    const existing = this._whisperCards();
+    if (existing.some((c) => `${c.entity}:${c.predicate}:${c.oldQuote}` === key))
+      return;
+    const card: RailWhisperCard = { ...p, id: this.nextWhisperId++ };
+    this._whisperCards.set(
+      [card, ...existing].slice(0, MeetingConversationStore.MAX_WHISPER_CARDS),
+    );
+  }
+
+  /** Dismiss ONE whisper card by id (a user ✕ — it does not resurface this session). */
+  dismissWhisper(id: number): void {
+    this._whisperCards.set(this._whisperCards().filter((c) => c.id !== id));
+  }
+
+  /**
+   * PURGE the entire reactions rail (recall hint + every whisper card) WITHOUT
+   * marking anything dismissed. The single teardown used by the screen-share
+   * privacy guard ({@link clearHint}), the lock-transition effect, a new
+   * recording ({@link clear}) and a meeting change. A card may legitimately
+   * resurface later — the backend re-gates visibility on every emit.
+   */
+  clearRail(): void {
+    this._hint.set(null);
+    this._whisperCards.set([]);
+  }
+
+  /**
+   * Hide the visible recall hint (and clear the rest of the rail) WITHOUT marking
+   * anything dismissed. Called by the screen-share privacy guard
    * (`ScreenShareService`): the backend has just auto-relocked, and a recall
-   * title from a possibly just-sealed meeting must not linger on the very
-   * surface being shared. The same hint may legitimately resurface later —
-   * the backend re-gates visibility on every emit.
+   * title / contradiction citation from a possibly just-sealed meeting must not
+   * linger on the very surface being shared. Broadened from hint-only to the whole
+   * rail so the whisper lane is purged on the same screen-share edge (the one
+   * existing caller). The same content may legitimately resurface later — the
+   * backend re-gates visibility on every emit.
    */
   clearHint(): void {
-    this._hint.set(null);
+    this.clearRail();
   }
 
   /**

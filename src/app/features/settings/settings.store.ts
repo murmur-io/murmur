@@ -14,8 +14,11 @@ import type {
   GatewayHealth,
   GatewayModel,
   InputDeviceInfo,
+  Posture,
   ProviderStatus,
   ReindexResult,
+  RetiredModelNudge,
+  StorageReport,
   VoiceprintInfo,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -128,6 +131,9 @@ export class SettingsStore {
     voiceprintEnabled: false,
     aecEnabled: false,
     postAecEnabled: true,
+    // Recording-storage cap (GB, string for an empty = "no cap") + opt-in auto-prune.
+    audioStorageLimitGb: "",
+    audioAutoPrune: false,
     modelSize: "large-v3",
     voiceTrigger: false,
     noteStyle: "standard",
@@ -188,6 +194,42 @@ export class SettingsStore {
   /** True while a voiceprint forget/clear IPC call is in flight (debounces clicks). */
   private readonly _voiceprintBusy = signal(false);
   readonly voiceprintBusy = this._voiceprintBusy.asReadonly();
+
+  // ── Recording storage — usage report + manual free-up (opt-in cap) ──────
+
+  /** Live disk-usage report for the recordings dir (best-effort; null before first load). */
+  private readonly _storageReport = signal<StorageReport | null>(null);
+  readonly storageReport = this._storageReport.asReadonly();
+  /** True while a manual "Free up space" prune is in flight (debounces the button). */
+  private readonly _storageBusy = signal(false);
+  readonly storageBusy = this._storageBusy.asReadonly();
+  /** Bytes freed by the last manual "Free up space" (for a confirmation line). */
+  private readonly _lastFreed = signal<number | null>(null);
+  readonly lastFreed = this._lastFreed.asReadonly();
+
+  /** Refresh the recording-storage usage report (best-effort; a failure leaves it null). */
+  async loadStorageReport(): Promise<void> {
+    this._storageReport.set(await this.ipc.getStorageReport().catch(() => null));
+  }
+
+  /** Manual prune to the cap NOW (no-op with no cap set), then refresh the report. */
+  async freeUpSpace(): Promise<void> {
+    this._storageBusy.set(true);
+    this._lastFreed.set(null);
+    try {
+      const s = await this.ipc.freeUpSpace();
+      this._lastFreed.set(s.freedBytes);
+      await this.loadStorageReport();
+    } finally {
+      this._storageBusy.set(false);
+    }
+  }
+
+  /** Reveal the recordings folder in Finder (best-effort; fire-and-forget). */
+  revealAudioDir(): void {
+    void this.ipc.revealAudioDir();
+  }
+
   private readonly _hasKey = signal(false);
   readonly hasKey = this._hasKey.asReadonly();
   private readonly _saved = signal(false);
@@ -729,6 +771,11 @@ export class SettingsStore {
     if (PROVIDER_CONNECTION_IDS.includes(connection)) {
       void this.ensureModels(connection);
     }
+    // Keep the posture segment honest against backend truth (it derives from the
+    // STORED config — an unsaved role edit doesn't change dispatch yet, so this
+    // holds the last real posture rather than an optimistic guess, and it flips
+    // to Custom once save() persists a role that breaks the preset).
+    void this.refreshPosture();
   }
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
@@ -754,6 +801,43 @@ export class SettingsStore {
   );
   /** Release handle for the EVENT_BRAIN_DOWNLOAD subscription. */
   private unlistenBrainDownload: UnlistenFn | null = null;
+
+  // ── Murmur Brain — posture (Cloud / Hybrid / Fully local) ──────────────
+
+  /** The DERIVED posture (`cloud`/`hybrid`/`fully_local`/`custom`), or null before load. */
+  private readonly _posture = signal<Posture | null>(null);
+  readonly posture = this._posture.asReadonly();
+  /** True while a `set_brain_posture` preset is being applied. */
+  private readonly _postureBusy = signal(false);
+  readonly postureBusy = this._postureBusy.asReadonly();
+  /** Surfaced if reading/applying the posture rejects. */
+  private readonly _postureError = signal<string | null>(null);
+  readonly postureError = this._postureError.asReadonly();
+
+  /** True while the one-tap "Enable Murmur Brain Live" flow (hybrid + light model) runs. */
+  private readonly _enablingBrainLive = signal(false);
+  readonly enablingBrainLive = this._enablingBrainLive.asReadonly();
+
+  /**
+   * Whether this Mac has enough RAM to run Realtime Reactions alongside a live
+   * recording (`brain_live_ram_ok`, the combined-residency guard). Drives a
+   * NON-BLOCKING warning on the Brain Live enablement card — enablement is never
+   * hard-blocked. Defaults TRUE (never warn behind an unread probe); set
+   * best-effort in load().
+   */
+  private readonly _brainLiveRamOk = signal(true);
+  readonly brainLiveRamOk = this._brainLiveRamOk.asReadonly();
+
+  /**
+   * The installed-base retirement nudge (`brain_model_retirement_nudge`), or null.
+   * Non-null → the persisted model is a retired non-commercial id and the FE
+   * offers the Apache-licensed replacement.
+   */
+  private readonly _retirementNudge = signal<RetiredModelNudge | null>(null);
+  readonly retirementNudge = this._retirementNudge.asReadonly();
+  /** True while the retirement replacement is being downloaded + selected. */
+  private readonly _applyingRetirement = signal(false);
+  readonly applyingRetirement = this._applyingRetirement.asReadonly();
 
   /**
    * Live signals of the two custom-GGUF controls — the same `valueChanges`
@@ -894,14 +978,20 @@ export class SettingsStore {
         claudeBinary: cfg.claudeBinary,
         claudeCodeInheritEnv: cfg.claudeCodeInheritEnv ?? false,
         inputDevice: cfg.inputDevice ?? "",
-        captureSystemAudio: cfg.captureSystemAudio ?? false,
+        // Mirrors backend default capture_system_audio = true (settings/config.rs, AppConfig::default; #167).
+        captureSystemAudio: cfg.captureSystemAudio ?? true,
         vadEnabled: cfg.vadEnabled ?? true,
         keepHiresMasters: cfg.keepHiresMasters ?? false,
         diarizeOthers: cfg.diarizeOthers ?? false,
         voiceprintEnabled: cfg.voiceprintEnabled ?? false,
         aecEnabled: cfg.aecEnabled ?? false,
-        postAecEnabled: cfg.postAecEnabled ?? true,
-        modelSize: cfg.modelSize ?? "large-v3",
+        // Mirrors backend default post_aec_enabled = false (settings/config.rs, AppConfig::default).
+        postAecEnabled: cfg.postAecEnabled ?? false,
+        audioStorageLimitGb:
+          cfg.audioStorageLimitGb != null ? String(cfg.audioStorageLimitGb) : "",
+        audioAutoPrune: cfg.audioAutoPrune ?? false,
+        // Mirrors backend default model_size = "small" (settings/config.rs, AppConfig::default).
+        modelSize: cfg.modelSize ?? "small",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
         notesMode: cfg.notesMode ?? "enhance",
@@ -913,7 +1003,8 @@ export class SettingsStore {
         userMemoryEnabled: cfg.userMemoryEnabled ?? true,
         brainModelId: cfg.brainModelId ?? "",
         brainModelPath: cfg.brainModelPath ?? "",
-        semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
+        // Mirrors backend default semantic_search_enabled = true (settings/config.rs; #159/#160).
+        semanticSearchEnabled: cfg.semanticSearchEnabled ?? true,
         webSearchEnabled: cfg.webSearchEnabled ?? false,
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
         gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
@@ -968,6 +1059,12 @@ export class SettingsStore {
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
       await this.refreshBrainModels();
+      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
+      await this.refreshPosture();
+      // Brain Live RAM headroom (best-effort; true = never warn behind a failed probe).
+      this._brainLiveRamOk.set(
+        await this.ipc.brainLiveRamOk().catch(() => true),
+      );
       // brain2 RAG — embedding-model presence + reindex/download progress streams.
       await this.subscribeSemanticStreams();
       this._embedModelPresent.set(
@@ -980,6 +1077,8 @@ export class SettingsStore {
       );
       // About section — product identity (best-effort; null leaves a "loading" line).
       this._appInfo.set(await this.ipc.appInfo().catch(() => null));
+      // Recording-storage usage report (best-effort; drives the Storage section + Library bar).
+      await this.loadStorageReport();
     } catch (e) {
       this._loadError.set(String(e));
     }
@@ -1076,6 +1175,181 @@ export class SettingsStore {
       this._brainError.set(String(e));
     } finally {
       this._brainDownloadingId.set(null);
+    }
+  }
+
+  // ── Murmur Brain — posture + Brain Live enablement + retirement nudge ───
+
+  /**
+   * Re-sync the reactive form's posture-OWNED controls (the nine role keys +
+   * `brainBackend`) from FRESH backend config after a `set_brain_posture` /
+   * `enableBrainLive` write.
+   *
+   * WHY (a silent zero-egress regression otherwise): a posture preset writes the
+   * `role_*` + `brain_backend` DB keys directly (e.g. Fully-Local sets them all
+   * to "local"), but the reactive form still holds the STALE values from the
+   * one-time load() ("" = inherit-cloud). The very next ordinary save() serializes
+   * `form.getRawValue()`, so it would send `roleNotesConnection:""` etc. and the
+   * backend `dto_to_config` takes them verbatim — CLOBBERING the "local" keys the
+   * posture just wrote and flipping the posture back to cloud egress. Re-patching
+   * the form to backend truth here ends that clobber while keeping the per-feature
+   * role editor fully editable (it legitimately writes these same keys via the
+   * form, so they can't be preserve-only backend-side). Mirrors load()'s
+   * config→form role mapping exactly.
+   */
+  private async syncPostureFormFromBackend(): Promise<void> {
+    const cfg = await this.ipc.getConfig().catch(() => null);
+    if (!cfg) return;
+    this.form.patchValue({
+      brainBackend: cfg.brainBackend ?? "cloud",
+      roleNotesConnection: cfg.roleNotesConnection ?? "",
+      roleNotesModel: cfg.roleNotesModel ?? "",
+      roleNotesEffort: cfg.roleNotesEffort ?? "",
+      roleAskConnection: cfg.roleAskConnection ?? "",
+      roleAskModel: cfg.roleAskModel ?? "",
+      roleAskEffort: cfg.roleAskEffort ?? "",
+      roleLiveConnection: cfg.roleLiveConnection ?? "",
+      roleLiveModel: cfg.roleLiveModel ?? "",
+      roleLiveEffort: cfg.roleLiveEffort ?? "",
+    });
+    // Keep the Ask-row "Inherit" restore baseline honest: a posture may have
+    // changed brain_backend, so the value load() snapshotted is now stale.
+    this._loadedBrainBackend = (cfg.brainBackend ?? "cloud") as BrainBackend;
+  }
+
+  /** Re-read the DERIVED posture + the retirement nudge (best-effort; failure is non-fatal). */
+  async refreshPosture(): Promise<void> {
+    try {
+      this._posture.set(await this.ipc.brainPosture());
+    } catch (e) {
+      this._postureError.set(String(e));
+    }
+    this._retirementNudge.set(
+      await this.ipc.brainModelRetirementNudge().catch(() => null),
+    );
+  }
+
+  /**
+   * Apply a posture PRESET (`cloud` / `hybrid` / `fully_local`). Re-reads the
+   * derived posture afterwards so the display reflects what the backend actually
+   * stored (never an optimistic guess).
+   */
+  async setPosture(p: Posture): Promise<void> {
+    if (p === "custom") return; // derived-only label — never settable
+    this._postureError.set(null);
+    this._postureBusy.set(true);
+    try {
+      await this.ipc.setBrainPosture(p);
+      // Re-patch the form to the role/brainBackend keys the preset just wrote, or
+      // the next save() would clobber them back (silent zero-egress regression).
+      await this.syncPostureFormFromBackend();
+      await this.refreshPosture();
+    } catch (e) {
+      this._postureError.set(String(e));
+    } finally {
+      this._postureBusy.set(false);
+    }
+  }
+
+  /**
+   * One-tap "Enable Murmur Brain Live": switch to the Hybrid preset AND ensure the
+   * smallest LIGHT on-device model is downloaded + selected (the ~1.1 GB engine
+   * that runs realtime reactions + local fact extraction). Progress rides the
+   * existing brain-download signals. Best-effort + honest on failure.
+   */
+  async enableBrainLive(): Promise<void> {
+    this._postureError.set(null);
+    this._brainError.set(null);
+    this._enablingBrainLive.set(true);
+    try {
+      await this.ipc.setBrainPosture("hybrid");
+      // Pick the smallest LIGHT-class model (the realtime engine).
+      const models = await this.ipc.listBrainModels();
+      const light = models
+        .filter((m) => m.class === "light")
+        .sort((a, b) => a.approxSizeBytes - b.approxSizeBytes)[0];
+      if (light) {
+        if (!light.downloaded) {
+          // Reuse the shared download-progress UI (brainDownloadingId + frac).
+          this._brainDownloadFrac.set(0);
+          this._brainDownloadingId.set(light.id);
+          try {
+            await this.ipc.downloadBrainModel(light.id);
+          } finally {
+            this._brainDownloadingId.set(null);
+          }
+        }
+        await this.ipc.selectBrainModel(light.id);
+      }
+      await this.refreshBrainModels();
+      // The setBrainPosture("hybrid") above wrote the role/brainBackend keys —
+      // re-patch the form so the next save() doesn't clobber them back to cloud.
+      await this.syncPostureFormFromBackend();
+      await this.refreshPosture();
+    } catch (e) {
+      this._postureError.set(String(e));
+    } finally {
+      this._enablingBrainLive.set(false);
+    }
+  }
+
+  /**
+   * The size (bytes) of the smallest LIGHT model — for the Brain Live card's
+   * "~N GB one-time download" copy. Null before the model list has loaded.
+   */
+  readonly brainLiveModelBytes = computed<number | null>(() => {
+    const light = this.brainModels()
+      .filter((m) => m.class === "light")
+      .sort((a, b) => a.approxSizeBytes - b.approxSizeBytes)[0];
+    return light ? light.approxSizeBytes : null;
+  });
+
+  /**
+   * Whether the light model the backend would ACTUALLY run for Brain Live is
+   * already on this Mac (skips the download step). Mirrors the backend's
+   * `class_model_id(Light)` (reason.rs): the light engine resolves to the
+   * SELECTED light if the user picked one, else the registry DEFAULT light (the
+   * first light in display order — `qwen3-1.7b`). Readiness = THAT specific model
+   * is downloaded — NOT "any light is downloaded", which would be a false
+   * positive when a different, unselected light happens to be on disk while
+   * `light()` still resolves to the un-downloaded default → the stub.
+   */
+  readonly brainLiveModelReady = computed<boolean>(() => {
+    const lights = this.brainModels().filter((m) => m.class === "light");
+    if (lights.length === 0) return false;
+    const effective = lights.find((m) => m.selected) ?? lights[0];
+    return effective.downloaded;
+  });
+
+  /**
+   * Apply the retirement nudge: download + select the Apache-licensed replacement
+   * for a retired non-commercial model, then clear the nudge. Progress rides the
+   * shared brain-download signals.
+   */
+  async applyRetirementReplacement(): Promise<void> {
+    const nudge = this._retirementNudge();
+    if (!nudge) return;
+    this._brainError.set(null);
+    this._applyingRetirement.set(true);
+    try {
+      this._brainDownloadFrac.set(0);
+      this._brainDownloadingId.set(nudge.replacementId);
+      try {
+        await this.ipc.downloadBrainModel(nudge.replacementId);
+      } finally {
+        this._brainDownloadingId.set(null);
+      }
+      await this.ipc.selectBrainModel(nudge.replacementId);
+      this.form.patchValue({
+        brainModelId: nudge.replacementId,
+        brainModelPath: "",
+      });
+      await this.refreshBrainModels();
+      await this.refreshPosture();
+    } catch (e) {
+      this._brainError.set(String(e));
+    } finally {
+      this._applyingRetirement.set(false);
     }
   }
 
@@ -1225,6 +1499,20 @@ export class SettingsStore {
       voiceprintEnabled: v.voiceprintEnabled,
       aecEnabled: v.aecEnabled,
       postAecEnabled: v.postAecEnabled,
+      // Recording-storage cap: the form control is a STRING. Clamp to ≥1 GB — blank /
+      // 0 / negative / NaN → null (no cap). A 0 must NEVER be sent: an in-session prune
+      // with limit 0 would delete every non-locked recording's audio, and AppConfig::load
+      // filters n>0 so a persisted 0 silently becomes "no cap" on restart (asymmetric).
+      // Opt-in auto-prune rides every save like the other flags.
+      audioStorageLimitGb: (() => {
+        const n = Math.floor(Number(v.audioStorageLimitGb));
+        return v.audioStorageLimitGb.trim() !== "" &&
+          Number.isFinite(n) &&
+          n >= 1
+          ? n
+          : null;
+      })(),
+      audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
@@ -1283,6 +1571,12 @@ export class SettingsStore {
     try {
       await this.ipc.saveConfig(cfg);
       this._saved.set(true);
+      // A save may have triggered an auto-prune (limit lowered) — refresh the usage report.
+      await this.loadStorageReport();
+      // The saved role/brainBackend keys may have changed what derive_posture
+      // reads — re-read it so the posture segment reflects backend truth (never a
+      // stale "Fully local" label over a just-saved cloud role).
+      await this.refreshPosture();
     } catch (e) {
       this._loadError.set("Save failed: " + String(e));
     }

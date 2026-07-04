@@ -10,6 +10,10 @@
 //!   and the authoritative final transcript produced at stop are unaffected.
 //! - Live quality/latency depends on the chosen model (use a small model for snappy
 //!   captions); a slow tick just means less frequent captions, never a broken recording.
+//! - MIC-ONLY until Stop: this loop transcribes the LOCAL MIC tail alone. The system-audio
+//!   (far-side / other participants) stream is captured separately and is batch-transcribed only
+//!   in the post-Stop `pipeline.rs` dual-stream merge — so the live captions AND the live `@brain`
+//!   context reflect what YOU say during the call; the other side is folded in only after Stop.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,6 +25,9 @@ use crate::transcribe::Transcriber;
 
 /// How often to attempt a live caption.
 const TICK: Duration = Duration::from_millis(3000);
+/// How many ticks between Realtime-Reactions scans (~21 s at the 3 s TICK) — matches the light-engine
+/// min-interval so a slow extraction can't pile up (spec §4.2).
+const REACTIONS_SCAN_EVERY: u32 = 7;
 /// How many trailing seconds of audio to transcribe each tick (overlapping window).
 const WINDOW_SECS: usize = 14;
 
@@ -125,6 +132,12 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
     // offset must never leak across recordings). See `crate::proactive` for the D1-D4 contract.
     let mut proactive = crate::proactive::ProactiveState::default();
 
+    // REALTIME REACTIONS state — the light-engine contradiction scan runs OFF this tick thread (a
+    // 5–10 s extraction inline would stall captions), throttled + skip-if-busy so ASR stays the
+    // priority tenant (spec §4.2, review perf #7 / code-truth #11).
+    let reactions_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut reactions_ticks: u32 = 0;
+
     loop {
         std::thread::sleep(TICK);
         // Age out an expired wake-suppression window once per tick (before this tick's wake check).
@@ -144,6 +157,43 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 "proactive hint emitted"
             );
             let _ = app.emit(crate::events::EVENT_PROACTIVE_HINT, hint);
+        }
+
+        // REALTIME REACTIONS (Brain Live): every REACTIONS_SCAN_EVERY ticks, if no scan is in flight,
+        // run the light-engine contradiction scan on a WORKER thread (never this tick thread) and emit
+        // the whisper cards — or, in shadow mode, count would-have-fired. Skip-if-busy: a slow scan
+        // drops this trigger; the recording never waits on the LLM.
+        reactions_ticks = reactions_ticks.wrapping_add(1);
+        if reactions_ticks % REACTIONS_SCAN_EVERY == 0
+            && !reactions_busy.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let app2 = app.clone();
+            let busy2 = std::sync::Arc::clone(&reactions_busy);
+            std::thread::spawn(move || {
+                // RAII: reset the busy flag on EVERY exit — including a panic inside reactions_scan.
+                // Without this, one panic would wedge the flag `true` and silently kill ALL further
+                // reaction scans this recording (deep-review: worker-thread-panic stuck-busy).
+                struct BusyReset(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for BusyReset {
+                    fn drop(&mut self) {
+                        self.0.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                let _reset = BusyReset(busy2);
+                let now = chrono::Utc::now().to_rfc3339();
+                let scan = crate::brain_reactions::reactions_scan(&app2, &now);
+                let n = scan.cards.len() as u64;
+                if scan.emit {
+                    for card in scan.cards {
+                        let _ = app2.emit(crate::events::EVENT_WHISPER_CARD, card);
+                    }
+                } else if n > 0 {
+                    // Shadow mode: count would-have-fired for user-local calibration; emit nothing.
+                    app2.state::<AppState>()
+                        .reactions_shadow_count
+                        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
         }
 
         // Snapshot the recent tail; stop as soon as the recording is gone.

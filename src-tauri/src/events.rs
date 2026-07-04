@@ -1,4 +1,5 @@
 use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
 pub const EVENT_STATUS: &str = "meetnotes://status";
 
@@ -108,6 +109,15 @@ pub struct AssistantToolPayload {
 /// needed. Throttled at the SOURCE (spec D2: ≥120 s cooldown, session dedup, and the
 /// `proactive_hints_enabled` backend mute), so the FE never has to rate-limit it.
 pub const EVENT_PROACTIVE_HINT: &str = "murmur://proactive-hint";
+
+/// Realtime Reactions (spec §4) — a private in-meeting "whisper" the user alone sees: the far side
+/// just asserted something that CONTRADICTS a fact you already recorded. The payload is a
+/// [`crate::brain_reactions::WhisperCard`] (neutral summary + the EXTRACTIVE old-fact citation + the
+/// source `[[meeting]]`), built on-device from the LIGHT engine + the deterministic reconcile. Only
+/// fires when Brain Live is ON, the light model is present, and the contradiction sub-toggle is on
+/// (else the detection runs in SHADOW mode and nothing is emitted). Ephemeral — never persisted; the
+/// FE rail must purge it on lock/screen-share transitions (lock-model, product #2).
+pub const EVENT_WHISPER_CARD: &str = "murmur://whisper-card";
 
 /// Payload for [`EVENT_PROACTIVE_HINT`]. IDs + a SHORT title from an already-VISIBLE row only —
 /// never sealed content, never content bodies. `kind` is `"past_meeting"` | `"open_commitment"`
@@ -234,4 +244,53 @@ pub struct EchoSuppressedPayload {
     /// Number of mic-echo segments removed from the transcript.
     pub suppressed: usize,
     pub meeting_id: String,
+}
+
+/// Emitted after an AUTO-prune removed ≥1 old recording's audio to stay under the storage cap.
+/// Counts/bytes ONLY — NO PII. The FE refreshes the usage bar + shows a "freed space" toast.
+pub const EVENT_STORAGE_PRUNED: &str = "murmur://storage-pruned";
+
+/// Payload for [`EVENT_STORAGE_PRUNED`]. Bytes + count only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePrunedPayload {
+    pub freed_bytes: u64,
+    pub pruned_count: u64,
+}
+
+/// Emitted ONCE per recording when the mic capture hits the [`crate::audio::recorder::MAX_RECORDING_SECONDS`]
+/// (4h) hard TIME cap and self-stops: past this point the capture thread has torn the stream down,
+/// the meter reads 0, and everything spoken is silently dropped. Fires on the RISING edge only
+/// (capped false→true, deduped per recording). The FE surfaces a "maximum recording length reached"
+/// notice and finalizes the meeting by invoking `stop_recording` (the buffer is capped-but-intact,
+/// so Stop still produces a note). This is a TIME cap — distinct from the byte/size-based
+/// [`EVENT_STORAGE_PRUNED`] storage cap. Carries a length, NO PII.
+pub const EVENT_RECORDING_CAPPED: &str = "murmur://recording-capped";
+
+/// Payload for [`EVENT_RECORDING_CAPPED`]. The cap length in seconds only — NO PII (no content,
+/// no meeting id, no path).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingCappedPayload {
+    /// The maximum recording length (seconds) that was reached — i.e. the cap.
+    pub limit_seconds: u64,
+}
+
+/// Emit [`EVENT_RECORDING_CAPPED`] to the FE (best-effort). The caller decides WHEN to fire (once,
+/// on the rising edge — see [`crate::audio::recorder::should_emit_cap_notice`]); this only performs
+/// the emit and swallows the failure with a `tracing::warn!` so a failed emit can NEVER break the
+/// live status poll or the recording. NO PII is logged (a flag only).
+pub fn emit_recording_capped(app: &AppHandle) {
+    if let Err(e) = app.emit(
+        EVENT_RECORDING_CAPPED,
+        RecordingCappedPayload {
+            limit_seconds: crate::audio::recorder::MAX_RECORDING_SECONDS,
+        },
+    ) {
+        tracing::warn!(
+            target: "audio",
+            error = %e,
+            "failed to emit recording-capped notice"
+        );
+    }
 }
