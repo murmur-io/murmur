@@ -15,6 +15,17 @@ import type { NoteDto, Stage, StatusPayload } from "./models";
 import { ToastService } from "../services/toast.service";
 
 /**
+ * Human byte label (binary), matching the Storage settings section's `mb()`:
+ * ≥1 GiB → "x.xx GB", else "N MB". Kept module-local so the toast copy and the
+ * Storage-section chip round identically.
+ */
+function humanBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024)
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  return Math.round(bytes / (1024 * 1024)) + " MB";
+}
+
+/**
  * Signal-based recorder state: status stage, last note, and last error.
  * Subscribes to the EVENT_STATUS stream from the Rust core.
  */
@@ -95,6 +106,7 @@ export class RecorderStore {
   private unlistenToggle: UnlistenFn | null = null;
   private unlistenLive: UnlistenFn | null = null;
   private unlistenEcho: UnlistenFn | null = null;
+  private unlistenStoragePruned: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -116,6 +128,13 @@ export class RecorderStore {
       const s = p.suppressed;
       this.toast.info(
         `Removed ${s} echoed line${s === 1 ? "" : "s"} from the transcript — wear headphones for best results 🎧`,
+      );
+    });
+    // Storage auto-prune notice: old recordings' audio was deleted to stay under the cap.
+    // Honest feedback that content (audio only — notes are kept) was removed.
+    this.unlistenStoragePruned = await this.ipc.onStoragePruned((p) => {
+      this.toast.info(
+        `Freed ${humanBytes(p.freedBytes)} — removed ${p.prunedCount} old recording${p.prunedCount === 1 ? "" : "s"} to stay under your storage limit`,
       );
     });
     await this.refreshLastNote();
