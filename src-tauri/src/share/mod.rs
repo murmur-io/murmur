@@ -160,7 +160,7 @@ pub fn new_share_id() -> String {
 }
 
 /// Map an absent session to a fail-closed `Unavailable` (spec §7 inv. 8: share ops require login).
-pub(crate) fn require_login<'a>(session: &'a Option<AccountSession>) -> Result<&'a AccountSession> {
+pub(crate) fn require_login(session: &Option<AccountSession>) -> Result<&AccountSession> {
     session
         .as_ref()
         .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))
