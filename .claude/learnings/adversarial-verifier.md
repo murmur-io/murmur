@@ -32,6 +32,39 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-05 detail redesign — #194] a PASS on a tree that didn't build
+- **Pattern:** A build workflow's verify phase ran WHILE the build phases had left the tree
+  NON-BUILDING (a Split agent died mid-response + a syntax error cascaded), yet a structure-level
+  "PASS" came back — the verdict was worthless because it never actually compiled the tree it judged.
+- **Caught by:** operator (re-running `cargo test --lib` + `npx ng build` on the repaired final tree).
+- **Lesson:** A verify verdict is only as good as the TREE STATE it ran against. Before hunting
+  behavioural failure modes, first prove the thing COMPILES/BUILDS on the FINAL, settled tree — run
+  the real gates yourself and paste the exact output you observed, never "gates green" secondhand. If
+  a prior phase could have died/half-applied, assume the tree is broken until `ng build`/`cargo test`
+  says otherwise.
+- **Status:** journal
+
+### [2026-07-04 PR#181 Murmur Brain] One adversarial pass MISSED 7 semantic-wiring gaps a multi-dimension Workflow caught
+- **Pattern:** a single adversarial-verifier pass PASSed a LARGE multi-phase feature (registry / reasoner /
+  postures / realtime whisper / local provider / FE) — yet a follow-up **6-dimension review Workflow**
+  (wiring · invariants · spec-conformance · realtime · FE · robustness), each finding independently
+  confirm-or-refuted, raised **22 confirmed** issues incl. a CRITICAL. The class a single pass
+  systematically misses: (a) a config field WRITTEN by one command but READ via a DIFFERENT field by its
+  consumer (`select` set `brain_model_id`; `light()` read `brain_light_model_id` → silent stub); (b) an
+  invariant enforced at the TESTED site only (`derive_posture` checked Notes+Ask but not the Live axis →
+  "Fully Local" over an egressing `@brain`); (c) dead code whose doc OVER-CLAIMS (`is_recording()` "drives
+  the gate" with zero callers); (d) a preset command + a reactive form both writing the same keys → the
+  stale form clobbers the preset on the next save (silent egress regression); (e) a worker-thread panic
+  wedging a busy-flag; (f) a per-call tokio Runtime = thread leak; (g) a 416-on-complete-`.part` bricking
+  download resume.
+- **Caught by:** deep-review Workflow (ran AFTER adversarial-verifier PASS + lock-security PASS).
+- **Lesson:** for a LARGE / multi-phase feature, one pass is NOT the gate — a multi-dimension deep-review
+  Workflow is (ship-feature stage 4c). Even in your OWN single pass, actively hunt the wiring class: grep
+  every new config field's PRODUCERS vs CONSUMERS (same field?); every new command's registration vs FE
+  call; every "never X" invariant at ALL sites, not just the one with a test; every new helper's callers
+  (0 callers + a doc claiming it "drives/gates" something = a red flag).
+- **Status:** journal
+
 ### [2026-07-02 seed] Distilled from agentic-workflow.md + memory notes
 - **Pattern:** the 7 shipped-and-caught failure modes + the verify-live / RED-before-GREEN discipline.
 - **Caught by:** operator (seeding the loop).
