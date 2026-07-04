@@ -8,7 +8,6 @@ import {
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
-import { LocalModelsListComponent } from "./local-models-list.component";
 
 /** Provider-backed connection ids (a per-role model select makes sense on these). */
 const PROVIDER_CONNECTION_IDS: readonly string[] = [
@@ -52,7 +51,7 @@ interface RoleRowVm {
   selector: "app-ai-role-rows",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, LocalModelsListComponent],
+  imports: [ReactiveFormsModule],
   template: `
     <div class="role-block" [formGroup]="form">
       <button
@@ -209,11 +208,14 @@ interface RoleRowVm {
 
           <!--
             The GGUF registry is GLOBAL (it owns brainModelId — the resolver's
-            local default for every role), so it renders once, shared by every
-            row set to "Local model", not per-row. Extracted to LocalModelsListComponent (Task 3).
+            local default for every role). It now lives under Engines → Murmur
+            Brain → Configure (Task 5); the row just points there.
           -->
           @if (anyLocal()) {
-            <app-local-models-list />
+            <p class="field-help text-muted">
+              On-device models are managed under Engines above (Murmur Brain →
+              Configure).
+            </p>
           }
         </div>
       }
