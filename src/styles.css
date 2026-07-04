@@ -112,6 +112,28 @@
   /* --- Layout ------------------------------------------------------------- */
   --content-max: 840px;
 
+  /* --- Shell liquid glass (PROTOTYPE — Apple TV chrome) --------------------
+     Real macOS Liquid Glass is NEUTRAL: a smoky multi-layer glass (gradient
+     fill + a specular top-edge gleam + a shaded bottom edge + heavy blur and
+     saturation). The accent never fills chrome — it colors the ACTIVE item's
+     glyph/label only; selection fills use the native accent-fill pattern. */
+  --shell-glass-bg: linear-gradient(
+    160deg,
+    rgba(255, 255, 255, 0.085) 0%,
+    rgba(255, 255, 255, 0.028) 55%,
+    rgba(255, 255, 255, 0.055) 100%
+  );
+  --shell-glass-border: rgba(255, 255, 255, 0.14);
+  --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.20),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+  --shell-glass-blur: 44px;
+  --shell-glass-saturate: 180%;
+  /* The neutral "glass on glass" pill behind the active nav item. */
+  --shell-active-bg: rgba(255, 255, 255, 0.12);
+  --shell-active-text: #aeb4ff;
+  --shell-active-shadow: 0 1px 5px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+
   font-family: var(--font-sans);
   color-scheme: dark;
   --aurora-opacity: 1;
@@ -154,6 +176,19 @@
   --shadow-lg: 0 28px 70px rgba(18, 18, 40, 0.16);
   --shadow-accent: 0 10px 30px rgba(110, 118, 255, 0.28);
   --aurora-opacity: 0.5;
+  --shell-glass-bg: linear-gradient(
+    160deg,
+    rgba(255, 255, 255, 0.66) 0%,
+    rgba(255, 255, 255, 0.44) 55%,
+    rgba(255, 255, 255, 0.58) 100%
+  );
+  --shell-glass-border: rgba(255, 255, 255, 0.75);
+  --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 0 rgba(18, 18, 40, 0.06);
+  --shell-active-bg: rgba(255, 255, 255, 0.92);
+  --shell-active-text: #4e56e4;
+  --shell-active-shadow: 0 1px 4px rgba(18, 18, 40, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 1);
 }
 @media (prefers-color-scheme: light) {
   :root[data-theme="system"],
@@ -185,6 +220,19 @@
     --shadow-lg: 0 28px 70px rgba(18, 18, 40, 0.16);
     --shadow-accent: 0 10px 30px rgba(110, 118, 255, 0.28);
     --aurora-opacity: 0.5;
+    --shell-glass-bg: linear-gradient(
+      160deg,
+      rgba(255, 255, 255, 0.66) 0%,
+      rgba(255, 255, 255, 0.44) 55%,
+      rgba(255, 255, 255, 0.58) 100%
+    );
+    --shell-glass-border: rgba(255, 255, 255, 0.75);
+    --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.95),
+      inset 0 -1px 0 rgba(18, 18, 40, 0.06);
+    --shell-active-bg: rgba(255, 255, 255, 0.92);
+    --shell-active-text: #4e56e4;
+    --shell-active-shadow: 0 1px 4px rgba(18, 18, 40, 0.14),
+      inset 0 1px 0 rgba(255, 255, 255, 1);
   }
 }
 
@@ -602,12 +650,12 @@ app-shell {
   height: calc(100vh - 20px);
   margin: 10px 0 10px 10px;
   padding: 0 var(--space-3) var(--space-4);
-  background: var(--surface-raised);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  border: 1px solid var(--glass-border);
+  background: var(--shell-glass-bg);
+  -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+  backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+  border: 1px solid var(--shell-glass-border);
   border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-md), var(--glass-highlight);
+  box-shadow: var(--shadow-md), var(--shell-glass-inner);
 }
 
 /* Top strip that reserves room for the overlay traffic lights and moves the
@@ -637,9 +685,9 @@ app-shell {
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  background: var(--accent-soft);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-highlight), 0 4px 16px rgba(110, 118, 255, 0.28);
+  background: var(--shell-active-bg);
+  border: 1px solid var(--shell-glass-border);
+  box-shadow: var(--glass-highlight);
 }
 .brand-wave {
   display: block;
@@ -741,10 +789,13 @@ app-shell {
   color: var(--text-primary);
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
+/* Active: a NEUTRAL glass-on-glass pill; only the glyph/label take the accent
+   (the Apple TV pattern — chrome never fills with the accent color). */
 .sidebar-nav a.active,
 .sidebar-settings.active {
-  color: var(--accent-hover);
-  background: var(--accent-soft);
+  color: var(--shell-active-text);
+  background: var(--shell-active-bg);
+  box-shadow: var(--shell-active-shadow);
 }
 app-nav-icon { display: contents; } /* the glyph span below is the flex child */
 .nav-icon {
@@ -816,12 +867,12 @@ app-nav-icon { display: contents; } /* the glyph span below is the flex child */
   gap: 3px;
   max-width: calc(100vw - 170px); /* clear the traffic lights on the left */
   padding: 5px;
-  background: var(--surface-raised);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  border: 1px solid var(--glass-border);
+  background: var(--shell-glass-bg);
+  -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+  backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+  border: 1px solid var(--shell-glass-border);
   border-radius: var(--radius-pill);
-  box-shadow: var(--shadow-md), var(--glass-highlight);
+  box-shadow: var(--shadow-md), var(--shell-glass-inner);
 }
 .pill-item {
   display: flex;
@@ -855,8 +906,9 @@ app-nav-icon { display: contents; } /* the glyph span below is the flex child */
 /* Apple TV pattern: icons only; the ACTIVE destination expands with its label. */
 .pill-item .nav-label { display: none; }
 .pill-item.active {
-  color: var(--accent-hover);
-  background: var(--accent-soft);
+  color: var(--shell-active-text);
+  background: var(--shell-active-bg);
+  box-shadow: var(--shell-active-shadow);
   padding: 0 var(--space-3);
 }
 .pill-item.active .nav-label { display: block; flex: none; }
