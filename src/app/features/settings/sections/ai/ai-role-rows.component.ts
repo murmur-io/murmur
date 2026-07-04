@@ -1,10 +1,14 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
   computed,
   effect,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
@@ -81,9 +85,9 @@ interface RoleRowVm {
       </button>
 
       @if (expanded()) {
-        <div class="role-rows">
+        <div class="role-rows" #rolesContainer>
           @for (row of rows(); track row.role) {
-            <div class="role-row">
+            <div class="role-row" [attr.data-role]="row.role">
               <div class="role-row-head">
                 <span class="role-title">{{ row.title }}</span>
                 <span class="role-what text-muted">{{ row.what }}</span>
@@ -276,6 +280,25 @@ interface RoleRowVm {
         background: var(--surface-input);
         border: 1px solid var(--border-subtle);
       }
+      /* Flash when the map's "Change" scrolls to this row (accent ring pulse). */
+      .role-row.hl {
+        animation: role-hl 1.6s ease;
+        border-color: var(--accent);
+      }
+      @keyframes role-hl {
+        0%,
+        100% {
+          box-shadow: none;
+        }
+        25% {
+          box-shadow: 0 0 0 3px var(--accent-ring);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .role-row.hl {
+          animation: none;
+        }
+      }
       .role-row-head {
         display: flex;
         align-items: baseline;
@@ -327,15 +350,53 @@ interface RoleRowVm {
 })
 export class AiRoleRowsComponent {
   private readonly store = inject(SettingsStore);
+  private readonly injector = inject(Injector);
 
   readonly form = this.store.form;
 
   /** Disclosure state — collapsed by default (overrides are the power path). */
   readonly expanded = signal(false);
 
+  /** The `.role-rows` container — the anchor for the map's "Change" scroll. */
+  private readonly rolesContainer =
+    viewChild<ElementRef<HTMLElement>>("rolesContainer");
+
   toggleExpanded(): void {
     this.expanded.update((v) => !v);
   }
+
+  /**
+   * When the map's "Change" asks for a role (store.highlightRole()), open the
+   * disclosure and, after the row renders, scroll it into view + flash it, then
+   * clear the request. `allowSignalWrites` covers the synchronous `expanded`
+   * write (the store clear runs later, inside afterNextRender, so it's outside
+   * this effect's reactive context — no NG0600 either way). The store's
+   * null-then-set makes a repeat Change on the same row re-fire this effect.
+   */
+  private readonly _highlight = effect(
+    () => {
+      const role = this.store.highlightRole();
+      if (!role) return;
+      this.expanded.set(true);
+      afterNextRender(
+        () => {
+          const el = this.rolesContainer()?.nativeElement.querySelector<HTMLElement>(
+            `[data-role="${role}"]`,
+          );
+          if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            // Restart the flash even if the class is already present.
+            el.classList.remove("hl");
+            void el.offsetWidth; // force reflow
+            el.classList.add("hl");
+          }
+          this.store.clearHighlightRole();
+        },
+        { injector: this.injector },
+      );
+    },
+    { allowSignalWrites: true },
+  );
 
   /**
    * Auto-open once when any override is active (loaded from config or just
