@@ -29,7 +29,12 @@
 pub mod calendar;
 pub mod web;
 
+use std::sync::Arc;
+
 use crate::settings::AppConfig;
+use crate::summarize::egress_log::{active_sink, EgressEntry, EgressSink};
+use crate::summarize::meta::CallMeta;
+use crate::summarize::redact::{active_name_redactor, redact_connector_query, NameRedactor};
 
 /// Whether a connector reaches OFF the device. The framework gates every [`External`] connector
 /// behind enable + consent; a [`Local`] connector (none yet) would be exempt, exactly as `ollama` is
@@ -128,6 +133,15 @@ pub trait Connector: Send + Sync {
 /// it. Built per call from the live [`AppConfig`] (cheap).
 pub struct ConnectorRegistry {
     connectors: Vec<Box<dyn Connector>>,
+    /// The active on-device NER name-redactor, applied by the FRAMEWORK to every outgoing connector
+    /// query (mirroring the cloud provider path). `NoopNameRedactor` when no model is installed →
+    /// byte-identical to before this seam existed. Held on the registry (not resolved per call) so a
+    /// single lazy-loaded redactor is reused, exactly as `make_provider` reuses one for the provider.
+    names: Arc<dyn NameRedactor>,
+    /// The content-free egress ledger sink. One [`EgressEntry`] is recorded per external connector
+    /// search ATTEMPT so the Analytics "receipt of what left your Mac" covers connector egress too.
+    /// `NoopEgressSink` before startup wiring / in tests that do not install a sink.
+    sink: Arc<dyn EgressSink>,
 }
 
 impl ConnectorRegistry {
@@ -138,12 +152,20 @@ impl ConnectorRegistry {
     /// Note: the API-key presence check reads the Keychain — kept here (not in `search`) so an
     /// un-keyed connector is ABSENT from the brain's tool list entirely (it never even appears as a
     /// callable tool), matching how an un-consented cloud provider is simply not built.
+    ///
+    /// The framework's NER name-redactor and the egress ledger sink are wired from the process-global
+    /// seams ([`active_name_redactor`] / [`active_sink`]) so EVERY connector inherits both — no
+    /// individual connector can forget the name layer or skip the ledger row.
     pub fn build(config: &AppConfig) -> Self {
         let mut connectors: Vec<Box<dyn Connector>> = Vec::new();
         if let Some(c) = web::WebConnector::from_config_if_available(config) {
             connectors.push(Box::new(c));
         }
-        Self { connectors }
+        Self {
+            connectors,
+            names: active_name_redactor(),
+            sink: active_sink(),
+        }
     }
 
     /// Is a connector with this id currently exposed (enabled + consented + configured)?
@@ -156,27 +178,98 @@ impl ConnectorRegistry {
         self.connectors.iter().map(|c| c.id()).collect()
     }
 
-    /// Run a search through the connector `id`, REDACTING the query through the firewall first.
+    /// Run a search through the connector `id`, REDACTING the query through the FULL firewall first
+    /// and recording a content-free egress ledger row for the attempt.
     ///
     /// The redaction is applied HERE (not inside the connector) so every connector inherits the
     /// firewall and cannot forget it. An `id` that is not exposed (disabled / unconsented / un-keyed)
-    /// returns [`ConnectorError::NeedsConsent`] WITHOUT touching the network — the fail-closed default.
+    /// returns [`ConnectorError::NeedsConsent`] WITHOUT touching the network — the fail-closed default
+    /// (no egress ⇒ NO ledger row).
+    ///
+    /// The scrub is the SAME two layers the cloud provider path applies
+    /// ([`RedactingProvider::summarize_with_meta`]): the regex firewall (emails/cards/phones) AND the
+    /// on-device NER name layer — so a person name the provider would scrub is scrubbed here too
+    /// (byte-identical to the regex-only behaviour when no NER model is installed). We discard the
+    /// token→value maps — web results are attributed to the source as-is and never de-tokenized back
+    /// into vault content.
+    ///
+    /// LEDGER: for an EXTERNAL connector we record ONE content-free [`EgressEntry`] on the attempt
+    /// (a failed HTTP call is still attempted egress), carrying provider/destination, a
+    /// `"web_search"` call_kind, the scrubbed-query BYTE SIZE, and the redaction COUNTS — never the
+    /// query text (the ledger is content-free by design).
     pub async fn search(&self, id: &str, query: &str) -> ConnectorResult {
         let Some(connector) = self.connectors.iter().find(|c| c.id() == id) else {
-            // Not exposed → fail closed. NOTHING egresses.
+            // Not exposed → fail closed. NOTHING egresses, so nothing is recorded.
             return Err(ConnectorError::NeedsConsent);
         };
-        // REDACT before egress: scrub emails/cards/phones out of the outgoing query (the same
-        // firewall any cloud-bound text passes). We discard the token→value map — web results are
-        // attributed to the source as-is and never de-tokenized back into vault content.
-        let (redacted, _map) = crate::summarize::redact::redact(query);
+        // FULL firewall scrub (regex + NER names), mirroring the provider path. `counts` are the
+        // content-free redaction tallies for the ledger; `redacted` is what actually egresses.
+        let (redacted, counts) = redact_connector_query(query, self.names.as_ref());
+
+        // Record ONE content-free ledger row for this external egress ATTEMPT, BEFORE the network
+        // call, so even a failing request is audited as attempted egress. `user_bytes` is the SIZE
+        // of the scrubbed query (never its text); `system_bytes` is 0 (a connector has no system
+        // prompt). `meta` is default (a search backend reports no token usage).
+        if connector.egress_class() == EgressClass::External {
+            self.sink.record(EgressEntry {
+                provider_id: connector.id().to_string(),
+                destination: "web search (connector)".to_string(),
+                model_requested: String::new(),
+                call_kind: "web_search",
+                meta: CallMeta::default(),
+                redactions: counts,
+                system_bytes: 0,
+                user_bytes: redacted.len(),
+                meeting_id: None,
+            });
+        }
+
         connector.search(&redacted).await
+    }
+
+    /// TEST-ONLY: build a registry around injected connectors + an explicit name redactor + sink, so
+    /// the framework-level NER scrub and the ledger row can be exercised with fakes and NO network /
+    /// NO Keychain. Never compiled into release.
+    #[cfg(test)]
+    fn with_parts(
+        connectors: Vec<Box<dyn Connector>>,
+        names: Arc<dyn NameRedactor>,
+        sink: Arc<dyn EgressSink>,
+    ) -> Self {
+        Self { connectors, names, sink }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::summarize::egress_log::NoopEgressSink;
+    use crate::summarize::redact::NoopNameRedactor;
+
+    /// Captures every `EgressEntry` the framework records, so a test can assert exactly one
+    /// content-free row was written for a connector search.
+    struct CaptureEgressSink(std::sync::Arc<std::sync::Mutex<Vec<EgressEntry>>>);
+    impl EgressSink for CaptureEgressSink {
+        fn record(&self, entry: EgressEntry) {
+            self.0.lock().unwrap().push(entry);
+        }
+    }
+
+    /// Deterministic test-only name redactor: scrubs a FIXED known name → a stable ⟪NAME_1⟫ token,
+    /// exactly mirroring the `FixtureNameRedactor` the redact.rs name-seam tests use. Stands in for
+    /// the on-device NER model so the framework's name layer is exercised without a model download.
+    struct FixtureNameRedactor;
+    impl NameRedactor for FixtureNameRedactor {
+        fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
+            let name = "Anna Kowalska";
+            if text.contains(name) {
+                let tok = "\u{27ea}NAME_1\u{27eb}".to_string();
+                (text.replace(name, &tok), vec![(tok, name.to_string())])
+            } else {
+                (text.to_string(), Vec::new())
+            }
+        }
+    }
 
     /// A fake connector that CAPTURES the query it was handed, so a test can prove the framework
     /// redacted it BEFORE the connector saw it (the connector itself does no redaction).
@@ -218,9 +311,11 @@ mod tests {
         let cap = std::sync::Arc::new(CaptureConnector {
             last_query: std::sync::Mutex::new(None),
         });
-        let registry = ConnectorRegistry {
-            connectors: vec![Box::new(CaptureConnectorRef(cap.clone()))],
-        };
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(CaptureConnectorRef(cap.clone()))],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(NoopEgressSink),
+        );
         let hits = block_on(registry.search("capture", "email bob@acme.com about weather")).unwrap();
         assert_eq!(hits.len(), 1);
         let seen = cap.last_query.lock().unwrap().clone().unwrap();
@@ -248,12 +343,21 @@ mod tests {
     #[test]
     fn unexposed_connector_id_fails_closed_without_egress() {
         // An empty registry (the disabled/unconsented state) returns NeedsConsent for any id and
-        // never reaches a network path.
-        let registry = ConnectorRegistry { connectors: vec![] };
+        // never reaches a network path — and, being not-exposed, records NO ledger row.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(captured.clone())),
+        );
         let res = block_on(registry.search("web", "what's the weather"));
         assert!(matches!(res, Err(ConnectorError::NeedsConsent)));
         assert!(!registry.has("web"));
         assert!(registry.ids().is_empty());
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "a fail-closed (not-exposed) search must egress nothing AND record no ledger row"
+        );
     }
 
     #[test]
@@ -309,5 +413,112 @@ mod tests {
             crate::error::AppError::from(ConnectorError::Failed("HTTP 500".into())),
             crate::error::AppError::Summarize(_)
         ));
+    }
+
+    /// (a) NER GAP FIX — RED-before-GREEN: with an ACTIVE name redactor (the model-installed case,
+    /// stood in by `FixtureNameRedactor`), a person name in the query is scrubbed to a ⟪NAME_…⟫
+    /// token BEFORE the connector — so no name egresses to the external service. On the pre-fix code
+    /// (registry applied `redact(query)` = regex ONLY, never the NER layer) the raw name reached the
+    /// connector → this asserts RED. GREEN once the framework runs `redact_connector_query`.
+    #[test]
+    fn registry_applies_ner_name_layer_before_the_connector_sees_it() {
+        let cap = std::sync::Arc::new(CaptureConnector {
+            last_query: std::sync::Mutex::new(None),
+        });
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(CaptureConnectorRef(cap.clone()))],
+            std::sync::Arc::new(FixtureNameRedactor), // the "NER model installed" stand-in
+            std::sync::Arc::new(NoopEgressSink),
+        );
+        let hits = block_on(registry.search("capture", "what did Anna Kowalska decide about weather"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let seen = cap.last_query.lock().unwrap().clone().unwrap();
+        assert!(
+            !seen.contains("Anna Kowalska"),
+            "the person NAME must be scrubbed by the NER layer before egress: {seen}"
+        );
+        assert!(
+            seen.contains("\u{27ea}NAME_1\u{27eb}"),
+            "the query must carry the NER name token: {seen}"
+        );
+        assert!(seen.contains("weather"), "non-PII terms survive: {seen}");
+    }
+
+    /// (b) LEDGER — a connector search records EXACTLY ONE content-free egress row: provider "capture"
+    /// (the connector id), call_kind "web_search", the SCRUBBED-query byte size, and the redaction
+    /// COUNTS (1 email + 1 name here). Copies the content-free invariant from redact.rs's
+    /// `egress_entry_is_content_free_and_captures_meta_and_counts`: NO query text / NO PII appears in
+    /// ANY field of the recorded entry (asserted over the full Debug output).
+    #[test]
+    fn connector_search_records_one_content_free_egress_row() {
+        let cap = std::sync::Arc::new(CaptureConnector {
+            last_query: std::sync::Mutex::new(None),
+        });
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(CaptureConnectorRef(cap.clone()))],
+            std::sync::Arc::new(FixtureNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
+        );
+        // Query carries one email (regex) + one person name (NER) + plain terms.
+        let query = "email bob@acme.com ask Anna Kowalska about the weather";
+        block_on(registry.search("capture", query)).unwrap();
+
+        let rows = recorded.lock().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one content-free ledger row per connector search");
+        let row = &rows[0];
+
+        // Shape: connector-attributed, web_search kind, sizes + counts only.
+        assert_eq!(row.provider_id, "capture");
+        assert_eq!(row.call_kind, "web_search");
+        assert_eq!(row.destination, "web search (connector)");
+        assert_eq!(row.model_requested, "");
+        assert_eq!(row.system_bytes, 0);
+        assert!(row.user_bytes > 0, "the scrubbed-query byte SIZE is recorded");
+        assert_eq!(row.redactions.email, 1, "one email scrubbed");
+        assert_eq!(row.redactions.name, 1, "one person name scrubbed by the NER layer");
+        assert_eq!(row.redactions.card, 0);
+        assert_eq!(row.redactions.phone, 0);
+
+        // CONTENT-FREE INVARIANT: no query text / no PII in ANY field (full Debug output).
+        let debug = format!("{:?}", row);
+        assert!(!debug.contains("bob@acme.com"), "email must NOT appear in ledger row: {debug}");
+        assert!(!debug.contains("Anna Kowalska"), "name must NOT appear in ledger row: {debug}");
+        assert!(!debug.contains("weather"), "query terms must NOT appear in ledger row: {debug}");
+    }
+
+    /// (b, cont.) The ledger row is recorded even when the external call FAILS — a failed HTTP call
+    /// is still ATTEMPTED egress and must be audited. Uses a connector that always errors; the row is
+    /// still present and still content-free.
+    #[test]
+    fn failed_connector_search_still_records_the_attempt() {
+        struct FailingConnector;
+        #[async_trait::async_trait]
+        impl Connector for FailingConnector {
+            fn id(&self) -> &str {
+                "capture"
+            }
+            fn egress_class(&self) -> EgressClass {
+                EgressClass::External
+            }
+            async fn search(&self, _redacted_query: &str) -> ConnectorResult {
+                Err(ConnectorError::Failed("brave HTTP 500".into()))
+            }
+        }
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(FailingConnector)],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
+        );
+        let res = block_on(registry.search("capture", "email bob@acme.com weather"));
+        assert!(matches!(res, Err(ConnectorError::Failed(_))), "the failure surfaces");
+        let rows = recorded.lock().unwrap();
+        assert_eq!(rows.len(), 1, "a failed attempt is still audited as attempted egress");
+        assert_eq!(rows[0].call_kind, "web_search");
+        assert_eq!(rows[0].redactions.email, 1);
+        let debug = format!("{:?}", rows[0]);
+        assert!(!debug.contains("bob@acme.com"), "email must NOT appear in ledger row: {debug}");
     }
 }
