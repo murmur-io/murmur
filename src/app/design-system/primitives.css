@@ -1,0 +1,323 @@
+/* Design System — reusable CSS primitives (buttons, cards, fields, switch,
+   pills, banners, wells, scrollbar). Extracted verbatim from styles.css so the
+   whole control language lives in ONE place. Components add semantics; these
+   carry the Liquid Glass visual language via design-tokens variables. */
+/* ============================================================================
+   Reusable primitives — carry the full visual language.
+   ============================================================================ */
+
+/* --- Buttons --------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-4);
+  height: 40px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.05);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 550;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  box-shadow: var(--glass-highlight);
+  transition: background var(--transition), border-color var(--transition),
+    color var(--transition), transform var(--transition-fast),
+    box-shadow var(--transition);
+}
+.btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-primary {
+  background: var(--accent-gradient);
+  border-color: transparent;
+  color: var(--text-on-accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-accent), var(--glass-highlight);
+}
+.btn-primary:hover {
+  background: var(--accent-gradient);
+  filter: brightness(1.08);
+  border-color: transparent;
+}
+.btn-primary:disabled { box-shadow: none; filter: none; }
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+  color: var(--text-secondary);
+}
+.btn-ghost:hover {
+  background: var(--surface-hover);
+  border-color: transparent;
+  color: var(--text-primary);
+}
+
+.btn-danger {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
+}
+.btn-danger:hover { border-color: var(--danger); filter: brightness(1.1); }
+
+/* --- Card (the core frosted-glass surface) --------------------------------- */
+.card {
+  background: var(--surface-raised);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-md), var(--glass-highlight);
+}
+
+/* --- Form fields ----------------------------------------------------------- */
+input[type="text"], input[type="password"], input[type="search"],
+input[type="number"], input[type="email"], input[type="url"],
+input:not([type]), select, textarea {
+  width: 100%;
+  padding: 0 var(--space-3);
+  height: 40px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  line-height: 1.4;
+  transition: border-color var(--transition), background var(--transition),
+    box-shadow var(--transition);
+  appearance: none;
+}
+textarea {
+  height: auto;
+  min-height: 96px;
+  padding: var(--space-3);
+  resize: vertical;
+  line-height: 1.55;
+}
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+input:hover, select:hover, textarea:hover { border-color: var(--border-strong); }
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  background: rgba(255, 255, 255, 0.06);
+}
+input:disabled, select:disabled, textarea:disabled { opacity: 0.5; cursor: not-allowed; }
+
+select {
+  padding-right: var(--space-6);
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' stroke='%23a6a6b6' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--space-3) center;
+  cursor: pointer;
+}
+select option { background: var(--surface-overlay); color: var(--text-primary); }
+
+input[type="checkbox"] {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  cursor: pointer;
+  position: relative;
+  transition: background var(--transition), border-color var(--transition),
+    box-shadow var(--transition);
+}
+input[type="checkbox"]:hover { border-color: var(--accent); }
+input[type="checkbox"]:checked { background: var(--accent-gradient); border-color: transparent; }
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 6px; top: 2px;
+  width: 5px; height: 10px;
+  border: solid var(--text-on-accent);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+
+/* --- ON/OFF toggle switch (Settings) ---------------------------------------
+   Same form semantics as a checkbox — add class="switch" to render the
+   macOS-style pill track + sliding knob instead of the square check. */
+input[type="checkbox"].switch {
+  width: 38px;
+  height: 23px;
+  min-width: 38px;
+  border-radius: var(--radius-pill);
+}
+input[type="checkbox"].switch::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 17px;
+  height: 17px;
+  border: none;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transform: none;
+  transition: transform var(--transition), background var(--transition);
+}
+input[type="checkbox"].switch:checked { background: var(--accent-gradient); border-color: transparent; }
+input[type="checkbox"].switch:checked::after {
+  left: 2px;
+  top: 2px;
+  width: 17px;
+  height: 17px;
+  border: none;
+  background: var(--text-on-accent);
+  transform: translateX(15px);
+}
+input[type="checkbox"].switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+fieldset { border: 1px solid var(--border); border-radius: var(--radius-lg); padding: var(--space-4); margin: 0; }
+legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.01em; }
+
+/* --- Status pill ----------------------------------------------------------- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  height: 28px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.pill .pill-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.pill.is-accent { background: var(--accent-soft); border-color: transparent; color: var(--accent-hover); }
+.pill.is-success { background: var(--success-soft); border-color: transparent; color: var(--success); }
+.pill.is-danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.pill.is-warning { background: var(--warning-soft); border-color: transparent; color: var(--warning); }
+.pill.is-live { background: var(--live-soft); border-color: transparent; color: var(--live-hover); }
+/* ENHANCE-MY-NOTES provenance badge (detail header). */
+.pill.pill-enhanced { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+
+/* --- Banner ---------------------------------------------------------------- */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  box-shadow: var(--glass-highlight);
+}
+.banner.is-warning { background: var(--warning-soft); border-color: rgba(245, 177, 76, 0.3); color: var(--text-primary); }
+.banner.is-danger { background: var(--danger-soft); border-color: rgba(255, 107, 107, 0.3); color: var(--text-primary); }
+.banner.is-accent { background: var(--accent-soft); border-color: rgba(110, 118, 255, 0.3); color: var(--text-primary); }
+
+/* --- Helper text ----------------------------------------------------------- */
+.text-secondary { color: var(--text-secondary); }
+.text-muted { color: var(--text-muted); }
+.text-success { color: var(--success); }
+.text-danger { color: var(--danger); }
+
+/* --- Count chip (list/section header tally) -------------------------------- */
+.count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* --- Empty / loading wells (shared across list + detail + analytics) -------- */
+.state-card { padding: var(--space-6); }
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-7) var(--space-5);
+  text-align: center;
+}
+.empty-mark {
+  width: 44px;
+  height: 44px;
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+}
+.empty-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.empty {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+/* --- Slim themed scrollbar ------------------------------------------------- */
+* { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.16) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); background-clip: padding-box; }
+
+/* --- Shared entrance: gentle staggered rise ------------------------------- */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}

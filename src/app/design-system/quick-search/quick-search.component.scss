@@ -1,0 +1,168 @@
+/* Scrim: the ONLY translucent layer — dims + slightly blurs the app. */
+.qs-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 70; /* above the toast viewport (60) */
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 14vh var(--space-4) var(--space-4);
+  background: rgba(0, 0, 0, 0.42);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+/* Panel: OPAQUE overlay surface (rule T3 — never the frosted .card). */
+.qs-panel {
+  width: min(580px, 100%);
+  max-height: 62vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  box-shadow: var(--shadow-lg), var(--glass-highlight);
+}
+.qs-input-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.qs-glass {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+}
+.qs-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+.qs-input::placeholder { color: var(--text-muted); }
+.qs-kbd {
+  flex: none;
+  padding: 2px 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+.qs-actions { padding: var(--space-2); }
+.qs-results {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.qs-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+/* Hover is NEUTRAL; the keyboard selection uses the native macOS
+   pattern — a flat accent fill with white content (menu/Spotlight). */
+.qs-row:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.qs-row.selected { background: var(--accent); }
+.qs-row:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.qs-row-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+}
+.qs-row-icon svg { width: 18px; height: 18px; display: block; }
+.qs-row:hover .qs-row-icon { color: var(--text-primary); }
+.qs-row.selected .qs-row-icon,
+.qs-row.selected .qs-row-title,
+.qs-row.selected .qs-date { color: var(--text-on-accent); }
+.qs-row.selected .qs-row-snippet { color: rgba(255, 255, 255, 0.78); }
+.qs-row.selected .qs-chip {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.2);
+  color: var(--text-on-accent);
+}
+.qs-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.qs-row-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qs-row-snippet {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qs-row-meta {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.qs-chip {
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.qs-date {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+.qs-action .qs-row-title { color: var(--text-primary); }
+.qs-hint {
+  margin: 0;
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
