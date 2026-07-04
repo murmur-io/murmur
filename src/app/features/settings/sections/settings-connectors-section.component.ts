@@ -34,7 +34,7 @@ import { SettingsStore } from "../settings.store";
                       your notes first; web results are added as “via web” sources.
                     </span>
                   </span>
-                  <input type="checkbox" formControlName="webSearchEnabled" />
+                  <input class="switch" type="checkbox" formControlName="webSearchEnabled" />
                 </label>
 
                 @if (form.controls.webSearchEnabled.value) {
