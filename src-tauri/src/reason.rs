@@ -116,9 +116,9 @@ pub static BRAIN_MODELS: &[BrainModel] = &[
     BrainModel {
         id: "bielik-1.5b-v3",
         name: "Bielik 1.5B v3 (light · Polish-native)",
-        filename: "Bielik-1.5B-v3.0-Instruct.Q4_K_M.gguf",
-        url: "https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct-GGUF/resolve/main/Bielik-1.5B-v3.0-Instruct.Q4_K_M.gguf",
-        approx_size_bytes: 1_050_000_000, // ~1.0 GB (verify on first download)
+        filename: "Bielik-1.5B-v3.0-Instruct.Q8_0.gguf",
+        url: "https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct-GGUF/resolve/main/Bielik-1.5B-v3.0-Instruct.Q8_0.gguf",
+        approx_size_bytes: 1_650_000_000, // ~1.65 GB Q8_0 — speakleash publishes only fp16 + Q8_0 for 1.5B (no Q4_K_M)
         min_ram_gb: 4,
         languages: &["pl", "en"],
         arch: "llama",
@@ -141,10 +141,10 @@ pub static BRAIN_MODELS: &[BrainModel] = &[
     BrainModel {
         id: "bielik-4.5b-v3",
         name: "Bielik 4.5B v3 (heavy · Polish-native)",
-        filename: "Bielik-4.5B-v3.0-Instruct.Q4_K_M.gguf",
-        url: "https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct-GGUF/resolve/main/Bielik-4.5B-v3.0-Instruct.Q4_K_M.gguf",
-        approx_size_bytes: 2_800_000_000, // ~2.8 GB (verify on first download)
-        min_ram_gb: 8,
+        filename: "Bielik-4.5B-v3.0-Instruct.Q8_0.gguf",
+        url: "https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct-GGUF/resolve/main/Bielik-4.5B-v3.0-Instruct.Q8_0.gguf",
+        approx_size_bytes: 4_900_000_000, // ~4.9 GB Q8_0 — speakleash publishes only fp16 + Q8_0 for 4.5B (no Q4_K_M)
+        min_ram_gb: 10,
         languages: &["pl", "en"],
         arch: "llama",
         class: ModelClass::Heavy,
