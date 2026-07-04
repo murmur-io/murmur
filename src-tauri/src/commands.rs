@@ -349,10 +349,14 @@ pub async fn start_recording(
     state
         .capped_notified
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    // Fresh recording ⇒ reset the Realtime-Reactions shadow counter (per-recording calibration).
+    // Fresh recording ⇒ reset the Realtime-Reactions shadow counter (per-recording calibration) and
+    // the per-recording whisper-card dedup set (each recording surfaces a contradiction at most once).
     state
         .reactions_shadow_count
         .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut e) = state.reactions_emitted.lock() {
+        e.clear();
+    }
 
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
@@ -4876,6 +4880,21 @@ pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<
     Ok(())
 }
 
+/// Whether the machine has enough RAM to run Realtime Reactions (the light engine) alongside a live
+/// recording — the combined-residency guard (spec §3.3), including a KV estimate + call-overhead. Lets
+/// the Brain Live card warn / gate before enabling. `true` when total RAM can't be read (never block
+/// behind a failed probe). Read-only capability probe.
+#[tauri::command]
+pub fn brain_live_ram_ok() -> Result<bool, AppError> {
+    let light = crate::reason::default_model_for_class(crate::reason::ModelClass::Light);
+    let models: Vec<&crate::reason::BrainModel> = light.into_iter().collect();
+    Ok(crate::reason::residency_fits(
+        &models,
+        total_ram_gb(),
+        crate::reason::CALL_OVERHEAD_GB,
+    ))
+}
+
 /// The Realtime-Reactions SHADOW counter (spec §4.2): how many contradiction cards WOULD have fired
 /// this recording while the sub-toggle is OFF. Lets the FE offer "the brain would have flagged N —
 /// enable?" (user-local calibration, no telemetry). Read-only; resets each `start_recording`.
@@ -7659,6 +7678,7 @@ mod lifecycle_tests {
             live_transcript: Mutex::new(String::new()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
             reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             lifecycle: Mutex::new(()),

@@ -170,6 +170,16 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             let app2 = app.clone();
             let busy2 = std::sync::Arc::clone(&reactions_busy);
             std::thread::spawn(move || {
+                // RAII: reset the busy flag on EVERY exit — including a panic inside reactions_scan.
+                // Without this, one panic would wedge the flag `true` and silently kill ALL further
+                // reaction scans this recording (deep-review: worker-thread-panic stuck-busy).
+                struct BusyReset(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for BusyReset {
+                    fn drop(&mut self) {
+                        self.0.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                let _reset = BusyReset(busy2);
                 let now = chrono::Utc::now().to_rfc3339();
                 let scan = crate::brain_reactions::reactions_scan(&app2, &now);
                 let n = scan.cards.len() as u64;
@@ -183,7 +193,6 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                         .reactions_shadow_count
                         .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 }
-                busy2.store(false, std::sync::atomic::Ordering::Release);
             });
         }
 

@@ -56,8 +56,11 @@ pub fn derive_posture(cfg: &AppConfig) -> Posture {
     let ask_od = is_on_device(&ask);
     let live_od = is_on_device(&live);
 
-    // Fully Local: the note artifact AND Ask are both on-device (zero cloud egress for content).
-    if notes_od && ask_od {
+    // Fully Local: notes + ask + the @brain (Live) assistant are ALL on-device (zero cloud egress).
+    // The Live axis is load-bearing (deep-review): Notes+Ask local but Live=cloud would mislabel an
+    // egressing @brain as "Fully Local" — the exact privacy-label lie this module forbids. A config
+    // with only some roles on-device is a hand-tuned combination and renders Custom.
+    if notes_od && ask_od && live_od {
         return Posture::FullyLocal;
     }
     // Cloud / Hybrid: notes + ask + live are ALL cloud (nothing on-device routed). The only difference
@@ -203,6 +206,22 @@ mod tests {
             derive_posture(&cfg),
             Posture::Custom,
             "a cloud Ask under a local Notes must be Custom, not a mislabeled Fully Local"
+        );
+    }
+
+    #[test]
+    fn fully_local_requires_the_live_axis_too() {
+        // Notes + Ask local but @brain (Live) still on the cloud provider must NOT read "Fully Local"
+        // (the @brain assistant would egress live meeting context). Deep-review: the Live-axis lie.
+        let mut cfg = AppConfig::default();
+        apply_posture(&mut cfg, Posture::FullyLocal);
+        assert_eq!(derive_posture(&cfg), Posture::FullyLocal);
+        cfg.role_live_connection = crate::summarize::PROVIDER_CLAUDE_CODE.to_string();
+        cfg.role_live_model.clear();
+        assert_eq!(
+            derive_posture(&cfg),
+            Posture::Custom,
+            "a cloud @brain (Live) under local Notes+Ask must be Custom, never mislabeled Fully Local"
         );
     }
 

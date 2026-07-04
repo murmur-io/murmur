@@ -64,9 +64,27 @@ fn model_cache() -> &'static Mutex<ResidentModels> {
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// One PROCESS-WIDE multi-thread runtime driving every mistralrs async op (loads + generations).
+/// Built once and reused — the Brain-Live `light()`/`heavy()` handles build a fresh [`MistralReasoner`]
+/// per call, so a per-instance runtime would spawn (and churn) a thread pool on every reaction scan
+/// (~every 21 s) — a real thread leak (deep-review). A build failure yields `None` and every inference
+/// then returns `Err` gracefully (never a panic).
+fn brain_rt() -> Option<&'static tokio::runtime::Runtime> {
+    static RT: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| tracing::error!(target: "reason", error = %e, "brain runtime build failed"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// A [`LocalReasoner`] running a local GGUF model in-process via mistralrs (Metal). The heavy engine
-/// lives in the shared [`model_cache`]; this holds only the path + a worker runtime, so instances are
-/// cheap to create (the light and heavy handles each build one, sharing weights by path).
+/// lives in the shared [`model_cache`] and the runtime is the shared [`brain_rt`], so an instance holds
+/// only paths — it is CHEAP to build (the light and heavy handles each build one per call, sharing
+/// both weights and the runtime).
 pub struct MistralReasoner {
     id: String,
     /// Full canonical GGUF path — the shared-cache key.
@@ -75,15 +93,13 @@ pub struct MistralReasoner {
     model_dir: PathBuf,
     /// GGUF filename within `model_dir`.
     model_file: String,
-    /// Dedicated runtime used to drive mistralrs' async API from the sync trait methods.
-    rt: tokio::runtime::Runtime,
 }
 
 impl MistralReasoner {
-    /// Build a reasoner for the GGUF at `model_path`. CHEAP + non-blocking: it only splits the path
-    /// and stands up the worker runtime — the multi-GB model load is deferred to first use (and shared
-    /// via [`model_cache`]), so this is safe to call from `active_reasoner` on the startup path.
-    /// Returns `Err` (never panics) if the path has no parent/filename or the runtime can't be built.
+    /// Build a reasoner for the GGUF at `model_path`. CHEAP + non-blocking: it only splits the path —
+    /// the multi-GB model load is deferred to first use (shared via [`model_cache`]) and the runtime is
+    /// the shared [`brain_rt`], so this is safe to call on the startup path and per call. Returns `Err`
+    /// (never panics) if the path has no parent/filename.
     pub fn new(model_path: PathBuf) -> Result<Self> {
         let model_dir = model_path
             .parent()
@@ -94,16 +110,11 @@ impl MistralReasoner {
             .and_then(|n| n.to_str())
             .ok_or_else(|| AppError::Summarize("brain model path has no filename".into()))?
             .to_string();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| AppError::Summarize(format!("brain runtime init failed: {e}")))?;
         Ok(Self {
             id: format!("mistralrs:{model_file}"),
             model_path,
             model_dir,
             model_file,
-            rt,
         })
     }
 
@@ -127,8 +138,9 @@ impl MistralReasoner {
             vec![self.model_file.clone()],
         )
         .with_logging();
+        let rt = brain_rt().ok_or_else(|| AppError::Summarize("brain runtime unavailable".into()))?;
         // `build()` returns `anyhow::Result<Model>`; flatten the thread-join + the inner result.
-        let model = block_on(&self.rt, builder.build())?
+        let model = block_on(rt, builder.build())?
             .map_err(|e| AppError::Summarize(format!("brain model load failed: {e}")))?;
         let arc = Arc::new(model);
         cache.push((self.model_path.clone(), arc.clone()));
@@ -151,7 +163,8 @@ impl MistralReasoner {
         if let Some(n) = opts.max_tokens {
             req = req.set_sampler_max_len(n);
         }
-        let resp = block_on(&self.rt, model.send_chat_request(req))?
+        let rt = brain_rt().ok_or_else(|| AppError::Summarize("brain runtime unavailable".into()))?;
+        let resp = block_on(rt, model.send_chat_request(req))?
             .map_err(|e| AppError::Summarize(format!("brain generation failed: {e}")))?;
         Self::first_content(resp)
     }

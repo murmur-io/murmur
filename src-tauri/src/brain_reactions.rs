@@ -196,6 +196,19 @@ pub fn reactions_scan(app: &tauri::AppHandle, now: &str) -> ReactionScan {
     }
     let entities = resolve_window_entities(&st.db, &unlocked, &current, &window);
     let cards = detect_reactions(&*reasoner, &st.db, &unlocked, &entities, &window, now);
+    // SESSION dedup (deep-review): a contradiction surfaces at most ONCE per recording — else the same
+    // card re-emits every ~21 s scan and (in shadow mode) re-inflates the calibration count. Keyed on
+    // (entity | predicate | old-value); `HashSet::insert` returns true only for a NOT-yet-seen key.
+    let cards = {
+        let mut seen = match st.reactions_emitted.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        cards
+            .into_iter()
+            .filter(|c| seen.insert(format!("{}|{}|{}", c.entity, c.predicate, c.old_quote)))
+            .collect()
+    };
     ReactionScan { cards, emit }
 }
 

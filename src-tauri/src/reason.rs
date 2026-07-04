@@ -464,44 +464,52 @@ where
         .await
         .map_err(|e| AppError::Summarize(format!("brain model download request failed: {e}")))?;
     let status = resp.status();
-    if !status.is_success() {
+    // A resumed request whose range starts at/after EOF returns 416 Range Not Satisfiable: the `.part`
+    // is already COMPLETE. Skip the body and go straight to verify + promote — otherwise a
+    // fully-downloaded `.part` would brick every retry with a permanent HTTP error (deep-review).
+    let already_complete = existing > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
+    if !already_complete && !status.is_success() {
         return Err(AppError::Summarize(format!(
             "brain model download HTTP {status}"
         )));
     }
-    // We requested a resume but the server sent the FULL body (200, not 206 Partial) → it ignored
-    // Range; discard the stale partial and restart from zero so we never concatenate mismatched bytes.
-    let resuming = status == reqwest::StatusCode::PARTIAL_CONTENT;
-    if existing > 0 && !resuming {
-        let _ = tokio::fs::remove_file(&part).await;
-        existing = 0;
-    }
-    // On a 206 the Content-Length is the REMAINING bytes; total = already-on-disk + remaining.
-    let total = resp.content_length().map(|r| existing + r);
 
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part)
-        .await
-        .map_err(|e| AppError::Summarize(format!("open brain model temp file: {e}")))?;
-    let mut resp = resp;
     let mut downloaded: u64 = existing;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| AppError::Summarize(format!("brain model download body failed: {e}")))?
-    {
-        file.write_all(&chunk)
+    if !already_complete {
+        // We requested a resume but the server sent the FULL body (200, not 206 Partial) → it ignored
+        // Range; discard the stale partial and restart from zero so we never concatenate mismatched bytes.
+        let resuming = status == reqwest::StatusCode::PARTIAL_CONTENT;
+        if existing > 0 && !resuming {
+            let _ = tokio::fs::remove_file(&part).await;
+            existing = 0;
+            downloaded = 0;
+        }
+        // On a 206 the Content-Length is the REMAINING bytes; total = already-on-disk + remaining.
+        let total = resp.content_length().map(|r| existing + r);
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)
             .await
-            .map_err(|e| AppError::Summarize(format!("write brain model chunk: {e}")))?;
-        downloaded += chunk.len() as u64;
-        on_progress(downloaded, total);
+            .map_err(|e| AppError::Summarize(format!("open brain model temp file: {e}")))?;
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| AppError::Summarize(format!("brain model download body failed: {e}")))?
+        {
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Summarize(format!("write brain model chunk: {e}")))?;
+            downloaded += chunk.len() as u64;
+            on_progress(downloaded, total);
+        }
+        file.flush()
+            .await
+            .map_err(|e| AppError::Summarize(format!("flush brain model file: {e}")))?;
+        drop(file);
     }
-    file.flush()
-        .await
-        .map_err(|e| AppError::Summarize(format!("flush brain model file: {e}")))?;
-    drop(file);
 
     if downloaded == 0 {
         let _ = tokio::fs::remove_file(&part).await;
