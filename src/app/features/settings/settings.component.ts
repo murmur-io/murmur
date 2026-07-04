@@ -280,28 +280,30 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
         background: var(--surface-base);
       }
 
-      /* ── Two-pane shell: full-height section rail + scrolling content ── */
+      /* ── Two-pane shell: floating section rail + scrolling content ── */
       .settings-shell {
         display: grid;
-        grid-template-columns: 232px minmax(0, 1fr);
+        grid-template-columns: 246px minmax(0, 1fr);
         height: 100vh;
         height: 100dvh;
       }
 
-      /* Left rail — a first-class full-height column flush to the window edge,
-         same visual weight as the primary rail it replaces (frosted in-flow
-         chrome, right border, NOT a floating card). */
+      /* Left rail — PROTOTYPE (Apple TV shell): the same floating rounded
+         liquid-glass panel as the primary rail (inset from the window edges),
+         so the drill-down chrome matches the shell it replaces. */
       .settings-sidebar {
         display: flex;
         flex-direction: column;
         gap: var(--space-3);
-        height: 100%;
+        height: calc(100% - 20px);
+        margin: 10px 0 10px 10px;
         padding: 0 var(--space-3) var(--space-4);
-        background: var(--surface-raised);
-        -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-        backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-        border-right: 1px solid var(--border-subtle);
-        box-shadow: var(--glass-highlight);
+        background: var(--shell-glass-bg);
+        -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+        backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+        border: 1px solid var(--shell-glass-border);
+        border-radius: var(--radius-xl);
+        box-shadow: var(--shadow-md), var(--shell-glass-inner);
         overflow: hidden;
         animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
       }
@@ -432,12 +434,15 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
           color var(--transition-fast);
       }
       .nav-item:hover {
-        background: var(--surface-input);
+        background: var(--surface-hover);
         color: var(--text-primary);
       }
+      /* Active: the shell's neutral glass-on-glass pill — accent only on the
+         glyph/label, never as the fill (matches the primary rail). */
       .nav-item.active {
-        background: var(--accent-soft);
-        color: var(--accent);
+        background: var(--shell-active-bg);
+        color: var(--shell-active-text);
+        box-shadow: var(--shell-active-shadow);
       }
       .nav-icon {
         display: inline-flex;
@@ -522,8 +527,8 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
           grid-template-rows: auto minmax(0, 1fr);
         }
         .settings-sidebar {
-          border-right: 0;
-          border-bottom: 1px solid var(--border-subtle);
+          height: auto;
+          margin: 10px 10px 0;
         }
         .sidebar-nav {
           flex-direction: row;
