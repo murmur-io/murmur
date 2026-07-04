@@ -60,12 +60,22 @@ import { FolderDropDirective } from "./folder-drop.directive";
           (click)="select.emit(null)"
         >
           <span class="root-icon" aria-hidden="true">
+            <!-- Same CLOSED folder outline as the per-folder rows (the old
+                 open-bottom path rendered as a broken half-shape), plus an
+                 inner line hinting "everything inside". -->
             <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
               <path
-                d="M2 13V5.5C2 4.7 2.7 4 3.5 4h3l1.5 1.7H12.5c.8 0 1.5.7 1.5 1.5V13"
+                d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
                 stroke="currentColor"
                 stroke-width="1.3"
                 stroke-linejoin="round"
+              />
+              <path
+                d="M4.4 9.4h7.2"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+                opacity="0.55"
               />
             </svg>
           </span>
