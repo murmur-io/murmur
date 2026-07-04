@@ -216,6 +216,18 @@ pub struct AppConfig {
     /// (fail-closed — a pre-existing install has NOT consented to share egress).
     #[serde(default)]
     pub share_egress_consented: bool,
+    /// Sharing-onboarding gate — has the user RESOLVED the first-run sharing decision? Either they
+    /// chose "use Murmur locally (no account)" OR they went through the account door. A one-way
+    /// latch: once `true` it is never auto-cleared, so the init gateway (`/welcome`) never nags a
+    /// user who has already decided. It is NOT a consent flag (no egress rides on it) — it purely
+    /// suppresses the first-run prompt. Same preserve-only discipline as `share_egress_consented`:
+    /// it round-trips through the DTO for DISPLAY (so the gateway gate can read it) but
+    /// `dto_to_config`/`save_config` PRESERVE the stored value — a normal settings save can never
+    /// set or clear it; the dedicated `mark_sharing_choice_made` command is the ONLY mutator.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`, so a
+    /// pre-existing install sees the gateway once (until it makes a choice).
+    #[serde(default)]
+    pub sharing_choice_made: bool,
     /// brain2 RAG Tier 1 — master gate for the on-device semantic (vector) retrieval layer.
     /// Default ON (`#[serde(default = "default_true")]` ⇒ a config persisted before this field existed
     /// loads as `true`). SAFE to default on: when the e5 model is PRESENT, note chunks auto-index on
@@ -446,6 +458,7 @@ impl Default for AppConfig {
             relock_on_screenshare: true,
             cloud_egress_consented: false,
             share_egress_consented: false,
+            sharing_choice_made: false,
             semantic_search_enabled: true,
             embed_model_id: None,
             brain_model_path: None,
@@ -461,7 +474,10 @@ impl Default for AppConfig {
             claude_code_inherit_env: false,
             gateway_base_url: String::new(),
             gateway_model: String::new(),
-            share_base_url: String::new(),
+            // Hosted sharing relay (murmur-io/murmur-server) — the default so Murmur↔Murmur sharing
+            // works out of the box; self-hosters override it in Settings. Swap for the production
+            // domain at release (this is the current Railway instance).
+            share_base_url: "https://murmur-server-production-b9e8.up.railway.app".to_string(),
             proactive_hints_enabled: true,
             user_memory_enabled: true,
             ground_summary: false,
@@ -512,6 +528,7 @@ const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SHARE_EGRESS_CONSENTED: &str = "share_egress_consented";
+const K_SHARING_CHOICE_MADE: &str = "sharing_choice_made";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 const K_EMBED_MODEL_ID: &str = "embed_model_id";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
@@ -651,6 +668,9 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_SHARE_EGRESS_CONSENTED)? {
             cfg.share_egress_consented = v == "true";
         }
+        if let Some(v) = db.get_setting(K_SHARING_CHOICE_MADE)? {
+            cfg.sharing_choice_made = v == "true";
+        }
         if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
             cfg.semantic_search_enabled = v == "true";
         }
@@ -694,8 +714,12 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_GATEWAY_MODEL)? {
             cfg.gateway_model = v;
         }
-        // M3-CLIENT sharing-server base URL — `""` (unset) is valid; take it verbatim.
-        if let Some(v) = db.get_setting(K_SHARE_BASE_URL)? {
+        // M3-CLIENT sharing-server base URL — a NON-EMPTY stored value overrides the hosted default;
+        // an absent/empty setting keeps the default so sharing works out of the box.
+        if let Some(v) = db
+            .get_setting(K_SHARE_BASE_URL)?
+            .filter(|s| !s.trim().is_empty())
+        {
             cfg.share_base_url = v;
         }
         if let Some(v) = db.get_setting(K_PROACTIVE_HINTS_ENABLED)? {
@@ -860,6 +884,14 @@ impl AppConfig {
         db.set_setting(
             K_SHARE_EGRESS_CONSENTED,
             if self.share_egress_consented {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_SHARING_CHOICE_MADE,
+            if self.sharing_choice_made {
                 "true"
             } else {
                 "false"
@@ -1031,6 +1063,17 @@ impl AppConfig {
     pub fn revoke_share_egress(&mut self, db: &Db) -> Result<()> {
         self.share_egress_consented = false;
         db.set_setting(K_SHARE_EGRESS_CONSENTED, "false")
+    }
+
+    /// Latch that the user has RESOLVED the first-run sharing decision (chose local-only OR went
+    /// through the account door), so the init gateway never shows again. Mirrors
+    /// [`grant_share_egress_consent`]'s fail-safe ordering: persist FIRST, flip the in-memory flag
+    /// ONLY on a durable write success. One-way latch — the ONLY mutator that sets it true, so it
+    /// can never be set (or cleared) as a settings-save side effect. Idempotent.
+    pub fn set_sharing_choice_made(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_SHARING_CHOICE_MADE, "true")?;
+        self.sharing_choice_made = true;
+        Ok(())
     }
 
     /// brain2 connector framework — record the user's one-time consent to send the (redacted) web
@@ -1689,6 +1732,26 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().proactive_hints_enabled);
+    }
+
+    /// Sharing-onboarding gate: `sharing_choice_made` defaults OFF (a fresh/pre-existing install
+    /// sees the gateway once), and the dedicated `set_sharing_choice_made` mutator persists it as a
+    /// one-way latch that survives reload. Mirrors the consent-mutator persistence test.
+    #[test]
+    fn sharing_choice_made_defaults_off_and_latches_via_mutator() {
+        // In-memory default + empty settings table (key never written) ⇒ OFF (gateway shows).
+        assert!(!AppConfig::default().sharing_choice_made);
+        let db = temp_db();
+        assert!(!AppConfig::load(&db).unwrap().sharing_choice_made);
+
+        // The dedicated mutator persists it, and the value survives a reload (one-way latch).
+        let mut cfg = AppConfig::load(&db).unwrap();
+        cfg.set_sharing_choice_made(&db).unwrap();
+        assert!(cfg.sharing_choice_made, "mutator flips the in-memory flag");
+        assert!(
+            AppConfig::load(&db).unwrap().sharing_choice_made,
+            "the latch persists across reload"
+        );
     }
 
     /// Cross-meeting USER MEMORY — the master gate defaults ON for fresh installs AND for configs

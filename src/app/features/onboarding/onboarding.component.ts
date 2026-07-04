@@ -1755,7 +1755,18 @@ export class OnboardingComponent implements OnInit {
           // Grant failed — recoverable post-wizard; don't block finishing.
         }
       }
-      await this.router.navigate(["/record"]);
+      // Hand off to the first-run SHARING gateway when its gate is still open,
+      // else straight to /record — reusing the SAME condition as app.component
+      // (`!sharingChoiceMade && !accountStatus.loggedIn`). So a fresh install
+      // flows /onboarding → (finish) → /welcome → pick → /record.
+      let dest = "/record";
+      if (!this.loadedConfig?.sharingChoiceMade) {
+        const st = await this.ipc.accountStatus().catch(() => null);
+        if (!st?.loggedIn) {
+          dest = "/welcome";
+        }
+      }
+      await this.router.navigate([dest]);
     } catch {
       // If saving the final flag fails, let them retry rather than trap them.
       this.finishing.set(false);
@@ -1799,6 +1810,10 @@ export class OnboardingComponent implements OnInit {
       modelSize: this.modelSize(),
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
+      // First-run sharing latch — preserve-only here (the /welcome gateway owns
+      // it via mark_sharing_choice_made). Round-trip the snapshot so onboarding
+      // never clears it; the backend's dto_to_config preserves it regardless.
+      sharingChoiceMade: base?.sharingChoiceMade ?? false,
       noteStyle: base?.noteStyle ?? "standard",
       notesMode: base?.notesMode ?? "enhance",
       autoOrganize: base?.autoOrganize ?? false,
