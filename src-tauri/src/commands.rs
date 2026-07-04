@@ -5716,8 +5716,11 @@ pub async fn unlock_folder(
     }
 
     // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
-    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK.
-    unseal_folder_extras(state.inner(), &folder_id, &ck)?;
+    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK. The
+    // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
+    // re-indexes the folder's meetings so semantic / related-meetings recover in-session.
+    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    unseal_folder_extras(state.inner(), &folder_id, &ck, meeting_embedder.as_deref())?;
 
     // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
     {
@@ -5936,8 +5939,11 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     }
 
     // Phase 0.5 — permanently restore the TRANSCRIPT + TIMELINE plaintext (clear *_blob columns)
-    // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio.
-    unseal_folder_extras_permanent(state, &folder_id, &ck)?;
+    // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio. The
+    // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
+    // re-indexes the now-open folder's meetings so semantic / related-meetings work again.
+    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    unseal_folder_extras_permanent(state, &folder_id, &ck, meeting_embedder.as_deref())?;
 
     // Flip the folder back to OPEN + drop it from the session set.
     state.db.set_folder_locked(&folder_id, false, None)?;
@@ -6617,7 +6623,63 @@ fn seal_meeting_extras(
 /// SESSION-unlock: decrypt every governed meeting's transcript + timeline back into the plaintext
 /// columns and materialize a playable WAV (decrypt <file>.enc → <file>) re-pointing audio_path at
 /// it. Keeps the `.enc` + the `*_blob` columns (folder is still locked on disk).
-fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+/// Re-index a just-unsealed folder's MEETINGS into `note_chunks` + `vec_chunks` so semantic search /
+/// related-meetings recover after an unlock. Keyword search over meeting notes already recovers on
+/// its own — the `fts_notes` UPDATE trigger fires when `restore_note_markdown` writes the plaintext
+/// back; `note_chunks` have NO independent FTS index (unlike `doc_chunks`/`fts_doc_chunks`), they are
+/// purely the plaintext substrate paired 1:1 with the (semantic) `vec_chunks`.
+///
+/// SYMMETRY / PRECEDENT: documents are ALREADY re-embedded on unseal (`index_document_chunks`, just
+/// above the call sites) and re-purged on relock (`purge_doc_chunks_tx` inside
+/// `blank_sealed_notes_in_folders` / `reblank_folder_extras`). MEETINGS were purged on lock
+/// (`purge_chunks_for_meetings` / `blank_sealed_notes_in_folders` → `purge_chunks_tx`) but were
+/// NEVER re-indexed on unlock — this closes that gap so meetings behave identically to documents. On
+/// relock the SAME `blank_sealed_notes_in_folders` → `purge_chunks_tx` re-purges these rebuilt rows,
+/// so a re-sealed folder still leaves NO meeting vector at rest.
+///
+/// MODEL POLICY — mirrors the MEETING half of `reindex_embeddings_inner` and the pipeline auto-index
+/// (`should_auto_index`) EXACTLY: `Db::index_meeting_chunks` writes chunks AND vectors together (there
+/// is no chunk-only mode, unlike `index_document_chunks(None)`), so it runs ONLY when the REAL e5
+/// model is present — i.e. `embedder == Some`. Model ABSENT (`None`) ⇒ write NOTHING: never a stub
+/// vector (the absolute no-stub-vector invariant), and a model-less install has nothing semantic to
+/// restore anyway (and chunkless-of-vector `note_chunks` rows would have no FTS role). Callers pass
+/// `embed_model_present().then(active_embedder)` — identical to the document re-index idiom.
+///
+/// ORDERING: the caller MUST have already restored each meeting's note plaintext markdown (via
+/// `restore_note_markdown`) before this runs — `index_meeting_chunks` chunks the plaintext note. Both
+/// production callers do (`unlock_folder` / `remove_lock_inner` restore markdown before the extras).
+///
+/// BEST-EFFORT: a per-meeting indexing failure WARNs (IDs/stage only, no PII) and continues — the
+/// unlock/restore has already succeeded and MUST NOT be failed by a re-index hiccup.
+fn reindex_meetings_after_unseal(
+    state: &AppState,
+    meeting_ids: &[String],
+    embedder: Option<&dyn crate::embed::Embedder>,
+) {
+    let Some(embedder) = embedder else {
+        // Model absent: meetings are not chunked (no chunk-only mode → would be stub vectors).
+        // Exactly the pipeline / manual-reindex behavior; note_chunks stay purged until a real reindex.
+        return;
+    };
+    for mid in meeting_ids {
+        if let Err(e) = state.db.index_meeting_chunks(mid, embedder) {
+            tracing::warn!(target: "rag", error = %e, "meeting re-index on unlock failed (note plaintext already restored)");
+        }
+    }
+}
+
+/// `meeting_embedder` is the model-gated embedder for the MEETING re-index, resolved by the CALLER
+/// (`embed_model_present().then(active_embedder)`) and passed in — `Some(real e5)` re-indexes the
+/// folder's meetings, `None` (model absent) writes nothing (never a stub vector). It is injected
+/// (rather than resolved internally like the document re-index below) so the model-PRESENT re-index
+/// is deterministically testable without a real model on disk — meetings have no model-absent
+/// chunk-only path, unlike documents.
+fn unseal_folder_extras(
+    state: &AppState,
+    folder_id: &str,
+    ck: &[u8; 32],
+    meeting_embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<(), AppError> {
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     for mid in &meeting_ids {
         for s in state.db.raw_segments(mid)? {
@@ -6695,6 +6757,11 @@ fn unseal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Res
             }
         }
     }
+    // MEETINGS: re-index the folder's meetings into note_chunks + vec_chunks so semantic /
+    // related-meetings recover in-session (their note markdown was restored by `unlock_folder`
+    // BEFORE this call). The caller supplies the model-gated `meeting_embedder` — never a stub
+    // vector; mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
+    reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
     Ok(())
 }
 
@@ -6750,10 +6817,13 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
 /// clear the `*_blob` columns, and permanently restore the plaintext WAV (decrypt .enc → file,
 /// remove the .enc). NEVER lose audio — the plaintext is written + the file decrypts before the
 /// `.enc` is removed.
+/// `meeting_embedder`: the caller-resolved, model-gated embedder for the MEETING re-index (see
+/// [`unseal_folder_extras`] for why it is injected rather than resolved internally).
 fn unseal_folder_extras_permanent(
     state: &AppState,
     folder_id: &str,
     ck: &[u8; 32],
+    meeting_embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<(), AppError> {
     for mid in state.db.meeting_ids_in_folder(folder_id)? {
         // Transcript: restore each segment from its blob (or keep the in-memory text if the folder
@@ -6842,6 +6912,12 @@ fn unseal_folder_extras_permanent(
             }
         }
     }
+    // MEETINGS: the folder is now permanently OPEN (plaintext + `.md` restored above), so there is no
+    // privacy rationale to skip re-indexing its meetings. Re-embed them into note_chunks + vec_chunks
+    // (caller-supplied model-gated embedder — never a stub vector) so semantic / related-meetings work
+    // again. Mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
+    let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+    reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
     Ok(())
 }
 
@@ -7861,7 +7937,7 @@ mod lifecycle_tests {
         let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
-        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
 
         assert_eq!(
             state.db.get_manual_notes("m1").unwrap(),
@@ -8133,7 +8209,7 @@ mod lifecycle_tests {
         let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
-        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
 
         let restored = state
             .db
@@ -8366,7 +8442,7 @@ mod lifecycle_tests {
         let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
-        unseal_folder_extras(&state, "f-lock", &ck).unwrap();
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
         assert!(
             state.db.doc_chunk_count(&id).unwrap() >= 1,
             "unlock must re-chunk the document even without the e5 model"
@@ -8374,6 +8450,187 @@ mod lifecycle_tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         assert_leg_visibility(&unlocked, true, "session-unlocked");
+    }
+
+    /// Mirror `unlock_folder`'s own note-markdown restore (KEK → unwrap CK → decrypt each sealed
+    /// provider row's `content_blob` back into its plaintext markdown column) — the step
+    /// `unlock_folder` runs BEFORE `unseal_folder_extras`, so the meeting re-index has plaintext to
+    /// chunk. Returns the unwrapped CK for the follow-on `unseal_folder_extras` call.
+    fn restore_notes_and_ck(state: &AppState, folder_id: &str) -> [u8; 32] {
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(folder_id).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        for n in state.db.notes_in_folder(folder_id).unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
+                let md = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
+                    .unwrap();
+            }
+        }
+        ck
+    }
+
+    /// REGRESSION (the reported bug): locking a folder PURGES its meetings' `note_chunks`/`vec_chunks`
+    /// (`purge_chunks_for_meetings`), but session-unlock (`unseal_folder_extras`) previously re-indexed
+    /// ONLY documents and NEVER the meetings — so semantic / related-meetings stayed DEAD for those
+    /// meetings until a manual full re-index. This asserts the fix on the PRODUCTION unlock path.
+    ///
+    /// RED-before-GREEN (deterministic, machine-independent): the meeting embedder is now injected, so
+    /// the model-PRESENT branch is driven by passing `Some(&StubEmbedder)` (the same stand-in every
+    /// meeting-chunk test uses) into the PRODUCTION `unseal_folder_extras`. On the pre-fix code
+    /// `unseal_folder_extras` had no meeting re-index at all (`index_meeting_chunks`'s only production
+    /// callers were the pipeline + the manual reindex command, grep-confirmed), so `note_chunk_count`
+    /// would stay 0 even with `Some` — RED. The `None` call proves the ABSOLUTE no-stub-vector /
+    /// mirror-the-pipeline invariant: model-absent unlock writes ZERO meeting chunks AND vectors.
+    #[test]
+    fn unlock_reindexes_folder_meetings_and_never_stub_vectors() {
+        let state = build_state("unlock-reindex-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Q3 plan\n\nbudget planning and hiring across the org",
+            Some("f-lock"),
+        );
+        // Index while the folder is OPEN (the stub stands in for a present model, as every other
+        // meeting-chunk test does) → chunks + vectors present.
+        state.db.index_meeting_chunks("m1", &crate::embed::StubEmbedder).unwrap();
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
+        assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectored while open");
+
+        // LOCK (production seal) → meeting chunks + vectors purged.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "note_chunks purged on lock");
+        assert_eq!(state.db.note_vec_count("m1").unwrap(), 0, "vec_chunks purged on lock");
+
+        // Restore note markdown exactly as `unlock_folder` does BEFORE `unseal_folder_extras`.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+
+        // MODEL-ABSENT (embedder = None): the PRODUCTION unlock must write NOTHING for meetings — no
+        // chunk-only mode → any write would be a forbidden stub vector. Mirrors the pipeline exactly.
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "model-absent unlock writes NO meeting note_chunks (mirrors the pipeline/reindex policy)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "ABSOLUTE no-stub-vector: model-absent unlock never writes a meeting vector"
+        );
+
+        // MODEL-PRESENT (embedder = Some): the PRODUCTION unlock re-indexes the folder's meetings.
+        // RED on the pre-fix code (unseal_folder_extras had no meeting re-index → stayed 0).
+        unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "production unlock re-indexes meeting vec_chunks when the e5 model is present"
+        );
+    }
+
+    /// REMOVE-LOCK analogue: permanently opening a folder (`remove_lock_inner` →
+    /// `unseal_folder_extras_permanent`) restores plaintext + `.md` for every meeting; the folder is
+    /// then permanently OPEN, so there is no privacy rationale to skip re-indexing — meetings must
+    /// re-index exactly like documents. Same deterministic RED-before-GREEN shape as the session-unlock
+    /// test, driving the PRODUCTION `unseal_folder_extras_permanent` with `None` then `Some`.
+    #[test]
+    fn remove_lock_reindexes_folder_meetings_and_never_stub_vectors() {
+        let state = build_state("remove-lock-reindex-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Roadmap\n\nrevisit auth and the billing migration next sprint",
+            Some("f-lock"),
+        );
+        state.db.index_meeting_chunks("m1", &crate::embed::StubEmbedder).unwrap();
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "purged on lock");
+
+        // `remove_lock_inner` restores the note markdown (Step 1) BEFORE `unseal_folder_extras_permanent`.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+
+        // MODEL-ABSENT (None): permanent unseal writes NO meeting chunks/vectors (no stub vectors).
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "model-absent remove-lock writes NO meeting note_chunks (mirrors the pipeline policy)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "ABSOLUTE no-stub-vector: model-absent remove-lock never writes a meeting vector"
+        );
+
+        // MODEL-PRESENT (Some): permanent unseal re-indexes the now-open folder's meetings. RED on the
+        // pre-fix code (unseal_folder_extras_permanent had no meeting re-index → stayed 0).
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+        );
+        assert!(state.db.note_vec_count("m1").unwrap() > 0, "remove-lock re-indexes meeting vec_chunks");
+    }
+
+    /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
+    /// must leave ZERO meeting chunks/vectors at rest — `relock_folder` → `blank_sealed_notes_in_folders`
+    /// → `purge_chunks_tx` covers the rows the unlock re-index rebuilt, so a re-sealed folder never
+    /// leaves a meeting vector at rest.
+    #[test]
+    fn lock_unlock_relock_leaves_zero_meeting_chunks() {
+        let state = build_state("relock-repurge-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Notes\n\nlaunch on the 14th; hire two engineers",
+            Some("f-lock"),
+        );
+        state.db.index_meeting_chunks("m1", &crate::embed::StubEmbedder).unwrap();
+
+        // Lock → purge.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "purged on lock");
+
+        // Session-unlock: restore markdown + the PRODUCTION unseal with a present (stub) model, which
+        // rebuilds the meeting chunks — so the relock below has something to re-purge.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+        unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: meeting re-indexed while session-unlocked"
+        );
+        assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectors rebuilt");
+
+        // RELOCK → re-purge. Zero meeting chunks AND zero vectors at rest.
+        relock_all_inner(&state).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "relock must re-purge the meeting note_chunks the unlock re-index rebuilt"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "relock must re-purge the rebuilt meeting vec_chunks (no invertible vector at rest)"
+        );
     }
 
     /// REINDEX BACKFILL (PR B): `reindex_embeddings_inner` covers documents. Model ABSENT →

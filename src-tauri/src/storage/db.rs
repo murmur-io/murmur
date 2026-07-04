@@ -2086,6 +2086,36 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Number of `note_chunks` rows currently indexed for a MEETING (0 when never indexed or purged
+    /// on lock). The meeting analogue of [`Db::doc_chunk_count`] — used by the lock tests to assert
+    /// purge-on-lock / re-index-on-unlock without reaching the private connection. Test-only.
+    #[cfg(test)]
+    pub(crate) fn note_chunk_count(&self, meeting_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM note_chunks WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Number of `vec_chunks` rows currently indexed for a MEETING. Lets the tests assert the absolute
+    /// no-stub-vector contract on the unlock re-index path (model-absent ⇒ ZERO meeting vectors). The
+    /// count JOINs through `note_chunks` (vec0 is FK-less) and is meeting-scoped. Test-only.
+    #[cfg(test)]
+    pub(crate) fn note_vec_count(&self, meeting_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM vec_chunks v
+               JOIN note_chunks nc ON nc.id = v.chunk_id
+              WHERE nc.meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
     /// A document's `(folder_id, name, plaintext text)`, or `None` if unknown. The COMMAND layer gates
     /// the folder before surfacing the text to the FE.
     pub fn get_document(&self, id: &str) -> Result<Option<(String, String, String)>> {
@@ -7160,6 +7190,45 @@ mod tests {
         assert!(
             shown.iter().any(|h| h.meeting.id == "sealed"),
             "session-unlocked meeting must reappear in semantic results"
+        );
+    }
+
+    /// GATE (hybrid): the fused FTS+semantic+graph reader also excludes a sealed-not-session-unlocked
+    /// meeting — with BOTH the FTS query term AND a query vector that match its (deliberately-surviving)
+    /// chunk, so exclusion can ONLY come from the shared `visibility_clause`, not purge. Companion to
+    /// `vec_semantic_search_is_gated_by_visibility`; asserts the unlock re-index change did not weaken
+    /// the hybrid gate. RED if the gate inside `search_semantic_visible`/`search_visible` were removed.
+    #[test]
+    fn vec_hybrid_search_is_gated_by_visibility() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "sealed", "claude_code", "quarterly budget secret body");
+        db.set_note_folder("sealed", Some("f-locked")).unwrap();
+        insert_known_chunk(&db, "sealed", "quarterly budget secret body", &one_hot(0));
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let query_vec = one_hot(0);
+        // Empty unlock set → the sealed meeting is absent through the whole fused reader.
+        let nothing = std::collections::HashSet::new();
+        let hidden = db
+            .search_hybrid_visible("budget", &query_vec, 10, &nothing)
+            .unwrap();
+        assert!(
+            !hidden.iter().any(|h| h.meeting.id == "sealed"),
+            "sealed-not-unlocked meeting leaked through the hybrid gate"
+        );
+
+        // Session-unlock → it reappears in the fused results.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let shown = db
+            .search_hybrid_visible("budget", &query_vec, 10, &unlocked)
+            .unwrap();
+        assert!(
+            shown.iter().any(|h| h.meeting.id == "sealed"),
+            "session-unlocked meeting must reappear in hybrid results"
         );
     }
 
