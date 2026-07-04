@@ -31,6 +31,24 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-05 Touch ID MK cache — #196] a master secret gains an at-rest cache
+- **Pattern:** The sharing-account MK moved from RAM-only to a biometric-gated Keychain item (a
+  deliberate posture change for UX). Review confirmed it was sound — user-presence + `WhenUnlocked-
+  ThisDeviceOnly` (non-syncable, no iCloud), the DEBUG plaintext dev-file path `#[cfg]`-compiled OUT
+  of release, cleared-on-logout, FFI-safe (SecItem* C funcs only, no `msg_send`), fail-closed, no
+  keychain-item-name collision with the folder-lock KEK — but caught a LOW: `account_logout` ran the
+  fallible `clear_*()?` keychain deletes BEFORE `*session = None`, so a rare keychain error early-
+  returns and leaves the live MK in RAM.
+- **Caught by:** lock-security-reviewer.
+- **Lesson:** When a secret gains an at-rest cache, audit the full checklist: ACL (user-presence +
+  device-only + non-syncable), the DEBUG/plaintext hatch is `#[cfg]`-compiled-out-of-release, cleared
+  on logout (+ consider rotation/password-change), never logged, held `Zeroizing`, fails-closed, and
+  no keychain-item-name collision with existing secrets. ORDERING: drop the in-RAM secret FIRST, then
+  run any fallible clear — a `?` must never skip the zeroize. Adjacent: a CSP gaining `'wasm-unsafe-eval'`
+  is wasm-compile-only (not `eval`) → not a broadened XSS surface; a self-hosted crypto lib should be
+  sha256-pinned (a CI test).
+- **Status:** journal
+
 ### [2026-07-02 seed] Distilled from lock-model.md
 - **Pattern:** gate-every-read + verify-before-destroy + the convertFileSrc asset-path leak.
 - **Caught by:** operator (seeding the loop). (Historically this gate caught a Resummarize
