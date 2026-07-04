@@ -10,7 +10,8 @@
 
 ## Global Constraints
 
-- **Zoneless (binding):** `standalone: true` + `ChangeDetectionStrategy.OnPush`; state is `signal()`/`computed()`; `inject()` (no constructor DI); `input()`/`output()`/`viewChild()` (never the decorators); `@if`/`@for` only (`*ngIf`/`*ngFor` BANNED); `@for` tracks a stable id; inline `template` + `styles:[\`…\`]`; **≤16 kB per-component style budget**; `var(--token)` for every color/space/radius/shadow (no hex/px design values); inline SVG icons; **no new npm packages**.
+- **Zoneless (binding):** `standalone: true` + `ChangeDetectionStrategy.OnPush`; state is `signal()`/`computed()`; `inject()` (no constructor DI); `input()`/`output()`/`viewChild()` (never the decorators); `@if`/`@for` only (`*ngIf`/`*ngFor` BANNED); `@for` tracks a stable id; inline `template` + `styles:[\`…\`]`; **≤16 kB per-component style budget**; `var(--token)` for every color/space/radius/shadow (no hex/px design values); inline SVG icons.
+- **Dependencies:** no new **runtime** npm packages. The ONE approved addition (user-approved 2026-07-04) is **`@playwright/test` as a devDependency** — the FE test harness stood up in Task 0. No other new packages, runtime or dev.
 - **NG0600:** any `effect()` that writes a signal it also reads needs `{ allowSignalWrites: true }`.
 - **Overlays:** any floating popover/menu uses `var(--surface-overlay)` + `backdrop-filter:none` (never the frosted `.card`). The Advanced expander is IN-FLOW, so a normal surface is fine — no overlay needed.
 - **IPC (binding):** one typed method per Tauri command in `ipc.service.ts`; NEVER `invoke(...)` from a component; every IPC result lands in a `signal` (no `.subscribe`-into-field, no `async` pipe). All commands this plan needs already exist on `IpcService`.
@@ -44,7 +45,105 @@
 | `sections/ai/ai-connection-cards.component.ts` | Connections | unchanged, rendered inside `ai-advanced-block` |
 | `sections/ai/ai-role-rows.component.ts` | per-feature rows; loses the GGUF-registry list (→ `local-models-list`) | **modify** |
 
-**Testing note (Murmur reality):** this repo's FE gate is `ng lint` + `ng build` + a **Playwright live-repro** against `:1420` with a mocked Tauri `invoke` (the `scripts/screenshots/mock-tauri.js` pattern) — there is no component unit-test runner. Each task's test cycle is therefore a Playwright spec that boots the settings page with a scripted `invoke` mock, asserts the behavior RED-before-GREEN, then GREEN after implementation. Put specs under `e2e/settings-ai/` (create the folder). Where a task adds a **pure function** (the auto-pick), test it directly inside the same spec via `page.evaluate` importing nothing — assert through the rendered UI it drives.
+**Testing note (Murmur reality):** this repo had **no** browser test runner before this work — its "E2E" (`scripts/e2e-core.sh`) is the audio pipeline, and FE was verified only by `ng lint` + `ng build` + ad-hoc Playwright-MCP live-repro. **Task 0 stands up a committed `@playwright/test` harness** (user-approved dev dependency) so every FE task gets a real RED→GREEN spec. Each task's test cycle is a Playwright spec that boots the settings page with a scripted Tauri `invoke` mock (reusing the `scripts/screenshots/mock-tauri.js` fixture data pattern), asserts the behavior RED-before-GREEN, then GREEN after implementation. Specs live under `e2e/settings-ai/`. Where a task adds a **pure function** (the auto-pick), assert it through the rendered UI it drives.
+
+---
+
+## Task 0: Playwright test harness (foundation)
+
+**Files:**
+- Modify: `package.json` (add `@playwright/test` devDependency + a `test:e2e` script)
+- Create: `playwright.config.ts`
+- Create: `e2e/settings-ai/mock-invoke.ts` (the Tauri `invoke`/`listen` mock helper)
+- Create: `e2e/settings-ai/harness.spec.ts` (a smoke test proving the harness boots the app + the mock works)
+
+**Interfaces:**
+- Produces: `mockTauri(page: Page, handlers: Record<string, (args: any) => unknown>): Promise<void>` — installs `window.__TAURI_INTERNALS__.invoke` (and a no-op `listen`) before app scripts run (via `page.addInitScript`), routing each Tauri command name to a handler, defaulting unknown commands to a benign value. Every later task's spec imports this.
+
+- [ ] **Step 1: Install the dev dependency + browser**
+
+```bash
+npm install --save-dev @playwright/test
+npx playwright install chromium
+```
+Expected: `@playwright/test` appears under `devDependencies` in `package.json`; Chromium downloads.
+
+- [ ] **Step 2: Write `playwright.config.ts`**
+
+```ts
+import { defineConfig, devices } from "@playwright/test";
+export default defineConfig({
+  testDir: "./e2e",
+  timeout: 30_000,
+  use: { baseURL: "http://localhost:1420", trace: "on-first-retry" },
+  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  webServer: {
+    command: "npm start",                 // ng serve on :1420 — confirm the exact script name in package.json
+    url: "http://localhost:1420",
+    reuseExistingServer: true,            // reuse a dev server already running
+    timeout: 120_000,
+  },
+});
+```
+
+- [ ] **Step 3: Write `e2e/settings-ai/mock-invoke.ts`**
+
+```ts
+import type { Page } from "@playwright/test";
+
+/** Install a Tauri IPC mock before app scripts run. `handlers` maps command name → result (sync value). */
+export async function mockTauri(page: Page, handlers: Record<string, (args: any) => unknown>): Promise<void> {
+  await page.addInitScript((h: Record<string, unknown>) => {
+    const names = Object.keys(h);
+    (window as any).__TAURI_INTERNALS__ = {
+      invoke: (cmd: string, args: any) => {
+        if (!names.includes(cmd)) return Promise.resolve(null);
+        // handlers are re-created page-side from their string bodies:
+        // eslint-disable-next-line no-new-func
+        const fn = new Function("args", "return (" + (h[cmd] as string) + ")(args);");
+        return Promise.resolve(fn(args));
+      },
+      // a no-op event stream so onStatus/onBrainDownload/etc. resolve to an unlisten fn
+      unregisterCallback: () => {},
+    };
+    (window as any).__TAURI_INTERNALS__.transformCallback = (cb: unknown) => cb;
+  }, Object.fromEntries(Object.entries(handlers).map(([k, v]) => [k, v.toString()])));
+}
+```
+*(Implementer: mirror the exact mock shape `scripts/screenshots/mock-tauri.js` uses — Murmur's `IpcService` calls `@tauri-apps/api` `invoke`/`listen`; match whatever internal surface that build expects. Adjust the `listen`/event mock to whatever the store subscribes to at settings load so no init subscription throws.)*
+
+- [ ] **Step 4: Write the smoke spec `e2e/settings-ai/harness.spec.ts`**
+
+```ts
+import { test, expect } from "@playwright/test";
+import { mockTauri } from "./mock-invoke";
+
+test("harness boots the settings page under a mocked Tauri invoke", async ({ page }) => {
+  await mockTauri(page, {
+    get_config: () => ({ providerId: "claude_code" }),
+    brain_posture: () => "cloud",
+    list_models: () => [],
+    brain_live_ram_ok: () => true,
+  });
+  await page.goto("/#/settings");
+  await expect(page.getByText("What Murmur uses")).toBeVisible();
+});
+```
+
+- [ ] **Step 5: Add the `test:e2e` script + run the smoke test**
+
+Add to `package.json` scripts: `"test:e2e": "playwright test"`. Then:
+Run: `npm run test:e2e -- e2e/settings-ai/harness.spec.ts`
+Expected: PASS (the settings page renders "What Murmur uses" under the mock). If the store throws on an unmocked command at load, add that command to the smoke mock and to `mock-invoke`'s defaults — this is the moment to make the mock complete enough for the settings page to boot.
+
+- [ ] **Step 6: `ng lint` + `ng build`** — still clean (the harness is test-only; `e2e/` is outside the ng build).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add package.json package-lock.json playwright.config.ts e2e/
+git commit --author="QueaT <kgm004a@gmail.com>" -m "test(e2e): stand up Playwright harness + Tauri invoke mock for settings"
+```
 
 ---
 
