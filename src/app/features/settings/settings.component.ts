@@ -15,6 +15,7 @@ import { SettingsAppearanceSectionComponent } from "./sections/settings-appearan
 import { SettingsGeneralSectionComponent } from "./sections/settings-general-section.component";
 import { SettingsTranscriptionSectionComponent } from "./sections/settings-transcription-section.component";
 import { SettingsAudioSectionComponent } from "./sections/settings-audio-section.component";
+import { SettingsStorageSectionComponent } from "./sections/settings-storage-section.component";
 import { SettingsNotesSectionComponent } from "./sections/settings-notes-section.component";
 import { SettingsAiSectionComponent } from "./sections/settings-ai-section.component";
 import { SettingsConnectorsSectionComponent } from "./sections/settings-connectors-section.component";
@@ -38,6 +39,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "general", label: "General", keywords: "vault folder subfolder whisper model path setup onboarding" },
   { id: "transcription", label: "Transcription", keywords: "language quality whisper model download on-device size accuracy" },
   { id: "audio", label: "Audio & Capture", keywords: "microphone input device system audio vad smart speech detection high fidelity masters diarization remote speakers echo cancellation aec voice trigger hands-free" },
+  { id: "storage", label: "Storage", keywords: "disk space usage recordings audio size limit cap gb delete old cleanup prune free up finder location" },
   { id: "notes", label: "Notes", keywords: "summary style brief detailed action language auto organize subfolders thematic enhance skeleton typed notes append" },
   // Stage-2 hub: Brain & AI + Providers collapsed into ONE section (keywords merged).
   { id: "ai", label: "AI & Models", keywords: "provider assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake anthropic ollama claude code gateway openai api key availability binary default consent revoke privacy egress" },
@@ -70,6 +72,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     SettingsGeneralSectionComponent,
     SettingsTranscriptionSectionComponent,
     SettingsAudioSectionComponent,
+    SettingsStorageSectionComponent,
     SettingsNotesSectionComponent,
     SettingsAiSectionComponent,
     SettingsConnectorsSectionComponent,
@@ -154,6 +157,9 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   @case ("audio") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="1.5" width="4" height="8" rx="2" /><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5" /></svg>
                   }
+                  @case ("storage") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.6" /><path d="M2.5 6.5h11M5 9.5h.01M5 11.3h3" /></svg>
+                  }
                   @case ("notes") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5l3 3v10H4z" /><path d="M9 1.5v3h3M5.8 8h4.4M5.8 10.6h4.4" /></svg>
                   }
@@ -223,6 +229,9 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
             }
             @case ("audio") {
               <app-settings-audio-section />
+            }
+            @case ("storage") {
+              <app-settings-storage-section />
             }
             @case ("notes") {
               <app-settings-notes-section />

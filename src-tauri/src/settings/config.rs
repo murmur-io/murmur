@@ -146,6 +146,16 @@ pub struct AppConfig {
     /// (the safe default) instead of resetting the whole config.
     #[serde(default)]
     pub post_aec_enabled: bool,
+    /// Recording-storage cap in GB (`None` = no cap). Drives auto-prune of the OLDEST
+    /// recordings' audio when exceeded; notes/transcripts are never touched.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `None`.
+    #[serde(default)]
+    pub audio_storage_limit_gb: Option<u32>,
+    /// When true AND a cap is set, delete the oldest recordings' audio after each
+    /// recording / on save to stay under the cap. OPT-IN, default OFF.
+    /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `false`.
+    #[serde(default)]
+    pub audio_auto_prune: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
     /// "large-v3". Default "small" (~466 MB) — a RAM-safe default: `large-v3` is ~3 GB and swaps
     /// on 8 GB Macs, and onboarding already preselects `small`. All sizes (incl. `large-v3`, best
@@ -381,6 +391,8 @@ impl Default for AppConfig {
             voiceprint_enabled: false,
             aec_enabled: false,
             post_aec_enabled: false,
+            audio_storage_limit_gb: None,
+            audio_auto_prune: false,
             model_size: "small".to_string(),
             voice_trigger: false,
             onboarded: false,
@@ -439,6 +451,8 @@ const K_DIARIZE_OTHERS: &str = "diarize_others";
 const K_VOICEPRINT_ENABLED: &str = "voiceprint_enabled";
 const K_AEC_ENABLED: &str = "aec_enabled";
 const K_POST_AEC_ENABLED: &str = "post_aec_enabled";
+const K_AUDIO_STORAGE_LIMIT_GB: &str = "audio_storage_limit_gb";
+const K_AUDIO_AUTO_PRUNE: &str = "audio_auto_prune";
 const K_MODEL_SIZE: &str = "model_size";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
@@ -654,6 +668,13 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_ROLE_LIVE_EFFORT)? {
             cfg.role_live_effort = v;
         }
+        cfg.audio_storage_limit_gb = db
+            .get_setting(K_AUDIO_STORAGE_LIMIT_GB)?
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        if let Some(v) = db.get_setting(K_AUDIO_AUTO_PRUNE)? {
+            cfg.audio_auto_prune = v == "true";
+        }
 
         Ok(cfg)
     }
@@ -794,6 +815,17 @@ impl AppConfig {
         db.set_setting(K_ROLE_LIVE_CONNECTION, &self.role_live_connection)?;
         db.set_setting(K_ROLE_LIVE_MODEL, &self.role_live_model)?;
         db.set_setting(K_ROLE_LIVE_EFFORT, &self.role_live_effort)?;
+        db.set_setting(
+            K_AUDIO_STORAGE_LIMIT_GB,
+            &self
+                .audio_storage_limit_gb
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        )?;
+        db.set_setting(
+            K_AUDIO_AUTO_PRUNE,
+            if self.audio_auto_prune { "true" } else { "false" },
+        )?;
         Ok(())
     }
 
@@ -1566,5 +1598,29 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.gateway_base_url, "", "serde default must be empty string");
         assert_eq!(cfg.gateway_model, "", "serde default must be empty string");
+    }
+
+    #[test]
+    fn audio_storage_settings_round_trip() {
+        let p = crate::storage::db::unique_temp_path("murmur-cfg-storage", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let db = Db::open_with_key(&p, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+
+        // Defaults: no cap, auto-prune OFF (fail-safe).
+        let def = AppConfig::default();
+        assert_eq!(def.audio_storage_limit_gb, None);
+        assert!(!def.audio_auto_prune);
+
+        let cfg = AppConfig {
+            audio_storage_limit_gb: Some(2),
+            audio_auto_prune: true,
+            ..AppConfig::default()
+        };
+        cfg.save(&db).unwrap();
+
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.audio_storage_limit_gb, Some(2));
+        assert!(loaded.audio_auto_prune);
+        let _ = std::fs::remove_file(&p);
     }
 }

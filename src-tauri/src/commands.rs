@@ -128,6 +128,12 @@ pub struct AppConfigDto {
     pub aec_enabled: bool,
     #[serde(default = "default_true")]
     pub post_aec_enabled: bool,
+    /// Recording-storage cap in GB (`None` = no cap). Mirrors `AppConfig::audio_storage_limit_gb`.
+    #[serde(default)]
+    pub audio_storage_limit_gb: Option<u32>,
+    /// Auto-delete oldest recordings' audio over the cap. Opt-in, default false.
+    #[serde(default)]
+    pub audio_auto_prune: bool,
     pub model_size: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
@@ -3317,6 +3323,30 @@ pub fn save_config(
     config: AppConfigDto,
 ) -> Result<(), AppError> {
     save_config_inner(state.inner(), config)?;
+    // Enforce the cap immediately when a save leaves auto-prune ON with a cap set (e.g. the
+    // user just lowered the limit). Best-effort; the config lock is already released. Runs
+    // BEFORE `restart_voice_listener` (which consumes `app`) so `app.emit` stays valid.
+    let (limit_gb, auto) = match state.config.lock() {
+        Ok(c) => (c.audio_storage_limit_gb, c.audio_auto_prune),
+        Err(_) => (None, false),
+    };
+    if let Ok(dir) = crate::pipeline::audio_dir() {
+        // Hold the seal lifecycle guard across the prune (config lock already released above, so
+        // the lock order is lifecycle ⊃ db, never config held while holding lifecycle) so the
+        // prune can never interleave with a folder seal.
+        let _lifecycle = lifecycle_guard(state.inner());
+        if let Ok(s) = crate::storage::usage::maybe_prune(&state.db, &dir, limit_gb, auto, None) {
+            if s.freed_bytes > 0 {
+                let _ = app.emit(
+                    crate::events::EVENT_STORAGE_PRUNED,
+                    crate::events::StoragePrunedPayload {
+                        freed_bytes: s.freed_bytes,
+                        pruned_count: s.pruned_count,
+                    },
+                );
+            }
+        }
+    }
     // Reconcile the voice-trigger listener with the new config (AppHandle-dependent; runs after
     // the config lock is released by `save_config_inner`).
     restart_voice_listener(app);
@@ -3417,6 +3447,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         voiceprint_enabled: c.voiceprint_enabled,
         aec_enabled: c.aec_enabled,
         post_aec_enabled: c.post_aec_enabled,
+        audio_storage_limit_gb: c.audio_storage_limit_gb,
+        audio_auto_prune: c.audio_auto_prune,
         model_size: c.model_size.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
@@ -3484,6 +3516,11 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         voiceprint_enabled: d.voiceprint_enabled,
         aec_enabled: d.aec_enabled,
         post_aec_enabled: d.post_aec_enabled,
+        // Recording-storage cap + auto-prune ARE settable from the DTO (the Storage UI owns them).
+        // Plain settable fields — an omitted cap deserializes to `None`, auto-prune to `false`
+        // (`#[serde(default)]`), so a partial/older save can never silently enable pruning.
+        audio_storage_limit_gb: d.audio_storage_limit_gb,
+        audio_auto_prune: d.audio_auto_prune,
         model_size: if d.model_size.trim().is_empty() {
             // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
             // fall back to the multilingual large-v3 default (best Polish quality), NOT a
@@ -3603,6 +3640,103 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
 #[tauri::command]
 pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppError> {
     Ok(crate::audio::list_input_devices())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReportDto {
+    pub audio_dir: String,
+    pub used_bytes: u64,
+    pub limit_bytes: Option<u64>,
+    pub playback_bytes: u64,
+    pub masters_bytes: u64,
+    pub sealed_bytes: u64,
+    pub recording_count: u64,
+    pub auto_prune: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneSummaryDto {
+    pub freed_bytes: u64,
+    pub pruned_count: u64,
+    pub masters_deleted: u64,
+}
+
+/// Recording-storage usage report: on-disk audio path, byte totals bucketed by category,
+/// recording count, and the current cap + auto-prune flag. Sizes only — no content.
+#[tauri::command]
+pub fn get_storage_report(state: State<'_, AppState>) -> Result<StorageReportDto, AppError> {
+    let (limit_bytes, auto_prune) = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        (
+            c.audio_storage_limit_gb
+                .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB),
+            c.audio_auto_prune,
+        )
+    };
+    let dir = crate::pipeline::audio_dir()?;
+    let u = crate::storage::usage::scan_audio_usage(&dir)?;
+    Ok(StorageReportDto {
+        audio_dir: dir.to_string_lossy().into_owned(),
+        used_bytes: u.used_bytes,
+        limit_bytes,
+        playback_bytes: u.playback_bytes,
+        masters_bytes: u.masters_bytes,
+        sealed_bytes: u.sealed_bytes,
+        recording_count: u.recording_count,
+        auto_prune,
+    })
+}
+
+/// Manual "Free up space": prune oldest recordings to the cap NOW (works even when auto-prune
+/// is off). Requires a cap — with none set it is an inert zero summary (the FE disables the
+/// button). Never touches notes or locked audio.
+#[tauri::command]
+pub fn free_up_space(state: State<'_, AppState>) -> Result<PruneSummaryDto, AppError> {
+    let limit_bytes = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.audio_storage_limit_gb
+            // `Some(0)` is not a "delete everything" cap → no cap (mirrors `AppConfig::load`).
+            .filter(|g| *g > 0)
+            .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB)
+    };
+    let Some(limit) = limit_bytes else {
+        return Ok(PruneSummaryDto {
+            freed_bytes: 0,
+            pruned_count: 0,
+            masters_deleted: 0,
+        });
+    };
+    let dir = crate::pipeline::audio_dir()?;
+    // Hold the seal lifecycle guard across the prune so it can never interleave with a folder
+    // seal (`lock_folder`) — the same guard every other multi-step audio-path mutator holds.
+    // Acquired AFTER the config lock is released (single lock order: lifecycle ⊃ db, never
+    // config held while holding lifecycle).
+    let _lifecycle = lifecycle_guard(state.inner());
+    let s = crate::storage::usage::prune_to_limit(&state.db, &dir, limit, None)?;
+    Ok(PruneSummaryDto {
+        freed_bytes: s.freed_bytes,
+        pruned_count: s.pruned_count,
+        masters_deleted: s.masters_deleted,
+    })
+}
+
+/// Reveal the recordings folder in Finder (macOS `open`). No content read.
+#[tauri::command]
+pub fn reveal_audio_dir() -> Result<(), AppError> {
+    let dir = crate::pipeline::audio_dir()?;
+    std::process::Command::new("open")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| AppError::Storage(format!("reveal audio dir: {e}")))?;
+    Ok(())
 }
 
 /// Whether the CURRENT default audio output is the built-in speakers (echo risk while
@@ -9528,5 +9662,31 @@ mod gateway_key_tests {
             crate::summarize::gateway::validate_gateway_url("http://127.0.0.1:4000/v1").is_ok(),
             "loopback http gateway URL must be accepted"
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_cmd_tests {
+    use super::*;
+
+    #[test]
+    fn free_up_space_is_noop_without_a_cap() {
+        let p = crate::storage::db::unique_temp_path("murmur-cmd-storage", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let state = AppState::init_at(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        // No limit set (default None) → free_up_space must be an inert zero summary.
+        let s = crate::storage::usage::prune_to_limit(
+            &state.db,
+            &crate::pipeline::audio_dir().unwrap(),
+            u64::MAX,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.freed_bytes, 0);
+        let _ = std::fs::remove_file(&p);
     }
 }

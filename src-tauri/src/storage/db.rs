@@ -29,6 +29,17 @@ pub struct LockedMeetingAudio {
     pub sys_master_path: Option<String>,
 }
 
+/// One meeting eligible for storage prune: NOT in a locked folder, with its three audio paths.
+/// Ordered oldest-first by [`Db::prunable_audio_candidates`]. Any column may be `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunableAudio {
+    pub meeting_id: String,
+    pub started_at: String,
+    pub audio_path: Option<String>,
+    pub mic_master_path: Option<String>,
+    pub sys_master_path: Option<String>,
+}
+
 impl MeetingStatus {
     /// Stable SCREAMING_SNAKE_CASE string used as the on-disk `status` column value.
     /// Kept in sync with the serde `rename_all = "SCREAMING_SNAKE_CASE"` on the enum.
@@ -3464,6 +3475,40 @@ impl Db {
         .map(Option::flatten)
     }
 
+    /// Meetings whose audio may be auto-pruned: every meeting NOT in a locked folder
+    /// (a meeting's folder = its `notes.folder_id`), OLDEST FIRST. A locked folder's audio
+    /// is exempt — it is the sealed `.enc` at rest and must never be deleted by prune.
+    pub fn prunable_audio_candidates(&self) -> Result<Vec<PrunableAudio>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, started_at, audio_path, mic_master_path, sys_master_path \
+                   FROM meetings \
+                  WHERE id NOT IN ( \
+                      SELECT DISTINCT meeting_id FROM notes \
+                       WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1) \
+                  ) \
+                  ORDER BY started_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PrunableAudio {
+                    meeting_id: r.get(0)?,
+                    started_at: r.get(1)?,
+                    audio_path: r.get(2)?,
+                    mic_master_path: r.get(3)?,
+                    sys_master_path: r.get(4)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// The RAW segment rows of a meeting (idx, plaintext text, sealed `text_blob`), regardless of
     /// seal state — for the seal/unseal lifecycle (NOT a user-facing read; that is `get_segments`).
     pub fn raw_segments(&self, meeting_id: &str) -> Result<Vec<RawSegment>> {
@@ -3625,6 +3670,44 @@ impl Db {
         conn.execute(
             "UPDATE meetings SET sys_master_path = ?2 WHERE id = ?1",
             rusqlite::params![meeting_id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Race-safe clear of `audio_path`: NULL it ONLY if it still equals `expected` (the plaintext
+    /// path the prune snapshotted). If a concurrent seal re-pointed it to `.enc` in between, the
+    /// `AND audio_path = ?2` fails to match → no-op → the freshly-sealed pointer SURVIVES. Used by
+    /// the storage prune, which snapshots candidates OUTSIDE the seal lifecycle lock (TOCTOU-safe).
+    pub fn clear_meeting_audio_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET audio_path = NULL WHERE id = ?1 AND audio_path = ?2",
+            rusqlite::params![meeting_id, expected],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Race-safe clear of `mic_master_path`: NULL it ONLY if it still equals `expected`. Mirrors
+    /// [`Db::clear_meeting_audio_path_if`] — a concurrent seal that re-pointed it survives.
+    pub fn clear_meeting_mic_master_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET mic_master_path = NULL WHERE id = ?1 AND mic_master_path = ?2",
+            rusqlite::params![meeting_id, expected],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Race-safe clear of `sys_master_path`: NULL it ONLY if it still equals `expected`. Mirrors
+    /// [`Db::clear_meeting_audio_path_if`] — a concurrent seal that re-pointed it survives.
+    pub fn clear_meeting_sys_master_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET sys_master_path = NULL WHERE id = ?1 AND sys_master_path = ?2",
+            rusqlite::params![meeting_id, expected],
         )
         .map_err(map_err)?;
         Ok(())
@@ -7741,6 +7824,97 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn prunable_candidates_are_oldest_first_and_exclude_locked_folders() {
+        const GOOD_KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let p = unique_temp_path("murmur-prunable", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
+
+        // Two meetings in an OPEN vault-root (folder_id NULL), one in a LOCKED folder.
+        for (id, at) in [
+            ("old", "2026-01-01T00:00:00Z"),
+            ("new", "2026-06-01T00:00:00Z"),
+            ("secret", "2026-03-01T00:00:00Z"),
+        ] {
+            db.insert_meeting(&crate::storage::Meeting {
+                id: id.into(),
+                started_at: at.into(),
+                ended_at: None,
+                title: Some("t".into()),
+                duration_s: 1,
+                audio_path: Some(format!("/a/{id}.wav")),
+                status: crate::storage::MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+            db.upsert_note(&crate::storage::NoteRecord {
+                meeting_id: id.into(),
+                provider_id: "claude_code".into(),
+                markdown: "m".into(),
+                created_at: at.into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        }
+        db.insert_folder(&crate::storage::Folder {
+            id: "f".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.set_note_folder("secret", Some("f")).unwrap();
+
+        let cands = db.prunable_audio_candidates().unwrap();
+        let ids: Vec<&str> = cands.iter().map(|c| c.meeting_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["old", "new"],
+            "locked 'secret' excluded; oldest-first order"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Race-safety regression (TOCTOU: prune snapshots a plaintext path, a concurrent seal
+    /// re-points the column to `.enc`, prune must NOT null the sealed pointer). The conditional
+    /// clear only nulls when the column still holds the snapshotted plaintext path.
+    #[test]
+    fn clear_meeting_audio_path_if_only_nulls_a_matching_path() {
+        let db = mem_db();
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "M".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: None,
+            title: Some("t".into()),
+            duration_s: 1,
+            audio_path: Some("/d/M.wav".into()),
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+
+        // Sealed-in-between case: the column was re-pointed to `/d/M.wav.enc` by a concurrent
+        // seal; the prune's stale snapshot `/d/M.wav.enc` != current would wrongly match the OLD
+        // unconditional NULL. The conditional clear (expected != current plaintext) must NO-OP.
+        db.clear_meeting_audio_path_if("M", "/d/M.wav.enc").unwrap();
+        assert_eq!(
+            db.get_meeting("M").unwrap().unwrap().audio_path,
+            Some("/d/M.wav".to_string()),
+            "mismatched expected path must NOT null the column (sealed-in-between case)"
+        );
+
+        // Matching snapshot (no concurrent seal) → clears.
+        db.clear_meeting_audio_path_if("M", "/d/M.wav").unwrap();
+        assert_eq!(db.get_meeting("M").unwrap().unwrap().audio_path, None);
     }
 }
 

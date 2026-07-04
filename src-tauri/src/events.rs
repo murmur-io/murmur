@@ -235,3 +235,15 @@ pub struct EchoSuppressedPayload {
     pub suppressed: usize,
     pub meeting_id: String,
 }
+
+/// Emitted after an AUTO-prune removed ≥1 old recording's audio to stay under the storage cap.
+/// Counts/bytes ONLY — NO PII. The FE refreshes the usage bar + shows a "freed space" toast.
+pub const EVENT_STORAGE_PRUNED: &str = "murmur://storage-pruned";
+
+/// Payload for [`EVENT_STORAGE_PRUNED`]. Bytes + count only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePrunedPayload {
+    pub freed_bytes: u64,
+    pub pruned_count: u64,
+}
