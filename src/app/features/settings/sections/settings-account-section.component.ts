@@ -9,7 +9,6 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
 import type {
   AccountStatus,
@@ -46,7 +45,7 @@ interface FolderOption {
   selector: "app-settings-account-section",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, SharingAuthFlowComponent],
+  imports: [SharingAuthFlowComponent],
   template: `
     <div class="section-stack">
       <div class="card account-card">
@@ -92,37 +91,6 @@ interface FolderOption {
               reaches the server.
             </p>
           </div>
-        </div>
-
-        <!-- (1) Sharing server base URL -->
-        <div class="account-section">
-          <span class="account-section-label text-muted">Sharing server</span>
-          <p class="text-secondary account-note">
-            The server that stores the encrypted note. It can't read your notes —
-            only ciphertext and wrapped keys leave this Mac.
-          </p>
-          <div class="server-row">
-            <input
-              type="url"
-              class="text-input server-input"
-              [formControl]="serverControl"
-              placeholder="https://share.example.com"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Sharing server base URL"
-            />
-            <button
-              type="button"
-              class="btn"
-              (click)="saveServer()"
-              [disabled]="savingServer()"
-            >
-              {{ savingServer() ? "Saving…" : "Save server" }}
-            </button>
-          </div>
-          @if (serverError(); as serr) {
-            <p class="text-danger account-note">{{ serr }}</p>
-          }
         </div>
 
         @if (status(); as st) {
@@ -463,19 +431,6 @@ interface FolderOption {
         box-shadow: 0 0 0 3px var(--accent-soft);
       }
 
-      .server-row {
-        display: flex;
-        gap: var(--space-2);
-        flex-wrap: wrap;
-      }
-      .server-input {
-        flex: 1 1 18rem;
-        min-width: 0;
-      }
-      .server-row .btn {
-        flex: none;
-      }
-
       .account-actions {
         display: flex;
         align-items: center;
@@ -716,11 +671,6 @@ export class SettingsAccountSectionComponent {
     viewChild<ElementRef<HTMLElement>>("flowPanel");
 
   // ── Server base URL ──────────────────────────────────────────────────────
-  readonly serverControl = new FormControl("", { nonNullable: true });
-  private readonly _savingServer = signal(false);
-  readonly savingServer = this._savingServer.asReadonly();
-  private readonly _serverError = signal<string | null>(null);
-  readonly serverError = this._serverError.asReadonly();
 
   // ── Incoming shares (M5-CLIENT inbox) ────────────────────────────────────
   private readonly _inbox = signal<ShareInboxItem[]>([]);
@@ -781,15 +731,6 @@ export class SettingsAccountSectionComponent {
     } catch (e) {
       this._accountError.set(String(e));
     }
-    try {
-      const cfg = await this.ipc.getConfig();
-      // Only seed the input if the user hasn't typed something unsaved.
-      if (!this.serverControl.dirty) {
-        this.serverControl.setValue(cfg.shareBaseUrl ?? "");
-      }
-    } catch {
-      // Leave the input empty on a config read failure.
-    }
     // Load the incoming-share inbox only when it's usable (signed in + a server).
     if (st?.loggedIn && st.serverConfigured) {
       await this.loadInbox();
@@ -844,25 +785,6 @@ export class SettingsAccountSectionComponent {
     await this.reload();
   }
 
-  /** Persist the sharing-server base URL through the normal config round-trip. */
-  async saveServer(): Promise<void> {
-    if (this._savingServer()) return;
-    this._serverError.set(null);
-    this._savingServer.set(true);
-    try {
-      const cfg = await this.ipc.getConfig();
-      await this.ipc.saveConfig({
-        ...cfg,
-        shareBaseUrl: this.serverControl.value.trim(),
-      });
-      this.serverControl.markAsPristine();
-      await this.reload();
-    } catch (e) {
-      this._serverError.set(String(e));
-    } finally {
-      this._savingServer.set(false);
-    }
-  }
 
   /**
    * One-tap Touch ID unlock for sharing: presents a single biometric sheet,
