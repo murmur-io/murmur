@@ -16,6 +16,7 @@ import { MeetingConversationStore } from "../../core/meeting-conversation.store"
 import { AiOrbComponent } from "./ai-orb.component";
 import { NoteItemComponent } from "./note-item.component";
 import { ProactiveHintCardComponent } from "./proactive-hint-card.component";
+import { WhisperCardComponent } from "./whisper-card.component";
 
 /** The inline mention marker that turns a composer line into a `@brain` thread. */
 const BRAIN_MARKER = "@brain";
@@ -75,7 +76,12 @@ export function parseBrainLine(text: string): string | null {
   selector: "app-meeting-conversation",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AiOrbComponent, NoteItemComponent, ProactiveHintCardComponent],
+  imports: [
+    AiOrbComponent,
+    NoteItemComponent,
+    ProactiveHintCardComponent,
+    WhisperCardComponent,
+  ],
   template: `
     <div class="card surface" role="group" aria-label="In-meeting notes">
       <div class="surface-head">
@@ -100,12 +106,59 @@ export function parseBrainLine(text: string): string | null {
         </span>
       </div>
 
-      <!-- Proactive recall card — PINNED above the notes flow (not inside the
-           scroller, so it can't scroll away mid-meeting). At most ONE: the store
-           keeps only the newest; hintsEnabled is the FE half of the global mute
-           (the backend silences the event source too — belt and braces). -->
-      @if (hintsEnabled() && store.hint(); as h) {
-        <app-proactive-hint-card [hint]="h" (dismissed)="store.dismissHint()" />
+      <!-- Reactions rail — PINNED above the notes flow (not inside the scroller,
+           so cards can't scroll away mid-meeting). Two lanes: the proactive RECALL
+           hint (at most one; hintsEnabled is the FE half of its global mute) and
+           the realtime CONTRADICTION whisper cards. Both are PURGED on any lock
+           transition (Lock all / screen-share auto-relock / seal) by the store so
+           content that already crossed to the FE never outlives the gate. -->
+      @if (
+        (hintsEnabled() && store.hint()) ||
+        store.whisperCards().length > 0 ||
+        store.showShadowCalibration()
+      ) {
+        <div class="reactions-rail">
+          @if (hintsEnabled() && store.hint(); as h) {
+            <app-proactive-hint-card
+              [hint]="h"
+              (dismissed)="store.dismissHint()"
+            />
+          }
+          @for (w of store.whisperCards(); track w.id) {
+            <app-whisper-card
+              [card]="w"
+              (dismissed)="store.dismissWhisper(w.id)"
+            />
+          }
+
+          <!-- Shadow-mode calibration — offer to switch on contradiction cards
+               once the user's OWN recording would have flagged enough of them. -->
+          @if (store.showShadowCalibration()) {
+            <div class="shadow-calibration" role="status">
+              <span class="shadow-copy">
+                The brain would have flagged {{ store.shadowCount() }}
+                {{ store.shadowCount() === 1 ? "contradiction" : "contradictions" }}
+                in this session — show them live?
+              </span>
+              <div class="shadow-actions">
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                  (click)="store.enableContradictionCards()"
+                >
+                  Show live
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  (click)="store.dismissShadowCalibration()"
+                >
+                  Not now
+                </button>
+              </div>
+            </div>
+          }
+        </div>
       }
 
       <div class="flow" #flow [class.is-enhancing]="enhancing()">
@@ -257,6 +310,44 @@ export function parseBrainLine(text: string): string | null {
       }
 
       /* ── The scrollable notes flow (oldest → newest) ─────────────────────── */
+      /* Reactions rail — the recall + contradiction lanes stacked above the flow. */
+      .reactions-rail {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        flex: none;
+      }
+      /* Shadow-mode calibration — an in-flow accent prompt (not a floating overlay). */
+      .shadow-calibration {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+        flex: none;
+        flex-wrap: wrap;
+        padding: var(--space-2) var(--space-3);
+        border: 1px solid var(--accent-ring);
+        border-radius: var(--radius-md);
+        background: var(--accent-soft);
+      }
+      .shadow-copy {
+        color: var(--text-primary);
+        font-size: 0.85rem;
+        line-height: 1.45;
+        flex: 1 1 200px;
+        min-width: 0;
+      }
+      .shadow-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        flex: none;
+      }
+      .shadow-actions .btn-sm {
+        height: 30px;
+        padding: 0 var(--space-3);
+        font-size: 0.8rem;
+      }
       .flow {
         display: flex;
         flex-direction: column;

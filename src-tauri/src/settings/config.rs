@@ -230,7 +230,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub brain_model_path: Option<String>,
     /// Phase B (model registry) — the SELECTED on-device brain model id (from `reason::BRAIN_MODELS`,
-    /// e.g. `bielik-11b-v3` / `qwen3-14b` / `qwen2.5-3b`). `None` (the default) means no model is
+    /// e.g. `qwen3-1.7b` / `qwen3-4b-instruct-2507` / `bielik-11b-v3`). `None` (the default) means no model is
     /// chosen ⇒ the resolver falls back to the `StubReasoner`. Set via the `select_brain_model`
     /// command. Consulted at runtime when `brain_backend == Local`. `#[serde(default)]` ⇒ a config
     /// persisted before this field existed loads as `None`.
@@ -242,6 +242,28 @@ pub struct AppConfig {
     /// existed loads as `Cloud`. See [`BrainBackend`].
     #[serde(default)]
     pub brain_backend: BrainBackend,
+    /// Murmur Brain LIVE master switch (spec §2.2). When ON, the on-device LIGHT engine powers
+    /// Realtime Reactions + local fact extraction, and the enablement flow downloads the light model.
+    /// OPT-IN, default OFF. DISTINCT from `realtime_reactions` (the wake-word voice-action gate) — this
+    /// gates the model-driven whisper layer and re-routes fact extraction fully on-device. When OFF the
+    /// brain behaves EXACTLY as today. `#[serde(default)]` ⇒ a pre-existing config loads as `false`.
+    #[serde(default)]
+    pub brain_live: bool,
+    /// The selected LIGHT-class on-device model id (realtime reactions / fact extraction). `None`
+    /// (the default) ⇒ the registry's default light model (`reason::default_model_for_class`). Resolved
+    /// LOCAL-or-stub, NEVER cloud (P1 invariant). `#[serde(default)]`.
+    #[serde(default)]
+    pub brain_light_model_id: Option<String>,
+    /// The selected HEAVY-class on-device model id (local Notes/Ask + post-call analysis). `None`
+    /// (the default) ⇒ the registry's default heavy model. `#[serde(default)]`.
+    #[serde(default)]
+    pub brain_heavy_model_id: Option<String>,
+    /// Realtime Reactions CONTRADICTION sub-toggle (spec §4.2). Default OFF: contradiction detection
+    /// runs in SHADOW mode (counts would-have-fired, emits nothing), so precision is calibrated on the
+    /// user's OWN meetings before the ⚠ cards are shown. Flipped ON per-user once the shadow bar clears.
+    /// Only meaningful while `brain_live` is on. `#[serde(default)]` ⇒ pre-existing configs load OFF.
+    #[serde(default)]
+    pub brain_contradiction_cards: bool,
     /// Phase E (Flow B) — the in-meeting VOICE ACTION DISPATCH master gate. When ON, a wake-word
     /// hit in a live caption ("Claudku, zrób research o X") DISPATCHES the parsed action against the
     /// gated vault (research/recall/reminder/note) and emits a live result. OPT-IN, default OFF
@@ -409,6 +431,10 @@ impl Default for AppConfig {
             brain_model_path: None,
             brain_model_id: None,
             brain_backend: BrainBackend::default(),
+            brain_live: false,
+            brain_light_model_id: None,
+            brain_heavy_model_id: None,
+            brain_contradiction_cards: false,
             realtime_reactions: false,
             web_search_enabled: false,
             web_search_consented: false,
@@ -470,6 +496,10 @@ const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
 const K_BRAIN_BACKEND: &str = "brain_backend";
 const K_REALTIME_REACTIONS: &str = "realtime_reactions";
+const K_BRAIN_LIVE: &str = "brain_live";
+const K_BRAIN_LIGHT_MODEL_ID: &str = "brain_light_model_id";
+const K_BRAIN_HEAVY_MODEL_ID: &str = "brain_heavy_model_id";
+const K_BRAIN_CONTRADICTION_CARDS: &str = "brain_contradiction_cards";
 const K_WEB_SEARCH_ENABLED: &str = "web_search_enabled";
 const K_WEB_SEARCH_CONSENTED: &str = "web_search_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
@@ -612,6 +642,14 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_REALTIME_REACTIONS)? {
             cfg.realtime_reactions = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_BRAIN_LIVE)? {
+            cfg.brain_live = v == "true";
+        }
+        cfg.brain_light_model_id = opt(db.get_setting(K_BRAIN_LIGHT_MODEL_ID)?);
+        cfg.brain_heavy_model_id = opt(db.get_setting(K_BRAIN_HEAVY_MODEL_ID)?);
+        if let Some(v) = db.get_setting(K_BRAIN_CONTRADICTION_CARDS)? {
+            cfg.brain_contradiction_cards = v == "true";
         }
         if let Some(v) = db.get_setting(K_WEB_SEARCH_ENABLED)? {
             cfg.web_search_enabled = v == "true";
@@ -779,6 +817,19 @@ impl AppConfig {
         db.set_setting(
             K_REALTIME_REACTIONS,
             if self.realtime_reactions { "true" } else { "false" },
+        )?;
+        db.set_setting(K_BRAIN_LIVE, if self.brain_live { "true" } else { "false" })?;
+        db.set_setting(
+            K_BRAIN_LIGHT_MODEL_ID,
+            self.brain_light_model_id.as_deref().unwrap_or(""),
+        )?;
+        db.set_setting(
+            K_BRAIN_HEAVY_MODEL_ID,
+            self.brain_heavy_model_id.as_deref().unwrap_or(""),
+        )?;
+        db.set_setting(
+            K_BRAIN_CONTRADICTION_CARDS,
+            if self.brain_contradiction_cards { "true" } else { "false" },
         )?;
         db.set_setting(
             K_WEB_SEARCH_ENABLED,

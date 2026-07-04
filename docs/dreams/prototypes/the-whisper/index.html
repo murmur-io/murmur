@@ -1,0 +1,387 @@
+<!doctype html>
+<!--
+  DREAM PROTOTYPE — "The Whisper" (vibe prototype, fake data, NOT production).
+  A live private co-pilot: while the far side talks (bot-free ScreenCaptureKit
+  capture), Murmur's on-device brain quietly raises cards ONLY you can see —
+  contradictions, recalls, context — cross-referenced against your private
+  cross-meeting memory, in real time. The other party never knows.
+  Everything here is faked in vanilla JS. Optimised for FEELING, not correctness.
+  Tokens mirror src/styles.css so it feels like Murmur over the "Sonora" world.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>The Whisper — Murmur dream</title>
+<style>
+  :root{
+    --surface-base:#07070b; --surface-raised:rgba(255,255,255,.045);
+    --surface-overlay:#1b1b24; --surface-solid:#111118;
+    --surface-hover:rgba(255,255,255,.06);
+    --text-primary:#f6f6fa; --text-secondary:#a6a6b6; --text-muted:#6c6c7d;
+    --accent:#6e76ff; --accent-hover:#8a90ff; --accent-soft:rgba(110,118,255,.16);
+    --accent-ring:rgba(110,118,255,.5);
+    --accent-gradient:linear-gradient(135deg,#6e76ff 0%,#9d7bff 100%);
+    --live:#ff7a5c; --live-soft:rgba(255,122,92,.16);
+    --live-gradient:linear-gradient(135deg,#ff7a5c 0%,#ff5e9c 100%);
+    --border:rgba(255,255,255,.09); --border-strong:rgba(255,255,255,.16);
+    --border-subtle:rgba(255,255,255,.055);
+    --success:#4ade80; --success-soft:rgba(74,222,128,.15);
+    --warning:#f5b14c; --warning-soft:rgba(245,177,76,.14);
+    --danger:#ff6b6b;
+    --radius-sm:9px; --radius-md:13px; --radius-lg:18px; --radius-xl:24px; --radius-pill:999px;
+    --shadow-md:0 16px 40px rgba(0,0,0,.42); --shadow-lg:0 28px 70px rgba(0,0,0,.55);
+    --transition:200ms cubic-bezier(.32,.72,0,1);
+    --ease-spring:cubic-bezier(.34,1.56,.64,1);
+    --font-sans:"Hanken Grotesk",-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    --font-mono:"JetBrains Mono","SF Mono",ui-monospace,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    font-family:var(--font-sans); color:var(--text-primary);
+    background:var(--surface-base); overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* atmospheric aurora field */
+  body::before{
+    content:""; position:fixed; inset:-20% -10% auto -10%; height:70%; z-index:0;
+    background:
+      radial-gradient(60% 55% at 20% 0%, rgba(110,118,255,.22), transparent 60%),
+      radial-gradient(50% 50% at 88% 8%, rgba(255,94,156,.14), transparent 60%),
+      radial-gradient(40% 40% at 60% 30%, rgba(157,123,255,.12), transparent 60%);
+    filter:blur(30px); pointer-events:none;
+  }
+  .app{position:relative; z-index:1; height:100vh; display:flex; flex-direction:column}
+
+  /* ── top recording bar ─────────────────────────────────────────── */
+  .topbar{
+    display:flex; align-items:center; gap:var(--space-4,16px);
+    padding:14px 22px; border-bottom:1px solid var(--border-subtle);
+    background:linear-gradient(180deg,rgba(255,255,255,.03),transparent);
+  }
+  .wordmark{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:-.02em}
+  .wordmark .dot{width:9px;height:9px;border-radius:50%;background:var(--accent-gradient);box-shadow:0 0 12px var(--accent)}
+  .live-pill{
+    display:flex;align-items:center;gap:10px;margin-left:6px;
+    padding:7px 14px 7px 12px;border-radius:var(--radius-pill);
+    background:var(--live-soft);border:1px solid rgba(255,122,92,.35);
+    color:#ffd7cb;font-size:13px;font-weight:600;
+  }
+  .rec-dot{width:9px;height:9px;border-radius:50%;background:var(--live);animation:pulse 1.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.7)}}
+  .eq{display:flex;align-items:flex-end;gap:2px;height:15px}
+  .eq i{width:2.5px;background:var(--live);border-radius:2px;animation:eq 1s infinite ease-in-out}
+  .eq i:nth-child(2){animation-delay:.15s}.eq i:nth-child(3){animation-delay:.3s}
+  .eq i:nth-child(4){animation-delay:.45s}.eq i:nth-child(5){animation-delay:.1s}
+  @keyframes eq{0%,100%{height:4px}50%{height:15px}}
+  .timer{font-family:var(--font-mono);font-size:13px;color:var(--text-secondary);letter-spacing:.02em}
+  .spacer{flex:1}
+  .who{display:flex;align-items:center;gap:9px;color:var(--text-secondary);font-size:13px}
+  .avatar{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;color:#0c0c12;background:linear-gradient(135deg,#ffd08a,#ff8e74)}
+  .peek-btn{
+    display:flex;align-items:center;gap:8px;padding:8px 13px;border-radius:var(--radius-pill);
+    background:var(--surface-raised);border:1px solid var(--border);color:var(--text-secondary);
+    font-size:12.5px;font-weight:600;cursor:pointer;transition:var(--transition);font-family:inherit;
+  }
+  .peek-btn:hover{background:var(--surface-hover);color:var(--text-primary)}
+
+  /* ── body: transcript | co-pilot ───────────────────────────────── */
+  .stage{display:grid;grid-template-columns:1fr 400px;gap:0;flex:1;min-height:0}
+  .transcript{padding:26px 30px;overflow:hidden;display:flex;flex-direction:column;gap:14px;position:relative}
+  .transcript::after{content:"";position:absolute;left:0;right:0;bottom:0;height:80px;background:linear-gradient(transparent,var(--surface-base));pointer-events:none}
+  .seg{display:flex;gap:13px;max-width:640px;opacity:0;transform:translateY(10px);animation:rise .5s var(--ease-spring) forwards}
+  @keyframes rise{to{opacity:1;transform:none}}
+  .seg .sp{flex-shrink:0;width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:11px;font-weight:700}
+  .seg.me{flex-direction:row-reverse;margin-left:auto}
+  .seg.me .sp{color:#0c0c12;background:linear-gradient(135deg,#8a90ff,#9d7bff)}
+  .seg.them .sp{color:#0c0c12;background:linear-gradient(135deg,#ffd08a,#ff8e74)}
+  .bubble{padding:11px 15px;border-radius:var(--radius-lg);font-size:14.5px;line-height:1.5;color:var(--text-primary)}
+  .seg.them .bubble{background:var(--surface-raised);border:1px solid var(--border);border-top-left-radius:5px}
+  .seg.me .bubble{background:var(--accent-soft);border:1px solid rgba(110,118,255,.28);border-top-right-radius:5px}
+  .seg .name{font-size:11px;color:var(--text-muted);margin:0 3px 4px;font-weight:600}
+  .seg.me .name{text-align:right}
+  .flag{outline:2px solid rgba(245,177,76,.55);outline-offset:2px;border-radius:var(--radius-lg);animation:flagpulse 1.6s ease-out}
+  @keyframes flagpulse{0%{outline-color:rgba(245,177,76,0)}30%{outline-color:rgba(245,177,76,.8)}100%{outline-color:rgba(245,177,76,.35)}}
+
+  /* co-pilot rail */
+  .copilot{
+    border-left:1px solid var(--border);background:linear-gradient(180deg,rgba(110,118,255,.05),rgba(7,7,11,.2));
+    display:flex;flex-direction:column;min-height:0;
+  }
+  .cop-head{padding:18px 20px 12px;border-bottom:1px solid var(--border-subtle)}
+  .cop-title{display:flex;align-items:center;gap:9px;font-weight:700;font-size:14px;letter-spacing:-.01em}
+  .brainmark{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;background:var(--accent-soft);border:1px solid rgba(110,118,255,.3);font-size:12px}
+  .cop-sub{margin-top:6px;display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--text-muted)}
+  .eye{display:inline-grid;place-items:center;width:16px;height:16px;color:var(--accent)}
+  .privacy-chip{
+    margin-left:auto;display:flex;align-items:center;gap:6px;padding:4px 9px;border-radius:var(--radius-pill);
+    background:var(--success-soft);border:1px solid rgba(74,222,128,.3);color:#9be9b4;font-size:10.5px;font-weight:600;
+  }
+  .feed{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:13px}
+  .feed::-webkit-scrollbar{width:7px}.feed::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:9px}
+
+  .whisper{
+    position:relative;padding:14px;border-radius:var(--radius-md);
+    background:var(--surface-overlay);border:1px solid var(--border-strong);
+    box-shadow:var(--shadow-md);opacity:0;transform:translateX(22px) scale(.97);
+    animation:whisperin .55s var(--ease-spring) forwards;
+  }
+  @keyframes whisperin{to{opacity:1;transform:none}}
+  .whisper.contradiction{border-color:rgba(245,177,76,.45);box-shadow:0 16px 40px rgba(245,177,76,.12)}
+  .whisper.recall{border-color:rgba(110,118,255,.4)}
+  .whisper.context{border-color:var(--border-strong)}
+  .w-head{display:flex;align-items:center;gap:8px;margin-bottom:9px}
+  .w-badge{display:flex;align-items:center;gap:6px;padding:3px 8px;border-radius:var(--radius-pill);font-size:10.5px;font-weight:700;letter-spacing:.02em;text-transform:uppercase}
+  .contradiction .w-badge{background:var(--warning-soft);color:var(--warning)}
+  .recall .w-badge{background:var(--accent-soft);color:var(--accent-hover)}
+  .context .w-badge{background:var(--surface-hover);color:var(--text-secondary)}
+  .w-time{margin-left:auto;font-size:10.5px;color:var(--text-muted);font-family:var(--font-mono)}
+  .w-body{font-size:13.5px;line-height:1.5;color:var(--text-primary)}
+  .w-body b{color:#fff}
+  .quote{
+    margin-top:10px;padding:9px 12px;border-left:2px solid var(--accent);
+    background:rgba(255,255,255,.03);border-radius:0 var(--radius-sm) var(--radius-sm) 0;
+    font-size:12.5px;line-height:1.45;color:var(--text-secondary);font-style:italic;
+  }
+  .src{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--text-muted);flex-wrap:wrap}
+  .wikilink{color:var(--accent-hover);text-decoration:none;font-style:normal;font-weight:600}
+  .wikilink:hover{text-decoration:underline}
+  .vp{display:flex;align-items:center;gap:6px;padding:3px 8px;border-radius:var(--radius-pill);background:var(--success-soft);border:1px solid rgba(74,222,128,.28);color:#9be9b4;font-size:10px;font-weight:600}
+  .vpwave{display:flex;align-items:center;gap:1.5px;height:11px}
+  .vpwave i{width:2px;background:#9be9b4;border-radius:2px;opacity:.85}
+  .play2s{cursor:pointer;color:var(--accent-hover);font-weight:600;display:inline-flex;align-items:center;gap:4px}
+  .w-actions{display:flex;gap:8px;margin-top:12px}
+  .w-btn{flex:1;padding:8px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--surface-raised);color:var(--text-secondary);font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:var(--transition)}
+  .w-btn:hover{background:var(--surface-hover);color:var(--text-primary)}
+  .w-btn.pin:hover{border-color:var(--accent);color:var(--accent-hover);background:var(--accent-soft)}
+  .w-btn.pinned{border-color:var(--accent);color:var(--accent-hover);background:var(--accent-soft)}
+
+  .hint{color:var(--text-muted);font-size:12px;text-align:center;padding:24px 16px;line-height:1.6}
+  .hint .k{display:inline-flex;width:20px;height:20px;border-radius:5px;background:var(--surface-hover);border:1px solid var(--border);align-items:center;justify-content:center;font-size:11px}
+
+  /* footer ledger */
+  .ledger{
+    display:flex;align-items:center;gap:16px;padding:11px 22px;
+    border-top:1px solid var(--border-subtle);background:rgba(7,7,11,.5);
+    font-size:12px;color:var(--text-secondary);
+  }
+  .ledger b{color:var(--text-primary)}
+  .ledger .g{display:flex;align-items:center;gap:7px}
+  .ledger .zero{color:#9be9b4;font-weight:700}
+  .replay{
+    margin-left:auto;padding:8px 15px;border-radius:var(--radius-pill);
+    background:var(--accent-gradient);color:#fff;border:none;font-family:inherit;
+    font-size:12.5px;font-weight:700;cursor:pointer;box-shadow:var(--shadow-md);transition:var(--transition);
+  }
+  .replay:hover{filter:brightness(1.08);transform:translateY(-1px)}
+
+  /* "what Marcus sees" peek overlay */
+  .peekwrap{position:fixed;inset:0;z-index:40;display:none;align-items:center;justify-content:center;background:rgba(4,4,8,.72);backdrop-filter:blur(6px)}
+  .peekwrap.on{display:flex;animation:fade .25s ease}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  .peekcard{width:520px;max-width:90vw;background:var(--surface-overlay);border:1px solid var(--border-strong);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);padding:26px;text-align:center}
+  .peekcard h3{font-size:16px;margin-bottom:6px}
+  .peekcard p{color:var(--text-secondary);font-size:13.5px;line-height:1.55;margin-bottom:18px}
+  .peekcard .plain{text-align:left;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:var(--radius-md);padding:16px;font-size:13.5px;color:var(--text-secondary)}
+  .peekcard .plain .row{display:flex;gap:10px;margin-bottom:9px}
+  .peekcard .plain .row:last-child{margin-bottom:0}
+  .peekcard .none{margin-top:16px;color:#9be9b4;font-weight:600;font-size:13px}
+  .peekcard .close{margin-top:20px;padding:9px 20px;border-radius:var(--radius-pill);background:var(--surface-raised);border:1px solid var(--border);color:var(--text-primary);font-family:inherit;font-weight:600;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- top bar -->
+  <div class="topbar">
+    <div class="wordmark"><span class="dot"></span> Murmur</div>
+    <div class="live-pill">
+      <span class="rec-dot"></span> REC
+      <span class="eq"><i style="height:8px"></i><i style="height:14px"></i><i style="height:6px"></i><i style="height:11px"></i><i style="height:9px"></i></span>
+      <span class="timer" id="timer">00:00</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="who"><span class="avatar">MR</span> Marcus Reid · far side</div>
+    <button class="peek-btn" onclick="showPeek()">👁 What Marcus sees</button>
+  </div>
+
+  <!-- stage -->
+  <div class="stage">
+    <div class="transcript" id="transcript"></div>
+
+    <aside class="copilot">
+      <div class="cop-head">
+        <div class="cop-title">
+          <span class="brainmark">🧠</span> Your private co-pilot
+        </div>
+        <div class="cop-sub">
+          <span class="eye">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><line x1="3" y1="21" x2="21" y2="3" stroke-width="2.2"/></svg>
+          </span>
+          Only you can see this pane
+          <span class="privacy-chip">● on-device</span>
+        </div>
+      </div>
+      <div class="feed" id="feed">
+        <div class="hint" id="hint">
+          Listening to the far side, bot-free.<br>
+          Cross-referencing everything Marcus says<br>against your private cross-meeting memory…
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- footer ledger -->
+  <div class="ledger">
+    <div class="g">🔒 <span><b id="count">0</b> private insights</span></div>
+    <div class="g">↑ <span class="zero">0 bytes</span> left this Mac</div>
+    <div class="g">🎙 <span>matched to on-device voiceprints</span></div>
+    <button class="replay" onclick="run()">▶ Replay the call</button>
+  </div>
+</div>
+
+<!-- peek overlay -->
+<div class="peekwrap" id="peek">
+  <div class="peekcard">
+    <h3>What Marcus sees on his end</h3>
+    <p>Bot-free capture means nothing joined his call. From where he sits, it's just the two of you talking.</p>
+    <div class="plain">
+      <div class="row"><span>🟠</span><span>Marcus: “The May 30 GA was always a soft target…”</span></div>
+      <div class="row"><span>🔵</span><span>You: “Right, let's keep some flexibility.”</span></div>
+      <div class="row"><span>🟠</span><span>Marcus: “Cool. Sending the deck after.”</span></div>
+    </div>
+    <div class="none">No bot · no notice · no idea your past just corrected him.</div>
+    <button class="close" onclick="hidePeek()">Back to your side</button>
+  </div>
+</div>
+
+<script>
+  const $ = (s)=>document.querySelector(s);
+  const transcript = $("#transcript"), feed = $("#feed"), hint = $("#hint");
+  let timers=[], t0=0, insights=0;
+
+  // ── the demo script (Sonora world; Marcus soft-pedals commitments he made) ──
+  const SEG = (side,name,text)=>({side,name,text});
+  const script = [
+    {at:600,  seg:SEG("them","Marcus","So on the redesign — honestly I never thought we'd get all three flows done this quarter.")},
+    {at:2600, seg:SEG("me","You","We scoped it to three though — onboarding, search, note detail.")},
+    {at:4200, seg:SEG("them","Marcus","And the May 30 Atlas GA… that was always a soft target. We've got flexibility there."),
+      whisper:{
+        type:"contradiction", badge:"Contradiction", time:"just now",
+        body:"Marcus called the <b>May 30 GA</b> a “soft target.” On <b>Mar 3</b> he called it the keystone — <b>firm</b>.",
+        quote:"“If Atlas slips, everything behind it slips — it's the keystone. May 30 is firm.”",
+        src:"Project Atlas — Kickoff", when:"Mar 3", vp:"Marcus · 98%"
+      }},
+    {at:8200, seg:SEG("me","You","Got it. Let's keep some room there.")},
+    {at:9600, seg:SEG("them","Marcus","And I don't think we ever actually promised Acme the SSO piece for the pilot."),
+      whisper:{
+        type:"recall", badge:"Recall", time:"just now",
+        body:"You <b>did</b> commit SSO to Acme. Two sources — a note and a call.",
+        quote:"“Acme wants SSO by pilot end.” → You: “We'll have SSO in by then.”",
+        src:"Customer Call — Acme Corp", when:"Jun 20", vp:"You · 99%"
+      }},
+    {at:13800, seg:SEG("them","Marcus","Anyway, the loopback thing is still blocked on Priya's sync layer, so Atlas can't move yet."),
+      whisper:{
+        type:"context", badge:"Context", time:"just now",
+        body:"That's no longer true. <b>Priya landed the sync layer Thursday</b> — the loopback spike is unblocked.",
+        quote:"“It merged Thursday. So the loopback work is unblocked.”",
+        src:"Eng Sync — Sales Engine", when:"yesterday", vp:"Priya · 96%"
+      }},
+    {at:18400, seg:SEG("me","You","Actually — it merged Thursday. We're unblocked. Let's hold the date.")},
+    {at:20800, final:true}
+  ];
+
+  function stopAll(){ timers.forEach(fn=>fn()); timers=[]; }
+
+  function clearAll(){
+    stopAll();
+    transcript.innerHTML=""; insights=0; $("#count").textContent="0";
+    feed.innerHTML=""; feed.appendChild(hint); hint.style.display="";
+    $("#timer").textContent="00:00";
+  }
+
+  function tick(){
+    const el=$("#timer"); let s=0;
+    const iv=setInterval(()=>{ s++; const m=String(Math.floor(s/60)).padStart(2,"0");
+      el.textContent=`${m}:${String(s%60).padStart(2,"0")}`; if(s>25)clearInterval(iv); },1000);
+    timers.push(()=>clearInterval(iv));
+  }
+
+  function addSeg(seg,flag){
+    const d=document.createElement("div");
+    d.className=`seg ${seg.side==="me"?"me":"them"}`;
+    const initials = seg.side==="me" ? "You".slice(0,2).toUpperCase() : "MR";
+    d.innerHTML=`<div class="sp">${seg.side==="me"?"YOU":"MR"}</div>
+      <div><div class="name">${seg.name}</div>
+      <div class="bubble ${flag?"flag":""}">${seg.text}</div></div>`;
+    transcript.appendChild(d);
+    // keep only last ~5 visible
+    while(transcript.children.length>5) transcript.removeChild(transcript.firstChild);
+  }
+
+  function vpBars(){
+    let h="";const hs=[6,10,4,11,7,9,5,10,6,8,4,9];
+    hs.forEach(x=>h+=`<i style="height:${x}px"></i>`); return h;
+  }
+
+  function addWhisper(w){
+    if(hint.style.display!=="none"){ hint.style.display="none"; }
+    insights++; $("#count").textContent=insights;
+    const el=document.createElement("div");
+    el.className=`whisper ${w.type}`;
+    const icon = w.type==="contradiction"?"⚠️":w.type==="recall"?"📌":"🧭";
+    el.innerHTML=`
+      <div class="w-head">
+        <span class="w-badge">${icon} ${w.badge}</span>
+        <span class="w-time">${w.time}</span>
+      </div>
+      <div class="w-body">${w.body}</div>
+      <div class="quote">${w.quote}</div>
+      <div class="src">
+        <a class="wikilink" href="#">[[${w.src}]]</a> · ${w.when}
+        <span class="vp" title="Matched on-device — no voiceprint ever uploaded">
+          🎙 <span class="vpwave">${vpBars()}</span> ${w.vp}
+        </span>
+        <span class="play2s">▶ 2s</span>
+      </div>
+      <div class="w-actions">
+        <button class="w-btn pin" onclick="pin(this)">📌 Pin to note</button>
+        <button class="w-btn" onclick="this.closest('.whisper').style.opacity=.35">Dismiss</button>
+      </div>`;
+    feed.appendChild(el);
+    feed.scrollTop=feed.scrollHeight;
+  }
+  window.pin=(b)=>{ b.classList.add("pinned"); b.textContent="✓ Pinned"; };
+
+  function finale(){
+    const el=document.createElement("div");
+    el.className="whisper recall";
+    el.style.borderColor="rgba(74,222,128,.4)";
+    el.innerHTML=`
+      <div class="w-head"><span class="w-badge" style="background:var(--success-soft);color:#9be9b4">✓ Call ended</span></div>
+      <div class="w-body"><b>3 things your past caught</b> that you'd have let slide. Every one stayed on your Mac — Marcus never knew your memory was in the room.</div>
+      <div class="w-actions"><button class="w-btn pin" onclick="pin(this)">📌 Fold all into the note</button></div>`;
+    feed.appendChild(el); feed.scrollTop=feed.scrollHeight;
+  }
+
+  function play(){
+    clearAll(); tick();
+    for(const step of script){
+      const id=setTimeout(()=>{
+        if(step.final){ finale(); return; }
+        addSeg(step.seg, !!step.whisper);
+        if(step.whisper){ const w=setTimeout(()=>addWhisper(step.whisper), 900); timers.push(()=>clearTimeout(w)); }
+      }, step.at);
+      timers.push(()=>clearTimeout(id));
+    }
+  }
+  window.run=()=>play();
+
+  window.showPeek=()=>$("#peek").classList.add("on");
+  window.hidePeek=()=>$("#peek").classList.remove("on");
+  document.getElementById("peek").addEventListener("click",e=>{ if(e.target.id==="peek") hidePeek(); });
+
+  play();
+</script>
+</body>
+</html>
