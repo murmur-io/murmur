@@ -253,6 +253,15 @@ export interface AppConfigDto {
 export type BrainBackend = "cloud" | "local" | "off";
 
 /**
+ * The Murmur Brain engine CLASS a registry model serves (mirrors the Rust
+ * `ModelClass`, serialized lowercase). `"light"` = fast, small-context work run
+ * DURING a recording (realtime reactions / fact-triple extraction); `"heavy"` =
+ * note/Ask summarization + post-call analysis. Lets the picker group by role and
+ * the Brain-Live card pick the smallest LIGHT model.
+ */
+export type ModelClass = "light" | "heavy";
+
+/**
  * Phase H — a selectable local brain model from the registry (`list_brain_models`).
  * Mirrors the Rust `BrainModelDto` (camelCase). RAM-fit / download / selected
  * state are computed by the backend against this Mac.
@@ -260,20 +269,81 @@ export type BrainBackend = "cloud" | "local" | "off";
 export interface BrainModelDto {
   id: string;
   name: string;
-  /** Human size label (e.g. "6.7 GB") for display. */
-  sizeLabel: string;
-  /** Exact on-disk size in bytes (for progress math / precise display). */
-  bytes: number;
-  /** Minimum recommended RAM in GB to run this model. */
+  /** On-disk filename inside the shared models dir. */
+  filename: string;
+  /** Hugging Face raw-file URL (inbound-only — never sent meeting content). */
+  url: string;
+  /** Approximate download / on-disk size in bytes (for the picker size label). */
+  approxSizeBytes: number;
+  /** Minimum recommended RAM in GB to run this model alone. */
   minRamGb: number;
   /** Languages the model handles well (e.g. ["pl", "en"]). */
   languages: string[];
+  /** mistral.rs architecture key (`llama` / `qwen2` / `qwen3`). */
+  arch: string;
+  /** The engine class (`light` / `heavy`) — lets the FE group the picker by role. */
+  class: ModelClass;
   /** Already downloaded on this Mac. */
   downloaded: boolean;
   /** Fits in this Mac's RAM (false → warn / discourage). */
   fitsRam: boolean;
   /** Currently the selected brain model. */
   selected: boolean;
+}
+
+/**
+ * The DERIVED Murmur Brain posture for the Settings display (`brain_posture`),
+ * NEVER stored — the backend computes it from the live config so the label can
+ * never lie about egress. `"cloud"` (Default AI writes everything, no on-device
+ * reactions) | `"hybrid"` (cloud notes/answers + LOCAL realtime reactions — the
+ * ⭐ recommendation) | `"fully_local"` (nothing leaves the device) | `"custom"`
+ * (a hand-tuned combination matching no preset). Only the first three are
+ * SETTABLE via `set_brain_posture`; `"custom"` is a read-only display state.
+ */
+export type Posture = "cloud" | "hybrid" | "fully_local" | "custom";
+
+/**
+ * The installed-base migration nudge (`brain_model_retirement_nudge`): non-null
+ * when the persisted `brainModelId` points at a RETIRED model (the non-commercial
+ * `qwen2.5-3b`), telling the FE to offer the Apache-licensed replacement. Mirrors
+ * the Rust `RetiredModelNudge` (camelCase). The retired GGUF keeps working until
+ * the user switches — nothing changes silently.
+ */
+export interface RetiredModelNudge {
+  retiredId: string;
+  replacementId: string;
+  replacementName: string;
+  reason: string;
+  /** The retired GGUF is still on disk (so deletion could be offered). */
+  fileOnDisk: boolean;
+}
+
+/**
+ * Realtime Reactions — one "whisper" contradiction card (`EVENT_WHISPER_CARD`).
+ * Mirrors the Rust `WhisperCard` (camelCase). EPHEMERAL (emitted as an event,
+ * never persisted). Surfaced to the user ALONE during a recording when a far-side
+ * utterance contradicts a fact already in their history. `oldQuote` is the
+ * EXTRACTIVE citation — a real prior fact value, never model-generated — so the
+ * card can never fabricate an accusation. `sourceMeetingId` (when set) is the
+ * `[[wikilink]]` / click-through to the meeting the old fact came from.
+ *
+ * PRIVACY (lock-model): a whisper card that already crossed to the FE cites a
+ * meeting that may be re-sealed mid-session (screen-share auto-relock / Lock all)
+ * — the reactions rail therefore PURGES every card on a lock transition, the FE
+ * analogue of the `convertFileSrc` gate. See {@link MeetingConversationStore}.
+ */
+export interface WhisperCard {
+  kind: "contradiction";
+  /** Neutral one-line framing ("Earlier, X said Y") — never accusatory. */
+  summary: string;
+  /** The old fact's value — the extractive citation. */
+  oldQuote: string;
+  /** The entity (subject) the fact is about. */
+  entity: string;
+  /** The attribute that changed. */
+  predicate: string;
+  /** The source meeting to open ([[wikilink]] / click-through), when known. */
+  sourceMeetingId: string | null;
 }
 
 /**

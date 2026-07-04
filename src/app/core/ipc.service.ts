@@ -7,6 +7,9 @@ import type {
   AppConfigDto,
   BrainDownloadProgress,
   BrainModelDto,
+  Posture,
+  RetiredModelNudge,
+  WhisperCard,
   EmbedDownloadProgress,
   EgressLedger,
   GatewayHealth,
@@ -86,6 +89,8 @@ export const EVENT_MODEL_DOWNLOAD = "murmur://model-download";
 // Proactive brain (P2) — one zero-egress recall hint from the live-loop matcher.
 export const EVENT_PROACTIVE_HINT = "murmur://proactive-hint";
 export const EVENT_BRAIN_DOWNLOAD = "murmur://brain-download";
+// Realtime Reactions (Murmur Brain Live) — one on-device "whisper" contradiction card.
+export const EVENT_WHISPER_CARD = "murmur://whisper-card";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
 export const EVENT_REINDEX = "murmur://reindex-embeddings";
@@ -776,6 +781,60 @@ export class IpcService {
     return invoke<void>("download_brain_model", { modelId });
   }
 
+  /** Whether a usable on-device brain (reasoning GGUF) is present at the resolved path. */
+  brainModelPresent(): Promise<boolean> {
+    return invoke<boolean>("brain_model_present");
+  }
+
+  // ── Murmur Brain — posture (Cloud / Hybrid / Fully local) ──────────────
+
+  /**
+   * The DERIVED Murmur Brain posture for the Settings display — computed by the
+   * backend from the live config (never stored), so the label can never lie about
+   * egress. `"custom"` when the config matches no preset; never settable.
+   */
+  brainPosture(): Promise<Posture> {
+    return invoke<Posture>("brain_posture");
+  }
+
+  /**
+   * Apply a Murmur Brain posture PRESET (`cloud` / `hybrid` / `fully_local`) and
+   * persist it. The single writer of the posture presets — a raw settings save
+   * preserves the posture keys. Rejects (`InvalidArg`) on the derived-only
+   * `"custom"`.
+   */
+  setBrainPosture(posture: Posture): Promise<void> {
+    return invoke<void>("set_brain_posture", { posture });
+  }
+
+  /**
+   * The installed-base migration nudge, or `null`: non-null when the persisted
+   * brain model is a RETIRED (non-commercial) id, telling the FE to offer the
+   * Apache-licensed replacement. Read-only capability probe (no content, no egress).
+   */
+  brainModelRetirementNudge(): Promise<RetiredModelNudge | null> {
+    return invoke<RetiredModelNudge | null>("brain_model_retirement_nudge");
+  }
+
+  /**
+   * The Realtime-Reactions SHADOW counter: how many contradiction cards WOULD
+   * have fired this recording while the sub-toggle is OFF. Resets each
+   * `startRecording`. Lets the FE offer user-local "the brain would have flagged
+   * N — enable?" calibration (no telemetry).
+   */
+  brainReactionsShadowCount(): Promise<number> {
+    return invoke<number>("brain_reactions_shadow_count");
+  }
+
+  /**
+   * Flip the Realtime-Reactions CONTRADICTION-card sub-toggle. Default OFF
+   * (shadow mode). Dedicated command (not the raw settings save, which only
+   * preserves it) so a partial save can never silently enable the ⚠ cards.
+   */
+  setBrainContradictionCards(enabled: boolean): Promise<void> {
+    return invoke<void>("set_brain_contradiction_cards", { enabled });
+  }
+
   // ── brain2 RAG — semantic search (embedding model + reindex backfill) ───
 
   /**
@@ -1179,6 +1238,17 @@ export class IpcService {
     return listen<BrainDownloadProgress>(EVENT_BRAIN_DOWNLOAD, (e) =>
       cb(e.payload),
     );
+  }
+
+  /**
+   * Fires when the on-device Realtime-Reactions layer surfaces a "whisper"
+   * contradiction card during a recording (far-side utterance conflicts with a
+   * known fact). The `oldQuote` is an EXTRACTIVE citation of the prior fact — the
+   * card never fabricates. Only emitted when the contradiction sub-toggle is on
+   * (shadow mode emits nothing); visibility-gated in the backend.
+   */
+  onWhisperCard(cb: (p: WhisperCard) => void): Promise<UnlistenFn> {
+    return listen<WhisperCard>(EVENT_WHISPER_CARD, (e) => cb(e.payload));
   }
 
   /** Fires with per-file progress for the in-flight embedding-model download. */

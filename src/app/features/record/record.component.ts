@@ -4,6 +4,7 @@ import {
   DestroyRef,
   OnInit,
   computed,
+  effect,
   inject,
   signal,
   viewChild,
@@ -1071,6 +1072,17 @@ export class RecordComponent implements OnInit {
   readonly assistant = inject(MeetingConversationStore);
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+
+  /**
+   * Shadow-mode calibration (deliverable #5): once a recording finishes, read the
+   * per-recording contradiction SHADOW count so the reactions rail can offer "the
+   * brain would have flagged N — show them live?". The effect only CALLS an async
+   * store method (the signal write happens inside the store, outside this effect),
+   * so no `allowSignalWrites` is needed. Event-driven, no FE timer.
+   */
+  private readonly _shadowOnStop = effect(() => {
+    if (this.store.stage() === "done") void this.assistant.refreshShadowCount();
+  });
 
   // NOTE: "clear the conversation on a new recording" now lives in
   // MeetingConversationStore.setMeetingId (keyed on the meeting id, which survives

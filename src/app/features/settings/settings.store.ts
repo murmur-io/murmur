@@ -14,8 +14,10 @@ import type {
   GatewayHealth,
   GatewayModel,
   InputDeviceInfo,
+  Posture,
   ProviderStatus,
   ReindexResult,
+  RetiredModelNudge,
   StorageReport,
   VoiceprintInfo,
 } from "../../core/models";
@@ -785,6 +787,33 @@ export class SettingsStore {
   /** Release handle for the EVENT_BRAIN_DOWNLOAD subscription. */
   private unlistenBrainDownload: UnlistenFn | null = null;
 
+  // ── Murmur Brain — posture (Cloud / Hybrid / Fully local) ──────────────
+
+  /** The DERIVED posture (`cloud`/`hybrid`/`fully_local`/`custom`), or null before load. */
+  private readonly _posture = signal<Posture | null>(null);
+  readonly posture = this._posture.asReadonly();
+  /** True while a `set_brain_posture` preset is being applied. */
+  private readonly _postureBusy = signal(false);
+  readonly postureBusy = this._postureBusy.asReadonly();
+  /** Surfaced if reading/applying the posture rejects. */
+  private readonly _postureError = signal<string | null>(null);
+  readonly postureError = this._postureError.asReadonly();
+
+  /** True while the one-tap "Enable Murmur Brain Live" flow (hybrid + light model) runs. */
+  private readonly _enablingBrainLive = signal(false);
+  readonly enablingBrainLive = this._enablingBrainLive.asReadonly();
+
+  /**
+   * The installed-base retirement nudge (`brain_model_retirement_nudge`), or null.
+   * Non-null → the persisted model is a retired non-commercial id and the FE
+   * offers the Apache-licensed replacement.
+   */
+  private readonly _retirementNudge = signal<RetiredModelNudge | null>(null);
+  readonly retirementNudge = this._retirementNudge.asReadonly();
+  /** True while the retirement replacement is being downloaded + selected. */
+  private readonly _applyingRetirement = signal(false);
+  readonly applyingRetirement = this._applyingRetirement.asReadonly();
+
   /**
    * Live signals of the two custom-GGUF controls — the same `valueChanges`
    * bridge as the role controls above — so `customGgufValue` re-derives when
@@ -1001,6 +1030,8 @@ export class SettingsStore {
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
       await this.refreshBrainModels();
+      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
+      await this.refreshPosture();
       // brain2 RAG — embedding-model presence + reindex/download progress streams.
       await this.subscribeSemanticStreams();
       this._embedModelPresent.set(
@@ -1111,6 +1142,127 @@ export class SettingsStore {
       this._brainError.set(String(e));
     } finally {
       this._brainDownloadingId.set(null);
+    }
+  }
+
+  // ── Murmur Brain — posture + Brain Live enablement + retirement nudge ───
+
+  /** Re-read the DERIVED posture + the retirement nudge (best-effort; failure is non-fatal). */
+  async refreshPosture(): Promise<void> {
+    try {
+      this._posture.set(await this.ipc.brainPosture());
+    } catch (e) {
+      this._postureError.set(String(e));
+    }
+    this._retirementNudge.set(
+      await this.ipc.brainModelRetirementNudge().catch(() => null),
+    );
+  }
+
+  /**
+   * Apply a posture PRESET (`cloud` / `hybrid` / `fully_local`). Re-reads the
+   * derived posture afterwards so the display reflects what the backend actually
+   * stored (never an optimistic guess).
+   */
+  async setPosture(p: Posture): Promise<void> {
+    if (p === "custom") return; // derived-only label — never settable
+    this._postureError.set(null);
+    this._postureBusy.set(true);
+    try {
+      await this.ipc.setBrainPosture(p);
+      await this.refreshPosture();
+    } catch (e) {
+      this._postureError.set(String(e));
+    } finally {
+      this._postureBusy.set(false);
+    }
+  }
+
+  /**
+   * One-tap "Enable Murmur Brain Live": switch to the Hybrid preset AND ensure the
+   * smallest LIGHT on-device model is downloaded + selected (the ~1.1 GB engine
+   * that runs realtime reactions + local fact extraction). Progress rides the
+   * existing brain-download signals. Best-effort + honest on failure.
+   */
+  async enableBrainLive(): Promise<void> {
+    this._postureError.set(null);
+    this._brainError.set(null);
+    this._enablingBrainLive.set(true);
+    try {
+      await this.ipc.setBrainPosture("hybrid");
+      // Pick the smallest LIGHT-class model (the realtime engine).
+      const models = await this.ipc.listBrainModels();
+      const light = models
+        .filter((m) => m.class === "light")
+        .sort((a, b) => a.approxSizeBytes - b.approxSizeBytes)[0];
+      if (light) {
+        if (!light.downloaded) {
+          // Reuse the shared download-progress UI (brainDownloadingId + frac).
+          this._brainDownloadFrac.set(0);
+          this._brainDownloadingId.set(light.id);
+          try {
+            await this.ipc.downloadBrainModel(light.id);
+          } finally {
+            this._brainDownloadingId.set(null);
+          }
+        }
+        await this.ipc.selectBrainModel(light.id);
+      }
+      await this.refreshBrainModels();
+      await this.refreshPosture();
+    } catch (e) {
+      this._postureError.set(String(e));
+    } finally {
+      this._enablingBrainLive.set(false);
+    }
+  }
+
+  /**
+   * The size (bytes) of the smallest LIGHT model — for the Brain Live card's
+   * "~N GB one-time download" copy. Null before the model list has loaded.
+   */
+  readonly brainLiveModelBytes = computed<number | null>(() => {
+    const light = this.brainModels()
+      .filter((m) => m.class === "light")
+      .sort((a, b) => a.approxSizeBytes - b.approxSizeBytes)[0];
+    return light ? light.approxSizeBytes : null;
+  });
+
+  /** Whether the smallest LIGHT model is already on this Mac (skips the download step). */
+  readonly brainLiveModelReady = computed<boolean>(() => {
+    const lights = this.brainModels().filter((m) => m.class === "light");
+    return lights.length > 0 && lights.some((m) => m.downloaded);
+  });
+
+  /**
+   * Apply the retirement nudge: download + select the Apache-licensed replacement
+   * for a retired non-commercial model, then clear the nudge. Progress rides the
+   * shared brain-download signals.
+   */
+  async applyRetirementReplacement(): Promise<void> {
+    const nudge = this._retirementNudge();
+    if (!nudge) return;
+    this._brainError.set(null);
+    this._applyingRetirement.set(true);
+    try {
+      this._brainDownloadFrac.set(0);
+      this._brainDownloadingId.set(nudge.replacementId);
+      try {
+        await this.ipc.downloadBrainModel(nudge.replacementId);
+      } finally {
+        this._brainDownloadingId.set(null);
+      }
+      await this.ipc.selectBrainModel(nudge.replacementId);
+      this.form.patchValue({
+        brainModelId: nudge.replacementId,
+        brainModelPath: "",
+      });
+      await this.refreshBrainModels();
+      await this.refreshPosture();
+    } catch (e) {
+      this._brainError.set(String(e));
+    } finally {
+      this._applyingRetirement.set(false);
     }
   }
 

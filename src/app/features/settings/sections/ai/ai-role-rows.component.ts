@@ -254,7 +254,8 @@ interface RoleRowVm {
                             }
                           </span>
                           <span class="brain-model-meta text-muted">
-                            {{ m.sizeLabel }} · needs ≥{{ m.minRamGb }} GB RAM
+                            {{ sizeLabel(m.approxSizeBytes) }} · {{ m.class }} ·
+                            needs ≥{{ m.minRamGb }} GB RAM
                             @if (m.languages.length > 0) {
                               · {{ m.languages.join("/") }}
                             }
@@ -705,5 +706,12 @@ export class AiRoleRowsComponent {
 
   downloadBrainModel(id: string): void {
     void this.store.downloadBrainModel(id);
+  }
+
+  /** Human GB/MB size label from a byte count (binary), mirroring the Storage section. */
+  sizeLabel(bytes: number): string {
+    const gb = 1024 * 1024 * 1024;
+    if (bytes >= gb) return (bytes / gb).toFixed(1) + " GB";
+    return Math.round(bytes / (1024 * 1024)) + " MB";
   }
 }
