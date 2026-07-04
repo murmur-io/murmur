@@ -380,6 +380,10 @@ pub async fn start_recording(
     // Start mic capture on the configured input device (falls back to default if unset/gone).
     let input_device = state.config.lock().ok().and_then(|c| c.input_device.clone());
     let recorder = Recorder::start(input_device)?;
+    // STAGE 2 crash-salvage: grab a read-only handle onto the live buffer + the device rate BEFORE the
+    // recorder is moved into state — the spill writer mirrors this handle (never the RT callback).
+    let sample_reader = recorder.sample_reader();
+    let src_rate = recorder.source_sample_rate();
     {
         let mut slot = state
             .recorder
@@ -397,6 +401,9 @@ pub async fn start_recording(
 
     // Optionally capture system audio (the other side of the call) alongside the mic.
     // Best-effort: if it can't start, we log and record mic-only — never fail recording.
+    // `sys_scratch_for_spill` remembers the far-side scratch path so the crash-salvage sidecar can
+    // pair the "others" track at next launch (only set when the system recorder actually started).
+    let mut sys_scratch_for_spill: Option<std::path::PathBuf> = None;
     {
         let enabled = state
             .config
@@ -405,8 +412,9 @@ pub async fn start_recording(
             .unwrap_or(false);
         if enabled && crate::audio::system::is_available(&app) {
             let sys_wav = std::env::temp_dir().join(format!("meetnotes-sys-{meeting_id}.wav"));
-            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav) {
+            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav.clone()) {
                 Ok(rec) => {
+                    sys_scratch_for_spill = Some(sys_wav);
                     if let Ok(mut slot) = state.system_recorder.lock() {
                         *slot = Some(rec);
                     }
@@ -417,6 +425,27 @@ pub async fn start_recording(
                 ),
             }
         }
+    }
+
+    // STAGE 2 crash-salvage: mirror the growing RAM mic buffer to an on-disk spill (+ a sidecar naming
+    // the rate + the paired far-side scratch) so a crash / SIGKILL mid-record is recoverable at next
+    // launch (see `audio::spill`). Its own NON-RT writer thread; best-effort — a spill start failure
+    // NEVER fails the recording (the RAM buffer stays the sole primary source until Stop).
+    match crate::audio::spill::SpillWriter::start(
+        &meeting_id,
+        sample_reader,
+        src_rate,
+        sys_scratch_for_spill,
+    ) {
+        Ok(w) => {
+            if let Ok(mut slot) = state.spill_writer.lock() {
+                *slot = Some(w);
+            }
+        }
+        Err(e) => tracing::warn!(
+            target: "audio", error = %e,
+            "crash-salvage spill unavailable; recording on the RAM buffer only"
+        ),
     }
 
     // NOTE: the live VPIO echo-cancel helper (aeccap) is intentionally NEVER spawned anymore.
@@ -470,6 +499,20 @@ pub async fn stop_recording(
         slot.take()
             .ok_or_else(|| AppError::Audio("not recording".into()))?
     };
+
+    // STAGE 2 crash-salvage: take the spill writer into a guard whose `Drop` stops the writer thread
+    // and DELETES the plaintext spill + sidecar on EVERY exit path of this Stop (success, `?`-error,
+    // panic) — mirroring `pipeline::ScratchWav`. It is held across `run_after_stop` below (dropped at
+    // end of scope), so it survives until the archive WAV is written; after a normal Stop the spill is
+    // gone. ONLY a crash (this function never runs) leaves it behind for next-launch salvage.
+    // A POISONED `spill_writer` mutex (`.lock().ok()` ⇒ None) merely DEFERS this clean-stop cleanup:
+    // the spill lingers to next launch, where `claim_inflight` sees the row is no longer RECORDING and
+    // DiscardOrphans it — benign (no leak, no content loss), so tolerating the poison here is correct.
+    let _spill_guard = state
+        .spill_writer
+        .lock()
+        .ok()
+        .and_then(|mut s| s.take());
 
     // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
     // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
@@ -7424,6 +7467,7 @@ mod lifecycle_tests {
             recorder: Mutex::new(None),
             system_recorder: Mutex::new(None),
             aec_recorder: Mutex::new(None),
+            spill_writer: Mutex::new(None),
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
             db,

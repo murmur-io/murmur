@@ -225,20 +225,28 @@ pub fn run() {
                 ));
             }
 
-            // Crash-recovery: a session that died mid-record (crash / SIGKILL / `tauri dev`
-            // hot-rebuild) never ran `stop_recording`, so the meeting row `start_recording` inserted
-            // up-front sits in the library forever as a `RECORDING` "ghost". Flip every such stuck row
-            // to the terminal `ERROR` state so it renders honestly (no spinner, no phantom live row).
-            // ORDERING IS LOAD-BEARING: a future crash-salvage stage (task: mic spill) must claim the
-            // far-side scratch WAV BEFORE the reaper below deletes it, so the launch order is
-            // salvage → reconcile → reap. Reconcile therefore stays ABOVE the reaper/sweep; when
-            // salvage lands it goes ABOVE this reconcile.
-            {
+            // Crash-recovery (STAGE 2 salvage + STAGE 1 reconcile) + orphan reap. A session that died
+            // mid-record (crash / SIGKILL / `tauri dev` hot-rebuild) never ran `stop_recording`, so the
+            // meeting row `start_recording` inserted up-front sits as a `RECORDING` "ghost" AND its mic
+            // audio (RAM-only) + far-side scratch would be lost. ORDER IS LOAD-BEARING:
+            //   1) CLAIM salvage: find inflight mic spills of crashed recordings + MOVE the paired
+            //      far-side scratch out of $TMPDIR (before the reaper below deletes it). Runs FIRST so
+            //      the reaper can't eat a recoverable far-side track.
+            //   2) RECONCILE the remaining ghosts to terminal `ERROR` — SKIPPING the claimed rows
+            //      (salvage sets their final status itself), so a claimed row isn't clobbered.
+            //   3) REAP orphaned capture helpers + sweep stale scratch (post-claim, so only truly-
+            //      abandoned files remain).
+            //   4) SPAWN the async salvage worker: reconstruct each claimed recording + run it through
+            //      the EXISTING post-Stop pipeline → a real transcript+note. After the reap so the
+            //      paired helper is already down. Best-effort; never deletes un-salvaged audio.
+            let salvage_jobs = {
                 let state = app.state::<AppState>();
-                if let Err(e) = state.db.reconcile_stuck_recordings() {
+                let (jobs, claimed) = crate::audio::spill::claim_inflight(&state.db);
+                if let Err(e) = state.db.reconcile_stuck_recordings_except(&claimed) {
                     tracing::warn!(target: "startup", error = %e, "could not reconcile stuck recordings");
                 }
-            }
+                jobs
+            };
 
             // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
             // (crash / force-quit / a `tauri dev` hot-rebuild SIGKILLing the app mid-record). Such a
@@ -246,8 +254,13 @@ pub fn run() {
             // dead-session audio the file-age sweep below can't catch (its mtime stays fresh). Run
             // FIRST so the kill releases the file, THEN reclaim any stale scratch left behind.
             // Nothing records yet at setup, so any live capture helper is by definition an orphan.
+            // (Salvage above already moved any RECOVERABLE far-side scratch out of the reaper's reach.)
             crate::audio::aec::reap_orphaned_capture_helpers();
             crate::audio::aec::sweep_stale_scratch();
+
+            // STAGE 2 salvage worker (async, detached): now that the reaper has downed any orphan
+            // helper, reconstruct + pipeline each claimed crashed recording. No-op when nothing crashed.
+            crate::audio::spill::spawn_salvage(app.handle().clone(), salvage_jobs);
 
             create_bar_window(app.handle())?;
             if let Err(e) = app.global_shortcut().register(SUMMON_SHORTCUT) {
