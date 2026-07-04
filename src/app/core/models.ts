@@ -107,6 +107,20 @@ export interface AppConfigDto {
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;
+  /**
+   * First-run SHARING decision latch (mirrors Rust `AppConfigDto.sharing_choice_made`).
+   * `false` (default) means the user has NOT yet resolved the first-run sharing
+   * choice — the init gateway (`/welcome`) is shown when this is false AND no
+   * account is logged in (`!sharingChoiceMade && !accountStatus.loggedIn`).
+   * Picking "use locally" OR completing the account flow flips it true via the
+   * dedicated `mark_sharing_choice_made` command, so the gateway never nags again
+   * (a one-way latch). PRESERVE-ONLY on `saveConfig` — a normal settings save can
+   * never set or clear it (the backend's `dto_to_config` carries the stored value
+   * back), exactly like `shareEgressConsented`. `onboarding.persistConfig()` must
+   * still round-trip it (`base?.sharingChoiceMade ?? false`) since all DTO fields
+   * are required. Display-only otherwise.
+   */
+  sharingChoiceMade: boolean;
   noteStyle: string;
   /** ENHANCE-MY-NOTES: how typed in-meeting notes shape the summary — "enhance" (they
    *  become the skeleton of the note) | "append" (verbatim `## My notes` section). */

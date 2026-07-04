@@ -126,8 +126,23 @@ export class AppComponent implements OnInit {
 
     try {
       const cfg = await this.ipc.getConfig();
+      // Core onboarding STRICTLY precedes the optional sharing gate — a
+      // brand-new user goes to /onboarding first (its finish() then hands off
+      // to /welcome when the sharing gate is still open).
       if (!cfg.onboarded) {
         await this.router.navigateByUrl("/onboarding");
+        return;
+      }
+      // First-run SHARING gate (single source of truth:
+      // `!sharingChoiceMade && !accountStatus.loggedIn`). A returning logged-in
+      // user, a user who picked local, or one who logged in then out (choice
+      // made) never sees it again — "never nag".
+      if (!cfg.sharingChoiceMade) {
+        const st = await this.ipc.accountStatus().catch(() => null);
+        if (!st?.loggedIn) {
+          await this.router.navigateByUrl("/welcome");
+          return;
+        }
       }
     } catch {
       // Config unavailable — don't trap the user; the app loads normally.

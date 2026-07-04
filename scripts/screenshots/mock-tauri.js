@@ -356,6 +356,9 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
     modelSize: "large-v3",
     voiceTrigger: true,
     onboarded: true,
+    // The demo world has already resolved the first-run sharing choice, so the
+    // /welcome gateway never intercepts a screenshot route.
+    sharingChoiceMade: true,
     noteStyle: "structured",
     autoOrganize: true,
     noteLanguage: "en",
