@@ -399,11 +399,26 @@ impl ShareClient {
         if !status.is_success() {
             return Err(Self::status_err("get-blob", status));
         }
-        let bytes = resp
-            .bytes()
+        // Size cap (adversarial finding): a malicious server could stream a multi-GB body → OOM.
+        // A legit content cell is <= the server's blob cap; reject anything larger, checking both the
+        // advertised Content-Length AND the actual streamed bytes (a chunked body can lie/omit it).
+        let cap = murmur_protocol::caps::MAX_BLOB_BYTES + 4096;
+        if resp.content_length().is_some_and(|n| n as usize > cap) {
+            return Err(AppError::Unavailable("get-blob: response too large".into()));
+        }
+        let mut resp = resp;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|_| AppError::Unavailable("get-blob: malformed server response".into()))?;
-        Ok(bytes.to_vec())
+            .map_err(|_| AppError::Unavailable("get-blob: malformed server response".into()))?
+        {
+            if buf.len() + chunk.len() > cap {
+                return Err(AppError::Unavailable("get-blob: response too large".into()));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 }
 

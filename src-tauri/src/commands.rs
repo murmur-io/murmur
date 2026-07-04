@@ -7818,8 +7818,8 @@ pub async fn preview_share_recipient(
     };
     // Recompute the fingerprint locally (never trust the server's string blindly).
     let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
-    let account_id = norm_email(&email);
-    let (first_contact, key_changed) = match tofu_check(&state.db, &account_id, &fp)? {
+    // Pin/check on the STABLE server account id (not the email) so send + accept share one namespace.
+    let (first_contact, key_changed) = match tofu_check(&state.db, &key.user_id, &fp)? {
         TofuState::FirstContact => (true, false),
         TofuState::Match => (false, false),
         TofuState::Changed => (false, true),
@@ -7913,7 +7913,7 @@ pub(crate) async fn share_note_to_user_inner(
         if let Some(key) = lookup.key.filter(|_| lookup.registered) {
             // Registered → verify the fingerprint + enforce TOFU (BLOCK on a changed key), then wrap now.
             let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
-            match tofu_check(&state.db, &recipient_acct, &fp)? {
+            match tofu_check(&state.db, &key.user_id, &fp)? {
                 TofuState::Changed => {
                     return Err(AppError::Other(anyhow::anyhow!(
                     "this contact's key changed since you last shared — re-verify the safety words \
@@ -7921,7 +7921,7 @@ pub(crate) async fn share_note_to_user_inner(
                 )));
                 }
                 _ => state.db.pin_contact(
-                    &recipient_acct,
+                    &key.user_id,
                     Some(&recipient_email),
                     &fp,
                     &chrono::Utc::now().to_rfc3339(),
@@ -8060,7 +8060,6 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
     for (share_id, rev, nk_bytes, recipient_email, content_hash) in
         state.db.list_awaiting_rewrap()?
     {
-        let recipient_acct = norm_email(&recipient_email);
         // Re-look-up the recipient. Not registered yet / lookup error ⇒ leave it pending.
         let Ok(lookup) = client.lookup_key(&access_token, &recipient_email).await else {
             continue;
@@ -8070,11 +8069,12 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
         };
         let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
         // A changed key on a not-yet-pinned invitee is first contact; a CHANGED existing pin is
-        // blocking — skip it (don't silently re-wrap to a rotated key).
-        match tofu_check(&state.db, &recipient_acct, &fp)? {
+        // blocking — skip it (don't silently re-wrap to a rotated key). Pin on the STABLE server
+        // account id (not email) so send + accept share one namespace.
+        match tofu_check(&state.db, &key.user_id, &fp)? {
             TofuState::Changed => continue,
             _ => state.db.pin_contact(
-                &recipient_acct,
+                &key.user_id,
                 Some(&recipient_email),
                 &fp,
                 &chrono::Utc::now().to_rfc3339(),
@@ -8097,16 +8097,15 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
         )?;
         let wrapped_key =
             crate::e2ee::wrap::pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant)?;
-        // NOTE (honest gap): `PUT /shares/{id}/keys` keys the recipient row by the SERVER user id,
-        // which `keys/lookup` does not return; we send the account handle we have. If the server
-        // can't resolve it the attach is a uniform no-op and the share stays pending (retried next
-        // launch) — never an error. The re-wrap crypto above is complete + verified.
+        // `PUT /shares/{id}/keys` keys the recipient row by the SERVER user id, which `keys/lookup`
+        // now returns (`key.user_id`) — so the attach resolves correctly (closes the earlier no-op
+        // gap). The re-wrap crypto above is complete + verified.
         let attach = client
             .attach_key(
                 &access_token,
                 &share_id,
                 murmur_protocol::dto::AttachKeyRequest {
-                    recipient_acct_id: recipient_acct.clone(),
+                    recipient_acct_id: key.user_id.clone(),
                     wrapped_key,
                     key_generation: generation,
                     grant_sig: grant.signature,
@@ -8206,19 +8205,17 @@ pub(crate) async fn accept_share_inner(
                 .into(),
         ));
     }
-    match tofu_check(&state.db, &item.sender_user_id, &sender_fp)? {
-        TofuState::Changed => {
-            return Err(AppError::Other(anyhow::anyhow!(
-                "this sender's key changed since you last accepted from them — re-verify the safety \
-                 words out of band before accepting"
-            )));
-        }
-        _ => state.db.pin_contact(
-            &item.sender_user_id,
-            None,
-            &sender_fp,
-            &chrono::Utc::now().to_rfc3339(),
-        )?,
+    // TOFU: BLOCK on a changed key before doing any work. But DEFER pinning a first-contact key until
+    // AFTER a successful ingest (step 9 below) — otherwise a malicious server could pre-poison a pin
+    // with a first-contact item whose grant later fails verification (adversarial finding).
+    if matches!(
+        tofu_check(&state.db, &item.sender_user_id, &sender_fp)?,
+        TofuState::Changed
+    ) {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "this sender's key changed since you last accepted from them — re-verify the safety \
+             words out of band before accepting"
+        )));
     }
 
     // (6) Flip the server row to accepted (authorizes the blob fetch), then (7) fetch the content cell.
@@ -8238,6 +8235,15 @@ pub(crate) async fn accept_share_inner(
         &share_id,
         item.rev,
         item.key_generation,
+    )?;
+
+    // (9) Pin the sender's key ONLY NOW — after the grant verified (§4.8) and the note actually landed
+    //     in the vault, so a failed/forged first-contact item never leaves a poisoned pin behind.
+    state.db.pin_contact(
+        &item.sender_user_id,
+        None,
+        &sender_fp,
+        &chrono::Utc::now().to_rfc3339(),
     )?;
 
     crate::share::ledger_row(
