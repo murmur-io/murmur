@@ -10,6 +10,7 @@ import {
   AiConnectionCardComponent,
   type ConnectionCardVm,
 } from "./ai-connection-card.component";
+import { BrainEngineCardComponent } from "./brain-engine-card.component";
 
 /** One selectable connection (implicit singleton — no named registry yet). */
 interface ConnectionDef {
@@ -43,19 +44,20 @@ const CONNECTIONS: readonly ConnectionDef[] = [
   selector: "app-ai-connection-cards",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AiConnectionCardComponent],
+  imports: [AiConnectionCardComponent, BrainEngineCardComponent],
   template: `
     <div class="card conn-block">
       <div class="conn-head">
-        <h3>Providers</h3>
+        <h3>Engines</h3>
         <p class="text-secondary conn-sub">
-          The connections Murmur can run models on. Set each one up once here —
-          then pick which one Murmur uses in the block below.
+          Where models can run. Set each engine up once — pick which one Murmur
+          uses under Default engine below.
         </p>
       </div>
 
       <div class="conn-group">
         <span class="conn-group-label text-muted">On this Mac</span>
+        <app-brain-engine-card />
         @for (c of localCards(); track c.id) {
           <app-ai-connection-card
             [card]="c"
@@ -65,8 +67,7 @@ const CONNECTIONS: readonly ConnectionDef[] = [
           />
         } @empty {
           <p class="conn-empty text-muted">
-            No local connection right now — Ollama counts as local only while
-            its base URL points at this Mac.
+            Ollama appears here only while its base URL points at this Mac.
           </p>
         }
       </div>

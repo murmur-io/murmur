@@ -194,6 +194,7 @@ pub fn run() {
             commands::list_brain_models,
             commands::brain_model_retirement_nudge,
             commands::brain_posture,
+            commands::resolved_ai_map,
             commands::set_brain_posture,
             commands::brain_live_ram_ok,
             commands::brain_reactions_shadow_count,

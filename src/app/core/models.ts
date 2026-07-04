@@ -329,6 +329,18 @@ export interface BrainModelDto {
  */
 export type Posture = "cloud" | "hybrid" | "fully_local" | "custom";
 
+/** One row of the Settings "What runs where" map (mirrors Rust `AiMapRow`, camelCase). */
+export interface AiMapRow {
+  job: string;
+  title: string;
+  engine: string;
+  model: string;
+  onDevice: boolean;
+  redacted: boolean;
+  active: boolean;
+  routable: boolean;
+}
+
 /**
  * The installed-base migration nudge (`brain_model_retirement_nudge`): non-null
  * when the persisted `brainModelId` points at a RETIRED model (the non-commercial

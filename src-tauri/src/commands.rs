@@ -5105,6 +5105,20 @@ pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<
     Ok(())
 }
 
+/// The RESOLVED "what runs where" map for the Settings AI page — one row per AI job with its
+/// resolved engine/model/locality (mirrors `roles::resolve`; display-only, steers nothing).
+/// Read-only config projection: no content, no PII, no keys — NOT a gated content read.
+#[tauri::command]
+pub fn resolved_ai_map(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::settings::ai_map::AiMapRow>, AppError> {
+    let c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(crate::settings::ai_map::ai_map_rows(&c))
+}
+
 /// Whether the machine has enough RAM to run Realtime Reactions (the light engine) alongside a live
 /// recording — the combined-residency guard (spec §3.3), including a KV estimate + call-overhead. Lets
 /// the Brain Live card warn / gate before enabling. `true` when total RAM can't be read (never block
@@ -8104,7 +8118,7 @@ pub(crate) async fn share_note_to_link_inner(
     // (4) Upload: content cell + wrapped_nk + gate_salt + gate_secret + rev + passwordRequired.
     //     L is NOT in this request (CreateShareRequest has no `l` field) — it stays on-device.
     let expires_at = expires_days.map(|d| {
-        let days = d.min(365).max(1) as i64;
+        let days = d.clamp(1, 365) as i64;
         (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
     });
     let argon = if pw_ref.is_some() {
@@ -8301,11 +8315,12 @@ fn tofu_check(
     }
 }
 
+/// The logged-in sharing session's `(account_id, generation, MK, access_token)` tuple.
+type SessionMk = (String, u32, zeroize::Zeroizing<[u8; 32]>, String);
+
 /// The logged-in sharing session's `(account_id, generation, MK, access_token)`, or a fail-closed
 /// `Unavailable` when logged out (mode-B needs MK to DERIVE the identity keypair for sign/open).
-fn require_session_mk(
-    state: &AppState,
-) -> Result<(String, u32, zeroize::Zeroizing<[u8; 32]>, String), AppError> {
+fn require_session_mk(state: &AppState) -> Result<SessionMk, AppError> {
     let g = state
         .account_session
         .lock()

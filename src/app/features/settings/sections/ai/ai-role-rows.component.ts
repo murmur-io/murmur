@@ -8,7 +8,6 @@ import {
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../settings.store";
-import { LocalModelsListComponent } from "./local-models-list.component";
 
 /** Provider-backed connection ids (a per-role model select makes sense on these). */
 const PROVIDER_CONNECTION_IDS: readonly string[] = [
@@ -45,14 +44,14 @@ interface RoleRowVm {
  * instead). The Ask row is the successor of the old "Assistant backend"
  * select (its Local/Off targets live here now, and changing it compat-writes
  * the legacy `brainBackend` — see SettingsStore.setRoleConnection). The
- * global GGUF registry block (owns `brainModelId`) renders below the rows
- * whenever Ask or Live picks "Local model" — it is shared, not per-role.
+ * global GGUF registry (owns `brainModelId`) now lives under Engines →
+ * Murmur Brain → Configure, not in these rows — it is shared, not per-role.
  */
 @Component({
   selector: "app-ai-role-rows",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, LocalModelsListComponent],
+  imports: [ReactiveFormsModule],
   template: `
     <div class="role-block" [formGroup]="form">
       <button
@@ -103,14 +102,18 @@ interface RoleRowVm {
                 (change)="onConnectionChange(row.role, $event)"
               >
                 <option value="">Inherit default</option>
-                <option value="claude_code">Claude Code</option>
-                <option value="anthropic">Anthropic API</option>
-                <option value="ollama">Ollama</option>
-                <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
                 @if (row.offersReasonerTargets) {
-                  <option value="local">Local model — on-device</option>
-                  <option value="off">Off — retrieval only</option>
+                  <optgroup label="Built-in (on this Mac)">
+                    <option value="local">Murmur Brain — on-device</option>
+                    <option value="off">Off — retrieval only</option>
+                  </optgroup>
                 }
+                <optgroup label="Your engines">
+                  <option value="claude_code">Claude Code</option>
+                  <option value="anthropic">Anthropic API</option>
+                  <option value="ollama">Ollama</option>
+                  <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
+                </optgroup>
               </select>
 
               @if (!row.conn) {
@@ -209,11 +212,14 @@ interface RoleRowVm {
 
           <!--
             The GGUF registry is GLOBAL (it owns brainModelId — the resolver's
-            local default for every role), so it renders once, shared by every
-            row set to "Local model", not per-row. Extracted to LocalModelsListComponent (Task 3).
+            local default for every role). It now lives under Engines → Murmur
+            Brain → Configure (Task 5); the row just points there.
           -->
           @if (anyLocal()) {
-            <app-local-models-list />
+            <p class="field-help text-muted">
+              On-device models are managed under Engines above (Murmur Brain →
+              Configure).
+            </p>
           }
         </div>
       }
