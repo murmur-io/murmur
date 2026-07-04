@@ -289,11 +289,6 @@ pub struct SampleReader {
 }
 
 impl SampleReader {
-    /// Total mono samples captured so far (source rate). `0` on a poisoned lock (best-effort).
-    pub fn total(&self) -> usize {
-        self.shared.samples.lock().map(|g| g.len()).unwrap_or(0)
-    }
-
     /// Clone the samples from `offset` to the current end (no drain). Empty past-the-end or on a
     /// poisoned lock — mirrors [`Recorder::snapshot_from`].
     pub fn snapshot_from(&self, offset: usize) -> Vec<f32> {
