@@ -442,7 +442,10 @@ mod tests {
             data.meetings.iter().all(|m| m.meeting_id != "sealedX"),
             "sealed-not-unlocked mentioning meeting leaked into dossier meetings"
         );
-        assert!(data.corpus.contains("[[Kickoff]]"), "must cite the visible meeting [[Title]]");
+        assert!(
+            data.corpus.contains("[[Kickoff]]"),
+            "must cite the visible meeting [[Title]]"
+        );
         assert!(
             !data.corpus.contains("LOCKED Atlas acquisition"),
             "sealed note body leaked into the dossier corpus (gate violation)"
@@ -450,9 +453,14 @@ mod tests {
 
         // Commitment filter: 'draft Atlas spec' is in a mentioning meeting (open1);
         // 'own the rollout' is owner==Atlas (owner filter). Carol's sealed item is excluded.
-        assert!(data.commitments.iter().any(|c| c.text.contains("draft Atlas spec")));
+        assert!(data
+            .commitments
+            .iter()
+            .any(|c| c.text.contains("draft Atlas spec")));
         assert!(
-            data.commitments.iter().any(|c| c.text.contains("own the rollout")),
+            data.commitments
+                .iter()
+                .any(|c| c.text.contains("own the rollout")),
             "owner==entity-name commitment must be included"
         );
         assert!(
@@ -460,7 +468,9 @@ mod tests {
             "sealed-not-unlocked commitment leaked (gate violation)"
         );
         assert!(
-            data.commitments.iter().all(|c| !c.text.contains("done thing")),
+            data.commitments
+                .iter()
+                .all(|c| !c.text.contains("done thing")),
             "checked-off item must not be an open commitment"
         );
 
@@ -472,7 +482,10 @@ mod tests {
         unlocked.insert("f-lock".to_string());
         let data2 = build_dossier_data(&db, &atlas, &unlocked).unwrap().unwrap();
         assert!(data2.meetings.iter().any(|m| m.meeting_id == "sealedX"));
-        assert!(data2.corpus.contains("LOCKED Atlas acquisition"), "unlocked content must reappear");
+        assert!(
+            data2.corpus.contains("LOCKED Atlas acquisition"),
+            "unlocked content must reappear"
+        );
         assert!(data2.commitments.iter().any(|c| c.text.contains("sign")));
     }
 
@@ -485,7 +498,13 @@ mod tests {
         let db = temp_db();
         seed_folder(&db, "f-lock");
         seed_meeting(&db, "open1", "Kickoff", "Atlas status", None);
-        seed_meeting(&db, "sealedX", "Secret Review", "Atlas secret", Some("f-lock"));
+        seed_meeting(
+            &db,
+            "sealedX",
+            "Secret Review",
+            "Atlas secret",
+            Some("f-lock"),
+        );
         let atlas = db
             .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
             .unwrap();
@@ -505,8 +524,10 @@ mod tests {
             })
         };
         // An open fact from the OPEN meeting + a (sealed-meeting) fact that must be gated out.
-        db.apply_fact_ops(&[mk("shipped", "2026-06-20T00:00:00Z", "open1")]).unwrap();
-        db.apply_fact_ops(&[mk("price-secret", "2026-06-21T00:00:00Z", "sealedX")]).unwrap();
+        db.apply_fact_ops(&[mk("shipped", "2026-06-20T00:00:00Z", "open1")])
+            .unwrap();
+        db.apply_fact_ops(&[mk("price-secret", "2026-06-21T00:00:00Z", "sealedX")])
+            .unwrap();
         db.set_folder_locked("f-lock", true, None).unwrap();
 
         let nothing = HashSet::new();
@@ -558,11 +579,20 @@ mod tests {
         };
         // ollama → tight 4k budget caps the user message hard; the [[Title]] cite still renders.
         let user = render_dossier_user(&data, "ollama");
-        assert!(user.contains("[[Kickoff]]"), "must cite [[Title]] in the user prompt");
-        assert!(user.len() <= 4_000, "ollama user prompt must respect the tight budget");
+        assert!(
+            user.contains("[[Kickoff]]"),
+            "must cite [[Title]] in the user prompt"
+        );
+        assert!(
+            user.len() <= 4_000,
+            "ollama user prompt must respect the tight budget"
+        );
         // Cloud provider gets headroom but is still bounded.
         let user_cloud = render_dossier_user(&data, "anthropic");
         assert!(user_cloud.len() <= 80_000);
-        assert!(user_cloud.len() > 4_000, "cloud budget must give more headroom than ollama");
+        assert!(
+            user_cloud.len() > 4_000,
+            "cloud budget must give more headroom than ollama"
+        );
     }
 }

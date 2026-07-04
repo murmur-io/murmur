@@ -84,7 +84,8 @@ mod tests {
 
     #[test]
     fn parses_and_dedups() {
-        let r = r#"junk {"people":["Anna Kowalska","anna kowalska",""],"projects":["Atlas"]} trailing"#;
+        let r =
+            r#"junk {"people":["Anna Kowalska","anna kowalska",""],"projects":["Atlas"]} trailing"#;
         let p = parse(r).unwrap();
         assert_eq!(p.people, vec!["Anna Kowalska"]); // dedup + drop empty
         assert_eq!(p.projects, vec!["Atlas"]);

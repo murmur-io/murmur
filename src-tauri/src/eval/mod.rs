@@ -319,7 +319,7 @@ mod tests {
         assert!((ndcg_at_k(&ids(&["a"]), &[], 5) - 1.0).abs() < 1e-9); // vacuous
         assert!((ndcg_at_k(&ids(&["a"]), &ids(&["a"]), 0) - 0.0).abs() < 1e-9); // k=0
         assert!((ndcg_at_k(&[], &ids(&["a"]), 5) - 0.0).abs() < 1e-9); // nothing retrieved
-        // No relevant in top-k → 0 (relevant is beyond the cutoff).
+                                                                       // No relevant in top-k → 0 (relevant is beyond the cutoff).
         assert!((ndcg_at_k(&ids(&["x", "y", "a"]), &ids(&["a"]), 2) - 0.0).abs() < 1e-9);
     }
 

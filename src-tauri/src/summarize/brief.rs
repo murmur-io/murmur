@@ -30,7 +30,11 @@ mod tests {
 
     #[test]
     fn builds_brief_prompt() {
-        let (s, u) = build_brief_prompt("### [[1:1 Anna]] · 2026-07-01\nDiscussed raise.", "1:1 with Anna", "auto");
+        let (s, u) = build_brief_prompt(
+            "### [[1:1 Anna]] · 2026-07-01\nDiscussed raise.",
+            "1:1 with Anna",
+            "auto",
+        );
         assert!(s.contains("Talking points"));
         assert!(s.contains("[[1:1 Anna]]"));
         assert!(u.contains("1:1 with Anna"));

@@ -262,7 +262,9 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                             crate::audio::wake::VoiceIntent::Research { .. } => "research",
                             crate::audio::wake::VoiceIntent::SlackSearch { .. } => "slack_search",
                             crate::audio::wake::VoiceIntent::Recall { .. } => "recall",
-                            crate::audio::wake::VoiceIntent::CreateReminder { .. } => "create_reminder",
+                            crate::audio::wake::VoiceIntent::CreateReminder { .. } => {
+                                "create_reminder"
+                            }
                             crate::audio::wake::VoiceIntent::NoteAside { .. } => "note_aside",
                             crate::audio::wake::VoiceIntent::Unknown { .. } => "unknown",
                         };
@@ -273,7 +275,11 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                         // hit, exactly as before. A dispatch panic is contained to its own thread.
                         let dispatch = {
                             let state = app.state::<AppState>();
-                            state.config.lock().map(|c| should_dispatch(&c)).unwrap_or(false)
+                            state
+                                .config
+                                .lock()
+                                .map(|c| should_dispatch(&c))
+                                .unwrap_or(false)
                         };
                         tracing::info!(
                             target: "voice",
@@ -431,7 +437,14 @@ pub fn run_assistant_query(
         thread_id,
         "assistant query dispatched"
     );
-    persist_interaction(state.inner(), &meeting_id, command, &result, thread_id, anchor_text);
+    persist_interaction(
+        state.inner(),
+        &meeting_id,
+        command,
+        &result,
+        thread_id,
+        anchor_text,
+    );
     result
 }
 
@@ -514,8 +527,7 @@ fn run_informational(
         // it next to the live-transcript section. It rides the SAME redaction firewall + cloud-consent
         // gate as every other prompt segment — NO new egress class (design spec C3). Suppressed
         // entirely when memory is turned off (`user_memory_enabled == false`).
-        let memory_brief =
-            gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled);
+        let memory_brief = gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled);
         let system = assistant_system_prompt(&live, &typed_notes, &memory_brief);
         match crate::agent::run_agentic_loop(
             &*reasoner,
@@ -573,7 +585,9 @@ fn floor_intent_for(
     match intent {
         crate::audio::wake::VoiceIntent::CreateReminder { .. }
         | crate::audio::wake::VoiceIntent::NoteAside { .. } => {
-            crate::audio::wake::VoiceIntent::Research { topic: command.trim().to_string() }
+            crate::audio::wake::VoiceIntent::Research {
+                topic: command.trim().to_string(),
+            }
         }
         other => other.clone(),
     }
@@ -593,9 +607,10 @@ pub(crate) struct ToolEventSink {
 }
 impl crate::agent::DeltaSink for ToolEventSink {
     fn tool_running(&self, tool: &str) {
-        let _ = self
-            .app
-            .emit(self.event, tool_trace_payload(&self.thread_id, tool, "running", true, None));
+        let _ = self.app.emit(
+            self.event,
+            tool_trace_payload(&self.thread_id, tool, "running", true, None),
+        );
     }
     fn tool_done(&self, tool: &str, ok: bool, result_chars: usize) {
         let _ = self.app.emit(
@@ -717,7 +732,9 @@ fn step_manual_capture(
     // Transcribe ONLY the post-click window when an offset was latched; otherwise fall back to the
     // rolling-tail caption the live loop already produced (degenerate arm path with no recorder).
     let command = match current.start_sample {
-        Some(offset) => transcribe_since(app, transcriber, clip_lang_ref, offset).unwrap_or_default(),
+        Some(offset) => {
+            transcribe_since(app, transcriber, clip_lang_ref, offset).unwrap_or_default()
+        }
         None => caption.trim().to_string(),
     };
 
@@ -776,11 +793,7 @@ fn transcribe_since(
 /// changed it mid-recording). Side-effecting only in that it reads the config lock; the decision is
 /// the pure [`resolve_clip_lang_core`].
 fn resolve_clip_lang(loop_lang: Option<&str>, state: &AppState) -> Option<String> {
-    let cfg_lang = state
-        .config
-        .lock()
-        .ok()
-        .and_then(|c| c.language.clone());
+    let cfg_lang = state.config.lock().ok().and_then(|c| c.language.clone());
     resolve_clip_lang_core(loop_lang, cfg_lang.as_deref())
 }
 
@@ -843,7 +856,11 @@ fn is_filler_token(tok: &str) -> bool {
 /// path's whole utterance is the command, which is virtually always ≥2 words).
 fn is_meaningful_command(command: &str) -> bool {
     let tokens: Vec<&str> = command.split_whitespace().collect();
-    let non_filler: Vec<&str> = tokens.iter().copied().filter(|t| !is_filler_token(t)).collect();
+    let non_filler: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .filter(|t| !is_filler_token(t))
+        .collect();
     // Count of meaningful (non-filler) tokens.
     let meaningful_tokens = non_filler.len();
     // Total non-filler alphanumeric chars (diacritic-insensitive count via char count of the kept
@@ -890,7 +907,9 @@ fn decide_manual_capture(
         // "nothing_heard", never a garbage card.
         if !command.is_empty() && is_meaningful_command(command) {
             (
-                ManualCaptureDecision::Dispatch { command: command.to_string() },
+                ManualCaptureDecision::Dispatch {
+                    command: command.to_string(),
+                },
                 None,
             )
         } else {
@@ -901,7 +920,10 @@ fn decide_manual_capture(
         // user's stop click. We do NOT dispatch on hearing speech (CLICK-TO-STOP).
         (
             ManualCaptureDecision::KeepListening,
-            Some(crate::state::CaptureState { budget: remaining, ..capture }),
+            Some(crate::state::CaptureState {
+                budget: remaining,
+                ..capture
+            }),
         )
     }
 }
@@ -927,7 +949,9 @@ fn resolve_command_intent(
         return intent;
     }
     // Brain unavailable / no mapping → Research over the literal command is a fine default.
-    crate::audio::wake::VoiceIntent::Research { topic: command.trim().to_string() }
+    crate::audio::wake::VoiceIntent::Research {
+        topic: command.trim().to_string(),
+    }
 }
 
 /// Pure, headless-testable core of the wake wiring: detect a wake utterance at the head of a
@@ -1008,7 +1032,8 @@ fn caption_words_match(a: &str, b: &str) -> bool {
 /// Normalize one word for the overlap compare: trim leading/trailing non-alphanumerics (Unicode-
 /// aware, so diacritics survive) and Unicode-lowercase the rest.
 fn normalize_caption_word(w: &str) -> String {
-    w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+    w.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
 }
 
 /// Merge a caption into the shared live-transcript buffer (read-modify-write under its Mutex) and
@@ -1045,12 +1070,15 @@ fn gated_live_context(
     meeting_id: &str,
     unlocked: &std::collections::HashSet<String>,
 ) -> (String, String) {
-    let visible = !meeting_id.is_empty()
-        && db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false);
+    let visible =
+        !meeting_id.is_empty() && db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false);
     if !visible {
         return (String::new(), String::new());
     }
-    let live = live_transcript.lock().map(|t| t.clone()).unwrap_or_default();
+    let live = live_transcript
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_default();
     let typed = db.get_manual_notes(meeting_id).unwrap_or_default();
     (live, typed)
 }
@@ -1196,7 +1224,11 @@ mod tests {
             uuid::Uuid::parse_str(&generated).is_ok(),
             "a missing thread id must become a real UUID"
         );
-        assert_eq!(ensure_thread_id(Some("t-7".into())), "t-7", "explicit id passes through");
+        assert_eq!(
+            ensure_thread_id(Some("t-7".into())),
+            "t-7",
+            "explicit id passes through"
+        );
         assert!(
             uuid::Uuid::parse_str(&ensure_thread_id(Some("   ".into()))).is_ok(),
             "a blank id counts as absent and is regenerated"
@@ -1220,16 +1252,24 @@ mod tests {
         // The FE reads camelCase — the serialized event must expose `threadId`.
         let json = serde_json::to_value(&done).unwrap();
         assert_eq!(json.get("threadId").and_then(|v| v.as_str()), Some("t-9"));
-        assert_eq!(json.get("tool").and_then(|v| v.as_str()), Some("search_meetings"));
+        assert_eq!(
+            json.get("tool").and_then(|v| v.as_str()),
+            Some("search_meetings")
+        );
     }
 
     #[test]
     fn wake_event_for_builds_payload_with_parsed_intent_on_hit() {
-        let p = wake_event_for("klodku zrób research o konkurencji")
-            .expect("vocative wake must fire");
+        let p =
+            wake_event_for("klodku zrób research o konkurencji").expect("vocative wake must fire");
         assert_eq!(p.matched_phrase, "klodku");
         assert_eq!(p.command, "zrób research o konkurencji");
-        assert_eq!(p.intent, VoiceIntent::Research { topic: "konkurencji".into() });
+        assert_eq!(
+            p.intent,
+            VoiceIntent::Research {
+                topic: "konkurencji".into()
+            }
+        );
     }
 
     // ── #23 DEDUP: one spoken wake = one dispatch; a fresh wake later DOES fire ───────────────────
@@ -1239,7 +1279,10 @@ mod tests {
         // The #23 echo: the same "Klaudku zrób research" stays visible across several overlapping
         // ~14s tails. The FIRST tick fires; the next ticks (within the window) are SKIPPED.
         let mut d = WakeDedup::default();
-        assert!(d.should_fire("zrób research o konkurencji"), "first detection must fire");
+        assert!(
+            d.should_fire("zrób research o konkurencji"),
+            "first detection must fire"
+        );
         for _ in 0..WAKE_DEDUP_TICKS - 1 {
             d.tick();
             assert!(
@@ -1267,7 +1310,10 @@ mod tests {
         // RECALL: a DIFFERENT wake command in the same recording must fire right away, even while the
         // previous one's suppression window is still live (the user's "to ma zawsze łapać").
         let mut d = WakeDedup::default();
-        assert!(d.should_fire("zrób research o konkurencji"), "first command fires");
+        assert!(
+            d.should_fire("zrób research o konkurencji"),
+            "first command fires"
+        );
         d.tick();
         assert!(
             d.should_fire("co wiemy o atlasie"),
@@ -1280,7 +1326,10 @@ mod tests {
         // The user genuinely asks the SAME thing again, later. Once the suppression window has fully
         // aged out, the same command fires again — dedup suppresses the echo, not a real re-ask.
         let mut d = WakeDedup::default();
-        assert!(d.should_fire("zrób research o konkurencji"), "first ask fires");
+        assert!(
+            d.should_fire("zrób research o konkurencji"),
+            "first ask fires"
+        );
         for _ in 0..WAKE_DEDUP_TICKS {
             d.tick();
         }
@@ -1319,8 +1368,14 @@ mod tests {
     fn realtime_reactions_off_does_not_dispatch_on_default_config() {
         // Default config has `realtime_reactions = false` ⇒ a wake hit is SURFACED, never dispatched.
         let cfg = crate::settings::AppConfig::default();
-        assert!(!cfg.realtime_reactions, "the in-meeting assistant must be opt-in");
-        assert!(!should_dispatch(&cfg), "default (OFF) must not dispatch a voice action");
+        assert!(
+            !cfg.realtime_reactions,
+            "the in-meeting assistant must be opt-in"
+        );
+        assert!(
+            !should_dispatch(&cfg),
+            "default (OFF) must not dispatch a voice action"
+        );
 
         // The wake still FIRES regardless of the toggle — only the dispatch is gated by it, so OFF
         // is exactly today's behaviour (detect + surface).
@@ -1342,12 +1397,20 @@ mod tests {
     use serde_json::Value;
 
     fn armed(budget: u32) -> CaptureState {
-        CaptureState { budget, start_sample: Some(0), ended: false }
+        CaptureState {
+            budget,
+            start_sample: Some(0),
+            ended: false,
+        }
     }
 
     /// An armed capture the user has CLICKED STOP on (`end_voice_command` flipped `ended`).
     fn ended(budget: u32) -> CaptureState {
-        CaptureState { budget, start_sample: Some(0), ended: true }
+        CaptureState {
+            budget,
+            start_sample: Some(0),
+            ended: true,
+        }
     }
 
     #[test]
@@ -1363,7 +1426,11 @@ mod tests {
         );
         assert_eq!(
             next,
-            Some(CaptureState { budget: 19, start_sample: Some(0), ended: false }),
+            Some(CaptureState {
+                budget: 19,
+                start_sample: Some(0),
+                ended: false
+            }),
             "a listening tick decrements the backstop and keeps the latched offset + ended flag"
         );
     }
@@ -1393,7 +1460,9 @@ mod tests {
         let (decision, next) = decide_manual_capture(cap, "zrób research o konkurencji");
         assert_eq!(
             decision,
-            ManualCaptureDecision::Dispatch { command: "zrób research o konkurencji".into() },
+            ManualCaptureDecision::Dispatch {
+                command: "zrób research o konkurencji".into()
+            },
             "reaching the backstop cap with a real utterance must dispatch it (backstop)"
         );
         assert!(next.is_none(), "capture cleared at the backstop");
@@ -1432,7 +1501,11 @@ mod tests {
         assert_eq!(decision, ManualCaptureDecision::KeepListening);
         assert_eq!(
             next,
-            Some(CaptureState { budget: 2, start_sample: Some(0), ended: false }),
+            Some(CaptureState {
+                budget: 2,
+                start_sample: Some(0),
+                ended: false
+            }),
             "a silent tick must decrement the backstop and keep the SAME latched offset + flag"
         );
     }
@@ -1441,7 +1514,10 @@ mod tests {
     fn nothing_heard_result_is_graceful_with_empty_command() {
         let r = crate::voice_action::VoiceActionResult::nothing_heard();
         assert_eq!(r.status, "nothing_heard");
-        assert!(r.command.is_empty(), "nothing was heard ⇒ no command surfaced");
+        assert!(
+            r.command.is_empty(),
+            "nothing was heard ⇒ no command surfaced"
+        );
         assert!(
             r.summary.contains("didn't hear"),
             "friendly nudge to click + speak again, not 'didn't catch an action'"
@@ -1493,14 +1569,24 @@ mod tests {
     fn resolve_keyword_fast_path_wins_without_touching_the_brain() {
         // A keyword-recognized command never calls the brain (DeadBrain would error if it did).
         let intent = resolve_command_intent(&DeadBrain, "zrób research o konkurencji");
-        assert_eq!(intent, VoiceIntent::Research { topic: "konkurencji".into() });
+        assert_eq!(
+            intent,
+            VoiceIntent::Research {
+                topic: "konkurencji".into()
+            }
+        );
     }
 
     #[test]
     fn resolve_unknown_command_uses_the_brain_mapping() {
         // Keyword Unknown ("poszukaj mi info o…") → brain maps it to Research over its argument.
         let intent = resolve_command_intent(&BrainResearch, "poszukaj mi info o wakacjach");
-        assert_eq!(intent, VoiceIntent::Research { topic: "wakacjach".into() });
+        assert_eq!(
+            intent,
+            VoiceIntent::Research {
+                topic: "wakacjach".into()
+            }
+        );
     }
 
     #[test]
@@ -1510,7 +1596,9 @@ mod tests {
         let intent = resolve_command_intent(&DeadBrain, "find me the latest on widgets");
         assert_eq!(
             intent,
-            VoiceIntent::Research { topic: "find me the latest on widgets".into() },
+            VoiceIntent::Research {
+                topic: "find me the latest on widgets".into()
+            },
             "a non-empty command with no brain must default to Research over the literal text"
         );
     }
@@ -1526,14 +1614,21 @@ mod tests {
         // A "save"-style phrase that the classifier parses as a WRITE (NoteAside) must NOT drive a
         // hardcoded write on the floor — it is demoted to a Research over the literal command. (The
         // actual answer-vs-act DECISION belongs to the agentic loop, not this floor.)
-        let note = VoiceIntent::NoteAside { text: "send the deck to Anna".into() };
+        let note = VoiceIntent::NoteAside {
+            text: "send the deck to Anna".into(),
+        };
         assert_eq!(
             floor_intent_for(&note, "note that I send the deck to Anna"),
-            VoiceIntent::Research { topic: "note that I send the deck to Anna".into() },
+            VoiceIntent::Research {
+                topic: "note that I send the deck to Anna".into()
+            },
             "the floor must NOT perform a hardcoded NoteAside write — it answers informationally"
         );
 
-        let reminder = VoiceIntent::CreateReminder { text: "email Bob".into(), due: None };
+        let reminder = VoiceIntent::CreateReminder {
+            text: "email Bob".into(),
+            due: None,
+        };
         assert_eq!(
             floor_intent_for(&reminder, "remind me to email Bob"),
             VoiceIntent::Research { topic: "remind me to email Bob".into() },
@@ -1546,10 +1641,18 @@ mod tests {
         // Read intents are UNTOUCHED by the floor demotion ⇒ the no-consent/local informational answer
         // is exactly today's behavior (zero regression). Research/Recall/SlackSearch/Unknown all pass.
         for intent in [
-            VoiceIntent::Research { topic: "atlas pricing".into() },
-            VoiceIntent::Recall { entity: "Anna".into() },
-            VoiceIntent::SlackSearch { query: "raport".into() },
-            VoiceIntent::Unknown { raw: "gibberish".into() },
+            VoiceIntent::Research {
+                topic: "atlas pricing".into(),
+            },
+            VoiceIntent::Recall {
+                entity: "Anna".into(),
+            },
+            VoiceIntent::SlackSearch {
+                query: "raport".into(),
+            },
+            VoiceIntent::Unknown {
+                raw: "gibberish".into(),
+            },
         ] {
             assert_eq!(
                 floor_intent_for(&intent, "the literal command"),
@@ -1564,7 +1667,9 @@ mod tests {
     #[test]
     fn is_meaningful_command_rejects_filler_and_too_short() {
         // Pure fillers / single short tokens / punctuation → NOT meaningful.
-        for junk in ["Uh,", "uh", "eee", "Hmm", "yyy", "aha", "ok", ".", ",", "a", "—", "  uh  ", "eh"] {
+        for junk in [
+            "Uh,", "uh", "eee", "Hmm", "yyy", "aha", "ok", ".", ",", "a", "—", "  uh  ", "eh",
+        ] {
             assert!(
                 !is_meaningful_command(junk),
                 "garbage/filler {junk:?} must NOT be a meaningful command"
@@ -1578,7 +1683,10 @@ mod tests {
             "do research on pricing",
             "przypomnij mi o spotkaniu",
         ] {
-            assert!(is_meaningful_command(good), "real command {good:?} must be meaningful");
+            assert!(
+                is_meaningful_command(good),
+                "real command {good:?} must be meaningful"
+            );
         }
     }
 
@@ -1601,7 +1709,9 @@ mod tests {
         let (d, n) = decide_manual_capture(ended(15), "  zrób research o pogodzie  ");
         assert_eq!(
             d,
-            ManualCaptureDecision::Dispatch { command: "zrób research o pogodzie".into() },
+            ManualCaptureDecision::Dispatch {
+                command: "zrób research o pogodzie".into()
+            },
             "an ended real command must dispatch"
         );
         assert!(n.is_none(), "capture cleared on dispatch");
@@ -1625,7 +1735,10 @@ mod tests {
             "the freshest configured language must win"
         );
         // Loop lang is used when config is unset.
-        assert_eq!(resolve_clip_lang_core(Some("de"), None).as_deref(), Some("de"));
+        assert_eq!(
+            resolve_clip_lang_core(Some("de"), None).as_deref(),
+            Some("de")
+        );
         // Blank / "auto" / both-unset → None (whisper auto-detects; user can set it in Settings).
         assert_eq!(resolve_clip_lang_core(None, Some("")), None);
         assert_eq!(resolve_clip_lang_core(None, Some("auto")), None);
@@ -1691,8 +1804,14 @@ mod tests {
     fn assistant_system_prompt_is_honest_about_attribution() {
         let p = assistant_system_prompt("we shipped the beta", "", "");
         let lower = p.to_lowercase();
-        assert!(lower.contains("unattributed"), "must state the transcript is unattributed: {p}");
-        assert!(lower.contains("microphone"), "must state the mic-side capture origin: {p}");
+        assert!(
+            lower.contains("unattributed"),
+            "must state the transcript is unattributed: {p}"
+        );
+        assert!(
+            lower.contains("microphone"),
+            "must state the mic-side capture origin: {p}"
+        );
         assert!(
             !p.contains("its topic, decisions, who said what"),
             "must not claim the transcript knows who said what: {p}"
@@ -1752,16 +1871,29 @@ mod tests {
         })
         .unwrap();
         seed_meeting(&db, "m1", Some("f1"));
-        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         let live = std::sync::Mutex::new("sealed meeting tail still in RAM".to_string());
         let unlocked = std::collections::HashSet::new();
         let (tail, notes) = gated_live_context(&db, &live, "m1", &unlocked);
-        assert!(tail.is_empty(), "sealed-not-unlocked meeting must inject NO live tail");
-        assert!(notes.is_empty(), "sealed-not-unlocked meeting must inject NO typed notes");
+        assert!(
+            tail.is_empty(),
+            "sealed-not-unlocked meeting must inject NO live tail"
+        );
+        assert!(
+            notes.is_empty(),
+            "sealed-not-unlocked meeting must inject NO typed notes"
+        );
         let prompt = assistant_system_prompt(&tail, &notes, "");
-        assert!(!prompt.contains("LIVE TRANSCRIPT"), "no live section for a sealed meeting: {prompt}");
-        assert!(!prompt.contains("sealed meeting tail"), "the RAM buffer must not reach the prompt");
+        assert!(
+            !prompt.contains("LIVE TRANSCRIPT"),
+            "no live section for a sealed meeting: {prompt}"
+        );
+        assert!(
+            !prompt.contains("sealed meeting tail"),
+            "the RAM buffer must not reach the prompt"
+        );
         // The in-flight buffer itself is NOT wiped — a session re-unlock re-injects it.
         assert_eq!(*live.lock().unwrap(), "sealed meeting tail still in RAM");
     }
@@ -1785,14 +1917,26 @@ mod tests {
         let live = std::sync::Mutex::new("we agreed to ship friday".to_string());
         let unlocked = std::collections::HashSet::new();
         let (tail, notes) = gated_live_context(&db, &live, "m-rec", &unlocked);
-        assert_eq!(tail, "we agreed to ship friday", "a visible meeting injects the live tail");
-        assert_eq!(notes, "ship Friday", "a visible meeting injects the typed notes");
+        assert_eq!(
+            tail, "we agreed to ship friday",
+            "a visible meeting injects the live tail"
+        );
+        assert_eq!(
+            notes, "ship Friday",
+            "a visible meeting injects the typed notes"
+        );
 
         // NO current meeting (not recording) ⇒ fail-closed: nothing injects even if a stale
         // buffer somehow survived.
         let (tail, notes) = gated_live_context(&db, &live, "", &unlocked);
-        assert!(tail.is_empty(), "no current meeting must inject NO live tail");
-        assert!(notes.is_empty(), "no current meeting must inject NO typed notes");
+        assert!(
+            tail.is_empty(),
+            "no current meeting must inject NO live tail"
+        );
+        assert!(
+            notes.is_empty(),
+            "no current meeting must inject NO typed notes"
+        );
     }
 
     #[test]
@@ -1810,7 +1954,8 @@ mod tests {
         })
         .unwrap();
         seed_meeting(&db, "m1", Some("f1"));
-        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         let live = std::sync::Mutex::new("tail".to_string());
         let mut unlocked = std::collections::HashSet::new();
@@ -1825,7 +1970,10 @@ mod tests {
     fn clear_live_transcript_empties_the_buffer() {
         let live = std::sync::Mutex::new("stale tail of the finished recording".to_string());
         clear_live_transcript(&live);
-        assert!(live.lock().unwrap().is_empty(), "the buffer must be empty after Stop clears it");
+        assert!(
+            live.lock().unwrap().is_empty(),
+            "the buffer must be empty after Stop clears it"
+        );
         // Idempotent on an already-empty buffer.
         clear_live_transcript(&live);
         assert!(live.lock().unwrap().is_empty());
@@ -1837,7 +1985,11 @@ mod tests {
         // correctness there is the visibility gate's job); idle it clears.
         let live = std::sync::Mutex::new("in-flight captions".to_string());
         clear_live_transcript_if_idle(&live, true);
-        assert_eq!(*live.lock().unwrap(), "in-flight captions", "mid-recording buffer untouched");
+        assert_eq!(
+            *live.lock().unwrap(),
+            "in-flight captions",
+            "mid-recording buffer untouched"
+        );
         clear_live_transcript_if_idle(&live, false);
         assert!(live.lock().unwrap().is_empty(), "idle buffer cleared");
     }
@@ -1846,13 +1998,26 @@ mod tests {
     fn assistant_system_prompt_injects_transcript_only_when_present() {
         // No live transcript (not recording / no captions yet) ⇒ the base prompt, no transcript section.
         let base = assistant_system_prompt("", "", "");
-        assert!(!base.contains("LIVE TRANSCRIPT"), "no transcript section when empty: {base}");
+        assert!(
+            !base.contains("LIVE TRANSCRIPT"),
+            "no transcript section when empty: {base}"
+        );
         assert!(base.contains("in-meeting assistant"));
         // With a transcript ⇒ it is embedded + the brain is told to use it for the current meeting.
-        let with = assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "", "");
-        assert!(with.contains("LIVE TRANSCRIPT"), "names the transcript section: {with}");
-        assert!(with.contains("assigned the deck to Anna"), "embeds the transcript text");
-        assert!(with.to_lowercase().contains("current"), "tells the brain it's the current meeting");
+        let with =
+            assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "", "");
+        assert!(
+            with.contains("LIVE TRANSCRIPT"),
+            "names the transcript section: {with}"
+        );
+        assert!(
+            with.contains("assigned the deck to Anna"),
+            "embeds the transcript text"
+        );
+        assert!(
+            with.to_lowercase().contains("current"),
+            "tells the brain it's the current meeting"
+        );
     }
 
     /// The system prompt instructs the model to DECIDE answer-vs-propose: name the `propose_note` tool
@@ -1864,13 +2029,19 @@ mod tests {
             assistant_system_prompt("", "", ""),
             assistant_system_prompt("we shipped the beta", "", ""),
         ] {
-            assert!(prompt.contains("propose_note"), "names the propose_note tool: {prompt}");
+            assert!(
+                prompt.contains("propose_note"),
+                "names the propose_note tool: {prompt}"
+            );
             assert!(
                 prompt.to_lowercase().contains("note"),
                 "tells the model when to draft a note: {prompt}"
             );
             // Both an answer path and a note-draft path are described (decide between them).
-            assert!(prompt.to_lowercase().contains("answer"), "describes plain answering too: {prompt}");
+            assert!(
+                prompt.to_lowercase().contains("answer"),
+                "describes plain answering too: {prompt}"
+            );
         }
     }
 
@@ -1881,7 +2052,10 @@ mod tests {
         let long = "x ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS); // way over the inject budget
         let p = assistant_system_prompt(&long, "", "");
         assert!(p.contains('…'), "elision marker present when truncated");
-        assert!(p.chars().count() < long.chars().count(), "shorter than the raw transcript");
+        assert!(
+            p.chars().count() < long.chars().count(),
+            "shorter than the raw transcript"
+        );
     }
 
     /// brain2 realtime notes: typed notes are injected as their own section when present, and the
@@ -1891,7 +2065,10 @@ mod tests {
         // Empty typed notes ⇒ no typed-notes section, AND byte-identical to the no-notes prompt for
         // BOTH the no-transcript and with-transcript branches.
         let no_tx = assistant_system_prompt("", "", "");
-        assert!(!no_tx.contains("TYPED NOTES"), "no typed-notes section when empty: {no_tx}");
+        assert!(
+            !no_tx.contains("TYPED NOTES"),
+            "no typed-notes section when empty: {no_tx}"
+        );
         let tx = "we shipped the beta and assigned the deck to Anna";
         assert_eq!(
             assistant_system_prompt(tx, "", ""),
@@ -1901,20 +2078,38 @@ mod tests {
 
         // Present typed notes ⇒ embedded under the labeled section, alongside the transcript.
         let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.", "");
-        assert!(with.contains("TYPED NOTES"), "names the typed-notes section: {with}");
-        assert!(with.contains("Anna owns QA sign-off"), "embeds the typed-notes text");
-        assert!(with.contains("LIVE TRANSCRIPT"), "still injects the transcript too");
+        assert!(
+            with.contains("TYPED NOTES"),
+            "names the typed-notes section: {with}"
+        );
+        assert!(
+            with.contains("Anna owns QA sign-off"),
+            "embeds the typed-notes text"
+        );
+        assert!(
+            with.contains("LIVE TRANSCRIPT"),
+            "still injects the transcript too"
+        );
 
         // Typed notes inject even with NO transcript (the user can type before any caption lands).
         let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker", "");
-        assert!(notes_only.contains("TYPED NOTES"), "typed notes inject without a transcript");
+        assert!(
+            notes_only.contains("TYPED NOTES"),
+            "typed notes inject without a transcript"
+        );
         assert!(notes_only.contains("budget cap is the blocker"));
-        assert!(!notes_only.contains("LIVE TRANSCRIPT"), "no transcript section when transcript empty");
+        assert!(
+            !notes_only.contains("LIVE TRANSCRIPT"),
+            "no transcript section when transcript empty"
+        );
 
         // A very long typed-notes buffer is truncated to the recent tail (bounded like the transcript).
         let long = "y ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS);
         let p = assistant_system_prompt("", &long, "");
-        assert!(p.contains('…'), "elision marker present when typed notes truncated");
+        assert!(
+            p.contains('…'),
+            "elision marker present when typed notes truncated"
+        );
     }
 
     // ── Phase 3 CROSS-MEETING USER MEMORY: brief injection + the seal invariant ───────────────────
@@ -1927,7 +2122,10 @@ mod tests {
         // Empty brief ⇒ no memory section, AND byte-identical to the no-brief prompt for BOTH the
         // no-transcript and with-transcript branches.
         let no_brief = assistant_system_prompt("", "", "");
-        assert!(!no_brief.to_uppercase().contains("KNOW ABOUT THE USER"), "no memory section when empty");
+        assert!(
+            !no_brief.to_uppercase().contains("KNOW ABOUT THE USER"),
+            "no memory section when empty"
+        );
         assert_eq!(
             assistant_system_prompt("we shipped the beta", "", ""),
             assistant_system_prompt("we shipped the beta", "", "   "),
@@ -1937,14 +2135,26 @@ mod tests {
         // Present brief ⇒ embedded under the labeled memory section, alongside transcript + notes.
         let brief = "- You prefer: Polish replies\n- You work on: Project Atlas";
         let with = assistant_system_prompt("we shipped the beta", "ship Friday", brief);
-        assert!(with.to_uppercase().contains("KNOW ABOUT THE USER"), "names the memory section: {with}");
+        assert!(
+            with.to_uppercase().contains("KNOW ABOUT THE USER"),
+            "names the memory section: {with}"
+        );
         assert!(with.contains("Project Atlas"), "embeds the brief text");
-        assert!(with.contains("LIVE TRANSCRIPT"), "still injects the transcript too");
-        assert!(with.contains("TYPED NOTES"), "still injects the typed notes too");
+        assert!(
+            with.contains("LIVE TRANSCRIPT"),
+            "still injects the transcript too"
+        );
+        assert!(
+            with.contains("TYPED NOTES"),
+            "still injects the typed notes too"
+        );
 
         // The brief injects even with NO transcript and NO notes.
         let brief_only = assistant_system_prompt("", "", brief);
-        assert!(brief_only.to_uppercase().contains("KNOW ABOUT THE USER"), "brief injects standalone");
+        assert!(
+            brief_only.to_uppercase().contains("KNOW ABOUT THE USER"),
+            "brief injects standalone"
+        );
         assert!(brief_only.contains("Polish replies"));
     }
 
@@ -1982,24 +2192,40 @@ mod tests {
         // While the folder is OPEN the fact is visible → the brief contains it.
         let mut unlocked = std::collections::HashSet::new();
         let brief_open = gated_user_memory_brief(&db, &unlocked, true);
-        assert!(brief_open.contains("Polish replies"), "an open-folder user fact must be in the brief");
+        assert!(
+            brief_open.contains("Polish replies"),
+            "an open-folder user fact must be in the brief"
+        );
         let prompt_open = assistant_system_prompt("", "", &brief_open);
-        assert!(prompt_open.contains("Polish replies"), "and injected into the prompt");
+        assert!(
+            prompt_open.contains("Polish replies"),
+            "and injected into the prompt"
+        );
 
         // SEAL the folder (session NOT unlocked). NOTE: `set_folder_locked` only flips the flag — the
         // real seal path PURGES the fact (`purge_user_facts_tx`); here we assert the READ GATE alone,
         // so we don't purge, proving the gate hides a fact whose row still exists at rest.
-        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
         let visible_sealed = db.list_user_facts_visible(&unlocked).unwrap();
         assert!(
             visible_sealed.is_empty(),
             "a sealed-not-unlocked meeting's user fact must be INVISIBLE to the gated reader"
         );
         let brief_sealed = gated_user_memory_brief(&db, &unlocked, true);
-        assert!(brief_sealed.is_empty(), "sealed-source fact must NOT appear in the injected brief");
+        assert!(
+            brief_sealed.is_empty(),
+            "sealed-source fact must NOT appear in the injected brief"
+        );
         let prompt_sealed = assistant_system_prompt("", "", &brief_sealed);
-        assert!(!prompt_sealed.contains("Polish replies"), "the sealed fact must not reach the prompt");
-        assert!(!prompt_sealed.to_uppercase().contains("KNOW ABOUT THE USER"), "no memory section at all");
+        assert!(
+            !prompt_sealed.contains("Polish replies"),
+            "the sealed fact must not reach the prompt"
+        );
+        assert!(
+            !prompt_sealed.to_uppercase().contains("KNOW ABOUT THE USER"),
+            "no memory section at all"
+        );
 
         // A SESSION UNLOCK re-admits it (reversible gate).
         unlocked.insert("f1".to_string());

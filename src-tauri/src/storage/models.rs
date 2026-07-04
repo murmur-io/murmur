@@ -604,7 +604,9 @@ mod tests {
         assert_eq!(ctx.title, "Sprint Planning");
         assert_eq!(ctx.attendees, vec!["Alice", "bob@example.com"]);
         assert!(ctx.text.contains("Meeting: Sprint Planning"));
-        assert!(ctx.text.contains("When: 2026-06-28T10:00:00Z – 2026-06-28T11:00:00Z"));
+        assert!(ctx
+            .text
+            .contains("When: 2026-06-28T10:00:00Z – 2026-06-28T11:00:00Z"));
         assert!(ctx.text.contains("Attendees: Alice, bob@example.com"));
         assert!(ctx.text.contains("Agenda:"));
         assert!(ctx.text.contains("velocity"));

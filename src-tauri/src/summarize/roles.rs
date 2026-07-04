@@ -107,9 +107,7 @@ impl RoleTarget {
     /// backend from the cloud agentic-eligibility gate AND makes `provider_for` refuse to build a
     /// cloud provider for an explicit `apple` role key — both correct, both free.
     pub fn is_reasoner_only(&self) -> bool {
-        self.connection == CONN_LOCAL
-            || self.connection == CONN_OFF
-            || self.connection == CONN_AFM
+        self.connection == CONN_LOCAL || self.connection == CONN_OFF || self.connection == CONN_AFM
     }
 }
 
@@ -311,7 +309,11 @@ mod tests {
             ] {
                 let cfg = legacy_cfg(provider_id, backend);
                 // Notes ignores brain_backend entirely.
-                assert_eq!(resolve(Role::Notes, &cfg), notes_want, "{provider_id}/{backend:?}");
+                assert_eq!(
+                    resolve(Role::Notes, &cfg),
+                    notes_want,
+                    "{provider_id}/{backend:?}"
+                );
                 // Ask and Live map brain_backend identically.
                 let brain_want = match backend {
                     BrainBackend::Cloud => notes_want.clone(),
@@ -354,10 +356,16 @@ mod tests {
             // live model/effort left "" — inherit anthropic's own defaults.
             ..legacy_cfg("claude_code", BrainBackend::Off)
         };
-        assert_eq!(resolve(Role::Ask, &cfg), target("ollama", "mistral-small", "low"));
+        assert_eq!(
+            resolve(Role::Ask, &cfg),
+            target("ollama", "mistral-small", "low")
+        );
         assert_eq!(resolve(Role::Live, &cfg), target("anthropic", "", ""));
         // Notes has no explicit key → still the legacy default triple.
-        assert_eq!(resolve(Role::Notes, &cfg), target("claude_code", "picker-model", "high"));
+        assert_eq!(
+            resolve(Role::Notes, &cfg),
+            target("claude_code", "picker-model", "high")
+        );
     }
 
     /// The CONNECTION key is the override switch: a lone model/effort key with the connection
@@ -369,7 +377,10 @@ mod tests {
             role_notes_effort: "low".to_string(),
             ..legacy_cfg("claude_code", BrainBackend::Cloud)
         };
-        assert_eq!(resolve(Role::Notes, &cfg), target("claude_code", "picker-model", "high"));
+        assert_eq!(
+            resolve(Role::Notes, &cfg),
+            target("claude_code", "picker-model", "high")
+        );
     }
 
     /// GATE EQUIVALENCE — the agentic-eligibility gates replace `brain_backend == Cloud` with
@@ -499,11 +510,17 @@ mod tests {
             assert_eq!(resolve(role, &cfg), want, "{role:?}");
             assert_eq!(reasoner_target(role, &cfg), want, "{role:?}");
             // The cloud agentic-eligibility gate (commands.rs) auto-excludes AFM like Local/Off.
-            assert!(resolve(role, &cfg).is_reasoner_only(), "{role:?} must be reasoner-only");
+            assert!(
+                resolve(role, &cfg).is_reasoner_only(),
+                "{role:?} must be reasoner-only"
+            );
         }
 
         // (b) A human-facing display name (never the raw token) — mirrors the FE label.
-        assert_eq!(connection_display_name(CONN_AFM), "Apple Intelligence (on-device)");
+        assert_eq!(
+            connection_display_name(CONN_AFM),
+            "Apple Intelligence (on-device)"
+        );
         assert_ne!(connection_display_name(CONN_AFM), CONN_AFM);
 
         // (c) An EXPLICIT per-role `apple` key also routes to AFM and stays reasoner-only (the

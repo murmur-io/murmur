@@ -4603,10 +4603,13 @@ name = "murmur-protocol"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "argon2",
  "base64 0.22.1",
  "getrandom 0.2.17",
+ "opaque-ke",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "thiserror 2.0.18",
  "zeroize",

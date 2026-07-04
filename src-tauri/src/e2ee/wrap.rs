@@ -52,8 +52,15 @@ pub const HPKE_ENC_LEN: usize = 32;
 /// server-attested `sender_fingerprint`, not the raw keys — can (1) recompute the fingerprint and
 /// require it EQUALS the server's attested value (anti-substitution binding) and (2) verify the
 /// Ed25519 grant signature against `sender_pk_sig`. The `grant_sig` rides beside this blob.
-pub fn pack_wrapped_key(sender_pk_enc: &[u8], sender_pk_sig: &[u8], grant: &SealedGrant) -> Result<Vec<u8>> {
-    if sender_pk_enc.len() != 32 || sender_pk_sig.len() != 32 || grant.hpke_enc.len() != HPKE_ENC_LEN {
+pub fn pack_wrapped_key(
+    sender_pk_enc: &[u8],
+    sender_pk_sig: &[u8],
+    grant: &SealedGrant,
+) -> Result<Vec<u8>> {
+    if sender_pk_enc.len() != 32
+        || sender_pk_sig.len() != 32
+        || grant.hpke_enc.len() != HPKE_ENC_LEN
+    {
         return Err(AppError::InvalidArg(
             "wrapped-key framing expects 32-byte pk_enc/pk_sig/hpke_enc".into(),
         ));
@@ -329,7 +336,15 @@ mod tests {
         let env = ShareEnvelope::new("Secret", "- body", "2026-07-04T10:00:00Z");
         let content = seal_content(&nk, &env, SHARE_ID, REV).unwrap();
         let grant = seal_to_recipient(
-            &nk, &content, &bob.pk_enc, BOB, &alice, ALICE, 1, SHARE_ID, REV,
+            &nk,
+            &content,
+            &bob.pk_enc,
+            BOB,
+            &alice,
+            ALICE,
+            1,
+            SHARE_ID,
+            REV,
         )
         .unwrap();
 
@@ -341,12 +356,25 @@ mod tests {
 
         // The recipient opens NK from the UNPACKED grant, verifying against the unpacked sender key.
         let opened = open_from_sender(
-            &up.grant, &content, &bob, BOB, BOB, ALICE, 1, ALICE, &up.sender_pk_sig, SHARE_ID, REV,
+            &up.grant,
+            &content,
+            &bob,
+            BOB,
+            BOB,
+            ALICE,
+            1,
+            ALICE,
+            &up.sender_pk_sig,
+            SHARE_ID,
+            REV,
         )
         .unwrap();
         assert_eq!(*opened, *nk);
         // A too-short blob fails closed.
-        assert!(matches!(unpack_wrapped_key(&[0u8; 10], &grant.signature), Err(AppError::InvalidArg(_))));
+        assert!(matches!(
+            unpack_wrapped_key(&[0u8; 10], &grant.signature),
+            Err(AppError::InvalidArg(_))
+        ));
     }
 
     /// The retained-NK re-wrap path (`share_rewrap_pending`): a grant signed over a precomputed
@@ -359,16 +387,37 @@ mod tests {
         let bob = generate_identity().unwrap();
         let nk = random_key32().unwrap();
         let content = seal_content(
-            &nk, &ShareEnvelope::new("t", "m", "2026-07-04T10:00:00Z"), SHARE_ID, REV,
+            &nk,
+            &ShareEnvelope::new("t", "m", "2026-07-04T10:00:00Z"),
+            SHARE_ID,
+            REV,
         )
         .unwrap();
         let hash = Sha256::digest(&content);
         let grant = seal_to_recipient_with_hash(
-            &nk, hash.as_slice(), &bob.pk_enc, BOB, &alice, ALICE, 1, SHARE_ID, REV,
+            &nk,
+            hash.as_slice(),
+            &bob.pk_enc,
+            BOB,
+            &alice,
+            ALICE,
+            1,
+            SHARE_ID,
+            REV,
         )
         .unwrap();
         let opened = open_from_sender(
-            &grant, &content, &bob, BOB, BOB, ALICE, 1, ALICE, &alice.pk_sig, SHARE_ID, REV,
+            &grant,
+            &content,
+            &bob,
+            BOB,
+            BOB,
+            ALICE,
+            1,
+            ALICE,
+            &alice.pk_sig,
+            SHARE_ID,
+            REV,
         )
         .unwrap();
         assert_eq!(*opened, *nk);

@@ -448,8 +448,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     let open = MenuItem::with_id(app, "open", "Open Murmur", true, None::<&str>)?;
-    let record =
-        MenuItem::with_id(app, "record", "Start / Stop recording", true, None::<&str>)?;
+    let record = MenuItem::with_id(app, "record", "Start / Stop recording", true, None::<&str>)?;
     let bar = MenuItem::with_id(app, "bar", "Recorder bar  (⌘⇧R)", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Murmur", true, None::<&str>)?;
     let menu = Menu::with_items(

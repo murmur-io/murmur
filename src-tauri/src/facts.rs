@@ -135,11 +135,7 @@ pub fn reconcile_facts(existing: &[Fact], candidates: &[FactCandidate], at: &str
         let subject = c.subject.trim();
         let predicate = c.predicate.trim();
         let object = c.object.trim();
-        if entity_id.is_empty()
-            || subject.is_empty()
-            || predicate.is_empty()
-            || object.is_empty()
-        {
+        if entity_id.is_empty() || subject.is_empty() || predicate.is_empty() || object.is_empty() {
             continue; // skip malformed candidate.
         }
         let key = (entity_id.to_string(), norm(subject), norm(predicate));
@@ -322,7 +318,14 @@ fn candidates_from_triples(
 mod tests {
     use super::*;
 
-    fn fact(id: &str, entity: &str, subject: &str, predicate: &str, object: &str, valid_to: Option<&str>) -> Fact {
+    fn fact(
+        id: &str,
+        entity: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        valid_to: Option<&str>,
+    ) -> Fact {
         Fact {
             id: id.to_string(),
             entity_id: entity.to_string(),
@@ -350,7 +353,11 @@ mod tests {
     /// Add: an entirely new (entity, subject, predicate) → one open Add at `at`.
     #[test]
     fn reconcile_adds_a_new_fact() {
-        let ops = reconcile_facts(&[], &[cand("atlas", "Atlas", "status", "in-progress")], "2026-06-10T00:00:00Z");
+        let ops = reconcile_facts(
+            &[],
+            &[cand("atlas", "Atlas", "status", "in-progress")],
+            "2026-06-10T00:00:00Z",
+        );
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             FactOp::Add(nf) => {
@@ -366,7 +373,11 @@ mod tests {
     #[test]
     fn reconcile_noop_on_identical() {
         let existing = vec![fact("f1", "atlas", "Atlas", "status", "in-progress", None)];
-        let ops = reconcile_facts(&existing, &[cand("atlas", "Atlas", "Status", "  In-Progress ")], "2026-06-10T00:00:00Z");
+        let ops = reconcile_facts(
+            &existing,
+            &[cand("atlas", "Atlas", "Status", "  In-Progress ")],
+            "2026-06-10T00:00:00Z",
+        );
         assert_eq!(ops, vec![FactOp::NoOp]);
     }
 
@@ -377,21 +388,30 @@ mod tests {
     fn reconcile_invalidates_old_and_adds_new_on_change() {
         let existing = vec![fact("f1", "atlas", "Atlas", "status", "in-progress", None)];
         let at = "2026-06-20T00:00:00Z";
-        let ops = reconcile_facts(&existing, &[cand("atlas", "Atlas", "status", "shipped")], at);
+        let ops = reconcile_facts(
+            &existing,
+            &[cand("atlas", "Atlas", "status", "shipped")],
+            at,
+        );
         assert_eq!(ops.len(), 2, "a change must emit exactly Invalidate + Add");
         // Invalidate closes the OLD row at `at`.
         assert!(
-            ops.iter().any(|o| matches!(o, FactOp::Invalidate { id, valid_to } if id == "f1" && valid_to == at)),
+            ops.iter().any(
+                |o| matches!(o, FactOp::Invalidate { id, valid_to } if id == "f1" && valid_to == at)
+            ),
             "old fact must be Invalidated with valid_to = at"
         );
         // Add opens the NEW row at `at`, still open (valid_to NULL by construction).
         assert!(
-            ops.iter().any(|o| matches!(o, FactOp::Add(nf) if nf.object == "shipped" && nf.valid_from == at)),
+            ops.iter().any(
+                |o| matches!(o, FactOp::Add(nf) if nf.object == "shipped" && nf.valid_from == at)
+            ),
             "new fact must be Added open at valid_from = at"
         );
         // The old object must NOT be re-added.
         assert!(
-            !ops.iter().any(|o| matches!(o, FactOp::Add(nf) if nf.object == "in-progress")),
+            !ops.iter()
+                .any(|o| matches!(o, FactOp::Add(nf) if nf.object == "in-progress")),
             "the superseded object must not be re-added"
         );
     }
@@ -441,13 +461,21 @@ mod tests {
             at,
         );
         // Atlas: Invalidate fa + Add shipped. Borealis: NoOp. Borealis's fb is NEVER invalidated.
-        assert!(ops.iter().any(|o| matches!(o, FactOp::Invalidate { id, .. } if id == "fa")));
-        assert!(ops.iter().any(|o| matches!(o, FactOp::Add(nf) if nf.entity_id == "atlas" && nf.object == "shipped")));
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, FactOp::Invalidate { id, .. } if id == "fa")));
+        assert!(ops.iter().any(
+            |o| matches!(o, FactOp::Add(nf) if nf.entity_id == "atlas" && nf.object == "shipped")
+        ));
         assert!(
-            !ops.iter().any(|o| matches!(o, FactOp::Invalidate { id, .. } if id == "fb")),
+            !ops.iter()
+                .any(|o| matches!(o, FactOp::Invalidate { id, .. } if id == "fb")),
             "another entity's open fact must never be invalidated by this entity's change"
         );
-        assert!(ops.contains(&FactOp::NoOp), "the unchanged entity's fact is a NoOp");
+        assert!(
+            ops.contains(&FactOp::NoOp),
+            "the unchanged entity's fact is a NoOp"
+        );
     }
 
     /// Malformed candidates (empty fields) are skipped — best-effort extraction can emit junk.
@@ -471,9 +499,21 @@ mod tests {
     fn triples_resolve_to_known_entities_only() {
         let entities = vec![("id-atlas".to_string(), "Atlas".to_string())];
         let triples = vec![
-            RawTriple { entity: "atlas".into(), predicate: "status".into(), object: "shipped".into() },
-            RawTriple { entity: "Unknown".into(), predicate: "status".into(), object: "x".into() },
-            RawTriple { entity: "Atlas".into(), predicate: "".into(), object: "x".into() },
+            RawTriple {
+                entity: "atlas".into(),
+                predicate: "status".into(),
+                object: "shipped".into(),
+            },
+            RawTriple {
+                entity: "Unknown".into(),
+                predicate: "status".into(),
+                object: "x".into(),
+            },
+            RawTriple {
+                entity: "Atlas".into(),
+                predicate: "".into(),
+                object: "x".into(),
+            },
         ];
         let cands = candidates_from_triples(triples, &entities);
         assert_eq!(cands.len(), 1);
@@ -485,7 +525,11 @@ mod tests {
     /// set_meeting_id stamps the source meeting onto Add ops only.
     #[test]
     fn set_meeting_id_stamps_adds() {
-        let mut ops = reconcile_facts(&[], &[cand("atlas", "Atlas", "status", "shipped")], "2026-06-10T00:00:00Z");
+        let mut ops = reconcile_facts(
+            &[],
+            &[cand("atlas", "Atlas", "status", "shipped")],
+            "2026-06-10T00:00:00Z",
+        );
         set_meeting_id(&mut ops, "m42");
         match &ops[0] {
             FactOp::Add(nf) => assert_eq!(nf.meeting_id.as_deref(), Some("m42")),

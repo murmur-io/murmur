@@ -148,7 +148,11 @@ mod tests {
                   - [ ] Janek wyśle raport w piątek\n\
                   - [ ] klaudku, jakie masz informacje w moich notatkach\n";
         let items = parse_action_items(md);
-        assert_eq!(items.len(), 1, "only the real task survives; assistant commands are dropped");
+        assert_eq!(
+            items.len(),
+            1,
+            "only the real task survives; assistant commands are dropped"
+        );
         assert_eq!(items[0].text, "Janek wyśle raport w piątek");
     }
 }
