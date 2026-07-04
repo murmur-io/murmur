@@ -122,44 +122,6 @@ type Step =
             </button>
           </div>
 
-          @if (advancedOpen()) {
-            <div class="adv-well">
-              <span class="flow-label text-muted">Sharing server</span>
-              <p class="flow-note text-secondary">
-                The server that stores the encrypted note. It can't read your
-                notes — only ciphertext and wrapped keys leave this Mac.
-              </p>
-              <div class="row">
-                <input
-                  type="url"
-                  class="field-input"
-                  [value]="serverUrl()"
-                  (input)="onServerUrl($event)"
-                  placeholder="https://share.example.com"
-                  autocomplete="off"
-                  spellcheck="false"
-                  aria-label="Sharing server base URL"
-                />
-                <button
-                  type="button"
-                  class="btn"
-                  (click)="saveServer()"
-                  [disabled]="serverSaving()"
-                >
-                  {{ serverSaving() ? "Saving…" : "Save" }}
-                </button>
-              </div>
-            </div>
-          } @else {
-            <button
-              type="button"
-              class="link-btn text-muted adv-toggle"
-              (click)="toggleAdvanced()"
-            >
-              Advanced — sharing server
-            </button>
-          }
-
           <div class="flow-nav">
             <button
               type="button"
@@ -195,40 +157,6 @@ type Step =
               [disabled]="busy()"
             />
           </label>
-
-          @if (advancedOpen()) {
-            <div class="adv-well">
-              <span class="flow-label text-muted">Sharing server</span>
-              <div class="row">
-                <input
-                  type="url"
-                  class="field-input"
-                  [value]="serverUrl()"
-                  (input)="onServerUrl($event)"
-                  placeholder="https://share.example.com"
-                  autocomplete="off"
-                  spellcheck="false"
-                  aria-label="Sharing server base URL"
-                />
-                <button
-                  type="button"
-                  class="btn"
-                  (click)="saveServer()"
-                  [disabled]="serverSaving()"
-                >
-                  {{ serverSaving() ? "Saving…" : "Save" }}
-                </button>
-              </div>
-            </div>
-          } @else {
-            <button
-              type="button"
-              class="link-btn text-muted adv-toggle"
-              (click)="toggleAdvanced()"
-            >
-              Advanced — sharing server
-            </button>
-          }
 
           @if (error(); as err) {
             <p class="flow-error text-danger" role="alert">{{ err }}</p>
@@ -657,32 +585,6 @@ type Step =
         font-size: 1.05rem;
       }
 
-      .row {
-        display: flex;
-        gap: var(--space-2);
-        flex-wrap: wrap;
-      }
-      .row .field-input {
-        flex: 1 1 16rem;
-        min-width: 0;
-      }
-      .row .btn {
-        flex: none;
-      }
-
-      /* Advanced disclosure — a quiet inset well, still tokenized. */
-      .adv-toggle {
-        align-self: flex-start;
-      }
-      .adv-well {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        padding: var(--space-3);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        border: 1px solid var(--border-subtle);
-      }
       .link-btn {
         padding: 0;
         border: none;
@@ -847,12 +749,6 @@ export class SharingAuthFlowComponent {
   readonly confirmControl = new FormControl("", { nonNullable: true });
   readonly signinPwControl = new FormControl("", { nonNullable: true });
 
-  // ── Advanced (optional) sharing-server disclosure ────────────────────────
-  readonly advancedOpen = signal(false);
-  readonly serverUrl = signal("");
-  private readonly _serverSaving = signal(false);
-  readonly serverSaving = this._serverSaving.asReadonly();
-
   /** The AccountStatus captured at auto-login, emitted after the recovery step. */
   private capturedStatus: AccountStatus | null = null;
 
@@ -892,27 +788,6 @@ export class SharingAuthFlowComponent {
     return Array.from({ length: prog.total }, (_, i) => i);
   });
 
-  constructor() {
-    // Fire-and-forget one-shot: seed the Advanced server field from config so
-    // it's prefilled if the user opens the disclosure. No signal is read here,
-    // so no effect / NG0600.
-    void this.seedServer();
-  }
-
-  private async seedServer(): Promise<void> {
-    try {
-      const cfg = await this.ipc.getConfig();
-      this.serverUrl.set(cfg.shareBaseUrl ?? "");
-      // Only auto-expand when no server is set (the Railway default means this
-      // is usually already configured → the disclosure stays collapsed).
-      if (!(cfg.shareBaseUrl ?? "").trim()) {
-        this.advancedOpen.set(true);
-      }
-    } catch {
-      // No config yet — leave the field empty + collapsed.
-    }
-  }
-
   // ── Input handlers (non-secret signals) ──────────────────────────────────
   onEmail(event: Event): void {
     this.email.set((event.target as HTMLInputElement).value);
@@ -927,34 +802,6 @@ export class SharingAuthFlowComponent {
 
   onSaveRecovery(event: Event): void {
     this.saveRecovery.set((event.target as HTMLInputElement).checked);
-  }
-
-  onServerUrl(event: Event): void {
-    this.serverUrl.set((event.target as HTMLInputElement).value);
-  }
-
-  toggleAdvanced(): void {
-    this.advancedOpen.update((v) => !v);
-  }
-
-  /** Persist the Advanced sharing-server URL through the normal config round-trip. */
-  async saveServer(): Promise<void> {
-    if (this._serverSaving()) {
-      return;
-    }
-    this._serverSaving.set(true);
-    this.error.set(null);
-    try {
-      const cfg = await this.ipc.getConfig();
-      await this.ipc.saveConfig({
-        ...cfg,
-        shareBaseUrl: this.serverUrl().trim(),
-      });
-    } catch (e) {
-      this.error.set(this.friendly(e));
-    } finally {
-      this._serverSaving.set(false);
-    }
   }
 
   // ── Navigation ───────────────────────────────────────────────────────────
@@ -1167,11 +1014,11 @@ export class SharingAuthFlowComponent {
   /** Map a raw backend error to a friendly, non-crashy inline message. */
   private friendly(e: unknown): string {
     const raw = String(e);
-    // Only a genuine connectivity / no-server-set problem gets the "can't reach" guidance. A 4xx
+    // Only a genuine connectivity problem gets the "can't reach" guidance. A 4xx
     // (wrong or expired code, too many tries, bad password) is NOT unreachability — it arrives as a
     // clear sentence we surface as-is (below).
     if (/could not reach|unreachable|no sharing server|failed to build|network|timed? ?out/i.test(raw)) {
-      return "Can't reach the sharing server. Check the server URL under Advanced, then try again.";
+      return "Can't reach the sharing server. Check your connection, then try again.";
     }
     // AppError serializes as "invalid argument: <msg>" / "authentication error: <msg>" etc. — strip
     // the variant prefix so the user reads the clean message.
