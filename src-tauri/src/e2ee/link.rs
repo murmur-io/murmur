@@ -72,6 +72,25 @@ fn random_salt() -> Result<[u8; LINK_SALT_LEN]> {
     Ok(s)
 }
 
+/// The HKDF `info` binding the Argon2id salt derivation (client + JS viewer MUST use this literal).
+const ARGON_SALT_INFO: &[u8] = b"murmur-link/v1:argon-salt";
+
+/// Derive the Argon2id salt `salt_p` DETERMINISTICALLY from the (random, per-link) `gate_salt`:
+/// `salt_p = HKDF-SHA256(ikm = gate_salt, info = "murmur-link/v1:argon-salt")[..16]`.
+///
+/// This lets the dependency-free JS viewer reproduce `salt_p` from the `gate_salt` it already
+/// receives — so the protocol needs NO separate transmitted salt (which it never carried, breaking
+/// every password link). An Argon2id salt need only be UNIQUE per password-hash (to defeat
+/// precomputation), never secret; `gate_salt` is a fresh 16-byte random per link, so the derived
+/// `salt_p` is unique per link, and a distinct HKDF `info` keeps it independent of the `KEK_link`
+/// HKDF that also uses `gate_salt`.
+fn derive_argon_salt(gate_salt: &[u8]) -> Result<[u8; LINK_SALT_LEN]> {
+    let full = hkdf_expand32(gate_salt, None, ARGON_SALT_INFO)?;
+    let mut s = [0u8; LINK_SALT_LEN];
+    s.copy_from_slice(&full[..LINK_SALT_LEN]);
+    Ok(s)
+}
+
 /// Argon2id(password, salt) → 32 bytes, with the given params.
 fn argon2id(password: &[u8], salt: &[u8], p: &ArgonParams) -> Result<Key32> {
     let params = Params::new(p.m_cost_kib, p.t_cost, p.p_cost, Some(32))
@@ -139,8 +158,10 @@ pub fn seal_link_share(
     let l = random_key32()?;
     let gate_salt = random_salt()?;
     let argon_params = ArgonParams::default_v1();
+    // `salt_p` is DERIVED from `gate_salt` (not random) so the viewer can reproduce it without the
+    // protocol transmitting a separate salt — see `derive_argon_salt`.
     let argon_salt = if password.is_some() {
-        Some(random_salt()?)
+        Some(derive_argon_salt(&gate_salt)?)
     } else {
         None
     };
