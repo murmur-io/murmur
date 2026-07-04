@@ -18,6 +18,7 @@ import { SettingsAudioSectionComponent } from "./sections/settings-audio-section
 import { SettingsNotesSectionComponent } from "./sections/settings-notes-section.component";
 import { SettingsAiSectionComponent } from "./sections/settings-ai-section.component";
 import { SettingsConnectorsSectionComponent } from "./sections/settings-connectors-section.component";
+import { SettingsAccountSectionComponent } from "./sections/settings-account-section.component";
 import { SettingsPrivacySectionComponent } from "./sections/settings-privacy-section.component";
 import { SettingsObsidianSectionComponent } from "./sections/settings-obsidian-section.component";
 import { SettingsAboutSectionComponent } from "./sections/settings-about-section.component";
@@ -42,6 +43,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   // Stage-2 hub: Brain & AI + Providers collapsed into ONE section (keywords merged).
   { id: "ai", label: "AI & Models", keywords: "provider assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake anthropic ollama claude code gateway openai api key availability binary default consent revoke privacy egress" },
   { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet" },
+  { id: "account", label: "Account", keywords: "sign in login sign up account sharing share link server e2ee zero knowledge recovery" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
@@ -73,6 +75,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     SettingsNotesSectionComponent,
     SettingsAiSectionComponent,
     SettingsConnectorsSectionComponent,
+    SettingsAccountSectionComponent,
     SettingsPrivacySectionComponent,
     SettingsObsidianSectionComponent,
     SettingsAboutSectionComponent,
@@ -163,6 +166,9 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
                   @case ("connectors") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c1.8 1.7 2.8 3.9 2.8 6.2S9.8 12.5 8 14.2C6.2 12.5 5.2 10.3 5.2 8S6.2 3.5 8 1.8z" /></svg>
                   }
+                  @case ("account") {
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.6" /><path d="M3 13.4c.9-2.4 2.7-3.6 5-3.6s4.1 1.2 5 3.6" /></svg>
+                  }
                   @case ("privacy") {
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.6 3 3.5v3.4c0 3 2 5.3 5 6.1 3-.8 5-3.1 5-6.1V3.5L8 1.6z" /><path d="M6 7.7 7.4 9.1 10 6.3" /></svg>
                   }
@@ -232,6 +238,9 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
             }
             @case ("connectors") {
               <app-settings-connectors-section />
+            }
+            @case ("account") {
+              <app-settings-account-section />
             }
             @case ("privacy") {
               <app-settings-privacy-section />

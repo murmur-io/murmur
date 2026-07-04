@@ -159,6 +159,12 @@ pub struct AppConfigDto {
     /// (`#[serde(default)]` = false) is inert here.
     #[serde(default)]
     pub cloud_egress_consented: bool,
+    /// M3-CLIENT: one-time SHARE-egress consent. DISPLAY-ONLY on this DTO (same discipline as
+    /// `cloud_egress_consented`): `get_config` carries the stored value out so the FE can show
+    /// consent status; `dto_to_config` PRESERVES it. Mutated ONLY by `consent_to_share_egress` /
+    /// `revoke_share_egress`, so a settings save can neither grant nor clear it.
+    #[serde(default)]
+    pub share_egress_consented: bool,
     /// Phase H — which reasoner powers the on-device "brain" pre-analysis (Flow A): `cloud` |
     /// `local` | `off`. Unlike `cloud_egress_consented`, this IS settable from the DTO (the Settings
     /// UI owns the brain toggle). An omitted/unknown value deserializes to the default `Cloud`
@@ -225,6 +231,12 @@ pub struct AppConfigDto {
     /// Model id to send to the gateway (e.g. `"gpt-4o"`). Settable from the DTO. Default `""`.
     #[serde(default)]
     pub gateway_model: String,
+    /// M3-CLIENT — base URL of the Murmur sharing server (self-host or hosted). Settable from the
+    /// DTO (Settings → Account owns the field). An omitted value deserializes to `""` (unset →
+    /// account/share commands fail closed `Unavailable`). Validated like `gateway_base_url` (https
+    /// required, http loopback-only, no embedded creds) at `ShareClient::new`.
+    #[serde(default)]
+    pub share_base_url: String,
     /// Proactive brain P1 — the recall-card mute toggle (`crate::proactive`). Settable from the
     /// DTO (the Settings UI owns it). Defaults ON when omitted (`default_true`), matching
     /// `AppConfig::default` — an older FE payload must not silently flip the backend mute.
@@ -3332,6 +3344,11 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
     if !config.gateway_base_url.trim().is_empty() {
         crate::summarize::gateway::validate_gateway_url(&config.gateway_base_url)?;
     }
+    // M3-CLIENT: validate the sharing-server URL at the same seam (reject embedded creds / http on a
+    // non-loopback host) so a bad value is refused BEFORE it is persisted. Empty is allowed (unset).
+    if !config.share_base_url.trim().is_empty() {
+        crate::summarize::gateway::validate_gateway_url(&config.share_base_url)?;
+    }
 
     // Merge against the CURRENT config under the config lock so the security-sensitive flags that
     // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
@@ -3428,6 +3445,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
         cloud_egress_consented: c.cloud_egress_consented,
+        // DISPLAY-ONLY out (M3-CLIENT): FE shows share-egress consent status; cannot set it back.
+        share_egress_consented: c.share_egress_consented,
         brain_backend: c.brain_backend,
         realtime_reactions: c.realtime_reactions,
         brain_model_id: c.brain_model_id.clone(),
@@ -3440,6 +3459,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         claude_code_inherit_env: c.claude_code_inherit_env,
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
+        share_base_url: c.share_base_url.clone(),
         proactive_hints_enabled: c.proactive_hints_enabled,
         user_memory_enabled: c.user_memory_enabled,
         role_notes_connection: c.role_notes_connection.clone(),
@@ -3519,6 +3539,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
         // `consent_to_cloud_egress` command may flip it. This makes an omitting/zeroed save inert.
         cloud_egress_consented: current.cloud_egress_consented,
+        // BLK-4 (M3-CLIENT): share-egress consent is NEVER set from the DTO — preserve the live value.
+        // Only `consent_to_share_egress` may flip it. An omitting/zeroed save is inert.
+        share_egress_consented: current.share_egress_consented,
         // brain2 RAG: the semantic-search master flag IS carried on the settings DTO (the Settings
         // UI owns the toggle). Plain bool; an omitted value already defaulted to OFF on the DTO
         // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
@@ -3571,6 +3594,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // deserializes to `""` (`#[serde(default)]`), which is a valid "unset" state.
         gateway_base_url: d.gateway_base_url,
         gateway_model: d.gateway_model,
+        // M3-CLIENT: the sharing-server base URL IS settable from the DTO (Settings → Account owns
+        // it). An omitted value defaults to `""` (unset) — no behavioral change for existing installs.
+        share_base_url: d.share_base_url,
         // Proactive brain P1: the recall-card mute IS settable from the DTO (Settings owns the
         // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default —
         // the backend mute is an explicit user choice, never a partial-save side effect.
@@ -6881,6 +6907,488 @@ pub fn stop_voice_listener(app: &AppHandle) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// M3-CLIENT — account (OPAQUE) + zero-knowledge link sharing (mode A). Spec §3/§4.7/§7.
+//
+// LOCK-CRITICAL. The binding invariants (audited by lock-security-reviewer):
+//   • `share_note_to_link` FIRST statement is `meeting_is_unlocked` → `AppError::Locked` (copies
+//     `export_note`). A sealed-not-unlocked meeting leaks NOTHING.
+//   • The note is cleaned (strip frontmatter + flatten wikilinks + strip obsidian://) BEFORE it
+//     enters the envelope — the `vault-titles-egress-leak` class (pure fn `share::envelope`).
+//   • The link key `L` NEVER leaves the device: it goes ONLY into the URL fragment, assembled
+//     LOCALLY; it is never in a request body, never logged, never ledgered (convertFileSrc-trap).
+//   • Every upload writes a CONTENT-FREE egress-ledger row (host + byte sizes only).
+//   • First-ever share requires explicit `share_egress_consented` (fail-closed, mirrors
+//     `consent_to_cloud_egress`). Share ops fail closed `Unavailable` when logged out.
+//   • `list_my_shares` masks a sealed-not-unlocked meeting's title (route through `meeting_is_unlocked`).
+//   • Session tokens + device id → Keychain only; MK → RAM only (`AccountSession`).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The FE-facing account status (camelCase). `loggedIn` = a session is present in RAM;
+/// `unlockedForSharing` = the MK is available so a share can actually be sealed this session.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStatus {
+    pub logged_in: bool,
+    /// Present when logged in: the account email (for display).
+    pub email: Option<String>,
+    /// True iff MK is in the session (a share can be created without re-auth).
+    pub unlocked_for_sharing: bool,
+    /// Whether the one-time share-egress consent has been granted (for the FE to show/skip the modal).
+    pub share_consented: bool,
+    /// Whether a sharing server is configured (a share is impossible without one).
+    pub server_configured: bool,
+}
+
+/// One row of `list_my_shares` (camelCase). Content-free by construction — the server holds no
+/// titles; the local title is added ONLY when the meeting is unlocked (else `null` + `locked:true`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyShareEntry {
+    pub share_id: String,
+    /// The share's local meeting title — `None` (and `locked:true`) when the meeting is sealed and
+    /// not session-unlocked, or when the share was created on another device (unknown locally).
+    pub title: Option<String>,
+    pub locked: bool,
+    pub rev: u32,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub revoked: bool,
+    pub download_count: u32,
+}
+
+/// Read the configured sharing-server base URL from the live config (empty ⇒ unset).
+fn share_base_url(state: &AppState) -> Result<String, AppError> {
+    Ok(state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .share_base_url
+        .clone())
+}
+
+/// `account_status` — is there a logged-in sharing account this session, and can it share?
+#[tauri::command]
+pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppError> {
+    let session = state
+        .account_session
+        .lock()
+        .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+    // Logged-in-but-locked survives a restart via the Keychain tokens even when MK isn't in RAM.
+    let persisted_email = crate::share::load_tokens()?.map(|t| t.email);
+    let (logged_in, email, unlocked) = match session.as_ref() {
+        Some(s) => (true, Some(s.email.clone()), true),
+        None => match persisted_email {
+            Some(e) => (true, Some(e), false),
+            None => (false, None, false),
+        },
+    };
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(AccountStatus {
+        logged_in,
+        email,
+        unlocked_for_sharing: unlocked,
+        share_consented: cfg.share_egress_consented,
+        server_configured: !cfg.share_base_url.trim().is_empty(),
+    })
+}
+
+/// `consent_to_share_egress` — grant the one-time SHARE-egress consent (§7 inv. 5). Fail-closed:
+/// until this is set, `share_note_to_link` refuses. Mirror of `consent_to_cloud_egress`.
+#[tauri::command]
+pub fn consent_to_share_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.grant_share_egress_consent(&state.db)?;
+    Ok(())
+}
+
+/// `revoke_share_egress` — revoke the share-egress consent (the next share is refused fail-closed).
+#[tauri::command]
+pub fn revoke_share_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.revoke_share_egress(&state.db)?;
+    Ok(())
+}
+
+/// `account_signup(email, password, save_recovery)` — create a sharing account (spec §3.1a/§4.3).
+///
+/// Runs the OPAQUE CLIENT registration, generates the account MK + identity keypair + (skippable)
+/// recovery phrase, wraps MK under `KEK_pw`, and uploads everything at `provision`/`provision/finish`.
+/// The password never leaves the device. The email verification is a two-step flow: the server
+/// emails a 6-digit code; the FE collects it and passes it here as `code`. Returns the recovery
+/// phrase (24 words) ONLY when `save_recovery` is true (else `None` — skipped, §4.3).
+#[tauri::command]
+pub async fn account_signup(
+    state: State<'_, AppState>,
+    email: String,
+    code: String,
+    password: String,
+    save_recovery: bool,
+) -> Result<Option<String>, AppError> {
+    let base = share_base_url(state.inner())?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let password = Zeroizing::new(password);
+
+    // 1. Exchange the emailed verification code for a single-use signup token.
+    let signup_token = client.verify_email(email.trim(), code.trim()).await?;
+
+    // 2. OPAQUE registration step 1 → server RegistrationResponse.
+    let reg_start = crate::share::opaque_client::client_registration_start(password.as_bytes())?;
+    let reg_response = client
+        .provision(&signup_token, reg_start.request_bytes)
+        .await?;
+
+    // 3. OPAQUE registration step 2 → the upload + the stable export_key.
+    let (upload_bytes, export_key) = crate::share::opaque_client::client_registration_finish(
+        reg_start.state,
+        password.as_bytes(),
+        &reg_response,
+    )?;
+    let export_key = Zeroizing::new(export_key);
+
+    // 4. Generate the account key hierarchy (§4.1). The server has already minted the user id at
+    //    provision-time, but we don't learn it until provision/finish; the identity-slot + MK-wrap
+    //    AAD bind to the account id. We use the VERIFIED email as the stable account identifier here
+    //    (the server's credential_identifier is the email — see auth::provision), matching the login
+    //    unwrap which re-derives the same acct binding. (A follow-up can switch to the server user_id
+    //    once provision returns it before finish; deferred — keep the AAD stable across signup/login.)
+    let acct_id = email.trim().to_string();
+    let mk = crate::e2ee::keys::generate_master_key()?;
+    let kek_pw = crate::e2ee::keys::derive_kek_pw(&export_key)?;
+    let mk_wrap_pw = crate::e2ee::keys::wrap_mk_pw(&mk, &kek_pw, &acct_id)?;
+
+    let identity = crate::e2ee::keys::generate_identity()?;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let (bundle, bundle_sig) =
+        crate::e2ee::keys::build_identity_bundle(&identity, &acct_id, 1, &created_at)?;
+
+    // 5. (Skippable §4.3) recovery phrase: wrap MK under RK and RK under MK, upload both wraps.
+    let (recovery_phrase, mk_wrap_rk, rk_wrap_mk) = if save_recovery {
+        let (phrase, rk) = crate::e2ee::recovery::generate_recovery_phrase()?;
+        let mk_wrap_rk = crate::e2ee::recovery::wrap_mk_rk(&mk, &rk, &acct_id)?;
+        let rk_wrap_mk = crate::e2ee::recovery::wrap_rk_mk(&rk, &mk, &acct_id)?;
+        (Some(phrase), Some(mk_wrap_rk), Some(rk_wrap_mk))
+    } else {
+        (None, None, None)
+    };
+
+    // 6. Atomic provision/finish — activate the account with all the key material.
+    let finish_req = murmur_protocol::dto::ProvisionFinishRequest {
+        signup_token,
+        opaque_registration_upload: upload_bytes,
+        mk_wrap_pw,
+        mk_wrap_rk,
+        rk_wrap_mk,
+        bundle: murmur_protocol::dto::PublicKeyBundle {
+            generation: bundle.generation,
+            pk_enc: bundle.pk_enc.clone(),
+            pk_sig: bundle.pk_sig.clone(),
+            bundle_sig,
+        },
+    };
+    let _user_id = client.provision_finish(finish_req).await?;
+
+    // Content-free ledger row for the provisioning upload (host + a coarse size).
+    crate::share::ledger_row(&state.db, &client.host(), "account_provision", 0);
+
+    // Signup does NOT auto-login (the FE prompts a login next); no tokens stored yet.
+    Ok(recovery_phrase)
+}
+
+/// `account_login(email, password) -> AccountStatus` — OPAQUE login; unwrap MK from the server's
+/// `mkWrapPw` via the login `export_key`; keep MK for the session; store tokens in the Keychain.
+#[tauri::command]
+pub async fn account_login(
+    state: State<'_, AppState>,
+    email: String,
+    password: String,
+) -> Result<AccountStatus, AppError> {
+    let base = share_base_url(state.inner())?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let password = Zeroizing::new(password);
+    let acct_id = email.trim().to_string();
+
+    // OPAQUE login (3 messages).
+    let login_start = crate::share::opaque_client::client_login_start(password.as_bytes())?;
+    let start = client
+        .login_start(acct_id.as_str(), login_start.ke1_bytes)
+        .await?;
+    let (ke3, export_key) = crate::share::opaque_client::client_login_finish(
+        login_start.state,
+        password.as_bytes(),
+        &start.ke2,
+    )?;
+    let export_key = Zeroizing::new(export_key);
+    let finish = client
+        .login_finish(&start.login_id, ke3, crate::share::device_platform())
+        .await?;
+
+    // TOTP/MFA is not wired in the M3 client — if the server demands a second factor, fail cleanly
+    // (the session fields are then absent). A follow-up milestone adds the `mfa_token` leg.
+    if finish.mfa_required {
+        return Err(AppError::Unavailable(
+            "this account has two-factor auth enabled — not yet supported in the app".into(),
+        ));
+    }
+    let (Some(access_token), Some(refresh_token), Some(device_id), Some(key_material)) = (
+        finish.access_token,
+        finish.refresh_token,
+        finish.device_id,
+        finish.key_material,
+    ) else {
+        return Err(AppError::Auth("login did not return a session".into()));
+    };
+
+    // Unwrap MK from the server-stored mk_wrap_pw using KEK_pw = HKDF(export_key). A wrong password
+    // would have failed the OPAQUE finish above; a tampered mk_wrap fails closed here (AAD/AEAD).
+    let kek_pw = crate::e2ee::keys::derive_kek_pw(&export_key)?;
+    let mk = crate::e2ee::keys::unwrap_mk_pw(&key_material.mk_wrap_pw, &kek_pw, &acct_id)?;
+    let generation = key_material.current_generation.unwrap_or(1);
+
+    // Persist tokens to the Keychain (never SQLite, never logged).
+    crate::share::store_tokens(&crate::share::PersistedTokens {
+        access_token: access_token.clone(),
+        refresh_token,
+        device_id: device_id.clone(),
+        email: acct_id.clone(),
+        account_id: acct_id.clone(),
+    })?;
+
+    // Cache the session (MK in RAM, zeroized on drop).
+    {
+        let mut session = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        *session = Some(crate::share::AccountSession {
+            account_id: acct_id.clone(),
+            email: acct_id.clone(),
+            device_id,
+            mk: Zeroizing::new(*mk),
+            generation,
+            access_token,
+        });
+    }
+
+    crate::share::ledger_row(&state.db, &client.host(), "account_login", 0);
+    account_status(state)
+}
+
+/// `account_logout()` — best-effort server logout, clear the Keychain tokens + drop the session MK.
+#[tauri::command]
+pub async fn account_logout(state: State<'_, AppState>) -> Result<(), AppError> {
+    // Best-effort server-side family revoke (ignore network errors — local logout still proceeds).
+    if let (Ok(base), Ok(Some(access))) = (share_base_url(state.inner()), crate::share::access_token())
+    {
+        if !base.trim().is_empty() {
+            if let Ok(client) = crate::share::client::ShareClient::new(&base) {
+                let _ = client.logout(&access).await;
+            }
+        }
+    }
+    crate::share::clear_tokens()?;
+    if let Ok(mut session) = state.account_session.lock() {
+        *session = None; // drops the AccountSession → zeroizes MK.
+    }
+    Ok(())
+}
+
+/// `share_note_to_link(meeting_id, expires_days?, password?) -> String` — create a zero-knowledge
+/// mode-A link share of a note and return the share URL. See the LOCK-CRITICAL invariants above.
+#[tauri::command]
+pub async fn share_note_to_link(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    expires_days: Option<u32>,
+    password: Option<String>,
+) -> Result<String, AppError> {
+    share_note_to_link_inner(state.inner(), meeting_id, expires_days, password).await
+}
+
+/// Core of [`share_note_to_link`] over `&AppState` so the lock gate + consent gate are unit-testable
+/// headless (no Tauri `State`, no server). The gate order is normative — DO NOT reorder.
+pub(crate) async fn share_note_to_link_inner(
+    state: &AppState,
+    meeting_id: String,
+    expires_days: Option<u32>,
+    password: Option<String>,
+) -> Result<String, AppError> {
+    // (1) READ-GATE — FIRST statement (copies `export_note`). A sealed-not-unlocked meeting refuses.
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to share the note".into(),
+        ));
+    }
+
+    // (7) First-ever share = explicit consent (fail-closed, mirrors cloud egress).
+    // (8) Logged out ⇒ fail closed Unavailable. A mode-A link share needs a live session (the bearer
+    //     token) but NOT the account MK — `L`/`NK` are per-share random (MK binds only mode-B grants),
+    //     so we require login + hold the access token; MK stays untouched in the session.
+    let (access_token, base) = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.share_egress_consented {
+            return Err(AppError::Unavailable(
+                "sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+        let base = cfg.share_base_url.clone();
+        drop(cfg);
+        let session_guard = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        let session = crate::share::require_login(&session_guard)?;
+        (session.access_token.clone(), base)
+    };
+
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (2) Fetch the note via the gated read, and its display title/timestamp.
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let meeting = state.db.get_meeting(&meeting_id)?;
+    let title = meeting
+        .as_ref()
+        .and_then(|m| m.title.clone())
+        .unwrap_or_else(|| "Shared note".to_string());
+    let created_at = meeting
+        .as_ref()
+        .map(|m| m.started_at.clone())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    // (2 cont.) Clean the body: strip frontmatter + flatten wikilinks + strip obsidian:// (pure fn).
+    let clean_body = crate::share::envelope::clean_note_body(&note.markdown);
+
+    // (3) Build the inner envelope + seal a fresh link share (e2ee M2). rev starts at 1.
+    let share_id = crate::share::new_share_id();
+    let rev = 1u32;
+    let env = murmur_protocol::envelope::ShareEnvelope::new(title, clean_body, created_at);
+    let pw_ref = password.as_deref().filter(|s| !s.is_empty());
+    let sealed = crate::e2ee::link::seal_link_share(&env, &share_id, rev, pw_ref)?;
+
+    // (4) Upload: content cell + wrapped_nk + gate_salt + gate_secret + rev + passwordRequired.
+    //     L is NOT in this request (CreateShareRequest has no `l` field) — it stays on-device.
+    let expires_at = expires_days.map(|d| {
+        let days = d.min(365).max(1) as i64;
+        (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+    });
+    let argon = if pw_ref.is_some() {
+        Some(murmur_protocol::dto::ArgonParams {
+            m: sealed.argon_params.m_cost_kib,
+            t: sealed.argon_params.t_cost,
+            p: sealed.argon_params.p_cost,
+        })
+    } else {
+        None
+    };
+    let cell_bytes = sealed.ciphertext_cell.len();
+    let create_req = murmur_protocol::dto::CreateShareRequest {
+        share_id: share_id.clone(),
+        mode: murmur_protocol::dto::ShareMode::Link,
+        content_cell: sealed.ciphertext_cell,
+        wrapped_nk: sealed.wrapped_nk,
+        gate_salt: sealed.gate_salt.to_vec(),
+        gate_secret: sealed.gate_secret.to_vec(),
+        rev,
+        password_required: pw_ref.is_some(),
+        argon,
+        expires_at,
+        max_downloads: None,
+        // Mode A: no per-recipient wrapped keys (that is mode B / §4.8). Absent for link shares.
+        recipients: None,
+    };
+    let created = client.create_share(&access_token, create_req).await?;
+
+    // (6) CONTENT-FREE egress ledger row (host + byte size). NEVER the URL / L / title.
+    crate::share::ledger_row(&state.db, &client.host(), "share_create", cell_bytes);
+    // Local bookkeeping — share_id + meeting_id only (NO title column).
+    state.db.insert_outbound_share(
+        &share_id,
+        &meeting_id,
+        "link",
+        rev,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+
+    // (5) Assemble the URL LOCALLY — L goes ONLY into the fragment; never logged/ledgered.
+    let base_for_url = if created.share_base_url.trim().is_empty() {
+        base
+    } else {
+        created.share_base_url
+    };
+    Ok(crate::share::assemble_share_url(&base_for_url, &share_id, &sealed.l))
+}
+
+/// `list_my_shares() -> Vec<MyShareEntry>` — the server's share list, with each entry's local title
+/// added ONLY when the meeting is unlocked (a sealed-not-unlocked meeting is MASKED: `locked:true`,
+/// no title). §7 inv. 6.
+#[tauri::command]
+pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEntry>, AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.list_shares(&access).await?;
+
+    let mut out = Vec::with_capacity(resp.shares.len());
+    for s in resp.shares {
+        // Resolve the local meeting for this share (None ⇒ created on another device ⇒ masked).
+        let (title, locked) = match state.db.outbound_share_meeting(&s.share_id)? {
+            Some(meeting_id) => {
+                if meeting_is_unlocked(state.inner(), &meeting_id)? {
+                    let t = state
+                        .db
+                        .get_meeting(&meeting_id)?
+                        .and_then(|m| m.title);
+                    (t, false)
+                } else {
+                    // Sealed-and-not-unlocked ⇒ MASK the title.
+                    (None, true)
+                }
+            }
+            None => (None, true),
+        };
+        out.push(MyShareEntry {
+            share_id: s.share_id,
+            title,
+            locked,
+            rev: s.rev,
+            created_at: s.created_at,
+            expires_at: s.expires_at,
+            revoked: s.revoked_at.is_some(),
+            download_count: s.download_count,
+        });
+    }
+    Ok(out)
+}
+
+/// `revoke_share(share_id)` — DELETE the server ciphertext + flip the local state. Idempotent.
+#[tauri::command]
+pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client.revoke_share(&access, &share_id).await?;
+    state.db.set_outbound_share_state(&share_id, "revoked")?;
+    crate::share::ledger_row(&state.db, &client.host(), "share_revoke", 0);
+    Ok(())
+}
+
 #[cfg(test)]
 mod lock_read_gate_tests {
     use super::*;
@@ -7163,8 +7671,88 @@ mod lifecycle_tests {
             live_transcript: Mutex::new(String::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
+            account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
         }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked
+    /// meeting MUST refuse with `AppError::Locked` BEFORE any note read / network / consent check — a
+    /// locked note can never be uploaded. This is the RED-before-GREEN regression for the leak class:
+    /// it runs with NO server configured + NO login, so a non-`Locked` return (e.g. it fell through to
+    /// the "not signed in"/"no server" errors) is a gate-order violation and fails the test.
+    #[test]
+    fn share_note_to_link_refuses_a_sealed_meeting() {
+        let state = build_state("share-lockgate");
+        // A locked folder holding a meeting + note.
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-locked".to_string(),
+                started_at: "2026-07-04T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-lock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-locked".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "---\nattendees:\n  - Alice\n---\n# secret".to_string(),
+                created_at: "2026-07-04T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        // Associate the note (hence the meeting) with the folder, then seal it. `meeting_is_unlocked`
+        // resolves the folder via `notes.folder_id` (`folder_for_meeting`), so this MUST be set or the
+        // meeting reads as vault-root/open and the gate is a no-op.
+        state.db.set_note_folder("m-locked", Some("f-lock")).unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let err = block_on(share_note_to_link_inner(
+            &state,
+            "m-locked".to_string(),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must fail closed with Locked, got: {err:?}"
+        );
+
+        // Session-unlock the folder → the gate passes, and the NEXT failure is the fail-closed
+        // consent/login gate (proving the Locked was the gate, not a downstream error).
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        let err2 = block_on(share_note_to_link_inner(
+            &state,
+            "m-locked".to_string(),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented/logged-out share fails Unavailable, got: {err2:?}"
+        );
     }
 
     /// MANUAL voice command: with NO recording in progress, arming reports `listening:false`

@@ -258,6 +258,16 @@ export class SettingsStore {
   private loadedLockRequireBiometric = true;
   private loadedRelockOnScreenshare = true;
 
+  /**
+   * M3-CLIENT sharing — preserve-only here (the Settings → Account section owns
+   * these). Snapshotted from the loaded config and round-tripped on save() so the
+   * shell's "Save settings" button never clears a set sharing server or the
+   * share-egress consent (the backend's serde defaults would otherwise reset
+   * shareBaseUrl to "" / shareEgressConsented to false).
+   */
+  private loadedShareBaseUrl = "";
+  private loadedShareEgressConsented = false;
+
   /** Cloud-egress consent state — drives the "Cloud processing" section; round-tripped on save. */
   private readonly _cloudConsented = signal(false);
   readonly cloudConsented = this._cloudConsented.asReadonly();
@@ -862,6 +872,10 @@ export class SettingsStore {
       this.loadedMcpRequireToken = cfg.mcpRequireToken ?? true;
       this.loadedLockRequireBiometric = cfg.lockRequireBiometric ?? true;
       this.loadedRelockOnScreenshare = cfg.relockOnScreenshare ?? true;
+      // M3-CLIENT sharing — snapshot the sharing server + share-egress consent so
+      // save() round-trips them unchanged (owned by Settings → Account).
+      this.loadedShareBaseUrl = cfg.shareBaseUrl ?? "";
+      this.loadedShareEgressConsented = cfg.shareEgressConsented ?? false;
       this._cloudConsented.set(cfg.cloudEgressConsented ?? false);
       // brain2 connectors — web-search consent is preserve-only (granted only via
       // consent_to_web_search); snapshot it so save() round-trips it unchanged.
@@ -1260,6 +1274,11 @@ export class SettingsStore {
       roleLiveConnection: v.roleLiveConnection,
       roleLiveModel: v.roleLiveModel,
       roleLiveEffort: v.roleLiveEffort,
+      // M3-CLIENT sharing — preserve-only: carry the snapshot back unchanged so
+      // the shell Save never clears the sharing server / share-egress consent
+      // (the Account section is the sole owner of these values).
+      shareBaseUrl: this.loadedShareBaseUrl,
+      shareEgressConsented: this.loadedShareEgressConsented,
     };
     try {
       await this.ipc.saveConfig(cfg);
