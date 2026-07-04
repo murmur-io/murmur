@@ -171,6 +171,15 @@ pub struct AppConfigDto {
     /// `revoke_share_egress`, so a settings save can neither grant nor clear it.
     #[serde(default)]
     pub share_egress_consented: bool,
+    /// Sharing-onboarding gate — whether the user has RESOLVED the first-run sharing decision
+    /// (chose local-only OR went through the account door). DISPLAY-ONLY on this DTO, same
+    /// preserve-only discipline as `share_egress_consented`: `get_config` carries the stored value
+    /// OUT so the init gateway (`/welcome`) knows whether to show, but `dto_to_config` PRESERVES the
+    /// stored value — a settings save can never set/clear it. Mutated ONLY by the dedicated
+    /// `mark_sharing_choice_made` command. `#[serde(default)]` = false (a pre-existing install sees
+    /// the gateway once).
+    #[serde(default)]
+    pub sharing_choice_made: bool,
     /// Phase H — which reasoner powers the on-device "brain" pre-analysis (Flow A): `cloud` |
     /// `local` | `off`. Unlike `cloud_egress_consented`, this IS settable from the DTO (the Settings
     /// UI owns the brain toggle). An omitted/unknown value deserializes to the default `Cloud`
@@ -3752,6 +3761,9 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         cloud_egress_consented: c.cloud_egress_consented,
         // DISPLAY-ONLY out (M3-CLIENT): FE shows share-egress consent status; cannot set it back.
         share_egress_consented: c.share_egress_consented,
+        // DISPLAY-ONLY out: the init gateway reads this to know whether the first-run sharing
+        // choice was already made; the FE cannot set it back (preserved in `dto_to_config`).
+        sharing_choice_made: c.sharing_choice_made,
         brain_backend: c.brain_backend,
         realtime_reactions: c.realtime_reactions,
         brain_model_id: c.brain_model_id.clone(),
@@ -3852,6 +3864,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // BLK-4 (M3-CLIENT): share-egress consent is NEVER set from the DTO — preserve the live value.
         // Only `consent_to_share_egress` may flip it. An omitting/zeroed save is inert.
         share_egress_consented: current.share_egress_consented,
+        // Sharing-onboarding gate: the first-run choice latch is NEVER set from the DTO — preserve the
+        // live value. Only `mark_sharing_choice_made` may flip it, so a settings save can never set or
+        // clear it (a re-save from an older FE that omits the key can't accidentally reopen the gate).
+        sharing_choice_made: current.sharing_choice_made,
         // brain2 RAG: the semantic-search master flag IS carried on the settings DTO (the Settings
         // UI owns the toggle). Plain bool; an omitted value already defaulted to OFF on the DTO
         // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
@@ -7772,6 +7788,21 @@ pub fn revoke_share_egress(state: State<'_, AppState>) -> Result<(), AppError> {
     Ok(())
 }
 
+/// `mark_sharing_choice_made` — persist that the user has RESOLVED the first-run sharing decision
+/// (either "use Murmur locally" OR they went through the account door), so the init gateway
+/// (`/welcome`) never nags again. One-way latch: the ONLY mutator that sets it true; a normal
+/// settings save PRESERVES it (`dto_to_config`). Idempotent — safe to call repeatedly. Carries no
+/// egress and no PII.
+#[tauri::command]
+pub fn mark_sharing_choice_made(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.set_sharing_choice_made(&state.db)?;
+    Ok(())
+}
+
 /// `account_signup(email, password, save_recovery)` — create a sharing account (spec §3.1a/§4.3).
 ///
 /// Runs the OPAQUE CLIENT registration, generates the account MK + identity keypair + (skippable)
@@ -7791,8 +7822,18 @@ pub async fn account_signup(
     let client = crate::share::client::ShareClient::new(&base)?;
     let password = Zeroizing::new(password);
 
-    // 1. Exchange the emailed verification code for a single-use signup token.
-    let signup_token = client.verify_email(email.trim(), code.trim()).await?;
+    // 1. Exchange the emailed verification code for a single-use signup token. A rejected/expired/
+    //    too-many-tries code comes back as a 4xx → InvalidArg; give the user a clear, actionable
+    //    message. Connectivity errors (Unavailable) pass through so "can't reach" still means that.
+    let signup_token = client
+        .verify_email(email.trim(), code.trim())
+        .await
+        .map_err(|e| match e {
+            AppError::InvalidArg(_) | AppError::Auth(_) => AppError::InvalidArg(
+                "That verification code is incorrect or has expired — request a new one.".into(),
+            ),
+            other => other,
+        })?;
 
     // 2. OPAQUE registration step 1 → server RegistrationResponse.
     let reg_start = crate::share::opaque_client::client_registration_start(password.as_bytes())?;
@@ -7858,6 +7899,29 @@ pub async fn account_signup(
 
     // Signup does NOT auto-login (the FE prompts a login next); no tokens stored yet.
     Ok(recovery_phrase)
+}
+
+/// `account_send_code(email)` — the PRE-SIGNUP send-code step (the leg the old inline form was
+/// missing). Triggers the server to email a 6-digit verification code
+/// (`POST /v1/auth/signup {email}` → 202). Needs NO account session (it runs before signup).
+///
+/// ANTI-ENUMERATION: the server ALWAYS returns 202 whether or not the address is already registered,
+/// so this resolves `Ok(())` regardless — it never reveals account existence to the caller. The
+/// email is trimmed; an empty email is rejected `InvalidArg` before any network call. Network/HTTP
+/// failures map to `AppError::Unavailable` (inside `ShareClient`), never a raw reqwest string. The
+/// email itself is never logged (the content-free ledger row carries only host + a coarse size).
+#[tauri::command]
+pub async fn account_send_code(state: State<'_, AppState>, email: String) -> Result<(), AppError> {
+    let email = email.trim();
+    if email.is_empty() {
+        return Err(AppError::InvalidArg("email is required".into()));
+    }
+    let base = share_base_url(state.inner())?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client.signup(email).await?;
+    // Content-free ledger row for the send-code egress (host + a coarse size; no email, no code).
+    crate::share::ledger_row(&state.db, &client.host(), "account_send_code", 0);
+    Ok(())
 }
 
 /// `account_login(email, password) -> AccountStatus` — OPAQUE login; unwrap MK from the server's
@@ -11849,6 +11913,42 @@ mod lifecycle_tests {
         assert!(
             !dto_to_config(dto2, &current2).cloud_egress_consented,
             "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
+        );
+    }
+
+    /// Sharing-onboarding gate: `sharing_choice_made` is PRESERVE-ONLY on the settings DTO exactly
+    /// like the consent flags. `config_to_dto` carries the stored value OUT (so the init gateway can
+    /// read it), but `dto_to_config` PRESERVES the live value — a save carrying `false` can't reopen
+    /// an already-made choice, and a save carrying `true` can't set it (only the dedicated
+    /// `mark_sharing_choice_made` command latches it).
+    #[test]
+    fn save_config_merge_never_clobbers_or_sets_sharing_choice_made() {
+        // OUT: config_to_dto reflects the live value.
+        let cfg_made = AppConfig {
+            sharing_choice_made: true,
+            ..AppConfig::default()
+        };
+        assert!(config_to_dto(&cfg_made).sharing_choice_made);
+
+        // (a) an omitting/false save must NOT reopen an already-made choice.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.sharing_choice_made = false;
+        let current = AppConfig {
+            sharing_choice_made: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            dto_to_config(dto, &current).sharing_choice_made,
+            "an omitting/false save must NOT clear the first-run sharing latch"
+        );
+
+        // (b) a save carrying true cannot SET the latch (default-off stays off — only the command latches).
+        let mut dto2 = config_to_dto(&AppConfig::default());
+        dto2.sharing_choice_made = true;
+        let current2 = AppConfig::default(); // latch off
+        assert!(
+            !dto_to_config(dto2, &current2).sharing_choice_made,
+            "a settings save must NEVER set the sharing latch — only mark_sharing_choice_made may"
         );
     }
 

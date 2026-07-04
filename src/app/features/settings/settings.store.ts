@@ -311,6 +311,14 @@ export class SettingsStore {
   private loadedShareBaseUrl = "";
   private loadedShareEgressConsented = false;
 
+  /**
+   * First-run sharing-choice latch — preserve-only here (the /welcome gateway is
+   * its sole writer via mark_sharing_choice_made). Snapshotted + round-tripped on
+   * save() so the shell "Save settings" never clears it (the backend also
+   * PRESERVES it in dto_to_config, so this is belt-and-braces).
+   */
+  private loadedSharingChoiceMade = false;
+
   /** Cloud-egress consent state — drives the "Cloud processing" section; round-tripped on save. */
   private readonly _cloudConsented = signal(false);
   readonly cloudConsented = this._cloudConsented.asReadonly();
@@ -1003,6 +1011,8 @@ export class SettingsStore {
       // save() round-trips them unchanged (owned by Settings → Account).
       this.loadedShareBaseUrl = cfg.shareBaseUrl ?? "";
       this.loadedShareEgressConsented = cfg.shareEgressConsented ?? false;
+      // First-run sharing latch — snapshot so save() round-trips it unchanged.
+      this.loadedSharingChoiceMade = cfg.sharingChoiceMade ?? false;
       this._cloudConsented.set(cfg.cloudEgressConsented ?? false);
       // brain2 connectors — web-search consent is preserve-only (granted only via
       // consent_to_web_search); snapshot it so save() round-trips it unchanged.
@@ -1730,6 +1740,9 @@ export class SettingsStore {
       // (the Account section is the sole owner of these values).
       shareBaseUrl: this.loadedShareBaseUrl,
       shareEgressConsented: this.loadedShareEgressConsented,
+      // First-run sharing latch — preserve-only (the /welcome gateway owns it);
+      // carry the snapshot back so the shell Save never clears it.
+      sharingChoiceMade: this.loadedSharingChoiceMade,
     };
     try {
       await this.ipc.saveConfig(cfg);

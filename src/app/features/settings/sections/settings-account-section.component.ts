@@ -1,9 +1,13 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
   computed,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
@@ -12,6 +16,7 @@ import type {
   FolderNode,
   ShareInboxItem,
 } from "../../../core/models";
+import { SharingAuthFlowComponent } from "../../sharing/sharing-auth-flow.component";
 
 /** A flattened, depth-indented folder option for the accept-into picker. */
 interface FolderOption {
@@ -25,19 +30,23 @@ interface FolderOption {
  * settings-privacy-section shape (`:host { display: contents }` + `.section-stack`
  * + frosted `.card`, global `.btn`/`.btn-primary`/`.btn-ghost`, `var(--token)`).
  *
- * Everything talks to the Rust core through {@link IpcService}: `accountStatus`
- * loads once into a signal on init; login / signup / logout write the resulting
- * `AccountStatus` back into that signal. The sharing-server base URL round-trips
- * through the normal config path (`getConfig` → mutate `shareBaseUrl` → `saveConfig`).
+ * REBUILT: the cramped all-at-once login+signup form (which never issued the
+ * send-code call → the "broken signup" bug) is gone. When signed out, a single
+ * primary button opens the SAME reusable `<app-sharing-auth-flow>` used by the
+ * `/welcome` gateway — here inside an OPAQUE modal (`var(--surface-overlay)`,
+ * `backdrop-filter: none`, `border-strong`, `shadow-lg` — trap T3, never the
+ * frosted `.card`). The signed-in state, the sharing-server editor, and the M5
+ * incoming-shares inbox are unchanged.
  *
- * SECURITY: the password lives ONLY in a per-form FormControl and is cleared after
- * each submit — it is never stored in a persistent signal and never logged.
+ * Everything talks to the Rust core through {@link IpcService}: `accountStatus`
+ * loads once into a signal on init; the flow's `completed` output triggers a
+ * reload that flips the section to its signed-in state.
  */
 @Component({
   selector: "app-settings-account-section",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, SharingAuthFlowComponent],
   template: `
     <div class="section-stack">
       <div class="card account-card">
@@ -135,146 +144,47 @@ interface FolderOption {
                   Sign out
                 </button>
               </div>
+              <p class="text-secondary account-note">
+                Your notes live on this Mac. Signing out only turns off sharing —
+                it never deletes, moves, or uploads a note.
+              </p>
               @if (!st.unlockedForSharing) {
                 <p class="text-secondary account-note">
                   Sign in again to share — your account key isn't loaded in this
                   session.
                 </p>
-              }
-            </div>
-          } @else {
-            <!-- (2b) Login form (primary path) -->
-            <div class="account-section">
-              <span class="account-section-label text-muted">Sign in</span>
-              <div class="field-grid">
-                <input
-                  type="email"
-                  class="text-input"
-                  [formControl]="emailControl"
-                  placeholder="you@example.com"
-                  autocomplete="username"
-                  spellcheck="false"
-                  aria-label="Email"
-                />
-                <input
-                  type="password"
-                  class="text-input"
-                  [formControl]="passwordControl"
-                  placeholder="Password"
-                  autocomplete="current-password"
-                  aria-label="Password"
-                />
-              </div>
-              <div class="account-actions">
-                <button
-                  type="button"
-                  class="btn btn-primary"
-                  (click)="login()"
-                  [disabled]="busy()"
-                >
-                  {{ busy() ? "Signing in…" : "Sign in" }}
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-ghost"
-                  (click)="toggleSignup()"
-                >
-                  {{ showSignup() ? "Cancel" : "Create an account" }}
-                </button>
-              </div>
-              @if (loginError(); as lerr) {
-                <p class="text-danger account-note">{{ lerr }}</p>
-              }
-            </div>
-
-            <!-- (2c) Sign-up (secondary, collapsed under a toggle) -->
-            @if (showSignup()) {
-              <div class="account-section signup-section">
-                <span class="account-section-label text-muted"
-                  >Create an account</span
-                >
-                <p class="text-secondary account-note">
-                  Enter your email to receive a 6-digit code, then set a
-                  password. Your password never leaves this Mac.
-                </p>
-                <div class="field-grid">
-                  <input
-                    type="email"
-                    class="text-input"
-                    [formControl]="signupEmailControl"
-                    placeholder="you@example.com"
-                    autocomplete="username"
-                    spellcheck="false"
-                    aria-label="Email"
-                  />
-                  <input
-                    type="text"
-                    inputmode="numeric"
-                    class="text-input"
-                    [formControl]="signupCodeControl"
-                    placeholder="6-digit code"
-                    autocomplete="one-time-code"
-                    spellcheck="false"
-                    aria-label="Verification code"
-                  />
-                  <input
-                    type="password"
-                    class="text-input"
-                    [formControl]="signupPasswordControl"
-                    placeholder="Choose a password"
-                    autocomplete="new-password"
-                    aria-label="Password"
-                  />
-                </div>
-                <label class="toggle-row">
-                  <span class="toggle-copy">
-                    <span class="toggle-title">Save a recovery phrase</span>
-                    <span class="text-secondary toggle-sub">
-                      Generates a 24-word recovery phrase — the only way to
-                      recover a forgotten password. You can skip this.
-                    </span>
-                  </span>
-                  <input type="checkbox" [formControl]="saveRecoveryControl" />
-                </label>
                 <div class="account-actions">
                   <button
                     type="button"
                     class="btn btn-primary"
-                    (click)="signup()"
-                    [disabled]="busy()"
+                    (click)="openFlow()"
                   >
-                    {{ busy() ? "Creating…" : "Create account" }}
+                    Sign in to share
                   </button>
                 </div>
-                @if (signupError(); as serr) {
-                  <p class="text-danger account-note">{{ serr }}</p>
-                }
-                @if (signupNotice(); as note) {
-                  <p class="text-secondary account-note">{{ note }}</p>
-                }
-                @if (recoveryPhrase(); as phrase) {
-                  <div class="recovery">
-                    <span class="account-section-label text-muted"
-                      >Recovery phrase</span
-                    >
-                    <p class="recovery-block" role="text">{{ phrase }}</p>
-                    <div class="account-actions">
-                      <button
-                        type="button"
-                        class="btn"
-                        (click)="copyRecovery(phrase)"
-                      >
-                        {{ recoveryCopied() ? "Copied" : "Copy" }}
-                      </button>
-                    </div>
-                    <p class="text-secondary account-note">
-                      Save this — it's the only way to recover a forgotten
-                      password.
-                    </p>
-                  </div>
-                }
+              }
+            </div>
+          } @else {
+            <!-- (2b) Signed-out: ONE button opens the reusable flow -->
+            <div class="account-section">
+              <span class="account-section-label text-muted">Account</span>
+              <p class="text-secondary account-note">
+                Create a sharing account or sign in to this Mac to start sharing
+                notes as end-to-end-encrypted links.
+              </p>
+              <div class="account-actions">
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  (click)="openFlow()"
+                >
+                  Create or sign in to a sharing account
+                </button>
               </div>
-            }
+              @if (accountError(); as aerr) {
+                <p class="text-danger account-note">{{ aerr }}</p>
+              }
+            </div>
           }
         } @else {
           <p class="text-muted account-note">Loading account…</p>
@@ -408,6 +318,29 @@ interface FolderOption {
         }
       }
     </div>
+
+    <!-- The reusable flow, hosted in an OPAQUE modal (trap T3 — never .card).
+         Dismissal = the flow's own Cancel (dismissed) or Escape on the panel —
+         matching the repo's share-verify-sheet modal (no scrim-click handler, so
+         the a11y lint rules stay clean). -->
+    @if (showFlow()) {
+      <div class="flow-scrim">
+        <div
+          #flowPanel
+          class="flow-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Sharing account"
+          tabindex="-1"
+          (keydown.escape)="closeFlow()"
+        >
+          <app-sharing-auth-flow
+            (completed)="onFlowDone()"
+            (dismissed)="closeFlow()"
+          />
+        </div>
+      </div>
+    }
   `,
   styles: [
     `
@@ -467,10 +400,6 @@ interface FolderOption {
         flex-direction: column;
         gap: var(--space-2);
       }
-      .signup-section {
-        padding-top: var(--space-4);
-        border-top: 1px solid var(--border-subtle);
-      }
       .account-section-label {
         font-size: 0.8125rem;
         font-weight: 550;
@@ -516,13 +445,6 @@ interface FolderOption {
         flex: none;
       }
 
-      .field-grid {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        max-width: 24rem;
-      }
-
       .account-actions {
         display: flex;
         align-items: center;
@@ -542,55 +464,6 @@ interface FolderOption {
       }
       .signed-pill {
         align-self: flex-start;
-      }
-
-      /* Recovery-phrase toggle (mirrors the privacy-section toggle rows). */
-      .toggle-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-4);
-        cursor: pointer;
-        max-width: 24rem;
-      }
-      .toggle-copy {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-1);
-      }
-      .toggle-title {
-        color: var(--text-primary);
-        font-size: 0.95rem;
-        font-weight: 550;
-      }
-      .toggle-sub {
-        font-size: 0.85rem;
-        line-height: 1.55;
-      }
-
-      /* The revealed recovery phrase — a quiet inset well, selectable. */
-      .recovery {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-2);
-        padding: var(--space-4);
-        border-radius: var(--radius-md);
-        background: var(--surface-input);
-        border: 1px solid var(--border-subtle);
-      }
-      .recovery-block {
-        margin: 0;
-        padding: var(--space-3);
-        border-radius: var(--radius-md);
-        background: var(--surface-raised);
-        border: 1px solid var(--glass-border);
-        color: var(--text-primary);
-        font-family: var(--font-mono);
-        font-size: 0.875rem;
-        line-height: 1.7;
-        user-select: text;
-        -webkit-user-select: text;
-        overflow-wrap: anywhere;
       }
 
       /* --- Incoming shares (M5-CLIENT inbox) --- */
@@ -696,23 +569,89 @@ interface FolderOption {
         color: var(--text-muted);
         font-size: 0.8125rem;
       }
+
+      /* --- The reusable-flow OPAQUE modal (trap T3) --- */
+      .flow-scrim {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: var(--space-5);
+        background: rgba(0, 0, 0, 0.5);
+        -webkit-backdrop-filter: blur(2px);
+        backdrop-filter: blur(2px);
+        animation: scrim-in 180ms var(--transition) both;
+      }
+      @keyframes scrim-in {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+      .flow-modal {
+        width: 100%;
+        max-width: 460px;
+        max-height: calc(100vh - 2 * var(--space-5));
+        overflow-y: auto;
+        padding: var(--space-6);
+        /* OPAQUE overlay — NOT the frosted .card (trap T3). */
+        background: var(--surface-overlay);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-lg);
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
+        animation: modal-in 220ms var(--ease-spring) both;
+      }
+      .flow-modal:focus-visible {
+        outline: none;
+      }
+      @keyframes modal-in {
+        from {
+          opacity: 0;
+          transform: translateY(10px) scale(0.985);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .flow-scrim,
+        .flow-modal {
+          animation: none !important;
+        }
+      }
     `,
   ],
 })
 export class SettingsAccountSectionComponent {
   private readonly ipc = inject(IpcService);
+  private readonly injector = inject(Injector);
 
   /** The current sharing-account session; `null` until the first load resolves. */
   private readonly _status = signal<AccountStatus | null>(null);
   readonly status = this._status.asReadonly();
 
-  /** True while any login/signup/logout IPC call is in flight (debounces clicks). */
+  /** True while a logout IPC call is in flight (debounces the Sign out button). */
   private readonly _busy = signal(false);
   readonly busy = this._busy.asReadonly();
 
-  /** Whether the secondary sign-up affordance is expanded (login stays primary). */
-  private readonly _showSignup = signal(false);
-  readonly showSignup = this._showSignup.asReadonly();
+  /** A general account error (status load / logout failure). */
+  private readonly _accountError = signal<string | null>(null);
+  readonly accountError = this._accountError.asReadonly();
+
+  /** Whether the reusable-flow modal is open. */
+  private readonly _showFlow = signal(false);
+  readonly showFlow = this._showFlow.asReadonly();
+
+  /** The modal panel — focused on open so Escape works immediately. */
+  private readonly flowPanel =
+    viewChild<ElementRef<HTMLElement>>("flowPanel");
 
   // ── Server base URL ──────────────────────────────────────────────────────
   readonly serverControl = new FormControl("", { nonNullable: true });
@@ -720,27 +659,6 @@ export class SettingsAccountSectionComponent {
   readonly savingServer = this._savingServer.asReadonly();
   private readonly _serverError = signal<string | null>(null);
   readonly serverError = this._serverError.asReadonly();
-
-  // ── Login form (password lives ONLY here; cleared after submit) ───────────
-  readonly emailControl = new FormControl("", { nonNullable: true });
-  readonly passwordControl = new FormControl("", { nonNullable: true });
-  private readonly _loginError = signal<string | null>(null);
-  readonly loginError = this._loginError.asReadonly();
-
-  // ── Sign-up form ─────────────────────────────────────────────────────────
-  readonly signupEmailControl = new FormControl("", { nonNullable: true });
-  readonly signupCodeControl = new FormControl("", { nonNullable: true });
-  readonly signupPasswordControl = new FormControl("", { nonNullable: true });
-  readonly saveRecoveryControl = new FormControl(false, { nonNullable: true });
-  private readonly _signupError = signal<string | null>(null);
-  readonly signupError = this._signupError.asReadonly();
-  private readonly _signupNotice = signal<string | null>(null);
-  readonly signupNotice = this._signupNotice.asReadonly();
-  /** The 24-word recovery phrase, shown once after a `saveRecovery` signup. */
-  private readonly _recoveryPhrase = signal<string | null>(null);
-  readonly recoveryPhrase = this._recoveryPhrase.asReadonly();
-  private readonly _recoveryCopied = signal(false);
-  readonly recoveryCopied = this._recoveryCopied.asReadonly();
 
   // ── Incoming shares (M5-CLIENT inbox) ────────────────────────────────────
   private readonly _inbox = signal<ShareInboxItem[]>([]);
@@ -796,7 +714,7 @@ export class SettingsAccountSectionComponent {
       st = await this.ipc.accountStatus();
       this._status.set(st);
     } catch (e) {
-      this._loginError.set(String(e));
+      this._accountError.set(String(e));
     }
     try {
       const cfg = await this.ipc.getConfig();
@@ -839,8 +757,26 @@ export class SettingsAccountSectionComponent {
     }
   }
 
-  toggleSignup(): void {
-    this._showSignup.update((v) => !v);
+  // ── The reusable flow (modal host) ───────────────────────────────────────
+
+  /** Open the OPAQUE modal + focus its panel so Escape/keyboard work at once. */
+  openFlow(): void {
+    this._accountError.set(null);
+    this._showFlow.set(true);
+    afterNextRender(() => this.flowPanel()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
+  }
+
+  /** Dismissed (user backed out) — just close. */
+  closeFlow(): void {
+    this._showFlow.set(false);
+  }
+
+  /** Completed (signed in) — close + reload so the section flips to signed-in. */
+  async onFlowDone(): Promise<void> {
+    this._showFlow.set(false);
+    await this.reload();
   }
 
   /** Persist the sharing-server base URL through the normal config round-trip. */
@@ -863,69 +799,6 @@ export class SettingsAccountSectionComponent {
     }
   }
 
-  /** Sign in (OPAQUE) — writes the returned AccountStatus into the status signal. */
-  async login(): Promise<void> {
-    if (this._busy()) return;
-    const email = this.emailControl.value.trim();
-    const password = this.passwordControl.value;
-    if (!email || !password) {
-      this._loginError.set("Enter your email and password.");
-      return;
-    }
-    this._loginError.set(null);
-    this._busy.set(true);
-    try {
-      const st = await this.ipc.accountLogin(email, password);
-      this._status.set(st);
-      this.passwordControl.setValue(""); // never persist the password
-    } catch (e) {
-      this._loginError.set(String(e));
-    } finally {
-      this._busy.set(false);
-    }
-  }
-
-  /**
-   * Create a sharing account. `accountSignup` returns the 24-word recovery
-   * phrase ONLY when saveRecovery is checked (else null → "now sign in").
-   */
-  async signup(): Promise<void> {
-    if (this._busy()) return;
-    const email = this.signupEmailControl.value.trim();
-    const code = this.signupCodeControl.value.trim();
-    const password = this.signupPasswordControl.value;
-    const saveRecovery = this.saveRecoveryControl.value;
-    if (!email || !code || !password) {
-      this._signupError.set("Enter your email, the 6-digit code, and a password.");
-      return;
-    }
-    this._signupError.set(null);
-    this._signupNotice.set(null);
-    this._recoveryPhrase.set(null);
-    this._busy.set(true);
-    try {
-      const phrase = await this.ipc.accountSignup(
-        email,
-        code,
-        password,
-        saveRecovery,
-      );
-      if (phrase) {
-        this._recoveryPhrase.set(phrase);
-      } else {
-        this._signupNotice.set("Account created — now sign in.");
-      }
-      // Prefill the login form for the freshly-created account; clear secrets.
-      this.emailControl.setValue(email);
-      this.signupPasswordControl.setValue("");
-      this.signupCodeControl.setValue("");
-    } catch (e) {
-      this._signupError.set(String(e));
-    } finally {
-      this._busy.set(false);
-    }
-  }
-
   /** Sign out (server family-revoke + clear tokens + drop session MK), then reload. */
   async logout(): Promise<void> {
     if (this._busy()) return;
@@ -934,19 +807,9 @@ export class SettingsAccountSectionComponent {
       await this.ipc.accountLogout();
       await this.reload();
     } catch (e) {
-      this._loginError.set(String(e));
+      this._accountError.set(String(e));
     } finally {
       this._busy.set(false);
-    }
-  }
-
-  /** Copy the recovery phrase to the clipboard and briefly confirm. */
-  async copyRecovery(phrase: string): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(phrase);
-      this._recoveryCopied.set(true);
-    } catch {
-      // Clipboard unavailable — the phrase stays visible and selectable.
     }
   }
 
