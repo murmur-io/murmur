@@ -221,9 +221,11 @@ import { FolderDropDirective } from "./folder-drop.directive";
         outline: none;
         box-shadow: 0 0 0 3px var(--accent-ring);
       }
+      /* Selected: the shell's neutral glass-on-glass pill (accent on text only). */
       .root-row.is-selected {
-        color: var(--accent-hover);
-        background: var(--accent-soft);
+        color: var(--shell-active-text);
+        background: var(--shell-active-bg);
+        box-shadow: var(--shell-active-shadow);
       }
       /* Drop target — armed (faint) while any note drags; lit under the pointer. */
       .root-row {
@@ -258,7 +260,7 @@ import { FolderDropDirective } from "./folder-drop.directive";
         white-space: nowrap;
       }
       .root-row.is-selected .root-icon {
-        color: var(--accent-hover);
+        color: var(--shell-active-text);
       }
 
       .tree-empty {
