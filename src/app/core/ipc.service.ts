@@ -297,14 +297,24 @@ export class IpcService {
    * Create a zero-knowledge link share of a note and return the share URL. The note is cleaned
    * (frontmatter/wikilinks/obsidian:// stripped) and sealed on-device; only ciphertext + wrapped
    * keys leave. The URL's `#…` fragment carries the decryption key `L` and is assembled locally —
-   * `L` never reaches the server. Refuses (`Locked`) a sealed meeting; requires login + consent.
+   * `L` never reaches the server (never log the returned URL). Refuses (`Locked`) a sealed meeting;
+   * requires login + consent.
+   *
+   * `opts` (all optional): `expiresDays` (link auto-expiry), `password` (mixed into the link key
+   * on-device — the server never sees it), and `maxDownloads` (the server-enforced open cap; a
+   * nonsensical 0 is clamped to 1 backend-side). Tauri maps the camelCase named args →
+   * the snake_case Rust params.
    */
   shareNoteToLink(
     meetingId: string,
-    expiresDays?: number,
-    password?: string,
+    opts?: { expiresDays?: number; password?: string; maxDownloads?: number },
   ): Promise<string> {
-    return invoke<string>("share_note_to_link", { meetingId, expiresDays, password });
+    return invoke<string>("share_note_to_link", {
+      meetingId,
+      expiresDays: opts?.expiresDays,
+      password: opts?.password,
+      maxDownloads: opts?.maxDownloads,
+    });
   }
 
   /** The user's shares (a sealed meeting's title is masked). */
