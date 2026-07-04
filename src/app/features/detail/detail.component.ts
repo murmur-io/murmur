@@ -374,6 +374,24 @@ interface ParsedNote {
                     Share with a person
                   </button>
                 </div>
+                <!-- Optional password for the NEXT "Share as link". Mixed into the link key on
+                     device (Argon2id) — the server never sees it; the viewer prompts for it. -->
+                <div class="share-pw-row">
+                  <input
+                    #pwField
+                    type="password"
+                    class="share-pw-input"
+                    [value]="sharePassword()"
+                    (input)="sharePassword.set(pwField.value)"
+                    placeholder="Link password (optional)"
+                    autocomplete="off"
+                    aria-label="Optional password for the share link"
+                  />
+                  <span class="share-pw-hint text-secondary">
+                    Set a password → recipients must enter it to open the link. Share
+                    the password separately.
+                  </span>
+                </div>
               }
 
               <!-- Share-as-link: one-time egress consent panel, the created
@@ -406,6 +424,11 @@ interface ParsedNote {
               }
               @if (shareUrl(); as url) {
                 <div class="share-result" role="group" aria-label="Share link">
+                  @if (sharedWithPassword()) {
+                    <span class="pill is-success share-pw-badge">
+                      🔒 Password-protected
+                    </span>
+                  }
                   <div class="share-link-row">
                     <input
                       type="text"
@@ -427,6 +450,12 @@ interface ParsedNote {
                     <code>#…</code> part is the decryption key and never reached
                     the server.
                   </p>
+                  @if (sharedWithPassword()) {
+                    <p class="share-link-note text-secondary">
+                      🔒 Password-protected — send the password to the recipient
+                      <strong>separately</strong> (not in the same message).
+                    </p>
+                  }
                 </div>
               }
               @if (shareError(); as err) {
@@ -1340,6 +1369,30 @@ interface ParsedNote {
         height: 36px;
         padding: 0 var(--space-3);
         font-size: 0.875rem;
+      }
+      .share-pw-row {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+        flex-basis: 100%;
+        max-width: 36rem;
+        margin-top: var(--space-1);
+      }
+      .share-pw-input {
+        flex: none;
+        width: 100%;
+        height: 36px;
+        padding: 0 var(--space-3);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text-primary);
+        font-size: 0.85rem;
+      }
+      .share-pw-hint {
+        margin: 0;
+        font-size: 0.8125rem;
+        color: var(--text-secondary);
       }
 
       /* --- Share as link (M3-CLIENT) + share with a person (M5-CLIENT) --- */
@@ -2278,6 +2331,12 @@ export class DetailComponent implements OnInit {
   readonly sharing = signal(false);
   /** The created share URL; the `#…` fragment holds the decryption key (kept local). */
   readonly shareUrl = signal<string | null>(null);
+  /** Optional password for the NEXT link share — recipients must enter it in the viewer to decrypt.
+   * Transient: mixed into the link key (Argon2id) at share time and cleared right after. */
+  readonly sharePassword = signal("");
+  /** True when the last-created link was password-protected (drives the "share the password
+   * separately" hint). */
+  readonly sharedWithPassword = signal(false);
   /** Inline error surfaced when sharing fails or is refused (not logged in, etc.). */
   readonly shareError = signal<string | null>(null);
   /**
@@ -3382,9 +3441,16 @@ export class DetailComponent implements OnInit {
    */
   private async doShare(meetingId: string): Promise<void> {
     this.sharing.set(true);
+    const pw = this.sharePassword().trim();
     try {
-      const url = await this.ipc.shareNoteToLink(meetingId);
+      const url = await this.ipc.shareNoteToLink(
+        meetingId,
+        undefined,
+        pw.length > 0 ? pw : undefined,
+      );
       this.shareUrl.set(url);
+      this.sharedWithPassword.set(pw.length > 0);
+      this.sharePassword.set(""); // clear the transient password once it's baked into the link
       try {
         await navigator.clipboard.writeText(url);
         this.shareLinkCopied.set(true);
