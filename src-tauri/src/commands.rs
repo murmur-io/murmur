@@ -5105,6 +5105,20 @@ pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<
     Ok(())
 }
 
+/// The RESOLVED "what runs where" map for the Settings AI page — one row per AI job with its
+/// resolved engine/model/locality (mirrors `roles::resolve`; display-only, steers nothing).
+/// Read-only config projection: no content, no PII, no keys — NOT a gated content read.
+#[tauri::command]
+pub fn resolved_ai_map(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::settings::ai_map::AiMapRow>, AppError> {
+    let c = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(crate::settings::ai_map::ai_map_rows(&c))
+}
+
 /// Whether the machine has enough RAM to run Realtime Reactions (the light engine) alongside a live
 /// recording — the combined-residency guard (spec §3.3), including a KV estimate + call-overhead. Lets
 /// the Brain Live card warn / gate before enabling. `true` when total RAM can't be read (never block
