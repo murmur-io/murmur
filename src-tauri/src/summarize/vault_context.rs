@@ -319,8 +319,8 @@ mod tests {
         // Index BEFORE sealing (content visible) so a vec_chunks row for the sealed meeting exists —
         // proving the READ-time gate (not just absence of an index row) excludes it.
         let emb = crate::embed::active_embedder();
-        db.index_meeting_chunks("open", emb.as_ref()).unwrap();
-        db.index_meeting_chunks("sealed", emb.as_ref()).unwrap();
+        db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", &[], emb.as_ref()).unwrap();
         db.set_folder_locked("f-locked", true, None).unwrap();
 
         let qv = emb

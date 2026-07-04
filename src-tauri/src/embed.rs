@@ -33,6 +33,17 @@ pub const EMBED_DIM: usize = 384;
 /// Target character size for one note chunk (paragraphs are merged up to roughly this width).
 const CHUNK_CHAR_TARGET: usize = 800;
 
+/// Target character size for one TRANSCRIPT chunk. Speaker-turn / sliding-window chunking follows the
+/// 2026 meeting-RAG convention (~800-1200 chars): big enough to hold a coherent exchange, small
+/// enough to embed with focus. Turns are accumulated until adding the next one would exceed this.
+const TRANSCRIPT_CHUNK_CHAR_TARGET: usize = 1000;
+
+/// Sliding-window OVERLAP (~15% of [`TRANSCRIPT_CHUNK_CHAR_TARGET`]) carried from the end of one
+/// transcript chunk into the start of the next, so a fact spanning a chunk boundary is embedded in
+/// both windows and stays retrievable. Whole trailing TURNS are carried (never a mid-turn cut) up to
+/// this many characters — this preserves the `[mm:ss-mm:ss] (speaker)` provenance on every line.
+const TRANSCRIPT_CHUNK_OVERLAP_CHARS: usize = 150;
+
 /// Reciprocal Rank Fusion constant (the standard k=60). Larger k flattens the contribution of
 /// rank position; 60 is the widely-used default from the original RRF paper.
 pub const RRF_K: f64 = 60.0;
@@ -390,6 +401,149 @@ pub fn chunk_note(title: &str, date: &str, markdown: &str) -> Vec<String> {
     chunks
 }
 
+/// Render `seconds` as `mm:ss` (minutes uncapped past 60 — a 75-minute meeting reads `75:xx`, not
+/// `01:15:xx`; provenance, not a clock). Negative/NaN clamp to `0`.
+fn mmss(seconds: f64) -> String {
+    let s = if seconds.is_finite() && seconds > 0.0 {
+        seconds as u64
+    } else {
+        0
+    };
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// One speaker-turn: consecutive same-speaker segments merged, carrying the turn's overall time span
+/// and the (already-rendered) `[mm:ss-mm:ss] (speaker)\n<text>` line used inside a chunk.
+struct Turn {
+    line: String,
+}
+
+/// Group `segments` into speaker TURNS: runs of consecutive segments with the SAME `speaker` label are
+/// merged into one turn (their texts joined by a space). The speaker tag is the segment's `speaker`
+/// (`me`/`others`, or any Unicode label); `None`/empty renders as `unknown`. Each turn becomes a
+/// single line `[mm:ss-mm:ss] (speaker)\n<merged text>` — the time span runs from the first segment's
+/// `start_s` to the last's `end_s`. Blank-text segments are skipped (they carry no content, only a
+/// gap); a turn made entirely of blank segments is dropped.
+fn group_turns(segments: &[crate::transcribe::types::Segment]) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut cur_speaker: Option<Option<String>> = None; // None = no open turn yet
+    let mut cur_text = String::new();
+    let mut cur_start = 0.0f64;
+    let mut cur_end = 0.0f64;
+
+    let flush = |turns: &mut Vec<Turn>, speaker: &Option<String>, text: &str, start: f64, end: f64| {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let label = match speaker {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => "unknown",
+        };
+        turns.push(Turn {
+            line: format!("[{}-{}] ({label})\n{text}", mmss(start), mmss(end)),
+        });
+    };
+
+    for seg in segments {
+        let text = seg.text.trim();
+        if text.is_empty() {
+            continue; // pure-gap segment — no content to attribute.
+        }
+        let same = cur_speaker.as_ref().map(|s| s == &seg.speaker).unwrap_or(false);
+        if same {
+            if !cur_text.is_empty() {
+                cur_text.push(' ');
+            }
+            cur_text.push_str(text);
+            cur_end = seg.end_s;
+        } else {
+            if cur_speaker.is_some() {
+                flush(&mut turns, cur_speaker.as_ref().unwrap(), &cur_text, cur_start, cur_end);
+            }
+            cur_speaker = Some(seg.speaker.clone());
+            cur_text = text.to_string();
+            cur_start = seg.start_s;
+            cur_end = seg.end_s;
+        }
+    }
+    if let Some(sp) = &cur_speaker {
+        flush(&mut turns, sp, &cur_text, cur_start, cur_end);
+    }
+    turns
+}
+
+/// Split a meeting's TRANSCRIPT segments into deterministic, provenance-carrying chunks for the
+/// semantic layer — the SAID-but-not-summarized substrate that note-summary chunks miss.
+///
+/// Pipeline: consecutive same-speaker segments merge into speaker TURNS (`group_turns`); turns are
+/// then packed into sliding windows of ~[`TRANSCRIPT_CHUNK_CHAR_TARGET`] chars with a ~15% overlap
+/// ([`TRANSCRIPT_CHUNK_OVERLAP_CHARS`]) — the trailing whole turn(s) of one window are re-emitted at
+/// the head of the next so a fact spanning a boundary is embedded in both. Each chunk is PREFIXED with
+/// the same `<title> · <date>` header as [`chunk_note`] (so provenance is identical across the two
+/// chunk classes), and every turn line inside carries `[mm:ss-mm:ss] (speaker)` — retrieval therefore
+/// surfaces WHO said it and WHEN.
+///
+/// Pure + deterministic: identical segments always yield identical chunk text (unit-tested), which is
+/// what keeps `content_hash`-based dedup and re-index stable. Empty/blank input yields no chunks. A
+/// single oversized turn becomes its own chunk (never split mid-turn — provenance is kept intact).
+pub fn chunk_transcript(
+    title: &str,
+    date: &str,
+    segments: &[crate::transcribe::types::Segment],
+) -> Vec<String> {
+    let header = format!("{title} · {date}");
+    let turns = group_turns(segments);
+    if turns.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    // The turns (as body lines) currently accumulated for the in-progress window.
+    let mut window: Vec<&str> = Vec::new();
+    let mut window_len = 0usize; // char length of the body (lines joined by '\n')
+
+    let emit = |chunks: &mut Vec<String>, window: &[&str]| {
+        if window.is_empty() {
+            return;
+        }
+        chunks.push(format!("{header}\n{}", window.join("\n")));
+    };
+
+    for turn in &turns {
+        let line = turn.line.as_str();
+        let add = if window.is_empty() { line.len() } else { line.len() + 1 };
+        // Close the current window before it overflows (but never emit an empty one).
+        if !window.is_empty() && window_len + add > TRANSCRIPT_CHUNK_CHAR_TARGET {
+            emit(&mut chunks, &window);
+            // OVERLAP: carry the trailing whole turn(s), newest-first up to the overlap budget, into
+            // the next window so a boundary-spanning fact is embedded in both chunks.
+            let mut carry: Vec<&str> = Vec::new();
+            let mut carry_len = 0usize;
+            for &prev in window.iter().rev() {
+                let plen = if carry.is_empty() { prev.len() } else { prev.len() + 1 };
+                if carry_len + plen > TRANSCRIPT_CHUNK_OVERLAP_CHARS && !carry.is_empty() {
+                    break;
+                }
+                carry.push(prev);
+                carry_len += plen;
+            }
+            carry.reverse();
+            window = carry;
+            window_len = window
+                .iter()
+                .map(|l| l.len())
+                .sum::<usize>()
+                + window.len().saturating_sub(1);
+        }
+        let add = if window.is_empty() { line.len() } else { line.len() + 1 };
+        window.push(line);
+        window_len += add;
+    }
+    emit(&mut chunks, &window);
+    chunks
+}
+
 /// Reciprocal Rank Fusion over any number of ranked id-lists (each already ordered best-first).
 /// Each list contributes `1 / (RRF_K + rank)` (rank 1-based) to an id's fused score; scores sum
 /// across lists. Returns `(id, score)` sorted by score DESC, ties broken by id ASC for a stable,
@@ -562,6 +716,128 @@ mod tests {
         let big = format!("{}\n\n{}", "x".repeat(900), "y".repeat(50));
         // 900-char para exceeds target → its own chunk; the 50-char para is a second chunk.
         assert_eq!(chunk_note("T", "D", &big).len(), 2);
+    }
+
+    fn seg(idx: i64, start: f64, end: f64, speaker: Option<&str>, text: &str) -> crate::transcribe::types::Segment {
+        crate::transcribe::types::Segment {
+            idx,
+            start_s: start,
+            end_s: end,
+            text: text.to_string(),
+            speaker: speaker.map(str::to_string),
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn chunk_transcript_empty_and_blank_yield_no_chunks() {
+        assert!(chunk_transcript("T", "D", &[]).is_empty(), "no segments → no chunks");
+        // Segments with only whitespace text carry no content → no chunks.
+        let blanks = [seg(0, 0.0, 1.0, Some("me"), "   "), seg(1, 1.0, 2.0, Some("others"), "")];
+        assert!(chunk_transcript("T", "D", &blanks).is_empty(), "all-blank transcript → no chunks");
+    }
+
+    #[test]
+    fn chunk_transcript_single_segment_carries_header_time_and_speaker() {
+        let segs = [seg(0, 5.0, 12.0, Some("me"), "let us discuss the budget")];
+        let chunks = chunk_transcript("Quarterly Sync", "2026-06-28", &segs);
+        assert_eq!(chunks.len(), 1);
+        let c = &chunks[0];
+        assert!(c.starts_with("Quarterly Sync · 2026-06-28\n"), "must carry the <title> · <date> header, got: {c:?}");
+        assert!(c.contains("[00:05-00:12] (me)"), "must carry [mm:ss-mm:ss] (speaker) provenance, got: {c:?}");
+        assert!(c.contains("let us discuss the budget"));
+    }
+
+    #[test]
+    fn chunk_transcript_groups_consecutive_same_speaker_into_one_turn() {
+        // Two consecutive "me" segments merge into ONE turn line (one time span, one speaker tag);
+        // then "others" opens a new turn.
+        let segs = [
+            seg(0, 0.0, 3.0, Some("me"), "hello there"),
+            seg(1, 3.0, 6.0, Some("me"), "and welcome"),
+            seg(2, 6.0, 9.0, Some("others"), "thanks glad to be here"),
+        ];
+        let chunks = chunk_transcript("T", "D", &segs);
+        assert_eq!(chunks.len(), 1, "short transcript fits one chunk");
+        let body = &chunks[0];
+        // Exactly two turn headers (me merged, others separate).
+        assert_eq!(body.matches("(me)").count(), 1, "consecutive me segments must merge into one turn");
+        assert_eq!(body.matches("(others)").count(), 1);
+        // The merged me turn spans 0:00-0:06 and joins both texts.
+        assert!(body.contains("[00:00-00:06] (me)\nhello there and welcome"), "got: {body:?}");
+        assert!(body.contains("[00:06-00:09] (others)"));
+    }
+
+    #[test]
+    fn chunk_transcript_solo_me_only() {
+        // A solo (mic-only) recording: every segment is "me" → one turn, one chunk, no "others".
+        let segs = [
+            seg(0, 0.0, 2.0, Some("me"), "note to self one"),
+            seg(1, 2.0, 4.0, Some("me"), "note to self two"),
+        ];
+        let chunks = chunk_transcript("Solo", "2026-06-28", &segs);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("(me)"));
+        assert!(!chunks[0].contains("(others)"));
+    }
+
+    #[test]
+    fn chunk_transcript_unicode_polish_speaker_tag_preserved() {
+        // A non-me/others Unicode speaker label (Polish) must round-trip verbatim into the turn header.
+        let segs = [seg(0, 0.0, 4.0, Some("Łukasz"), "budżet na kwartał wygląda dobrze")];
+        let chunks = chunk_transcript("T", "D", &segs);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("(Łukasz)"), "Unicode speaker tag must survive, got: {:?}", chunks[0]);
+        assert!(chunks[0].contains("budżet na kwartał"));
+    }
+
+    #[test]
+    fn chunk_transcript_none_speaker_renders_unknown() {
+        let segs = [seg(0, 0.0, 4.0, None, "unattributed legacy line")];
+        let chunks = chunk_transcript("T", "D", &segs);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].contains("(unknown)"), "None speaker → (unknown), got: {:?}", chunks[0]);
+    }
+
+    #[test]
+    fn chunk_transcript_windows_with_overlap() {
+        // Build enough alternating turns to force several windows; each turn ~120 chars of body.
+        let mut segs = Vec::new();
+        for i in 0..12i64 {
+            let speaker = if i % 2 == 0 { "me" } else { "others" };
+            // ~110-char utterance so a handful of turns exceed the 1000-char window target.
+            let text = format!("this is turn number {i} with a fair amount of spoken content to push the running window past the target size");
+            segs.push(seg(i, i as f64 * 5.0, i as f64 * 5.0 + 4.0, Some(speaker), &text));
+        }
+        let chunks = chunk_transcript("Long", "2026-06-28", &segs);
+        assert!(chunks.len() >= 2, "long transcript must split into multiple windows, got {}", chunks.len());
+        // Every chunk carries the header.
+        for c in &chunks {
+            assert!(c.starts_with("Long · 2026-06-28\n"), "chunk missing header: {c:?}");
+        }
+        // OVERLAP: the LAST turn line of chunk N must reappear as (near) the FIRST body line of chunk N+1
+        // (whole-turn carry). Assert at least one shared turn line across the first boundary.
+        let turn_lines = |c: &str| -> Vec<String> {
+            c.lines().filter(|l| l.starts_with('[')).map(str::to_string).collect::<Vec<_>>()
+        };
+        let a = turn_lines(&chunks[0]);
+        let b = turn_lines(&chunks[1]);
+        let shared = a.iter().rev().take(3).any(|t| b.contains(t));
+        assert!(shared, "sliding window must overlap: a tail turn of chunk 0 must reappear in chunk 1\n0={a:?}\n1={b:?}");
+        // Overlap stays BOUNDED — the carried body must be well under a full window.
+        let carried_chars: usize = b.iter().take_while(|t| a.contains(t)).map(|t| t.len()).sum();
+        assert!(carried_chars <= TRANSCRIPT_CHUNK_CHAR_TARGET / 2, "overlap must be ~15%, not half a window (got {carried_chars} chars)");
+    }
+
+    #[test]
+    fn chunk_transcript_is_deterministic() {
+        let segs = [
+            seg(0, 0.0, 3.0, Some("me"), "deterministic check one"),
+            seg(1, 3.0, 6.0, Some("others"), "deterministic check two"),
+        ];
+        let a = chunk_transcript("T", "D", &segs);
+        let b = chunk_transcript("T", "D", &segs);
+        assert_eq!(a, b, "chunk_transcript must be pure + deterministic");
     }
 
     #[test]
