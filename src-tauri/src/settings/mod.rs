@@ -1,3 +1,4 @@
+pub mod ai_map;
 pub mod config;
 pub mod postures;
 
