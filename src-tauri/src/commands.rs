@@ -5037,9 +5037,19 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
         // Defense-in-depth: only index a meeting whose latest note is currently visible.
         match db.get_note_if_visible(&m.id, unlocked) {
             Ok(Some(_note)) => {
-                if let Err(e) = db.index_meeting_chunks(&m.id, embedder) {
-                    // Never abort the whole backfill on one bad note — log (no PII) and continue.
-                    tracing::warn!(target: "rag", error = %e, "reindex: indexing one meeting failed (skipped)");
+                // The meeting is visible ⇒ its segments are restored plaintext; index BOTH the note-
+                // summary and the transcript chunks. A read failure on segments is logged + skipped
+                // (never aborts the whole backfill).
+                match db.get_segments(&m.id) {
+                    Ok(segments) => {
+                        if let Err(e) = db.index_meeting_chunks(&m.id, &segments, embedder) {
+                            // Never abort the whole backfill on one bad note — log (no PII) and continue.
+                            tracing::warn!(target: "rag", error = %e, "reindex: indexing one meeting failed (skipped)");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "rag", error = %e, "reindex: reading segments failed (skipped)");
+                    }
                 }
             }
             Ok(None) => {
@@ -6662,7 +6672,17 @@ fn reindex_meetings_after_unseal(
         return;
     };
     for mid in meeting_ids {
-        if let Err(e) = state.db.index_meeting_chunks(mid, embedder) {
+        // The caller (`unseal_folder_extras`) has ALREADY restored each meeting's segment plaintext
+        // (`restore_segment_text`) and note markdown BEFORE this runs, so the transcript chunks re-derive
+        // from restored plaintext. A segments read failure is logged + skipped (never fails the unlock).
+        let segments = match state.db.get_segments(mid) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "rag", error = %e, "meeting re-index on unlock: reading segments failed (skipped)");
+                continue;
+            }
+        };
+        if let Err(e) = state.db.index_meeting_chunks(mid, &segments, embedder) {
             tracing::warn!(target: "rag", error = %e, "meeting re-index on unlock failed (note plaintext already restored)");
         }
     }
@@ -8498,7 +8518,7 @@ mod lifecycle_tests {
         );
         // Index while the folder is OPEN (the stub stands in for a present model, as every other
         // meeting-chunk test does) → chunks + vectors present.
-        state.db.index_meeting_chunks("m1", &crate::embed::StubEmbedder).unwrap();
+        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
         assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
         assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectored while open");
 
@@ -8552,7 +8572,7 @@ mod lifecycle_tests {
             "# Roadmap\n\nrevisit auth and the billing migration next sprint",
             Some("f-lock"),
         );
-        state.db.index_meeting_chunks("m1", &crate::embed::StubEmbedder).unwrap();
+        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
         assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
 
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
@@ -8598,7 +8618,7 @@ mod lifecycle_tests {
             "# Notes\n\nlaunch on the 14th; hire two engineers",
             Some("f-lock"),
         );
-        state.db.index_meeting_chunks("m1", &crate::embed::StubEmbedder).unwrap();
+        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
 
         // Lock → purge.
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
