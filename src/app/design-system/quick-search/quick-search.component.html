@@ -1,0 +1,77 @@
+<div
+  class="qs-scrim"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Quick search"
+  (click)="onScrim($event)"
+  (keydown.escape)="closed.emit()"
+>
+  <div class="qs-panel">
+    <div class="qs-input-row">
+      <svg class="qs-glass" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <circle cx="9" cy="9" r="5.2" stroke="currentColor" stroke-width="1.5" />
+        <path d="m13.2 13.2 3.3 3.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+      </svg>
+      <input
+        #qsInput
+        class="qs-input"
+        type="text"
+        placeholder="Search meetings, notes, transcripts…"
+        autocomplete="off"
+        spellcheck="false"
+        [value]="query()"
+        (input)="onQuery($any($event.target).value)"
+        (keydown.arrowDown)="move(1); $event.preventDefault()"
+        (keydown.arrowUp)="move(-1); $event.preventDefault()"
+        (keydown.enter)="confirm()"
+      />
+      <kbd class="qs-kbd">esc</kbd>
+    </div>
+
+    @if (!searching()) {
+      <div class="qs-actions">
+        <button type="button" class="qs-row qs-action" (click)="newNote()">
+          <span class="qs-row-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none">
+              <path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+          </span>
+          <span class="qs-row-title">New note</span>
+          <kbd class="qs-kbd">⌘N</kbd>
+        </button>
+      </div>
+      <p class="qs-hint">Type to search your vault — everything stays on device.</p>
+    } @else {
+      <div class="qs-results" role="listbox" aria-label="Search results">
+        @for (row of rows(); track row.id; let i = $index) {
+          <button
+            type="button"
+            class="qs-row"
+            role="option"
+            [attr.aria-selected]="i === selected()"
+            [class.selected]="i === selected()"
+            (mouseenter)="sel.set(i)"
+            (click)="open(row)"
+          >
+            <span class="qs-row-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="none">
+                <rect x="3.25" y="3.75" width="13.5" height="12.5" rx="2.2" stroke="currentColor" stroke-width="1.4" />
+                <path d="M6.5 7.5h7M6.5 10.5h7M6.5 13.25h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              </svg>
+            </span>
+            <span class="qs-row-main">
+              <span class="qs-row-title">{{ row.title }}</span>
+              <span class="qs-row-snippet">{{ row.snippet }}</span>
+            </span>
+            <span class="qs-row-meta">
+              <span class="qs-chip">{{ row.matchedIn }}</span>
+              <span class="qs-date">{{ row.dateLabel }}</span>
+            </span>
+          </button>
+        } @empty {
+          <p class="qs-hint">No matches in the vault.</p>
+        }
+      </div>
+    }
+  </div>
+</div>

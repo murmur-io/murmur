@@ -1,0 +1,66 @@
+/* Design tokens — generated split of the former styles.css :root (prototype).
+   Every value the UI uses lives HERE; components consume var(--token) only. */
+:root {  /* --- Glass (frosted treatment) ------------------------------------------ */
+  --glass-blur: 30px;
+  --glass-saturate: 135%;
+  --glass-border: rgba(255, 255, 255, 0.10);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.10); /* top edge gleam */
+
+  /* --- Shell liquid glass (PROTOTYPE — Apple TV chrome) --------------------
+     Modeled on macOS Liquid Glass's THREE layers (HIG "Materials"):
+     highlight — the specular rim where curved glass concentrates light
+     (lensing), here the layered inset rim shadows; shadow — depth separating
+     the pane from content (outer --shadow-md + the shaded bottom edge);
+     illumination — the adaptive translucent fill (gradient + heavy blur and
+     saturation of whatever scrolls beneath). NEUTRAL by design: the accent
+     never fills chrome, it colors the active glyph/label only.
+
+     `--glass-user-alpha` (0–1) is the Settings "transparency" slider, applied
+     inline on <html> by GlassService: 1 = full glass, 0 = opaque. The VEIL is
+     a solid-color layer whose alpha is the inverse of the slider, painted OVER
+     the glass fill — sliding toward 0 fades the pane to a solid surface
+     (the HIG reduce-transparency behavior, also forced by the media query
+     below). */
+  --glass-user-alpha: 1;
+  --shell-glass-bg: linear-gradient(
+    160deg,
+    rgba(255, 255, 255, 0.10) 0%,
+    rgba(255, 255, 255, 0.035) 55%,
+    rgba(255, 255, 255, 0.065) 100%
+  );
+  --shell-glass-veil: rgba(22, 22, 30, calc(0.94 * (1 - var(--glass-user-alpha))));
+  --shell-glass-border: rgba(255, 255, 255, 0.16);
+  /* Lensing rim: bright top edge + faint side rims + shaded bottom edge,
+     plus a soft top illumination bloom inside the pane. */
+  --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.30),
+    inset 1px 0 0 rgba(255, 255, 255, 0.10),
+    inset -1px 0 0 rgba(255, 255, 255, 0.07),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.30),
+    inset 0 18px 38px -22px rgba(255, 255, 255, 0.16);
+  --shell-glass-blur: 44px;
+  --shell-glass-saturate: 210%;
+  /* The neutral "glass on glass" pill behind the active nav item. */
+  --shell-active-bg: rgba(255, 255, 255, 0.12);
+  --shell-active-text: #aeb4ff;
+  --shell-active-shadow: 0 1px 5px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+
+  --aurora-opacity: 1;
+  /* The ambient color field the Liquid Glass chrome refracts (body::before).
+     Blobs hug the EDGES (left rail, top pill, corners) so the reading column
+     stays calm while the glass panes always have color to lens. */
+  --aurora-field:
+    radial-gradient(46% 38% at 16% 8%, rgba(110, 118, 255, 0.18), transparent 60%),
+    radial-gradient(42% 34% at 88% 14%, rgba(74, 196, 240, 0.10), transparent 62%),
+    radial-gradient(48% 46% at 78% 92%, rgba(157, 123, 255, 0.14), transparent 64%),
+    radial-gradient(40% 40% at 10% 96%, rgba(255, 122, 92, 0.07), transparent 60%);
+}
+
+/* HIG accessibility: a user with "Reduce transparency" gets solid panes no
+   matter what the Settings slider says (stylesheet !important beats the
+   inline --glass-user-alpha GlassService sets). */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-user-alpha: 0 !important;
+  }
+}

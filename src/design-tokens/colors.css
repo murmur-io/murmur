@@ -1,0 +1,45 @@
+/* Design tokens — generated split of the former styles.css :root (prototype).
+   Every value the UI uses lives HERE; components consume var(--token) only. */
+:root {  /* --- Surfaces (deep layered field; glass sits on top) ------------------- */
+  --surface-base: #07070b;       /* app/body background — deepest layer        */
+  --surface-raised: rgba(255, 255, 255, 0.045); /* glass cards/panels          */
+  --surface-overlay: #1b1b24;    /* opaque popovers/menus/<option>             */
+  --surface-input: rgba(255, 255, 255, 0.035);  /* form wells (glassy)         */
+  --surface-solid: #111118;      /* when a true opaque surface is needed       */
+  --surface-hover: rgba(255, 255, 255, 0.06);   /* hover wash on rows/ghosts   */
+
+  /* --- Text --------------------------------------------------------------- */
+  --text-primary: #f6f6fa;
+  --text-secondary: #a6a6b6;
+  --text-muted: #6c6c7d;
+  --text-on-accent: #ffffff;
+
+  /* --- Cool accent (calm states: idle, nav, focus, links) ----------------- */
+  --accent: #6e76ff;
+  --accent-hover: #8a90ff;
+  --accent-active: #5b63f0;
+  --accent-soft: rgba(110, 118, 255, 0.16);
+  --accent-ring: rgba(110, 118, 255, 0.5);
+  --accent-gradient: linear-gradient(135deg, #6e76ff 0%, #9d7bff 100%);
+
+  /* --- Warm "live" accent (recording only — alive, not alarming) ---------- */
+  --live: #ff7a5c;
+  --live-hover: #ff8e74;
+  --live-soft: rgba(255, 122, 92, 0.16);
+  --live-gradient: linear-gradient(135deg, #ff7a5c 0%, #ff5e9c 100%);
+  --live-glow: 0 0 0 1px rgba(255, 122, 92, 0.35),
+    0 12px 40px rgba(255, 94, 120, 0.35);
+
+  /* --- Borders ------------------------------------------------------------ */
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-subtle: rgba(255, 255, 255, 0.055);
+
+  /* --- Status ------------------------------------------------------------- */
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.15);
+  --danger: #ff6b6b;
+  --danger-soft: rgba(255, 107, 107, 0.14);
+  --warning: #f5b14c;
+  --warning-soft: rgba(245, 177, 76, 0.14);
+}
