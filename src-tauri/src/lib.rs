@@ -117,6 +117,13 @@ pub fn run() {
             commands::share_note_to_link,
             commands::list_my_shares,
             commands::revoke_share,
+            // M5-CLIENT — Murmur↔Murmur (mode B): invite by email + accept into the vault.
+            commands::preview_share_recipient,
+            commands::share_note_to_user,
+            commands::share_rewrap_pending,
+            commands::list_share_inbox,
+            commands::accept_share,
+            commands::decline_share,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::set_gateway_key,

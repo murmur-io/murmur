@@ -96,6 +96,38 @@ pub fn generate_identity() -> Result<IdentityKeypair> {
     })
 }
 
+/// DETERMINISTICALLY derive the account identity keypair from `MK` (M5 enablement). The X25519 KEM
+/// IKM and the Ed25519 seed are each `HKDF-SHA256(MK, info = "murmur:v1:id-{enc,sig}|<acct>|<gen>")`,
+/// so the SAME identity keypair is reproducible from `MK` on any device / any login WITHOUT storing or
+/// uploading the private keys (the server never sees them; only the self-signed public bundle is
+/// published). This is what makes mode-B send (needs `sk_sig`) and accept (needs `sk_enc`) work after
+/// a fresh login: `MK` is unwrapped from `mk_wrap_pw` and the identity is re-derived from it.
+///
+/// SECURITY: an `MK` compromise compromises the identity either way (the wraps are also under `MK`),
+/// so deriving is no weaker than wrapping-and-storing — it just removes a storage/round-trip. The
+/// per-`(acct, generation)` info string domain-separates generations (a future rotation bumps `gen`).
+pub fn derive_identity(mk: &[u8; 32], acct_id: &str, generation: u32) -> Result<IdentityKeypair> {
+    // X25519 (HPKE KEM): HKDF a 32-byte IKM from MK, then RFC 9180 DeriveKeyPair.
+    let enc_info = format!("murmur:v1:id-enc|{acct_id}|{generation}");
+    let ikm = super::hkdf_expand32(mk, None, enc_info.as_bytes())?;
+    let (sk, pk) = X25519HkdfSha256::derive_keypair(&*ikm);
+    let sk_enc = Zeroizing::new(to_arr32(&sk.to_bytes())?);
+    let pk_enc = to_arr32(&pk.to_bytes())?;
+
+    // Ed25519: HKDF a 32-byte seed from MK.
+    let sig_info = format!("murmur:v1:id-sig|{acct_id}|{generation}");
+    let seed = super::hkdf_expand32(mk, None, sig_info.as_bytes())?;
+    let signing = SigningKey::from_bytes(&seed);
+    let pk_sig = signing.verifying_key().to_bytes();
+
+    Ok(IdentityKeypair {
+        sk_enc,
+        pk_enc,
+        sk_sig: seed,
+        pk_sig,
+    })
+}
+
 /// Wrap BOTH identity private keys under `MK`, each with its generation-bound AAD
 /// (`sk-enc|<acct>|<gen>` and `sk-sig|<acct>|<gen>`). Returns `(sk_enc_wrap, sk_sig_wrap)`.
 pub fn wrap_identity(
@@ -244,6 +276,27 @@ mod tests {
         let id = generate_identity().unwrap();
         let (enc_wrap, sig_wrap) = wrap_identity(&id, &mk, ACCT, 2).unwrap();
         assert!(unwrap_identity(&enc_wrap, &sig_wrap, &mk, ACCT, 1).is_err());
+    }
+
+    #[test]
+    fn derive_identity_is_deterministic_and_mk_bound() {
+        // The SAME (MK, acct, gen) reproduces byte-identical private + public keys — this is what
+        // lets a fresh login re-derive `sk_enc`/`sk_sig` to accept/send mode-B shares.
+        let mk = generate_master_key().unwrap();
+        let a = derive_identity(&mk, ACCT, 1).unwrap();
+        let b = derive_identity(&mk, ACCT, 1).unwrap();
+        assert_eq!(a.pk_enc, b.pk_enc);
+        assert_eq!(a.pk_sig, b.pk_sig);
+        assert_eq!(*a.sk_enc, *b.sk_enc);
+        assert_eq!(*a.sk_sig, *b.sk_sig);
+        // The derived X25519 public key matches sk_to_pk(sk_enc) (a valid HPKE keypair).
+        let sk =
+            <X25519HkdfSha256 as KemTrait>::PrivateKey::from_bytes(&*a.sk_enc).unwrap();
+        assert_eq!(a.pk_enc, to_arr32(&X25519HkdfSha256::sk_to_pk(&sk).to_bytes()).unwrap());
+        // A different generation, account, or MK yields a different identity (domain separation).
+        assert_ne!(a.pk_sig, derive_identity(&mk, ACCT, 2).unwrap().pk_sig);
+        assert_ne!(a.pk_sig, derive_identity(&mk, "other", 1).unwrap().pk_sig);
+        assert_ne!(a.pk_sig, derive_identity(&generate_master_key().unwrap(), ACCT, 1).unwrap().pk_sig);
     }
 
     #[test]

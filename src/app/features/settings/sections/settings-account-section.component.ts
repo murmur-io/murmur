@@ -1,12 +1,23 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  computed,
   inject,
   signal,
 } from "@angular/core";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
-import type { AccountStatus } from "../../../core/models";
+import type {
+  AccountStatus,
+  FolderNode,
+  ShareInboxItem,
+} from "../../../core/models";
+
+/** A flattened, depth-indented folder option for the accept-into picker. */
+interface FolderOption {
+  node: FolderNode;
+  depth: number;
+}
 
 /**
  * Settings → Account section (M3-CLIENT): the sharing account behind zero-knowledge
@@ -269,6 +280,133 @@ import type { AccountStatus } from "../../../core/models";
           <p class="text-muted account-note">Loading account…</p>
         }
       </div>
+
+      <!-- (3) Incoming shares (M5-CLIENT, mode B): notes other Murmur users sent
+           you. Shown only when signed in AND a server is configured. -->
+      @if (status(); as st) {
+        @if (st.loggedIn && st.serverConfigured) {
+          <div class="card inbox-card">
+            <div class="account-copy">
+              <h3>Incoming shares</h3>
+              <p class="text-secondary account-sub">
+                Notes other Murmur users shared with you. Compare the sender's
+                safety words out of band, then accept to add the note to your
+                vault.
+              </p>
+            </div>
+
+            @if (inboxError(); as ierr) {
+              <p class="text-danger account-note">{{ ierr }}</p>
+            }
+
+            @if (inboxLoading()) {
+              <p class="text-muted account-note">Loading…</p>
+            } @else {
+              @for (item of inbox(); track item.shareId) {
+                <div class="inbox-row">
+                  <div class="inbox-meta">
+                    <span class="account-section-label text-muted"
+                      >From — safety words</span
+                    >
+                    <p class="fp-inline">{{ item.senderFingerprint }}</p>
+                    <span class="text-secondary inbox-sub">
+                      {{ formatDate(item.createdAt) }} ·
+                      {{ formatSize(item.size) }} · rev {{ item.rev }}
+                    </span>
+                  </div>
+
+                  @if (item.alreadyAccepted) {
+                    <span class="pill is-success signed-pill">
+                      <span class="pill-dot"></span>
+                      Accepted
+                    </span>
+                  } @else {
+                    <div class="inbox-actions-wrap">
+                      <div class="account-actions">
+                        <button
+                          type="button"
+                          class="btn btn-primary"
+                          (click)="accept(item)"
+                          [disabled]="busyShare() !== null"
+                        >
+                          {{
+                            busyShare() === item.shareId
+                              ? "Accepting…"
+                              : "Accept"
+                          }}
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="togglePicker(item.shareId)"
+                          [disabled]="busyShare() !== null"
+                        >
+                          Choose folder…
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost"
+                          (click)="decline(item)"
+                          [disabled]="busyShare() !== null"
+                        >
+                          Decline
+                        </button>
+                      </div>
+
+                      @if (pickerFor() === item.shareId) {
+                        <div
+                          class="folder-menu"
+                          role="menu"
+                          aria-label="Accept into folder"
+                        >
+                          <button
+                            type="button"
+                            class="folder-opt"
+                            role="menuitem"
+                            (click)="accept(item)"
+                          >
+                            Shared <span class="folder-opt-tag">default</span>
+                          </button>
+                          @for (opt of folderOptions(); track opt.node.id) {
+                            <button
+                              type="button"
+                              class="folder-opt"
+                              role="menuitem"
+                              [style.--depth]="opt.depth"
+                              (click)="accept(item, opt.node.id)"
+                            >
+                              {{ opt.node.name }}
+                            </button>
+                          } @empty {
+                            <p class="opts-empty">No open folders yet.</p>
+                          }
+                        </div>
+                      }
+                    </div>
+                  }
+
+                  @if (acceptedTitle(); as at) {
+                    @if (at.id === item.shareId) {
+                      <p class="inbox-ok" role="status">
+                        Added “{{ at.title }}” to your vault.
+                      </p>
+                    }
+                  }
+                  @if (rowError(); as re) {
+                    @if (re.id === item.shareId) {
+                      <p class="text-danger account-note" role="alert">
+                        {{ re.msg }}
+                      </p>
+                    }
+                  }
+                </div>
+              } @empty {
+                <p class="text-muted account-note">No incoming shares.</p>
+              }
+            }
+          </div>
+        }
+      }
     </div>
   `,
   styles: [
@@ -454,6 +592,110 @@ import type { AccountStatus } from "../../../core/models";
         -webkit-user-select: text;
         overflow-wrap: anywhere;
       }
+
+      /* --- Incoming shares (M5-CLIENT inbox) --- */
+      .inbox-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-4);
+      }
+      .inbox-row {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        padding-top: var(--space-4);
+        border-top: 1px solid var(--border-subtle);
+      }
+      .inbox-meta {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-1);
+      }
+      .fp-inline {
+        margin: 0;
+        color: var(--text-primary);
+        font-family: var(--font-mono);
+        font-size: 0.9rem;
+        letter-spacing: 0.03em;
+        line-height: 1.5;
+        overflow-wrap: anywhere;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .inbox-sub {
+        font-size: 0.8rem;
+      }
+      .inbox-ok {
+        margin: 0;
+        color: var(--success);
+        font-size: 0.85rem;
+      }
+
+      /* The accept-into picker floats over the rows below → OPAQUE (trap T3),
+         never the frosted .card. */
+      .inbox-actions-wrap {
+        position: relative;
+        align-self: flex-start;
+      }
+      .folder-menu {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        z-index: 20;
+        margin-top: var(--space-1);
+        min-width: 220px;
+        max-height: 260px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        padding: var(--space-2);
+        background: var(--surface-overlay);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-lg);
+        -webkit-backdrop-filter: none;
+        backdrop-filter: none;
+      }
+      .folder-opt {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        width: 100%;
+        padding: var(--space-2);
+        padding-left: calc(var(--space-2) + var(--depth, 0) * var(--space-4));
+        border: 1px solid transparent;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--text-secondary);
+        font: inherit;
+        font-size: 0.875rem;
+        font-weight: 550;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          color var(--transition),
+          background var(--transition);
+      }
+      .folder-opt:hover {
+        color: var(--text-primary);
+        background: var(--surface-hover);
+      }
+      .folder-opt:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--accent-ring);
+      }
+      .folder-opt-tag {
+        color: var(--text-muted);
+        font-size: 0.72rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+      .opts-empty {
+        margin: var(--space-2);
+        color: var(--text-muted);
+        font-size: 0.8125rem;
+      }
     `,
   ],
 })
@@ -500,6 +742,47 @@ export class SettingsAccountSectionComponent {
   private readonly _recoveryCopied = signal(false);
   readonly recoveryCopied = this._recoveryCopied.asReadonly();
 
+  // ── Incoming shares (M5-CLIENT inbox) ────────────────────────────────────
+  private readonly _inbox = signal<ShareInboxItem[]>([]);
+  readonly inbox = this._inbox.asReadonly();
+  private readonly _inboxLoading = signal(false);
+  readonly inboxLoading = this._inboxLoading.asReadonly();
+  private readonly _inboxError = signal<string | null>(null);
+  readonly inboxError = this._inboxError.asReadonly();
+  /** The shareId currently being accepted/declined (locks the whole list). */
+  private readonly _busyShare = signal<string | null>(null);
+  readonly busyShare = this._busyShare.asReadonly();
+  /** The shareId whose folder picker is open (null = none). */
+  private readonly _pickerFor = signal<string | null>(null);
+  readonly pickerFor = this._pickerFor.asReadonly();
+  /** The last accepted row → its returned title (rendered inline on that row). */
+  private readonly _acceptedTitle = signal<{ id: string; title: string } | null>(
+    null,
+  );
+  readonly acceptedTitle = this._acceptedTitle.asReadonly();
+  /** The last row error (rendered inline on that row). */
+  private readonly _rowError = signal<{ id: string; msg: string } | null>(null);
+  readonly rowError = this._rowError.asReadonly();
+  /** Open folders (locked ones excluded — accepting into a sealed folder fails). */
+  private readonly _folders = signal<FolderNode[]>([]);
+
+  /** Flattened, depth-indented OPEN folders for the accept-into picker. */
+  readonly folderOptions = computed<FolderOption[]>(() => {
+    const out: FolderOption[] = [];
+    const walk = (nodes: FolderNode[], depth: number): void => {
+      for (const node of nodes) {
+        if (!node.locked) {
+          out.push({ node, depth });
+        }
+        if (node.children?.length) {
+          walk(node.children, depth + 1);
+        }
+      }
+    };
+    walk(this._folders(), 0);
+    return out;
+  });
+
   constructor() {
     // Fire-and-forget one-shot load — the section fetches its state exactly once
     // on construction (no signal is read, so no NG0600 / no effect needed).
@@ -508,8 +791,9 @@ export class SettingsAccountSectionComponent {
 
   /** Load the current account status + seed the server URL input from config. */
   private async reload(): Promise<void> {
+    let st: AccountStatus | null = null;
     try {
-      const st = await this.ipc.accountStatus();
+      st = await this.ipc.accountStatus();
       this._status.set(st);
     } catch (e) {
       this._loginError.set(String(e));
@@ -522,6 +806,36 @@ export class SettingsAccountSectionComponent {
       }
     } catch {
       // Leave the input empty on a config read failure.
+    }
+    // Load the incoming-share inbox only when it's usable (signed in + a server).
+    if (st?.loggedIn && st.serverConfigured) {
+      await this.loadInbox();
+    } else {
+      this._inbox.set([]);
+    }
+  }
+
+  /**
+   * Load the incoming-share inbox + the open-folder options for the picker.
+   * Fires the on-launch `shareRewrapPending` best-effort (advances any pending
+   * outgoing invites whose recipient has since registered) — errors ignored.
+   */
+  private async loadInbox(): Promise<void> {
+    this._inboxLoading.set(true);
+    this._inboxError.set(null);
+    // Fire-and-forget: advance pending invites; never blocks / breaks the inbox.
+    void this.ipc.shareRewrapPending().catch(() => undefined);
+    try {
+      this._inbox.set(await this.ipc.listShareInbox());
+    } catch (e) {
+      this._inboxError.set(String(e));
+    } finally {
+      this._inboxLoading.set(false);
+    }
+    try {
+      this._folders.set(await this.ipc.listFolders());
+    } catch {
+      // Leave the picker with just the default "Shared" folder option.
     }
   }
 
@@ -634,5 +948,89 @@ export class SettingsAccountSectionComponent {
     } catch {
       // Clipboard unavailable — the phrase stays visible and selectable.
     }
+  }
+
+  // ── Incoming shares: accept / decline ────────────────────────────────────
+
+  /** Toggle the OPAQUE accept-into folder picker for a row. */
+  togglePicker(shareId: string): void {
+    this._pickerFor.update((cur) => (cur === shareId ? null : shareId));
+  }
+
+  /**
+   * Accept an incoming share into `folderId` (omitted → the auto "Shared"
+   * folder). On success shows the returned title; a thrown error (sealed target
+   * → "locked …", or a verification failure) surfaces inline on the row.
+   */
+  async accept(item: ShareInboxItem, folderId?: string): Promise<void> {
+    if (this._busyShare() !== null) {
+      return;
+    }
+    this._busyShare.set(item.shareId);
+    this._pickerFor.set(null);
+    this._rowError.set(null);
+    this._acceptedTitle.set(null);
+    try {
+      const res = await this.ipc.acceptShare(item.shareId, folderId);
+      this._acceptedTitle.set({ id: item.shareId, title: res.title });
+      await this.loadInbox();
+    } catch (e) {
+      this._rowError.set({
+        id: item.shareId,
+        msg: this.friendlyShareError(String(e)),
+      });
+    } finally {
+      this._busyShare.set(null);
+    }
+  }
+
+  /** Decline an incoming share, then refresh the list. */
+  async decline(item: ShareInboxItem): Promise<void> {
+    if (this._busyShare() !== null) {
+      return;
+    }
+    this._busyShare.set(item.shareId);
+    this._pickerFor.set(null);
+    this._rowError.set(null);
+    try {
+      await this.ipc.declineShare(item.shareId);
+      await this.loadInbox();
+    } catch (e) {
+      this._rowError.set({ id: item.shareId, msg: String(e) });
+    } finally {
+      this._busyShare.set(null);
+    }
+  }
+
+  /** Turn a raw backend error into a friendly, non-crashy inline message. */
+  private friendlyShareError(raw: string): string {
+    if (/lock/i.test(raw)) {
+      return "That folder is locked. Unlock it (or pick an open folder / the default) to accept.";
+    }
+    return raw;
+  }
+
+  /** Presentational: render an ISO timestamp as a friendly local date. */
+  formatDate(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) {
+      return iso;
+    }
+    return d.toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
+  }
+
+  /** Presentational: render a byte count as a compact size. */
+  formatSize(bytes: number): string {
+    if (bytes < 1024) {
+      return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+      return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 }
