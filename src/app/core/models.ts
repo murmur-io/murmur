@@ -91,6 +91,10 @@ export interface AppConfigDto {
   voiceprintEnabled: boolean;
   aecEnabled: boolean;
   postAecEnabled: boolean;
+  /** Recording-storage cap in GB (`null` = no cap). Mirrors Rust `audio_storage_limit_gb`. */
+  audioStorageLimitGb: number | null;
+  /** Auto-delete oldest recordings' audio over the cap. Opt-in, default false. Mirrors Rust `audio_auto_prune`. */
+  audioAutoPrune: boolean;
   modelSize: string;
   voiceTrigger: boolean;
   onboarded: boolean;
@@ -1155,4 +1159,23 @@ export interface EgressLedger {
   totalRedactions: RedactionCounts;
   /** Most-recent calls (newest first, capped server-side). */
   recent: EgressRow[];
+}
+
+/** Recording-storage usage report (mirrors Rust `StorageReportDto`). Bytes + counts only. */
+export interface StorageReport {
+  audioDir: string;
+  usedBytes: number;
+  limitBytes: number | null;
+  playbackBytes: number;
+  mastersBytes: number;
+  sealedBytes: number;
+  recordingCount: number;
+  autoPrune: boolean;
+}
+
+/** Result of a prune / free-up-space run (mirrors Rust `PruneSummaryDto`). */
+export interface PruneSummary {
+  freedBytes: number;
+  prunedCount: number;
+  mastersDeleted: number;
 }
