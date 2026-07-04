@@ -7,6 +7,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import { hostIsLoopback } from "../../core/loopback";
 import type {
+  AiMapRow,
   AppConfigDto,
   AppInfo,
   BrainBackend,
@@ -823,6 +824,29 @@ export class SettingsStore {
   private readonly _postureError = signal<string | null>(null);
   readonly postureError = this._postureError.asReadonly();
 
+  // ── "What runs where" resolved map ──────────────────────────────────────
+  /** The backend-resolved per-job routing rows (resolved_ai_map). */
+  private readonly _aiMap = signal<AiMapRow[]>([]);
+  readonly aiMap = this._aiMap.asReadonly();
+
+  /** Re-fetch the resolved map (load, after save, after a posture apply). Keeps last on failure. */
+  async refreshAiMap(): Promise<void> {
+    try {
+      this._aiMap.set(await this.ipc.resolvedAiMap());
+    } catch {
+      // keep the last known map — the card renders its loading/emptiness state
+    }
+  }
+
+  /**
+   * Advanced-disclosure open state, HOISTED from AiAdvancedBlockComponent so the
+   * map card's "Change" affordance can open it from outside.
+   */
+  readonly advancedExpanded = signal(false);
+  expandAdvanced(): void {
+    this.advancedExpanded.set(true);
+  }
+
   /**
    * The posture mid-download (drives the target-card progress indicator).
    * Non-null only while `setPosture` is downloading absent needed models.
@@ -1114,6 +1138,8 @@ export class SettingsStore {
       await this.refreshBrainModels();
       // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
       await this.refreshPosture();
+      // The resolved "what runs where" map for the Settings AI section.
+      void this.refreshAiMap();
       // Brain Live RAM headroom (best-effort; true = never warn behind a failed probe).
       this._brainLiveRamOk.set(
         await this.ipc.brainLiveRamOk().catch(() => true),
@@ -1280,6 +1306,10 @@ export class SettingsStore {
     this._retirementNudge.set(
       await this.ipc.brainModelRetirementNudge().catch(() => null),
     );
+    // Posture/roles just changed → the resolved "what runs where" map may have
+    // shifted. Refresh it here so every posture caller (setPosture, role/provider
+    // saves, retirement apply, load) keeps the map in sync.
+    void this.refreshAiMap();
   }
 
   /**
