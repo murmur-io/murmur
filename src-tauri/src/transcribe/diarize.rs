@@ -573,8 +573,16 @@ mod tests {
     fn relabel_assigns_max_overlap_speaker() {
         let mut segs = vec![seg(0.0, 2.0), seg(5.0, 7.0)];
         let spans = vec![
-            SpeakerSpan { start: 0.0, end: 3.0, speaker: 0 },
-            SpeakerSpan { start: 4.0, end: 8.0, speaker: 1 },
+            SpeakerSpan {
+                start: 0.0,
+                end: 3.0,
+                speaker: 0,
+            },
+            SpeakerSpan {
+                start: 4.0,
+                end: 8.0,
+                speaker: 1,
+            },
         ];
         relabel_others(&mut segs, &spans);
         assert_eq!(segs[0].speaker.as_deref(), Some("others-0"));
@@ -586,8 +594,16 @@ mod tests {
         // Segment 1..6 overlaps speaker 0 for 2s (1..3) and speaker 1 for 3s (3..6) → speaker 1.
         let mut segs = vec![seg(1.0, 6.0)];
         let spans = vec![
-            SpeakerSpan { start: 0.0, end: 3.0, speaker: 0 },
-            SpeakerSpan { start: 3.0, end: 9.0, speaker: 1 },
+            SpeakerSpan {
+                start: 0.0,
+                end: 3.0,
+                speaker: 0,
+            },
+            SpeakerSpan {
+                start: 3.0,
+                end: 9.0,
+                speaker: 1,
+            },
         ];
         relabel_others(&mut segs, &spans);
         assert_eq!(segs[0].speaker.as_deref(), Some("others-1"));
@@ -596,17 +612,32 @@ mod tests {
     #[test]
     fn relabel_single_speaker_is_noop() {
         let mut segs = vec![seg(0.0, 2.0)];
-        let spans = vec![SpeakerSpan { start: 0.0, end: 3.0, speaker: 0 }];
+        let spans = vec![SpeakerSpan {
+            start: 0.0,
+            end: 3.0,
+            speaker: 0,
+        }];
         relabel_others(&mut segs, &spans);
-        assert_eq!(segs[0].speaker, None, "one speaker → keep the plain others label");
+        assert_eq!(
+            segs[0].speaker, None,
+            "one speaker → keep the plain others label"
+        );
     }
 
     #[test]
     fn relabel_no_overlap_keeps_none() {
         let mut segs = vec![seg(10.0, 12.0)];
         let spans = vec![
-            SpeakerSpan { start: 0.0, end: 3.0, speaker: 0 },
-            SpeakerSpan { start: 3.0, end: 5.0, speaker: 1 },
+            SpeakerSpan {
+                start: 0.0,
+                end: 3.0,
+                speaker: 0,
+            },
+            SpeakerSpan {
+                start: 3.0,
+                end: 5.0,
+                speaker: 1,
+            },
         ];
         relabel_others(&mut segs, &spans);
         assert_eq!(segs[0].speaker, None);
@@ -625,7 +656,11 @@ mod tests {
         assert_eq!(back, v, "blob → vec is byte-exact");
         // A misaligned blob (not a multiple of 4) is rejected, never silently truncated.
         assert!(blob_to_embedding(&[1, 2, 3]).is_none());
-        assert_eq!(blob_to_embedding(&[]), Some(Vec::new()), "empty blob → empty vec");
+        assert_eq!(
+            blob_to_embedding(&[]),
+            Some(Vec::new()),
+            "empty blob → empty vec"
+        );
     }
 
     /// Cosine on known vectors: identical → 1.0, orthogonal → 0.0, opposite → -1.0; a length
@@ -653,7 +688,11 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-6, "unit length after normalize");
         let mut z = vec![0.0f32, 0.0, 0.0];
         l2_normalize(&mut z);
-        assert_eq!(z, vec![0.0, 0.0, 0.0], "zero vector untouched (no divide-by-zero)");
+        assert_eq!(
+            z,
+            vec![0.0, 0.0, 0.0],
+            "zero vector untouched (no divide-by-zero)"
+        );
     }
 
     /// The pure gather seam concatenates ONLY the requested cluster's spans, clamps to the buffer,
@@ -665,9 +704,21 @@ mod tests {
         // 3 seconds of ramp so each sample index is identifiable.
         let samples: Vec<f32> = (0..24_000).map(|i| i as f32).collect();
         let spans = vec![
-            SpeakerSpan { start: 0.0, end: 1.0, speaker: 0 }, // [0,8000)
-            SpeakerSpan { start: 2.0, end: 3.0, speaker: 0 }, // [16000,24000)
-            SpeakerSpan { start: 1.0, end: 2.0, speaker: 1 }, // cluster 1 → excluded
+            SpeakerSpan {
+                start: 0.0,
+                end: 1.0,
+                speaker: 0,
+            }, // [0,8000)
+            SpeakerSpan {
+                start: 2.0,
+                end: 3.0,
+                speaker: 0,
+            }, // [16000,24000)
+            SpeakerSpan {
+                start: 1.0,
+                end: 2.0,
+                speaker: 1,
+            }, // cluster 1 → excluded
         ];
         let c0 = gather_cluster_samples(&samples, &spans, 0, sr);
         assert_eq!(c0.len(), 16_000, "cluster 0 = two 1s spans concatenated");
@@ -681,7 +732,11 @@ mod tests {
         // A cluster with no spans → empty.
         assert!(gather_cluster_samples(&samples, &spans, 9, sr).is_empty());
         // Out-of-range span end is clamped to the buffer, never panics.
-        let over = vec![SpeakerSpan { start: 2.0, end: 100.0, speaker: 0 }];
+        let over = vec![SpeakerSpan {
+            start: 2.0,
+            end: 100.0,
+            speaker: 0,
+        }];
         assert_eq!(gather_cluster_samples(&samples, &over, 0, sr).len(), 8_000);
         // Guard rails: zero sample-rate / empty buffer → empty.
         assert!(gather_cluster_samples(&samples, &spans, 0, 0).is_empty());
@@ -701,12 +756,24 @@ mod tests {
         let c0 = [0.99f32, 0.14, 0.0]; // ~unit, cos(alice)≈0.99
         let c1 = [0.10f32, 0.99, 0.0]; // cos(bob)≈0.99
         let clusters = [
-            ClusterEmbeddingRef { cluster_index: 0, embedding: &c0 },
-            ClusterEmbeddingRef { cluster_index: 1, embedding: &c1 },
+            ClusterEmbeddingRef {
+                cluster_index: 0,
+                embedding: &c0,
+            },
+            ClusterEmbeddingRef {
+                cluster_index: 1,
+                embedding: &c1,
+            },
         ];
         let labeled = [
-            LabeledEmbeddingRef { label: "Alice", embedding: &alice },
-            LabeledEmbeddingRef { label: "Bob", embedding: &bob },
+            LabeledEmbeddingRef {
+                label: "Alice",
+                embedding: &alice,
+            },
+            LabeledEmbeddingRef {
+                label: "Bob",
+                embedding: &bob,
+            },
         ];
         let sugg = suggest_voiceprint_labels(&clusters, &labeled, VOICEPRINT_MATCH_THRESHOLD);
         assert_eq!(sugg.len(), 2);
@@ -723,13 +790,22 @@ mod tests {
     fn suggest_below_threshold_returns_nothing() {
         let alice = [1.0f32, 0.0, 0.0];
         let orthogonal = [0.0f32, 1.0, 0.0];
-        let clusters = [ClusterEmbeddingRef { cluster_index: 0, embedding: &orthogonal }];
-        let labeled = [LabeledEmbeddingRef { label: "Alice", embedding: &alice }];
+        let clusters = [ClusterEmbeddingRef {
+            cluster_index: 0,
+            embedding: &orthogonal,
+        }];
+        let labeled = [LabeledEmbeddingRef {
+            label: "Alice",
+            embedding: &alice,
+        }];
         let sugg = suggest_voiceprint_labels(&clusters, &labeled, VOICEPRINT_MATCH_THRESHOLD);
         assert!(sugg.is_empty(), "cos 0.0 < 0.5 threshold → no suggestion");
         // Exactly-at-threshold IS offered (>=): a hand-built pair at cos 0.5.
         let half = [0.5f32, (0.75f32).sqrt(), 0.0]; // cos(alice)=0.5
-        let at = [ClusterEmbeddingRef { cluster_index: 3, embedding: &half }];
+        let at = [ClusterEmbeddingRef {
+            cluster_index: 3,
+            embedding: &half,
+        }];
         let s2 = suggest_voiceprint_labels(&at, &labeled, VOICEPRINT_MATCH_THRESHOLD);
         assert_eq!(s2.len(), 1, "cos==threshold is inclusive");
         assert!((s2[0].score - 0.5).abs() < 1e-5);
@@ -741,9 +817,15 @@ mod tests {
     #[test]
     fn suggest_with_no_visible_labeled_priors_is_empty() {
         let c0 = [1.0f32, 0.0, 0.0];
-        let clusters = [ClusterEmbeddingRef { cluster_index: 0, embedding: &c0 }];
+        let clusters = [ClusterEmbeddingRef {
+            cluster_index: 0,
+            embedding: &c0,
+        }];
         let sugg = suggest_voiceprint_labels(&clusters, &[], VOICEPRINT_MATCH_THRESHOLD);
-        assert!(sugg.is_empty(), "no visible labeled priors → nothing to suggest from");
+        assert!(
+            sugg.is_empty(),
+            "no visible labeled priors → nothing to suggest from"
+        );
     }
 
     /// Tie-break is stable (first-seen label wins) and a length mismatch is a safe 0.0 (never a
@@ -753,17 +835,29 @@ mod tests {
         let a = [1.0f32, 0.0];
         let c0 = [1.0f32, 0.0];
         let labeled = [
-            LabeledEmbeddingRef { label: "First", embedding: &a },
-            LabeledEmbeddingRef { label: "Second", embedding: &a }, // identical → tie
+            LabeledEmbeddingRef {
+                label: "First",
+                embedding: &a,
+            },
+            LabeledEmbeddingRef {
+                label: "Second",
+                embedding: &a,
+            }, // identical → tie
         ];
-        let clusters = [ClusterEmbeddingRef { cluster_index: 0, embedding: &c0 }];
+        let clusters = [ClusterEmbeddingRef {
+            cluster_index: 0,
+            embedding: &c0,
+        }];
         let sugg = suggest_voiceprint_labels(&clusters, &labeled, VOICEPRINT_MATCH_THRESHOLD);
         assert_eq!(sugg.len(), 1);
         assert_eq!(sugg[0].label, "First", "tie → first-seen label (stable)");
 
         // A wrong-dim prior scores 0.0 (cosine guard) → below threshold → dropped.
         let wrong_dim = [1.0f32, 0.0, 0.0];
-        let only_bad = [LabeledEmbeddingRef { label: "Bad", embedding: &wrong_dim }];
+        let only_bad = [LabeledEmbeddingRef {
+            label: "Bad",
+            embedding: &wrong_dim,
+        }];
         assert!(
             suggest_voiceprint_labels(&clusters, &only_bad, VOICEPRINT_MATCH_THRESHOLD).is_empty(),
             "dimension mismatch → cosine 0.0 → no suggestion"

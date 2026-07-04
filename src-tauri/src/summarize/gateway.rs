@@ -25,8 +25,13 @@ pub fn host_is_loopback(url: &reqwest::Url) -> bool {
             if h.eq_ignore_ascii_case("localhost") {
                 return true;
             }
-            let h = h.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(h);
-            h.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+            let h = h
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(h);
+            h.parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
         }
     }
 }
@@ -51,7 +56,9 @@ pub fn validate_gateway_url(raw: &str) -> Result<reqwest::Url> {
         "http" => Err(AppError::InvalidArg(
             "gateway URL must use https:// (http:// is only allowed for localhost)".into(),
         )),
-        other => Err(AppError::InvalidArg(format!("unsupported gateway URL scheme: {other}"))),
+        other => Err(AppError::InvalidArg(format!(
+            "unsupported gateway URL scheme: {other}"
+        ))),
     }
 }
 
@@ -151,9 +158,7 @@ pub(crate) fn parse_chat_response(body: &str) -> Result<(String, CallMeta)> {
         .and_then(|c| c.message)
         .and_then(|m| m.content)
         .ok_or_else(|| {
-            AppError::Summarize(
-                "gateway response missing choices[0].message.content".to_string(),
-            )
+            AppError::Summarize("gateway response missing choices[0].message.content".to_string())
         })?;
 
     let note = text.trim_start_matches('\u{feff}').trim();
@@ -467,7 +472,8 @@ impl OpenAiCompatProvider {
 
     /// POST to `{base}/chat/completions` with a free-text body (no `response_format`).
     async fn post_chat(&self, system: &str, user: &str) -> Result<String> {
-        self.post_chat_raw(chat_body(&self.model, system, user)).await
+        self.post_chat_raw(chat_body(&self.model, system, user))
+            .await
     }
 
     /// Shared call path returning both the text and the `CallMeta`.
@@ -501,10 +507,7 @@ impl SummarizerProvider for OpenAiCompatProvider {
         Ok(text)
     }
 
-    async fn summarize_with_meta(
-        &self,
-        req: &SummarizeRequest,
-    ) -> Result<(String, CallMeta)> {
+    async fn summarize_with_meta(&self, req: &SummarizeRequest) -> Result<(String, CallMeta)> {
         let system_prompt = if req.template.trim().is_empty() {
             template::default_template()
         } else {
@@ -514,11 +517,7 @@ impl SummarizerProvider for OpenAiCompatProvider {
         self.call_with_meta(&system_prompt, &user_content).await
     }
 
-    async fn complete_with_meta(
-        &self,
-        system: &str,
-        user: &str,
-    ) -> Result<(String, CallMeta)> {
+    async fn complete_with_meta(&self, system: &str, user: &str) -> Result<(String, CallMeta)> {
         self.call_with_meta(system, user).await
     }
 
@@ -580,8 +579,16 @@ mod tests {
         assert_eq!(meta.prompt_tokens, Some(13), "prompt_tokens");
         assert_eq!(meta.completion_tokens, Some(7), "completion_tokens");
         assert_eq!(meta.total_tokens, Some(20), "total_tokens (API-reported)");
-        assert_eq!(meta.cached_tokens, Some(4), "prompt_tokens_details.cached_tokens");
-        assert_eq!(meta.model_served.as_deref(), Some("gpt-4o"), "model → model_served");
+        assert_eq!(
+            meta.cached_tokens,
+            Some(4),
+            "prompt_tokens_details.cached_tokens"
+        );
+        assert_eq!(
+            meta.model_served.as_deref(),
+            Some("gpt-4o"),
+            "model → model_served"
+        );
     }
 
     /// A response missing `usage` and `model` degrades gracefully.
@@ -607,10 +614,18 @@ mod tests {
 
     #[test]
     fn loopback_detection() {
-        assert!(host_is_loopback(&reqwest::Url::parse("http://localhost:11434").unwrap()));
-        assert!(host_is_loopback(&reqwest::Url::parse("http://127.0.0.1:4000/v1").unwrap()));
-        assert!(host_is_loopback(&reqwest::Url::parse("http://[::1]:8000").unwrap()));
-        assert!(!host_is_loopback(&reqwest::Url::parse("https://api.example.com/v1").unwrap()));
+        assert!(host_is_loopback(
+            &reqwest::Url::parse("http://localhost:11434").unwrap()
+        ));
+        assert!(host_is_loopback(
+            &reqwest::Url::parse("http://127.0.0.1:4000/v1").unwrap()
+        ));
+        assert!(host_is_loopback(
+            &reqwest::Url::parse("http://[::1]:8000").unwrap()
+        ));
+        assert!(!host_is_loopback(
+            &reqwest::Url::parse("https://api.example.com/v1").unwrap()
+        ));
     }
 
     #[test]
@@ -635,14 +650,16 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["stream"], false, "streaming must be disabled");
         let rf = &body["response_format"];
-        assert_eq!(rf["type"], "json_schema", "response_format.type must be 'json_schema'");
+        assert_eq!(
+            rf["type"], "json_schema",
+            "response_format.type must be 'json_schema'"
+        );
         let js = &rf["json_schema"];
         assert_eq!(js["name"], "result", "json_schema.name must be 'result'");
         assert_eq!(js["strict"], true, "strict must be true");
         // The supplied schema appears verbatim under json_schema.schema.
         assert_eq!(
-            js["schema"],
-            schema,
+            js["schema"], schema,
             "caller-supplied schema must appear verbatim under json_schema.schema"
         );
     }
@@ -686,23 +703,18 @@ mod tests {
         )
         .is_ok());
         // Remote HTTP → rejected (R4).
-        let err = OpenAiCompatProvider::new(
-            "http://gw.example.com/v1".to_string(),
-            String::new(),
-            None,
-        )
-        .map(|_| ()).expect_err("expected InvalidArg for remote http URL");
+        let err =
+            OpenAiCompatProvider::new("http://gw.example.com/v1".to_string(), String::new(), None)
+                .map(|_| ())
+                .expect_err("expected InvalidArg for remote http URL");
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg, got: {err}"
         );
         // Bad scheme → rejected.
-        let err2 = OpenAiCompatProvider::new(
-            "file:///etc/passwd".to_string(),
-            String::new(),
-            None,
-        )
-        .map(|_| ()).expect_err("expected InvalidArg for file:// URL");
+        let err2 = OpenAiCompatProvider::new("file:///etc/passwd".to_string(), String::new(), None)
+            .map(|_| ())
+            .expect_err("expected InvalidArg for file:// URL");
         assert!(
             matches!(err2, AppError::InvalidArg(_)),
             "expected InvalidArg for bad scheme, got: {err2}"
@@ -727,33 +739,27 @@ mod tests {
         );
 
         // No path (root) → /chat/completions.
-        let p2 = OpenAiCompatProvider::new(
-            "http://localhost:4000".to_string(),
-            String::new(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(p2.chat_endpoint().as_str(), "http://localhost:4000/chat/completions");
+        let p2 =
+            OpenAiCompatProvider::new("http://localhost:4000".to_string(), String::new(), None)
+                .unwrap();
+        assert_eq!(
+            p2.chat_endpoint().as_str(),
+            "http://localhost:4000/chat/completions"
+        );
 
         // HTTPS remote with /v1 — preserved.
-        let p3 = OpenAiCompatProvider::new(
-            "https://gw.example.com/v1".to_string(),
-            String::new(),
-            None,
-        )
-        .unwrap();
+        let p3 =
+            OpenAiCompatProvider::new("https://gw.example.com/v1".to_string(), String::new(), None)
+                .unwrap();
         assert_eq!(
             p3.chat_endpoint().as_str(),
             "https://gw.example.com/v1/chat/completions"
         );
 
         // Trailing slash on /v1 → idempotent.
-        let p4 = OpenAiCompatProvider::new(
-            "http://localhost:4000/v1/".to_string(),
-            String::new(),
-            None,
-        )
-        .unwrap();
+        let p4 =
+            OpenAiCompatProvider::new("http://localhost:4000/v1/".to_string(), String::new(), None)
+                .unwrap();
         assert_eq!(
             p4.chat_endpoint().as_str(),
             "http://localhost:4000/v1/chat/completions"
@@ -877,10 +883,7 @@ mod tests {
     /// 500 → `Summarize` with "gateway error 500: …".
     #[test]
     fn map_gateway_error_500_is_summarize_with_status() {
-        let err = map_gateway_error(
-            500,
-            r#"{"error":{"message":"internal server error"}}"#,
-        );
+        let err = map_gateway_error(500, r#"{"error":{"message":"internal server error"}}"#);
         match err {
             AppError::Summarize(msg) => {
                 assert!(
@@ -912,7 +915,10 @@ mod tests {
     #[test]
     fn gateway_error_extraction() {
         let body = r#"{"error":{"message":"model 'x' not found","type":"invalid_request_error"}}"#;
-        assert_eq!(extract_gateway_error(body).as_deref(), Some("model 'x' not found"));
+        assert_eq!(
+            extract_gateway_error(body).as_deref(),
+            Some("model 'x' not found")
+        );
         // No error field → None (callers fall back to a generic message).
         assert!(extract_gateway_error("{}").is_none());
         assert!(extract_gateway_error("not json").is_none());
@@ -925,14 +931,21 @@ mod tests {
     fn parse_models_response_extracts_ids() {
         let body = r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":"llama-3"}]}"#;
         let ids = parse_models_response(body).unwrap();
-        assert_eq!(ids, vec!["gpt-4o", "llama-3"], "ids must match fixture order");
+        assert_eq!(
+            ids,
+            vec!["gpt-4o", "llama-3"],
+            "ids must match fixture order"
+        );
     }
 
     /// A malformed (non-JSON) body degrades to an empty list — never a panic.
     #[test]
     fn parse_models_response_malformed_body_returns_empty() {
         let ids = parse_models_response("not json at all").unwrap();
-        assert!(ids.is_empty(), "malformed body must degrade to an empty list");
+        assert!(
+            ids.is_empty(),
+            "malformed body must degrade to an empty list"
+        );
     }
 
     /// An empty data array returns an empty list cleanly.
@@ -1046,7 +1059,10 @@ mod tests {
 
     #[test]
     fn classify_reachable_transport_failure_is_false() {
-        assert!(!classify_reachable(false), "transport failure → not reachable");
+        assert!(
+            !classify_reachable(false),
+            "transport failure → not reachable"
+        );
     }
 
     // ─── list_models with no catalog (None models endpoint) — async, no network ─────────────────
@@ -1064,7 +1080,10 @@ mod tests {
         // models_endpoint() is None for /test — list_models must short-circuit.
         assert!(provider.models_endpoint().is_none());
         let ids = provider.list_models().await.unwrap();
-        assert!(ids.is_empty(), "custom route must yield empty model list without a network call");
+        assert!(
+            ids.is_empty(),
+            "custom route must yield empty model list without a network call"
+        );
     }
 
     /// `models_endpoint` applies the path-resolution heuristic: root/`/v1` → `Some(…/models)`;
@@ -1085,13 +1104,13 @@ mod tests {
         );
 
         // Root base → Some(/models).
-        let p2 = OpenAiCompatProvider::new(
-            "http://localhost:4000".to_string(),
-            String::new(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(p2.models_endpoint().unwrap().as_str(), "http://localhost:4000/models");
+        let p2 =
+            OpenAiCompatProvider::new("http://localhost:4000".to_string(), String::new(), None)
+                .unwrap();
+        assert_eq!(
+            p2.models_endpoint().unwrap().as_str(),
+            "http://localhost:4000/models"
+        );
 
         // Custom Kong route /test → None (no catalog).
         let p3 = OpenAiCompatProvider::new(

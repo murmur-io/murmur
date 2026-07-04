@@ -83,8 +83,8 @@ pub async fn fetch_events(
         tracing::info!(target: "calendar", "calendar sidecar unavailable; returning no events");
         return Vec::new();
     };
-    let res = tokio::task::spawn_blocking(move || run_sidecar(&bin, back_minutes, forward_minutes))
-        .await;
+    let res =
+        tokio::task::spawn_blocking(move || run_sidecar(&bin, back_minutes, forward_minutes)).await;
     match res {
         Ok(stdout) => parse_sidecar_output(&stdout),
         Err(e) => {

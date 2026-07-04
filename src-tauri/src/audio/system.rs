@@ -108,8 +108,7 @@ impl SystemAudioRecorder {
         // sidecar needs, so MURMUR_DEV_* / API keys / tokens in the app environment can never be
         // inherited by this child. PATH is a fixed system list (the sidecar runs no helpers), HOME
         // is needed for the macOS per-user TCC/container context.
-        cmd.env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        cmd.env_clear().env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
         for key in ["HOME", "USER", "LOGNAME", "TMPDIR"] {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
@@ -147,7 +146,10 @@ impl SystemAudioRecorder {
     /// Prefers the helper's first-frame anchor; falls back to the spawn instant (a helper that
     /// died before capturing, or an old helper without the line).
     pub fn started_at(&self) -> std::time::Instant {
-        self.first_frame_at.get().copied().unwrap_or(self.started_at)
+        self.first_frame_at
+            .get()
+            .copied()
+            .unwrap_or(self.started_at)
     }
 
     /// SIGTERM the sidecar so it finalizes the WAV, wait for it, and return the WAV path
@@ -193,7 +195,9 @@ mod tests {
         assert!(is_first_frame_line("sysaudio: first-frame"));
         assert!(is_first_frame_line("audiocap: first-frame\n".trim()));
         assert!(!is_first_frame_line("sysaudio: capturing"));
-        assert!(!is_first_frame_line("audiocap: tap stuck silent — rebuilding (1)"));
+        assert!(!is_first_frame_line(
+            "audiocap: tap stuck silent — rebuilding (1)"
+        ));
         assert!(!is_first_frame_line(""));
     }
 }

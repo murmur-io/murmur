@@ -256,7 +256,9 @@ fn wait_bounded(child: &mut std::process::Child) -> Result<()> {
             }
             Err(e) => {
                 let _ = child.kill();
-                return Err(AppError::Summarize(format!("afm: sidecar wait failed: {e}")));
+                return Err(AppError::Summarize(format!(
+                    "afm: sidecar wait failed: {e}"
+                )));
             }
         }
     }
@@ -454,7 +456,8 @@ mod tests {
         assert_eq!(v["schema"], serde_json::json!(null));
 
         // structured mode: the schema is carried verbatim.
-        let schema = serde_json::json!({ "type": "object", "properties": { "n": { "type": "number" } } });
+        let schema =
+            serde_json::json!({ "type": "object", "properties": { "n": { "type": "number" } } });
         let req = build_afm_request("structured", "s", "u", Some(&schema));
         let v: Value = serde_json::from_str(&req).unwrap();
         assert_eq!(v["mode"], serde_json::json!("structured"));
@@ -513,7 +516,8 @@ mod tests {
             parse_probe_output(r#"{"status":"available","reason":"ready"}"#).unwrap(),
             (true, "ready".to_string())
         );
-        let (avail, _) = parse_probe_output(r#"{"status":"unavailable","reason":"no os26"}"#).unwrap();
+        let (avail, _) =
+            parse_probe_output(r#"{"status":"unavailable","reason":"no os26"}"#).unwrap();
         assert!(!avail);
         assert!(parse_probe_output("garbage").is_err());
     }

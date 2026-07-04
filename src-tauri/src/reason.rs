@@ -288,7 +288,9 @@ pub fn brain_model_dtos(
             arch: m.arch.to_string(),
             class: m.class,
             downloaded: models_dir.join(m.filename).is_file(),
-            fits_ram: total_ram_gb.map(|g| u64::from(m.min_ram_gb) <= g).unwrap_or(true),
+            fits_ram: total_ram_gb
+                .map(|g| u64::from(m.min_ram_gb) <= g)
+                .unwrap_or(true),
             selected: selected_id == Some(m.id),
         })
         .collect()
@@ -1169,7 +1171,10 @@ mod tests {
         let b = r.reason("sys", "hello").unwrap();
         assert_eq!(a, b);
         // Different input → different output (the length fields move).
-        assert_ne!(r.reason("sys", "hello").unwrap(), r.reason("sys", "hi").unwrap());
+        assert_ne!(
+            r.reason("sys", "hello").unwrap(),
+            r.reason("sys", "hi").unwrap()
+        );
     }
 
     #[test]
@@ -1187,7 +1192,9 @@ mod tests {
         // The echoed user text contains braces; the extractor must still recover the whole object.
         let r = StubReasoner;
         let schema = serde_json::json!({});
-        let v = r.structured("sys", "json like {a:1} please", &schema).unwrap();
+        let v = r
+            .structured("sys", "json like {a:1} please", &schema)
+            .unwrap();
         assert_eq!(v["echo"], serde_json::json!("json like {a:1} please"));
     }
 
@@ -1272,7 +1279,9 @@ mod tests {
         // (a) custom path override wins.
         let f = tmp_file("resolve-custom", b"GGUF");
         assert_eq!(
-            resolve_brain_model(Some(&f), Some("qwen2.5-3b")).unwrap().as_deref(),
+            resolve_brain_model(Some(&f), Some("qwen2.5-3b"))
+                .unwrap()
+                .as_deref(),
             Some(f.as_path())
         );
         let _ = std::fs::remove_file(&f);
@@ -1297,7 +1306,9 @@ mod tests {
         // (c) no custom path + no selection ⇒ None (stub).
         assert!(resolve_brain_model(None, None).unwrap().is_none());
         // unknown id resolves to None (no models dir hit for it).
-        assert!(resolve_brain_model(None, Some("nope-bad-id")).unwrap().is_none());
+        assert!(resolve_brain_model(None, Some("nope-bad-id"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1493,8 +1504,11 @@ mod tests {
         let provider = Arc::new(MockProvider::new(reply));
         let r = CloudReasoner::with_provider(AppConfig::default(), provider.clone());
 
-        let schema = serde_json::json!({ "type": "object", "properties": { "n": { "type": "number" } } });
-        let v = r.structured("plan retrieval", "transcript excerpt", &schema).unwrap();
+        let schema =
+            serde_json::json!({ "type": "object", "properties": { "n": { "type": "number" } } });
+        let v = r
+            .structured("plan retrieval", "transcript excerpt", &schema)
+            .unwrap();
 
         // (b) parsed JSON value from the noisy reply.
         assert_eq!(v["entities"], serde_json::json!(["Atlas"]));
@@ -1502,8 +1516,14 @@ mod tests {
 
         // (a) the system prompt actually carried the schema-as-instruction.
         let sent = provider.last_system.lock().unwrap().clone().unwrap();
-        assert!(sent.contains("conforming to this schema"), "schema instruction embedded: {sent}");
-        assert!(sent.contains("\"properties\""), "the JSON schema itself is embedded: {sent}");
+        assert!(
+            sent.contains("conforming to this schema"),
+            "schema instruction embedded: {sent}"
+        );
+        assert!(
+            sent.contains("\"properties\""),
+            "the JSON schema itself is embedded: {sent}"
+        );
         assert!(sent.contains("No prose, no fences"));
     }
 
@@ -1625,7 +1645,11 @@ mod tests {
             ..Default::default()
         });
         let cell = ReasonerCell::new(Arc::clone(&cfg));
-        assert_eq!(cell.current().id(), "stub", "Off backend dispatches the stub");
+        assert_eq!(
+            cell.current().id(),
+            "stub",
+            "Off backend dispatches the stub"
+        );
 
         cfg.lock().unwrap().brain_backend = BrainBackend::Cloud;
         let id = cell.current().id().to_string();
@@ -1680,7 +1704,11 @@ mod tests {
         let cell = ReasonerCell::new(Arc::clone(&cfg));
         let a = cell.current();
         let b = cell.current();
-        assert_eq!(a.id(), "stub", "no GGUF resolves ⇒ the local dispatch is the stub");
+        assert_eq!(
+            a.id(),
+            "stub",
+            "no GGUF resolves ⇒ the local dispatch is the stub"
+        );
         assert!(
             Arc::ptr_eq(&a, &b),
             "the local instance must be reused across calls, never rebuilt per call"
@@ -1751,7 +1779,11 @@ mod tests {
             ..Default::default()
         });
         let cell = ReasonerCell::new(Arc::clone(&cfg));
-        assert_eq!(cell.current_for(Role::Ask).id(), "stub", "explicit Ask→off is the stub");
+        assert_eq!(
+            cell.current_for(Role::Ask).id(),
+            "stub",
+            "explicit Ask→off is the stub"
+        );
         assert_eq!(cell.current_for(Role::Notes).id(), "cloud:claude_code");
         assert_eq!(cell.current_for(Role::Live).id(), "cloud:claude_code");
 
@@ -1856,7 +1888,10 @@ mod tests {
     #[test]
     fn active_reasoner_default_is_cloud() {
         let id = active_reasoner(&AppConfig::default()).id().to_string();
-        assert!(id.starts_with("cloud:"), "default brain must be cloud, got {id}");
+        assert!(
+            id.starts_with("cloud:"),
+            "default brain must be cloud, got {id}"
+        );
     }
 
     // ---- WS2: AppleFoundation dispatch + anti-egress ordering --------------------------------
@@ -1899,7 +1934,10 @@ mod tests {
 
         cfg.lock().unwrap().brain_backend = BrainBackend::AppleFoundation;
         let id = cell.current().id().to_string();
-        assert_eq!(id, "stub", "AFM without a sidecar dispatches the stub, got {id}");
+        assert_eq!(
+            id, "stub",
+            "AFM without a sidecar dispatches the stub, got {id}"
+        );
         assert!(
             !id.starts_with("cloud:"),
             "AFM (on-device) must NEVER fall through to the cloud reasoner (anti-egress), got {id}"
@@ -1910,7 +1948,10 @@ mod tests {
         cfg.lock().unwrap().brain_backend = BrainBackend::Cloud;
         cfg.lock().unwrap().role_ask_connection = "apple".to_string();
         let ask_id = cell.current_for(Role::Ask).id().to_string();
-        assert_eq!(ask_id, "stub", "explicit Ask→apple dispatches on-device (stub when absent)");
+        assert_eq!(
+            ask_id, "stub",
+            "explicit Ask→apple dispatches on-device (stub when absent)"
+        );
         // Notes (no key) keeps the legacy Cloud dispatch — the AFM arm didn't hijack other roles.
         assert!(cell.current_for(Role::Notes).id().starts_with("cloud:"));
     }

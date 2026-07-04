@@ -2,9 +2,15 @@ import { Injectable } from "@angular/core";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AccountStatus,
   ActionItem,
   Analytics,
   AppConfigDto,
+  MyShareEntry,
+  RecipientPreview,
+  ShareToUserResult,
+  ShareInboxItem,
+  AcceptedShare,
   BrainDownloadProgress,
   BrainModelDto,
   Posture,
@@ -215,6 +221,123 @@ export class IpcService {
    */
   revokeCloudEgress(): Promise<void> {
     return invoke<void>("revoke_cloud_egress");
+  }
+
+  // ── M3-CLIENT: sharing account + zero-knowledge link shares (mode A) ──
+
+  /** Current sharing-account session state (logged in? unlocked? consented? server set?). */
+  accountStatus(): Promise<AccountStatus> {
+    return invoke<AccountStatus>("account_status");
+  }
+
+  /**
+   * Create a sharing account. Runs the OPAQUE client registration on-device (the password never
+   * leaves the Mac), generates the account key material + (skippable) recovery phrase, and uploads
+   * it. `code` is the 6-digit email verification code. Returns the 24-word recovery phrase ONLY when
+   * `saveRecovery` is true (else `null` — skipped).
+   */
+  accountSignup(
+    email: string,
+    code: string,
+    password: string,
+    saveRecovery: boolean,
+  ): Promise<string | null> {
+    return invoke<string | null>("account_signup", { email, code, password, saveRecovery });
+  }
+
+  /** Log in (OPAQUE); unwraps MK for the session and stores the tokens in the Keychain. */
+  accountLogin(email: string, password: string): Promise<AccountStatus> {
+    return invoke<AccountStatus>("account_login", { email, password });
+  }
+
+  /** Log out: server family-revoke (best-effort) + clear Keychain tokens + drop the session MK. */
+  accountLogout(): Promise<void> {
+    return invoke<void>("account_logout");
+  }
+
+  /** Grant the one-time share-egress consent (mirrors {@link consentToCloudEgress}). */
+  consentToShareEgress(): Promise<void> {
+    return invoke<void>("consent_to_share_egress");
+  }
+
+  /** Revoke the share-egress consent (the next share is refused fail-closed). */
+  revokeShareEgress(): Promise<void> {
+    return invoke<void>("revoke_share_egress");
+  }
+
+  /**
+   * Create a zero-knowledge link share of a note and return the share URL. The note is cleaned
+   * (frontmatter/wikilinks/obsidian:// stripped) and sealed on-device; only ciphertext + wrapped
+   * keys leave. The URL's `#…` fragment carries the decryption key `L` and is assembled locally —
+   * `L` never reaches the server. Refuses (`Locked`) a sealed meeting; requires login + consent.
+   */
+  shareNoteToLink(
+    meetingId: string,
+    expiresDays?: number,
+    password?: string,
+  ): Promise<string> {
+    return invoke<string>("share_note_to_link", { meetingId, expiresDays, password });
+  }
+
+  /** The user's shares (a sealed meeting's title is masked). */
+  listMyShares(): Promise<MyShareEntry[]> {
+    return invoke<MyShareEntry[]>("list_my_shares");
+  }
+
+  /** Revoke a share: DELETE the server ciphertext + flip the local state. Idempotent. */
+  revokeShare(shareId: string): Promise<void> {
+    return invoke<void>("revoke_share", { shareId });
+  }
+
+  // ── M5-CLIENT: Murmur↔Murmur (mode B) — invite a colleague + accept into the vault ──
+
+  /**
+   * Read-only preview of a recipient email: is it a registered Murmur account, its safety-word
+   * fingerprint, and the TOFU state (first contact → show + confirm; key changed → BLOCK). Mutates
+   * no pin. The FE uses this to DEFAULT to a protected link when the recipient isn't registered.
+   */
+  previewShareRecipient(email: string): Promise<RecipientPreview> {
+    return invoke<RecipientPreview>("preview_share_recipient", { email });
+  }
+
+  /**
+   * Share a note to a colleague by email (mode B). Registered → wrapped + `"sent"`; unregistered →
+   * a pending invite + `"invited"`. Refuses (`Locked`) a sealed meeting; BLOCKS on a changed key.
+   */
+  shareNoteToUser(
+    meetingId: string,
+    recipientEmail: string,
+    expiresDays?: number,
+  ): Promise<ShareToUserResult> {
+    return invoke<ShareToUserResult>("share_note_to_user", {
+      meetingId,
+      recipientEmail,
+      expiresDays,
+    });
+  }
+
+  /** Re-wrap any pending invites whose recipient has since registered. Returns the count advanced. */
+  shareRewrapPending(): Promise<number> {
+    return invoke<number>("share_rewrap_pending");
+  }
+
+  /** The incoming (pending-accept) share inbox (content-free; titles only appear on accept). */
+  listShareInbox(): Promise<ShareInboxItem[]> {
+    return invoke<ShareInboxItem[]>("list_share_inbox");
+  }
+
+  /**
+   * Accept an incoming share into the vault. Verifies the sender's signature + binding, then writes a
+   * new meeting + note into `folderId` (default: an auto-created unsealed "Shared" folder). Refuses a
+   * sealed target (`Locked`); rejects a tampered/unsigned grant; idempotent on `shareId`.
+   */
+  acceptShare(shareId: string, folderId?: string): Promise<AcceptedShare> {
+    return invoke<AcceptedShare>("accept_share", { shareId, folderId });
+  }
+
+  /** Decline an incoming share: drop the wrapped key server-side. Idempotent. */
+  declineShare(shareId: string): Promise<void> {
+    return invoke<void>("decline_share", { shareId });
   }
 
   setAnthropicKey(key: string): Promise<void> {

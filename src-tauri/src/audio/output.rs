@@ -108,7 +108,10 @@ mod tests {
         // Built-in transport, unreadable data source ⇒ conservatively speakers.
         assert_eq!(classify_output(Some(TRANSPORT_BUILTIN), None), Some(true));
         // Bluetooth / USB / anything else ⇒ not the built-in speakers.
-        assert_eq!(classify_output(Some(0x626C7565 /* 'blue' */), None), Some(false));
+        assert_eq!(
+            classify_output(Some(0x626C7565 /* 'blue' */), None),
+            Some(false)
+        );
         // Unknown transport ⇒ None.
         assert_eq!(classify_output(None, None), None);
     }

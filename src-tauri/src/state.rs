@@ -78,13 +78,21 @@ impl CaptureState {
     /// by `armed_from` at the call site that has the recorder). Kept for the headless tests that
     /// don't have a recorder; the live loop falls back to the rolling tail when `start_sample` is None.
     pub fn armed() -> Self {
-        Self { budget: Self::DEFAULT_BUDGET, start_sample: None, ended: false }
+        Self {
+            budget: Self::DEFAULT_BUDGET,
+            start_sample: None,
+            ended: false,
+        }
     }
 
     /// A freshly-armed capture that latches the recorder's total-sample `offset` at arm time, so the
     /// live loop transcribes only the POST-CLICK utterance.
     pub fn armed_from(offset: usize) -> Self {
-        Self { budget: Self::DEFAULT_BUDGET, start_sample: Some(offset), ended: false }
+        Self {
+            budget: Self::DEFAULT_BUDGET,
+            start_sample: Some(offset),
+            ended: false,
+        }
     }
 }
 
@@ -158,6 +166,13 @@ pub struct AppState {
     /// `Zeroizing` so the bytes are wiped from RAM whenever the cached copy is dropped/replaced (C4),
     /// in addition to the explicit `zeroize()` on relock-all.
     pub master_kek: Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
+    /// M3-CLIENT (spec §3/§4) — the logged-in sharing account for THIS session, or `None` when logged
+    /// out. Holds the account id, the unwrapped account master key `MK` (zeroized on drop), the cached
+    /// device id, and the current identity generation. The MK never touches SQLite (it is unwrapped
+    /// from the server-stored `mk_wrap_pw` at login via the OPAQUE `export_key`); the session tokens
+    /// live in the Keychain (source of truth) — this cache only holds MK + non-secret metadata so a
+    /// share can be sealed without re-prompting for the password. Cleared on logout.
+    pub account_session: Mutex<Option<crate::share::AccountSession>>,
     /// BLK-1 coarse LIFECYCLE lock. Serializes the folder-lock state machine
     /// (`lock_folder` / `unlock_folder` / `relock_folder` / `relock_all_inner` / `remove_lock` /
     /// the seal half of `move_note`) so two of them can NEVER interleave their multi-step
@@ -243,6 +258,7 @@ impl AppState {
             reactions_emitted: Mutex::new(std::collections::HashSet::new()),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
+            account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
         })
     }
@@ -451,28 +467,54 @@ mod tests {
         let plaintext_bak = dir.join("meetnotes.sqlite.pre-encrypt.bak");
         {
             let c = Connection::open(&plaintext_bak).unwrap();
-            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);").unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);")
+                .unwrap();
         }
-        assert!(is_plaintext_sqlite_file(&plaintext_bak), "fixture is plaintext");
+        assert!(
+            is_plaintext_sqlite_file(&plaintext_bak),
+            "fixture is plaintext"
+        );
 
         // (b) a KEYED (encrypted) pre-encrypt backup → MUST be kept (not a leak).
         let keyed_bak = dir.join("other.sqlite.pre-encrypt.bak");
         {
             let c = Connection::open(&keyed_bak).unwrap();
-            c.pragma_update(None, "key", "x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'").unwrap();
-            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);").unwrap();
+            c.pragma_update(
+                None,
+                "key",
+                "x'00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'",
+            )
+            .unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);")
+                .unwrap();
         }
-        assert!(!is_plaintext_sqlite_file(&keyed_bak), "keyed backup is not plaintext");
+        assert!(
+            !is_plaintext_sqlite_file(&keyed_bak),
+            "keyed backup is not plaintext"
+        );
 
         // (c) a session-encrypted backup (encrypted user data) → MUST be kept regardless of content.
         let session_bak = dir.join("meetnotes.sqlite.session-encrypted.bak");
-        std::fs::write(&session_bak, b"SQLite format 3\0 but this is session-encrypted user data").unwrap();
+        std::fs::write(
+            &session_bak,
+            b"SQLite format 3\0 but this is session-encrypted user data",
+        )
+        .unwrap();
 
         sweep_pre_encrypt_baks(&dir);
 
-        assert!(!plaintext_bak.exists(), "plaintext pre-encrypt backup must be swept (B4)");
-        assert!(keyed_bak.exists(), "a keyed pre-encrypt backup is encrypted at rest — keep it");
-        assert!(session_bak.exists(), "session-encrypted backups are user data — never swept");
+        assert!(
+            !plaintext_bak.exists(),
+            "plaintext pre-encrypt backup must be swept (B4)"
+        );
+        assert!(
+            keyed_bak.exists(),
+            "a keyed pre-encrypt backup is encrypted at rest — keep it"
+        );
+        assert!(
+            session_bak.exists(),
+            "session-encrypted backups are user data — never swept"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -566,7 +608,10 @@ mod tests {
         // provider id through the SAME lock the settings commands write.
         {
             let mut c = state.config.lock().unwrap();
-            assert!(!c.cloud_egress_consented, "fresh DB defaults to consent OFF");
+            assert!(
+                !c.cloud_egress_consented,
+                "fresh DB defaults to consent OFF"
+            );
             c.provider_id = "no_such_provider_for_gate_probe".into();
         }
         match state.reasoner.current().reason("s", "u") {
@@ -583,7 +628,9 @@ mod tests {
             .unwrap();
         match state.reasoner.current().reason("s", "u") {
             Err(AppError::InvalidArg(_)) => {} // past the gate — the bogus id is now the error
-            other => panic!("post-grant call must pass the consent gate without restart, got {other:?}"),
+            other => {
+                panic!("post-grant call must pass the consent gate without restart, got {other:?}")
+            }
         }
 
         // Flip the brain off (as a settings save would): the next dispatch is the stub.
@@ -654,22 +701,44 @@ mod tests {
         std::fs::write(&mic_enc, b"ENC-MIC").unwrap();
         // Crash shape B (sys): plaintext ALREADY GONE, only the .enc survives, column still dangles.
         std::fs::write(&sys_enc, b"ENC-SYS").unwrap();
-        assert!(!std::path::Path::new(&sys_plain).exists(), "sys plaintext is gone (crash shape B)");
+        assert!(
+            !std::path::Path::new(&sys_plain).exists(),
+            "sys plaintext is gone (crash shape B)"
+        );
 
-        db.set_meeting_mic_master_path("m1", Some(&mic_plain)).unwrap();
-        db.set_meeting_sys_master_path("m1", Some(&sys_plain)).unwrap();
+        db.set_meeting_mic_master_path("m1", Some(&mic_plain))
+            .unwrap();
+        db.set_meeting_sys_master_path("m1", Some(&sys_plain))
+            .unwrap();
 
         // RECONCILE — the production startup pass.
         reconcile_locked_at_rest(&db);
 
         // mic: stray plaintext dropped; sys: dangling column re-pointed. Both columns now at the .enc.
-        assert!(!std::path::Path::new(&mic_plain).exists(), "stray plaintext mic master removed");
+        assert!(
+            !std::path::Path::new(&mic_plain).exists(),
+            "stray plaintext mic master removed"
+        );
         let (mic_after, sys_after) = db.get_meeting_master_paths("m1").unwrap();
-        assert_eq!(mic_after.as_deref(), Some(mic_enc.as_str()), "mic master re-pointed at .enc");
-        assert_eq!(sys_after.as_deref(), Some(sys_enc.as_str()), "sys master dangling column re-pointed at .enc");
+        assert_eq!(
+            mic_after.as_deref(),
+            Some(mic_enc.as_str()),
+            "mic master re-pointed at .enc"
+        );
+        assert_eq!(
+            sys_after.as_deref(),
+            Some(sys_enc.as_str()),
+            "sys master dangling column re-pointed at .enc"
+        );
         // The encrypted masters (the durable copies) are never touched.
-        assert!(std::path::Path::new(&mic_enc).exists(), "encrypted mic master preserved");
-        assert!(std::path::Path::new(&sys_enc).exists(), "encrypted sys master preserved");
+        assert!(
+            std::path::Path::new(&mic_enc).exists(),
+            "encrypted mic master preserved"
+        );
+        assert!(
+            std::path::Path::new(&sys_enc).exists(),
+            "encrypted sys master preserved"
+        );
 
         let _ = std::fs::remove_file(&mic_enc);
         let _ = std::fs::remove_file(&sys_enc);
@@ -719,13 +788,21 @@ mod tests {
         let base = p.to_string_lossy().to_string();
         let mic_enc = format!("{base}.m1.mic.wav.enc");
         std::fs::write(&mic_enc, b"ENC-MIC").unwrap();
-        db.set_meeting_mic_master_path("m1", Some(&mic_enc)).unwrap();
+        db.set_meeting_mic_master_path("m1", Some(&mic_enc))
+            .unwrap();
 
         reconcile_locked_at_rest(&db);
 
         let (mic_after, _sys_after) = db.get_meeting_master_paths("m1").unwrap();
-        assert_eq!(mic_after.as_deref(), Some(mic_enc.as_str()), "already-sealed master left as-is");
-        assert!(!std::path::Path::new(&format!("{base}.m1.mic.wav")).exists(), "no plaintext fabricated");
+        assert_eq!(
+            mic_after.as_deref(),
+            Some(mic_enc.as_str()),
+            "already-sealed master left as-is"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{base}.m1.mic.wav")).exists(),
+            "no plaintext fabricated"
+        );
 
         let _ = std::fs::remove_file(&mic_enc);
         let _ = std::fs::remove_file(&p);

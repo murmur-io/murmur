@@ -78,9 +78,14 @@ pub fn resample_to_16k(samples: &[f32], src_rate: u32) -> Result<Vec<f32>> {
     // FftFixedIn consumes a fixed number of input frames per chunk and emits the
     // corresponding output frames. We process in CHUNK-sized blocks and zero-pad the
     // final partial block so no tail samples are dropped.
-    let mut resampler =
-        FftFixedIn::<f32>::new(src_rate as usize, TARGET_RATE_HZ as usize, RESAMPLE_CHUNK, 1, 1)
-            .map_err(|e| AppError::Audio(format!("failed to build resampler: {e}")))?;
+    let mut resampler = FftFixedIn::<f32>::new(
+        src_rate as usize,
+        TARGET_RATE_HZ as usize,
+        RESAMPLE_CHUNK,
+        1,
+        1,
+    )
+    .map_err(|e| AppError::Audio(format!("failed to build resampler: {e}")))?;
 
     // Pre-size output using the exact ratio (a small over-estimate is fine).
     let est = (samples.len() as f64 * TARGET_RATE_HZ as f64 / src_rate as f64).ceil() as usize;
@@ -206,7 +211,10 @@ mod tests {
         assert_eq!(rate, 48_000);
         assert_eq!(back.len(), samples.len());
         for (a, b) in samples.iter().zip(back.iter()) {
-            assert!((a - b).abs() < 1e-6, "master float WAV not faithful: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "master float WAV not faithful: {a} vs {b}"
+            );
         }
     }
 

@@ -399,10 +399,7 @@ mod tests {
     /// Build (label_ids, offsets, special) for a sequence of (token_text, label_id) over a source
     /// string, prepending a CLS and appending a SEP special token (offsets (0,0), special=1) like a
     /// real DeBERTa encoding. Token offsets are located by scanning the source left-to-right.
-    fn fixture(
-        src: &str,
-        toks: &[(&str, u32)],
-    ) -> (Vec<u32>, Vec<(usize, usize)>, Vec<u32>) {
+    fn fixture(src: &str, toks: &[(&str, u32)]) -> (Vec<u32>, Vec<(usize, usize)>, Vec<u32>) {
         let mut labels = vec![0u32]; // CLS
         let mut offsets = vec![(0usize, 0usize)];
         let mut special = vec![1u32];
@@ -476,8 +473,7 @@ mod tests {
     fn non_person_entities_are_not_masked() {
         let src = "Acme shipped Atlas";
         // Both ORG/O — NO person → text unchanged, empty pairs (leaks nothing extra, masks nothing).
-        let (labels, offsets, special) =
-            fixture(src, &[("Acme", 3), ("shipped", 0), ("Atlas", 4)]);
+        let (labels, offsets, special) = fixture(src, &[("Acme", 3), ("shipped", 0), ("Atlas", 4)]);
         let spans = decode_person_spans(&labels, &offsets, &special, &id2label());
         assert!(spans.is_empty());
         let (out, pairs) = apply_person_spans(src, &spans);

@@ -171,7 +171,10 @@ fn compile_single(src: &Path, out_bin: &Path, deploy_target: &str, frameworks: &
     };
     match Command::new("swiftc")
         .arg("-O")
-        .args(["-target", &format!("{host_arch}-apple-macos{deploy_target}")])
+        .args([
+            "-target",
+            &format!("{host_arch}-apple-macos{deploy_target}"),
+        ])
         .arg("-o")
         .arg(out_bin)
         .arg(src)

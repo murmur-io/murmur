@@ -64,18 +64,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 /// only the *first* gate — we additionally require a sharing-indicator title (see
 /// `APP_SHARING_INDICATORS`) so that merely running the app does not trip a relock. HEURISTIC.
 const CONFERENCING_OWNERS: &[&str] = &[
-    "zoom.us",       // Zoom
-    "zoom",          // Zoom (older / localized helper process names)
+    "zoom.us",         // Zoom
+    "zoom",            // Zoom (older / localized helper process names)
     "microsoft teams", // Teams classic + "Microsoft Teams (work or school)"
-    "google chrome", // Meet / generic WebRTC share runs inside Chrome
+    "google chrome",   // Meet / generic WebRTC share runs inside Chrome
     "chromium",
     "google chrome canary",
-    "safari",        // Meet / WebRTC share inside Safari
+    "safari", // Meet / WebRTC share inside Safari
     "microsoft edge",
     "firefox",
-    "webex",         // Cisco Webex Meetings ("Webex", "Meeting Center")
+    "webex", // Cisco Webex Meetings ("Webex", "Meeting Center")
     "cisco webex",
-    "slack",         // Slack huddles
+    "slack", // Slack huddles
     "discord",
     "whereby",
     "around",
@@ -98,8 +98,8 @@ const APP_SHARING_INDICATORS: &[&str] = &[
     "you're sharing",
     "screen sharing",
     "screen share",
-    "share toolbar",  // Zoom share/annotation toolbar
-    "as_toolbar",     // Zoom internal share/annotation toolbar window name
+    "share toolbar", // Zoom share/annotation toolbar
+    "as_toolbar",    // Zoom internal share/annotation toolbar window name
     "sharing indicator",
 ];
 
@@ -343,7 +343,10 @@ mod tests {
             Some("Zoom - screen sharing")
         ));
         // In a Zoom meeting but NOT sharing → must not fire.
-        assert!(!is_active_share_window(Some("zoom.us"), Some("Zoom Meeting")));
+        assert!(!is_active_share_window(
+            Some("zoom.us"),
+            Some("Zoom Meeting")
+        ));
         // Zoom merely running with its main window → must not fire.
         assert!(!is_active_share_window(Some("zoom.us"), Some("Zoom")));
     }

@@ -211,6 +211,19 @@ export interface AppConfigDto {
    */
   gatewayModel: string;
   /**
+   * M3-CLIENT — base URL of the Murmur sharing server (self-host or hosted).
+   * Default `""` (unset ⇒ account/share commands fail closed). Mirrors Rust
+   * `AppConfigDto.share_base_url`. Validated like `gatewayBaseUrl`.
+   */
+  shareBaseUrl: string;
+  /**
+   * M3-CLIENT — one-time SHARE-egress consent. DISPLAY-ONLY on this DTO (like
+   * `cloudEgressConsented`): carried OUT so the FE can show consent status, but
+   * PRESERVE-ONLY on `saveConfig` — mutated only by `consentToShareEgress` /
+   * `revokeShareEgress`. Mirrors Rust `AppConfigDto.share_egress_consented`.
+   */
+  shareEgressConsented: boolean;
+  /**
    * Proactive brain (P2) — the GLOBAL MUTE for in-meeting recall hints
    * (`EVENT_PROACTIVE_HINT` cards). Off silences the event source in the
    * BACKEND (the live-loop matcher never runs), and the FE additionally never
@@ -1233,6 +1246,76 @@ export interface EgressLedger {
   totalRedactions: RedactionCounts;
   /** Most-recent calls (newest first, capped server-side). */
   recent: EgressRow[];
+}
+
+// ── M3-CLIENT: sharing account + zero-knowledge link shares (mode A) ──
+
+/** Mirrors Rust `commands::AccountStatus` — the sharing-account session state. */
+export interface AccountStatus {
+  /** A session is present (logged in this session, or restorable from the Keychain). */
+  loggedIn: boolean;
+  /** The account email, when logged in. */
+  email: string | null;
+  /** MK is in the session so a share can actually be sealed without re-auth. */
+  unlockedForSharing: boolean;
+  /** The one-time share-egress consent has been granted. */
+  shareConsented: boolean;
+  /** A sharing server base URL is configured (sharing is impossible without one). */
+  serverConfigured: boolean;
+}
+
+/** Mirrors Rust `commands::MyShareEntry` — one row of the user's shares. Content-free: `title` is
+ * present ONLY when the local meeting is unlocked (a sealed meeting is masked `locked:true`). */
+export interface MyShareEntry {
+  shareId: string;
+  /** The local meeting title, or `null` when the meeting is sealed/unknown (then `locked:true`). */
+  title: string | null;
+  locked: boolean;
+  rev: number;
+  createdAt: string;
+  expiresAt: string | null;
+  revoked: boolean;
+  downloadCount: number;
+}
+
+// ── M5-CLIENT: Murmur↔Murmur (mode B) ──
+
+/** Mirrors Rust `commands::RecipientPreview` — a read-only lookup of a recipient email. */
+export interface RecipientPreview {
+  /** The address is a registered Murmur account (else: suggest a protected link instead). */
+  registered: boolean;
+  /** The safety-word fingerprint of their current key (present iff registered). */
+  fingerprint: string | null;
+  /** First contact — show the fingerprint for out-of-band verification, then confirm to share. */
+  firstContact: boolean;
+  /** Their key CHANGED since you last shared — BLOCK + re-verify out of band (never click-through). */
+  keyChanged: boolean;
+}
+
+/** Mirrors Rust `commands::ShareToUserResult`. */
+export interface ShareToUserResult {
+  /** `"sent"` (registered → wrapped now) or `"invited"` (unregistered → pending invite). */
+  status: string;
+  /** The recipient's safety-word fingerprint (present for a registered recipient). */
+  fingerprint: string | null;
+}
+
+/** Mirrors Rust `commands::ShareInboxItem` — one incoming pending-accept share (content-free). */
+export interface ShareInboxItem {
+  shareId: string;
+  /** The sender's safety-word fingerprint (show for out-of-band verification on accept). */
+  senderFingerprint: string;
+  rev: number;
+  size: number;
+  createdAt: string;
+  /** Already accepted locally (idempotency) — render as done. */
+  alreadyAccepted: boolean;
+}
+
+/** Mirrors Rust `commands::AcceptedShare` — the new local meeting a share was accepted into. */
+export interface AcceptedShare {
+  meetingId: string;
+  title: string;
 }
 
 /** Recording-storage usage report (mirrors Rust `StorageReportDto`). Bytes + counts only. */

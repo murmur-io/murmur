@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod commands;
 pub mod connectors;
 pub mod crypto;
+pub mod e2ee;
 pub mod embed;
 pub mod error;
 pub mod eval;
@@ -19,6 +20,7 @@ pub mod reason;
 pub mod screenshare;
 pub mod secrets;
 pub mod settings;
+pub mod share;
 pub mod state;
 pub mod storage;
 pub mod summarize;
@@ -109,6 +111,23 @@ pub fn run() {
             commands::consent_to_cloud_egress,
             commands::revoke_cloud_egress,
             commands::consent_to_web_search,
+            // M3-CLIENT — sharing account + zero-knowledge link shares (mode A).
+            commands::account_status,
+            commands::account_signup,
+            commands::account_login,
+            commands::account_logout,
+            commands::consent_to_share_egress,
+            commands::revoke_share_egress,
+            commands::share_note_to_link,
+            commands::list_my_shares,
+            commands::revoke_share,
+            // M5-CLIENT — Murmur↔Murmur (mode B): invite by email + accept into the vault.
+            commands::preview_share_recipient,
+            commands::share_note_to_user,
+            commands::share_rewrap_pending,
+            commands::list_share_inbox,
+            commands::accept_share,
+            commands::decline_share,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::set_gateway_key,
@@ -451,8 +470,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     let open = MenuItem::with_id(app, "open", "Open Murmur", true, None::<&str>)?;
-    let record =
-        MenuItem::with_id(app, "record", "Start / Stop recording", true, None::<&str>)?;
+    let record = MenuItem::with_id(app, "record", "Start / Stop recording", true, None::<&str>)?;
     let bar = MenuItem::with_id(app, "bar", "Recorder bar  (⌘⇧R)", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Murmur", true, None::<&str>)?;
     let menu = Menu::with_items(

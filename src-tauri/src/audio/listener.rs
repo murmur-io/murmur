@@ -102,7 +102,10 @@ impl VoiceListener {
             tracing::info!(target: "voice", "voice listener stopped");
         });
 
-        Self { stop, handle: Some(handle) }
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// Signal the loop to stop and join the thread (releases the mic). Blocks up to one

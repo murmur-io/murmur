@@ -275,7 +275,9 @@ mod tests {
         // No `web` key → empty (clean "no results"), never an error.
         assert!(BraveSearch::parse_results(r#"{}"#).unwrap().is_empty());
         // `web.results` empty → empty.
-        assert!(BraveSearch::parse_results(r#"{"web":{"results":[]}}"#).unwrap().is_empty());
+        assert!(BraveSearch::parse_results(r#"{"web":{"results":[]}}"#)
+            .unwrap()
+            .is_empty());
         // A result missing description/url still maps (snippet/url default to empty); a result with
         // an empty title is skipped.
         let body = r#"{"web":{"results":[{"title":"Only Title"},{"title":""}]}}"#;
@@ -330,8 +332,14 @@ mod tests {
         };
         let _ = block_on(connector.search(&redacted));
         let seen = captured.last_query.lock().unwrap().clone().unwrap();
-        assert!(!seen.contains("bob@acme.com"), "raw email must not reach the provider: {seen}");
-        assert!(seen.contains("\u{27ea}EMAIL_"), "redaction token must reach the provider: {seen}");
+        assert!(
+            !seen.contains("bob@acme.com"),
+            "raw email must not reach the provider: {seen}"
+        );
+        assert!(
+            seen.contains("\u{27ea}EMAIL_"),
+            "redaction token must reach the provider: {seen}"
+        );
         assert!(seen.contains("weather"), "non-PII terms survive: {seen}");
         // The BYO key is forwarded to the provider (never logged / FE-exposed).
         assert_eq!(captured.last_key.lock().unwrap().as_deref(), Some("key"));

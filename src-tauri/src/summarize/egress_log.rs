@@ -11,8 +11,8 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::summarize::meta::{CallMeta, RedactionCounts};
 use crate::storage::Db;
+use crate::summarize::meta::{CallMeta, RedactionCounts};
 
 /// One content-free audit row per cloud provider call.
 ///
@@ -166,10 +166,19 @@ mod tests {
         // - API keys
         // It should only contain counts, labels, ids, byte sizes, and the CallMeta token counts.
         let debug_str = format!("{:?}", entry);
-        assert!(!debug_str.contains("@acme.com"), "email must not appear in entry debug");
-        assert!(!debug_str.contains("transcript text"), "transcript must not appear in entry debug");
+        assert!(
+            !debug_str.contains("@acme.com"),
+            "email must not appear in entry debug"
+        );
+        assert!(
+            !debug_str.contains("transcript text"),
+            "transcript must not appear in entry debug"
+        );
         // Only counts, labels, and byte sizes are present.
-        assert!(debug_str.contains("api.anthropic.com"), "destination label is non-PII");
+        assert!(
+            debug_str.contains("api.anthropic.com"),
+            "destination label is non-PII"
+        );
         assert!(debug_str.contains("512"), "system_bytes size is non-PII");
     }
 }

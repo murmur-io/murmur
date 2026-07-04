@@ -80,7 +80,10 @@ mod tests {
 
     #[test]
     fn renders_prior_history() {
-        let history = [turn("user", "What was decided?"), turn("assistant", "To ship Friday.")];
+        let history = [
+            turn("user", "What was decided?"),
+            turn("assistant", "To ship Friday."),
+        ];
         let (_s, user) = build("t", &history, "By whom?", "");
         assert!(user.contains("User: What was decided?"));
         assert!(user.contains("Assistant: To ship Friday."));
