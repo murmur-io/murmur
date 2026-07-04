@@ -574,6 +574,38 @@ impl Db {
             )
             .map_err(map_err)?;
         }
+
+        // WS8 / capture-default: one-time flip of the SYSTEM-AUDIO-CAPTURE default to ON for the
+        // INSTALLED base (fresh installs already default ON via `AppConfig::default().capture_system_audio`
+        // — the default flipped OFF→ON in #167). This reaches DBs that persisted the historical 'false'.
+        // RATIONALE: that stored 'false' comes from onboarding round-tripping the OLD (pre-#167) default,
+        // NOT a deliberate opt-out — so, exactly as the `semantic_default_v1` precedent did for a
+        // historical default, we flip it ON once. Sentinel-guarded (`capture_default_v1`) so it runs
+        // EXACTLY once and never re-fires: a user who turns capture OFF *after* this migration stays off.
+        // Uses the HELD `conn` directly (self.get_setting/set_setting would re-lock `self.lock()` and
+        // DEADLOCK). Config-only settings key, additive, idempotent, and reversible via Settings → Audio
+        // — it touches NO meeting content, crypto, or seal state.
+        let capture_default_applied: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'capture_default_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if capture_default_applied.is_none() {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('capture_system_audio', 'true')
+                 ON CONFLICT(key) DO UPDATE SET value = 'true'",
+                [],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('capture_default_v1', '1')",
+                [],
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -5571,6 +5603,35 @@ mod tests {
         db.migrate().unwrap();
         assert_eq!(
             db.get_setting("semantic_search_enabled").unwrap().as_deref(),
+            Some("false"),
+            "sentinel-guarded: a post-migration opt-out persists across re-migrate"
+        );
+    }
+
+    /// WS8 installed-base flip (mirrors the `semantic_default_v1` precedent): `migrate()` sets
+    /// `capture_system_audio='true'` + the `capture_default_v1` sentinel exactly ONCE; a later opt-out
+    /// (`false`) survives a re-migrate (the sentinel guards the block so it never re-fires). Config-only,
+    /// idempotent, reversible.
+    #[test]
+    fn capture_default_migration_runs_once_and_opt_out_persists() {
+        let db = mem_db();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_setting("capture_default_v1").unwrap().as_deref(),
+            Some("1"),
+            "sentinel is set after the migration"
+        );
+        assert_eq!(
+            db.get_setting("capture_system_audio").unwrap().as_deref(),
+            Some("true"),
+            "installed base is flipped ON once"
+        );
+        // A user turns system-audio capture OFF after the migration; re-running migrate() must NOT
+        // flip it back.
+        db.set_setting("capture_system_audio", "false").unwrap();
+        db.migrate().unwrap();
+        assert_eq!(
+            db.get_setting("capture_system_audio").unwrap().as_deref(),
             Some("false"),
             "sentinel-guarded: a post-migration opt-out persists across re-migrate"
         );

@@ -414,7 +414,8 @@ pub async fn start_recording(
     }
 
     // NOTE: the live VPIO echo-cancel helper (aeccap) is intentionally NEVER spawned anymore.
-    // It is superseded by the OFFLINE AEC pass (`post_aec_enabled`, default on) which cancels
+    // It is superseded by the OFFLINE AEC pass (`post_aec_enabled`, default OFF — opt-in in
+    // Settings → Audio) which cancels
     // echo after Stop using the captured system track as a perfect far-end reference — with zero
     // effect on the live call. On a real Mac VPIO (a) cancelled ~nothing (macOS gives an input-
     // only voice-processing unit no downlink reference) and (b) DUCKED all other apps' audio

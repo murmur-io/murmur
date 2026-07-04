@@ -920,17 +920,20 @@ export class SettingsStore {
         claudeBinary: cfg.claudeBinary,
         claudeCodeInheritEnv: cfg.claudeCodeInheritEnv ?? false,
         inputDevice: cfg.inputDevice ?? "",
-        captureSystemAudio: cfg.captureSystemAudio ?? false,
+        // Mirrors backend default capture_system_audio = true (settings/config.rs, AppConfig::default; #167).
+        captureSystemAudio: cfg.captureSystemAudio ?? true,
         vadEnabled: cfg.vadEnabled ?? true,
         keepHiresMasters: cfg.keepHiresMasters ?? false,
         diarizeOthers: cfg.diarizeOthers ?? false,
         voiceprintEnabled: cfg.voiceprintEnabled ?? false,
         aecEnabled: cfg.aecEnabled ?? false,
-        postAecEnabled: cfg.postAecEnabled ?? true,
+        // Mirrors backend default post_aec_enabled = false (settings/config.rs, AppConfig::default).
+        postAecEnabled: cfg.postAecEnabled ?? false,
         audioStorageLimitGb:
           cfg.audioStorageLimitGb != null ? String(cfg.audioStorageLimitGb) : "",
         audioAutoPrune: cfg.audioAutoPrune ?? false,
-        modelSize: cfg.modelSize ?? "large-v3",
+        // Mirrors backend default model_size = "small" (settings/config.rs, AppConfig::default).
+        modelSize: cfg.modelSize ?? "small",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
         notesMode: cfg.notesMode ?? "enhance",
@@ -942,7 +945,8 @@ export class SettingsStore {
         userMemoryEnabled: cfg.userMemoryEnabled ?? true,
         brainModelId: cfg.brainModelId ?? "",
         brainModelPath: cfg.brainModelPath ?? "",
-        semanticSearchEnabled: cfg.semanticSearchEnabled ?? false,
+        // Mirrors backend default semantic_search_enabled = true (settings/config.rs; #159/#160).
+        semanticSearchEnabled: cfg.semanticSearchEnabled ?? true,
         webSearchEnabled: cfg.webSearchEnabled ?? false,
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
         gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
