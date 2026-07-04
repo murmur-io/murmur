@@ -278,6 +278,19 @@ export class IpcService {
     return invoke<AccountStatus>("account_login", { email, password });
   }
 
+  /**
+   * Re-unlock the session for sharing with a SINGLE Touch ID sheet — no password.
+   * Requires being logged in with a cached account key on this device (mirror of
+   * {@link AccountStatus.biometricUnlockAvailable}); presents one biometric prompt,
+   * restores the session MK, and returns the fresh {@link AccountStatus} (now
+   * `unlockedForSharing: true`). Fails closed with an `AppError`: `Unavailable`
+   * ("not signed in" / "no cached account key") or `BiometricFailed` on
+   * cancel/failure — callers fall back to the password sign-in flow.
+   */
+  unlockSharingWithBiometric(): Promise<AccountStatus> {
+    return invoke<AccountStatus>("unlock_sharing_with_biometric");
+  }
+
   /** Log out: server family-revoke (best-effort) + clear Keychain tokens + drop the session MK. */
   accountLogout(): Promise<void> {
     return invoke<void>("account_logout");
