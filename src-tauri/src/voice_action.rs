@@ -178,12 +178,26 @@ pub fn handle_voice_action(
     app: Option<&tauri::AppHandle>,
 ) -> VoiceActionResult {
     match intent {
-        VoiceIntent::Research { topic } => {
-            rag_answer("research", topic, literal_command, reasoner, db, unlocked, config, app)
-        }
-        VoiceIntent::Recall { entity } => {
-            rag_answer("recall", entity, literal_command, reasoner, db, unlocked, config, app)
-        }
+        VoiceIntent::Research { topic } => rag_answer(
+            "research",
+            topic,
+            literal_command,
+            reasoner,
+            db,
+            unlocked,
+            config,
+            app,
+        ),
+        VoiceIntent::Recall { entity } => rag_answer(
+            "recall",
+            entity,
+            literal_command,
+            reasoner,
+            db,
+            unlocked,
+            config,
+            app,
+        ),
         VoiceIntent::CreateReminder { text, due } => {
             let text = text.trim();
             if text.is_empty() {
@@ -194,11 +208,7 @@ pub fn handle_voice_action(
                 );
             }
             match crate::commands::add_reminder_blocking(text, due.as_deref()) {
-                Ok(()) => VoiceActionResult::new(
-                    "create_reminder",
-                    "ok",
-                    "Added a reminder.",
-                ),
+                Ok(()) => VoiceActionResult::new("create_reminder", "ok", "Added a reminder."),
                 Err(e) => VoiceActionResult::new("create_reminder", "error", non_pii_error(&e)),
             }
         }
@@ -263,7 +273,11 @@ pub fn interpret_with_brain(reasoner: &dyn LocalReasoner, command: &str) -> Opti
             return None;
         }
     };
-    let action = value.get("action").and_then(|a| a.as_str())?.trim().to_lowercase();
+    let action = value
+        .get("action")
+        .and_then(|a| a.as_str())?
+        .trim()
+        .to_lowercase();
     // The argument the brain extracted; fall back to the whole command when it omits/empties it.
     let argument = value
         .get("argument")
@@ -275,7 +289,10 @@ pub fn interpret_with_brain(reasoner: &dyn LocalReasoner, command: &str) -> Opti
     match action.as_str() {
         "research" => Some(VoiceIntent::Research { topic: argument }),
         "recall" => Some(VoiceIntent::Recall { entity: argument }),
-        "reminder" => Some(VoiceIntent::CreateReminder { text: argument, due: None }),
+        "reminder" => Some(VoiceIntent::CreateReminder {
+            text: argument,
+            due: None,
+        }),
         "note" => Some(VoiceIntent::NoteAside { text: argument }),
         // "unknown" or any unexpected label ⇒ no mapping; caller uses the keyword fallback.
         _ => None,
@@ -302,10 +319,15 @@ fn retrieval_queries(topic: &str, literal_command: &str) -> Vec<String> {
         }
     };
     // MUST-HAVE: the user's literal salient terms (their own language/words).
-    push(crate::summarize::related_context::salient_query(None, literal_command));
+    push(crate::summarize::related_context::salient_query(
+        None,
+        literal_command,
+    ));
     // ADDITIONAL: the brain/parser topic verbatim, and its salient terms.
     push(topic.to_string());
-    push(crate::summarize::related_context::salient_query(None, topic));
+    push(crate::summarize::related_context::salient_query(
+        None, topic,
+    ));
     queries
 }
 
@@ -481,8 +503,12 @@ fn rag_answer(
         match db.search_visible(q, 8, unlocked) {
             Ok(hits) => {
                 for h in &hits {
-                    if let Some(t) =
-                        h.meeting.title.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                    if let Some(t) = h
+                        .meeting
+                        .title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
                     {
                         push_cite(format!("[[{t}]]"));
                     }
@@ -652,13 +678,36 @@ fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<
 fn wants_calendar(topic: &str, literal_command: &str) -> bool {
     const KEYWORDS: &[&str] = &[
         // English
-        "calendar", "meeting", "meetings", "agenda", "next meeting", "who's in", "who is in",
-        "attendee", "attendees", "schedule", "scheduled", "appointment", "invite",
+        "calendar",
+        "meeting",
+        "meetings",
+        "agenda",
+        "next meeting",
+        "who's in",
+        "who is in",
+        "attendee",
+        "attendees",
+        "schedule",
+        "scheduled",
+        "appointment",
+        "invite",
         // Polish
-        "kalendarz", "spotkanie", "spotkania", "spotkaniu", "agenda", "kto jest", "uczestnik",
-        "uczestnicy", "harmonogram", "termin",
+        "kalendarz",
+        "spotkanie",
+        "spotkania",
+        "spotkaniu",
+        "agenda",
+        "kto jest",
+        "uczestnik",
+        "uczestnicy",
+        "harmonogram",
+        "termin",
     ];
-    let hay = format!("{} {}", topic.to_lowercase(), literal_command.to_lowercase());
+    let hay = format!(
+        "{} {}",
+        topic.to_lowercase(),
+        literal_command.to_lowercase()
+    );
     KEYWORDS.iter().any(|k| hay.contains(k))
 }
 
@@ -668,10 +717,7 @@ fn wants_calendar(topic: &str, literal_command: &str) -> bool {
 /// future never crosses a thread boundary (only the `Result<String>` does). NO egress — the calendar
 /// read is on-device — and `fetch_events` degrades to empty on every failure inside
 /// `execute_calendar_search`.
-fn calendar_search_blocking(
-    query: &str,
-    app: &tauri::AppHandle,
-) -> crate::error::Result<String> {
+fn calendar_search_blocking(query: &str, app: &tauri::AppHandle) -> crate::error::Result<String> {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -978,14 +1024,26 @@ mod tests {
 
         // (1) Direct gate proof on the executor (RED-able).
         let got = exec
-            .run("get_meeting", &serde_json::json!({ "meetingId": "sealed1" }))
+            .run(
+                "get_meeting",
+                &serde_json::json!({ "meetingId": "sealed1" }),
+            )
             .unwrap();
-        assert!(got.starts_with("No data"), "sealed meeting fetch must be gated: {got}");
+        assert!(
+            got.starts_with("No data"),
+            "sealed meeting fetch must be gated: {got}"
+        );
         let searched = exec
             .run("search_meetings", &serde_json::json!({ "query": "Atlas" }))
             .unwrap();
-        assert!(!searched.contains("sealed1"), "sealed meeting must NOT appear in gated search: {searched}");
-        assert!(searched.contains("open1"), "the VISIBLE meeting is still found");
+        assert!(
+            !searched.contains("sealed1"),
+            "sealed meeting must NOT appear in gated search: {searched}"
+        );
+        assert!(
+            searched.contains("open1"),
+            "the VISIBLE meeting is still found"
+        );
 
         // (2) The full loop routes every read through that gate.
         struct Exfil {
@@ -998,7 +1056,12 @@ mod tests {
             fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
                 Ok("floored".into())
             }
-            fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> crate::error::Result<Value> {
+            fn structured(
+                &self,
+                _s: &str,
+                _u: &str,
+                _schema: &Value,
+            ) -> crate::error::Result<Value> {
                 Ok(self
                     .steps
                     .lock()
@@ -1021,11 +1084,17 @@ mod tests {
             .unwrap()
             .expect("the brain answered");
         assert!(
-            !outcome.citations.iter().any(|c| c.contains("Atlas Secret Terms")),
+            !outcome
+                .citations
+                .iter()
+                .any(|c| c.contains("Atlas Secret Terms")),
             "the loop must never cite the sealed meeting: {:?}",
             outcome.citations
         );
-        assert!(outcome.steps.iter().all(|s| s.ok), "gated tool calls ran without panic");
+        assert!(
+            outcome.steps.iter().all(|s| s.ok),
+            "gated tool calls ran without panic"
+        );
     }
 
     #[test]
@@ -1036,7 +1105,9 @@ mod tests {
         let cfg = AppConfig::default();
 
         let res = handle_voice_action(
-            &VoiceIntent::Research { topic: "Atlas".into() },
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1082,7 +1153,9 @@ mod tests {
         seed_visible_and_sealed(&db); // gives a VISIBLE "Atlas Kickoff" note ⇒ non-empty grounding.
         let stub = crate::reason::StubReasoner;
         let res = handle_voice_action(
-            &VoiceIntent::Research { topic: "Atlas".into() },
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
             &stub,
             &db,
             &empty_unlocked(),
@@ -1105,7 +1178,10 @@ mod tests {
         );
         // Honest, non-"ok" status the FE renders as a non-answer notice (reused: the SlackSearch arm's
         // "unavailable" — an existing VoiceActionStatus already rendered on the FE).
-        assert_eq!(res.status, "unavailable", "stub floor must be a non-'ok' notice, not an answer");
+        assert_eq!(
+            res.status, "unavailable",
+            "stub floor must be a non-'ok' notice, not an answer"
+        );
         assert!(
             res.summary.contains("No AI model is available"),
             "the honest notice must be surfaced: {}",
@@ -1131,7 +1207,9 @@ mod tests {
         seed_visible_and_sealed(&db);
         let reasoner = MockReasoner::new("Recall: [[Atlas Kickoff]] covered the plan.");
         let res = handle_voice_action(
-            &VoiceIntent::Recall { entity: "Atlas".into() },
+            &VoiceIntent::Recall {
+                entity: "Atlas".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1143,7 +1221,10 @@ mod tests {
         assert_eq!(res.intent_kind, "recall");
         assert_eq!(res.status, "ok");
         let grounding = reasoner.last_user.lock().unwrap().clone().unwrap();
-        assert!(!grounding.contains("Atlas Secret Terms"), "sealed excluded from recall too");
+        assert!(
+            !grounding.contains("Atlas Secret Terms"),
+            "sealed excluded from recall too"
+        );
     }
 
     #[test]
@@ -1152,7 +1233,9 @@ mod tests {
         seed_visible_and_sealed(&db);
         let reasoner = MockReasoner::new("SHOULD-NOT-BE-CALLED");
         let res = handle_voice_action(
-            &VoiceIntent::Research { topic: "nonexistent-topic-zzz".into() },
+            &VoiceIntent::Research {
+                topic: "nonexistent-topic-zzz".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1164,7 +1247,10 @@ mod tests {
         assert_eq!(res.status, "ok");
         assert!(res.summary.contains("couldn't find"));
         // No grounding ⇒ no brain call (so the mock never recorded a user prompt).
-        assert!(reasoner.last_user.lock().unwrap().is_none(), "brain must not be called with empty grounding");
+        assert!(
+            reasoner.last_user.lock().unwrap().is_none(),
+            "brain must not be called with empty grounding"
+        );
     }
 
     #[test]
@@ -1184,7 +1270,9 @@ mod tests {
         .unwrap();
         let reasoner = MockReasoner::new("");
         let res = handle_voice_action(
-            &VoiceIntent::NoteAside { text: "deadline is friday".into() },
+            &VoiceIntent::NoteAside {
+                text: "deadline is friday".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1207,7 +1295,9 @@ mod tests {
         let reasoner = MockReasoner::new("");
         // sealed1 is in a locked folder, not in the unlocked set ⇒ not visible ⇒ refuse the write.
         let res = handle_voice_action(
-            &VoiceIntent::NoteAside { text: "secret aside".into() },
+            &VoiceIntent::NoteAside {
+                text: "secret aside".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1217,7 +1307,10 @@ mod tests {
             None,
         );
         assert_eq!(res.status, "error");
-        assert!(db.list_note_asides("sealed1").unwrap().is_empty(), "no aside written to a sealed meeting");
+        assert!(
+            db.list_note_asides("sealed1").unwrap().is_empty(),
+            "no aside written to a sealed meeting"
+        );
     }
 
     #[test]
@@ -1225,7 +1318,9 @@ mod tests {
         let db = tmp_db();
         let reasoner = MockReasoner::new("");
         let res = handle_voice_action(
-            &VoiceIntent::SlackSearch { query: "raport".into() },
+            &VoiceIntent::SlackSearch {
+                query: "raport".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1243,7 +1338,9 @@ mod tests {
         let db = tmp_db();
         let reasoner = MockReasoner::new("");
         let res = handle_voice_action(
-            &VoiceIntent::Unknown { raw: "qwer asdf secret-thing".into() },
+            &VoiceIntent::Unknown {
+                raw: "qwer asdf secret-thing".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1253,7 +1350,10 @@ mod tests {
             None,
         );
         assert_eq!(res.status, "unrecognized");
-        assert!(!res.summary.contains("secret-thing"), "raw command must not be echoed back");
+        assert!(
+            !res.summary.contains("secret-thing"),
+            "raw command must not be echoed back"
+        );
     }
 
     #[test]
@@ -1263,7 +1363,9 @@ mod tests {
         // A generic Summarize error → status "error", non-PII message, citations still surfaced.
         let reasoner = ErrReasoner(AppError::Summarize("boom internal detail".into()));
         let res = handle_voice_action(
-            &VoiceIntent::Research { topic: "Atlas".into() },
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1273,7 +1375,10 @@ mod tests {
             None,
         );
         assert_eq!(res.status, "error");
-        assert!(!res.summary.contains("boom internal detail"), "internal error detail must not leak");
+        assert!(
+            !res.summary.contains("boom internal detail"),
+            "internal error detail must not leak"
+        );
         assert!(res.citations.contains(&"[[Atlas Kickoff]]".to_string()));
     }
 
@@ -1284,7 +1389,9 @@ mod tests {
         // The make_provider consent gate returns AppError::Unavailable when consent is OFF.
         let reasoner = ErrReasoner(AppError::Unavailable("cloud egress not consented".into()));
         let res = handle_voice_action(
-            &VoiceIntent::Research { topic: "Atlas".into() },
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1316,14 +1423,31 @@ mod tests {
     #[test]
     fn interpret_with_brain_maps_each_action() {
         let cases = [
-            (serde_json::json!({"action":"research","argument":"wakacjach"}),
-             VoiceIntent::Research { topic: "wakacjach".into() }),
-            (serde_json::json!({"action":"recall","argument":"atlas"}),
-             VoiceIntent::Recall { entity: "atlas".into() }),
-            (serde_json::json!({"action":"reminder","argument":"call bob"}),
-             VoiceIntent::CreateReminder { text: "call bob".into(), due: None }),
-            (serde_json::json!({"action":"note","argument":"deadline friday"}),
-             VoiceIntent::NoteAside { text: "deadline friday".into() }),
+            (
+                serde_json::json!({"action":"research","argument":"wakacjach"}),
+                VoiceIntent::Research {
+                    topic: "wakacjach".into(),
+                },
+            ),
+            (
+                serde_json::json!({"action":"recall","argument":"atlas"}),
+                VoiceIntent::Recall {
+                    entity: "atlas".into(),
+                },
+            ),
+            (
+                serde_json::json!({"action":"reminder","argument":"call bob"}),
+                VoiceIntent::CreateReminder {
+                    text: "call bob".into(),
+                    due: None,
+                },
+            ),
+            (
+                serde_json::json!({"action":"note","argument":"deadline friday"}),
+                VoiceIntent::NoteAside {
+                    text: "deadline friday".into(),
+                },
+            ),
         ];
         for (map, want) in cases {
             let got = interpret_with_brain(&MapReasoner(map), "some free-form command").unwrap();
@@ -1336,7 +1460,12 @@ mod tests {
         // When the brain omits/empties the argument, the whole command is used as the argument.
         let r = MapReasoner(serde_json::json!({ "action": "research", "argument": "" }));
         let got = interpret_with_brain(&r, "look into the pricing model").unwrap();
-        assert_eq!(got, VoiceIntent::Research { topic: "look into the pricing model".into() });
+        assert_eq!(
+            got,
+            VoiceIntent::Research {
+                topic: "look into the pricing model".into()
+            }
+        );
     }
 
     #[test]
@@ -1353,7 +1482,8 @@ mod tests {
 
     #[test]
     fn with_command_surfaces_the_heard_command_on_a_result() {
-        let r = VoiceActionResult::new("research", "ok", "answer").with_command("zrób research o X");
+        let r =
+            VoiceActionResult::new("research", "ok", "answer").with_command("zrób research o X");
         assert_eq!(r.command, "zrób research o X");
         // nothing_heard carries an empty command (nothing was heard).
         assert!(VoiceActionResult::nothing_heard().command.is_empty());
@@ -1366,17 +1496,26 @@ mod tests {
     fn voice_action_result_round_trips_proposed_note() {
         // Default: no proposal ⇒ plain answer.
         let plain = VoiceActionResult::new("research", "ok", "an answer");
-        assert_eq!(plain.proposed_note, None, "a result defaults to no note proposal (a plain answer)");
+        assert_eq!(
+            plain.proposed_note, None,
+            "a result defaults to no note proposal (a plain answer)"
+        );
 
         // With a proposal: the reply IS a note draft.
         let proposed = plain
             .clone()
             .with_proposed_note(Some("Decision: ship Friday.".to_string()));
-        assert_eq!(proposed.proposed_note.as_deref(), Some("Decision: ship Friday."));
+        assert_eq!(
+            proposed.proposed_note.as_deref(),
+            Some("Decision: ship Friday.")
+        );
 
         // None / whitespace are no-ops (still a plain answer).
         assert_eq!(plain.clone().with_proposed_note(None).proposed_note, None);
-        assert_eq!(plain.with_proposed_note(Some("   ".into())).proposed_note, None);
+        assert_eq!(
+            plain.with_proposed_note(Some("   ".into())).proposed_note,
+            None
+        );
 
         // Serializes to the camelCase `proposedNote` field the FE consumes; absent (null) ⇒ plain.
         let json = serde_json::to_value(
@@ -1384,9 +1523,16 @@ mod tests {
                 .with_proposed_note(Some("note body".into())),
         )
         .unwrap();
-        assert_eq!(json.get("proposedNote").and_then(|v| v.as_str()), Some("note body"));
-        let null_json = serde_json::to_value(VoiceActionResult::new("research", "ok", "x")).unwrap();
-        assert!(null_json.get("proposedNote").unwrap().is_null(), "no proposal ⇒ proposedNote is null");
+        assert_eq!(
+            json.get("proposedNote").and_then(|v| v.as_str()),
+            Some("note body")
+        );
+        let null_json =
+            serde_json::to_value(VoiceActionResult::new("research", "ok", "x")).unwrap();
+        assert!(
+            null_json.get("proposedNote").unwrap().is_null(),
+            "no proposal ⇒ proposedNote is null"
+        );
     }
 
     /// PR D: `thread_id` round-trips through `VoiceActionResult` — default None, threaded on via
@@ -1395,7 +1541,10 @@ mod tests {
     #[test]
     fn voice_action_result_round_trips_thread_id() {
         let plain = VoiceActionResult::new("research", "ok", "an answer");
-        assert_eq!(plain.thread_id, None, "a result defaults to no thread identity");
+        assert_eq!(
+            plain.thread_id, None,
+            "a result defaults to no thread identity"
+        );
 
         let threaded = plain.with_thread_id("t-123");
         assert_eq!(threaded.thread_id.as_deref(), Some("t-123"));
@@ -1404,7 +1553,10 @@ mod tests {
 
         let null_json =
             serde_json::to_value(VoiceActionResult::new("research", "ok", "x")).unwrap();
-        assert!(null_json.get("threadId").unwrap().is_null(), "no thread ⇒ threadId is null");
+        assert!(
+            null_json.get("threadId").unwrap().is_null(),
+            "no thread ⇒ threadId is null"
+        );
     }
 
     #[test]
@@ -1419,12 +1571,18 @@ mod tests {
     #[test]
     fn wants_calendar_fires_only_on_calendar_meeting_intent() {
         // EN + PL calendar/meeting phrasings fire the leg.
-        assert!(wants_calendar("who's in my next meeting", "who's in my next meeting"));
+        assert!(wants_calendar(
+            "who's in my next meeting",
+            "who's in my next meeting"
+        ));
         assert!(wants_calendar("what's on my agenda", ""));
         assert!(wants_calendar("", "kto jest na spotkaniu"));
         assert!(wants_calendar("kalendarz na dziś", ""));
         // A plain research question does NOT fire it (no calendar noise on "weather").
-        assert!(!wants_calendar("what's the weather in Kraków", "jaka jest pogoda"));
+        assert!(!wants_calendar(
+            "what's the weather in Kraków",
+            "jaka jest pogoda"
+        ));
         assert!(!wants_calendar("research the Atlas pricing model", ""));
     }
 
@@ -1447,10 +1605,14 @@ mod tests {
     #[test]
     fn is_empty_tool_result_matches_calendar_sentinel() {
         // The calendar "nothing found" sentinels are filtered out of the grounding.
-        assert!(is_empty_tool_result("No calendar events match \"standup\"."));
+        assert!(is_empty_tool_result(
+            "No calendar events match \"standup\"."
+        ));
         assert!(is_empty_tool_result("No calendar events in the window."));
         // A real calendar block is NOT a sentinel.
-        assert!(!is_empty_tool_result("[calendar] Sprint Planning — Meeting: Sprint Planning"));
+        assert!(!is_empty_tool_result(
+            "[calendar] Sprint Planning — Meeting: Sprint Planning"
+        ));
     }
 
     // ── FIX 1: cross-lingual RETRIEVAL uses the user's LITERAL terms, not the brain topic ─────────
@@ -1514,7 +1676,9 @@ mod tests {
 
         // WITH the literal Polish command → the Polish note is FOUND, brain is called, cited.
         let res = handle_voice_action(
-            &VoiceIntent::Research { topic: "yesterday's weather".into() },
+            &VoiceIntent::Research {
+                topic: "yesterday's weather".into(),
+            },
             &reasoner,
             &db,
             &empty_unlocked(),
@@ -1525,7 +1689,8 @@ mod tests {
         );
         assert_eq!(res.status, "ok");
         assert!(
-            res.citations.contains(&"[[Notatka o pogodzie]]".to_string()),
+            res.citations
+                .contains(&"[[Notatka o pogodzie]]".to_string()),
             "the Polish note must be cited when retrieval uses the literal Polish terms"
         );
         let grounding = reasoner
@@ -1544,7 +1709,9 @@ mod tests {
         // brain call. This is the bug the user hit.
         let reasoner2 = MockReasoner::new("SHOULD-NOT-BE-CALLED");
         let res2 = handle_voice_action(
-            &VoiceIntent::Research { topic: "yesterday's weather".into() },
+            &VoiceIntent::Research {
+                topic: "yesterday's weather".into(),
+            },
             &reasoner2,
             &db,
             &empty_unlocked(),

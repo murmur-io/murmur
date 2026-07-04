@@ -165,6 +165,12 @@ pub struct AppConfigDto {
     /// (`#[serde(default)]` = false) is inert here.
     #[serde(default)]
     pub cloud_egress_consented: bool,
+    /// M3-CLIENT: one-time SHARE-egress consent. DISPLAY-ONLY on this DTO (same discipline as
+    /// `cloud_egress_consented`): `get_config` carries the stored value out so the FE can show
+    /// consent status; `dto_to_config` PRESERVES it. Mutated ONLY by `consent_to_share_egress` /
+    /// `revoke_share_egress`, so a settings save can neither grant nor clear it.
+    #[serde(default)]
+    pub share_egress_consented: bool,
     /// Phase H — which reasoner powers the on-device "brain" pre-analysis (Flow A): `cloud` |
     /// `local` | `off`. Unlike `cloud_egress_consented`, this IS settable from the DTO (the Settings
     /// UI owns the brain toggle). An omitted/unknown value deserializes to the default `Cloud`
@@ -231,6 +237,12 @@ pub struct AppConfigDto {
     /// Model id to send to the gateway (e.g. `"gpt-4o"`). Settable from the DTO. Default `""`.
     #[serde(default)]
     pub gateway_model: String,
+    /// M3-CLIENT — base URL of the Murmur sharing server (self-host or hosted). Settable from the
+    /// DTO (Settings → Account owns the field). An omitted value deserializes to `""` (unset →
+    /// account/share commands fail closed `Unavailable`). Validated like `gateway_base_url` (https
+    /// required, http loopback-only, no embedded creds) at `ShareClient::new`.
+    #[serde(default)]
+    pub share_base_url: String,
     /// Proactive brain P1 — the recall-card mute toggle (`crate::proactive`). Settable from the
     /// DTO (the Settings UI owns it). Defaults ON when omitted (`default_true`), matching
     /// `AppConfig::default` — an older FE payload must not silently flip the backend mute.
@@ -283,7 +295,9 @@ fn default_true() -> bool {
 /// enum would reject `"bogus"` with an error). Mirrors `BrainBackend::from_str_or_default`, so the
 /// FE can never wedge a settings save with a stale/typo'd backend value. A non-string (e.g. null)
 /// also falls back to `Cloud`.
-fn deserialize_brain_backend_lenient<'de, D>(deserializer: D) -> std::result::Result<BrainBackend, D::Error>
+fn deserialize_brain_backend_lenient<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BrainBackend, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -386,7 +400,11 @@ pub async fn start_recording(
     }
 
     // Start mic capture on the configured input device (falls back to default if unset/gone).
-    let input_device = state.config.lock().ok().and_then(|c| c.input_device.clone());
+    let input_device = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|c| c.input_device.clone());
     let recorder = Recorder::start(input_device)?;
     // STAGE 2 crash-salvage: grab a read-only handle onto the live buffer + the device rate BEFORE the
     // recorder is moved into state — the spill writer mirrors this handle (never the RT callback).
@@ -785,7 +803,10 @@ pub(crate) fn begin_voice_command_inner(
         .lock()
         .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
     *guard = Some(crate::state::CaptureState::armed_from(offset));
-    Ok(VoiceCommandArmResult { listening: true, reason: None })
+    Ok(VoiceCommandArmResult {
+        listening: true,
+        reason: None,
+    })
 }
 
 /// STOP the MANUAL voice-command capture (CLICK-TO-STOP): the user clicked "stop" / "done", so the
@@ -799,9 +820,7 @@ pub(crate) fn begin_voice_command_inner(
 /// progress — the user double-clicked, or it already auto-stopped at the backstop) this is a graceful
 /// no-op (`stopped: false`), never an error.
 #[tauri::command]
-pub fn end_voice_command(
-    state: State<'_, AppState>,
-) -> Result<VoiceCommandEndResult, AppError> {
+pub fn end_voice_command(state: State<'_, AppState>) -> Result<VoiceCommandEndResult, AppError> {
     let result = end_voice_command_inner(state.inner())?;
     if result.stopped {
         tracing::info!(target: "voice", "manual voice command stopped by user — dispatching");
@@ -821,9 +840,7 @@ pub struct VoiceCommandEndResult {
 /// Headless core of [`end_voice_command`]: flip the armed capture's `ended` flag so the live loop
 /// dispatches the FULL accumulated utterance on its next tick. A NOT-armed state is a graceful no-op
 /// (`stopped: false`). No `AppHandle`/IPC here, so it is unit-testable without Tauri.
-pub(crate) fn end_voice_command_inner(
-    state: &AppState,
-) -> Result<VoiceCommandEndResult, AppError> {
+pub(crate) fn end_voice_command_inner(state: &AppState) -> Result<VoiceCommandEndResult, AppError> {
     let mut guard = state
         .voice_command_capture
         .lock()
@@ -894,11 +911,14 @@ fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
     }
     let latest = last.text.trim().to_string();
     let start = messages.len().saturating_sub(CHAT_CONTEXT_TURNS);
-    let mut convo = String::from(
-        "This is an ongoing chat during a live meeting. Conversation so far:\n",
-    );
+    let mut convo =
+        String::from("This is an ongoing chat during a live meeting. Conversation so far:\n");
     for m in &messages[start..] {
-        let who = if m.role.eq_ignore_ascii_case("assistant") { "Assistant" } else { "User" };
+        let who = if m.role.eq_ignore_ascii_case("assistant") {
+            "Assistant"
+        } else {
+            "User"
+        };
         convo.push_str(&format!("{who}: {}\n", m.text.trim()));
     }
     convo.push_str("\nAnswer the User's LATEST message, using the conversation above for context.");
@@ -956,7 +976,9 @@ pub fn list_assistant_threads(
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
-    state.db.list_assistant_threads_visible(&meeting_id, &unlocked)
+    state
+        .db
+        .list_assistant_threads_visible(&meeting_id, &unlocked)
 }
 
 #[cfg(test)]
@@ -964,7 +986,10 @@ mod chat_format_tests {
     use super::*;
 
     fn msg(role: &str, text: &str) -> ChatMsg {
-        ChatMsg { role: role.into(), text: text.into() }
+        ChatMsg {
+            role: role.into(),
+            text: text.into(),
+        }
     }
 
     #[test]
@@ -987,7 +1012,10 @@ mod chat_format_tests {
     #[test]
     fn format_chat_rejects_empty_or_non_user_last() {
         assert!(format_chat(&[]).is_err(), "empty chat is rejected");
-        assert!(format_chat(&[msg("user", "   ")]).is_err(), "blank last message is rejected");
+        assert!(
+            format_chat(&[msg("user", "   ")]).is_err(),
+            "blank last message is rejected"
+        );
         assert!(
             format_chat(&[msg("user", "hi"), msg("assistant", "hello")]).is_err(),
             "the last message must be from the user"
@@ -997,12 +1025,17 @@ mod chat_format_tests {
     #[test]
     fn format_chat_caps_history_to_recent_turns() {
         // A long chat: only the last CHAT_CONTEXT_TURNS are rendered (bounds tokens + cloud egress).
-        let mut msgs: Vec<ChatMsg> = (0..39).map(|i| msg("user", &format!("turn-{i}-text"))).collect();
+        let mut msgs: Vec<ChatMsg> = (0..39)
+            .map(|i| msg("user", &format!("turn-{i}-text")))
+            .collect();
         msgs.push(msg("user", "the final question"));
         let (latest, convo) = format_chat(&msgs).unwrap();
         assert_eq!(latest, "the final question");
         assert!(convo.contains("the final question"));
-        assert!(!convo.contains("turn-0-text"), "turns beyond the cap are dropped");
+        assert!(
+            !convo.contains("turn-0-text"),
+            "turns beyond the cap are dropped"
+        );
     }
 }
 
@@ -1208,7 +1241,11 @@ pub(crate) fn import_text_inner(
     if text.trim().is_empty() {
         return Err(AppError::InvalidArg("note text is empty".into()));
     }
-    let name = if name.trim().is_empty() { "note" } else { name.trim() };
+    let name = if name.trim().is_empty() {
+        "note"
+    } else {
+        name.trim()
+    };
     ingest_into_folder(state, folder_id, name, text, "note")
 }
 
@@ -1370,7 +1407,9 @@ pub(crate) fn delete_document_inner(state: &AppState, id: &str) -> Result<(), Ap
 /// that is injected into grounding. GATED: only facts whose SOURCE meeting is visible under the live
 /// unlocked snapshot are returned — a sealed-not-unlocked meeting's user memory surfaces NOTHING.
 #[tauri::command]
-pub fn get_user_memory(state: State<'_, AppState>) -> Result<crate::user_memory::UserMemory, AppError> {
+pub fn get_user_memory(
+    state: State<'_, AppState>,
+) -> Result<crate::user_memory::UserMemory, AppError> {
     get_user_memory_inner(state.inner())
 }
 
@@ -1394,7 +1433,11 @@ pub(crate) fn get_user_memory_inner(
         .iter()
         .map(crate::user_memory::UserMemoryFact::from_fact)
         .collect();
-    Ok(crate::user_memory::UserMemory { facts: dtos, brief, disabled: false })
+    Ok(crate::user_memory::UserMemory {
+        facts: dtos,
+        brief,
+        disabled: false,
+    })
 }
 
 /// Forget ONE user-memory fact (bitemporal invalidate — the row is CLOSED, never silently deleted,
@@ -1636,7 +1679,11 @@ pub fn export_note(
 /// "start recording?" nudge. Browser-based Google Meet is NOT detectable this way.
 #[tauri::command]
 pub fn detect_meeting_app() -> Result<Option<String>, AppError> {
-    let listing = match std::process::Command::new("ps").arg("-axo").arg("comm=").output() {
+    let listing = match std::process::Command::new("ps")
+        .arg("-axo")
+        .arg("comm=")
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => return Ok(None),
     };
@@ -1754,7 +1801,9 @@ pub async fn run_recipe(
     }
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
-        return Err(AppError::InvalidArg("this meeting has no transcript yet".into()));
+        return Err(AppError::InvalidArg(
+            "this meeting has no transcript yet".into(),
+        ));
     }
     let transcript = segments
         .iter()
@@ -1770,11 +1819,8 @@ pub async fn run_recipe(
             .clone()
     };
     let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
-    let (system, user) = crate::summarize::recipes::build_recipe_prompt(
-        &transcript,
-        &prompt,
-        &config.note_language,
-    );
+    let (system, user) =
+        crate::summarize::recipes::build_recipe_prompt(&transcript, &prompt, &config.note_language);
     provider.complete(&system, &user).await
 }
 
@@ -2063,7 +2109,9 @@ pub async fn build_and_persist_entities(
     // facts ABOUT these very entities.
     let mut entity_refs: Vec<(String, String)> = Vec::new();
     for p in &payload.people {
-        let id = state.db.upsert_entity(p, crate::storage::models::EntityKind::Person)?;
+        let id = state
+            .db
+            .upsert_entity(p, crate::storage::models::EntityKind::Person)?;
         state.db.add_mention(&id, meeting_id)?;
         entity_refs.push((id, p.clone()));
     }
@@ -2282,7 +2330,10 @@ fn gated_memory_brief_for_injection(
     if !user_memory_enabled(state) {
         return String::new();
     }
-    let facts = state.db.list_user_facts_visible(unlocked).unwrap_or_default();
+    let facts = state
+        .db
+        .list_user_facts_visible(unlocked)
+        .unwrap_or_default();
     crate::user_memory::synthesize_brief(&facts)
 }
 
@@ -2310,7 +2361,10 @@ pub async fn link_meeting_entities(
         .db
         .get_latest_note_for_meeting(&meeting_id)?
         .ok_or_else(|| AppError::InvalidArg("this meeting has no note yet".into()))?;
-    let title = meeting.title.clone().unwrap_or_else(|| "Meeting".to_string());
+    let title = meeting
+        .title
+        .clone()
+        .unwrap_or_else(|| "Meeting".to_string());
     build_and_persist_entities(&state, &meeting_id, &title, &note.markdown).await
 }
 
@@ -2444,7 +2498,15 @@ pub async fn ask_vault(
     // Gated cross-meeting USER MEMORY brief (parity with the @brain loop): VISIBLE facts only under
     // this same unlock snapshot, empty when memory is disabled ⇒ the floor prompt is byte-identical.
     let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked);
-    ask_vault_floor(&state.db, &config, &unlocked, &question, &history, &memory_brief).await
+    ask_vault_floor(
+        &state.db,
+        &config,
+        &unlocked,
+        &question,
+        &history,
+        &memory_brief,
+    )
+    .await
 }
 
 /// Max agentic rounds for the Ask surface. Not live-latency-bound like the in-meeting loop
@@ -2476,7 +2538,9 @@ fn ask_vault_agentic_attempt(
     };
     // Re-resolved per turn (never a startup snapshot): consent/provider/backend changes apply.
     // ASK role — under the legacy fallback this dispatches exactly like the pre-role `current()`.
-    let reasoner = state.reasoner.current_for(crate::summarize::roles::Role::Ask);
+    let reasoner = state
+        .reasoner
+        .current_for(crate::summarize::roles::Role::Ask);
     // VAULT-SCOPED executor: no live meeting, READ-ONLY, and NO note drafts (the Ask page has no
     // notes flow / Accept affordance, so `propose_note` is not advertised on this surface). The
     // AppHandle is present so web_search / calendar_lookup participate under their existing
@@ -2553,7 +2617,11 @@ fn ask_vault_loop(
     // Resolve sources against the LIVE unlocked set (fail-closed on a poisoned lock: no source
     // chips rather than an ungated resolution).
     let unlocked_now = unlocked.lock().map(|g| g.clone()).unwrap_or_default();
-    Ok(Some(agent_outcome_to_ask_result(db, &unlocked_now, outcome)))
+    Ok(Some(agent_outcome_to_ask_result(
+        db,
+        &unlocked_now,
+        outcome,
+    )))
 }
 
 /// Map a converged [`crate::agent::AgentOutcome`] onto the Ask DTO. `citations` carries the loop's
@@ -2586,7 +2654,11 @@ fn agent_outcome_to_ask_result(
             }
         }
     }
-    AskVaultResult { answer: outcome.answer, sources, citations: outcome.citations }
+    AskVaultResult {
+        answer: outcome.answer,
+        sources,
+        citations: outcome.citations,
+    }
 }
 
 /// The floor's prompt assembly, split from the provider call so the floor-equivalence test can
@@ -2595,7 +2667,11 @@ enum AskFloorPrompt {
     /// Nothing to search — the canned early-return result (identical to the pre-change string).
     Empty(AskVaultResult),
     /// The assembled corpus prompt, ready for ONE provider completion.
-    Ready { system: String, user: String, sources: Vec<crate::storage::models::VaultSource> },
+    Ready {
+        system: String,
+        user: String,
+        sources: Vec<crate::storage::models::VaultSource>,
+    },
 }
 
 /// Everything the pre-agentic `ask_vault` did BEFORE its provider call, verbatim: gated corpus
@@ -2631,18 +2707,11 @@ fn build_ask_vault_floor_prompt(
             .next()
             .unwrap_or_default();
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            db,
-            question,
-            &ask_conn,
-            &query_vec,
-            unlocked,
+            db, question, &ask_conn, &query_vec, unlocked,
         )?
     } else {
         crate::summarize::vault_context::build_vault_context_visible(
-            db,
-            question,
-            &ask_conn,
-            unlocked,
+            db, question, &ask_conn, unlocked,
         )?
     };
     if corpus.trim().is_empty() {
@@ -2655,7 +2724,11 @@ fn build_ask_vault_floor_prompt(
     }
     let (system, user) =
         crate::summarize::vault_chat::build(&corpus, history, question, memory_brief);
-    Ok(AskFloorPrompt::Ready { system, user, sources })
+    Ok(AskFloorPrompt::Ready {
+        system,
+        user,
+        sources,
+    })
 }
 
 /// THE FLOOR — the pre-agentic Ask-My-Vault implementation: gated corpus pack + ONE provider
@@ -2672,13 +2745,21 @@ async fn ask_vault_floor(
 ) -> Result<AskVaultResult, AppError> {
     match build_ask_vault_floor_prompt(db, config, unlocked, question, history, memory_brief)? {
         AskFloorPrompt::Empty(result) => Ok(result),
-        AskFloorPrompt::Ready { system, user, sources } => {
+        AskFloorPrompt::Ready {
+            system,
+            user,
+            sources,
+        } => {
             // ASK role. With role keys absent this builds the legacy default provider for EVERY
             // brain_backend (the pre-role floor ignored it) — original error/consent semantics.
             let provider =
                 crate::summarize::provider_for(crate::summarize::roles::Role::Ask, config)?;
             let answer = provider.complete(&system, &user).await?;
-            Ok(AskVaultResult { answer, sources, citations: Vec::new() })
+            Ok(AskVaultResult {
+                answer,
+                sources,
+                citations: Vec::new(),
+            })
         }
     }
 }
@@ -2758,7 +2839,9 @@ mod ask_vault_tests {
     }
     impl ScriptReasoner {
         fn ok(steps: Vec<Value>) -> Self {
-            Self { script: Mutex::new(steps.into_iter().map(Ok).collect()) }
+            Self {
+                script: Mutex::new(steps.into_iter().map(Ok).collect()),
+            }
         }
     }
     impl LocalReasoner for ScriptReasoner {
@@ -2805,7 +2888,13 @@ mod ask_vault_tests {
     #[test]
     fn ask_floor_prompt_matches_pre_change_implementation() {
         let db = tmp_db();
-        seed_note(&db, "m1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
+        seed_note(
+            &db,
+            "m1",
+            "Atlas Kickoff",
+            "We decided to ship atlas on Friday.",
+            None,
+        );
         seed_note(&db, "m2", "Weekly Sync", "Anna owns QA for atlas.", None);
         // Tier 1 flipped the semantic default ON; PIN it false so this test keeps EXPLICITLY exercising
         // the FTS-floor branch (its stated purpose) rather than the hybrid branch — which, on an empty
@@ -2817,8 +2906,14 @@ mod ask_vault_tests {
         };
         let unlocked = HashSet::new();
         let history = vec![
-            ChatTurn { role: "user".into(), content: "earlier question".into() },
-            ChatTurn { role: "assistant".into(), content: "earlier answer".into() },
+            ChatTurn {
+                role: "user".into(),
+                content: "earlier question".into(),
+            },
+            ChatTurn {
+                role: "assistant".into(),
+                content: "earlier answer".into(),
+            },
         ];
         let q = "what did we decide about atlas?";
 
@@ -2830,18 +2925,37 @@ mod ask_vault_tests {
             &unlocked,
         )
         .unwrap();
-        assert!(!corpus.trim().is_empty(), "fixture must produce a non-empty corpus");
+        assert!(
+            !corpus.trim().is_empty(),
+            "fixture must produce a non-empty corpus"
+        );
         // Empty memory brief ⇒ the floor prompt must stay BYTE-IDENTICAL to the pre-memory build.
         let (want_system, want_user) =
             crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
         match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "").unwrap() {
-            AskFloorPrompt::Ready { system, user, sources } => {
-                assert_eq!(system, want_system, "floor system prompt diverged from pre-change");
-                assert_eq!(user, want_user, "floor user prompt diverged from pre-change");
+            AskFloorPrompt::Ready {
+                system,
+                user,
+                sources,
+            } => {
                 assert_eq!(
-                    sources.iter().map(|s| s.meeting_id.as_str()).collect::<Vec<_>>(),
-                    want_sources.iter().map(|s| s.meeting_id.as_str()).collect::<Vec<_>>(),
+                    system, want_system,
+                    "floor system prompt diverged from pre-change"
+                );
+                assert_eq!(
+                    user, want_user,
+                    "floor user prompt diverged from pre-change"
+                );
+                assert_eq!(
+                    sources
+                        .iter()
+                        .map(|s| s.meeting_id.as_str())
+                        .collect::<Vec<_>>(),
+                    want_sources
+                        .iter()
+                        .map(|s| s.meeting_id.as_str())
+                        .collect::<Vec<_>>(),
                     "floor sources diverged from pre-change"
                 );
             }
@@ -2868,13 +2982,29 @@ mod ask_vault_tests {
     #[test]
     fn ask_floor_preserves_no_consent_error_semantics() {
         let db = tmp_db();
-        seed_note(&db, "m1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
+        seed_note(
+            &db,
+            "m1",
+            "Atlas Kickoff",
+            "We decided to ship atlas on Friday.",
+            None,
+        );
         let cfg = AppConfig {
             provider_id: "anthropic".into(),
             ..AppConfig::default()
         };
-        assert!(!cfg.cloud_egress_consented, "fresh config defaults to consent OFF");
-        let res = block_on(ask_vault_floor(&db, &cfg, &HashSet::new(), "atlas?", &[], ""));
+        assert!(
+            !cfg.cloud_egress_consented,
+            "fresh config defaults to consent OFF"
+        );
+        let res = block_on(ask_vault_floor(
+            &db,
+            &cfg,
+            &HashSet::new(),
+            "atlas?",
+            &[],
+            "",
+        ));
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
             "no-consent floor must keep the Unavailable refusal: {res:?}"
@@ -2901,16 +3031,32 @@ mod ask_vault_tests {
             serde_json::json!({ "tool": "get_open_commitments", "args": {} }),
             serde_json::json!({ "answer": "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]]." }),
         ]);
-        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "who owns the deck?", &[], "", None)
-            .unwrap()
-            .expect("scripted brain converged");
-        assert_eq!(out.answer, "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]].");
+        let out = ask_vault_loop(
+            &brain,
+            &exec,
+            &db,
+            &unlocked,
+            "who owns the deck?",
+            &[],
+            "",
+            None,
+        )
+        .unwrap()
+        .expect("scripted brain converged");
+        assert_eq!(
+            out.answer,
+            "Anna ships the deck by 2026-07-10 [[Atlas Kickoff]]."
+        );
         assert!(
             out.citations.contains(&"[[Atlas Kickoff]]".to_string()),
             "tool-derived citation must reach the DTO verbatim: {:?}",
             out.citations
         );
-        assert_eq!(out.sources.len(), 1, "the citation resolves to ONE source chip");
+        assert_eq!(
+            out.sources.len(),
+            1,
+            "the citation resolves to ONE source chip"
+        );
         assert_eq!(out.sources[0].meeting_id, "m1");
         assert_eq!(out.sources[0].title, "Atlas Kickoff");
         assert_eq!(out.sources[0].started_at, "2026-06-26T09:00:00Z");
@@ -2932,7 +3078,10 @@ mod ask_vault_tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "a" } }),
         ]);
         let out = ask_vault_loop(&stuck, &exec, &db, &unlocked, "q", &[], "", None).unwrap();
-        assert!(out.is_none(), "non-convergence must return Ok(None) for the command to floor");
+        assert!(
+            out.is_none(),
+            "non-convergence must return Ok(None) for the command to floor"
+        );
 
         struct Refuses;
         impl LocalReasoner for Refuses {
@@ -2964,15 +3113,30 @@ mod ask_vault_tests {
     #[test]
     fn ask_history_cap_enforced() {
         let msgs: Vec<ChatTurn> = (0..13)
-            .map(|i| ChatTurn { role: "user".into(), content: format!("turn-{i}-text") })
+            .map(|i| ChatTurn {
+                role: "user".into(),
+                content: format!("turn-{i}-text"),
+            })
             .collect();
         let capped = capped_ask_history(&msgs);
         assert_eq!(capped.len(), CHAT_CONTEXT_TURNS);
-        assert_eq!(capped[0].content, "turn-1-text", "the oldest message beyond the cap is dropped");
+        assert_eq!(
+            capped[0].content, "turn-1-text",
+            "the oldest message beyond the cap is dropped"
+        );
         let rendered = crate::summarize::vault_chat::render_conversation(capped, "final question");
-        assert!(!rendered.contains("turn-0-text"), "turn beyond the cap must not render");
-        assert!(rendered.contains("turn-12-text"), "the newest capped turn renders");
-        assert!(rendered.trim_end().ends_with("Assistant:"), "render keeps the completion cue");
+        assert!(
+            !rendered.contains("turn-0-text"),
+            "turn beyond the cap must not render"
+        );
+        assert!(
+            rendered.contains("turn-12-text"),
+            "the newest capped turn renders"
+        );
+        assert!(
+            rendered.trim_end().ends_with("Assistant:"),
+            "render keeps the completion cue"
+        );
 
         // A short history passes through untouched.
         assert_eq!(capped_ask_history(&msgs[..3]).len(), 3);
@@ -3024,7 +3188,13 @@ mod ask_vault_tests {
     #[test]
     fn ask_loop_never_surfaces_sealed_content() {
         let db = tmp_db();
-        seed_note(&db, "open1", "Atlas Kickoff", "We decided to ship atlas on Friday.", None);
+        seed_note(
+            &db,
+            "open1",
+            "Atlas Kickoff",
+            "We decided to ship atlas on Friday.",
+            None,
+        );
         seed_sealed(&db, "sealed1", "fsec", "Atlas Secret Terms");
 
         // Seed self-check: the fixture must be sealed-not-unlocked BEFORE we prove the gate.
@@ -3040,8 +3210,16 @@ mod ask_vault_tests {
         let exec = ask_executor(&db, &unlocked, &cfg);
 
         // Direct gate proof on THIS surface's executor shape.
-        let got = exec.run("get_meeting", &serde_json::json!({ "meetingId": "sealed1" })).unwrap();
-        assert!(got.starts_with("No data"), "sealed fetch must be gated: {got}");
+        let got = exec
+            .run(
+                "get_meeting",
+                &serde_json::json!({ "meetingId": "sealed1" }),
+            )
+            .unwrap();
+        assert!(
+            got.starts_with("No data"),
+            "sealed fetch must be gated: {got}"
+        );
 
         // The full loop, driven by an exfiltrating script.
         let brain = ScriptReasoner::ok(vec![
@@ -3049,9 +3227,18 @@ mod ask_vault_tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "Atlas Secret Terms" } }),
             serde_json::json!({ "answer": "Here is what I found." }),
         ]);
-        let out = ask_vault_loop(&brain, &exec, &db, &unlocked, "the secret terms?", &[], "", None)
-            .unwrap()
-            .expect("converged");
+        let out = ask_vault_loop(
+            &brain,
+            &exec,
+            &db,
+            &unlocked,
+            "the secret terms?",
+            &[],
+            "",
+            None,
+        )
+        .unwrap()
+        .expect("converged");
         assert!(
             out.citations.iter().all(|c| !c.contains("Secret")),
             "sealed title must never be cited: {:?}",
@@ -3065,7 +3252,9 @@ mod ask_vault_tests {
 
         // The resolver itself is gated: the sealed title resolves ONLY once session-unlocked.
         assert!(
-            db.meeting_by_title_visible("Atlas Secret Terms", &nothing).unwrap().is_none(),
+            db.meeting_by_title_visible("Atlas Secret Terms", &nothing)
+                .unwrap()
+                .is_none(),
             "sealed-not-unlocked title must not resolve"
         );
         let mut open = HashSet::new();
@@ -3082,8 +3271,14 @@ mod ask_vault_tests {
     /// The Ask trace stream is its OWN event — record-screen stores must never see Ask chips.
     #[test]
     fn ask_tool_event_is_distinct() {
-        assert_ne!(crate::events::EVENT_ASK_TOOL, crate::events::EVENT_ASSISTANT_TOOL);
-        assert_ne!(crate::events::EVENT_ASK_TOOL, crate::events::EVENT_CHAT_TOOL);
+        assert_ne!(
+            crate::events::EVENT_ASK_TOOL,
+            crate::events::EVENT_ASSISTANT_TOOL
+        );
+        assert_ne!(
+            crate::events::EVENT_ASK_TOOL,
+            crate::events::EVENT_CHAT_TOOL
+        );
     }
 }
 
@@ -3148,7 +3343,11 @@ pub async fn generate_digest(
     let notes_conn =
         crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
             .connection;
-    let budget = if notes_conn == "ollama" { 4_000 } else { 80_000 };
+    let budget = if notes_conn == "ollama" {
+        4_000
+    } else {
+        80_000
+    };
     // Finding 2 + BLK-2b: build the cloud corpus from VISIBLE meetings + VISIBLE notes only, so a
     // sealed-and-not-unlocked meeting's TITLE (the `### [[title]]` header) AND markdown never leave
     // the device. `list_meetings_visible` + `get_note_if_visible` push the session unlock set
@@ -3167,7 +3366,12 @@ pub async fn generate_digest(
             continue;
         };
         let title = m.title.clone().unwrap_or_else(|| "(untitled)".to_string());
-        let date = m.started_at.split(['T', ' ']).next().unwrap_or("").to_string();
+        let date = m
+            .started_at
+            .split(['T', ' '])
+            .next()
+            .unwrap_or("")
+            .to_string();
         let header = format!("\n\n### [[{title}]] · {date}\n");
         let remaining = budget.saturating_sub(corpus.len() + header.len());
         if remaining < 200 {
@@ -3443,6 +3647,11 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
     if !config.gateway_base_url.trim().is_empty() {
         crate::summarize::gateway::validate_gateway_url(&config.gateway_base_url)?;
     }
+    // M3-CLIENT: validate the sharing-server URL at the same seam (reject embedded creds / http on a
+    // non-loopback host) so a bad value is refused BEFORE it is persisted. Empty is allowed (unset).
+    if !config.share_base_url.trim().is_empty() {
+        crate::summarize::gateway::validate_gateway_url(&config.share_base_url)?;
+    }
 
     // Merge against the CURRENT config under the config lock so the security-sensitive flags that
     // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
@@ -3541,6 +3750,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
         cloud_egress_consented: c.cloud_egress_consented,
+        // DISPLAY-ONLY out (M3-CLIENT): FE shows share-egress consent status; cannot set it back.
+        share_egress_consented: c.share_egress_consented,
         brain_backend: c.brain_backend,
         realtime_reactions: c.realtime_reactions,
         brain_model_id: c.brain_model_id.clone(),
@@ -3553,6 +3764,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         claude_code_inherit_env: c.claude_code_inherit_env,
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
+        share_base_url: c.share_base_url.clone(),
         proactive_hints_enabled: c.proactive_hints_enabled,
         user_memory_enabled: c.user_memory_enabled,
         role_notes_connection: c.role_notes_connection.clone(),
@@ -3637,6 +3849,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // BLK-4: consent is NEVER set from the DTO. Preserve the live value; only the dedicated
         // `consent_to_cloud_egress` command may flip it. This makes an omitting/zeroed save inert.
         cloud_egress_consented: current.cloud_egress_consented,
+        // BLK-4 (M3-CLIENT): share-egress consent is NEVER set from the DTO — preserve the live value.
+        // Only `consent_to_share_egress` may flip it. An omitting/zeroed save is inert.
+        share_egress_consented: current.share_egress_consented,
         // brain2 RAG: the semantic-search master flag IS carried on the settings DTO (the Settings
         // UI owns the toggle). Plain bool; an omitted value already defaulted to OFF on the DTO
         // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
@@ -3696,6 +3911,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // deserializes to `""` (`#[serde(default)]`), which is a valid "unset" state.
         gateway_base_url: d.gateway_base_url,
         gateway_model: d.gateway_model,
+        // M3-CLIENT: the sharing-server base URL IS settable from the DTO (Settings → Account owns
+        // it). An omitted value defaults to `""` (unset) — no behavioral change for existing installs.
+        share_base_url: d.share_base_url,
         // Proactive brain P1: the recall-card mute IS settable from the DTO (Settings owns the
         // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default —
         // the backend mute is an explicit user choice, never a partial-save side effect.
@@ -4015,13 +4233,16 @@ pub struct GatewayHealthDto {
 /// Inbound-only: sends NO meeting content, only an optional `Authorization: Bearer` header. Does
 /// NOT need the redaction firewall or the consent gate (same rationale as `list_gateway_models`).
 #[tauri::command]
-pub async fn gateway_health(
-    state: State<'_, AppState>,
-) -> Result<GatewayHealthDto, AppError> {
+pub async fn gateway_health(state: State<'_, AppState>) -> Result<GatewayHealthDto, AppError> {
     let (base_url, model, api_key) = {
         let config = match state.config.lock() {
             Ok(c) => c,
-            Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
+            Err(_) => {
+                return Ok(GatewayHealthDto {
+                    reachable: false,
+                    model_count: 0,
+                })
+            }
         };
         let base_url = config.gateway_base_url.clone();
         let model = config.gateway_model.clone();
@@ -4032,17 +4253,29 @@ pub async fn gateway_health(
 
     if base_url.trim().is_empty() {
         // Not configured → degrade silently.
-        return Ok(GatewayHealthDto { reachable: false, model_count: 0 });
+        return Ok(GatewayHealthDto {
+            reachable: false,
+            model_count: 0,
+        });
     }
 
-    let provider = match crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key) {
-        Ok(p) => p,
-        Err(_) => return Ok(GatewayHealthDto { reachable: false, model_count: 0 }),
-    };
+    let provider =
+        match crate::summarize::gateway::OpenAiCompatProvider::new(base_url, model, api_key) {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(GatewayHealthDto {
+                    reachable: false,
+                    model_count: 0,
+                })
+            }
+        };
 
     // probe() never returns Err — degrades to (false, 0) on transport failure.
     let (reachable, model_count) = provider.probe().await;
-    Ok(GatewayHealthDto { reachable, model_count })
+    Ok(GatewayHealthDto {
+        reachable,
+        model_count,
+    })
 }
 
 // ── Egress ledger DTOs (Phase 6) ────────────────────────────────────────────────────────────────
@@ -4131,12 +4364,19 @@ pub fn get_egress_ledger(
         by_model: ledger
             .by_model
             .into_iter()
-            .map(|m| ModelUsageDto { model: m.model, calls: m.calls, tokens: m.tokens })
+            .map(|m| ModelUsageDto {
+                model: m.model,
+                calls: m.calls,
+                tokens: m.tokens,
+            })
             .collect(),
         by_day: ledger
             .by_day
             .into_iter()
-            .map(|d| DayUsageDto { day: d.day, tokens: d.tokens })
+            .map(|d| DayUsageDto {
+                day: d.day,
+                tokens: d.tokens,
+            })
             .collect(),
         total_redactions: RedactionTotalsDto {
             email: ledger.total_redactions.email,
@@ -4178,9 +4418,11 @@ pub fn set_web_search_api_key(key: String) -> Result<(), AppError> {
 /// Whether a web-search API key is currently stored (UI shows "set"/"not set"; never the value).
 #[tauri::command]
 pub fn has_web_search_key() -> Result<bool, AppError> {
-    Ok(secrets::get_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT)?
-        .filter(|k| !k.trim().is_empty())
-        .is_some())
+    Ok(
+        secrets::get_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT)?
+            .filter(|k| !k.trim().is_empty())
+            .is_some(),
+    )
 }
 
 /// availability() fan-out across all three providers for the Settings UI.
@@ -4408,7 +4650,10 @@ pub(crate) fn suggest_speaker_labels_inner(
             v.label
                 .as_deref()
                 .filter(|l| !l.trim().is_empty())
-                .map(|label| LabeledEmbeddingRef { label, embedding: &v.embedding })
+                .map(|label| LabeledEmbeddingRef {
+                    label,
+                    embedding: &v.embedding,
+                })
         })
         .collect();
     if labeled_refs.is_empty() {
@@ -4417,7 +4662,12 @@ pub(crate) fn suggest_speaker_labels_inner(
     let cluster_refs: Vec<ClusterEmbeddingRef<'_>> = mine
         .iter()
         // Only suggest for clusters that are NOT already labeled in this meeting.
-        .filter(|v| v.label.as_deref().map(|l| l.trim().is_empty()).unwrap_or(true))
+        .filter(|v| {
+            v.label
+                .as_deref()
+                .map(|l| l.trim().is_empty())
+                .unwrap_or(true)
+        })
         .map(|v| ClusterEmbeddingRef {
             cluster_index: v.cluster_index as i32,
             embedding: &v.embedding,
@@ -4602,15 +4852,9 @@ pub fn get_meeting_detail(
     // Phase 5: capture provenance from the note row BEFORE converting to NoteDto (NoteDto is a
     // subset and doesn't carry model fields). All three are None when the note is absent or when
     // the provider did not record provenance (pre-Phase-5 notes).
-    let ai_provider = note_row
-        .as_ref()
-        .map(|n| n.provider_id.clone());
-    let ai_model = note_row
-        .as_ref()
-        .and_then(|n| n.model_requested.clone());
-    let model_served = note_row
-        .as_ref()
-        .and_then(|n| n.model_served.clone());
+    let ai_provider = note_row.as_ref().map(|n| n.provider_id.clone());
+    let ai_model = note_row.as_ref().and_then(|n| n.model_requested.clone());
+    let model_served = note_row.as_ref().and_then(|n| n.model_served.clone());
     let note = note_row.map(|n| NoteDto {
         meeting_id: n.meeting_id,
         provider_id: n.provider_id,
@@ -4693,7 +4937,10 @@ pub fn model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
 /// missing; returns its path. No-op (returns the existing path) when already present. Emits
 /// [`crate::events::EVENT_MODEL_DOWNLOAD`] progress (throttled) so the FE can show a progress bar.
 #[tauri::command]
-pub async fn download_model(app: AppHandle, state: State<'_, AppState>) -> Result<String, AppError> {
+pub async fn download_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, AppError> {
     let (configured, size, language) = {
         let c = state
             .config
@@ -4924,17 +5171,16 @@ fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), Ap
 /// Resolve a registry `model_id` to its `(download url, on-disk dest)`. Unknown id ⇒
 /// `AppError::InvalidArg` (the rejection [`download_brain_model`] enforces). Testable sync core.
 fn brain_download_target(model_id: &str) -> Result<(&'static str, std::path::PathBuf), AppError> {
-    let model = crate::reason::brain_model_by_id(model_id).ok_or_else(|| {
-        AppError::InvalidArg(format!("unknown brain model id: {model_id}"))
-    })?;
-    Ok((model.url, crate::transcribe::models_dir()?.join(model.filename)))
+    let model = crate::reason::brain_model_by_id(model_id)
+        .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
+    Ok((
+        model.url,
+        crate::transcribe::models_dir()?.join(model.filename),
+    ))
 }
 
 #[tauri::command]
-pub async fn download_brain_model(
-    app: AppHandle,
-    model_id: String,
-) -> Result<String, AppError> {
+pub async fn download_brain_model(app: AppHandle, model_id: String) -> Result<String, AppError> {
     let (url, dest) = brain_download_target(&model_id)?;
 
     if dest.is_file() {
@@ -5513,7 +5759,9 @@ pub fn move_note(
 
     // ── Target is a LOCKED folder: seal-or-reject (BLK-2) ───────────────────────────────────────
     if target_locked {
-        let fid = folder_id.as_deref().expect("locked target implies Some(folder_id)");
+        let fid = folder_id
+            .as_deref()
+            .expect("locked target implies Some(folder_id)");
         return move_into_locked_folder(state.inner(), &meeting_id, fid);
     }
 
@@ -5526,7 +5774,9 @@ pub fn move_note(
     // Reassign in the DB first (the source-of-truth association). Targets EVERY provider row of
     // the meeting (WHERE meeting_id = ?1) so the meeting's folder is consistent across providers
     // and the seal/unlock lifecycle (which iterates provider rows) stays coherent.
-    state.db.set_meeting_folder(&meeting_id, folder_id.as_deref())?;
+    state
+        .db
+        .set_meeting_folder(&meeting_id, folder_id.as_deref())?;
 
     // Best-effort FS move only when a plaintext .md exists (target is open here).
     if let Some(src_path) = exported {
@@ -5535,7 +5785,13 @@ pub fn move_note(
                 Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
                 None => None,
             };
-            move_note_file(&state, &meeting_id, &src_path, &vault, target_rel.as_deref())?;
+            move_note_file(
+                &state,
+                &meeting_id,
+                &src_path,
+                &vault,
+                target_rel.as_deref(),
+            )?;
         }
     }
     Ok(())
@@ -5579,10 +5835,16 @@ fn move_into_locked_folder(
             .lock()
             .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
         g.clone().ok_or_else(|| {
-            AppError::Locked("the destination folder is locked — unlock it first, then move the note".into())
+            AppError::Locked(
+                "the destination folder is locked — unlock it first, then move the note".into(),
+            )
         })?
     };
-    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id))?);
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
+        &kek,
+        &wrapped,
+        &aad_wrapped_ck(folder_id),
+    )?);
     let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
         ck_bytes
             .as_slice()
@@ -5702,7 +5964,9 @@ fn seal_moved_note(
     // must NOT survive at rest for a meeting now sealed into a locked folder — same invariant the
     // lock_folder / relock / startup-reconcile paths enforce. Covers both the manual move-into-locked
     // and the auto-file callers. (Re-indexed on unlock once indexing ships.)
-    state.db.purge_chunks_for_meetings(&[meeting_id.to_string()])?;
+    state
+        .db
+        .purge_chunks_for_meetings(&[meeting_id.to_string()])?;
     Ok(())
 }
 
@@ -5823,7 +6087,10 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     }
 
     // Capture every governed note's .md path BEFORE any seal_note nulls exported_path.
-    let exported_paths: Vec<String> = notes.iter().filter_map(|n| n.exported_path.clone()).collect();
+    let exported_paths: Vec<String> = notes
+        .iter()
+        .filter_map(|n| n.exported_path.clone())
+        .collect();
 
     // Persist: mark the folder locked (+ wrapped key) and write every sealed blob per provider
     // row (markdown blanked, exported_path cleared). Each write is guarded by the verification
@@ -5855,7 +6122,9 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // their invertible vectors too — a doc vector is PII derived from the plaintext, so it must not
     // survive at rest in a locked folder. Re-embeddable on unlock (the text seal is restorable).
     let sealed_document_ids = state.db.document_ids_in_folder(&folder_id)?;
-    state.db.purge_doc_chunks_for_documents(&sealed_document_ids)?;
+    state
+        .db
+        .purge_doc_chunks_for_documents(&sealed_document_ids)?;
 
     // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
     // lost content is not — so this is last).
@@ -5937,7 +6206,11 @@ pub async fn unlock_folder(
         }
     };
     // Wrapped CK is bound to the folder id (legacy folders fall back to empty AAD transparently).
-    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id))?);
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
+        &kek,
+        &wrapped,
+        &aad_wrapped_ck(&folder_id),
+    )?);
     let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
         ck_bytes
             .as_slice()
@@ -6120,7 +6393,11 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
         .folder_wrapped_key(&folder_id)?
         .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
     let kek = Zeroizing::new(crate::secrets::get_or_create_master_kek()?);
-    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id))?);
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
+        &kek,
+        &wrapped,
+        &aad_wrapped_ck(&folder_id),
+    )?);
     let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
         ck_bytes
             .as_slice()
@@ -6271,7 +6548,11 @@ pub(crate) fn rename_folder_inner(
 
     // No-op fast path: same path AND same name → nothing to move/rewrite.
     if new_path == old_path && clean == folder.name {
-        return Ok(Folder { name: clean, path: new_path, ..folder });
+        return Ok(Folder {
+            name: clean,
+            path: new_path,
+            ..folder
+        });
     }
 
     // Move the on-disk vault subdir, if a vault is configured. Both ends are containment-checked.
@@ -6318,7 +6599,11 @@ pub(crate) fn rename_folder_inner(
         }
     }
 
-    Ok(Folder { name: clean, path: new_path, ..folder })
+    Ok(Folder {
+        name: clean,
+        path: new_path,
+        ..folder
+    })
 }
 
 /// Recursively re-prefix the vault-relative `path` of every DESCENDANT folder of `folder_id` to sit
@@ -6375,9 +6660,11 @@ fn reexport_notes_under_subtree(state: &AppState, folder_id: &str) -> Result<(),
             continue;
         };
         let new_path = new_dir.join(name);
-        state
-            .db
-            .set_note_exported_path(&n.meeting_id, &n.provider_id, &new_path.to_string_lossy())?;
+        state.db.set_note_exported_path(
+            &n.meeting_id,
+            &n.provider_id,
+            &new_path.to_string_lossy(),
+        )?;
     }
 
     // Recurse into descendant folders (their dirs moved with the same single `fs::rename`).
@@ -6514,9 +6801,11 @@ fn move_note_file_to_root(
     crate::export::overwrite_note(&dest, &bytes)?;
     let _ = std::fs::remove_file(src);
     if let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? {
-        state
-            .db
-            .set_note_exported_path(meeting_id, &existing.provider_id, &dest.to_string_lossy())?;
+        state.db.set_note_exported_path(
+            meeting_id,
+            &existing.provider_id,
+            &dest.to_string_lossy(),
+        )?;
     }
     Ok(())
 }
@@ -6581,12 +6870,7 @@ fn aad_wrapped_ck(folder_id: &str) -> Vec<u8> {
 /// AAD for a content blob (note / transcript segment / timeline). Bound to
 /// `folder_id | meeting_id | provider_id | record_type | schema_version`. `provider_id` is the note
 /// provider for note rows, or a fixed sentinel for transcript/timeline rows (which have no provider).
-fn aad_content(
-    folder_id: &str,
-    meeting_id: &str,
-    provider_id: &str,
-    record_type: &str,
-) -> Vec<u8> {
+fn aad_content(folder_id: &str, meeting_id: &str, provider_id: &str, record_type: &str) -> Vec<u8> {
     format!(
         "murmur:content:v{AAD_SCHEMA_VERSION}|folder={folder_id}|meeting={meeting_id}|provider={provider_id}|type={record_type}"
     )
@@ -6609,7 +6893,8 @@ fn aad_document(folder_id: &str, document_id: &str) -> Vec<u8> {
 /// carry exactly this NON-empty AAD) still decrypt — see [`aad_audio_role`] and
 /// [`crate::crypto::decrypt_file_multi`].
 fn aad_audio(meeting_id: &str, folder_id: &str) -> Vec<u8> {
-    format!("murmur:audio:v{AAD_SCHEMA_VERSION}|meeting={meeting_id}|folder={folder_id}").into_bytes()
+    format!("murmur:audio:v{AAD_SCHEMA_VERSION}|meeting={meeting_id}|folder={folder_id}")
+        .into_bytes()
 }
 
 /// Which audio stream a `.enc` belongs to. Bound into the audio AAD ([`aad_audio_role`]) so the
@@ -6709,7 +6994,9 @@ fn session_unseal_audio(
     enc_path: Option<String>,
     aads: &[&[u8]],
 ) -> Result<Option<String>, AppError> {
-    let Some(enc_path) = enc_path else { return Ok(None) };
+    let Some(enc_path) = enc_path else {
+        return Ok(None);
+    };
     if !enc_path.ends_with(ENC_SUFFIX) {
         return Ok(None);
     }
@@ -6746,7 +7033,9 @@ fn permanent_unseal_audio(
     enc_path: Option<String>,
     aads: &[&[u8]],
 ) -> Result<Option<String>, AppError> {
-    let Some(enc_path) = enc_path else { return Ok(None) };
+    let Some(enc_path) = enc_path else {
+        return Ok(None);
+    };
     if !enc_path.ends_with(ENC_SUFFIX) {
         return Ok(None);
     }
@@ -6848,10 +7137,14 @@ fn seal_meeting_extras(
         state.db.set_meeting_audio_path(mid, Some(&enc))?;
     }
     let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
-    if let Some(enc) = seal_audio_at_rest(ck, mic, &aad_audio_role(mid, folder_id, StreamRole::Mic))? {
+    if let Some(enc) =
+        seal_audio_at_rest(ck, mic, &aad_audio_role(mid, folder_id, StreamRole::Mic))?
+    {
         state.db.set_meeting_mic_master_path(mid, Some(&enc))?;
     }
-    if let Some(enc) = seal_audio_at_rest(ck, sys, &aad_audio_role(mid, folder_id, StreamRole::Sys))? {
+    if let Some(enc) =
+        seal_audio_at_rest(ck, sys, &aad_audio_role(mid, folder_id, StreamRole::Sys))?
+    {
         state.db.set_meeting_sys_master_path(mid, Some(&enc))?;
     }
 
@@ -6959,8 +7252,9 @@ fn unseal_folder_extras(
             if let Some(blob) = &tl.data_blob {
                 let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
                 let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let data = String::from_utf8(pt)
-                    .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
+                let data = String::from_utf8(pt).map_err(|_| {
+                    AppError::Storage("decrypted timeline is not valid UTF-8".into())
+                })?;
                 state.db.restore_timeline_data(mid, &data)?;
             }
         }
@@ -6970,8 +7264,9 @@ fn unseal_folder_extras(
             if let Some(blob) = &rn.blob {
                 let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
                 let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let text = String::from_utf8(pt)
-                    .map_err(|_| AppError::Storage("decrypted manual notes is not valid UTF-8".into()))?;
+                let text = String::from_utf8(pt).map_err(|_| {
+                    AppError::Storage("decrypted manual notes is not valid UTF-8".into())
+                })?;
                 state.db.set_manual_notes(mid, &text)?;
             }
         }
@@ -7074,7 +7369,9 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
         }
         reblanked_doc_ids.push(d.id.clone());
     }
-    state.db.purge_doc_chunks_for_documents(&reblanked_doc_ids)?;
+    state
+        .db
+        .purge_doc_chunks_for_documents(&reblanked_doc_ids)?;
     Ok(())
 }
 
@@ -7097,8 +7394,9 @@ fn unseal_folder_extras_permanent(
             if let Some(blob) = &s.text_blob {
                 let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "segment");
                 let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let text = String::from_utf8(pt)
-                    .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
+                let text = String::from_utf8(pt).map_err(|_| {
+                    AppError::Storage("decrypted segment is not valid UTF-8".into())
+                })?;
                 state.db.restore_segment_text(&mid, s.idx, &text)?;
             }
         }
@@ -7108,8 +7406,9 @@ fn unseal_folder_extras_permanent(
             if let Some(blob) = &tl.data_blob {
                 let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "timeline");
                 let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let data = String::from_utf8(pt)
-                    .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
+                let data = String::from_utf8(pt).map_err(|_| {
+                    AppError::Storage("decrypted timeline is not valid UTF-8".into())
+                })?;
                 state.db.restore_timeline_data(&mid, &data)?;
             }
         }
@@ -7122,8 +7421,9 @@ fn unseal_folder_extras_permanent(
             if let Some(blob) = &rn.blob {
                 let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "manual_notes");
                 let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let text = String::from_utf8(pt)
-                    .map_err(|_| AppError::Storage("decrypted manual notes is not valid UTF-8".into()))?;
+                let text = String::from_utf8(pt).map_err(|_| {
+                    AppError::Storage("decrypted manual notes is not valid UTF-8".into())
+                })?;
                 state.db.set_manual_notes(&mid, &text)?;
             }
         }
@@ -7263,7 +7563,10 @@ fn vault_path(state: &AppState) -> Option<String> {
 /// about to be created) — the deepest EXISTING ancestor is canonicalized (so symlinks are resolved)
 /// and the remaining components are appended after rejecting any `..` / root / prefix component that
 /// could climb out. The vault root itself must exist (it is the user-configured directory).
-fn assert_in_vault(vault: &std::path::Path, candidate: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
+fn assert_in_vault(
+    vault: &std::path::Path,
+    candidate: &std::path::Path,
+) -> Result<std::path::PathBuf, AppError> {
     use std::path::Component;
 
     let root = vault
@@ -7287,9 +7590,9 @@ fn assert_in_vault(vault: &std::path::Path, candidate: &std::path::Path) -> Resu
                 // symlinks for the portion on disk.
                 let probe = existing.join(seg);
                 if probe.exists() {
-                    existing = probe
-                        .canonicalize()
-                        .map_err(|e| AppError::InvalidArg(format!("resolve path component: {e}")))?;
+                    existing = probe.canonicalize().map_err(|e| {
+                        AppError::InvalidArg(format!("resolve path component: {e}"))
+                    })?;
                 }
             }
             Component::CurDir => {}
@@ -7355,6 +7658,1270 @@ pub fn stop_voice_listener(app: &AppHandle) {
     if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
         l.stop();
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// M3-CLIENT — account (OPAQUE) + zero-knowledge link sharing (mode A). Spec §3/§4.7/§7.
+//
+// LOCK-CRITICAL. The binding invariants (audited by lock-security-reviewer):
+//   • `share_note_to_link` FIRST statement is `meeting_is_unlocked` → `AppError::Locked` (copies
+//     `export_note`). A sealed-not-unlocked meeting leaks NOTHING.
+//   • The note is cleaned (strip frontmatter + flatten wikilinks + strip obsidian://) BEFORE it
+//     enters the envelope — the `vault-titles-egress-leak` class (pure fn `share::envelope`).
+//   • The link key `L` NEVER leaves the device: it goes ONLY into the URL fragment, assembled
+//     LOCALLY; it is never in a request body, never logged, never ledgered (convertFileSrc-trap).
+//   • Every upload writes a CONTENT-FREE egress-ledger row (host + byte sizes only).
+//   • First-ever share requires explicit `share_egress_consented` (fail-closed, mirrors
+//     `consent_to_cloud_egress`). Share ops fail closed `Unavailable` when logged out.
+//   • `list_my_shares` masks a sealed-not-unlocked meeting's title (route through `meeting_is_unlocked`).
+//   • Session tokens + device id → Keychain only; MK → RAM only (`AccountSession`).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The FE-facing account status (camelCase). `loggedIn` = a session is present in RAM;
+/// `unlockedForSharing` = the MK is available so a share can actually be sealed this session.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStatus {
+    pub logged_in: bool,
+    /// Present when logged in: the account email (for display).
+    pub email: Option<String>,
+    /// True iff MK is in the session (a share can be created without re-auth).
+    pub unlocked_for_sharing: bool,
+    /// Whether the one-time share-egress consent has been granted (for the FE to show/skip the modal).
+    pub share_consented: bool,
+    /// Whether a sharing server is configured (a share is impossible without one).
+    pub server_configured: bool,
+}
+
+/// One row of `list_my_shares` (camelCase). Content-free by construction — the server holds no
+/// titles; the local title is added ONLY when the meeting is unlocked (else `null` + `locked:true`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyShareEntry {
+    pub share_id: String,
+    /// The share's local meeting title — `None` (and `locked:true`) when the meeting is sealed and
+    /// not session-unlocked, or when the share was created on another device (unknown locally).
+    pub title: Option<String>,
+    pub locked: bool,
+    pub rev: u32,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub revoked: bool,
+    pub download_count: u32,
+}
+
+/// Read the configured sharing-server base URL from the live config (empty ⇒ unset).
+fn share_base_url(state: &AppState) -> Result<String, AppError> {
+    Ok(state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .share_base_url
+        .clone())
+}
+
+/// `account_status` — is there a logged-in sharing account this session, and can it share?
+#[tauri::command]
+pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppError> {
+    let session = state
+        .account_session
+        .lock()
+        .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+    // Logged-in-but-locked survives a restart via the Keychain tokens even when MK isn't in RAM.
+    let persisted_email = crate::share::load_tokens()?.map(|t| t.email);
+    let (logged_in, email, unlocked) = match session.as_ref() {
+        Some(s) => (true, Some(s.email.clone()), true),
+        None => match persisted_email {
+            Some(e) => (true, Some(e), false),
+            None => (false, None, false),
+        },
+    };
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    Ok(AccountStatus {
+        logged_in,
+        email,
+        unlocked_for_sharing: unlocked,
+        share_consented: cfg.share_egress_consented,
+        server_configured: !cfg.share_base_url.trim().is_empty(),
+    })
+}
+
+/// `consent_to_share_egress` — grant the one-time SHARE-egress consent (§7 inv. 5). Fail-closed:
+/// until this is set, `share_note_to_link` refuses. Mirror of `consent_to_cloud_egress`.
+#[tauri::command]
+pub fn consent_to_share_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.grant_share_egress_consent(&state.db)?;
+    Ok(())
+}
+
+/// `revoke_share_egress` — revoke the share-egress consent (the next share is refused fail-closed).
+#[tauri::command]
+pub fn revoke_share_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.revoke_share_egress(&state.db)?;
+    Ok(())
+}
+
+/// `account_signup(email, password, save_recovery)` — create a sharing account (spec §3.1a/§4.3).
+///
+/// Runs the OPAQUE CLIENT registration, generates the account MK + identity keypair + (skippable)
+/// recovery phrase, wraps MK under `KEK_pw`, and uploads everything at `provision`/`provision/finish`.
+/// The password never leaves the device. The email verification is a two-step flow: the server
+/// emails a 6-digit code; the FE collects it and passes it here as `code`. Returns the recovery
+/// phrase (24 words) ONLY when `save_recovery` is true (else `None` — skipped, §4.3).
+#[tauri::command]
+pub async fn account_signup(
+    state: State<'_, AppState>,
+    email: String,
+    code: String,
+    password: String,
+    save_recovery: bool,
+) -> Result<Option<String>, AppError> {
+    let base = share_base_url(state.inner())?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let password = Zeroizing::new(password);
+
+    // 1. Exchange the emailed verification code for a single-use signup token.
+    let signup_token = client.verify_email(email.trim(), code.trim()).await?;
+
+    // 2. OPAQUE registration step 1 → server RegistrationResponse.
+    let reg_start = crate::share::opaque_client::client_registration_start(password.as_bytes())?;
+    let reg_response = client
+        .provision(&signup_token, reg_start.request_bytes)
+        .await?;
+
+    // 3. OPAQUE registration step 2 → the upload + the stable export_key.
+    let (upload_bytes, export_key) = crate::share::opaque_client::client_registration_finish(
+        reg_start.state,
+        password.as_bytes(),
+        &reg_response,
+    )?;
+    let export_key = Zeroizing::new(export_key);
+
+    // 4. Generate the account key hierarchy (§4.1). The server has already minted the user id at
+    //    provision-time, but we don't learn it until provision/finish; the identity-slot + MK-wrap
+    //    AAD bind to the account id. We use the VERIFIED email as the stable account identifier here
+    //    (the server's credential_identifier is the email — see auth::provision), matching the login
+    //    unwrap which re-derives the same acct binding. (A follow-up can switch to the server user_id
+    //    once provision returns it before finish; deferred — keep the AAD stable across signup/login.)
+    let acct_id = email.trim().to_string();
+    let mk = crate::e2ee::keys::generate_master_key()?;
+    let kek_pw = crate::e2ee::keys::derive_kek_pw(&export_key)?;
+    let mk_wrap_pw = crate::e2ee::keys::wrap_mk_pw(&mk, &kek_pw, &acct_id)?;
+
+    // M5 enablement: DERIVE the identity keypair deterministically from MK (not a stored random one),
+    // so a fresh login on this or a second Mac re-derives the SAME sk_enc/sk_sig from MK and can
+    // send/accept mode-B shares. The published bundle below is the derived public half.
+    let identity = crate::e2ee::keys::derive_identity(&mk, &acct_id, 1)?;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let (bundle, bundle_sig) =
+        crate::e2ee::keys::build_identity_bundle(&identity, &acct_id, 1, &created_at)?;
+
+    // 5. (Skippable §4.3) recovery phrase: wrap MK under RK and RK under MK, upload both wraps.
+    let (recovery_phrase, mk_wrap_rk, rk_wrap_mk) = if save_recovery {
+        let (phrase, rk) = crate::e2ee::recovery::generate_recovery_phrase()?;
+        let mk_wrap_rk = crate::e2ee::recovery::wrap_mk_rk(&mk, &rk, &acct_id)?;
+        let rk_wrap_mk = crate::e2ee::recovery::wrap_rk_mk(&rk, &mk, &acct_id)?;
+        (Some(phrase), Some(mk_wrap_rk), Some(rk_wrap_mk))
+    } else {
+        (None, None, None)
+    };
+
+    // 6. Atomic provision/finish — activate the account with all the key material.
+    let finish_req = murmur_protocol::dto::ProvisionFinishRequest {
+        signup_token,
+        opaque_registration_upload: upload_bytes,
+        mk_wrap_pw,
+        mk_wrap_rk,
+        rk_wrap_mk,
+        bundle: murmur_protocol::dto::PublicKeyBundle {
+            generation: bundle.generation,
+            pk_enc: bundle.pk_enc.clone(),
+            pk_sig: bundle.pk_sig.clone(),
+            bundle_sig,
+        },
+    };
+    let _user_id = client.provision_finish(finish_req).await?;
+
+    // Content-free ledger row for the provisioning upload (host + a coarse size).
+    crate::share::ledger_row(&state.db, &client.host(), "account_provision", 0);
+
+    // Signup does NOT auto-login (the FE prompts a login next); no tokens stored yet.
+    Ok(recovery_phrase)
+}
+
+/// `account_login(email, password) -> AccountStatus` — OPAQUE login; unwrap MK from the server's
+/// `mkWrapPw` via the login `export_key`; keep MK for the session; store tokens in the Keychain.
+#[tauri::command]
+pub async fn account_login(
+    state: State<'_, AppState>,
+    email: String,
+    password: String,
+) -> Result<AccountStatus, AppError> {
+    let base = share_base_url(state.inner())?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let password = Zeroizing::new(password);
+    let acct_id = email.trim().to_string();
+
+    // OPAQUE login (3 messages).
+    let login_start = crate::share::opaque_client::client_login_start(password.as_bytes())?;
+    let start = client
+        .login_start(acct_id.as_str(), login_start.ke1_bytes)
+        .await?;
+    let (ke3, export_key) = crate::share::opaque_client::client_login_finish(
+        login_start.state,
+        password.as_bytes(),
+        &start.ke2,
+    )?;
+    let export_key = Zeroizing::new(export_key);
+    let finish = client
+        .login_finish(&start.login_id, ke3, crate::share::device_platform())
+        .await?;
+
+    // TOTP/MFA is not wired in the M3 client — if the server demands a second factor, fail cleanly
+    // (the session fields are then absent). A follow-up milestone adds the `mfa_token` leg.
+    if finish.mfa_required {
+        return Err(AppError::Unavailable(
+            "this account has two-factor auth enabled — not yet supported in the app".into(),
+        ));
+    }
+    let (Some(access_token), Some(refresh_token), Some(device_id), Some(key_material)) = (
+        finish.access_token,
+        finish.refresh_token,
+        finish.device_id,
+        finish.key_material,
+    ) else {
+        return Err(AppError::Auth("login did not return a session".into()));
+    };
+
+    // Unwrap MK from the server-stored mk_wrap_pw using KEK_pw = HKDF(export_key). A wrong password
+    // would have failed the OPAQUE finish above; a tampered mk_wrap fails closed here (AAD/AEAD).
+    let kek_pw = crate::e2ee::keys::derive_kek_pw(&export_key)?;
+    let mk = crate::e2ee::keys::unwrap_mk_pw(&key_material.mk_wrap_pw, &kek_pw, &acct_id)?;
+    let generation = key_material.current_generation.unwrap_or(1);
+
+    // Persist tokens to the Keychain (never SQLite, never logged).
+    crate::share::store_tokens(&crate::share::PersistedTokens {
+        access_token: access_token.clone(),
+        refresh_token,
+        device_id: device_id.clone(),
+        email: acct_id.clone(),
+        account_id: acct_id.clone(),
+    })?;
+
+    // Cache the session (MK in RAM, zeroized on drop).
+    {
+        let mut session = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        *session = Some(crate::share::AccountSession {
+            account_id: acct_id.clone(),
+            email: acct_id.clone(),
+            device_id,
+            mk: Zeroizing::new(*mk),
+            generation,
+            access_token,
+        });
+    }
+
+    crate::share::ledger_row(&state.db, &client.host(), "account_login", 0);
+    account_status(state)
+}
+
+/// `account_logout()` — best-effort server logout, clear the Keychain tokens + drop the session MK.
+#[tauri::command]
+pub async fn account_logout(state: State<'_, AppState>) -> Result<(), AppError> {
+    // Best-effort server-side family revoke (ignore network errors — local logout still proceeds).
+    if let (Ok(base), Ok(Some(access))) =
+        (share_base_url(state.inner()), crate::share::access_token())
+    {
+        if !base.trim().is_empty() {
+            if let Ok(client) = crate::share::client::ShareClient::new(&base) {
+                let _ = client.logout(&access).await;
+            }
+        }
+    }
+    crate::share::clear_tokens()?;
+    if let Ok(mut session) = state.account_session.lock() {
+        *session = None; // drops the AccountSession → zeroizes MK.
+    }
+    Ok(())
+}
+
+/// `share_note_to_link(meeting_id, expires_days?, password?) -> String` — create a zero-knowledge
+/// mode-A link share of a note and return the share URL. See the LOCK-CRITICAL invariants above.
+#[tauri::command]
+pub async fn share_note_to_link(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    expires_days: Option<u32>,
+    password: Option<String>,
+) -> Result<String, AppError> {
+    share_note_to_link_inner(state.inner(), meeting_id, expires_days, password).await
+}
+
+/// Core of [`share_note_to_link`] over `&AppState` so the lock gate + consent gate are unit-testable
+/// headless (no Tauri `State`, no server). The gate order is normative — DO NOT reorder.
+pub(crate) async fn share_note_to_link_inner(
+    state: &AppState,
+    meeting_id: String,
+    expires_days: Option<u32>,
+    password: Option<String>,
+) -> Result<String, AppError> {
+    // (1) READ-GATE — FIRST statement (copies `export_note`). A sealed-not-unlocked meeting refuses.
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to share the note".into(),
+        ));
+    }
+
+    // (7) First-ever share = explicit consent (fail-closed, mirrors cloud egress).
+    // (8) Logged out ⇒ fail closed Unavailable. A mode-A link share needs a live session (the bearer
+    //     token) but NOT the account MK — `L`/`NK` are per-share random (MK binds only mode-B grants),
+    //     so we require login + hold the access token; MK stays untouched in the session.
+    let (access_token, base) = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.share_egress_consented {
+            return Err(AppError::Unavailable(
+                "sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+        let base = cfg.share_base_url.clone();
+        drop(cfg);
+        let session_guard = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        let session = crate::share::require_login(&session_guard)?;
+        (session.access_token.clone(), base)
+    };
+
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (2) Fetch the note via the gated read, and its display title/timestamp.
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let meeting = state.db.get_meeting(&meeting_id)?;
+    let title = meeting
+        .as_ref()
+        .and_then(|m| m.title.clone())
+        .unwrap_or_else(|| "Shared note".to_string());
+    let created_at = meeting
+        .as_ref()
+        .map(|m| m.started_at.clone())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    // (2 cont.) Clean the body: strip frontmatter + flatten wikilinks + strip obsidian:// (pure fn).
+    let clean_body = crate::share::envelope::clean_note_body(&note.markdown);
+
+    // (3) Build the inner envelope + seal a fresh link share (e2ee M2). rev starts at 1.
+    let share_id = crate::share::new_share_id();
+    let rev = 1u32;
+    let env = murmur_protocol::envelope::ShareEnvelope::new(title, clean_body, created_at);
+    let pw_ref = password.as_deref().filter(|s| !s.is_empty());
+    let sealed = crate::e2ee::link::seal_link_share(&env, &share_id, rev, pw_ref)?;
+
+    // (4) Upload: content cell + wrapped_nk + gate_salt + gate_secret + rev + passwordRequired.
+    //     L is NOT in this request (CreateShareRequest has no `l` field) — it stays on-device.
+    let expires_at = expires_days.map(|d| {
+        let days = d.min(365).max(1) as i64;
+        (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+    });
+    let argon = if pw_ref.is_some() {
+        Some(murmur_protocol::dto::ArgonParams {
+            m: sealed.argon_params.m_cost_kib,
+            t: sealed.argon_params.t_cost,
+            p: sealed.argon_params.p_cost,
+        })
+    } else {
+        None
+    };
+    let cell_bytes = sealed.ciphertext_cell.len();
+    let create_req = murmur_protocol::dto::CreateShareRequest {
+        share_id: share_id.clone(),
+        mode: murmur_protocol::dto::ShareMode::Link,
+        content_cell: sealed.ciphertext_cell,
+        wrapped_nk: sealed.wrapped_nk,
+        gate_salt: sealed.gate_salt.to_vec(),
+        gate_secret: sealed.gate_secret.to_vec(),
+        rev,
+        password_required: pw_ref.is_some(),
+        argon,
+        expires_at,
+        max_downloads: None,
+        // Mode A: no per-recipient wrapped keys (that is mode B / §4.8). Absent for link shares.
+        recipients: None,
+    };
+    let created = client.create_share(&access_token, create_req).await?;
+
+    // (6) CONTENT-FREE egress ledger row (host + byte size). NEVER the URL / L / title.
+    crate::share::ledger_row(&state.db, &client.host(), "share_create", cell_bytes);
+    // Local bookkeeping — share_id + meeting_id only (NO title column).
+    state.db.insert_outbound_share(
+        &share_id,
+        &meeting_id,
+        "link",
+        rev,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+
+    // (5) Assemble the URL LOCALLY — L goes ONLY into the fragment; never logged/ledgered.
+    let base_for_url = if created.share_base_url.trim().is_empty() {
+        base
+    } else {
+        created.share_base_url
+    };
+    Ok(crate::share::assemble_share_url(
+        &base_for_url,
+        &share_id,
+        &sealed.l,
+    ))
+}
+
+/// `list_my_shares() -> Vec<MyShareEntry>` — the server's share list, with each entry's local title
+/// added ONLY when the meeting is unlocked (a sealed-not-unlocked meeting is MASKED: `locked:true`,
+/// no title). §7 inv. 6.
+#[tauri::command]
+pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEntry>, AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.list_shares(&access).await?;
+
+    let mut out = Vec::with_capacity(resp.shares.len());
+    for s in resp.shares {
+        // Resolve the local meeting for this share (None ⇒ created on another device ⇒ masked).
+        let (title, locked) = match state.db.outbound_share_meeting(&s.share_id)? {
+            Some(meeting_id) => {
+                if meeting_is_unlocked(state.inner(), &meeting_id)? {
+                    let t = state.db.get_meeting(&meeting_id)?.and_then(|m| m.title);
+                    (t, false)
+                } else {
+                    // Sealed-and-not-unlocked ⇒ MASK the title.
+                    (None, true)
+                }
+            }
+            None => (None, true),
+        };
+        out.push(MyShareEntry {
+            share_id: s.share_id,
+            title,
+            locked,
+            rev: s.rev,
+            created_at: s.created_at,
+            expires_at: s.expires_at,
+            revoked: s.revoked_at.is_some(),
+            download_count: s.download_count,
+        });
+    }
+    Ok(out)
+}
+
+/// `revoke_share(share_id)` — DELETE the server ciphertext + flip the local state. Idempotent.
+#[tauri::command]
+pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client.revoke_share(&access, &share_id).await?;
+    state.db.set_outbound_share_state(&share_id, "revoked")?;
+    crate::share::ledger_row(&state.db, &client.host(), "share_revoke", 0);
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// M5-CLIENT — Murmur↔Murmur (mode B). Spec §4.8 / §6 / §7. THE HIGHEST LOCK BAR: `accept_share`
+// WRITES into the user's Obsidian vault, so it is gated + verified before a single byte lands.
+//
+// Binding invariants (audited by lock-security-reviewer):
+//   • `share_note_to_user` FIRST statement is `meeting_is_unlocked` → `AppError::Locked` (copies
+//     `export_note`); then consent + login; then the note is CLEANED before enveloping; the request
+//     carries ONLY ciphertext + the recipient EMAIL + wrapped keys — NEVER a title or note text.
+//   • TOFU: on a `keys/lookup`, first contact PINS (on the stable account_id, not email) + shows the
+//     safety-word fingerprint; an UNCHANGED pin proceeds; a CHANGED fingerprint BLOCKS (spec §4.8 —
+//     key change is blocking, never click-through).
+//   • `accept_share`: WRITE-GATE the target folder FIRST (default = an auto-created UNSEALED "Shared"
+//     folder; a sealed-not-unlocked target is refused `AppError::Locked`); then the §4.8 signature +
+//     binding verification via `open_from_sender` (HARD-FAILS unsigned/tampered/replayed/swapped/
+//     gen-mismatch) BEFORE any write — on failure it writes NOTHING; IDEMPOTENT on `share_id`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The read-only result of previewing a recipient (spec §4.8): is the address a Murmur account, its
+/// safety-word fingerprint, and whether this is first contact (show + confirm) or a BLOCKING key
+/// change (re-verify out of band). Mutates NO pin — the FE shows this before the user commits.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientPreview {
+    pub registered: bool,
+    pub fingerprint: Option<String>,
+    pub first_contact: bool,
+    pub key_changed: bool,
+}
+
+/// The outcome of `share_note_to_user`: `"sent"` (recipient was a registered account, wrapped now) or
+/// `"invited"` (unregistered → a pending invite; a re-wrap follows when they register). The
+/// `fingerprint` is present for a registered recipient (the safety word the FE can echo).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareToUserResult {
+    pub status: String,
+    pub fingerprint: Option<String>,
+}
+
+/// One incoming (pending-accept) share in the inbox. CONTENT-FREE by construction — no title exists
+/// server-side; the title only materializes locally on accept (inside the verified envelope).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareInboxItem {
+    pub share_id: String,
+    pub sender_fingerprint: String,
+    pub rev: u32,
+    pub size: u64,
+    pub created_at: String,
+    /// Already accepted locally (idempotency) — the FE can render it as done.
+    pub already_accepted: bool,
+}
+
+/// The result of accepting a share: the new local meeting + its title (now known, from the verified
+/// envelope).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedShare {
+    pub meeting_id: String,
+    pub title: String,
+}
+
+/// The TOFU state of a contact's current key vs the local pin.
+enum TofuState {
+    /// Never pinned — first contact (pin it, show safety words).
+    FirstContact,
+    /// The pin matches the current key — proceed.
+    Match,
+    /// The pin DIFFERS — a key change; BLOCK until re-verified (spec §4.8).
+    Changed,
+}
+
+/// Normalize an email for use as a stable pin key + server lookup (trim + lowercase).
+fn norm_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Compare a contact's current `fingerprint` to the local pin WITHOUT mutating anything.
+fn tofu_check(
+    db: &crate::storage::Db,
+    account_id: &str,
+    fingerprint: &str,
+) -> Result<TofuState, AppError> {
+    match db.get_pinned_contact(account_id)? {
+        None => Ok(TofuState::FirstContact),
+        Some((_, pinned)) if pinned == fingerprint => Ok(TofuState::Match),
+        Some(_) => Ok(TofuState::Changed),
+    }
+}
+
+/// The logged-in sharing session's `(account_id, generation, MK, access_token)`, or a fail-closed
+/// `Unavailable` when logged out (mode-B needs MK to DERIVE the identity keypair for sign/open).
+fn require_session_mk(
+    state: &AppState,
+) -> Result<(String, u32, zeroize::Zeroizing<[u8; 32]>, String), AppError> {
+    let g = state
+        .account_session
+        .lock()
+        .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+    let s = crate::share::require_login(&g)?;
+    Ok((
+        s.account_id.clone(),
+        s.generation,
+        zeroize::Zeroizing::new(*s.mk),
+        s.access_token.clone(),
+    ))
+}
+
+/// The configured vault path (empty ⇒ `None`), read over `&AppState`.
+fn config_vault(state: &AppState) -> Option<String> {
+    state
+        .config
+        .lock()
+        .ok()
+        .and_then(|c| c.vault_path.clone())
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// `preview_share_recipient(email)` — is the address a Murmur account, and (if so) its fingerprint +
+/// TOFU state. Read-only (pins nothing). Requires login + a configured server.
+#[tauri::command]
+pub async fn preview_share_recipient(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<RecipientPreview, AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.lookup_key(&access, email.trim()).await?;
+    let Some(key) = resp.key.filter(|_| resp.registered) else {
+        return Ok(RecipientPreview {
+            registered: false,
+            fingerprint: None,
+            first_contact: false,
+            key_changed: false,
+        });
+    };
+    // Recompute the fingerprint locally (never trust the server's string blindly).
+    let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+    // Pin/check on the STABLE server account id (not the email) so send + accept share one namespace.
+    let (first_contact, key_changed) = match tofu_check(&state.db, &key.user_id, &fp)? {
+        TofuState::FirstContact => (true, false),
+        TofuState::Match => (false, false),
+        TofuState::Changed => (false, true),
+    };
+    Ok(RecipientPreview {
+        registered: true,
+        fingerprint: Some(fp),
+        first_contact,
+        key_changed,
+    })
+}
+
+/// `share_note_to_user(meeting_id, recipient_email, expires_days?)` — mode-B share (spec §4.8/§7).
+#[tauri::command]
+pub async fn share_note_to_user(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    recipient_email: String,
+    expires_days: Option<u32>,
+) -> Result<ShareToUserResult, AppError> {
+    share_note_to_user_inner(state.inner(), meeting_id, recipient_email, expires_days).await
+}
+
+/// Core of [`share_note_to_user`] over `&AppState`. Gate order is normative — DO NOT reorder.
+pub(crate) async fn share_note_to_user_inner(
+    state: &AppState,
+    meeting_id: String,
+    recipient_email: String,
+    expires_days: Option<u32>,
+) -> Result<ShareToUserResult, AppError> {
+    // (1) READ-GATE — FIRST statement (copies `export_note`). A sealed-not-unlocked meeting refuses.
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to share the note".into(),
+        ));
+    }
+
+    // (2) consent (fail-closed, first-ever share) + login (needs MK to derive sk_sig for the grant).
+    let base = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.share_egress_consented {
+            return Err(AppError::Unavailable(
+                "sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+        cfg.share_base_url.clone()
+    };
+    let (account_id, generation, mk, access_token) = require_session_mk(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (3) Fetch + CLEAN the note (gated read), build the inner envelope, seal a fresh NK.
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let meeting = state.db.get_meeting(&meeting_id)?;
+    let title = meeting
+        .as_ref()
+        .and_then(|m| m.title.clone())
+        .unwrap_or_else(|| "Shared note".to_string());
+    let created_at = meeting
+        .as_ref()
+        .map(|m| m.started_at.clone())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let clean_body = crate::share::envelope::clean_note_body(&note.markdown);
+
+    let share_id = crate::share::new_share_id();
+    let rev = 1u32;
+    let nk = crate::e2ee::random_key32()?;
+    let env = murmur_protocol::envelope::ShareEnvelope::new(title, clean_body, created_at);
+    let content_cell = crate::e2ee::seal_content(&nk, &env, &share_id, rev)?;
+    let content_hash = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&content_cell).to_vec()
+    };
+
+    // (4) Look up the recipient → TOFU pin/verify; wrap-now (registered) or invite (unregistered).
+    let recipient_email = recipient_email.trim().to_string();
+    let recipient_acct = norm_email(&recipient_email);
+    let lookup = client.lookup_key(&access_token, &recipient_email).await?;
+
+    let expires_at = expires_days.map(|d| {
+        let days = d.clamp(1, 365) as i64;
+        (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+    });
+
+    let (recipients, status, fingerprint) =
+        if let Some(key) = lookup.key.filter(|_| lookup.registered) {
+            // Registered → verify the fingerprint + enforce TOFU (BLOCK on a changed key), then wrap now.
+            let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+            match tofu_check(&state.db, &key.user_id, &fp)? {
+                TofuState::Changed => {
+                    return Err(AppError::Other(anyhow::anyhow!(
+                    "this contact's key changed since you last shared — re-verify the safety words \
+                     out of band, then share again"
+                )));
+                }
+                _ => state.db.pin_contact(
+                    &key.user_id,
+                    Some(&recipient_email),
+                    &fp,
+                    &chrono::Utc::now().to_rfc3339(),
+                )?,
+            }
+
+            // Derive OUR identity from MK and sign the grant (fingerprints are the party ids in the grant).
+            let sender = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+            let sender_fp = crate::e2ee::key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+            let grant = crate::e2ee::wrap::seal_to_recipient(
+                &nk,
+                &content_cell,
+                &key.pk_enc,
+                &fp, // recipient_acct_id = recipient fingerprint
+                &sender,
+                &sender_fp, // sender_acct_id = our fingerprint
+                generation,
+                &share_id,
+                rev,
+            )?;
+            let wrapped_key =
+                crate::e2ee::wrap::pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant)?;
+            let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+                email: recipient_email.clone(),
+                wrapped_key: Some(wrapped_key),
+                key_generation: Some(generation),
+                grant_sig: Some(grant.signature),
+            }];
+            // Retain NK + content_hash locally so an "Update share" / re-wrap can reuse them; state 'sent'.
+            state.db.insert_outbound_user_share(
+                &share_id,
+                &meeting_id,
+                rev,
+                &chrono::Utc::now().to_rfc3339(),
+                "sent",
+                &*nk,
+                &recipient_acct,
+                &recipient_email,
+                &content_hash,
+            )?;
+            (recipients, "sent".to_string(), Some(fp))
+        } else {
+            // Unregistered → an invite; retain NK + content_hash for the on-launch re-wrap ('awaiting_key').
+            let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+                email: recipient_email.clone(),
+                wrapped_key: None,
+                key_generation: None,
+                grant_sig: None,
+            }];
+            state.db.insert_outbound_user_share(
+                &share_id,
+                &meeting_id,
+                rev,
+                &chrono::Utc::now().to_rfc3339(),
+                "awaiting_key",
+                &*nk,
+                &recipient_acct,
+                &recipient_email,
+                &content_hash,
+            )?;
+            (recipients, "invited".to_string(), None)
+        };
+
+    // (5) Upload — mode='user'; the link fields are unused (empty). NO note content/title in the body.
+    let create_req =
+        assemble_user_share_request(&share_id, rev, content_cell.clone(), recipients, expires_at);
+    let _ = client.create_user_share(&access_token, create_req).await?;
+
+    // (6) CONTENT-FREE egress ledger (host + cell byte size). NEVER a title / note text / key.
+    crate::share::ledger_row(
+        &state.db,
+        &client.host(),
+        if status == "sent" {
+            "share_user_send"
+        } else {
+            "share_user_invite"
+        },
+        content_cell.len(),
+    );
+
+    Ok(ShareToUserResult {
+        status,
+        fingerprint,
+    })
+}
+
+/// Assemble the `POST /v1/shares` body for a mode-B share. PURE (so a test can assert the serialized
+/// request carries NO note title / body — only ciphertext + wrapped keys + the recipient email).
+fn assemble_user_share_request(
+    share_id: &str,
+    rev: u32,
+    content_cell: Vec<u8>,
+    recipients: Vec<murmur_protocol::dto::ShareRecipientInput>,
+    expires_at: Option<String>,
+) -> murmur_protocol::dto::CreateShareRequest {
+    murmur_protocol::dto::CreateShareRequest {
+        share_id: share_id.to_string(),
+        mode: murmur_protocol::dto::ShareMode::User,
+        content_cell,
+        // Mode-B: the link fields are unused (the NK is wrapped per-recipient via HPKE instead).
+        wrapped_nk: Vec::new(),
+        gate_salt: Vec::new(),
+        gate_secret: Vec::new(),
+        rev,
+        password_required: false,
+        argon: None,
+        expires_at,
+        max_downloads: None,
+        recipients: Some(recipients),
+    }
+}
+
+/// `share_rewrap_pending()` — for each locally-retained mode-B invite whose recipient has since
+/// registered, re-wrap the retained NK to their now-published key and attach it (`PUT /shares/{id}/
+/// keys`). Reads ONLY key material + retained NK (never meeting content) → no read-gate. Returns the
+/// number of shares advanced to `sent`.
+#[tauri::command]
+pub async fn share_rewrap_pending(state: State<'_, AppState>) -> Result<u32, AppError> {
+    share_rewrap_pending_inner(state.inner()).await
+}
+
+pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, AppError> {
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(0);
+    }
+    // Logged out ⇒ nothing to do (not an error — this is a best-effort launch sweep).
+    let Ok((account_id, generation, mk, access_token)) = require_session_mk(state) else {
+        return Ok(0);
+    };
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let sender = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+    let sender_fp = crate::e2ee::key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+
+    let mut advanced = 0u32;
+    for (share_id, rev, nk_bytes, recipient_email, content_hash) in
+        state.db.list_awaiting_rewrap()?
+    {
+        // Re-look-up the recipient. Not registered yet / lookup error ⇒ leave it pending.
+        let Ok(lookup) = client.lookup_key(&access_token, &recipient_email).await else {
+            continue;
+        };
+        let Some(key) = lookup.key.filter(|_| lookup.registered) else {
+            continue;
+        };
+        let fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
+        // A changed key on a not-yet-pinned invitee is first contact; a CHANGED existing pin is
+        // blocking — skip it (don't silently re-wrap to a rotated key). Pin on the STABLE server
+        // account id (not email) so send + accept share one namespace.
+        match tofu_check(&state.db, &key.user_id, &fp)? {
+            TofuState::Changed => continue,
+            _ => state.db.pin_contact(
+                &key.user_id,
+                Some(&recipient_email),
+                &fp,
+                &chrono::Utc::now().to_rfc3339(),
+            )?,
+        }
+        let Ok(nk_arr) = crate::e2ee::to_arr32(&nk_bytes) else {
+            continue;
+        };
+        let nk = zeroize::Zeroizing::new(nk_arr);
+        let grant = crate::e2ee::wrap::seal_to_recipient_with_hash(
+            &nk,
+            &content_hash,
+            &key.pk_enc,
+            &fp,
+            &sender,
+            &sender_fp,
+            generation,
+            &share_id,
+            rev,
+        )?;
+        let wrapped_key =
+            crate::e2ee::wrap::pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant)?;
+        // `PUT /shares/{id}/keys` keys the recipient row by the SERVER user id, which `keys/lookup`
+        // now returns (`key.user_id`) — so the attach resolves correctly (closes the earlier no-op
+        // gap). The re-wrap crypto above is complete + verified.
+        let attach = client
+            .attach_key(
+                &access_token,
+                &share_id,
+                murmur_protocol::dto::AttachKeyRequest {
+                    recipient_acct_id: key.user_id.clone(),
+                    wrapped_key,
+                    key_generation: generation,
+                    grant_sig: grant.signature,
+                },
+            )
+            .await;
+        if attach.is_ok() {
+            state.db.set_outbound_share_state(&share_id, "sent")?;
+            crate::share::ledger_row(&state.db, &client.host(), "share_user_rewrap", 0);
+            advanced += 1;
+        }
+    }
+    Ok(advanced)
+}
+
+/// `list_share_inbox()` — the caller's incoming pending-accept shares (content-free). No gate: no
+/// local content is read; each item's title is unknown until accept decrypts the envelope.
+#[tauri::command]
+pub async fn list_share_inbox(state: State<'_, AppState>) -> Result<Vec<ShareInboxItem>, AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.list_inbox(&access).await?;
+    let mut out = Vec::with_capacity(resp.items.len());
+    for i in resp.items {
+        let already_accepted = state.db.inbound_share_meeting(&i.share_id)?.is_some();
+        out.push(ShareInboxItem {
+            share_id: i.share_id,
+            sender_fingerprint: i.sender_fingerprint,
+            rev: i.rev,
+            size: i.size,
+            created_at: i.created_at,
+            already_accepted,
+        });
+    }
+    Ok(out)
+}
+
+/// `accept_share(share_id, folder_id?)` — THE HIGH-BAR vault WRITE. See the module invariants above.
+#[tauri::command]
+pub async fn accept_share(
+    state: State<'_, AppState>,
+    share_id: String,
+    folder_id: Option<String>,
+) -> Result<AcceptedShare, AppError> {
+    accept_share_inner(state.inner(), share_id, folder_id).await
+}
+
+pub(crate) async fn accept_share_inner(
+    state: &AppState,
+    share_id: String,
+    folder_id: Option<String>,
+) -> Result<AcceptedShare, AppError> {
+    // (1) IDEMPOTENT on share_id — a re-accept returns the existing meeting, never a duplicate note.
+    if let Some(mid) = state.db.inbound_share_meeting(&share_id)? {
+        let title = state
+            .db
+            .get_meeting(&mid)?
+            .and_then(|m| m.title)
+            .unwrap_or_else(|| "Shared note".to_string());
+        return Ok(AcceptedShare {
+            meeting_id: mid,
+            title,
+        });
+    }
+
+    // (2) WRITE-GATE the target folder FIRST (mirror `ingest_into_folder`). Default = an auto-created
+    //     UNSEALED "Shared" folder; a sealed-not-session-unlocked target is REFUSED (write nothing).
+    let target = resolve_accept_folder(state, folder_id.as_deref())?;
+
+    // (3) Need a session (MK derives the recipient identity for HPKE-open) + server.
+    let (account_id, generation, mk, access) = require_session_mk(state)?;
+    let base = share_base_url(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (4) Find the pending inbox item for this share.
+    let inbox = client.list_inbox(&access).await?;
+    let item = inbox
+        .items
+        .into_iter()
+        .find(|i| i.share_id == share_id)
+        .ok_or_else(|| {
+            AppError::InvalidArg(
+                "no pending share to accept (already accepted/declined, expired, or not addressed to you)"
+                    .into(),
+            )
+        })?;
+
+    // (5) Unpack the sender's public identity + grant from the opaque blob; ATTEST the fingerprint
+    //     against the server-relayed value, then TOFU (BLOCK on a changed key) — all before any write.
+    let up = crate::e2ee::wrap::unpack_wrapped_key(&item.wrapped_key, &item.grant_sig)?;
+    let sender_fp = crate::e2ee::key_fingerprint(&up.sender_pk_enc, &up.sender_pk_sig);
+    if sender_fp != item.sender_fingerprint {
+        return Err(AppError::InvalidArg(
+            "share sender identity does not match the server-attested fingerprint — refusing"
+                .into(),
+        ));
+    }
+    // TOFU: BLOCK on a changed key before doing any work. But DEFER pinning a first-contact key until
+    // AFTER a successful ingest (step 9 below) — otherwise a malicious server could pre-poison a pin
+    // with a first-contact item whose grant later fails verification (adversarial finding).
+    if matches!(
+        tofu_check(&state.db, &item.sender_user_id, &sender_fp)?,
+        TofuState::Changed
+    ) {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "this sender's key changed since you last accepted from them — re-verify the safety \
+             words out of band before accepting"
+        )));
+    }
+
+    // (6) Flip the server row to accepted (authorizes the blob fetch), then (7) fetch the content cell.
+    let accepted = client.accept_share_server(&access, &share_id).await?;
+    let content_cell = client.get_blob(&access, &accepted.blob_id).await?;
+
+    // (8) Derive OUR identity from MK; VERIFY (§4.8) + decrypt + ingest — writes NOTHING on failure.
+    let recipient = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+    let result = accept_ingest_verified(
+        state,
+        &target,
+        &recipient,
+        &sender_fp,
+        &item.sender_user_id,
+        &up,
+        &content_cell,
+        &share_id,
+        item.rev,
+        item.key_generation,
+    )?;
+
+    // (9) Pin the sender's key ONLY NOW — after the grant verified (§4.8) and the note actually landed
+    //     in the vault, so a failed/forged first-contact item never leaves a poisoned pin behind.
+    state.db.pin_contact(
+        &item.sender_user_id,
+        None,
+        &sender_fp,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+
+    crate::share::ledger_row(
+        &state.db,
+        &client.host(),
+        "share_accept",
+        content_cell.len(),
+    );
+    Ok(result)
+}
+
+/// Resolve + WRITE-GATE the folder an accepted share lands in. `Some(id)` uses that folder (refusing a
+/// sealed-not-unlocked one with `AppError::Locked`); `None` gets-or-creates the UNSEALED "Shared"
+/// folder.
+fn resolve_accept_folder(state: &AppState, folder_id: Option<&str>) -> Result<Folder, AppError> {
+    match folder_id {
+        Some(fid) => {
+            let f = state
+                .db
+                .folder_by_id(fid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no folder {fid}")))?;
+            if f.locked && !folder_is_unlocked(state, fid)? {
+                return Err(AppError::Locked(
+                    "the target folder is locked — unlock it first to accept the share into it"
+                        .into(),
+                ));
+            }
+            Ok(f)
+        }
+        None => get_or_create_shared_folder(state),
+    }
+}
+
+/// Get-or-create the UNSEALED "Shared" folder at the vault root (the default accept target). If it
+/// already exists and is sealed-not-unlocked, the write-gate refuses (`AppError::Locked`).
+fn get_or_create_shared_folder(state: &AppState) -> Result<Folder, AppError> {
+    const SHARED: &str = "Shared";
+    if let Some(f) = state.db.folder_by_path(SHARED)? {
+        if f.locked && !folder_is_unlocked(state, &f.id)? {
+            return Err(AppError::Locked(
+                "your \"Shared\" folder is locked — unlock it (or pick another folder) to accept"
+                    .into(),
+            ));
+        }
+        return Ok(f);
+    }
+    let folder = Folder {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: SHARED.to_string(),
+        path: SHARED.to_string(),
+        parent_id: None,
+        locked: false,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Some(vault) = config_vault(state) {
+        let dir = std::path::Path::new(&vault).join(SHARED);
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    state.db.insert_folder(&folder)?;
+    Ok(folder)
+}
+
+/// The load-bearing crypto+write step, factored out so it is unit-testable with a crafted grant + no
+/// network. It (a) VERIFIES the §4.8 grant via `open_from_sender` (HARD-FAILS unsigned / tampered /
+/// replayed / swapped / gen-mismatch), (b) decrypts the content cell, and ONLY THEN (c) ingests the
+/// note into the (already write-gated) folder. On ANY verification/decrypt failure it returns
+/// `AppError::InvalidArg` and writes NOTHING.
+#[allow(clippy::too_many_arguments)]
+fn accept_ingest_verified(
+    state: &AppState,
+    target: &Folder,
+    recipient: &crate::e2ee::keys::IdentityKeypair,
+    sender_fp: &str,
+    sender_user_id: &str,
+    up: &crate::e2ee::wrap::UnpackedGrant,
+    content_cell: &[u8],
+    share_id: &str,
+    rev: u32,
+    key_generation: u32,
+) -> Result<AcceptedShare, AppError> {
+    let recipient_fp = crate::e2ee::key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+    // (a) §4.8 VERIFY before any write. The pinned pk_sig is the one we unpacked + fingerprint-attested.
+    let nk = crate::e2ee::wrap::open_from_sender(
+        &up.grant,
+        content_cell,
+        recipient,
+        &recipient_fp, // recipient_acct_id
+        &recipient_fp, // self_acct_id
+        sender_fp,     // sender_acct_id (as signed)
+        key_generation,
+        sender_fp,         // pinned_sender_acct_id
+        &up.sender_pk_sig, // pinned_sender_pk_sig (attested to the server fingerprint upstream)
+        share_id,
+        rev,
+    )
+    .map_err(|_| {
+        AppError::InvalidArg(
+            "share grant failed verification (unsigned / tampered / replayed) — refusing to ingest"
+                .into(),
+        )
+    })?;
+    // (b) Decrypt the content cell → the inner envelope (title travels INSIDE).
+    let env = crate::e2ee::open_content(&nk, content_cell, share_id, rev).map_err(|_| {
+        AppError::InvalidArg("shared note failed to decrypt — refusing to ingest".into())
+    })?;
+    // (c) Ingest into the write-gated folder.
+    ingest_shared_note(state, target, &env, sender_fp, sender_user_id, share_id)
+}
+
+/// Write a VERIFIED shared note into the vault + DB: a new `Exported` meeting (audio `None`) + a
+/// `"shared"` note carrying `shared-by`/`shared-at`/`share-id` provenance frontmatter, atomically
+/// exported to the folder's vault subdir, and an `inbound_shares` idempotency record. The new meeting
+/// is a NORMAL row → it participates in every existing gate automatically.
+fn ingest_shared_note(
+    state: &AppState,
+    target: &Folder,
+    env: &murmur_protocol::envelope::ShareEnvelope,
+    sender_fp: &str,
+    sender_user_id: &str,
+    share_id: &str,
+) -> Result<AcceptedShare, AppError> {
+    let meeting_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    // A well-formed created_at (RFC3339) is kept; otherwise fall back to now (never trust the payload).
+    let started_at = if chrono::DateTime::parse_from_rfc3339(env.created_at.trim()).is_ok() {
+        env.created_at.trim().to_string()
+    } else {
+        now.clone()
+    };
+    let title = {
+        let t = env.title.trim();
+        if t.is_empty() {
+            "Shared note".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    // Provenance frontmatter. `shared-by` is the ATTESTED sender fingerprint (safe base32) — NEVER the
+    // attacker-controlled envelope, so a malicious sender can't forge/inject provenance.
+    let full_md = format!(
+        "---\nshared-by: {sender_fp}\nshared-at: {now}\nshare-id: {share_id}\n---\n\n{}",
+        env.markdown
+    );
+
+    // Meeting row (Exported, no audio), associated with the target folder.
+    state.db.insert_meeting(&Meeting {
+        id: meeting_id.clone(),
+        started_at: started_at.clone(),
+        ended_at: None,
+        title: Some(title.clone()),
+        duration_s: 0,
+        audio_path: None,
+        status: MeetingStatus::Exported,
+        folder_id: Some(target.id.clone()),
+    })?;
+
+    // Atomic vault export (best-effort — a missing/invalid vault just leaves exported_path None; the
+    // note is still durable in the DB, the source of truth).
+    let exported_path = config_vault(state).and_then(|vault| {
+        crate::export::write_note(
+            std::path::Path::new(&vault),
+            Some(&target.path),
+            &title,
+            &started_at,
+            &full_md,
+        )
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+    });
+
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: "shared".to_string(),
+        markdown: full_md,
+        created_at: now.clone(),
+        exported_path,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })?;
+    // The meeting's folder is resolved via `notes.folder_id` (`folder_for_meeting`) — set it so every
+    // gate (`meeting_is_unlocked`, `visibility_clause`) sees this note as living in the target folder.
+    state.db.set_note_folder(&meeting_id, Some(&target.id))?;
+
+    // Idempotency + provenance record (a re-accept of this share_id is INSERT-OR-IGNORE'd).
+    state
+        .db
+        .insert_inbound_share(share_id, &meeting_id, sender_user_id, &now)?;
+
+    tracing::info!(
+        target: "share",
+        share_id = %share_id,
+        meeting_id = %meeting_id,
+        folder_id = %target.id,
+        "accepted a shared note into the vault"
+    );
+    Ok(AcceptedShare { meeting_id, title })
+}
+
+/// `decline_share(share_id)` — drop the wrapped key server-side + flip the local state. Idempotent.
+#[tauri::command]
+pub async fn decline_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
+    let base = share_base_url(state.inner())?;
+    let access = crate::share::access_token()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client.decline_share_server(&access, &share_id).await?;
+    crate::share::ledger_row(&state.db, &client.host(), "share_decline", 0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7423,7 +8990,10 @@ mod lock_read_gate_tests {
         );
         let back = std::fs::read(&restored).unwrap();
         let _ = std::fs::remove_file(&restored);
-        assert_eq!(back, original, "master survives seal -> unseal byte-identical");
+        assert_eq!(
+            back, original,
+            "master survives seal -> unseal byte-identical"
+        );
     }
 
     /// REGRESSION (audio asset-protocol leak): `get_meeting_detail`'s masked DTO for a sealed-and-
@@ -7450,7 +9020,10 @@ mod lock_read_gate_tests {
         assert_eq!(masked.meeting.title.as_deref(), Some("🔒 Locked"));
         assert!(masked.note.is_none(), "no note while locked");
         assert!(masked.segments.is_empty(), "no segments while locked");
-        assert!(masked.locked, "locked flag set so the FE renders the unlock affordance");
+        assert!(
+            masked.locked,
+            "locked flag set so the FE renders the unlock affordance"
+        );
         // Non-content metadata is preserved so the FE can offer "unlock this folder".
         assert_eq!(masked.meeting.id, "m1");
         assert_eq!(masked.meeting.folder_id.as_deref(), Some("secret-folder"));
@@ -7505,8 +9078,12 @@ mod lock_read_gate_tests {
     fn assert_in_vault_accepts_legit_relative_and_nonexistent_leaf() {
         let vault = tmp_vault("ok");
         // A not-yet-existing nested target inside the vault is allowed (it's about to be created).
-        let resolved = assert_in_vault(&vault, std::path::Path::new("Projects/Q3/note.md")).unwrap();
-        assert!(resolved.starts_with(vault.canonicalize().unwrap()), "stays inside the vault root");
+        let resolved =
+            assert_in_vault(&vault, std::path::Path::new("Projects/Q3/note.md")).unwrap();
+        assert!(
+            resolved.starts_with(vault.canonicalize().unwrap()),
+            "stays inside the vault root"
+        );
         // The empty path resolves to the vault root itself.
         let root = assert_in_vault(&vault, std::path::Path::new("")).unwrap();
         assert_eq!(root, vault.canonicalize().unwrap());
@@ -7546,7 +9123,10 @@ mod lock_read_gate_tests {
             // Best-effort: if symlink creation fails (e.g. sandbox), skip the assertion.
             if std::os::unix::fs::symlink(&outside, &link).is_ok() {
                 let res = assert_in_vault(&vault, std::path::Path::new("escape-link/evil.md"));
-                assert!(res.is_err(), "a symlink that points outside the vault must be rejected");
+                assert!(
+                    res.is_err(),
+                    "a symlink that points outside the vault must be rejected"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&vault);
@@ -7560,13 +9140,35 @@ mod lock_read_gate_tests {
         // The five axes (folder, meeting, provider, record-type, schema-version) must each change
         // the AAD so a blob cannot be swapped across any of them.
         let base = aad_content("f", "m", "p", "note");
-        assert_ne!(base, aad_content("F", "m", "p", "note"), "folder axis binds");
-        assert_ne!(base, aad_content("f", "M", "p", "note"), "meeting axis binds");
-        assert_ne!(base, aad_content("f", "m", "P", "note"), "provider axis binds");
-        assert_ne!(base, aad_content("f", "m", "p", "segment"), "record-type axis binds");
+        assert_ne!(
+            base,
+            aad_content("F", "m", "p", "note"),
+            "folder axis binds"
+        );
+        assert_ne!(
+            base,
+            aad_content("f", "M", "p", "note"),
+            "meeting axis binds"
+        );
+        assert_ne!(
+            base,
+            aad_content("f", "m", "P", "note"),
+            "provider axis binds"
+        );
+        assert_ne!(
+            base,
+            aad_content("f", "m", "p", "segment"),
+            "record-type axis binds"
+        );
         // wrapped-CK and audio AADs are distinct namespaces from content.
-        assert_ne!(aad_wrapped_ck("f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
-        assert_ne!(aad_audio("m", "f"), aad_content("f", "m", AAD_NO_PROVIDER, "note"));
+        assert_ne!(
+            aad_wrapped_ck("f"),
+            aad_content("f", "m", AAD_NO_PROVIDER, "note")
+        );
+        assert_ne!(
+            aad_audio("m", "f"),
+            aad_content("f", "m", AAD_NO_PROVIDER, "note")
+        );
     }
 
     /// Stream-role hardening: each of the three per-meeting audio roles produces a DISTINCT AAD, and
@@ -7583,10 +9185,16 @@ mod lock_read_gate_tests {
         assert_ne!(mic, sys, "mic vs sys binds");
 
         let role_less = aad_audio("m", "f");
-        assert_ne!(role_less, mic, "the role form differs from the role-less form");
+        assert_ne!(
+            role_less, mic,
+            "the role form differs from the role-less form"
+        );
         // Each role form is the role-less string PLUS a |stream=… suffix → a role-less blob can never
         // match a role AAD, which is exactly why the decrypt ladder must also try the role-less rung.
-        assert!(mic.starts_with(&role_less), "role AAD extends the role-less form");
+        assert!(
+            mic.starts_with(&role_less),
+            "role AAD extends the role-less form"
+        );
         // The role-less form is the EXACT v1 string existing masters carry (no drift = no data loss).
         assert_eq!(role_less, b"murmur:audio:v1|meeting=m|folder=f".to_vec());
     }
@@ -7643,8 +9251,427 @@ mod lifecycle_tests {
             reactions_emitted: Mutex::new(HashSet::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
+            account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
         }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked
+    /// meeting MUST refuse with `AppError::Locked` BEFORE any note read / network / consent check — a
+    /// locked note can never be uploaded. This is the RED-before-GREEN regression for the leak class:
+    /// it runs with NO server configured + NO login, so a non-`Locked` return (e.g. it fell through to
+    /// the "not signed in"/"no server" errors) is a gate-order violation and fails the test.
+    #[test]
+    fn share_note_to_link_refuses_a_sealed_meeting() {
+        let state = build_state("share-lockgate");
+        // A locked folder holding a meeting + note.
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-locked".to_string(),
+                started_at: "2026-07-04T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-lock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-locked".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "---\nattendees:\n  - Alice\n---\n# secret".to_string(),
+                created_at: "2026-07-04T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        // Associate the note (hence the meeting) with the folder, then seal it. `meeting_is_unlocked`
+        // resolves the folder via `notes.folder_id` (`folder_for_meeting`), so this MUST be set or the
+        // meeting reads as vault-root/open and the gate is a no-op.
+        state
+            .db
+            .set_note_folder("m-locked", Some("f-lock"))
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let err = block_on(share_note_to_link_inner(
+            &state,
+            "m-locked".to_string(),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must fail closed with Locked, got: {err:?}"
+        );
+
+        // Session-unlock the folder → the gate passes, and the NEXT failure is the fail-closed
+        // consent/login gate (proving the Locked was the gate, not a downstream error).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        let err2 = block_on(share_note_to_link_inner(
+            &state,
+            "m-locked".to_string(),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented/logged-out share fails Unavailable, got: {err2:?}"
+        );
+    }
+
+    // ── M5-CLIENT (mode B) tests ──────────────────────────────────────────────────────────────────
+
+    use crate::e2ee::keys::{derive_identity, generate_master_key, IdentityKeypair};
+    use crate::e2ee::wrap::{pack_wrapped_key, seal_to_recipient, UnpackedGrant};
+    use crate::e2ee::{key_fingerprint, random_key32, seal_content};
+    use murmur_protocol::envelope::ShareEnvelope;
+
+    /// Build a `(sender, recipient)` identity pair from two fixed MKs (deterministic, no network).
+    fn mode_b_pair() -> (IdentityKeypair, [u8; 32], IdentityKeypair, [u8; 32]) {
+        let sender_mk = *generate_master_key().unwrap();
+        let recip_mk = *generate_master_key().unwrap();
+        let sender = derive_identity(&sender_mk, "sender@acct", 1).unwrap();
+        let recipient = derive_identity(&recip_mk, "recipient@acct", 1).unwrap();
+        (sender, sender_mk, recipient, recip_mk)
+    }
+
+    /// Craft the accept-side inputs a real inbox item + blob would carry: a valid grant sealed by
+    /// `sender` to `recipient`, packed into the opaque `wrapped_key`, plus the content cell `C`.
+    fn craft_valid_grant(
+        sender: &IdentityKeypair,
+        recipient: &IdentityKeypair,
+        env: &ShareEnvelope,
+        share_id: &str,
+        rev: u32,
+    ) -> (UnpackedGrant, Vec<u8>, String) {
+        let nk = random_key32().unwrap();
+        let content = seal_content(&nk, env, share_id, rev).unwrap();
+        let sender_fp = key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let recipient_fp = key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let grant = seal_to_recipient(
+            &nk,
+            &content,
+            &recipient.pk_enc,
+            &recipient_fp,
+            sender,
+            &sender_fp,
+            1,
+            share_id,
+            rev,
+        )
+        .unwrap();
+        let blob = pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant).unwrap();
+        let up = crate::e2ee::wrap::unpack_wrapped_key(&blob, &grant.signature).unwrap();
+        (up, content, sender_fp)
+    }
+
+    /// HIGH-BAR: `accept_share` refuses a SEALED (not-session-unlocked) target folder with `Locked`,
+    /// BEFORE any inbox/network/decrypt — RED-before-GREEN for the vault write-gate. Runs with NO
+    /// server + NO login, so a non-`Locked` return would mean the gate wasn't first.
+    #[test]
+    fn accept_share_refuses_a_sealed_target_folder() {
+        let state = build_state("accept-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked.
+        let before = state.db.list_meetings(1000).unwrap().len();
+        let err = block_on(accept_share_inner(
+            &state,
+            "share-xyz".to_string(),
+            Some("f-lock".to_string()),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed target must fail Locked, got {err:?}"
+        );
+        assert_eq!(
+            state.db.list_meetings(1000).unwrap().len(),
+            before,
+            "no meeting written"
+        );
+        assert!(
+            state
+                .db
+                .inbound_share_meeting("share-xyz")
+                .unwrap()
+                .is_none(),
+            "no inbound record"
+        );
+    }
+
+    /// The happy path: a VALID grant → verify + decrypt + ingest writes exactly one `Exported` meeting
+    /// with a `"shared"` note carrying provenance frontmatter (mode-B seal→open round-trip through the
+    /// command's ingest layer).
+    #[test]
+    fn accept_ingest_writes_a_verified_shared_note() {
+        let state = build_state("accept-happy");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _smk, recipient, _rmk) = mode_b_pair();
+        let env = ShareEnvelope::new(
+            "Q3 Strategy",
+            "- ship the thing\n- talk to Alice",
+            "2026-07-04T10:00:00Z",
+        );
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "share-1", 1);
+
+        let res = accept_ingest_verified(
+            &state,
+            &target,
+            &recipient,
+            &sender_fp,
+            "sender-uuid",
+            &up,
+            &content,
+            "share-1",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(res.title, "Q3 Strategy");
+        let note = state
+            .db
+            .get_note(&res.meeting_id, "shared")
+            .unwrap()
+            .unwrap();
+        assert!(
+            note.markdown.contains("ship the thing"),
+            "body ingested: {}",
+            note.markdown
+        );
+        assert!(
+            note.markdown.contains("shared-by: "),
+            "provenance frontmatter present"
+        );
+        assert!(
+            note.markdown.contains("share-id: share-1"),
+            "share-id provenance present"
+        );
+        // Idempotency record written; the meeting is a normal Exported row in the target folder.
+        assert_eq!(
+            state
+                .db
+                .inbound_share_meeting("share-1")
+                .unwrap()
+                .as_deref(),
+            Some(res.meeting_id.as_str())
+        );
+        let m = state.db.get_meeting(&res.meeting_id).unwrap().unwrap();
+        assert!(matches!(m.status, MeetingStatus::Exported));
+        assert!(m.audio_path.is_none(), "shared notes carry no audio");
+    }
+
+    /// The full `accept_share_inner` is idempotent on `share_id`: a second call after a successful
+    /// ingest returns the SAME meeting and writes no duplicate (short-circuits before any network).
+    #[test]
+    fn accept_share_is_idempotent_on_share_id() {
+        let state = build_state("accept-idem");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new("Dup", "body", "2026-07-04T10:00:00Z");
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "share-dup", 1);
+        let first = accept_ingest_verified(
+            &state,
+            &target,
+            &recipient,
+            &sender_fp,
+            "s",
+            &up,
+            &content,
+            "share-dup",
+            1,
+            1,
+        )
+        .unwrap();
+        let count = state.db.list_meetings(1000).unwrap().len();
+        // The command-level idempotency short-circuit returns the existing meeting with no network.
+        let again = block_on(accept_share_inner(&state, "share-dup".to_string(), None)).unwrap();
+        assert_eq!(again.meeting_id, first.meeting_id, "same meeting returned");
+        assert_eq!(
+            state.db.list_meetings(1000).unwrap().len(),
+            count,
+            "no duplicate meeting"
+        );
+    }
+
+    /// §4.8 BINDING through the command layer: an UNSIGNED (zeroed-sig) grant, a TAMPERED content
+    /// cell, and a REPLAY to the wrong recipient are ALL rejected `InvalidArg` and write NOTHING.
+    #[test]
+    fn accept_ingest_rejects_unsigned_tampered_and_replayed_grants() {
+        let state = build_state("accept-reject");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new("t", "body", "2026-07-04T10:00:00Z");
+
+        // (a) Unsigned: zero the grant signature.
+        let (mut up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-a", 1);
+        up.grant.signature = vec![0u8; 64];
+        let e = accept_ingest_verified(
+            &state, &target, &recipient, &sender_fp, "s", &up, &content, "s-a", 1, 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, AppError::InvalidArg(_)),
+            "unsigned must be rejected"
+        );
+
+        // (b) Tampered content: a different cell than the one the grant's hash binds.
+        let (up, _c, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-b", 1);
+        let evil = seal_content(
+            &random_key32().unwrap(),
+            &ShareEnvelope::new("t", "EVIL", "2026-07-04T10:00:00Z"),
+            "s-b",
+            1,
+        )
+        .unwrap();
+        let e = accept_ingest_verified(
+            &state, &target, &recipient, &sender_fp, "s", &up, &evil, "s-b", 1, 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, AppError::InvalidArg(_)),
+            "tampered cell must be rejected"
+        );
+
+        // (c) Replay to the WRONG recipient (grant addressed to `recipient`, opened by `attacker`).
+        let attacker =
+            derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-c", 1);
+        let e = accept_ingest_verified(
+            &state, &target, &attacker, &sender_fp, "s", &up, &content, "s-c", 1, 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, AppError::InvalidArg(_)),
+            "replay to a different recipient must be rejected"
+        );
+
+        // NONE of the three wrote a meeting or an inbound record.
+        assert_eq!(
+            state.db.list_meetings(1000).unwrap().len(),
+            0,
+            "no meeting written for any rejected grant"
+        );
+        for sid in ["s-a", "s-b", "s-c"] {
+            assert!(
+                state.db.inbound_share_meeting(sid).unwrap().is_none(),
+                "no inbound record for {sid}"
+            );
+        }
+    }
+
+    /// TOFU: first contact PINS (on the account_id, not email); the SAME fingerprint proceeds; a
+    /// CHANGED fingerprint for the same contact is a BLOCK (never a silent overwrite).
+    #[test]
+    fn tofu_first_contact_pins_and_a_changed_fingerprint_blocks() {
+        let state = build_state("tofu");
+        let acct = "alice@example.com";
+        // First contact: no pin yet.
+        assert!(matches!(
+            tofu_check(&state.db, acct, "FP-ORIGINAL").unwrap(),
+            TofuState::FirstContact
+        ));
+        state
+            .db
+            .pin_contact(
+                acct,
+                Some("Alice@Example.com"),
+                "FP-ORIGINAL",
+                "2026-07-04T00:00:00Z",
+            )
+            .unwrap();
+        // Same key → Match.
+        assert!(matches!(
+            tofu_check(&state.db, acct, "FP-ORIGINAL").unwrap(),
+            TofuState::Match
+        ));
+        // A different fingerprint for the SAME account → Changed (blocking).
+        assert!(matches!(
+            tofu_check(&state.db, acct, "FP-DIFFERENT").unwrap(),
+            TofuState::Changed
+        ));
+        // The pin persisted the ORIGINAL fingerprint (a Changed check does not overwrite it).
+        assert_eq!(
+            state.db.get_pinned_contact(acct).unwrap().unwrap().1,
+            "FP-ORIGINAL"
+        );
+    }
+
+    /// The mode-B share request carries NO note title or body — only ciphertext + wrapped keys + the
+    /// recipient email. Seal a note with distinctive plaintext, build the exact `POST /v1/shares`
+    /// body, serialize it, and assert the plaintext never appears.
+    #[test]
+    fn share_to_user_request_leaks_no_note_content() {
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let nk = random_key32().unwrap();
+        let title = "TOPSECRET_TITLE_ZZZ";
+        let body = "TOPSECRET_BODY_QQQ meeting minutes";
+        let env = ShareEnvelope::new(title, body, "2026-07-04T10:00:00Z");
+        let content = seal_content(&nk, &env, "s-leak", 1).unwrap();
+        let sender_fp = key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let recipient_fp = key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let grant = seal_to_recipient(
+            &nk,
+            &content,
+            &recipient.pk_enc,
+            &recipient_fp,
+            &sender,
+            &sender_fp,
+            1,
+            "s-leak",
+            1,
+        )
+        .unwrap();
+        let wrapped = pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant).unwrap();
+        let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+            email: "bob@example.com".to_string(),
+            wrapped_key: Some(wrapped),
+            key_generation: Some(1),
+            grant_sig: Some(grant.signature),
+        }];
+        let req = assemble_user_share_request("s-leak", 1, content, recipients, None);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains(title),
+            "title must never appear in the request body"
+        );
+        assert!(
+            !json.contains("TOPSECRET_BODY_QQQ"),
+            "note body must never appear in the request body"
+        );
+        assert!(
+            json.contains("bob@example.com"),
+            "the recipient email is present (allowed metadata)"
+        );
     }
 
     /// MANUAL voice command: with NO recording in progress, arming reports `listening:false`
@@ -7653,7 +9680,10 @@ mod lifecycle_tests {
     #[test]
     fn begin_voice_command_not_recording_does_not_arm() {
         let state = build_state("voicecmd-notrec");
-        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "precondition: not recording"
+        );
 
         let res = begin_voice_command_inner(&state).unwrap();
         assert!(!res.listening, "must not listen when not recording");
@@ -7679,7 +9709,11 @@ mod lifecycle_tests {
         let armed = *state.voice_command_capture.lock().unwrap();
         assert_eq!(
             armed,
-            Some(CaptureState { budget: CaptureState::DEFAULT_BUDGET, start_sample: None, ended: false }),
+            Some(CaptureState {
+                budget: CaptureState::DEFAULT_BUDGET,
+                start_sample: None,
+                ended: false
+            }),
             "arming must store a fresh full-budget capture the live loop can consume"
         );
     }
@@ -7699,9 +9733,20 @@ mod lifecycle_tests {
         let res = end_voice_command_inner(&state).unwrap();
         assert!(res.stopped, "an armed capture must report stopped:true");
 
-        let after = state.voice_command_capture.lock().unwrap().expect("capture still present");
-        assert!(after.ended, "the user's stop must flip `ended` so the live loop dispatches");
-        assert_eq!(after.start_sample, Some(1000), "the latched offset is preserved");
+        let after = state
+            .voice_command_capture
+            .lock()
+            .unwrap()
+            .expect("capture still present");
+        assert!(
+            after.ended,
+            "the user's stop must flip `ended` so the live loop dispatches"
+        );
+        assert_eq!(
+            after.start_sample,
+            Some(1000),
+            "the latched offset is preserved"
+        );
     }
 
     /// CLICK-TO-STOP: `end_voice_command` on a NOT-armed state (double-click, already auto-stopped at
@@ -7709,10 +9754,16 @@ mod lifecycle_tests {
     #[test]
     fn end_voice_command_not_armed_is_graceful_noop() {
         let state = build_state("voicecmd-end-noop");
-        assert!(state.voice_command_capture.lock().unwrap().is_none(), "precondition: not armed");
+        assert!(
+            state.voice_command_capture.lock().unwrap().is_none(),
+            "precondition: not armed"
+        );
 
         let res = end_voice_command_inner(&state).unwrap();
-        assert!(!res.stopped, "a not-armed end must be a graceful no-op (stopped:false)");
+        assert!(
+            !res.stopped,
+            "a not-armed end must be a graceful no-op (stopped:false)"
+        );
         assert!(
             state.voice_command_capture.lock().unwrap().is_none(),
             "a no-op end must not fabricate a capture"
@@ -7745,12 +9796,27 @@ mod lifecycle_tests {
         db.insert_segments(
             mid,
             &[
-                Segment { idx: 0, start_s: 0.0, end_s: 2.0, text: "alpha bravo".to_string(), speaker: None, confidence: None },
-                Segment { idx: 1, start_s: 2.0, end_s: 4.0, text: "charlie delta".to_string(), speaker: None, confidence: None },
+                Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 2.0,
+                    text: "alpha bravo".to_string(),
+                    speaker: None,
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 4.0,
+                    text: "charlie delta".to_string(),
+                    speaker: None,
+                    confidence: None,
+                },
             ],
         )
         .unwrap();
-        db.set_timeline_data(mid, "{\"topics\":[],\"speakers\":[]}").unwrap();
+        db.set_timeline_data(mid, "{\"topics\":[],\"speakers\":[]}")
+            .unwrap();
         db.set_meeting_folder(mid, folder_id).unwrap();
     }
 
@@ -7777,7 +9843,12 @@ mod lifecycle_tests {
         let state = build_state("person-dossier");
         let db = &state.db;
         make_open_folder(db, "f-lock", "Locked");
-        seed_meeting(db, "open1", "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n", None);
+        seed_meeting(
+            db,
+            "open1",
+            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            None,
+        );
         seed_meeting(
             db,
             "sealedX",
@@ -7789,7 +9860,8 @@ mod lifecycle_tests {
             .unwrap();
         db.add_mention(&atlas, "open1").unwrap();
         db.add_mention(&atlas, "sealedX").unwrap();
-        db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         // Sealed + not session-unlocked: the sealed meeting + its commitment MUST be invisible.
         let data = get_person_dossier_inner(&state, &atlas).unwrap();
@@ -7802,7 +9874,9 @@ mod lifecycle_tests {
             "sealed-not-unlocked meeting leaked into the dossier (gate violation)"
         );
         assert!(
-            data.commitments.iter().any(|c| c.text.contains("draft Atlas spec")),
+            data.commitments
+                .iter()
+                .any(|c| c.text.contains("draft Atlas spec")),
             "the visible commitment must be present"
         );
         assert!(
@@ -7811,7 +9885,11 @@ mod lifecycle_tests {
         );
 
         // Session-unlock the folder → the sealed meeting + its commitment reappear (reversible gate).
-        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
         let data2 = get_person_dossier_inner(&state, &atlas).unwrap();
         assert!(
             data2.meetings.iter().any(|m| m.meeting_id == "sealedX"),
@@ -7837,7 +9915,12 @@ mod lifecycle_tests {
     fn get_person_dossier_dto_omits_corpus_and_is_camelcase() {
         let state = build_state("person-dossier-dto");
         let db = &state.db;
-        seed_meeting(db, "m-open", "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n", None);
+        seed_meeting(
+            db,
+            "m-open",
+            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            None,
+        );
         let atlas = db
             .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
             .unwrap();
@@ -7854,8 +9937,13 @@ mod lifecycle_tests {
             "corpus must be serde-skipped — note bodies must never cross IPC to the FE"
         );
         // Nested camelCase the FE consumes (a commitment carries meetingId/meetingTitle/dueDate).
-        let commit = v["commitments"].get(0).expect("the visible commitment must serialize");
-        assert!(commit.get("meetingId").is_some(), "commitment.meetingId must be camelCase");
+        let commit = v["commitments"]
+            .get(0)
+            .expect("the visible commitment must serialize");
+        assert!(
+            commit.get("meetingId").is_some(),
+            "commitment.meetingId must be camelCase"
+        );
         assert!(
             commit.get("meeting_id").is_none(),
             "snake_case commitment.meeting_id must not appear"
@@ -7899,26 +9987,51 @@ mod lifecycle_tests {
         // OPEN folder: the fact is VISIBLE → the gated brief carries it → it reaches the Ask prompt.
         let open = unlocked_snapshot(&state).unwrap();
         let brief_open = gated_memory_brief_for_injection(&state, &open);
-        assert!(brief_open.contains("Polish replies"), "an open-folder user fact must be in the brief");
+        assert!(
+            brief_open.contains("Polish replies"),
+            "an open-folder user fact must be in the brief"
+        );
         let (sys_open, _) =
             crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", &brief_open);
-        assert!(sys_open.contains("Polish replies"), "and reach the Ask system prompt when open");
-        assert_ne!(sys_open, want_empty_system, "a present brief changes the prompt");
+        assert!(
+            sys_open.contains("Polish replies"),
+            "and reach the Ask system prompt when open"
+        );
+        assert_ne!(
+            sys_open, want_empty_system,
+            "a present brief changes the prompt"
+        );
 
         // SEAL the folder (session NOT unlocked). Flip the flag only (the real seal purges the fact);
         // here we prove the READ GATE hides a fact whose row still exists at rest.
-        state.db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
         let sealed = unlocked_snapshot(&state).unwrap();
         let brief_sealed = gated_memory_brief_for_injection(&state, &sealed);
-        assert!(brief_sealed.is_empty(), "a sealed-source user fact must NOT be in the injected brief");
+        assert!(
+            brief_sealed.is_empty(),
+            "a sealed-source user fact must NOT be in the injected brief"
+        );
         let (sys_sealed, _) =
             crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", &brief_sealed);
-        assert!(!sys_sealed.contains("Polish replies"), "the sealed fact must not reach the Ask prompt");
+        assert!(
+            !sys_sealed.contains("Polish replies"),
+            "the sealed fact must not reach the Ask prompt"
+        );
         // Empty brief ⇒ the prompt is BYTE-IDENTICAL to the pre-memory prompt.
-        assert_eq!(sys_sealed, want_empty_system, "empty memory ⇒ byte-identical Ask prompt");
+        assert_eq!(
+            sys_sealed, want_empty_system,
+            "empty memory ⇒ byte-identical Ask prompt"
+        );
 
         // A SESSION UNLOCK re-admits it (reversible gate).
-        state.unlocked_folders.lock().unwrap().insert("f1".to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f1".to_string());
         let unlocked = unlocked_snapshot(&state).unwrap();
         assert!(
             gated_memory_brief_for_injection(&state, &unlocked).contains("Polish replies"),
@@ -7933,8 +10046,14 @@ mod lifecycle_tests {
         );
         // And get_user_memory reports the explicit disabled marker (empty + disabled:true).
         let mem = get_user_memory_inner(&state).unwrap();
-        assert!(mem.disabled, "disabled flag ⇒ the audit payload reports disabled");
-        assert!(mem.facts.is_empty() && mem.brief.is_empty(), "disabled ⇒ nothing surfaced");
+        assert!(
+            mem.disabled,
+            "disabled flag ⇒ the audit payload reports disabled"
+        );
+        assert!(
+            mem.facts.is_empty() && mem.brief.is_empty(),
+            "disabled ⇒ nothing surfaced"
+        );
     }
 
     // ── VOICEPRINTS (Phase 2): matcher gating + enroll + management ───────────────────────────────
@@ -7952,11 +10071,21 @@ mod lifecycle_tests {
         // A LABELED prior voiceprint ("Sarah") living in a folder we will SEAL.
         make_open_folder(&state.db, "f-secret", "Secret");
         seed_meeting(&state.db, "prior", "prior note", None);
-        state.db.set_meeting_folder("prior", Some("f-secret")).unwrap();
+        state
+            .db
+            .set_meeting_folder("prior", Some("f-secret"))
+            .unwrap();
         let sarah = vec![1.0f32, 0.0, 0.0];
         state
             .db
-            .insert_voiceprint("vp-prior", "prior", 0, Some("Sarah"), &sarah, "2026-07-01T00:00:00Z")
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Sarah"),
+                &sarah,
+                "2026-07-01T00:00:00Z",
+            )
             .unwrap();
 
         // The CURRENT (open) meeting has a cluster near-identical to Sarah's voiceprint.
@@ -7964,19 +10093,33 @@ mod lifecycle_tests {
         let cur_cluster = vec![0.99f32, 0.14, 0.0];
         state
             .db
-            .insert_voiceprint("vp-cur", "cur", 1, None, &cur_cluster, "2026-07-02T00:00:00Z")
+            .insert_voiceprint(
+                "vp-cur",
+                "cur",
+                1,
+                None,
+                &cur_cluster,
+                "2026-07-02T00:00:00Z",
+            )
             .unwrap();
 
         // OPEN prior → the suggestion surfaces (Sarah for others-1).
         let sugg_open = suggest_speaker_labels_inner(&state, "cur").unwrap();
-        assert_eq!(sugg_open.len(), 1, "an open labeled prior yields a suggestion");
+        assert_eq!(
+            sugg_open.len(),
+            1,
+            "an open labeled prior yields a suggestion"
+        );
         assert_eq!(sugg_open[0].speaker, "others-1");
         assert_eq!(sugg_open[0].suggested_label, "Sarah");
         assert!(sugg_open[0].score >= 0.9);
 
         // SEAL the prior's folder (session NOT unlocked): the sealed labeled prior must vanish from
         // the candidate gallery → NO suggestion. RED here without the gate.
-        state.db.set_folder_locked("f-secret", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-secret", true, Some(&b"wrapped"[..]))
+            .unwrap();
         let sugg_sealed = suggest_speaker_labels_inner(&state, "cur").unwrap();
         assert!(
             sugg_sealed.is_empty(),
@@ -7984,9 +10127,17 @@ mod lifecycle_tests {
         );
 
         // A session unlock re-admits it (reversible gate).
-        state.unlocked_folders.lock().unwrap().insert("f-secret".to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-secret".to_string());
         let sugg_unlocked = suggest_speaker_labels_inner(&state, "cur").unwrap();
-        assert_eq!(sugg_unlocked.len(), 1, "a session unlock re-admits the labeled prior");
+        assert_eq!(
+            sugg_unlocked.len(),
+            1,
+            "a session unlock re-admits the labeled prior"
+        );
         assert_eq!(sugg_unlocked[0].suggested_label, "Sarah");
     }
 
@@ -8001,7 +10152,14 @@ mod lifecycle_tests {
         let v = vec![1.0f32, 0.0, 0.0];
         state
             .db
-            .insert_voiceprint("vp-prior", "prior", 0, Some("Sarah"), &v, "2026-07-01T00:00:00Z")
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Sarah"),
+                &v,
+                "2026-07-01T00:00:00Z",
+            )
             .unwrap();
 
         make_open_folder(&state.db, "f-cur", "Cur");
@@ -8011,10 +10169,15 @@ mod lifecycle_tests {
             .db
             .insert_voiceprint("vp-cur", "cur", 1, None, &v, "2026-07-02T00:00:00Z")
             .unwrap();
-        state.db.set_folder_locked("f-cur", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-cur", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         assert!(
-            suggest_speaker_labels_inner(&state, "cur").unwrap().is_empty(),
+            suggest_speaker_labels_inner(&state, "cur")
+                .unwrap()
+                .is_empty(),
             "a locked current meeting must surface no suggestions"
         );
     }
@@ -8037,7 +10200,11 @@ mod lifecycle_tests {
         rename_speaker_inner(&state, "m1", "others-1", "Sarah").unwrap();
         let listed = list_voiceprints_inner(&state).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].label.as_deref(), Some("Sarah"), "enroll bound the label");
+        assert_eq!(
+            listed[0].label.as_deref(),
+            Some("Sarah"),
+            "enroll bound the label"
+        );
         assert_eq!(listed[0].cluster_index, 1);
 
         // A rename of a PLAIN non-cluster label enrolls nothing (still one row, label unchanged).
@@ -8267,7 +10434,14 @@ mod lifecycle_tests {
         seed_meeting(&state.db, "m2", "note2", None);
         state
             .db
-            .insert_voiceprint("vp1", "m1", 0, Some("Sarah"), &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .insert_voiceprint(
+                "vp1",
+                "m1",
+                0,
+                Some("Sarah"),
+                &[1.0f32, 0.0],
+                "2026-07-01T00:00:00Z",
+            )
             .unwrap();
         state
             .db
@@ -8299,7 +10473,10 @@ mod lifecycle_tests {
         seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
         *state.live_transcript.lock().unwrap() =
             "stale tail of the just-recorded meeting".to_string();
-        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "precondition: not recording"
+        );
 
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
 
@@ -8315,7 +10492,10 @@ mod lifecycle_tests {
     fn relock_all_clears_stale_live_transcript_when_not_recording() {
         let state = build_state("relock-clears-live");
         *state.live_transcript.lock().unwrap() = "stale tail".to_string();
-        assert!(state.recorder.lock().unwrap().is_none(), "precondition: not recording");
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "precondition: not recording"
+        );
 
         relock_all_inner(&state).unwrap();
 
@@ -8332,7 +10512,9 @@ mod lifecycle_tests {
         let state = build_state("manual-notes-open");
         seed_meeting(&state.db, "m1", "note", None); // no folder ⇒ always open
 
-        get_manual_notes_inner(&state, "m1").map(|s| assert_eq!(s, "")).unwrap();
+        get_manual_notes_inner(&state, "m1")
+            .map(|s| assert_eq!(s, ""))
+            .unwrap();
         save_manual_notes_inner(&state, "m1", "ship Friday; Anna owns QA").unwrap();
         assert_eq!(
             get_manual_notes_inner(&state, "m1").unwrap(),
@@ -8351,15 +10533,28 @@ mod lifecycle_tests {
         make_open_folder(&state.db, "f-lock", "Secret");
         seed_meeting(&state.db, "m1", "note", Some("f-lock"));
         // The buffer holds content at rest (e.g. typed pre-seal); the gate must mask/refuse it.
-        state.db.set_manual_notes("m1", "secret typed plaintext").unwrap();
+        state
+            .db
+            .set_manual_notes("m1", "secret typed plaintext")
+            .unwrap();
         // Seal the folder (locked, NOT in the session unlock set).
-        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         // WRITE is refused with Locked.
         let err = save_manual_notes_inner(&state, "m1", "new secret").unwrap_err();
-        assert!(matches!(err, AppError::Locked(_)), "sealed write must be AppError::Locked, got {err:?}");
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed write must be AppError::Locked, got {err:?}"
+        );
         // The refused write left the stored buffer untouched.
-        assert_eq!(state.db.get_manual_notes("m1").unwrap(), "secret typed plaintext", "refused write must not mutate");
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            "secret typed plaintext",
+            "refused write must not mutate"
+        );
         // READ is masked to "" despite the column holding content.
         assert_eq!(
             get_manual_notes_inner(&state, "m1").unwrap(),
@@ -8368,10 +10563,20 @@ mod lifecycle_tests {
         );
 
         // Session-unlock the folder ⇒ both read and write work again.
-        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
-        assert_eq!(get_manual_notes_inner(&state, "m1").unwrap(), "secret typed plaintext");
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "secret typed plaintext"
+        );
         save_manual_notes_inner(&state, "m1", "edited after unlock").unwrap();
-        assert_eq!(get_manual_notes_inner(&state, "m1").unwrap(), "edited after unlock");
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "edited after unlock"
+        );
     }
 
     /// COUNTEREXAMPLE A (verify-before-destroy): the user's typed notes SURVIVE a real lock→unlock
@@ -8390,8 +10595,14 @@ mod lifecycle_tests {
         // LOCK → production seal: plaintext blanked at rest, manual_notes_blob present.
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
         let sealed = state.db.raw_manual_notes("m1").unwrap().unwrap();
-        assert_eq!(sealed.text, "", "typed notes plaintext blanked while sealed");
-        assert!(sealed.blob.is_some(), "typed notes sealed under the folder CK (blob present)");
+        assert_eq!(
+            sealed.text, "",
+            "typed notes plaintext blanked while sealed"
+        );
+        assert!(
+            sealed.blob.is_some(),
+            "typed notes sealed under the folder CK (blob present)"
+        );
 
         // UNLOCK (mirror unlock_folder's internals): KEK → unwrap CK → unseal extras.
         let kek = secrets::get_or_create_master_kek().unwrap();
@@ -8418,7 +10629,11 @@ mod lifecycle_tests {
         state.db.set_manual_notes("m1", typed).unwrap();
 
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
-        assert_eq!(state.db.raw_manual_notes("m1").unwrap().unwrap().text, "", "blanked while sealed");
+        assert_eq!(
+            state.db.raw_manual_notes("m1").unwrap().unwrap().text,
+            "",
+            "blanked while sealed"
+        );
 
         // Cache the KEK for remove_lock (it reads the gated master KEK), then permanently remove.
         let kek = secrets::get_or_create_master_kek().unwrap();
@@ -8426,8 +10641,14 @@ mod lifecycle_tests {
         remove_lock_inner(&state, "f-lock".to_string()).unwrap();
 
         let rn = state.db.raw_manual_notes("m1").unwrap().unwrap();
-        assert_eq!(rn.text, typed, "typed notes permanently restored to plaintext on remove-lock");
-        assert!(rn.blob.is_none(), "manual_notes_blob cleared on remove-lock");
+        assert_eq!(
+            rn.text, typed,
+            "typed notes permanently restored to plaintext on remove-lock"
+        );
+        assert!(
+            rn.blob.is_none(),
+            "manual_notes_blob cleared on remove-lock"
+        );
     }
 
     // ── document ingestion ──────────────────────────────────────────────────
@@ -8455,7 +10676,11 @@ mod lifecycle_tests {
         let state = build_state("doc-import");
         make_open_folder(&state.db, "f-open", "Project");
 
-        let md = write_temp_doc("md", "md", "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.");
+        let md = write_temp_doc(
+            "md",
+            "md",
+            "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.",
+        );
         let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
         // Stored + readable through the gated get.
         assert_eq!(
@@ -8507,7 +10732,10 @@ mod lifecycle_tests {
 
         let pdf = write_temp_doc("pdf", "pdf", "%PDF-1.4 ...");
         let err = import_document_inner(&state, pdf.to_str().unwrap(), "f-open").unwrap_err();
-        assert!(matches!(err, AppError::InvalidArg(_)), "pdf must be rejected, got {err:?}");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "pdf must be rejected, got {err:?}"
+        );
 
         // Extension-less path.
         let noext = {
@@ -8517,9 +10745,15 @@ mod lifecycle_tests {
             p
         };
         let err2 = import_document_inner(&state, noext.to_str().unwrap(), "f-open").unwrap_err();
-        assert!(matches!(err2, AppError::InvalidArg(_)), "extension-less must be rejected");
+        assert!(
+            matches!(err2, AppError::InvalidArg(_)),
+            "extension-less must be rejected"
+        );
 
-        assert!(list_documents_inner(&state, "f-open").unwrap().is_empty(), "no row inserted on reject");
+        assert!(
+            list_documents_inner(&state, "f-open").unwrap().is_empty(),
+            "no row inserted on reject"
+        );
     }
 
     /// WRITE-GATE + LIST/GET MASK: importing into a sealed-and-NOT-session-unlocked folder is refused
@@ -8532,23 +10766,47 @@ mod lifecycle_tests {
         // Seed a document while open, then seal the folder (locked, NOT in the session set).
         let md = write_temp_doc("seal", "md", "secret: launch date is the 14th");
         let existing = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
-        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         // IMPORT is refused with Locked.
         let md2 = write_temp_doc("seal2", "md", "another secret");
         let err = import_document_inner(&state, md2.to_str().unwrap(), "f-lock").unwrap_err();
-        assert!(matches!(err, AppError::Locked(_)), "sealed import must be Locked, got {err:?}");
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed import must be Locked, got {err:?}"
+        );
         // DELETE is refused with Locked too.
         let derr = delete_document_inner(&state, &existing).unwrap_err();
-        assert!(matches!(derr, AppError::Locked(_)), "sealed delete must be Locked, got {derr:?}");
+        assert!(
+            matches!(derr, AppError::Locked(_)),
+            "sealed delete must be Locked, got {derr:?}"
+        );
 
         // LIST is masked to empty; GET is masked to "" — even though the row + text column persist.
-        assert!(list_documents_inner(&state, "f-lock").unwrap().is_empty(), "sealed list masked");
-        assert_eq!(get_document_inner(&state, &existing).unwrap(), "", "sealed get masked");
+        assert!(
+            list_documents_inner(&state, "f-lock").unwrap().is_empty(),
+            "sealed list masked"
+        );
+        assert_eq!(
+            get_document_inner(&state, &existing).unwrap(),
+            "",
+            "sealed get masked"
+        );
 
         // Session-unlock ⇒ list + get + import work again.
-        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
-        assert_eq!(list_documents_inner(&state, "f-lock").unwrap().len(), 1, "unlocked list visible");
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            list_documents_inner(&state, "f-lock").unwrap().len(),
+            1,
+            "unlocked list visible"
+        );
         assert_eq!(
             get_document_inner(&state, &existing).unwrap(),
             "secret: launch date is the 14th",
@@ -8579,9 +10837,16 @@ mod lifecycle_tests {
         assert_eq!(listed[0].name, "Decisions");
         // Model-presence-gated chunk count (deterministic on a no-model CI machine).
         if crate::embed::embed_model_present() {
-            assert!(state.db.doc_chunk_count(&id).unwrap() >= 1, "note chunked+embedded when model present");
+            assert!(
+                state.db.doc_chunk_count(&id).unwrap() >= 1,
+                "note chunked+embedded when model present"
+            );
         } else {
-            assert_eq!(state.db.doc_chunk_count(&id).unwrap(), 0, "no stub vectors when model absent");
+            assert_eq!(
+                state.db.doc_chunk_count(&id).unwrap(),
+                0,
+                "no stub vectors when model absent"
+            );
         }
         // Empty / whitespace-only text is refused.
         assert!(matches!(
@@ -8597,14 +10862,24 @@ mod lifecycle_tests {
         let state = build_state("text-sealed");
         make_open_folder(&state.db, "f-lock", "Secret");
         let note = import_text_inner(&state, "n", "the code is 4291", "f-lock").unwrap();
-        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         assert!(matches!(
             import_text_inner(&state, "n2", "another", "f-lock").unwrap_err(),
             AppError::Locked(_)
         ));
-        assert!(list_documents_inner(&state, "f-lock").unwrap().is_empty(), "sealed note list masked");
-        assert_eq!(get_document_inner(&state, &note).unwrap(), "", "sealed note get masked");
+        assert!(
+            list_documents_inner(&state, "f-lock").unwrap().is_empty(),
+            "sealed note list masked"
+        );
+        assert_eq!(
+            get_document_inner(&state, &note).unwrap(),
+            "",
+            "sealed note get masked"
+        );
     }
 
     /// brain_overview counts ONLY visible content: a note in a SEALED-not-unlocked folder is NOT
@@ -8617,13 +10892,18 @@ mod lifecycle_tests {
         import_text_inner(&state, "a", "open note one", "f-open").unwrap();
         import_document_inner(
             &state,
-            write_temp_doc("ov", "md", "an open document").to_str().unwrap(),
+            write_temp_doc("ov", "md", "an open document")
+                .to_str()
+                .unwrap(),
             "f-open",
         )
         .unwrap();
         let secret = import_text_inner(&state, "s", "secret note", "f-lock").unwrap();
         assert!(!secret.is_empty());
-        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         // Sealed folder's note is excluded: 1 note (open) + 1 document (open), NOT 2 notes.
         let ov = brain_overview_inner(&state).unwrap();
@@ -8632,8 +10912,16 @@ mod lifecycle_tests {
         assert_eq!(ov.embed_model_present, crate::embed::embed_model_present());
 
         // Session-unlock ⇒ the sealed note now counts.
-        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
-        assert_eq!(brain_overview_inner(&state).unwrap().note_count, 2, "unlocked note counted");
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            brain_overview_inner(&state).unwrap().note_count,
+            2,
+            "unlocked note counted"
+        );
     }
 
     /// COUNTEREXAMPLE (verify-before-destroy): an uploaded document's TEXT survives a real lock→unlock
@@ -8644,7 +10932,11 @@ mod lifecycle_tests {
     fn document_text_survives_lock_unlock_cycle_sealed_and_restored() {
         let state = build_state("doc-seal-cycle");
         make_open_folder(&state.db, "f-lock", "Secret");
-        let md = write_temp_doc("cycle", "md", "zażółć 🔒 DECISION: ship Friday; Anna owns QA");
+        let md = write_temp_doc(
+            "cycle",
+            "md",
+            "zażółć 🔒 DECISION: ship Friday; Anna owns QA",
+        );
         let id = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
         let original = "zażółć 🔒 DECISION: ship Friday; Anna owns QA";
 
@@ -8657,8 +10949,14 @@ mod lifecycle_tests {
             .into_iter()
             .find(|d| d.id == id)
             .unwrap();
-        assert_eq!(sealed.text, "", "document text plaintext blanked while sealed");
-        assert!(sealed.blob.is_some(), "document sealed under the folder CK (blob present)");
+        assert_eq!(
+            sealed.text, "",
+            "document text plaintext blanked while sealed"
+        );
+        assert!(
+            sealed.blob.is_some(),
+            "document sealed under the folder CK (blob present)"
+        );
         assert_eq!(
             state.db.doc_chunk_count(&id).unwrap(),
             0,
@@ -8715,8 +11013,14 @@ mod lifecycle_tests {
             .into_iter()
             .find(|d| d.id == id)
             .unwrap();
-        assert_eq!(d.text, "permanent: revisit auth next sprint", "permanently restored on remove-lock");
-        assert!(d.blob.is_none(), "document text_blob cleared on remove-lock");
+        assert_eq!(
+            d.text, "permanent: revisit auth next sprint",
+            "permanently restored on remove-lock"
+        );
+        assert!(
+            d.blob.is_none(),
+            "document text_blob cleared on remove-lock"
+        );
     }
 
     /// DELETE cascades the document's chunks/vectors away.
@@ -8729,7 +11033,10 @@ mod lifecycle_tests {
         assert_eq!(list_documents_inner(&state, "f-open").unwrap().len(), 1);
 
         delete_document_inner(&state, &id).unwrap();
-        assert!(list_documents_inner(&state, "f-open").unwrap().is_empty(), "document deleted");
+        assert!(
+            list_documents_inner(&state, "f-open").unwrap().is_empty(),
+            "document deleted"
+        );
         assert_eq!(
             state.db.doc_chunk_count(&id).unwrap(),
             0,
@@ -8785,7 +11092,9 @@ mod lifecycle_tests {
             ..AppConfig::default()
         };
         let out = crate::tools::execute_tool(
-            &crate::tools::ToolCall::SearchMeetings { query: "fioletowoszary".into() },
+            &crate::tools::ToolCall::SearchMeetings {
+                query: "fioletowoszary".into(),
+            },
             &state.db,
             &nothing,
             &cfg,
@@ -8797,7 +11106,9 @@ mod lifecycle_tests {
              empty-result sentinel); got: {out:?}"
         );
         let out2 = crate::tools::execute_tool(
-            &crate::tools::ToolCall::SearchSemantic { query: "fioletowoszary".into() },
+            &crate::tools::ToolCall::SearchSemantic {
+                query: "fioletowoszary".into(),
+            },
             &state.db,
             &nothing,
             &cfg,
@@ -8832,7 +11143,9 @@ mod lifecycle_tests {
             ..AppConfig::default()
         };
         let out = crate::tools::execute_tool(
-            &crate::tools::ToolCall::SearchSemantic { query: "fioletowoszary".into() },
+            &crate::tools::ToolCall::SearchSemantic {
+                query: "fioletowoszary".into(),
+            },
             &state.db,
             &nothing,
             &cfg,
@@ -8860,7 +11173,10 @@ mod lifecycle_tests {
             "f-lock",
         )
         .unwrap();
-        assert!(state.db.doc_chunk_count(&id).unwrap() >= 1, "precondition: chunked on ingest");
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "precondition: chunked on ingest"
+        );
 
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
 
@@ -8884,13 +11200,25 @@ mod lifecycle_tests {
                 unlocked,
             )
             .unwrap();
-            assert_eq!(corpus.contains("przejęcia"), expected, "Ask corpus leg, {phase}");
+            assert_eq!(
+                corpus.contains("przejęcia"),
+                expected,
+                "Ask corpus leg, {phase}"
+            );
             for call in [
-                crate::tools::ToolCall::SearchMeetings { query: "TAJNYTOKEN".into() },
-                crate::tools::ToolCall::SearchSemantic { query: "TAJNYTOKEN".into() },
+                crate::tools::ToolCall::SearchMeetings {
+                    query: "TAJNYTOKEN".into(),
+                },
+                crate::tools::ToolCall::SearchSemantic {
+                    query: "TAJNYTOKEN".into(),
+                },
             ] {
                 let out = crate::tools::execute_tool(&call, &state.db, unlocked, &cfg).unwrap();
-                assert_eq!(out.contains("przejęcia"), expected, "tool leg {call:?}, {phase}");
+                assert_eq!(
+                    out.contains("przejęcia"),
+                    expected,
+                    "tool leg {call:?}, {phase}"
+                );
             }
         };
 
@@ -9105,25 +11433,53 @@ mod lifecycle_tests {
         // A write-only legacy row: document stored, never chunked (the pre-PR-B model-less ingest).
         state
             .db
-            .insert_document("d-legacy", "f-open", "legacy.md", "szmaragdowy raport roczny", "document", 100)
+            .insert_document(
+                "d-legacy",
+                "f-open",
+                "legacy.md",
+                "szmaragdowy raport roczny",
+                "document",
+                100,
+            )
             .unwrap();
         // An already-indexed document WITH vectors (stub-deterministic).
         state
             .db
-            .insert_document("d-vec", "f-open", "vec.md", "vectored content here", "document", 200)
+            .insert_document(
+                "d-vec",
+                "f-open",
+                "vec.md",
+                "vectored content here",
+                "document",
+                200,
+            )
             .unwrap();
-        state.db.index_document_chunks("d-vec", Some(&crate::embed::StubEmbedder)).unwrap();
+        state
+            .db
+            .index_document_chunks("d-vec", Some(&crate::embed::StubEmbedder))
+            .unwrap();
         let vec_before = state.db.doc_vec_count("d-vec").unwrap();
         assert!(vec_before >= 1, "precondition: d-vec has vectors");
-        assert_eq!(state.db.doc_chunk_count("d-legacy").unwrap(), 0, "precondition: d-legacy chunkless");
+        assert_eq!(
+            state.db.doc_chunk_count("d-legacy").unwrap(),
+            0,
+            "precondition: d-legacy chunkless"
+        );
 
         // Model ABSENT: chunk/FTS backfill only.
         let nothing = HashSet::new();
         let stub = crate::embed::StubEmbedder;
         let res = reindex_embeddings_inner(&state.db, &nothing, false, &stub, |_, _| {}).unwrap();
         assert_eq!(res.status, "model_missing", "meeting semantics unchanged");
-        assert!(state.db.doc_chunk_count("d-legacy").unwrap() >= 1, "legacy doc backfilled");
-        assert_eq!(state.db.doc_vec_count("d-legacy").unwrap(), 0, "no stub vectors on backfill");
+        assert!(
+            state.db.doc_chunk_count("d-legacy").unwrap() >= 1,
+            "legacy doc backfilled"
+        );
+        assert_eq!(
+            state.db.doc_vec_count("d-legacy").unwrap(),
+            0,
+            "no stub vectors on backfill"
+        );
         assert_eq!(
             state.db.doc_vec_count("d-vec").unwrap(),
             vec_before,
@@ -9190,8 +11546,14 @@ mod lifecycle_tests {
                     !(n.markdown.is_empty() && n.content_blob.is_none()),
                     "IRREVERSIBLE DATA LOSS at iter {i}: markdown='' AND content_blob=NULL"
                 );
-                assert_eq!(n.markdown, ORIGINAL_MD, "note restored to original at iter {i}");
-                assert!(n.content_blob.is_none(), "content_blob cleared after remove_lock at iter {i}");
+                assert_eq!(
+                    n.markdown, ORIGINAL_MD,
+                    "note restored to original at iter {i}"
+                );
+                assert!(
+                    n.content_blob.is_none(),
+                    "content_blob cleared after remove_lock at iter {i}"
+                );
             }
         }
 
@@ -9218,10 +11580,17 @@ mod lifecycle_tests {
         lock_folder_inner(&state, TARGET.to_string()).unwrap(); // seal it; NOT session-unlocked
 
         let res = move_into_locked_folder(&state, MID, TARGET);
-        assert!(matches!(res, Err(AppError::Locked(_))), "must reject with Locked, got {res:?}");
+        assert!(
+            matches!(res, Err(AppError::Locked(_))),
+            "must reject with Locked, got {res:?}"
+        );
 
         // Untouched: still at the root, still plaintext, no blob.
-        assert_eq!(state.db.folder_for_meeting(MID).unwrap(), None, "note was NOT reassigned");
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap(),
+            None,
+            "note was NOT reassigned"
+        );
         let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
         assert_eq!(n.markdown, MD, "plaintext preserved");
         assert!(n.content_blob.is_none(), "never sealed");
@@ -9242,18 +11611,34 @@ mod lifecycle_tests {
         lock_folder_inner(&state, TARGET.to_string()).unwrap(); // seal the (empty) target
 
         // Make the target SESSION-UNLOCKED: in the unlock set + KEK cached (as a real unlock would).
-        state.unlocked_folders.lock().unwrap().insert(TARGET.to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(TARGET.to_string());
         let kek = secrets::get_or_create_master_kek().unwrap();
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
 
         move_into_locked_folder(&state, MID, TARGET).unwrap();
 
         // Reassigned into the target AND sealed at rest (blob set, plaintext blanked).
-        assert_eq!(state.db.folder_for_meeting(MID).unwrap().as_deref(), Some(TARGET));
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap().as_deref(),
+            Some(TARGET)
+        );
         let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
-        assert!(n.content_blob.is_some(), "moved note must be sealed (content_blob set)");
-        assert!(n.markdown.is_empty(), "moved note plaintext markdown blanked at rest");
-        assert!(n.exported_path.is_none(), "no vault .md for a note in a locked folder");
+        assert!(
+            n.content_blob.is_some(),
+            "moved note must be sealed (content_blob set)"
+        );
+        assert!(
+            n.markdown.is_empty(),
+            "moved note plaintext markdown blanked at rest"
+        );
+        assert!(
+            n.exported_path.is_none(),
+            "no vault .md for a note in a locked folder"
+        );
         // Transcript sealed too (text blanked, text_blob present).
         for s in state.db.raw_segments(MID).unwrap() {
             assert!(s.text.is_empty(), "segment text blanked");
@@ -9263,7 +11648,10 @@ mod lifecycle_tests {
         // And it round-trips: a permanent remove-lock restores the original plaintext (no loss).
         remove_lock_inner(&state, TARGET.to_string()).unwrap();
         let restored = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
-        assert_eq!(restored.markdown, MD, "remove-lock restores the moved note's original content");
+        assert_eq!(
+            restored.markdown, MD,
+            "remove-lock restores the moved note's original content"
+        );
     }
 
     /// Auto-organize seam: [`classify_auto_file_target`] maps a classifier-chosen subfolder to the
@@ -9275,7 +11663,10 @@ mod lifecycle_tests {
         let state = build_state("autofile");
 
         // No subfolder / unmanaged subfolder → Open.
-        assert_eq!(classify_auto_file_target(&state, None).unwrap(), AutoFileTarget::Open);
+        assert_eq!(
+            classify_auto_file_target(&state, None).unwrap(),
+            AutoFileTarget::Open
+        );
         assert_eq!(
             classify_auto_file_target(&state, Some("Nonexistent")).unwrap(),
             AutoFileTarget::Open,
@@ -9299,7 +11690,11 @@ mod lifecycle_tests {
         );
 
         // Make it SESSION-UNLOCKED (in the set + KEK cached) → SealInto(folder_id).
-        state.unlocked_folders.lock().unwrap().insert("f-locked".to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-locked".to_string());
         let kek = secrets::get_or_create_master_kek().unwrap();
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         assert_eq!(
@@ -9322,16 +11717,29 @@ mod lifecycle_tests {
         seed_meeting(&state.db, MID, MD, None);
         make_open_folder(&state.db, TARGET, "AutoLocked");
         lock_folder_inner(&state, TARGET.to_string()).unwrap();
-        state.unlocked_folders.lock().unwrap().insert(TARGET.to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(TARGET.to_string());
         let kek = secrets::get_or_create_master_kek().unwrap();
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
 
         seal_auto_filed_note(&state, MID, TARGET).unwrap();
 
-        assert_eq!(state.db.folder_for_meeting(MID).unwrap().as_deref(), Some(TARGET));
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap().as_deref(),
+            Some(TARGET)
+        );
         let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
-        assert!(n.content_blob.is_some(), "auto-filed note sealed (content_blob set)");
-        assert!(n.markdown.is_empty(), "auto-filed note plaintext blanked at rest");
+        assert!(
+            n.content_blob.is_some(),
+            "auto-filed note sealed (content_blob set)"
+        );
+        assert!(
+            n.markdown.is_empty(),
+            "auto-filed note plaintext blanked at rest"
+        );
     }
 
     /// BLK-3: an `AppConfigDto` payload that OMITS `mcpRequireToken` deserializes to `true`
@@ -9353,10 +11761,16 @@ mod lifecycle_tests {
             "noteLanguage":"auto"
         }"#;
         let dto: AppConfigDto = serde_json::from_str(json).unwrap();
-        assert!(dto.mcp_require_token, "omitted mcpRequireToken must fail closed to true (BLK-3)");
+        assert!(
+            dto.mcp_require_token,
+            "omitted mcpRequireToken must fail closed to true (BLK-3)"
+        );
         assert!(dto.lock_require_biometric, "Stage-E flags default ON");
         assert!(dto.relock_on_screenshare, "Stage-E flags default ON");
-        assert!(!dto.cloud_egress_consented, "consent defaults OFF (fail-closed)");
+        assert!(
+            !dto.cloud_egress_consented,
+            "consent defaults OFF (fail-closed)"
+        );
         assert!(
             dto.proactive_hints_enabled,
             "omitted proactiveHintsEnabled defaults ON (matches AppConfig::default)"
@@ -9373,7 +11787,10 @@ mod lifecycle_tests {
     #[test]
     fn dto_round_trips_proactive_hints_toggle() {
         // OUT: the DTO reflects the live value.
-        let cfg = AppConfig { proactive_hints_enabled: false, ..Default::default() };
+        let cfg = AppConfig {
+            proactive_hints_enabled: false,
+            ..Default::default()
+        };
         assert!(!config_to_dto(&cfg).proactive_hints_enabled);
 
         // IN: the DTO value lands in the merged config (proven from a differing `current`).
@@ -9392,7 +11809,10 @@ mod lifecycle_tests {
     #[test]
     fn dto_round_trips_user_memory_toggle() {
         // OUT: the DTO reflects the live value.
-        let cfg = AppConfig { user_memory_enabled: false, ..Default::default() };
+        let cfg = AppConfig {
+            user_memory_enabled: false,
+            ..Default::default()
+        };
         assert!(!config_to_dto(&cfg).user_memory_enabled);
 
         // IN: the DTO value lands in the merged config (proven from a differing `current`).
@@ -9413,7 +11833,10 @@ mod lifecycle_tests {
         // (a) preserve an existing grant even when the DTO carries false.
         let mut dto = config_to_dto(&AppConfig::default());
         dto.cloud_egress_consented = false;
-        let current = AppConfig { cloud_egress_consented: true, ..AppConfig::default() };
+        let current = AppConfig {
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
         assert!(
             dto_to_config(dto, &current).cloud_egress_consented,
             "an omitting/false save must NOT clobber an existing consent (BLK-4)"
@@ -9437,7 +11860,10 @@ mod lifecycle_tests {
         // (a) preserve an existing grant even when the DTO carries false.
         let mut dto = config_to_dto(&AppConfig::default());
         dto.web_search_consented = false;
-        let current = AppConfig { web_search_consented: true, ..AppConfig::default() };
+        let current = AppConfig {
+            web_search_consented: true,
+            ..AppConfig::default()
+        };
         assert!(
             dto_to_config(dto, &current).web_search_consented,
             "an omitting/false save must NOT clobber an existing web-search consent"
@@ -9468,7 +11894,10 @@ mod lifecycle_tests {
             "web_search_enabled is settable from the DTO"
         );
         // And OUT: config_to_dto reflects the live value.
-        let cfg = AppConfig { web_search_enabled: true, ..AppConfig::default() };
+        let cfg = AppConfig {
+            web_search_enabled: true,
+            ..AppConfig::default()
+        };
         assert!(config_to_dto(&cfg).web_search_enabled);
     }
 
@@ -9512,15 +11941,24 @@ mod lifecycle_tests {
     #[test]
     fn dto_round_trips_semantic_search_enabled_both_ways() {
         // OUT: true and false both surface on the DTO.
-        let cfg_on = AppConfig { semantic_search_enabled: true, ..AppConfig::default() };
+        let cfg_on = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
         assert!(config_to_dto(&cfg_on).semantic_search_enabled);
-        let cfg_off = AppConfig { semantic_search_enabled: false, ..AppConfig::default() };
+        let cfg_off = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
         assert!(!config_to_dto(&cfg_off).semantic_search_enabled);
 
         // IN (set true): DTO=true over current=false ⇒ merged true (the DTO is authoritative).
         let mut dto_on = config_to_dto(&AppConfig::default());
         dto_on.semantic_search_enabled = true;
-        let current_off = AppConfig { semantic_search_enabled: false, ..AppConfig::default() };
+        let current_off = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
         assert!(
             dto_to_config(dto_on, &current_off).semantic_search_enabled,
             "semantic_search_enabled MUST be settable from the DTO (turn on)"
@@ -9530,7 +11968,10 @@ mod lifecycle_tests {
         // preserve-only like cloud_egress_consented).
         let mut dto_off = config_to_dto(&AppConfig::default());
         dto_off.semantic_search_enabled = false;
-        let current_on = AppConfig { semantic_search_enabled: true, ..AppConfig::default() };
+        let current_on = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
         assert!(
             !dto_to_config(dto_off, &current_on).semantic_search_enabled,
             "semantic_search_enabled MUST be settable from the DTO (turn off)"
@@ -9617,7 +12058,10 @@ mod lifecycle_tests {
         assert_eq!(merged.role_notes_connection, "anthropic");
         assert_eq!(merged.role_ask_connection, "ollama");
         assert_eq!(merged.role_live_connection, "off");
-        assert_eq!(merged.role_live_model, "", "a \"\" role key from the DTO clears the override");
+        assert_eq!(
+            merged.role_live_model, "",
+            "a \"\" role key from the DTO clears the override"
+        );
 
         // An older FE payload OMITTING the role keys deserializes them to "" (#[serde(default)]).
         let json = serde_json::to_string(&config_to_dto(&AppConfig::default())).unwrap();
@@ -9671,7 +12115,9 @@ mod lifecycle_tests {
             ..AppConfig::default()
         };
         assert_eq!(
-            dto_to_config(dto_none, &current_some).brain_model_id.as_deref(),
+            dto_to_config(dto_none, &current_some)
+                .brain_model_id
+                .as_deref(),
             Some("qwen3-14b")
         );
 
@@ -9703,7 +12149,8 @@ mod lifecycle_tests {
             ..AppConfig::default()
         };
         assert_eq!(
-            dto_to_config(dto_empty, &current_path).brain_model_path, None,
+            dto_to_config(dto_empty, &current_path).brain_model_path,
+            None,
             "an empty brainModelPath clears the custom path"
         );
 
@@ -9728,8 +12175,15 @@ mod lifecycle_tests {
             "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
         }"#;
         let dto_bad: AppConfigDto = serde_json::from_str(json).unwrap();
-        assert_eq!(dto_bad.brain_backend, BrainBackend::Cloud, "unknown token → Cloud");
-        assert!(!dto_bad.realtime_reactions, "omitted realtimeReactions defaults OFF");
+        assert_eq!(
+            dto_bad.brain_backend,
+            BrainBackend::Cloud,
+            "unknown token → Cloud"
+        );
+        assert!(
+            !dto_bad.realtime_reactions,
+            "omitted realtimeReactions defaults OFF"
+        );
         assert_eq!(
             dto_to_config(dto_bad, &AppConfig::default()).brain_backend,
             BrainBackend::Cloud
@@ -9758,7 +12212,10 @@ mod lifecycle_tests {
         );
         // Survives a reload from the settings table.
         assert_eq!(
-            AppConfig::load(&state.db).unwrap().brain_model_id.as_deref(),
+            AppConfig::load(&state.db)
+                .unwrap()
+                .brain_model_id
+                .as_deref(),
             Some("bielik-11b-v3")
         );
 
@@ -9794,18 +12251,27 @@ mod lifecycle_tests {
         // Selecting the SAME (default) model as the effective one ⇒ no re-index needed.
         let res = select_embed_model_inner(&state, "multilingual-e5-small".to_string()).unwrap();
         assert_eq!(res.selected, "multilingual-e5-small");
-        assert!(!res.reindex_needed, "re-selecting the default must not force a re-index");
+        assert!(
+            !res.reindex_needed,
+            "re-selecting the default must not force a re-index"
+        );
 
         // Switching to mmlw CHANGES the resolved model ⇒ re-index needed; persists + reloads.
         let res = select_embed_model_inner(&state, "mmlw-retrieval-e5-small".to_string()).unwrap();
         assert_eq!(res.selected, "mmlw-retrieval-e5-small");
-        assert!(res.reindex_needed, "changing the embed model must flag a re-index");
+        assert!(
+            res.reindex_needed,
+            "changing the embed model must flag a re-index"
+        );
         assert_eq!(
             state.config.lock().unwrap().embed_model_id.as_deref(),
             Some("mmlw-retrieval-e5-small")
         );
         assert_eq!(
-            AppConfig::load(&state.db).unwrap().embed_model_id.as_deref(),
+            AppConfig::load(&state.db)
+                .unwrap()
+                .embed_model_id
+                .as_deref(),
             Some("mmlw-retrieval-e5-small")
         );
 
@@ -9962,7 +12428,10 @@ mod lifecycle_tests {
             "the wrapped CK is untouched by a rename"
         );
         let after = &state.db.sealable_notes_for_meeting("ms").unwrap()[0];
-        assert_eq!(after.content_blob, blob_before, "ciphertext byte-identical after rename");
+        assert_eq!(
+            after.content_blob, blob_before,
+            "ciphertext byte-identical after rename"
+        );
         assert!(after.markdown.is_empty(), "blanked plaintext stays blanked");
 
         let _ = std::fs::remove_dir_all(&vault);
@@ -9977,7 +12446,10 @@ mod lifecycle_tests {
 
         rename_folder_inner(&state, "parent".into(), "Projects".into()).unwrap();
 
-        assert_eq!(state.db.folder_by_id("parent").unwrap().unwrap().path, "Projects");
+        assert_eq!(
+            state.db.folder_by_id("parent").unwrap().unwrap().path,
+            "Projects"
+        );
         assert_eq!(
             state.db.folder_by_id("child").unwrap().unwrap().path,
             "Projects/Q3",
@@ -10006,9 +12478,16 @@ mod lifecycle_tests {
         delete_folder_inner(&state, "f".into()).unwrap();
 
         // Folder row gone.
-        assert!(state.db.folder_by_id("f").unwrap().is_none(), "folder row deleted");
+        assert!(
+            state.db.folder_by_id("f").unwrap().is_none(),
+            "folder row deleted"
+        );
         // Note survived, now at the root (folder_id NULL).
-        assert_eq!(state.db.folder_for_meeting("m").unwrap(), None, "note demoted to All notes");
+        assert_eq!(
+            state.db.folder_for_meeting("m").unwrap(),
+            None,
+            "note demoted to All notes"
+        );
         let n = state.db.get_latest_note_for_meeting("m").unwrap().unwrap();
         assert_eq!(n.markdown, "# must survive", "note content never lost");
         let root_md = vault.join("keep.md");
@@ -10030,14 +12509,26 @@ mod lifecycle_tests {
         lock_folder_inner(&state, "lf".to_string()).unwrap(); // sealed, NOT session-unlocked
 
         let res = delete_folder_inner(&state, "lf".into());
-        assert!(matches!(res, Err(AppError::Locked(_))), "must refuse with Locked, got {res:?}");
+        assert!(
+            matches!(res, Err(AppError::Locked(_))),
+            "must refuse with Locked, got {res:?}"
+        );
 
         // Folder + sealed content intact.
-        assert!(state.db.folder_by_id("lf").unwrap().is_some(), "folder NOT deleted");
-        assert!(state.db.folder_wrapped_key("lf").unwrap().is_some(), "wrapped key kept");
+        assert!(
+            state.db.folder_by_id("lf").unwrap().is_some(),
+            "folder NOT deleted"
+        );
+        assert!(
+            state.db.folder_wrapped_key("lf").unwrap().is_some(),
+            "wrapped key kept"
+        );
         let n = &state.db.sealable_notes_for_meeting("m").unwrap()[0];
         assert!(n.content_blob.is_some(), "ciphertext kept (never orphaned)");
-        assert_eq!(state.db.folder_for_meeting("m").unwrap().as_deref(), Some("lf"));
+        assert_eq!(
+            state.db.folder_for_meeting("m").unwrap().as_deref(),
+            Some("lf")
+        );
     }
 
     /// SECURITY: deleting a LOCKED + SESSION-UNLOCKED folder UNSEALS its notes back to plaintext
@@ -10054,18 +12545,35 @@ mod lifecycle_tests {
         lock_folder_inner(&state, "lf".to_string()).unwrap();
 
         // Make it SESSION-UNLOCKED: in the unlock set + KEK cached (as a real unlock would leave it).
-        state.unlocked_folders.lock().unwrap().insert("lf".to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("lf".to_string());
         let kek = secrets::get_or_create_master_kek().unwrap();
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
 
         delete_folder_inner(&state, "lf".into()).unwrap();
 
         // Folder gone; note unsealed (plaintext restored, blob cleared) and demoted to the root.
-        assert!(state.db.folder_by_id("lf").unwrap().is_none(), "folder row deleted");
-        assert_eq!(state.db.folder_for_meeting("m").unwrap(), None, "note demoted to All notes");
+        assert!(
+            state.db.folder_by_id("lf").unwrap().is_none(),
+            "folder row deleted"
+        );
+        assert_eq!(
+            state.db.folder_for_meeting("m").unwrap(),
+            None,
+            "note demoted to All notes"
+        );
         let n = &state.db.sealable_notes_for_meeting("m").unwrap()[0];
-        assert_eq!(n.markdown, "# decrypt me back", "plaintext restored before delete");
-        assert!(n.content_blob.is_none(), "no orphaned ciphertext left behind");
+        assert_eq!(
+            n.markdown, "# decrypt me back",
+            "plaintext restored before delete"
+        );
+        assert!(
+            n.content_blob.is_none(),
+            "no orphaned ciphertext left behind"
+        );
         // The session set no longer references the deleted folder.
         assert!(!state.unlocked_folders.lock().unwrap().contains("lf"));
 
@@ -10081,9 +12589,18 @@ mod lifecycle_tests {
         make_child_folder(&state.db, "child", "Q3", "Work/Q3", "parent");
 
         let res = delete_folder_inner(&state, "parent".into());
-        assert!(matches!(res, Err(AppError::InvalidArg(_))), "must refuse, got {res:?}");
-        assert!(state.db.folder_by_id("parent").unwrap().is_some(), "parent NOT deleted");
-        assert!(state.db.folder_by_id("child").unwrap().is_some(), "child NOT orphaned");
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "must refuse, got {res:?}"
+        );
+        assert!(
+            state.db.folder_by_id("parent").unwrap().is_some(),
+            "parent NOT deleted"
+        );
+        assert!(
+            state.db.folder_by_id("child").unwrap().is_some(),
+            "child NOT orphaned"
+        );
     }
 
     // ── reindex_embeddings (semantic backfill) ──────────────────────────────────────────────────
@@ -10112,9 +12629,24 @@ mod lifecycle_tests {
         make_open_folder(&state.db, "f-lock", "Confidential");
 
         // Two open meetings (no folder ⇒ always visible) + one in a folder we will SEAL.
-        seed_meeting(&state.db, "m-open-1", "Quarterly budget planning and hiring runway.", None);
-        seed_meeting(&state.db, "m-open-2", "Roadmap review for the next sprint.", None);
-        seed_meeting(&state.db, "m-sealed", "Secret acquisition numbers and the term sheet.", Some("f-lock"));
+        seed_meeting(
+            &state.db,
+            "m-open-1",
+            "Quarterly budget planning and hiring runway.",
+            None,
+        );
+        seed_meeting(
+            &state.db,
+            "m-open-2",
+            "Roadmap review for the next sprint.",
+            None,
+        );
+        seed_meeting(
+            &state.db,
+            "m-sealed",
+            "Secret acquisition numbers and the term sheet.",
+            Some("f-lock"),
+        );
 
         // Seal the folder (verify-before-destroy seal + chunk purge) — m-sealed is now invisible.
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
@@ -10125,15 +12657,33 @@ mod lifecycle_tests {
         let res = reindex_embeddings_inner(&state.db, &nothing, true, &stub, |_, _| {}).unwrap();
         assert_eq!(res.status, "indexed");
         // Only the two VISIBLE meetings were processed (the sealed one is absent from the corpus).
-        assert_eq!(res.total, 2, "sealed meeting must NOT be in the reindex corpus");
+        assert_eq!(
+            res.total, 2,
+            "sealed meeting must NOT be in the reindex corpus"
+        );
         assert_eq!(res.indexed, 2);
 
         // The two open meetings are now semantically findable; the sealed one is NOT — even under the
         // same empty unlock set (it has no chunks, and is gated out).
-        assert!(reindex_semantic_finds(&state.db, "m-open-1", "budget planning hiring", &nothing));
-        assert!(reindex_semantic_finds(&state.db, "m-open-2", "roadmap sprint review", &nothing));
+        assert!(reindex_semantic_finds(
+            &state.db,
+            "m-open-1",
+            "budget planning hiring",
+            &nothing
+        ));
+        assert!(reindex_semantic_finds(
+            &state.db,
+            "m-open-2",
+            "roadmap sprint review",
+            &nothing
+        ));
         assert!(
-            !reindex_semantic_finds(&state.db, "m-sealed", "secret acquisition term sheet", &nothing),
+            !reindex_semantic_finds(
+                &state.db,
+                "m-sealed",
+                "secret acquisition term sheet",
+                &nothing
+            ),
             "a sealed-not-unlocked meeting must never be indexed by reindex (gate violation)"
         );
     }
@@ -10257,8 +12807,8 @@ mod lifecycle_tests {
     #[test]
     fn list_models_unknown_connection_refuses() {
         for conn in ["", "openai", "GATEWAY", "claude"] {
-            let err = static_connection_models(conn)
-                .expect_err("unknown connection must be refused");
+            let err =
+                static_connection_models(conn).expect_err("unknown connection must be refused");
             assert!(
                 matches!(err, AppError::InvalidArg(_)),
                 "expected InvalidArg for '{conn}', got: {err:?}"
@@ -10295,7 +12845,10 @@ mod reminder_script_tests {
         // `day` is reset to 1 BEFORE year/month so a month change can't overflow the day.
         let reset = s.find("set day of theDate to 1").unwrap();
         let yr = s.find("set year of theDate").unwrap();
-        assert!(reset < yr, "day must be reset to 1 before changing year/month");
+        assert!(
+            reset < yr,
+            "day must be reset to 1 before changing year/month"
+        );
     }
 
     #[test]
@@ -10309,7 +12862,10 @@ mod reminder_script_tests {
     #[test]
     fn invalid_due_date_falls_back_to_name_only() {
         let s = build_reminder_script("Task", Some("not-a-date"));
-        assert!(!s.contains("due date"), "an unparseable date must not produce date props");
+        assert!(
+            !s.contains("due date"),
+            "an unparseable date must not produce date props"
+        );
         assert!(s.contains("name:\"Task\""));
     }
 
@@ -10317,15 +12873,22 @@ mod reminder_script_tests {
     fn item_text_cannot_break_out_of_the_applescript_literal() {
         // A name carrying a quote + a forged statement must stay INSIDE the string literal: the
         // `"` is escaped to `\"`, so `end tell` / the injected `make` never become real statements.
-        let evil = "pwn\", remind me date:theDate}\nend tell\ntell application \"Finder\" to delete";
+        let evil =
+            "pwn\", remind me date:theDate}\nend tell\ntell application \"Finder\" to delete";
         let esc = escape_applescript(evil);
-        assert!(!esc.contains('\n'), "raw newlines flattened (literals can't span lines)");
+        assert!(
+            !esc.contains('\n'),
+            "raw newlines flattened (literals can't span lines)"
+        );
         // Every `"` in the payload is preceded by a backslash — no bare quote survives to close
         // the literal early. (Checked by scanning: each `"` byte has a `\` immediately before it.)
         let bytes = esc.as_bytes();
         for (i, &b) in bytes.iter().enumerate() {
             if b == b'"' {
-                assert!(i > 0 && bytes[i - 1] == b'\\', "unescaped quote survived at {i}");
+                assert!(
+                    i > 0 && bytes[i - 1] == b'\\',
+                    "unescaped quote survived at {i}"
+                );
             }
         }
         let s = build_reminder_script(evil, Some("2026-07-01"));
@@ -10384,8 +12947,8 @@ mod gateway_key_tests {
     #[test]
     fn save_config_gateway_url_with_credentials_is_rejected() {
         // Credential-bearing URL → InvalidArg (never stored).
-        let err = crate::summarize::gateway::validate_gateway_url("https://key:@host/v1")
-            .unwrap_err();
+        let err =
+            crate::summarize::gateway::validate_gateway_url("https://key:@host/v1").unwrap_err();
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "URL with credentials must be InvalidArg, got: {err:?}"

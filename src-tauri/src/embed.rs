@@ -68,7 +68,10 @@ pub trait Embedder {
     /// practice (the prefix tokens add a tiny constant bag), so this is safe to route through the
     /// stub; the real `CandleBertEmbedder` relies on it for correct e5 retrieval quality.
     fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{PASSAGE_PREFIX}{t}")).collect();
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{PASSAGE_PREFIX}{t}"))
+            .collect();
         self.embed(&prefixed)
     }
 
@@ -241,10 +244,7 @@ pub fn set_selected_embed_model_id(id: Option<String>) {
 /// else the DEFAULT. NEVER panics (a poisoned lock or an unknown id both fall back to the default),
 /// so this is safe on any hot path.
 pub fn selected_embed_model() -> &'static EmbedModel {
-    let id = SELECTED_EMBED_MODEL_ID
-        .read()
-        .ok()
-        .and_then(|g| g.clone());
+    let id = SELECTED_EMBED_MODEL_ID.read().ok().and_then(|g| g.clone());
     match id.as_deref().and_then(embed_model_by_id) {
         Some(m) => m,
         None => default_embed_model(),
@@ -338,7 +338,10 @@ fn fnv1a(s: &str) -> u64 {
 /// L2-normalize. Deterministic; an empty/punctuation-only text yields an all-zero vector.
 fn stub_embed_one(text: &str) -> Vec<f32> {
     let mut v = vec![0f32; EMBED_DIM];
-    for token in text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+    for token in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
         let h = fnv1a(&token.to_lowercase());
         let idx = (h % EMBED_DIM as u64) as usize;
         let sign = if (h >> 40) & 1 == 0 { 1.0 } else { -1.0 };
@@ -685,7 +688,10 @@ mod tests {
         assert_eq!(a, b, "same text must embed byte-identically");
         assert_eq!(a[0].len(), EMBED_DIM);
         let norm: f32 = a[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "non-empty vector must be L2-normalized, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "non-empty vector must be L2-normalized, got {norm}"
+        );
         // Empty / punctuation-only text → all-zero (no NaN from div-by-zero).
         let z = e.embed(&["   !!! ".to_string()]).unwrap();
         assert!(z[0].iter().all(|x| *x == 0.0));
@@ -852,8 +858,14 @@ mod tests {
         // m2 (ranked in both, high in each) must beat m1 and m3 (each ranked well in only one).
         // m2: 1/(60+2) + 1/(60+2); m1: 1/(60+1) + 1/(60+3); m3: 1/(60+1).
         let pos = |want: &str| fused.iter().position(|(id, _)| id == want).unwrap();
-        assert!(pos("m2") < pos("m3"), "m2 (in both lists) must outrank m3 (one list)");
-        assert!(pos("m1") < pos("m3"), "m1 (in both lists) must outrank m3 (one list)");
+        assert!(
+            pos("m2") < pos("m3"),
+            "m2 (in both lists) must outrank m3 (one list)"
+        );
+        assert!(
+            pos("m1") < pos("m3"),
+            "m1 (in both lists) must outrank m3 (one list)"
+        );
     }
 
     #[test]
@@ -872,20 +884,31 @@ mod tests {
         }
         let e = CaptureEmbedder(std::sync::Mutex::new(Vec::new()));
         e.embed_passage(&["a budget note".to_string()]).unwrap();
-        assert_eq!(e.0.lock().unwrap().as_slice(), &["passage: a budget note".to_string()]);
+        assert_eq!(
+            e.0.lock().unwrap().as_slice(),
+            &["passage: a budget note".to_string()]
+        );
         e.embed_query(&["how much budget".to_string()]).unwrap();
-        assert_eq!(e.0.lock().unwrap().as_slice(), &["query: how much budget".to_string()]);
+        assert_eq!(
+            e.0.lock().unwrap().as_slice(),
+            &["query: how much budget".to_string()]
+        );
     }
 
     #[test]
     fn embed_model_dir_is_under_models_dir() {
-        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // With no selection set, the resolver falls back to the default (e5) subdir.
         set_selected_embed_model_id(None);
         let dir = embed_model_dir().unwrap();
         assert!(dir.ends_with(EMBED_MODEL_SUBDIR));
         // The three e5 files are the documented set.
-        assert_eq!(EMBED_MODEL_FILES, &["model.safetensors", "tokenizer.json", "config.json"]);
+        assert_eq!(
+            EMBED_MODEL_FILES,
+            &["model.safetensors", "tokenizer.json", "config.json"]
+        );
         assert!(EMBED_MODEL_HF_BASE.contains("intfloat/multilingual-e5-small"));
     }
 
@@ -895,19 +918,29 @@ mod tests {
     #[test]
     fn embed_registry_is_wellformed_and_has_mmlw() {
         assert_eq!(default_embed_model().id, DEFAULT_EMBED_MODEL_ID);
-        assert_eq!(EMBED_MODELS[0].id, DEFAULT_EMBED_MODEL_ID, "default must be first");
+        assert_eq!(
+            EMBED_MODELS[0].id, DEFAULT_EMBED_MODEL_ID,
+            "default must be first"
+        );
         // Unique ids.
         let mut ids: Vec<&str> = EMBED_MODELS.iter().map(|m| m.id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), EMBED_MODELS.len(), "embed model ids must be unique");
+        assert_eq!(
+            ids.len(),
+            EMBED_MODELS.len(),
+            "embed model ids must be unique"
+        );
         // mmlw is a first-class selectable option with the documented e5-compatible prefixes.
         let mmlw = embed_model_by_id("mmlw-retrieval-e5-small")
             .expect("mmlw-retrieval-e5-small must be registered");
         assert_eq!(mmlw.query_prefix, "query: ");
         assert_eq!(mmlw.passage_prefix, "passage: ");
         assert!(mmlw.hf_base.contains("sdadas/mmlw-retrieval-e5-small"));
-        assert_ne!(mmlw.subdir, EMBED_MODEL_SUBDIR, "each model needs its own subdir");
+        assert_ne!(
+            mmlw.subdir, EMBED_MODEL_SUBDIR,
+            "each model needs its own subdir"
+        );
         // The default carries the historical values verbatim (byte-identical default behavior).
         let def = default_embed_model();
         assert_eq!(def.subdir, EMBED_MODEL_SUBDIR);
@@ -921,10 +954,14 @@ mod tests {
     /// this test cannot leak state into others that share the process global.
     #[test]
     fn selected_embed_model_resolves_and_falls_back() {
-        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_selected_embed_model_id(Some("mmlw-retrieval-e5-small".to_string()));
         assert_eq!(selected_embed_model().id, "mmlw-retrieval-e5-small");
-        assert!(embed_model_dir().unwrap().ends_with("embed-mmlw-retrieval-e5-small"));
+        assert!(embed_model_dir()
+            .unwrap()
+            .ends_with("embed-mmlw-retrieval-e5-small"));
 
         // Unknown id ⇒ default. Empty ⇒ default. None ⇒ default.
         set_selected_embed_model_id(Some("does-not-exist".to_string()));
@@ -941,22 +978,38 @@ mod tests {
     fn embed_model_dtos_mark_selected() {
         let dtos = embed_model_dtos(None);
         assert_eq!(dtos.len(), EMBED_MODELS.len());
-        let selected: Vec<&str> = dtos.iter().filter(|d| d.selected).map(|d| d.id.as_str()).collect();
-        assert_eq!(selected, vec![DEFAULT_EMBED_MODEL_ID], "None ⇒ default is selected");
+        let selected: Vec<&str> = dtos
+            .iter()
+            .filter(|d| d.selected)
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec![DEFAULT_EMBED_MODEL_ID],
+            "None ⇒ default is selected"
+        );
 
         let dtos = embed_model_dtos(Some("mmlw-retrieval-e5-small"));
-        let selected: Vec<&str> = dtos.iter().filter(|d| d.selected).map(|d| d.id.as_str()).collect();
+        let selected: Vec<&str> = dtos
+            .iter()
+            .filter(|d| d.selected)
+            .map(|d| d.id.as_str())
+            .collect();
         assert_eq!(selected, vec!["mmlw-retrieval-e5-small"]);
 
         // Unknown id ⇒ the default is marked selected (never zero-selected).
         let dtos = embed_model_dtos(Some("bogus"));
         assert!(dtos.iter().filter(|d| d.selected).count() == 1);
-        assert!(dtos.iter().find(|d| d.selected).map(|d| d.id.as_str()) == Some(DEFAULT_EMBED_MODEL_ID));
+        assert!(
+            dtos.iter().find(|d| d.selected).map(|d| d.id.as_str()) == Some(DEFAULT_EMBED_MODEL_ID)
+        );
     }
 
     #[test]
     fn embed_model_present_false_when_any_file_missing() {
-        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_selected_embed_model_id(None);
         // On a clean machine the e5 dir is absent ⇒ not present. Even with a partial dir (only one of
         // the three files), `present` must be false — the loader needs all three.
@@ -965,7 +1018,10 @@ mod tests {
         // If a real model happens to be installed, this assertion is vacuously satisfied; otherwise
         // assert the absent/partial cases without clobbering a real install.
         if !had_dir {
-            assert!(!embed_model_present(), "absent e5 dir must report not-present");
+            assert!(
+                !embed_model_present(),
+                "absent e5 dir must report not-present"
+            );
         }
     }
 
@@ -976,7 +1032,9 @@ mod tests {
     /// `active_reasoner_falls_back_to_stub_without_model`).
     #[test]
     fn active_embedder_falls_back_to_stub_without_model() {
-        let _g = EMBED_SELECTION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_selected_embed_model_id(None);
         // Only meaningful as a fallback assertion when no real model is installed; on a clean
         // machine/CI the e5 dir is absent, so the always-compiled candle backend still yields the stub.

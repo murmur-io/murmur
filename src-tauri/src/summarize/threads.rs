@@ -24,7 +24,9 @@ pub fn build_threads(meetings: &[MeetingTopics]) -> Vec<TopicThread> {
             if key.is_empty() {
                 continue;
             }
-            let entry = map.entry(key).or_insert_with(|| (label.trim().to_string(), Vec::new()));
+            let entry = map
+                .entry(key)
+                .or_insert_with(|| (label.trim().to_string(), Vec::new()));
             entry.1.push(TopicMention {
                 meeting_id: m.meeting_id.clone(),
                 title: m.title.clone(),
@@ -58,7 +60,10 @@ mod tests {
             meeting_id: id.into(),
             title: format!("Meeting {id}"),
             started_at: when.into(),
-            topics: topics.iter().map(|(l, s, e)| (l.to_string(), *s, *e)).collect(),
+            topics: topics
+                .iter()
+                .map(|(l, s, e)| (l.to_string(), *s, *e))
+                .collect(),
         }
     }
 
@@ -66,13 +71,17 @@ mod tests {
     fn clusters_across_meetings_chronologically() {
         let ms = vec![
             mt("2", "2026-07-02", &[("Budget", 0.0, 60.0)]),
-            mt("1", "2026-07-01", &[("budget", 10.0, 50.0), ("Hiring", 0.0, 20.0)]),
+            mt(
+                "1",
+                "2026-07-01",
+                &[("budget", 10.0, 50.0), ("Hiring", 0.0, 20.0)],
+            ),
         ];
         let threads = build_threads(&ms);
         // "Budget"/"budget" merge into one thread of 2, ordered first (highest count)
         assert_eq!(threads[0].count, 2);
         assert_eq!(threads[0].label, "Budget"); // first-seen casing kept
-        // chronological: meeting 1 (07-01) before meeting 2 (07-02)
+                                                // chronological: meeting 1 (07-01) before meeting 2 (07-02)
         assert_eq!(threads[0].mentions[0].meeting_id, "1");
         assert_eq!(threads[0].mentions[1].meeting_id, "2");
         assert!(threads.iter().any(|t| t.label == "Hiring" && t.count == 1));

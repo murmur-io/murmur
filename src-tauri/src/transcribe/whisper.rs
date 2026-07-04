@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use whisper_rs::{
-    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
-};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::error::{AppError, Result};
 use crate::transcribe::types::{Segment, Transcript};
@@ -82,9 +80,9 @@ impl Transcriber {
                 model_path.display()
             )));
         }
-        let path_str = model_path.to_str().ok_or_else(|| {
-            AppError::Transcribe("whisper model path is not valid UTF-8".into())
-        })?;
+        let path_str = model_path
+            .to_str()
+            .ok_or_else(|| AppError::Transcribe("whisper model path is not valid UTF-8".into()))?;
 
         // Disable ggml-metal residency sets BEFORE the Metal device is created (read live in
         // `ggml_metal_device_init`). On macOS 15+/Apple-silicon the residency-set teardown asserts
@@ -160,9 +158,9 @@ impl Transcriber {
         let mut full_text = String::new();
 
         for i in 0..n_segments {
-            let segment = state.get_segment(i).ok_or_else(|| {
-                AppError::Transcribe(format!("segment {i} out of bounds"))
-            })?;
+            let segment = state
+                .get_segment(i)
+                .ok_or_else(|| AppError::Transcribe(format!("segment {i} out of bounds")))?;
             // Lossy decode tolerates the rare invalid-UTF8 byte rather than failing the run.
             let text = segment
                 .to_str_lossy()

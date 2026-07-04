@@ -7,13 +7,13 @@ use rusqlite::{Connection, OptionalExtension, Row};
 use crate::error::{AppError, Result};
 use std::collections::HashSet;
 
+use crate::embed::Embedder;
 use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
-    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, PersonCard, RecipeRecord,
-    SearchHit, StatusCount, VaultSource,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, PersonCard,
+    RecipeRecord, SearchHit, StatusCount, VaultSource,
 };
-use crate::embed::Embedder;
 use crate::transcribe::types::Segment;
 
 /// The at-rest audio columns of one locked-folder meeting, surfaced by
@@ -66,7 +66,9 @@ impl FromStr for MeetingStatus {
             "SUMMARIZED" => Ok(MeetingStatus::Summarized),
             "EXPORTED" => Ok(MeetingStatus::Exported),
             "ERROR" => Ok(MeetingStatus::Error),
-            other => Err(AppError::Storage(format!("unknown meeting status: {other}"))),
+            other => Err(AppError::Storage(format!(
+                "unknown meeting status: {other}"
+            ))),
         }
     }
 }
@@ -134,7 +136,9 @@ fn register_vec_extension() {
                     *mut *mut std::os::raw::c_char,
                     *const rusqlite::ffi::sqlite3_api_routines,
                 ) -> std::os::raw::c_int,
-            >(sqlite_vec::sqlite3_vec_init as *const ())));
+            >(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
         }
     });
 }
@@ -228,11 +232,11 @@ impl Db {
         conn.pragma_update(None, "key", key_pragma.as_str())
             .map_err(map_err)?;
         drop(key_pragma); // explicit: wipe the hex key string now.
-        // Harden SQLCipher's transient memory (B2/B10): keep temp tables / indices / materialized
-        // subqueries in RAM (never spilled to an unencrypted temp FILE), and have SQLCipher wipe its
-        // internal allocations (page buffers, KDF state) when freed. These MUST follow `PRAGMA key`
-        // on EVERY connection (the keyed handle is what they harden). Enforce FK cascades
-        // (segments/notes → meetings) and use WAL for concurrent reads while a write is in progress.
+                          // Harden SQLCipher's transient memory (B2/B10): keep temp tables / indices / materialized
+                          // subqueries in RAM (never spilled to an unencrypted temp FILE), and have SQLCipher wipe its
+                          // internal allocations (page buffers, KDF state) when freed. These MUST follow `PRAGMA key`
+                          // on EVERY connection (the keyed handle is what they harden). Enforce FK cascades
+                          // (segments/notes → meetings) and use WAL for concurrent reads while a write is in progress.
         conn.execute_batch(
             "PRAGMA cipher_memory_security = ON;
              PRAGMA temp_store = MEMORY;
@@ -575,6 +579,68 @@ impl Db {
             .map_err(map_err)?;
         }
 
+        // M3-CLIENT (spec §7) — local bookkeeping for OUTBOUND server shares. Stores ONLY the
+        // client-minted `share_id` + the local `meeting_id` (+ mode/rev/state/ts). There is
+        // DELIBERATELY NO title column: the share list derives the title via the GATED meeting read
+        // (`meeting_is_unlocked`), so a sealed meeting's title can never leak from this table. It
+        // never holds the link key `L`, `NK`, ciphertext, or any note text — those live server-side
+        // (encrypted) and in the URL fragment (which is never persisted here). Additive + guarded so
+        // migrate() stays idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS outbound_shares (
+               share_id   TEXT PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               mode       TEXT NOT NULL,
+               rev        INTEGER NOT NULL DEFAULT 1,
+               state      TEXT NOT NULL DEFAULT 'active',
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_outbound_shares_meeting ON outbound_shares(meeting_id);
+             -- Content-free egress ledger for SHARE uploads (§7 inv. 4): host + byte sizes only.
+             -- NEVER the share URL, the fragment key L, a title, or any note text.
+             CREATE TABLE IF NOT EXISTS share_egress_log (
+               id         INTEGER PRIMARY KEY AUTOINCREMENT,
+               ts         INTEGER NOT NULL,
+               host       TEXT NOT NULL,
+               kind       TEXT NOT NULL,
+               byte_count INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(map_err)?;
+
+        // M5-CLIENT (spec §4.8/§7) — Murmur↔Murmur (mode B) local bookkeeping.
+        //
+        // `pinned_contacts` = TOFU key pins. Keyed on a STABLE `account_id` (NOT email, so a future
+        // email change doesn't strand the pin — spec §4.8) with the safety-word `fingerprint` as the
+        // pinned VALUE, so a CHANGED fingerprint for a known contact is detectable → BLOCKING re-verify
+        // (never click-through). Carries no key bytes, no note content.
+        //
+        // `inbound_shares` = the idempotency + provenance record for an ACCEPTED share (share_id →
+        // local meeting_id). A re-accept of the same share_id is a no-op (never a duplicate vault note).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pinned_contacts (
+               account_id  TEXT PRIMARY KEY,
+               email       TEXT,
+               fingerprint TEXT NOT NULL,
+               pinned_at   TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS inbound_shares (
+               share_id       TEXT PRIMARY KEY,
+               meeting_id     TEXT NOT NULL,
+               sender_acct_id TEXT,
+               accepted_at    TEXT NOT NULL
+             );",
+        )
+        .map_err(map_err)?;
+        // Additive columns on `outbound_shares` for mode B (spec §7 schema: `nk BLOB`,
+        // `recipient_acct_id?`). The retained `nk` + `content_hash` let `share_rewrap_pending` re-wrap
+        // to a newly-registered recipient WITHOUT re-reading meeting content (only key material). Both
+        // are protected at rest by the whole-DB SQLCipher DEK. Guarded so migrate() stays idempotent.
+        Self::add_column_if_missing(&conn, "outbound_shares", "nk", "BLOB")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "recipient_acct_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "recipient_email", "TEXT")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "content_hash", "BLOB")?;
+
         // WS8 / capture-default: one-time flip of the SYSTEM-AUDIO-CAPTURE default to ON for the
         // INSTALLED base (fresh installs already default ON via `AppConfig::default().capture_system_audio`
         // — the default flipped OFF→ON in #167). This reaches DBs that persisted the historical 'false'.
@@ -650,7 +716,12 @@ impl Db {
         // `kind` distinguishes an UPLOADED file ('document') from a TYPED brain note ('note'). Additive
         // + guarded so migrate() stays idempotent; legacy rows default to 'document'. Both kinds ride
         // the SAME seal/unseal/purge/gating — `kind` is a presentation split for the Brain page only.
-        Self::add_column_if_missing(conn, "documents", "kind", "TEXT NOT NULL DEFAULT 'document'")?;
+        Self::add_column_if_missing(
+            conn,
+            "documents",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'document'",
+        )?;
         // The vec0 column width is the embedder's EMBED_DIM (== the note vec_chunks width). Format the
         // DDL (no user input). Parallel to `vec_chunks` but keyed to `doc_chunks.id`.
         conn.execute_batch(&format!(
@@ -958,6 +1029,210 @@ impl Db {
         Ok(())
     }
 
+    // ── M3-CLIENT: outbound server-share bookkeeping + share egress ledger (spec §7) ─────────────
+
+    /// Record a newly-created OUTBOUND link share. Stores ONLY `share_id` + `meeting_id` (+
+    /// mode/rev/state/ts) — NO title (derived via the gated meeting read), no `L`, no ciphertext.
+    pub fn insert_outbound_share(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        mode: &str,
+        rev: u32,
+        created_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO outbound_shares (share_id, meeting_id, mode, rev, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+            rusqlite::params![share_id, meeting_id, mode, rev as i64, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The local `meeting_id` for an outbound share (so the share list can gate on the meeting's lock
+    /// state before revealing its title). `None` if we never created this share locally.
+    pub fn outbound_share_meeting(&self, share_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT meeting_id FROM outbound_shares WHERE share_id = ?1",
+            rusqlite::params![share_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Flip an outbound share's local state (e.g. `'revoked'`). Idempotent; a no-op if the share_id
+    /// is unknown locally (a share created on another device).
+    pub fn set_outbound_share_state(&self, share_id: &str, state: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE outbound_shares SET state = ?2 WHERE share_id = ?1",
+            rusqlite::params![share_id, state],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Append one CONTENT-FREE share-egress ledger row (§7 inv. 4): host + byte size + a `kind` label
+    /// (`"share_create"` / `"share_revoke"` / `"account_login"` …). NEVER the URL, `L`, a title, or
+    /// any note text. `ts` is a Unix epoch (seconds).
+    pub fn insert_share_egress(
+        &self,
+        ts: i64,
+        host: &str,
+        kind: &str,
+        byte_count: usize,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO share_egress_log (ts, host, kind, byte_count) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![ts, host, kind, byte_count as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    // ── M5-CLIENT: TOFU pins, mode-B outbound bookkeeping, inbound accept idempotency (spec §4.8/§7) ──
+
+    /// TOFU-pin a contact's identity fingerprint under a STABLE `account_id` (spec §4.8: pin on
+    /// account_id, not email). Idempotent upsert — the CALLER decides whether to pin (first contact) or
+    /// BLOCK (an existing pin with a different fingerprint), never a silent overwrite of a changed key.
+    pub fn pin_contact(
+        &self,
+        account_id: &str,
+        email: Option<&str>,
+        fingerprint: &str,
+        pinned_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO pinned_contacts (account_id, email, fingerprint, pinned_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET
+               email = excluded.email, fingerprint = excluded.fingerprint, pinned_at = excluded.pinned_at",
+            rusqlite::params![account_id, email, fingerprint, pinned_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The pinned `(email, fingerprint)` for a contact `account_id`, or `None` if never pinned
+    /// (first contact). The safety-word compare + the blocking key-change detection read this.
+    pub fn get_pinned_contact(&self, account_id: &str) -> Result<Option<(Option<String>, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT email, fingerprint FROM pinned_contacts WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Record a mode-B OUTBOUND share. Stores the retained note key `nk` + the `content_hash`
+    /// (SHA-256 of the sealed cell) so a later `share_rewrap_pending` can re-wrap to a newly-registered
+    /// recipient WITHOUT re-reading meeting content — plus `share_id`+`meeting_id` for the gated title
+    /// derivation (NO title column, spec §7). `state` = `'sent'` (registered) or `'awaiting_key'`
+    /// (invited/unregistered). `nk`/`content_hash` are at-rest-protected by the whole-DB SQLCipher DEK.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_outbound_user_share(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        rev: u32,
+        created_at: &str,
+        state: &str,
+        nk: &[u8],
+        recipient_acct_id: &str,
+        recipient_email: &str,
+        content_hash: &[u8],
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO outbound_shares
+               (share_id, meeting_id, mode, rev, state, created_at,
+                nk, recipient_acct_id, recipient_email, content_hash)
+             VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                share_id,
+                meeting_id,
+                rev as i64,
+                state,
+                created_at,
+                nk,
+                recipient_acct_id,
+                recipient_email,
+                content_hash
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Every mode-B outbound share still `'awaiting_key'` (the recipient was unregistered at share
+    /// time). Returns `(share_id, rev, nk, recipient_email, content_hash)` for the on-launch re-wrap.
+    #[allow(clippy::type_complexity)]
+    pub fn list_awaiting_rewrap(&self) -> Result<Vec<(String, u32, Vec<u8>, String, Vec<u8>)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT share_id, rev, nk, recipient_email, content_hash
+                 FROM outbound_shares
+                 WHERE mode = 'user' AND state = 'awaiting_key'
+                   AND nk IS NOT NULL AND recipient_email IS NOT NULL AND content_hash IS NOT NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(map_err)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Record an ACCEPTED inbound share (idempotency + provenance). A duplicate `share_id` is ignored
+    /// (INSERT OR IGNORE) so a re-accept never writes a second vault note.
+    pub fn insert_inbound_share(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        sender_acct_id: &str,
+        accepted_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO inbound_shares (share_id, meeting_id, sender_acct_id, accepted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![share_id, meeting_id, sender_acct_id, accepted_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The local `meeting_id` a share was already accepted into, or `None` if never accepted. Drives
+    /// the `accept_share` idempotency check (spec §7 inv. 2: idempotent on `share_id`).
+    pub fn inbound_share_meeting(&self, share_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT meeting_id FROM inbound_shares WHERE share_id = ?1",
+            rusqlite::params![share_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     /// Aggregate the `egress_log` table over the last `days` calendar days and return a rich
     /// summary for the "Egress & Usage" Analytics panel.
     ///
@@ -973,7 +1248,11 @@ impl Db {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let since = if days > 0 { now_unix - days * 86_400 } else { 0 };
+        let since = if days > 0 {
+            now_unix - days * 86_400
+        } else {
+            0
+        };
 
         let conn = self.lock();
 
@@ -1088,9 +1367,7 @@ impl Db {
                         provider_id: r.get(1)?,
                         destination: r.get(2)?,
                         model_served: r.get(3)?,
-                        total_tokens: r
-                            .get::<_, Option<i64>>(4)?
-                            .map(|v| v as u32),
+                        total_tokens: r.get::<_, Option<i64>>(4)?.map(|v| v as u32),
                         redactions: EgressRedactionTotals {
                             email: r.get::<_, i64>(5)? as u64,
                             card: r.get::<_, i64>(6)? as u64,
@@ -1107,7 +1384,14 @@ impl Db {
             out
         };
 
-        Ok(EgressLedger { total_calls, total_tokens, by_model, by_day, total_redactions, recent })
+        Ok(EgressLedger {
+            total_calls,
+            total_tokens,
+            by_model,
+            by_day,
+            total_redactions,
+            recent,
+        })
     }
 
     // ── correction-log flywheel ──────────────────────────────────────────────
@@ -1255,12 +1539,12 @@ impl Db {
                 .prepare("SELECT id FROM meetings WHERE status = ?1")
                 .map_err(map_err)?;
             let rows = stmt
-                .query_map(
-                    rusqlite::params![MeetingStatus::Recording.as_str()],
-                    |r| r.get::<_, String>(0),
-                )
+                .query_map(rusqlite::params![MeetingStatus::Recording.as_str()], |r| {
+                    r.get::<_, String>(0)
+                })
                 .map_err(map_err)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_err)?
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?
         };
         // Exclude the rows salvage claimed this launch — it owns their final status.
         let to_reconcile: Vec<&String> =
@@ -2117,7 +2401,12 @@ impl Db {
         let doc_chunks: i64 = conn
             .query_row("SELECT COUNT(*) FROM doc_chunks", [], |r| r.get(0))
             .map_err(map_err)?;
-        Ok((meeting_count, document_count, note_count, note_chunks + doc_chunks))
+        Ok((
+            meeting_count,
+            document_count,
+            note_count,
+            note_chunks + doc_chunks,
+        ))
     }
 
     /// Number of `doc_chunks` rows currently indexed for a document (0 when sealed/purged or never
@@ -2227,9 +2516,7 @@ impl Db {
     pub fn raw_documents_in_folder(&self, folder_id: &str) -> Result<Vec<RawDocument>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, COALESCE(text, ''), text_blob FROM documents WHERE folder_id = ?1",
-            )
+            .prepare("SELECT id, COALESCE(text, ''), text_blob FROM documents WHERE folder_id = ?1")
             .map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![folder_id], |r| {
@@ -2371,10 +2658,7 @@ impl Db {
     /// Delete doc-chunk rows for `document_ids` within an EXISTING transaction (so the purge lands in
     /// the same atomic unit as the plaintext blanking on lock). vec0 first (its FK-less rowid mirrors
     /// doc_chunks.id), then the source rows. Mirrors [`Db::purge_chunks_tx`].
-    fn purge_doc_chunks_tx(
-        tx: &rusqlite::Transaction<'_>,
-        document_ids: &[String],
-    ) -> Result<()> {
+    fn purge_doc_chunks_tx(tx: &rusqlite::Transaction<'_>, document_ids: &[String]) -> Result<()> {
         for did in document_ids {
             tx.execute(
                 "DELETE FROM doc_vec_chunks WHERE chunk_id IN
@@ -2912,14 +3196,18 @@ impl Db {
             .query_row("SELECT COUNT(*) FROM meetings", [], |r| r.get(0))
             .map_err(map_err)?;
         let total_duration_s: i64 = conn
-            .query_row("SELECT COALESCE(SUM(duration_s), 0) FROM meetings", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(SUM(duration_s), 0) FROM meetings",
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let longest_duration_s: i64 = conn
-            .query_row("SELECT COALESCE(MAX(duration_s), 0) FROM meetings", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(duration_s), 0) FROM meetings",
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let notes_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
@@ -3147,10 +3435,7 @@ impl Db {
     pub fn delete_folder(&self, id: &str) -> Result<usize> {
         let conn = self.lock();
         let n = conn
-            .execute(
-                "DELETE FROM folders WHERE id = ?1",
-                rusqlite::params![id],
-            )
+            .execute("DELETE FROM folders WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         Ok(n)
     }
@@ -3259,7 +3544,12 @@ impl Db {
     /// blob — a meeting re-summarized with multiple providers never collapses to one blob (which
     /// would destroy every provider's content but the first). The whole meeting is sealed by
     /// calling this once per provider row.
-    pub fn seal_note(&self, meeting_id: &str, provider_id: &str, content_blob: &[u8]) -> Result<()> {
+    pub fn seal_note(
+        &self,
+        meeting_id: &str,
+        provider_id: &str,
+        content_blob: &[u8],
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE notes SET content_blob = ?3, markdown = '', exported_path = NULL
@@ -3770,7 +4060,12 @@ impl Db {
         conn.query_row(
             "SELECT mic_master_path, sys_master_path FROM meetings WHERE id = ?1",
             rusqlite::params![meeting_id],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            },
         )
         .optional()
         .map_err(map_err)?
@@ -4019,11 +4314,7 @@ impl Db {
 
     /// Whether a meeting is visible at all (any note visible, or no notes) — gates the transcript
     /// in MCP `get_meeting` so a sealed meeting's transcript is not leaked either.
-    pub fn meeting_is_visible(
-        &self,
-        meeting_id: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<bool> {
+    pub fn meeting_is_visible(&self, meeting_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
@@ -4294,12 +4585,14 @@ impl Db {
             }
         }
         // Due date ascending (soonest first), items with no date last; ties broken by recency.
-        out.sort_by(|a, b| match (a.due_date.as_deref(), b.due_date.as_deref()) {
-            (Some(x), Some(y)) => x.cmp(y).then_with(|| b.started_at.cmp(&a.started_at)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => b.started_at.cmp(&a.started_at),
-        });
+        out.sort_by(
+            |a, b| match (a.due_date.as_deref(), b.due_date.as_deref()) {
+                (Some(x), Some(y)) => x.cmp(y).then_with(|| b.started_at.cmp(&a.started_at)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => b.started_at.cmp(&a.started_at),
+            },
+        );
         Ok(out)
     }
 
@@ -4494,11 +4787,7 @@ impl Db {
     /// markdown) can never leak through `get_entity` / `build_entity_detail`. This is the gate the
     /// detail path was missing: `get_entity` itself reads the raw `entities` row with no visibility
     /// predicate, so callers that expose an entity to the FE MUST go through this check first.
-    pub fn entity_is_visible(
-        &self,
-        entity_id: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<bool> {
+    pub fn entity_is_visible(&self, entity_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         let sql = format!(
@@ -4949,14 +5238,16 @@ impl Db {
             });
         }
         // Most-recent contact first (None last), ties broken by name.
-        out.sort_by(|a, b| match (a.last_talked.as_deref(), b.last_talked.as_deref()) {
-            (Some(x), Some(y)) => y
-                .cmp(x)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
+        out.sort_by(
+            |a, b| match (a.last_talked.as_deref(), b.last_talked.as_deref()) {
+                (Some(x), Some(y)) => y
+                    .cmp(x)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            },
+        );
         Ok(out)
     }
 
@@ -5454,7 +5745,9 @@ fn row_to_user_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
 
 /// Escape LIKE wildcards so user input is matched literally (paired with `ESCAPE '\'`).
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Build a SAFE FTS5 `MATCH` expression from a raw user query.
@@ -5494,12 +5787,7 @@ fn fts_match_query(q: &str) -> Option<String> {
 }
 
 /// Build a `(snippet, matched_in)` pair for a search hit, reusing the open connection.
-fn search_snippet(
-    conn: &Connection,
-    m: &Meeting,
-    q: &str,
-    like: &str,
-) -> Result<(String, String)> {
+fn search_snippet(conn: &Connection, m: &Meeting, q: &str, like: &str) -> Result<(String, String)> {
     let ql = q.to_lowercase();
     if let Some(t) = &m.title {
         if t.to_lowercase().contains(&ql) {
@@ -5575,9 +5863,15 @@ mod search_helper_tests {
     #[test]
     fn fts_match_query_quotes_terms_and_drops_operators() {
         // Each alnum token becomes a quoted literal joined by implicit-AND whitespace.
-        assert_eq!(fts_match_query("alpha beta"), Some("\"alpha\" \"beta\"".into()));
+        assert_eq!(
+            fts_match_query("alpha beta"),
+            Some("\"alpha\" \"beta\"".into())
+        );
         // Order is just term order; the conjunction is order-independent at the SQL level.
-        assert_eq!(fts_match_query("beta alpha"), Some("\"beta\" \"alpha\"".into()));
+        assert_eq!(
+            fts_match_query("beta alpha"),
+            Some("\"beta\" \"alpha\"".into())
+        );
         // FTS5 operators / punctuation are stripped, leaving only the literal terms.
         assert_eq!(
             fts_match_query("a* b\"c( AND d:e"),
@@ -5686,7 +5980,9 @@ mod tests {
             "sentinel is set after the migration"
         );
         assert_eq!(
-            db.get_setting("semantic_search_enabled").unwrap().as_deref(),
+            db.get_setting("semantic_search_enabled")
+                .unwrap()
+                .as_deref(),
             Some("true"),
             "installed base is flipped ON once"
         );
@@ -5694,7 +5990,9 @@ mod tests {
         db.set_setting("semantic_search_enabled", "false").unwrap();
         db.migrate().unwrap();
         assert_eq!(
-            db.get_setting("semantic_search_enabled").unwrap().as_deref(),
+            db.get_setting("semantic_search_enabled")
+                .unwrap()
+                .as_deref(),
             Some("false"),
             "sentinel-guarded: a post-migration opt-out persists across re-migrate"
         );
@@ -5747,7 +6045,12 @@ mod tests {
                 cached_tokens: None,
                 redactions: None,
             },
-            redactions: RedactionCounts { email: 1, card: 0, phone: 1, name: 2 },
+            redactions: RedactionCounts {
+                email: 1,
+                card: 0,
+                phone: 1,
+                name: 2,
+            },
             system_bytes: 512,
             user_bytes: 1024,
             meeting_id: Some("m1".to_string()),
@@ -5785,7 +6088,11 @@ mod tests {
 
         let conn = db.lock();
         let (ts, prompt_tokens, redactions_email, redactions_name, system_bytes): (
-            i64, Option<i64>, i64, i64, i64,
+            i64,
+            Option<i64>,
+            i64,
+            i64,
+            i64,
         ) = conn
             .query_row(
                 "SELECT ts, prompt_tokens, redactions_email, redactions_name, system_bytes
@@ -5843,14 +6150,31 @@ mod tests {
     #[test]
     fn egress_summary_empty_table_returns_zeros() {
         let db = mem_db();
-        let ledger = db.egress_summary(30).expect("egress_summary must not error on empty table");
-        assert_eq!(ledger.total_calls, 0, "total_calls should be 0 on empty table");
-        assert_eq!(ledger.total_tokens, 0, "total_tokens should be 0 on empty table");
-        assert!(ledger.by_model.is_empty(), "by_model should be empty on empty table");
-        assert!(ledger.by_day.is_empty(), "by_day should be empty on empty table");
+        let ledger = db
+            .egress_summary(30)
+            .expect("egress_summary must not error on empty table");
+        assert_eq!(
+            ledger.total_calls, 0,
+            "total_calls should be 0 on empty table"
+        );
+        assert_eq!(
+            ledger.total_tokens, 0,
+            "total_tokens should be 0 on empty table"
+        );
+        assert!(
+            ledger.by_model.is_empty(),
+            "by_model should be empty on empty table"
+        );
+        assert!(
+            ledger.by_day.is_empty(),
+            "by_day should be empty on empty table"
+        );
         assert_eq!(ledger.total_redactions.email, 0);
         assert_eq!(ledger.total_redactions.name, 0);
-        assert!(ledger.recent.is_empty(), "recent should be empty on empty table");
+        assert!(
+            ledger.recent.is_empty(),
+            "recent should be empty on empty table"
+        );
     }
 
     /// Insert 3 rows — 2 models ("claude-opus", "gpt-4o"), 2 distinct UTC dates, known redaction
@@ -5882,7 +6206,10 @@ mod tests {
 
         // ── totals ────────────────────────────────────────────────────────
         assert_eq!(ledger.total_calls, 3, "total_calls must be 3");
-        assert_eq!(ledger.total_tokens, 350, "total_tokens must be 100+200+50=350");
+        assert_eq!(
+            ledger.total_tokens, 350,
+            "total_tokens must be 100+200+50=350"
+        );
 
         // ── by_model (ordered tokens DESC: gpt-4o=200, claude-opus=150) ──
         assert_eq!(ledger.by_model.len(), 2, "by_model must have 2 entries");
@@ -5903,26 +6230,50 @@ mod tests {
         assert_eq!(opus.tokens, 150, "claude-opus: 100+50=150 tokens");
 
         // First entry is the one with more tokens (gpt-4o=200 > claude-opus=150)
-        assert_eq!(ledger.by_model[0].model, "gpt-4o", "by_model[0] must be gpt-4o (most tokens)");
+        assert_eq!(
+            ledger.by_model[0].model, "gpt-4o",
+            "by_model[0] must be gpt-4o (most tokens)"
+        );
 
         // ── by_day (2 distinct UTC days, ascending) ───────────────────────
         assert_eq!(ledger.by_day.len(), 2, "by_day must have 2 entries");
         // 1_700_000_000 = 2023-11-14 UTC; 1_700_086_400/1_700_086_401 = 2023-11-15 UTC
-        assert_eq!(ledger.by_day[0].day, "2023-11-14", "by_day[0] must be 2023-11-14");
+        assert_eq!(
+            ledger.by_day[0].day, "2023-11-14",
+            "by_day[0] must be 2023-11-14"
+        );
         assert_eq!(ledger.by_day[0].tokens, 100, "2023-11-14: 100 tokens");
-        assert_eq!(ledger.by_day[1].day, "2023-11-15", "by_day[1] must be 2023-11-15");
-        assert_eq!(ledger.by_day[1].tokens, 250, "2023-11-15: 200+50=250 tokens");
+        assert_eq!(
+            ledger.by_day[1].day, "2023-11-15",
+            "by_day[1] must be 2023-11-15"
+        );
+        assert_eq!(
+            ledger.by_day[1].tokens, 250,
+            "2023-11-15: 200+50=250 tokens"
+        );
 
         // ── total_redactions: email=1+0+2=3, name=0+1+1=2 ────────────────
-        assert_eq!(ledger.total_redactions.email, 3, "total email redactions must be 3");
+        assert_eq!(
+            ledger.total_redactions.email, 3,
+            "total email redactions must be 3"
+        );
         assert_eq!(ledger.total_redactions.card, 0);
         assert_eq!(ledger.total_redactions.phone, 0);
-        assert_eq!(ledger.total_redactions.name, 2, "total name redactions must be 2");
+        assert_eq!(
+            ledger.total_redactions.name, 2,
+            "total name redactions must be 2"
+        );
 
         // ── recent: 3 rows, newest first ─────────────────────────────────
         assert_eq!(ledger.recent.len(), 3, "recent must have 3 rows");
-        assert_eq!(ledger.recent[0].ts, 1_700_086_401, "recent[0] must be the newest row");
-        assert_eq!(ledger.recent[2].ts, 1_700_000_000, "recent[2] must be the oldest row");
+        assert_eq!(
+            ledger.recent[0].ts, 1_700_086_401,
+            "recent[0] must be the newest row"
+        );
+        assert_eq!(
+            ledger.recent[2].ts, 1_700_000_000,
+            "recent[2] must be the oldest row"
+        );
     }
 
     /// `egress_summary(30)` excludes rows outside the time window. Two rows in the past (ts≈0 =
@@ -5944,13 +6295,28 @@ mod tests {
         let recent = egress_entry_for_summary("new-model", 42, 0, 0);
         db.insert_egress(now_unix, &recent).unwrap();
 
-        let ledger = db.egress_summary(30).expect("egress_summary must not error");
-        assert_eq!(ledger.total_calls, 1, "only 1 in-window row should be counted");
-        assert_eq!(ledger.total_tokens, 42, "only in-window tokens should be counted");
-        assert_eq!(ledger.by_model.len(), 1, "by_model should only contain new-model");
+        let ledger = db
+            .egress_summary(30)
+            .expect("egress_summary must not error");
+        assert_eq!(
+            ledger.total_calls, 1,
+            "only 1 in-window row should be counted"
+        );
+        assert_eq!(
+            ledger.total_tokens, 42,
+            "only in-window tokens should be counted"
+        );
+        assert_eq!(
+            ledger.by_model.len(),
+            1,
+            "by_model should only contain new-model"
+        );
         assert_eq!(ledger.by_model[0].model, "new-model");
         // Redaction totals from the old row must NOT appear.
-        assert_eq!(ledger.total_redactions.email, 0, "old row redactions must be excluded");
+        assert_eq!(
+            ledger.total_redactions.email, 0,
+            "old row redactions must be excluded"
+        );
     }
 
     /// FIX 2: a row where BOTH `model_served` and `model_requested` are empty strings (the common
@@ -6000,7 +6366,8 @@ mod tests {
     #[test]
     fn manual_notes_round_trip_and_default_empty() {
         let db = mem_db();
-        db.insert_meeting(&sample_meeting("m1", "2026-06-30T09:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-30T09:00:00Z"))
+            .unwrap();
 
         // Default: never set ⇒ "" (NULL column reads back empty, no behavior change for legacy rows).
         assert_eq!(db.get_manual_notes("m1").unwrap(), "");
@@ -6008,8 +6375,12 @@ mod tests {
         assert_eq!(db.get_manual_notes("nope").unwrap(), "");
 
         // Set → get round-trips verbatim.
-        db.set_manual_notes("m1", "ship the deck by Friday; Anna owns QA").unwrap();
-        assert_eq!(db.get_manual_notes("m1").unwrap(), "ship the deck by Friday; Anna owns QA");
+        db.set_manual_notes("m1", "ship the deck by Friday; Anna owns QA")
+            .unwrap();
+        assert_eq!(
+            db.get_manual_notes("m1").unwrap(),
+            "ship the deck by Friday; Anna owns QA"
+        );
 
         // Overwrite replaces the whole buffer (FE owns the full text).
         db.set_manual_notes("m1", "rewritten").unwrap();
@@ -6022,7 +6393,8 @@ mod tests {
     #[test]
     fn seal_manual_notes_round_trips_byte_identical() {
         let db = mem_db();
-        db.insert_meeting(&sample_meeting("m1", "2026-06-30T09:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-30T09:00:00Z"))
+            .unwrap();
         let typed = "zażółć gęślą jaźń 🔒 — DECISION: ship Friday; Anna owns QA";
         db.set_manual_notes("m1", typed).unwrap();
 
@@ -6030,30 +6402,49 @@ mod tests {
         // SEAL: encrypt → verify-before-destroy → blank plaintext (the seal_meeting_extras pattern).
         let rn = db.raw_manual_notes("m1").unwrap().unwrap();
         let blob = crate::crypto::encrypt(&ck, rn.text.as_bytes(), b"aad").unwrap();
-        assert_eq!(crate::crypto::decrypt(&ck, &blob, b"aad").unwrap(), rn.text.as_bytes());
+        assert_eq!(
+            crate::crypto::decrypt(&ck, &blob, b"aad").unwrap(),
+            rn.text.as_bytes()
+        );
         db.seal_manual_notes("m1", &blob).unwrap();
 
         // At rest while sealed: plaintext blanked, blob present, ciphertext doesn't leak the plaintext.
         let sealed = db.raw_manual_notes("m1").unwrap().unwrap();
         assert_eq!(sealed.text, "", "plaintext blanked while sealed");
-        assert!(sealed.blob.is_some(), "manual_notes_blob present while sealed");
-        assert_eq!(db.get_manual_notes("m1").unwrap(), "", "the gated reader sees blank while sealed");
+        assert!(
+            sealed.blob.is_some(),
+            "manual_notes_blob present while sealed"
+        );
+        assert_eq!(
+            db.get_manual_notes("m1").unwrap(),
+            "",
+            "the gated reader sees blank while sealed"
+        );
         let cipher = sealed.blob.as_ref().unwrap();
-        let leaks = cipher
-            .windows(typed.len())
-            .any(|w| w == typed.as_bytes());
+        let leaks = cipher.windows(typed.len()).any(|w| w == typed.as_bytes());
         assert!(!leaks, "manual-notes ciphertext must not leak plaintext");
 
         // UNLOCK: decrypt the blob → restore plaintext byte-identical.
         let blob = sealed.blob.unwrap();
         let pt = String::from_utf8(crate::crypto::decrypt(&ck, &blob, b"aad").unwrap()).unwrap();
         db.set_manual_notes("m1", &pt).unwrap();
-        assert_eq!(db.get_manual_notes("m1").unwrap(), typed, "typed notes round-trip byte-identical");
+        assert_eq!(
+            db.get_manual_notes("m1").unwrap(),
+            typed,
+            "typed notes round-trip byte-identical"
+        );
 
         // PERMANENT remove-lock: clear the blob after the plaintext is back.
         db.clear_manual_notes_blob("m1").unwrap();
-        assert!(db.raw_manual_notes("m1").unwrap().unwrap().blob.is_none(), "blob cleared on remove-lock");
-        assert_eq!(db.get_manual_notes("m1").unwrap(), typed, "plaintext survives the blob clear");
+        assert!(
+            db.raw_manual_notes("m1").unwrap().unwrap().blob.is_none(),
+            "blob cleared on remove-lock"
+        );
+        assert_eq!(
+            db.get_manual_notes("m1").unwrap(),
+            typed,
+            "plaintext survives the blob clear"
+        );
     }
 
     /// LOCK-SAFETY (verify-before-destroy): startup reconciliation re-blanks the typed-notes
@@ -6064,23 +6455,37 @@ mod tests {
         let db = mem_db();
         seed_folder(&db, "f-lock", "Secret");
         // Meeting A: sealed blob present + plaintext stranded by a crash-while-unlocked → MUST re-blank.
-        db.insert_meeting(&sample_meeting("m-sealed", "2026-06-30T09:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m-sealed", "2026-06-30T09:00:00Z"))
+            .unwrap();
         note_for(&db, "m-sealed", "claude_code", "");
         db.set_note_folder("m-sealed", Some("f-lock")).unwrap();
-        db.seal_note("m-sealed", "claude_code", b"ciphertext").unwrap();
-        db.seal_manual_notes("m-sealed", b"ck-ciphertext-blob").unwrap(); // blob present
-        db.set_manual_notes("m-sealed", "restored plaintext stranded by the crash").unwrap();
+        db.seal_note("m-sealed", "claude_code", b"ciphertext")
+            .unwrap();
+        db.seal_manual_notes("m-sealed", b"ck-ciphertext-blob")
+            .unwrap(); // blob present
+        db.set_manual_notes("m-sealed", "restored plaintext stranded by the crash")
+            .unwrap();
 
         // Meeting B: NO blob (buffer typed but never sealed) → MUST be left intact (no encrypted copy).
-        db.insert_meeting(&sample_meeting("m-unsealed", "2026-06-30T09:30:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m-unsealed", "2026-06-30T09:30:00Z"))
+            .unwrap();
         note_for(&db, "m-unsealed", "claude_code", "note");
         db.set_note_folder("m-unsealed", Some("f-lock")).unwrap();
-        db.set_manual_notes("m-unsealed", "typed but never sealed — must not be destroyed").unwrap();
+        db.set_manual_notes(
+            "m-unsealed",
+            "typed but never sealed — must not be destroyed",
+        )
+        .unwrap();
 
-        db.set_folder_locked("f-lock", true, Some(b"wrapped")).unwrap();
+        db.set_folder_locked("f-lock", true, Some(b"wrapped"))
+            .unwrap();
         db.reblank_locked_folders_at_rest().unwrap();
 
-        assert_eq!(db.get_manual_notes("m-sealed").unwrap(), "", "sealed meeting's stranded plaintext re-blanked");
+        assert_eq!(
+            db.get_manual_notes("m-sealed").unwrap(),
+            "",
+            "sealed meeting's stranded plaintext re-blanked"
+        );
         assert_eq!(
             db.get_manual_notes("m-unsealed").unwrap(),
             "typed but never sealed — must not be destroyed",
@@ -6126,7 +6531,15 @@ mod tests {
 
         // Insert two NER examples (one accepted-as-is, one edited) and one of another kind.
         let id1 = db
-            .log_correction(&corr_rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z", Some("m1")))
+            .log_correction(&corr_rec(
+                "ner",
+                "in-1",
+                "out-1",
+                None,
+                true,
+                "2026-06-28T10:00:00Z",
+                Some("m1"),
+            ))
             .unwrap();
         let id2 = db
             .log_correction(&corr_rec(
@@ -6139,8 +6552,16 @@ mod tests {
                 Some("m2"),
             ))
             .unwrap();
-        db.log_correction(&corr_rec("timeline", "in-3", "out-3", None, true, "2026-06-28T10:02:00Z", Some("m3")))
-            .unwrap();
+        db.log_correction(&corr_rec(
+            "timeline",
+            "in-3",
+            "out-3",
+            None,
+            true,
+            "2026-06-28T10:02:00Z",
+            Some("m3"),
+        ))
+        .unwrap();
         assert!(id2 > id1);
 
         // Only the matching kind comes back, newest first.
@@ -6159,7 +6580,10 @@ mod tests {
         // Limit is honoured.
         assert_eq!(db.list_corrections("ner", 1, &nothing).unwrap().len(), 1);
         // A kind with no rows yields empty (not an error).
-        assert!(db.list_corrections("does-not-exist", 10, &nothing).unwrap().is_empty());
+        assert!(db
+            .list_corrections("does-not-exist", 10, &nothing)
+            .unwrap()
+            .is_empty());
     }
 
     /// GATE: a correction row for a sealed-and-not-unlocked meeting is EXCLUDED; the same kind's row
@@ -6170,31 +6594,58 @@ mod tests {
         let db = mem_db();
         seed_folder(&db, "f-open", "Open");
         seed_folder(&db, "f-locked", "Secret");
-        db.set_folder_locked("f-locked", true, Some(b"wrapped")).unwrap();
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
         // Visible meeting in the open folder.
-        db.insert_meeting(&sample_meeting("m-open", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m-open", "2026-06-24T10:00:00Z"))
+            .unwrap();
         note_for(&db, "m-open", "claude_code", "note");
         db.set_note_folder("m-open", Some("f-open")).unwrap();
         // Sealed meeting in the locked folder.
-        db.insert_meeting(&sample_meeting("m-sealed", "2026-06-24T11:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m-sealed", "2026-06-24T11:00:00Z"))
+            .unwrap();
         note_for(&db, "m-sealed", "claude_code", "note");
         db.set_note_folder("m-sealed", Some("f-locked")).unwrap();
 
-        db.log_correction(&corr_rec("ner", "in-o", "out-o", None, true, "2026-06-28T10:00:00Z", Some("m-open")))
-            .unwrap();
-        db.log_correction(&corr_rec("ner", "in-s", "out-s", None, true, "2026-06-28T10:01:00Z", Some("m-sealed")))
-            .unwrap();
+        db.log_correction(&corr_rec(
+            "ner",
+            "in-o",
+            "out-o",
+            None,
+            true,
+            "2026-06-28T10:00:00Z",
+            Some("m-open"),
+        ))
+        .unwrap();
+        db.log_correction(&corr_rec(
+            "ner",
+            "in-s",
+            "out-s",
+            None,
+            true,
+            "2026-06-28T10:01:00Z",
+            Some("m-sealed"),
+        ))
+        .unwrap();
 
         let nothing = std::collections::HashSet::new();
         let visible = db.list_corrections("ner", 10, &nothing).unwrap();
-        assert_eq!(visible.len(), 1, "sealed meeting's correction leaked through the gate");
+        assert_eq!(
+            visible.len(),
+            1,
+            "sealed meeting's correction leaked through the gate"
+        );
         assert_eq!(visible[0].meeting_id.as_deref(), Some("m-open"));
 
         // Session-unlock the locked folder → its correction reappears.
         let mut unlocked = std::collections::HashSet::new();
         unlocked.insert("f-locked".to_string());
         let both = db.list_corrections("ner", 10, &unlocked).unwrap();
-        assert_eq!(both.len(), 2, "session-unlocked meeting's correction must reappear");
+        assert_eq!(
+            both.len(),
+            2,
+            "session-unlocked meeting's correction must reappear"
+        );
     }
 
     /// FAIL-CLOSED: a correction row with a NULL `meeting_id` (legacy/unattributed) is never returned
@@ -6202,8 +6653,16 @@ mod tests {
     #[test]
     fn list_corrections_excludes_null_meeting_id() {
         let db = mem_db();
-        db.log_correction(&corr_rec("ner", "in-x", "out-x", None, true, "2026-06-28T10:00:00Z", None))
-            .unwrap();
+        db.log_correction(&corr_rec(
+            "ner",
+            "in-x",
+            "out-x",
+            None,
+            true,
+            "2026-06-28T10:00:00Z",
+            None,
+        ))
+        .unwrap();
         let nothing = std::collections::HashSet::new();
         assert!(
             db.list_corrections("ner", 10, &nothing).unwrap().is_empty(),
@@ -6217,12 +6676,25 @@ mod tests {
     fn correction_log_purged_on_lock() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
         note_for(&db, "m1", "claude_code", "note");
         db.set_note_folder("m1", Some("f-locked")).unwrap();
-        db.log_correction(&corr_rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z", Some("m1")))
-            .unwrap();
-        assert_eq!(correction_count(&db, "m1"), 1, "expected a correction row before seal");
+        db.log_correction(&corr_rec(
+            "ner",
+            "in-1",
+            "out-1",
+            None,
+            true,
+            "2026-06-28T10:00:00Z",
+            Some("m1"),
+        ))
+        .unwrap();
+        assert_eq!(
+            correction_count(&db, "m1"),
+            1,
+            "expected a correction row before seal"
+        );
 
         // Seal: blank the note (content_blob present so blank_sealed_notes_in_folders acts), then run
         // the relock blanker for the folder.
@@ -6242,9 +6714,18 @@ mod tests {
     #[test]
     fn correction_log_purged_on_delete_meeting() {
         let db = mem_db();
-        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
-        db.log_correction(&corr_rec("ner", "in-1", "out-1", None, true, "2026-06-28T10:00:00Z", Some("m1")))
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
             .unwrap();
+        db.log_correction(&corr_rec(
+            "ner",
+            "in-1",
+            "out-1",
+            None,
+            true,
+            "2026-06-28T10:00:00Z",
+            Some("m1"),
+        ))
+        .unwrap();
         assert_eq!(correction_count(&db, "m1"), 1);
         db.delete_meeting("m1").unwrap();
         assert_eq!(
@@ -6279,12 +6760,16 @@ mod tests {
     #[test]
     fn assistant_interaction_round_trips_for_visible_meeting() {
         let db = mem_db();
-        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
         db.insert_assistant_interaction(
             "m1",
             "Klaudku, sprawdź jaka była pogoda",
             "Wczoraj było słonecznie. Zobacz [[Notatka o pogodzie]].",
-            &["[[Notatka o pogodzie]]".to_string(), "(web) Weather — http://x".to_string()],
+            &[
+                "[[Notatka o pogodzie]]".to_string(),
+                "(web) Weather — http://x".to_string(),
+            ],
             "ok",
             Some("research"),
             None,
@@ -6294,7 +6779,9 @@ mod tests {
         .unwrap();
 
         let nothing = std::collections::HashSet::new();
-        let got = db.list_assistant_interactions_visible("m1", &nothing).unwrap();
+        let got = db
+            .list_assistant_interactions_visible("m1", &nothing)
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].command, "Klaudku, sprawdź jaka była pogoda");
         assert!(got[0].answer.contains("słonecznie"));
@@ -6317,7 +6804,8 @@ mod tests {
     fn assistant_interactions_gated_for_sealed_meeting() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
         note_for(&db, "m1", "claude_code", "note"); // gives the meeting a note in the folder
         db.set_note_folder("m1", Some("f-locked")).unwrap();
         db.insert_assistant_interaction(
@@ -6333,18 +6821,23 @@ mod tests {
         )
         .unwrap();
         // Seal the folder (visibility_clause keys off folders.locked); session-unlock set is empty.
-        db.set_folder_locked("f-locked", true, Some(b"wrapped")).unwrap();
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
 
         let empty = std::collections::HashSet::new();
         assert!(
-            db.list_assistant_interactions_visible("m1", &empty).unwrap().is_empty(),
+            db.list_assistant_interactions_visible("m1", &empty)
+                .unwrap()
+                .is_empty(),
             "a sealed-not-unlocked meeting must surface NO interactions through the gated read"
         );
         // …and once the folder is session-unlocked, the row is visible again.
         let mut unlocked = std::collections::HashSet::new();
         unlocked.insert("f-locked".to_string());
         assert_eq!(
-            db.list_assistant_interactions_visible("m1", &unlocked).unwrap().len(),
+            db.list_assistant_interactions_visible("m1", &unlocked)
+                .unwrap()
+                .len(),
             1,
             "a session-unlocked folder's interactions ARE visible"
         );
@@ -6357,11 +6850,19 @@ mod tests {
     fn assistant_interactions_purged_on_seal() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
         note_for(&db, "m1", "claude_code", "note");
         db.set_note_folder("m1", Some("f-locked")).unwrap();
         db.insert_assistant_interaction(
-            "m1", "cmd", "answer", &[], "ok", Some("research"), None, None,
+            "m1",
+            "cmd",
+            "answer",
+            &[],
+            "ok",
+            Some("research"),
+            None,
+            None,
             "2026-06-24T10:05:00Z",
         )
         .unwrap();
@@ -6380,9 +6881,17 @@ mod tests {
     #[test]
     fn assistant_interactions_purged_on_delete_meeting() {
         let db = mem_db();
-        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
         db.insert_assistant_interaction(
-            "m1", "cmd", "answer", &[], "ok", Some("research"), None, None,
+            "m1",
+            "cmd",
+            "answer",
+            &[],
+            "ok",
+            Some("research"),
+            None,
+            None,
             "2026-06-24T10:05:00Z",
         )
         .unwrap();
@@ -6403,10 +6912,18 @@ mod tests {
     #[test]
     fn assistant_threads_round_trip_ordered_and_exclude_legacy() {
         let db = mem_db();
-        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z"))
+            .unwrap();
         // A legacy-shaped voice row (no thread) — must NOT surface in the thread reader.
         db.insert_assistant_interaction(
-            "m1", "legacy voice cmd", "a0", &[], "ok", Some("research"), None, None,
+            "m1",
+            "legacy voice cmd",
+            "a0",
+            &[],
+            "ok",
+            Some("research"),
+            None,
+            None,
             "2026-07-02T10:01:00Z",
         )
         .unwrap();
@@ -6424,17 +6941,31 @@ mod tests {
         )
         .unwrap();
         db.insert_assistant_interaction(
-            "m1", "and the timeline?", "Ships Friday.", &[], "ok", Some("research"),
-            Some("t-1"), None, "2026-07-02T10:03:00Z",
+            "m1",
+            "and the timeline?",
+            "Ships Friday.",
+            &[],
+            "ok",
+            Some("research"),
+            Some("t-1"),
+            None,
+            "2026-07-02T10:03:00Z",
         )
         .unwrap();
 
         let rows = db
             .list_assistant_threads_visible("m1", &std::collections::HashSet::new())
             .unwrap();
-        assert_eq!(rows.len(), 2, "only thread-carrying rows; the legacy NULL row is excluded");
+        assert_eq!(
+            rows.len(),
+            2,
+            "only thread-carrying rows; the legacy NULL row is excluded"
+        );
         assert_eq!(rows[0].thread_id, "t-1");
-        assert_eq!(rows[0].anchor_text.as_deref(), Some("• pricing: tiered, ship Friday"));
+        assert_eq!(
+            rows[0].anchor_text.as_deref(),
+            Some("• pricing: tiered, ship Friday")
+        );
         assert_eq!(
             rows[0].command, "what did we decide on pricing?",
             "command is the LATEST user message of the exchange, never the rendered history"
@@ -6457,25 +6988,38 @@ mod tests {
     fn assistant_threads_gated_for_sealed_meeting() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z"))
+            .unwrap();
         note_for(&db, "m1", "claude_code", "note");
         db.set_note_folder("m1", Some("f-locked")).unwrap();
         db.insert_assistant_interaction(
-            "m1", "secret thread question", "secret answer", &[], "ok", Some("research"),
-            Some("t-secret"), Some("secret anchor"), "2026-07-02T10:05:00Z",
+            "m1",
+            "secret thread question",
+            "secret answer",
+            &[],
+            "ok",
+            Some("research"),
+            Some("t-secret"),
+            Some("secret anchor"),
+            "2026-07-02T10:05:00Z",
         )
         .unwrap();
-        db.set_folder_locked("f-locked", true, Some(b"wrapped")).unwrap();
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
 
         let empty = std::collections::HashSet::new();
         assert!(
-            db.list_assistant_threads_visible("m1", &empty).unwrap().is_empty(),
+            db.list_assistant_threads_visible("m1", &empty)
+                .unwrap()
+                .is_empty(),
             "a sealed-not-unlocked meeting must surface NO threads through the gated read"
         );
         let mut unlocked = std::collections::HashSet::new();
         unlocked.insert("f-locked".to_string());
         assert_eq!(
-            db.list_assistant_threads_visible("m1", &unlocked).unwrap().len(),
+            db.list_assistant_threads_visible("m1", &unlocked)
+                .unwrap()
+                .len(),
             1,
             "a session-unlocked folder's threads ARE visible"
         );
@@ -6489,23 +7033,37 @@ mod tests {
     fn assistant_threads_purged_on_seal() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z")).unwrap();
+        db.insert_meeting(&sample_meeting("m1", "2026-07-02T10:00:00Z"))
+            .unwrap();
         note_for(&db, "m1", "claude_code", "note");
         db.set_note_folder("m1", Some("f-locked")).unwrap();
         db.insert_assistant_interaction(
-            "m1", "thread cmd", "thread answer", &[], "ok", Some("research"),
-            Some("t-1"), Some("anchor"), "2026-07-02T10:05:00Z",
+            "m1",
+            "thread cmd",
+            "thread answer",
+            &[],
+            "ok",
+            Some("research"),
+            Some("t-1"),
+            Some("anchor"),
+            "2026-07-02T10:05:00Z",
         )
         .unwrap();
         assert_eq!(interaction_count(&db, "m1"), 1, "row present before seal");
 
         // The seal purge runs in the SAME tx that drops chunks + corrections for sealed meetings.
         db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
-        assert_eq!(interaction_count(&db, "m1"), 0, "raw thread rows gone after the seal purge");
+        assert_eq!(
+            interaction_count(&db, "m1"),
+            0,
+            "raw thread rows gone after the seal purge"
+        );
         let mut unlocked = std::collections::HashSet::new();
         unlocked.insert("f-locked".to_string());
         assert!(
-            db.list_assistant_threads_visible("m1", &unlocked).unwrap().is_empty(),
+            db.list_assistant_threads_visible("m1", &unlocked)
+                .unwrap()
+                .is_empty(),
             "the thread reader has nothing to return after the purge"
         );
     }
@@ -6525,7 +7083,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 0, "fresh table: no thread rows yet, but the columns must exist");
+        assert_eq!(
+            n, 0,
+            "fresh table: no thread rows yet, but the columns must exist"
+        );
     }
 
     #[test]
@@ -6771,7 +7332,10 @@ mod tests {
         assert_eq!(read.len(), 2);
         let c0 = read[0].confidence.expect("Some(0.42) must round-trip");
         assert!((c0 - 0.42).abs() < 1e-6, "confidence drifted: {c0}");
-        assert_eq!(read[1].confidence, None, "NULL confidence must read back as None");
+        assert_eq!(
+            read[1].confidence, None,
+            "NULL confidence must read back as None"
+        );
         // The additive column did not perturb the other fields.
         assert_eq!(read[0].text, "clear speech");
         assert_eq!(read[1].speaker.as_deref(), Some("others"));
@@ -6859,7 +7423,10 @@ mod tests {
         })
         .unwrap();
         let got = db.get_note("leg1", "claude_code").unwrap().unwrap();
-        assert!(got.model_requested.is_none(), "legacy: model_requested is None");
+        assert!(
+            got.model_requested.is_none(),
+            "legacy: model_requested is None"
+        );
         assert!(got.model_served.is_none(), "legacy: model_served is None");
         assert!(got.gateway_host.is_none(), "legacy: gateway_host is None");
     }
@@ -6896,7 +7463,10 @@ mod tests {
         db.set_setting("provider_id", "claude_code").unwrap();
         // overwrite
         db.set_setting("vault_path", "/vault2").unwrap();
-        assert_eq!(db.get_setting("vault_path").unwrap().as_deref(), Some("/vault2"));
+        assert_eq!(
+            db.get_setting("vault_path").unwrap().as_deref(),
+            Some("/vault2")
+        );
 
         // Only the keys THIS test set — migrate() also seeds the Tier 1 semantic-default keys
         // (semantic_search_enabled / semantic_default_v1), which are not this KV test's concern.
@@ -7016,12 +7586,19 @@ mod tests {
                 .unwrap();
             rows.map(|r| r.unwrap()).collect()
         };
-        assert_eq!(folders, vec![Some("f1".to_string()), Some("f1".to_string())]);
+        assert_eq!(
+            folders,
+            vec![Some("f1".to_string()), Some("f1".to_string())]
+        );
 
         // list_meetings reports a single consistent folder_id (LIMIT 1 subselect, no dup rows).
         let listed = db.list_meetings(50).unwrap();
         let m1_rows: Vec<&Meeting> = listed.iter().filter(|m| m.id == "m1").collect();
-        assert_eq!(m1_rows.len(), 1, "one meeting row despite two provider notes");
+        assert_eq!(
+            m1_rows.len(),
+            1,
+            "one meeting row despite two provider notes"
+        );
         assert_eq!(m1_rows[0].folder_id.as_deref(), Some("f1"));
 
         // Clearing the folder (move to root) clears it for every provider row.
@@ -7039,7 +7616,12 @@ mod tests {
         let db = mem_db();
         db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
             .unwrap();
-        note_for(&db, "m1", "claude_code", "the alpha and the beta of the plan");
+        note_for(
+            &db,
+            "m1",
+            "claude_code",
+            "the alpha and the beta of the plan",
+        );
 
         let fwd = db.search("alpha beta", 50).unwrap();
         assert!(
@@ -7062,7 +7644,17 @@ mod tests {
             .unwrap();
         note_for(&db, "m1", "claude_code", "quarterly planning notes");
         // Operators / punctuation that would be FTS5 syntax if passed raw.
-        for q in ["", "   ", "\"", "*", "AND OR NOT", "(", ":", "^foo", "a* b\"c("] {
+        for q in [
+            "",
+            "   ",
+            "\"",
+            "*",
+            "AND OR NOT",
+            "(",
+            ":",
+            "^foo",
+            "a* b\"c(",
+        ] {
             let hits = db.search(q, 50);
             assert!(hits.is_ok(), "query {q:?} must not error the FTS parser");
         }
@@ -7080,7 +7672,12 @@ mod tests {
         seed_folder(&db, "f-locked", "Secret");
         db.insert_meeting(&sample_meeting("sealed", "2026-06-24T10:00:00Z"))
             .unwrap();
-        note_for(&db, "sealed", "claude_code", "ACQUISITION zarządzanie tajemnica");
+        note_for(
+            &db,
+            "sealed",
+            "claude_code",
+            "ACQUISITION zarządzanie tajemnica",
+        );
         db.set_note_folder("sealed", Some("f-locked")).unwrap();
 
         // Sanity: before sealing, with the folder session-unlocked it IS findable.
@@ -7163,7 +7760,8 @@ mod tests {
         // Lock the folder (locked=1) + seal the note (blank markdown). The TITLE stays plaintext.
         let ck = crate::crypto::random_key().unwrap();
         let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
-        db.set_folder_locked("f-locked", true, Some(&wrapped)).unwrap();
+        db.set_folder_locked("f-locked", true, Some(&wrapped))
+            .unwrap();
         let blob = crate::crypto::encrypt(&ck, b"innocuous body text", b"").unwrap();
         db.seal_note("titled", "claude_code", &blob).unwrap();
 
@@ -7347,9 +7945,17 @@ mod tests {
     fn document_index_and_purge_round_trip() {
         let db = mem_db();
         seed_folder(&db, "f-open", "Project");
-        db.insert_document("d1", "f-open", "spec.md", "budget planning for the quarter", "document", 100)
+        db.insert_document(
+            "d1",
+            "f-open",
+            "spec.md",
+            "budget planning for the quarter",
+            "document",
+            100,
+        )
+        .unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder))
             .unwrap();
-        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder)).unwrap();
 
         // Metadata (no text) + full text read back.
         let listed = db.documents_in_folder("f-open").unwrap();
@@ -7362,9 +7968,7 @@ mod tests {
         assert_eq!(text, "budget planning for the quarter");
 
         // Chunks + 1:1 vectors exist.
-        let count = |sql: &str| -> i64 {
-            db.lock().query_row(sql, [], |r| r.get(0)).unwrap()
-        };
+        let count = |sql: &str| -> i64 { db.lock().query_row(sql, [], |r| r.get(0)).unwrap() };
         let chunks = count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'");
         let vecs = count(
             "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN \
@@ -7374,11 +7978,22 @@ mod tests {
         assert_eq!(chunks, vecs, "doc_vec_chunks is 1:1 with doc_chunks");
 
         // Purge drops BOTH chunks and vectors.
-        db.purge_doc_chunks_for_documents(&["d1".to_string()]).unwrap();
-        assert_eq!(count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM doc_vec_chunks"), 0, "vectors purged with chunks");
+        db.purge_doc_chunks_for_documents(&["d1".to_string()])
+            .unwrap();
+        assert_eq!(
+            count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'"),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM doc_vec_chunks"),
+            0,
+            "vectors purged with chunks"
+        );
         // The document row + its plaintext survive the chunk purge (re-embeddable).
-        assert_eq!(db.get_document("d1").unwrap().unwrap().2, "budget planning for the quarter");
+        assert_eq!(
+            db.get_document("d1").unwrap().unwrap().2,
+            "budget planning for the quarter"
+        );
     }
 
     /// GATE: a document in a sealed-and-not-session-unlocked folder is ABSENT from
@@ -7389,9 +8004,17 @@ mod tests {
     fn doc_chunk_search_is_gated_by_visibility() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", "document", 100)
+        db.insert_document(
+            "d1",
+            "f-locked",
+            "secret.md",
+            "launch date is the 14th",
+            "document",
+            100,
+        )
+        .unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder))
             .unwrap();
-        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder)).unwrap();
         // Query vector = the stub passage embedding of the doc's own chunk text → guaranteed nearest.
         let chunk_text: String = db
             .lock()
@@ -7444,21 +8067,41 @@ mod tests {
     fn index_document_chunks_none_embedder_chunks_no_vectors_fts_finds() {
         let db = mem_db();
         seed_folder(&db, "f-open", "Project");
-        db.insert_document("d1", "f-open", "spec.md", "the pistachio launch is in March", "document", 100)
-            .unwrap();
+        db.insert_document(
+            "d1",
+            "f-open",
+            "spec.md",
+            "the pistachio launch is in March",
+            "document",
+            100,
+        )
+        .unwrap();
         db.index_document_chunks("d1", None).unwrap();
 
-        assert!(db.doc_chunk_count("d1").unwrap() >= 1, "chunk rows stored without a model");
-        assert_eq!(db.doc_vec_count("d1").unwrap(), 0, "no vectors written without a model");
+        assert!(
+            db.doc_chunk_count("d1").unwrap() >= 1,
+            "chunk rows stored without a model"
+        );
+        assert_eq!(
+            db.doc_vec_count("d1").unwrap(),
+            0,
+            "no vectors written without a model"
+        );
 
         let nothing = std::collections::HashSet::new();
-        let hits = db.search_doc_chunks_fts_visible("pistachio", 10, &nothing).unwrap();
+        let hits = db
+            .search_doc_chunks_fts_visible("pistachio", 10, &nothing)
+            .unwrap();
         assert!(
-            hits.iter().any(|h| h.document_id == "d1" && h.snippet.contains("pistachio")),
+            hits.iter()
+                .any(|h| h.document_id == "d1" && h.snippet.contains("pistachio")),
             "chunk-only document must be keyword-findable: {hits:?}"
         );
         // Punctuation-only query defuses to no hits (never an FTS syntax error).
-        assert!(db.search_doc_chunks_fts_visible("?!*(", 10, &nothing).unwrap().is_empty());
+        assert!(db
+            .search_doc_chunks_fts_visible("?!*(", 10, &nothing)
+            .unwrap()
+            .is_empty());
     }
 
     /// GATE twin of `doc_chunk_search_is_gated_by_visibility` for the KEYWORD leg: a doc chunk row
@@ -7469,8 +8112,15 @@ mod tests {
     fn doc_chunk_fts_search_is_gated_by_visibility() {
         let db = mem_db();
         seed_folder(&db, "f-locked", "Secret");
-        db.insert_document("d1", "f-locked", "secret.md", "launch date is the 14th", "document", 100)
-            .unwrap();
+        db.insert_document(
+            "d1",
+            "f-locked",
+            "secret.md",
+            "launch date is the 14th",
+            "document",
+            100,
+        )
+        .unwrap();
         db.index_document_chunks("d1", None).unwrap();
 
         let nothing = std::collections::HashSet::new();
@@ -7512,8 +8162,15 @@ mod tests {
     fn doc_fts_tokens_purged_with_chunks_and_restored_on_reindex() {
         let db = mem_db();
         seed_folder(&db, "f", "F");
-        db.insert_document("d1", "f", "n.md", "unicornfeather budget detail", "note", 100)
-            .unwrap();
+        db.insert_document(
+            "d1",
+            "f",
+            "n.md",
+            "unicornfeather budget detail",
+            "note",
+            100,
+        )
+        .unwrap();
         db.index_document_chunks("d1", None).unwrap();
 
         let fts_count = |db: &Db| -> i64 {
@@ -7527,10 +8184,18 @@ mod tests {
         };
         assert!(fts_count(&db) >= 1, "token indexed after chunking");
 
-        db.purge_doc_chunks_for_documents(&["d1".to_string()]).unwrap();
-        assert_eq!(fts_count(&db), 0, "sealed/purged token must not survive in the FTS index");
+        db.purge_doc_chunks_for_documents(&["d1".to_string()])
+            .unwrap();
+        assert_eq!(
+            fts_count(&db),
+            0,
+            "sealed/purged token must not survive in the FTS index"
+        );
         let nothing = std::collections::HashSet::new();
-        assert!(db.search_doc_chunks_fts_visible("unicornfeather", 10, &nothing).unwrap().is_empty());
+        assert!(db
+            .search_doc_chunks_fts_visible("unicornfeather", 10, &nothing)
+            .unwrap()
+            .is_empty());
 
         db.index_document_chunks("d1", None).unwrap();
         assert!(fts_count(&db) >= 1, "re-index restores the keyword index");
@@ -7544,8 +8209,15 @@ mod tests {
     fn doc_fts_matches_polish_diacritics_folded() {
         let db = mem_db();
         seed_folder(&db, "f", "F");
-        db.insert_document("d1", "f", "pl.md", "gęślą jaźń — budżet kwartalny", "note", 100)
-            .unwrap();
+        db.insert_document(
+            "d1",
+            "f",
+            "pl.md",
+            "gęślą jaźń — budżet kwartalny",
+            "note",
+            100,
+        )
+        .unwrap();
         db.index_document_chunks("d1", None).unwrap();
 
         let nothing = std::collections::HashSet::new();
@@ -7575,12 +8247,16 @@ mod tests {
         let db = mem_db();
         seed_folder(&db, "f", "F");
         let original = "zażółć gęślą jaźń — DECISION: ship Friday";
-        db.insert_document("d1", "f", "n.md", original, "document", 100).unwrap();
+        db.insert_document("d1", "f", "n.md", original, "document", 100)
+            .unwrap();
 
         let ck = crate::crypto::random_key().unwrap();
         // Encrypt + VERIFY decryptable BEFORE sealing (the command's verify-before-destroy rule).
         let blob = crate::crypto::encrypt(&ck, original.as_bytes(), b"").unwrap();
-        assert_eq!(crate::crypto::decrypt(&ck, &blob, b"").unwrap(), original.as_bytes());
+        assert_eq!(
+            crate::crypto::decrypt(&ck, &blob, b"").unwrap(),
+            original.as_bytes()
+        );
         db.seal_document("d1", &blob).unwrap();
         // Plaintext blanked, blob present.
         let raw = db.raw_documents_in_folder("f").unwrap();
@@ -7588,9 +8264,14 @@ mod tests {
         let stored_blob = raw[0].blob.clone().unwrap();
         // Decrypt the STORED blob → byte-identical to the original.
         let restored = crate::crypto::decrypt(&ck, &stored_blob, b"").unwrap();
-        assert_eq!(restored, original.as_bytes(), "sealed document round-trips byte-identical");
+        assert_eq!(
+            restored,
+            original.as_bytes(),
+            "sealed document round-trips byte-identical"
+        );
         // Restore + clear the blob (remove-lock shape).
-        db.set_document_text("d1", &String::from_utf8(restored).unwrap()).unwrap();
+        db.set_document_text("d1", &String::from_utf8(restored).unwrap())
+            .unwrap();
         db.clear_document_blob("d1").unwrap();
         let raw2 = db.raw_documents_in_folder("f").unwrap();
         assert_eq!(raw2[0].text, original);
@@ -7602,13 +8283,22 @@ mod tests {
     fn delete_document_drops_row_and_chunks() {
         let db = mem_db();
         seed_folder(&db, "f", "F");
-        db.insert_document("d1", "f", "n.md", "alpha bravo charlie", "document", 100).unwrap();
-        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder)).unwrap();
+        db.insert_document("d1", "f", "n.md", "alpha bravo charlie", "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder))
+            .unwrap();
         db.delete_document("d1").unwrap();
-        assert!(db.get_document("d1").unwrap().is_none(), "document row deleted");
+        assert!(
+            db.get_document("d1").unwrap().is_none(),
+            "document row deleted"
+        );
         let count: i64 = db
             .lock()
-            .query_row("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 0, "doc chunks cascade-deleted");
     }
@@ -7641,7 +8331,10 @@ mod tests {
         // Lock the sealed folder WITHOUT purging — its chunk row survives, so any exclusion must be
         // the gate doing its job.
         db.set_folder_locked("f-locked", true, None).unwrap();
-        assert!(chunk_count(&db, "sealed") > 0, "sealed chunk must survive for a true gate test");
+        assert!(
+            chunk_count(&db, "sealed") > 0,
+            "sealed chunk must survive for a true gate test"
+        );
 
         let stub = crate::embed::StubEmbedder;
 
@@ -7705,7 +8398,12 @@ mod tests {
         let db = mem_db();
         db.insert_meeting(&sample_meeting("bare", "2026-06-24T10:00:00Z"))
             .unwrap();
-        note_for(&db, "bare", "claude_code", "has a note but was never indexed");
+        note_for(
+            &db,
+            "bare",
+            "claude_code",
+            "has a note but was never indexed",
+        );
         // No index_meeting_chunks call → zero chunk rows.
         assert_eq!(chunk_count(&db, "bare"), 0);
         let stub = crate::embed::StubEmbedder;
@@ -8058,7 +8756,11 @@ mod tests {
         uniq.dedup();
         assert_eq!(uniq.len(), ids.len(), "hybrid must dedup by meeting");
         // `both` is in BOTH ranked lists → must be the top fused result.
-        assert_eq!(ids.first(), Some(&"both"), "meeting strong in both lists must rank first");
+        assert_eq!(
+            ids.first(),
+            Some(&"both"),
+            "meeting strong in both lists must rank first"
+        );
         assert!(ids.contains(&"fts_only") && ids.contains(&"vec_only"));
     }
 
@@ -8225,7 +8927,10 @@ mod tests {
             .into_iter()
             .map(|h| h.meeting.id)
             .collect();
-        assert_eq!(got, expected, "no-entity hybrid must equal the 2-leg fusion");
+        assert_eq!(
+            got, expected,
+            "no-entity hybrid must equal the 2-leg fusion"
+        );
     }
 
     /// 3-WAY RRF: a meeting present in ALL THREE legs (FTS + vector + entity-graph) ranks first,
@@ -8263,7 +8968,11 @@ mod tests {
         uniq.dedup();
         assert_eq!(uniq.len(), ids.len(), "3-leg fusion must dedup by meeting");
         // all3 (in all three legs) outranks single-leg meetings.
-        assert_eq!(ids.first(), Some(&"all3"), "meeting in all 3 legs ranks first");
+        assert_eq!(
+            ids.first(),
+            Some(&"all3"),
+            "meeting in all 3 legs ranks first"
+        );
         assert!(ids.contains(&"fts_only") && ids.contains(&"graph_only"));
     }
 
@@ -8467,7 +9176,8 @@ mod lock_tests {
             .optional()
             .unwrap()
             .flatten();
-        db.set_note_folder(meeting_id, folder_id.as_deref()).unwrap();
+        db.set_note_folder(meeting_id, folder_id.as_deref())
+            .unwrap();
     }
 
     /// Mirror of `lock_folder`: generate CK, KEK-wrap, encrypt+verify each note (PER provider
@@ -8480,10 +9190,14 @@ mod lock_tests {
         for n in &notes {
             let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes(), b"").unwrap();
             // Verify decryptable BEFORE blanking (the command's atomicity rule).
-            assert_eq!(crate::crypto::decrypt(&ck, &blob, b"").unwrap(), n.markdown.as_bytes());
+            assert_eq!(
+                crate::crypto::decrypt(&ck, &blob, b"").unwrap(),
+                n.markdown.as_bytes()
+            );
             blobs.push((n.meeting_id.clone(), n.provider_id.clone(), blob));
         }
-        db.set_folder_locked(folder_id, true, Some(&wrapped)).unwrap();
+        db.set_folder_locked(folder_id, true, Some(&wrapped))
+            .unwrap();
         for (mid, pid, blob) in &blobs {
             db.seal_note(mid, pid, blob).unwrap();
         }
@@ -8498,8 +9212,12 @@ mod lock_tests {
         for n in &notes {
             let blob = n.content_blob.as_ref().unwrap();
             let pt = crate::crypto::decrypt(&ck, blob, b"").unwrap();
-            db.restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
-                .unwrap();
+            db.restore_note_markdown(
+                &n.meeting_id,
+                &n.provider_id,
+                &String::from_utf8(pt).unwrap(),
+            )
+            .unwrap();
         }
     }
 
@@ -8517,7 +9235,12 @@ mod lock_tests {
         // open2: one open item, an earlier due date (sorts first).
         seed_note(&db, "open2", "- [ ] Carol — review 2026-06-15\n", None);
         // sealed: in a folder we lock → must contribute NOTHING until session-unlocked.
-        seed_note(&db, "sealed", "- [ ] Dave — secret task 2026-07-02\n", Some("f-lock"));
+        seed_note(
+            &db,
+            "sealed",
+            "- [ ] Dave — secret task 2026-07-02\n",
+            Some("f-lock"),
+        );
         db.set_folder_locked("f-lock", true, None).unwrap();
 
         // GATED: folder locked, not session-unlocked → sealed meeting excluded; DONE item excluded.
@@ -8526,13 +9249,23 @@ mod lock_tests {
             open.iter().all(|c| c.meeting_id != "sealed"),
             "sealed-not-unlocked meeting leaked into the rollup (gate violation)"
         );
-        assert!(open.iter().all(|c| !c.text.contains("done thing")), "checked `- [x]` item must be excluded");
-        assert_eq!(open.len(), 3, "two open meetings → 3 open items (Carol, Anna, loose)");
+        assert!(
+            open.iter().all(|c| !c.text.contains("done thing")),
+            "checked `- [x]` item must be excluded"
+        );
+        assert_eq!(
+            open.len(),
+            3,
+            "two open meetings → 3 open items (Carol, Anna, loose)"
+        );
 
         // Sort: due dates ascending, then None last.
         assert_eq!(open[0].due_date.as_deref(), Some("2026-06-15"));
         assert_eq!(open[0].owner.as_deref(), Some("Carol"));
-        assert_eq!(open[0].meeting_title, "title-open2", "meeting context attached");
+        assert_eq!(
+            open[0].meeting_title, "title-open2",
+            "meeting context attached"
+        );
         assert_eq!(open[1].due_date.as_deref(), Some("2026-07-01"));
         assert_eq!(open[1].owner.as_deref(), Some("Anna"));
         assert_eq!(open[2].due_date, None, "the dateless loose task sorts last");
@@ -8543,7 +9276,8 @@ mod lock_tests {
         unlocked.insert("f-lock".to_string());
         let all = db.list_open_commitments(&unlocked, None).unwrap();
         assert!(
-            all.iter().any(|c| c.meeting_id == "sealed" && c.text.contains("secret task")),
+            all.iter()
+                .any(|c| c.meeting_id == "sealed" && c.text.contains("secret task")),
             "unlocked folder's commitment must reappear"
         );
 
@@ -8590,10 +9324,18 @@ mod lock_tests {
         // SESSION-UNLOCK → markdown byte-identical.
         session_unlock(&db, "f1", &kek);
         let unlocked = db.notes_in_folder("f1").unwrap();
-        let by_id: std::collections::HashMap<_, _> =
-            unlocked.iter().map(|n| (n.meeting_id.as_str(), n)).collect();
-        assert_eq!(by_id["m1"].markdown, md_a, "m1 markdown must round-trip byte-identical");
-        assert_eq!(by_id["m2"].markdown, md_b, "m2 markdown must round-trip byte-identical");
+        let by_id: std::collections::HashMap<_, _> = unlocked
+            .iter()
+            .map(|n| (n.meeting_id.as_str(), n))
+            .collect();
+        assert_eq!(
+            by_id["m1"].markdown, md_a,
+            "m1 markdown must round-trip byte-identical"
+        );
+        assert_eq!(
+            by_id["m2"].markdown, md_b,
+            "m2 markdown must round-trip byte-identical"
+        );
         // content_blob still present (folder is still locked on disk during a session unlock).
         assert!(by_id["m1"].content_blob.is_some());
     }
@@ -8624,10 +9366,16 @@ mod lock_tests {
         assert_eq!(sealed.len(), 2);
         for n in &sealed {
             assert_eq!(n.markdown, "", "markdown blanked");
-            assert!(n.content_blob.is_some(), "each provider row keeps its own blob");
+            assert!(
+                n.content_blob.is_some(),
+                "each provider row keeps its own blob"
+            );
         }
         // The two blobs must differ (distinct plaintext → distinct ciphertext).
-        let blob_claude = sealed.iter().find(|n| n.provider_id == "claude_code").unwrap();
+        let blob_claude = sealed
+            .iter()
+            .find(|n| n.provider_id == "claude_code")
+            .unwrap();
         let blob_ollama = sealed.iter().find(|n| n.provider_id == "ollama").unwrap();
         assert_ne!(
             blob_claude.content_blob, blob_ollama.content_blob,
@@ -8637,8 +9385,10 @@ mod lock_tests {
         // Unlock → BOTH providers' markdown returns byte-identical.
         session_unlock(&db, "f1", &kek);
         let unlocked = db.notes_in_folder("f1").unwrap();
-        let by_provider: std::collections::HashMap<_, _> =
-            unlocked.iter().map(|n| (n.provider_id.as_str(), n)).collect();
+        let by_provider: std::collections::HashMap<_, _> = unlocked
+            .iter()
+            .map(|n| (n.provider_id.as_str(), n))
+            .collect();
         assert_eq!(
             by_provider["claude_code"].markdown, md_claude,
             "claude_code markdown must round-trip"
@@ -8655,7 +9405,12 @@ mod lock_tests {
         let kek = crate::crypto::random_key().unwrap();
         seed_folder(&db, "secret", "Secret");
         seed_note(&db, "open1", "# open note about apples", None); // root, always visible
-        seed_note(&db, "sealed1", "# secret note about bananas", Some("secret"));
+        seed_note(
+            &db,
+            "sealed1",
+            "# secret note about bananas",
+            Some("secret"),
+        );
 
         let empty: HashSet<String> = HashSet::new();
 
@@ -8692,8 +9447,14 @@ mod lock_tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("secret".to_string());
         assert!(db.meeting_is_visible("sealed1", &unlocked).unwrap());
-        assert!(db.get_note_if_visible("sealed1", &unlocked).unwrap().is_some());
-        assert!(!db.search_visible("bananas", 20, &unlocked).unwrap().is_empty());
+        assert!(db
+            .get_note_if_visible("sealed1", &unlocked)
+            .unwrap()
+            .is_some());
+        assert!(!db
+            .search_visible("bananas", 20, &unlocked)
+            .unwrap()
+            .is_empty());
         let visible_after: HashSet<String> = db
             .list_meetings_visible(50, &unlocked)
             .unwrap()
@@ -8737,9 +9498,7 @@ mod lock_tests {
         assert!(db.folder_wrapped_key("f1").unwrap().is_none());
 
         // Visible to MCP again with an empty session set.
-        assert!(db
-            .meeting_is_visible("m1", &HashSet::new())
-            .unwrap());
+        assert!(db.meeting_is_visible("m1", &HashSet::new()).unwrap());
     }
 
     // ── Phase 0.5 full-lock helpers (transcript + timeline + audio) ──────────────
@@ -8747,7 +9506,12 @@ mod lock_tests {
     use crate::transcribe::types::Segment;
 
     /// Seed transcript segments + a cached timeline JSON for a meeting (open state).
-    fn seed_transcript_and_timeline(db: &Db, meeting_id: &str, texts: &[&str], timeline_json: &str) {
+    fn seed_transcript_and_timeline(
+        db: &Db,
+        meeting_id: &str,
+        texts: &[&str],
+        timeline_json: &str,
+    ) {
         let segs: Vec<Segment> = texts
             .iter()
             .enumerate()
@@ -8756,7 +9520,11 @@ mod lock_tests {
                 start_s: i as f64,
                 end_s: (i + 1) as f64,
                 text: t.to_string(),
-                speaker: if i % 2 == 0 { Some("me".into()) } else { Some("others".into()) },
+                speaker: if i % 2 == 0 {
+                    Some("me".into())
+                } else {
+                    Some("others".into())
+                },
                 confidence: None,
             })
             .collect();
@@ -8776,7 +9544,10 @@ mod lock_tests {
                     continue;
                 }
                 let blob = crate::crypto::encrypt(ck, s.text.as_bytes(), b"").unwrap();
-                assert_eq!(crate::crypto::decrypt(ck, &blob, b"").unwrap(), s.text.as_bytes());
+                assert_eq!(
+                    crate::crypto::decrypt(ck, &blob, b"").unwrap(),
+                    s.text.as_bytes()
+                );
                 db.seal_segment(&mid, s.idx, &blob).unwrap();
             }
             // timeline
@@ -8810,13 +9581,15 @@ mod lock_tests {
         for mid in db.meeting_ids_in_folder(folder_id).unwrap() {
             for s in db.raw_segments(&mid).unwrap() {
                 if let Some(blob) = &s.text_blob {
-                    let text = String::from_utf8(crate::crypto::decrypt(ck, blob, b"").unwrap()).unwrap();
+                    let text =
+                        String::from_utf8(crate::crypto::decrypt(ck, blob, b"").unwrap()).unwrap();
                     db.restore_segment_text(&mid, s.idx, &text).unwrap();
                 }
             }
             if let Some(tl) = db.raw_timeline(&mid).unwrap() {
                 if let Some(blob) = &tl.data_blob {
-                    let data = String::from_utf8(crate::crypto::decrypt(ck, blob, b"").unwrap()).unwrap();
+                    let data =
+                        String::from_utf8(crate::crypto::decrypt(ck, blob, b"").unwrap()).unwrap();
                     db.restore_timeline_data(&mid, &data).unwrap();
                 }
             }
@@ -8854,8 +9627,13 @@ mod lock_tests {
         let kek = crate::crypto::random_key().unwrap();
         seed_folder(&db, "f1", "Secret");
         seed_note(&db, "m1", "# note", Some("f1"));
-        let texts = ["zażółć gęślą jaźń 🔒", "second segment with budget 1_000_000 EUR", ""];
-        let timeline = r#"{"turns":[{"speaker":"me","topic":"secret topic","start_s":0.0,"end_s":1.0}]}"#;
+        let texts = [
+            "zażółć gęślą jaźń 🔒",
+            "second segment with budget 1_000_000 EUR",
+            "",
+        ];
+        let timeline =
+            r#"{"turns":[{"speaker":"me","topic":"secret topic","start_s":0.0,"end_s":1.0}]}"#;
         seed_transcript_and_timeline(&db, "m1", &texts, timeline);
         let ck = crate::crypto::random_key().unwrap();
         // Wrap CK so the folder carries a real wrapped_key (parity with the command).
@@ -8886,14 +9664,21 @@ mod lock_tests {
             "timeline ciphertext must not leak plaintext"
         );
         // The user-facing reads see blank while sealed.
-        assert!(db.get_segments("m1").unwrap().iter().all(|s| s.text.is_empty()));
+        assert!(db
+            .get_segments("m1")
+            .unwrap()
+            .iter()
+            .all(|s| s.text.is_empty()));
         assert_eq!(db.get_timeline_data("m1").unwrap().as_deref(), Some(""));
 
         // UNLOCK → byte-identical round-trip of EVERY segment + the timeline.
         unseal_extras(&db, "f1", &ck);
         let restored = db.get_segments("m1").unwrap();
         let restored_texts: Vec<&str> = restored.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(restored_texts, texts, "transcript round-trips byte-identical");
+        assert_eq!(
+            restored_texts, texts,
+            "transcript round-trips byte-identical"
+        );
         assert_eq!(
             db.get_timeline_data("m1").unwrap().as_deref(),
             Some(timeline),
@@ -8917,7 +9702,8 @@ mod lock_tests {
         let wav = temp_db_path("audio").with_extension("wav");
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
         std::fs::write(&wav, &payload).unwrap();
-        db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy())).unwrap();
+        db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy()))
+            .unwrap();
 
         let ck = crate::crypto::random_key().unwrap();
         let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
@@ -8927,7 +9713,10 @@ mod lock_tests {
         seal_extras(&db, "f1", &ck);
         assert!(!wav.exists(), "plaintext WAV removed while sealed");
         let enc_path = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
-        assert!(enc_path.ends_with(".enc"), "audio_path points at the encrypted file");
+        assert!(
+            enc_path.ends_with(".enc"),
+            "audio_path points at the encrypted file"
+        );
         assert!(std::path::Path::new(&enc_path).exists(), ".enc exists");
         let blob = std::fs::read(&enc_path).unwrap();
         assert!(
@@ -8938,7 +9727,10 @@ mod lock_tests {
         // UNLOCK → plaintext WAV materialized again, byte-identical.
         unseal_extras(&db, "f1", &ck);
         let plain_path = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
-        assert!(!plain_path.ends_with(".enc"), "audio_path re-points at the plaintext WAV");
+        assert!(
+            !plain_path.ends_with(".enc"),
+            "audio_path re-points at the plaintext WAV"
+        );
         assert_eq!(
             std::fs::read(&plain_path).unwrap(),
             payload,
@@ -8963,8 +9755,8 @@ mod lock_tests {
         let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
         db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
         seal_folder(&db, "f1", &kek); // seals the note (markdown)
-        // Re-seal extras under the folder's own CK (unwrap the wrapped we just set is the SAME CK
-        // the note seal used? No — seal_folder mints its OWN CK). Use the folder's wrapped CK.
+                                      // Re-seal extras under the folder's own CK (unwrap the wrapped we just set is the SAME CK
+                                      // the note seal used? No — seal_folder mints its OWN CK). Use the folder's wrapped CK.
         let folder_wrapped = db.folder_wrapped_key("f1").unwrap().unwrap();
         let folder_ck: [u8; 32] = crate::crypto::decrypt(&kek, &folder_wrapped, b"")
             .unwrap()
@@ -8976,14 +9768,24 @@ mod lock_tests {
         let empty: HashSet<String> = HashSet::new();
 
         // SEALED-not-unlocked → masked: gate says locked, plaintext columns blank.
-        assert!(!meeting_unlocked(&db, "m1", &empty), "gate: meeting is locked");
         assert!(
-            db.get_segments("m1").unwrap().iter().all(|s| s.text.is_empty()),
+            !meeting_unlocked(&db, "m1", &empty),
+            "gate: meeting is locked"
+        );
+        assert!(
+            db.get_segments("m1")
+                .unwrap()
+                .iter()
+                .all(|s| s.text.is_empty()),
             "transcript empty while locked"
         );
         assert_eq!(db.get_timeline_data("m1").unwrap().as_deref(), Some(""));
         assert!(
-            db.get_latest_note_for_meeting("m1").unwrap().unwrap().markdown.is_empty(),
+            db.get_latest_note_for_meeting("m1")
+                .unwrap()
+                .unwrap()
+                .markdown
+                .is_empty(),
             "note markdown blank while locked"
         );
 
@@ -8992,11 +9794,20 @@ mod lock_tests {
         unlocked.insert("f1".to_string());
         session_unlock(&db, "f1", &kek); // note markdown
         unseal_extras(&db, "f1", &folder_ck); // transcript + timeline
-        assert!(meeting_unlocked(&db, "m1", &unlocked), "gate: meeting unlocked");
+        assert!(
+            meeting_unlocked(&db, "m1", &unlocked),
+            "gate: meeting unlocked"
+        );
         assert_eq!(db.get_segments("m1").unwrap()[0].text, "secret words");
-        assert_eq!(db.get_timeline_data("m1").unwrap().as_deref(), Some(r#"{"turns":[]}"#));
         assert_eq!(
-            db.get_latest_note_for_meeting("m1").unwrap().unwrap().markdown,
+            db.get_timeline_data("m1").unwrap().as_deref(),
+            Some(r#"{"turns":[]}"#)
+        );
+        assert_eq!(
+            db.get_latest_note_for_meeting("m1")
+                .unwrap()
+                .unwrap()
+                .markdown,
             "# secret note"
         );
     }
@@ -9011,7 +9822,8 @@ mod lock_tests {
         seed_note(&db, "m1", "# note", Some("f1"));
         let wav = temp_db_path("export-audio").with_extension("wav");
         std::fs::write(&wav, b"RIFF....WAVEfmt fake-pcm").unwrap();
-        db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy())).unwrap();
+        db.set_meeting_audio_path("m1", Some(&wav.to_string_lossy()))
+            .unwrap();
         let ck = crate::crypto::random_key().unwrap();
         let wrapped = crate::crypto::encrypt(&kek, &ck, b"").unwrap();
         db.set_folder_locked("f1", true, Some(&wrapped)).unwrap();
@@ -9020,7 +9832,10 @@ mod lock_tests {
         let empty: HashSet<String> = HashSet::new();
         // LOCKED → export refused (the command early-returns AppError::Locked when the gate is
         // false). There is also no plaintext WAV on disk to copy.
-        assert!(!meeting_unlocked(&db, "m1", &empty), "export refused while locked");
+        assert!(
+            !meeting_unlocked(&db, "m1", &empty),
+            "export refused while locked"
+        );
         let enc = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
         assert!(enc.ends_with(".enc"));
         assert!(!std::path::Path::new(enc.trim_end_matches(".enc")).exists());
@@ -9029,9 +9844,15 @@ mod lock_tests {
         unseal_extras(&db, "f1", &ck);
         let mut unlocked = HashSet::new();
         unlocked.insert("f1".to_string());
-        assert!(meeting_unlocked(&db, "m1", &unlocked), "export allowed once unlocked");
+        assert!(
+            meeting_unlocked(&db, "m1", &unlocked),
+            "export allowed once unlocked"
+        );
         let plain = db.get_meeting("m1").unwrap().unwrap().audio_path.unwrap();
-        assert!(std::path::Path::new(&plain).exists(), "plaintext WAV available for export");
+        assert!(
+            std::path::Path::new(&plain).exists(),
+            "plaintext WAV available for export"
+        );
 
         let _ = std::fs::remove_file(&enc);
         let _ = std::fs::remove_file(&plain);
@@ -9049,7 +9870,13 @@ mod lock_tests {
 
     use crate::facts::{FactCandidate, FactOp, NewFact};
 
-    fn add_op(entity_id: &str, predicate: &str, object: &str, valid_from: &str, meeting_id: &str) -> FactOp {
+    fn add_op(
+        entity_id: &str,
+        predicate: &str,
+        object: &str,
+        valid_from: &str,
+        meeting_id: &str,
+    ) -> FactOp {
         FactOp::Add(NewFact {
             entity_id: entity_id.to_string(),
             subject: "Atlas".to_string(),
@@ -9073,8 +9900,14 @@ mod lock_tests {
         db.add_mention(&atlas, "m1").unwrap();
 
         // First meeting records: status = in-progress (open).
-        db.apply_fact_ops(&[add_op(&atlas, "status", "in-progress", "2026-06-01T00:00:00Z", "m1")])
-            .unwrap();
+        db.apply_fact_ops(&[add_op(
+            &atlas,
+            "status",
+            "in-progress",
+            "2026-06-01T00:00:00Z",
+            "m1",
+        )])
+        .unwrap();
 
         // Second meeting says: status = shipped → reconcile.
         let existing = db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap();
@@ -9093,7 +9926,11 @@ mod lock_tests {
 
         // Both rows present: old closed at `at`, new open.
         let all = db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap();
-        assert_eq!(all.len(), 2, "history preserved — old fact kept, not overwritten");
+        assert_eq!(
+            all.len(),
+            2,
+            "history preserved — old fact kept, not overwritten"
+        );
         let open: Vec<_> = all.iter().filter(|f| f.valid_to.is_none()).collect();
         let closed: Vec<_> = all.iter().filter(|f| f.valid_to.is_some()).collect();
         assert_eq!(open.len(), 1, "exactly one currently-valid fact");
@@ -9101,12 +9938,19 @@ mod lock_tests {
         assert_eq!(open[0].valid_from, at);
         assert_eq!(closed.len(), 1, "exactly one superseded fact");
         assert_eq!(closed[0].object, "in-progress");
-        assert_eq!(closed[0].valid_to.as_deref(), Some(at), "old fact closed at the supersession instant");
+        assert_eq!(
+            closed[0].valid_to.as_deref(),
+            Some(at),
+            "old fact closed at the supersession instant"
+        );
 
         // The gated read returns both (open first), since m1 is in an open folder.
         let facts = db.list_facts_visible(&atlas, &HashSet::new()).unwrap();
         assert_eq!(facts.len(), 2);
-        assert!(facts[0].valid_to.is_none(), "open (current) fact ordered first");
+        assert!(
+            facts[0].valid_to.is_none(),
+            "open (current) fact ordered first"
+        );
     }
 
     /// list_facts_visible GATE: a fact whose source meeting is in a sealed-and-not-unlocked folder is
@@ -9121,16 +9965,29 @@ mod lock_tests {
         seed_note(&db, "secret1", "Atlas acquisition", Some("f-lock"));
         let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
         db.add_mention(&atlas, "secret1").unwrap();
-        db.apply_fact_ops(&[add_op(&atlas, "price", "10M", "2026-06-01T00:00:00Z", "secret1")])
-            .unwrap();
+        db.apply_fact_ops(&[add_op(
+            &atlas,
+            "price",
+            "10M",
+            "2026-06-01T00:00:00Z",
+            "secret1",
+        )])
+        .unwrap();
 
         // Open folder → fact visible.
-        assert_eq!(db.list_facts_visible(&atlas, &HashSet::new()).unwrap().len(), 1);
+        assert_eq!(
+            db.list_facts_visible(&atlas, &HashSet::new())
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Seal the folder flag directly (no purge) → the row survives at rest but must be GATED OUT.
         db.set_folder_locked("f-lock", true, None).unwrap();
         assert!(
-            db.list_facts_visible(&atlas, &HashSet::new()).unwrap().is_empty(),
+            db.list_facts_visible(&atlas, &HashSet::new())
+                .unwrap()
+                .is_empty(),
             "a sealed-not-unlocked meeting's facts must not surface (gate violation)"
         );
 
@@ -9153,14 +10010,27 @@ mod lock_tests {
         seed_note(&db, "m1", "Atlas shipped", None);
         let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
         db.add_mention(&atlas, "m1").unwrap();
-        db.apply_fact_ops(&[add_op(&atlas, "status", "shipped", "2026-06-01T00:00:00Z", "m1")])
-            .unwrap();
-        assert_eq!(db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap().len(), 1);
+        db.apply_fact_ops(&[add_op(
+            &atlas,
+            "status",
+            "shipped",
+            "2026-06-01T00:00:00Z",
+            "m1",
+        )])
+        .unwrap();
+        assert_eq!(
+            db.facts_for_entities(std::slice::from_ref(&atlas))
+                .unwrap()
+                .len(),
+            1
+        );
 
         // The seal purge (chunks + corrections + assistant interactions + FACTS) in one tx.
         db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
         assert!(
-            db.facts_for_entities(std::slice::from_ref(&atlas)).unwrap().is_empty(),
+            db.facts_for_entities(std::slice::from_ref(&atlas))
+                .unwrap()
+                .is_empty(),
             "facts must be purged on seal (drop-on-seal, like correction_log / note_chunks)"
         );
     }
@@ -9172,10 +10042,19 @@ mod lock_tests {
         seed_note(&db, "m1", "Atlas", None);
         let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
         db.add_mention(&atlas, "m1").unwrap();
-        db.apply_fact_ops(&[add_op(&atlas, "status", "shipped", "2026-06-01T00:00:00Z", "m1")])
-            .unwrap();
+        db.apply_fact_ops(&[add_op(
+            &atlas,
+            "status",
+            "shipped",
+            "2026-06-01T00:00:00Z",
+            "m1",
+        )])
+        .unwrap();
         db.delete_meeting("m1").unwrap();
-        assert!(db.facts_for_entities(&[atlas]).unwrap().is_empty(), "FK CASCADE drops facts");
+        assert!(
+            db.facts_for_entities(&[atlas]).unwrap().is_empty(),
+            "FK CASCADE drops facts"
+        );
     }
 
     // ── Phase 3 CROSS-MEETING USER MEMORY: persistence + reconcile + gating + forget + purge ──
@@ -9201,8 +10080,13 @@ mod lock_tests {
     fn user_facts_apply_and_reconcile_round_trips() {
         let db = file_db("user-facts-roundtrip");
         seed_note(&db, "m1", "note", None);
-        db.apply_user_fact_ops(&[user_add_op("prefer", "English replies", "2026-06-01T00:00:00Z", "m1")])
-            .unwrap();
+        db.apply_user_fact_ops(&[user_add_op(
+            "prefer",
+            "English replies",
+            "2026-06-01T00:00:00Z",
+            "m1",
+        )])
+        .unwrap();
 
         // A later meeting supersedes the preference: prefer = Polish replies.
         seed_note(&db, "m2", "note2", None);
@@ -9221,7 +10105,11 @@ mod lock_tests {
         db.apply_user_fact_ops(&ops).unwrap();
 
         let all = db.user_facts_all().unwrap();
-        assert_eq!(all.len(), 2, "history preserved — old user fact kept, not overwritten");
+        assert_eq!(
+            all.len(),
+            2,
+            "history preserved — old user fact kept, not overwritten"
+        );
         let open: Vec<_> = all.iter().filter(|f| f.valid_to.is_none()).collect();
         assert_eq!(open.len(), 1, "exactly one currently-valid user fact");
         assert_eq!(open[0].object, "Polish replies");
@@ -9230,7 +10118,11 @@ mod lock_tests {
         let visible = db.list_user_facts_visible(&HashSet::new()).unwrap();
         assert_eq!(visible.len(), 1, "only the current preference is visible");
         assert_eq!(visible[0].object, "Polish replies");
-        assert_eq!(visible[0].meeting_id.as_deref(), Some("m2"), "provenance = the source meeting");
+        assert_eq!(
+            visible[0].meeting_id.as_deref(),
+            Some("m2"),
+            "provenance = the source meeting"
+        );
     }
 
     /// GATE (task C5.i, DB layer): a user fact whose source meeting is sealed-and-not-unlocked is
@@ -9243,13 +10135,23 @@ mod lock_tests {
         let db = file_db("user-facts-gate");
         seed_folder(&db, "f-lock", "Secret");
         seed_note(&db, "secret1", "private", Some("f-lock"));
-        db.apply_user_fact_ops(&[user_add_op("salary", "confidential", "2026-06-01T00:00:00Z", "secret1")])
-            .unwrap();
+        db.apply_user_fact_ops(&[user_add_op(
+            "salary",
+            "confidential",
+            "2026-06-01T00:00:00Z",
+            "secret1",
+        )])
+        .unwrap();
 
-        assert_eq!(db.list_user_facts_visible(&HashSet::new()).unwrap().len(), 1);
+        assert_eq!(
+            db.list_user_facts_visible(&HashSet::new()).unwrap().len(),
+            1
+        );
         db.set_folder_locked("f-lock", true, None).unwrap();
         assert!(
-            db.list_user_facts_visible(&HashSet::new()).unwrap().is_empty(),
+            db.list_user_facts_visible(&HashSet::new())
+                .unwrap()
+                .is_empty(),
             "a sealed-not-unlocked meeting's user facts must not surface (gate violation)"
         );
         let mut unlocked = HashSet::new();
@@ -9277,18 +10179,39 @@ mod lock_tests {
         let target = visible[0].id.clone();
 
         // Forget one → it is closed and drops out.
-        assert!(db.forget_user_fact(&target, "2026-06-02T00:00:00Z").unwrap(), "closed one open fact");
-        assert!(!db.forget_user_fact(&target, "2026-06-02T00:00:00Z").unwrap(), "re-forget is a no-op");
+        assert!(
+            db.forget_user_fact(&target, "2026-06-02T00:00:00Z")
+                .unwrap(),
+            "closed one open fact"
+        );
+        assert!(
+            !db.forget_user_fact(&target, "2026-06-02T00:00:00Z")
+                .unwrap(),
+            "re-forget is a no-op"
+        );
         let after = db.list_user_facts_visible(&HashSet::new()).unwrap();
-        assert_eq!(after.len(), 1, "the forgotten fact drops out of the gated read");
+        assert_eq!(
+            after.len(),
+            1,
+            "the forgotten fact drops out of the gated read"
+        );
         assert!(after.iter().all(|f| f.id != target));
         // The row still EXISTS (closed, not deleted) — history preserved.
-        assert_eq!(db.user_facts_all().unwrap().len(), 2, "forget is an invalidate, not a delete");
+        assert_eq!(
+            db.user_facts_all().unwrap().len(),
+            2,
+            "forget is an invalidate, not a delete"
+        );
 
         // Clear all → nothing visible; every open fact closed.
         let n = db.clear_user_facts("2026-06-03T00:00:00Z").unwrap();
         assert_eq!(n, 1, "one remaining open fact closed");
-        assert!(db.list_user_facts_visible(&HashSet::new()).unwrap().is_empty(), "no user memory after clear");
+        assert!(
+            db.list_user_facts_visible(&HashSet::new())
+                .unwrap()
+                .is_empty(),
+            "no user memory after clear"
+        );
     }
 
     /// PURGE-ON-SEAL (task C2.a, DB layer): the same atomic seal tx that purges facts also DELETES the
@@ -9298,8 +10221,13 @@ mod lock_tests {
     fn seal_purges_user_facts() {
         let db = file_db("user-facts-purge");
         seed_note(&db, "m1", "note", None);
-        db.apply_user_fact_ops(&[user_add_op("prefer", "Polish", "2026-06-01T00:00:00Z", "m1")])
-            .unwrap();
+        db.apply_user_fact_ops(&[user_add_op(
+            "prefer",
+            "Polish",
+            "2026-06-01T00:00:00Z",
+            "m1",
+        )])
+        .unwrap();
         assert_eq!(db.user_facts_all().unwrap().len(), 1);
         // The seal purge (chunks + corrections + assistant interactions + facts + USER facts) in one tx.
         db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
@@ -9314,10 +10242,18 @@ mod lock_tests {
     fn delete_meeting_cascades_to_user_facts() {
         let db = file_db("user-facts-cascade");
         seed_note(&db, "m1", "note", None);
-        db.apply_user_fact_ops(&[user_add_op("prefer", "Polish", "2026-06-01T00:00:00Z", "m1")])
-            .unwrap();
+        db.apply_user_fact_ops(&[user_add_op(
+            "prefer",
+            "Polish",
+            "2026-06-01T00:00:00Z",
+            "m1",
+        )])
+        .unwrap();
         db.delete_meeting("m1").unwrap();
-        assert!(db.user_facts_all().unwrap().is_empty(), "FK CASCADE drops user facts");
+        assert!(
+            db.user_facts_all().unwrap().is_empty(),
+            "FK CASCADE drops user facts"
+        );
     }
 
     // ── Voiceprints: at-rest storage + LOCK invariants (mirror the user_facts tests exactly) ──────
@@ -9333,13 +10269,20 @@ mod lock_tests {
             .unwrap();
 
         let got = db.list_voiceprints_visible(&HashSet::new()).unwrap();
-        assert_eq!(got.len(), 1, "the voiceprint is visible for an open meeting");
+        assert_eq!(
+            got.len(),
+            1,
+            "the voiceprint is visible for an open meeting"
+        );
         assert_eq!(got[0].id, "vp1");
         assert_eq!(got[0].meeting_id, "m1");
         assert_eq!(got[0].cluster_index, 0);
         assert_eq!(got[0].dim, emb.len() as i64);
         assert!(got[0].label.is_none(), "label is NULL until enrolled");
-        assert_eq!(got[0].embedding, emb, "embedding round-trips byte-exact through the BLOB");
+        assert_eq!(
+            got[0].embedding, emb,
+            "embedding round-trips byte-exact through the BLOB"
+        );
     }
 
     /// GATE: a voiceprint whose source meeting is SEALED (its folder locked, not session-unlocked)
@@ -9350,13 +10293,25 @@ mod lock_tests {
         let db = file_db("voiceprint-gate");
         seed_folder(&db, "f-lock", "Secret");
         seed_note(&db, "secret1", "private", Some("f-lock"));
-        db.insert_voiceprint("vp1", "secret1", 1, None, &[0.5f32, 0.5, 0.5, 0.5], "2026-07-01T00:00:00Z")
-            .unwrap();
+        db.insert_voiceprint(
+            "vp1",
+            "secret1",
+            1,
+            None,
+            &[0.5f32, 0.5, 0.5, 0.5],
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
 
-        assert_eq!(db.list_voiceprints_visible(&HashSet::new()).unwrap().len(), 1);
+        assert_eq!(
+            db.list_voiceprints_visible(&HashSet::new()).unwrap().len(),
+            1
+        );
         db.set_folder_locked("f-lock", true, None).unwrap();
         assert!(
-            db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty(),
+            db.list_voiceprints_visible(&HashSet::new())
+                .unwrap()
+                .is_empty(),
             "a sealed-not-unlocked meeting's voiceprint must not surface (gate violation)"
         );
         let mut unlocked = HashSet::new();
@@ -9375,15 +10330,27 @@ mod lock_tests {
     fn seal_purges_voiceprints() {
         let db = file_db("voiceprint-purge");
         seed_note(&db, "m1", "note", None);
-        db.insert_voiceprint("vp1", "m1", 0, None, &[0.1f32, 0.2, 0.3], "2026-07-01T00:00:00Z")
-            .unwrap();
+        db.insert_voiceprint(
+            "vp1",
+            "m1",
+            0,
+            None,
+            &[0.1f32, 0.2, 0.3],
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
         // Present before the seal (visible for the open meeting).
-        assert_eq!(db.list_voiceprints_visible(&HashSet::new()).unwrap().len(), 1);
+        assert_eq!(
+            db.list_voiceprints_visible(&HashSet::new()).unwrap().len(),
+            1
+        );
         // The seal purge (chunks + corrections + assistant interactions + facts + user facts +
         // VOICEPRINTS) in one tx.
         db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
         assert!(
-            db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty(),
+            db.list_voiceprints_visible(&HashSet::new())
+                .unwrap()
+                .is_empty(),
             "voiceprints must be purged on seal (drop-on-seal, like user facts)"
         );
     }
@@ -9399,8 +10366,15 @@ mod lock_tests {
         db.set_folder_locked("f-lock", true, None).unwrap();
         // Simulate a crash-while-unlocked leftover: a voiceprint persisted against a since-locked
         // meeting (the folder is locked at rest, so this row must not survive the reconcile).
-        db.insert_voiceprint("vp1", "secret1", 0, None, &[0.9f32, 0.1], "2026-07-01T00:00:00Z")
-            .unwrap();
+        db.insert_voiceprint(
+            "vp1",
+            "secret1",
+            0,
+            None,
+            &[0.9f32, 0.1],
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
 
         db.reblank_locked_folders_at_rest().unwrap();
         // Even with the folder session-unlocked, the row is GONE (reconcile deleted it at rest).
@@ -9421,7 +10395,9 @@ mod lock_tests {
             .unwrap();
         db.delete_meeting("m1").unwrap();
         assert!(
-            db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty(),
+            db.list_voiceprints_visible(&HashSet::new())
+                .unwrap()
+                .is_empty(),
             "FK CASCADE drops voiceprints"
         );
     }
@@ -9437,7 +10413,9 @@ mod lock_tests {
         db.insert_voiceprint("vp1", "m1", 1, None, &[0.0f32, 1.0], "2026-07-01T00:00:00Z")
             .unwrap();
 
-        let n = db.set_voiceprint_label_for_cluster("m1", 0, "Sarah").unwrap();
+        let n = db
+            .set_voiceprint_label_for_cluster("m1", 0, "Sarah")
+            .unwrap();
         assert_eq!(n, 1, "exactly the cluster-0 row is labeled");
 
         let got = db.list_voiceprints_visible(&HashSet::new()).unwrap();
@@ -9447,15 +10425,27 @@ mod lock_tests {
         assert!(c1.label.is_none(), "the other cluster is untouched");
 
         // Idempotent overwrite.
-        assert_eq!(db.set_voiceprint_label_for_cluster("m1", 0, "Sara").unwrap(), 1);
+        assert_eq!(
+            db.set_voiceprint_label_for_cluster("m1", 0, "Sara")
+                .unwrap(),
+            1
+        );
         let got2 = db.list_voiceprints_visible(&HashSet::new()).unwrap();
         assert_eq!(
-            got2.iter().find(|v| v.cluster_index == 0).unwrap().label.as_deref(),
+            got2.iter()
+                .find(|v| v.cluster_index == 0)
+                .unwrap()
+                .label
+                .as_deref(),
             Some("Sara")
         );
 
         // No voiceprint for that cluster → no-op (0 rows), never an error (pre-opt-in recordings).
-        assert_eq!(db.set_voiceprint_label_for_cluster("m1", 9, "Nobody").unwrap(), 0);
+        assert_eq!(
+            db.set_voiceprint_label_for_cluster("m1", 9, "Nobody")
+                .unwrap(),
+            0
+        );
     }
 
     /// FORGET one voiceprint by id removes exactly that row; deleting a missing id is a no-op.
@@ -9472,7 +10462,10 @@ mod lock_tests {
         let got = db.list_voiceprints_visible(&HashSet::new()).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "vp1", "only the requested row is gone");
-        assert!(!db.delete_voiceprint("missing").unwrap(), "no-op on a missing id");
+        assert!(
+            !db.delete_voiceprint("missing").unwrap(),
+            "no-op on a missing id"
+        );
     }
 
     /// CLEAR removes every voiceprint (the "forget all captured voices" affordance).
@@ -9486,7 +10479,10 @@ mod lock_tests {
         db.insert_voiceprint("vp1", "m2", 0, None, &[0.0f32, 1.0], "2026-07-01T00:00:00Z")
             .unwrap();
         assert_eq!(db.clear_voiceprints().unwrap(), 2, "both rows cleared");
-        assert!(db.list_voiceprints_visible(&HashSet::new()).unwrap().is_empty());
+        assert!(db
+            .list_voiceprints_visible(&HashSet::new())
+            .unwrap()
+            .is_empty());
     }
 }
 
@@ -9576,7 +10572,8 @@ mod graph_tests {
             let blob = crate::crypto::encrypt(&ck, n.markdown.as_bytes(), b"").unwrap();
             blobs.push((n.meeting_id.clone(), n.provider_id.clone(), blob));
         }
-        db.set_folder_locked(folder_id, true, Some(&wrapped)).unwrap();
+        db.set_folder_locked(folder_id, true, Some(&wrapped))
+            .unwrap();
         for (mid, pid, blob) in &blobs {
             db.seal_note(mid, pid, blob).unwrap();
         }
@@ -9595,8 +10592,12 @@ mod graph_tests {
         seed_note(&db, "m1", "# note", None);
         seed_note(&db, "m2", "# note", None);
 
-        let id1 = db.upsert_entity("Anna Kowalska", EntityKind::Person).unwrap();
-        let id2 = db.upsert_entity("anna kowalska", EntityKind::Person).unwrap();
+        let id1 = db
+            .upsert_entity("Anna Kowalska", EntityKind::Person)
+            .unwrap();
+        let id2 = db
+            .upsert_entity("anna kowalska", EntityKind::Person)
+            .unwrap();
         assert_eq!(id1, id2, "case-insensitive dedup → same entity id");
 
         // First-seen casing is preserved (the lowercase re-insert must NOT overwrite it).
@@ -9604,7 +10605,9 @@ mod graph_tests {
         assert_eq!(ent.name, "Anna Kowalska", "first-seen casing kept");
 
         // Same name, DIFFERENT kind → a distinct entity row (the (name_ci, kind) unique index).
-        let proj = db.upsert_entity("Anna Kowalska", EntityKind::Project).unwrap();
+        let proj = db
+            .upsert_entity("Anna Kowalska", EntityKind::Project)
+            .unwrap();
         assert_ne!(proj, id1, "same name + different kind = distinct entity");
 
         // Mentions accumulate across meetings; a duplicate mention is idempotent.
@@ -9618,7 +10621,10 @@ mod graph_tests {
             .iter()
             .find(|n| n.id == id1)
             .expect("Anna present in visible nodes");
-        assert_eq!(anna.mention_count, 2, "two distinct meetings, idempotent repeat");
+        assert_eq!(
+            anna.mention_count, 2,
+            "two distinct meetings, idempotent repeat"
+        );
         assert_eq!(anna.name, "Anna Kowalska");
     }
 
@@ -9635,10 +10641,14 @@ mod graph_tests {
         seed_note(&db, "sealed1", "# sealed", Some("secret"));
 
         // "Secret Person" mentioned ONLY in the sealed meeting.
-        let secret_p = db.upsert_entity("Secret Person", EntityKind::Person).unwrap();
+        let secret_p = db
+            .upsert_entity("Secret Person", EntityKind::Person)
+            .unwrap();
         db.add_mention(&secret_p, "sealed1").unwrap();
         // "Shared Project" mentioned in BOTH the open and the sealed meeting.
-        let shared = db.upsert_entity("Shared Project", EntityKind::Project).unwrap();
+        let shared = db
+            .upsert_entity("Shared Project", EntityKind::Project)
+            .unwrap();
         db.add_mention(&shared, "open1").unwrap();
         db.add_mention(&shared, "sealed1").unwrap();
 
@@ -9648,7 +10658,11 @@ mod graph_tests {
         let before = db.list_entities_visible(&empty).unwrap();
         assert!(before.iter().any(|n| n.id == secret_p));
         assert_eq!(
-            before.iter().find(|n| n.id == shared).unwrap().mention_count,
+            before
+                .iter()
+                .find(|n| n.id == shared)
+                .unwrap()
+                .mention_count,
             2
         );
         // An edge exists between the two (they co-occur in sealed1) — pre-seal.
@@ -9688,10 +10702,16 @@ mod graph_tests {
         );
         // build_graph reflects the same + flags hidden folders.
         let graph = db.build_graph(&empty).unwrap();
-        assert!(graph.has_hidden, "a sealed-not-unlocked folder sets has_hidden");
+        assert!(
+            graph.has_hidden,
+            "a sealed-not-unlocked folder sets has_hidden"
+        );
         assert!(!graph.nodes.iter().any(|n| n.id == secret_p));
         // entity_mentions_visible: the secret entity has zero visible backlinks while sealed.
-        assert!(db.entity_mentions_visible(&secret_p, &empty).unwrap().is_empty());
+        assert!(db
+            .entity_mentions_visible(&secret_p, &empty)
+            .unwrap()
+            .is_empty());
 
         // SESSION-UNLOCK the folder id → the sealed contribution reappears.
         let unlocked = unlocked_set(&["secret"]);
@@ -9701,7 +10721,11 @@ mod graph_tests {
             "entity reappears once its folder id is in the unlocked set"
         );
         assert_eq!(
-            nodes_u.iter().find(|n| n.id == shared).unwrap().mention_count,
+            nodes_u
+                .iter()
+                .find(|n| n.id == shared)
+                .unwrap()
+                .mention_count,
             2,
             "both mentions visible again when unlocked"
         );
@@ -9713,7 +10737,9 @@ mod graph_tests {
         assert!(!db.build_graph(&unlocked).unwrap().has_hidden);
         // The secret entity's visible backlinks return when unlocked.
         assert_eq!(
-            db.entity_mentions_visible(&secret_p, &unlocked).unwrap().len(),
+            db.entity_mentions_visible(&secret_p, &unlocked)
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -9732,7 +10758,12 @@ mod graph_tests {
         seed_folder(&db, "secret", "Secret");
 
         // OPEN meeting: mentions Bob, has an open commitment Bob owns, no facts here.
-        seed_note(&db, "open1", "## Action items\n- [ ] Bob — ship the deck 2026-07-01\n", None);
+        seed_note(
+            &db,
+            "open1",
+            "## Action items\n- [ ] Bob — ship the deck 2026-07-01\n",
+            None,
+        );
         // SEALED meeting: mentions Bob AGAIN + a Secret-Person-only mention, plus Bob's sealed
         // commitment and a sealed fact about Bob.
         seed_note(
@@ -9745,7 +10776,9 @@ mod graph_tests {
         let bob = db.upsert_entity("Bob", EntityKind::Person).unwrap();
         db.add_mention(&bob, "open1").unwrap();
         db.add_mention(&bob, "sealed1").unwrap();
-        let secret_p = db.upsert_entity("Secret Person", EntityKind::Person).unwrap();
+        let secret_p = db
+            .upsert_entity("Secret Person", EntityKind::Person)
+            .unwrap();
         db.add_mention(&secret_p, "sealed1").unwrap();
 
         // One VISIBLE-source fact about Bob (open meeting) + one SEALED-source fact (sealed meeting).
@@ -9782,7 +10815,10 @@ mod graph_tests {
             .find(|p| p.id == bob)
             .expect("Bob is visible via his open meeting");
         assert_eq!(bob_card.name, "Bob");
-        assert_eq!(bob_card.meeting_count, 1, "only the open meeting counts while sealed");
+        assert_eq!(
+            bob_card.meeting_count, 1,
+            "only the open meeting counts while sealed"
+        );
         assert_eq!(
             bob_card.last_talked.as_deref(),
             Some("2026-06-26T09:00:00Z+open1"),
@@ -9815,14 +10851,23 @@ mod graph_tests {
             "the secret person reappears once its folder id is in the unlocked set"
         );
         let bob_u = unlocked_view.iter().find(|p| p.id == bob).unwrap();
-        assert_eq!(bob_u.meeting_count, 2, "both meetings visible when unlocked");
+        assert_eq!(
+            bob_u.meeting_count, 2,
+            "both meetings visible when unlocked"
+        );
         assert_eq!(
             bob_u.last_talked.as_deref(),
             Some("2026-06-26T09:00:00Z+sealed1"),
             "last_talked advances to the now-visible sealed meeting (later suffix sorts last)"
         );
-        assert_eq!(bob_u.open_commitment_count, 2, "both commitments visible when unlocked");
-        assert_eq!(bob_u.current_fact_count, 2, "both facts visible when unlocked");
+        assert_eq!(
+            bob_u.open_commitment_count, 2,
+            "both commitments visible when unlocked"
+        );
+        assert_eq!(
+            bob_u.current_fact_count, 2,
+            "both facts visible when unlocked"
+        );
     }
 
     #[test]
@@ -9847,13 +10892,24 @@ mod graph_tests {
             let id = db.upsert_entity(person, EntityKind::Person).unwrap();
             db.add_mention(&id, meeting_id).unwrap();
             // Sink B — vault stub only if the meeting's folder is unsealed on disk.
-            let folder_locked = match db.get_meeting(meeting_id).unwrap().and_then(|m| m.folder_id) {
-                Some(fid) => db.folder_by_id(&fid).unwrap().map(|f| f.locked).unwrap_or(false),
+            let folder_locked = match db
+                .get_meeting(meeting_id)
+                .unwrap()
+                .and_then(|m| m.folder_id)
+            {
+                Some(fid) => db
+                    .folder_by_id(&fid)
+                    .unwrap()
+                    .map(|f| f.locked)
+                    .unwrap_or(false),
                 None => false,
             };
             if !folder_locked {
                 crate::export::entity_stub::ensure_entity_backlink(
-                    &vault, "People", person, &format!("title-{meeting_id}"),
+                    &vault,
+                    "People",
+                    person,
+                    &format!("title-{meeting_id}"),
                 )
                 .unwrap();
             }
@@ -9931,7 +10987,13 @@ mod graph_tests {
         let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
         let bob = db.upsert_entity("Bob", EntityKind::Person).unwrap();
         // Anna+Atlas co-occur in m1 AND m2 (weight 2); Anna+Bob only in m1 (weight 1).
-        for (e, m) in [(&anna, "m1"), (&anna, "m2"), (&atlas, "m1"), (&atlas, "m2"), (&bob, "m1")] {
+        for (e, m) in [
+            (&anna, "m1"),
+            (&anna, "m2"),
+            (&atlas, "m1"),
+            (&atlas, "m2"),
+            (&bob, "m1"),
+        ] {
             db.add_mention(e, m).unwrap();
         }
         let detail = db
@@ -9940,11 +11002,18 @@ mod graph_tests {
             .unwrap();
         assert_eq!(detail.entity.name, "Anna");
         assert_eq!(detail.meetings.len(), 2, "Anna backlinks m1 + m2");
-        assert_eq!(detail.neighbors.first().unwrap().id, atlas, "Atlas is the top neighbor (shared 2)");
+        assert_eq!(
+            detail.neighbors.first().unwrap().id,
+            atlas,
+            "Atlas is the top neighbor (shared 2)"
+        );
         assert_eq!(detail.neighbors.first().unwrap().shared_meetings, 2);
         assert!(detail.neighbors.iter().any(|n| n.id == bob));
         // Unknown id → None.
-        assert!(db.build_entity_detail("nope", &HashSet::new(), 12).unwrap().is_none());
+        assert!(db
+            .build_entity_detail("nope", &HashSet::new(), 12)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -9960,7 +11029,9 @@ mod graph_tests {
         seed_folder(&db, "secret", "Secret");
         seed_note(&db, "sealed1", "# sealed", Some("secret"));
 
-        let secret_p = db.upsert_entity("Secret Person", EntityKind::Person).unwrap();
+        let secret_p = db
+            .upsert_entity("Secret Person", EntityKind::Person)
+            .unwrap();
         db.add_mention(&secret_p, "sealed1").unwrap();
 
         let empty: HashSet<String> = HashSet::new();
@@ -9984,6 +11055,10 @@ mod graph_tests {
             .unwrap()
             .expect("entity detail reappears once its folder id is in the unlocked set");
         assert_eq!(detail.entity.name, "Secret Person");
-        assert_eq!(detail.meetings.len(), 1, "the (now visible) sealed meeting backlinks");
+        assert_eq!(
+            detail.meetings.len(),
+            1,
+            "the (now visible) sealed meeting backlinks"
+        );
     }
 }

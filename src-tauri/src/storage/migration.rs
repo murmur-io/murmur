@@ -143,7 +143,11 @@ fn verify_encrypted(source: &Path, encrypted: &Path, dek_hex: &str) -> Result<()
             .prepare("PRAGMA cipher_integrity_check")
             .map_err(|e| mig_err("integrity prepare", e))?;
         let mut rows = stmt.query([]).map_err(|e| mig_err("integrity query", e))?;
-        if rows.next().map_err(|e| mig_err("integrity next", e))?.is_some() {
+        if rows
+            .next()
+            .map_err(|e| mig_err("integrity next", e))?
+            .is_some()
+        {
             return Err(AppError::Migration(
                 "cipher_integrity_check reported problems".into(),
             ));
@@ -209,13 +213,19 @@ mod tests {
     fn round_trips_and_is_idempotent() {
         let p = tmp_path("roundtrip");
         seed_plaintext(&p);
-        assert!(needs_encryption(&p).unwrap(), "plaintext should need encryption");
+        assert!(
+            needs_encryption(&p).unwrap(),
+            "plaintext should need encryption"
+        );
 
         encrypt_in_place(&p, KEY).unwrap();
 
         // No longer plaintext; backup exists and is KEYED (encrypted), NOT plaintext (B4).
         assert!(!is_plaintext_sqlite(&p).unwrap(), "should be encrypted now");
-        assert!(!needs_encryption(&p).unwrap(), "idempotent: encrypted file → no re-migration");
+        assert!(
+            !needs_encryption(&p).unwrap(),
+            "idempotent: encrypted file → no re-migration"
+        );
         let bak = backup_path(&p);
         assert!(bak.exists(), "a recovery backup is produced");
         assert!(
@@ -224,34 +234,49 @@ mod tests {
         );
         // The keyed backup decrypts with the SAME DEK and holds the same rows.
         let bak_conn = Connection::open(&bak).unwrap();
-        bak_conn.pragma_update(None, "key", format!("x'{KEY}'")).unwrap();
+        bak_conn
+            .pragma_update(None, "key", format!("x'{KEY}'"))
+            .unwrap();
         let bc: i64 = bak_conn
             .query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(bc, 2, "keyed backup holds the migrated rows");
         // And the WRONG key cannot read the backup (proves it is genuinely encrypted).
         let bad = Connection::open(&bak).unwrap();
-        bad.pragma_update(None, "key", "x'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'")
-            .unwrap();
+        bad.pragma_update(
+            None,
+            "key",
+            "x'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'",
+        )
+        .unwrap();
         assert!(
-            bad.query_row::<i64, _, _>("SELECT count(*) FROM meetings", [], |r| r.get(0)).is_err(),
+            bad.query_row::<i64, _, _>("SELECT count(*) FROM meetings", [], |r| r.get(0))
+                .is_err(),
             "the keyed backup must not be readable without the DEK"
         );
 
         // Reopen encrypted, verify byte-identical reads + carried user_version.
         let enc = Connection::open(&p).unwrap();
         enc.pragma_update(None, "key", format!("x'{KEY}'")).unwrap();
-        let mc: i64 = enc.query_row("SELECT count(*) FROM meetings", [], |r| r.get(0)).unwrap();
+        let mc: i64 = enc
+            .query_row("SELECT count(*) FROM meetings", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(mc, 2);
         let title: String = enc
             .query_row("SELECT title FROM meetings WHERE id='m2'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "Review");
         let seg: String = enc
-            .query_row("SELECT text FROM segments WHERE meeting_id='m1' AND idx=1", [], |r| r.get(0))
+            .query_row(
+                "SELECT text FROM segments WHERE meeting_id='m1' AND idx=1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(seg, "second line");
-        let uv: i64 = enc.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let uv: i64 = enc
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(uv, 7, "user_version carried across export");
     }
 
@@ -262,10 +287,17 @@ mod tests {
         encrypt_in_place(&p, KEY).unwrap();
 
         let bad = Connection::open(&p).unwrap();
-        bad.pragma_update(None, "key", "x'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'")
-            .unwrap();
+        bad.pragma_update(
+            None,
+            "key",
+            "x'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'",
+        )
+        .unwrap();
         let res: rusqlite::Result<i64> =
             bad.query_row("SELECT count(*) FROM meetings", [], |r| r.get(0));
-        assert!(res.is_err(), "wrong key must fail, never return an empty/garbage DB");
+        assert!(
+            res.is_err(),
+            "wrong key must fail, never return an empty/garbage DB"
+        );
     }
 }

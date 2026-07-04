@@ -69,7 +69,9 @@ mod tests {
     fn burst_signal(len: usize, seed: u64) -> Vec<f32> {
         let mut x = seed.wrapping_add(1);
         let next = |x: &mut u64| {
-            *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *x
         };
         let mut out = vec![0.0f32; len];
@@ -122,6 +124,9 @@ mod tests {
         let out = cancel_echo_offline(&mic, &sys, 0).expect("aec runs");
         let tail = 16_000 * 5;
         let kept = energy_db(&out[tail..]) - energy_db(&own[tail..]);
-        assert!(kept > -3.0, "near-end speech attenuated {kept:.1} dB — too aggressive");
+        assert!(
+            kept > -3.0,
+            "near-end speech attenuated {kept:.1} dB — too aggressive"
+        );
     }
 }

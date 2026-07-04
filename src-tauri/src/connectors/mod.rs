@@ -319,9 +319,18 @@ mod tests {
         let hits = block_on(registry.search("capture", "email bob@acme.com about weather")).unwrap();
         assert_eq!(hits.len(), 1);
         let seen = cap.last_query.lock().unwrap().clone().unwrap();
-        assert!(!seen.contains("bob@acme.com"), "raw email must be redacted before egress: {seen}");
-        assert!(seen.contains("\u{27ea}EMAIL_"), "the query must carry the redaction token: {seen}");
-        assert!(seen.contains("weather"), "non-PII terms survive redaction: {seen}");
+        assert!(
+            !seen.contains("bob@acme.com"),
+            "raw email must be redacted before egress: {seen}"
+        );
+        assert!(
+            seen.contains("\u{27ea}EMAIL_"),
+            "the query must carry the redaction token: {seen}"
+        );
+        assert!(
+            seen.contains("weather"),
+            "non-PII terms survive redaction: {seen}"
+        );
     }
 
     /// Thin wrapper so the test can share one `CaptureConnector` between the registry and the
@@ -368,7 +377,10 @@ mod tests {
         // would be present and would attempt a network call.)
         let off = AppConfig::default();
         let registry = ConnectorRegistry::build(&off);
-        assert!(!registry.has("web"), "web connector must be absent when disabled/unconsented");
+        assert!(
+            !registry.has("web"),
+            "web connector must be absent when disabled/unconsented"
+        );
         let res = block_on(registry.search("web", "what's the weather"));
         assert!(
             matches!(res, Err(ConnectorError::NeedsConsent)),

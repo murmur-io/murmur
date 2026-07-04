@@ -35,7 +35,11 @@ mod tests {
 
     #[test]
     fn builds_digest_prompt() {
-        let (s, u) = build_digest_prompt("### [[Sync]] · 2026-07-01\nWe shipped.", "the last 7 days", "auto");
+        let (s, u) = build_digest_prompt(
+            "### [[Sync]] · 2026-07-01\nWe shipped.",
+            "the last 7 days",
+            "auto",
+        );
         assert!(s.contains("DIGEST"));
         assert!(s.contains("who owes what"));
         assert!(u.contains("[[Sync]]"));

@@ -343,12 +343,12 @@ impl KekStore for MacKekStore {
     /// `errSecItemNotFound` ⇒ absent; `errSecInteractionNotAllowed` ⇒ exists but gated (still
     /// "exists"). Any other status is a real error.
     fn biometric_exists(&self) -> Result<bool> {
+        use crate::secrets::keychain::sec_consts::ERR_SEC_INTERACTION_NOT_ALLOWED;
         use core_foundation::base::{CFType, TCFType};
         use core_foundation::boolean::CFBoolean;
         use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
         use security_framework_sys::item::kSecUseAuthenticationUISkip;
         use security_framework_sys::item::{kSecReturnAttributes, kSecUseAuthenticationUI};
-        use crate::secrets::keychain::sec_consts::ERR_SEC_INTERACTION_NOT_ALLOWED;
         use security_framework_sys::keychain_item::SecItemCopyMatching;
 
         let mut q = self.base_query();
@@ -364,9 +364,7 @@ impl KekStore for MacKekStore {
         }
         let dict = q.to_immutable();
         let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
-        let status = unsafe {
-            SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out)
-        };
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out) };
         // Release anything returned (we only care about the status code).
         if !out.is_null() {
             unsafe { drop(CFType::wrap_under_create_rule(out)) };
@@ -387,7 +385,9 @@ impl KekStore for MacKekStore {
         match legacy_get_secret(ACCOUNT_MASTER_KEK)? {
             Some(hex) => match hex_to_key32(&hex) {
                 Some(k) => Ok(Some(k)),
-                None => Err(AppError::Secrets("legacy plain master KEK is malformed".into())),
+                None => Err(AppError::Secrets(
+                    "legacy plain master KEK is malformed".into(),
+                )),
             },
             None => Ok(None),
         }
@@ -419,19 +419,14 @@ impl KekStore for MacKekStore {
         let add = |access: &SecAccessControl| -> i32 {
             let mut q = self.base_query();
             unsafe {
-                q.add(
-                    &(kSecAttrAccessControl as *const _),
-                    &access.as_CFTypeRef(),
-                );
+                q.add(&(kSecAttrAccessControl as *const _), &access.as_CFTypeRef());
                 q.add(&(kSecValueData as *const _), &data.as_CFTypeRef());
             }
             let dict = q.to_immutable();
             let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
             let s = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), &mut out) };
             if !out.is_null() {
-                unsafe {
-                    drop(core_foundation::base::CFType::wrap_under_create_rule(out))
-                };
+                unsafe { drop(core_foundation::base::CFType::wrap_under_create_rule(out)) };
             }
             s
         };
@@ -447,7 +442,10 @@ impl KekStore for MacKekStore {
             if status2 == errSecSuccess {
                 return Ok(());
             }
-            return Err(map_osstatus("add biometric KEK item (after replace)", status2));
+            return Err(map_osstatus(
+                "add biometric KEK item (after replace)",
+                status2,
+            ));
         }
         Err(map_osstatus("add biometric KEK item", status))
     }
@@ -456,13 +454,13 @@ impl KekStore for MacKekStore {
     /// sheet with `reason` shown via `kSecUseOperationPrompt`, and returns the 32 raw bytes on a
     /// successful presence check. A user cancel / auth failure maps to [`AppError::BiometricFailed`].
     fn read_biometric(&self, reason: &str) -> Result<[u8; 32]> {
+        use crate::secrets::keychain::sec_consts::{
+            ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_USER_CANCELED,
+        };
         use core_foundation::base::{CFType, TCFType};
         use core_foundation::boolean::CFBoolean;
         use core_foundation::data::CFData;
         use core_foundation::string::CFString;
-        use crate::secrets::keychain::sec_consts::{
-            ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_USER_CANCELED,
-        };
         use security_framework_sys::base::{errSecAuthFailed, errSecSuccess};
         use security_framework_sys::item::{kSecMatchLimit, kSecReturnData};
         use security_framework_sys::keychain_item::SecItemCopyMatching;
@@ -857,7 +855,10 @@ impl DpStringStore for MacDpStore {
             if s2 == errSecSuccess {
                 return Ok(());
             }
-            return Err(map_osstatus("add data-protection secret (after replace)", s2));
+            return Err(map_osstatus(
+                "add data-protection secret (after replace)",
+                s2,
+            ));
         }
         Err(map_osstatus("add data-protection secret", status))
     }
@@ -963,7 +964,9 @@ pub fn set_secret(account: &str, secret: &str) -> Result<()> {
     {
         // DP write; on an unsigned dev build the DP op returns errSecMissingEntitlement (-34018) and
         // the helper falls back to the legacy keyring. Unreachable in a signed release.
-        let store = MacDpStore { account: leak_account(account) };
+        let store = MacDpStore {
+            account: leak_account(account),
+        };
         dp_set_or_legacy(&store, secret)
     }
     #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
@@ -984,7 +987,9 @@ pub fn get_secret(account: &str) -> Result<Option<String>> {
     {
         // Migrate/read DP; on an unsigned dev build the DP read returns -34018 and the helper reads
         // from the legacy keyring (where the set fallback wrote it). Unreachable in a signed release.
-        let store = MacDpStore { account: leak_account(account) };
+        let store = MacDpStore {
+            account: leak_account(account),
+        };
         dp_get_or_legacy(&store)
     }
     #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
@@ -1005,7 +1010,9 @@ pub fn delete_secret(account: &str) -> Result<()> {
     {
         // DP delete; on an unsigned dev build the DP op returns -34018 and the helper deletes from
         // the legacy keyring (where the dev secret lives). Unreachable in a signed release.
-        let store = MacDpStore { account: leak_account(account) };
+        let store = MacDpStore {
+            account: leak_account(account),
+        };
         dp_delete_or_legacy(&store)
     }
     #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
@@ -1103,9 +1110,7 @@ fn dev_read_map(path: &std::path::Path) -> Result<std::collections::BTreeMap<Str
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Secrets(format!("parse dev-secrets file: {e}"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(std::collections::BTreeMap::new())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::collections::BTreeMap::new()),
         Err(e) => Err(AppError::Secrets(format!("read dev-secrets file: {e}"))),
     }
 }
@@ -1288,7 +1293,10 @@ mod tests {
 
         // Order proof: the write + a confirming read happen BEFORE the plain delete.
         let log = store.log();
-        let wrote = log.iter().position(|o| matches!(o, Op::WriteBiometric(_))).unwrap();
+        let wrote = log
+            .iter()
+            .position(|o| matches!(o, Op::WriteBiometric(_)))
+            .unwrap();
         let confirmed = log
             .iter()
             .enumerate()
@@ -1363,7 +1371,10 @@ mod tests {
             .iter()
             .filter(|o| **o == Op::ReadBiometric)
             .count();
-        assert_eq!(reads, 1, "steady-state unlock must be a single biometric read");
+        assert_eq!(
+            reads, 1,
+            "steady-state unlock must be a single biometric read"
+        );
         assert!(
             !store.log().contains(&Op::DeletePlain),
             "no plain item present → no delete"
@@ -1377,14 +1388,21 @@ mod tests {
         let store = FakeStore::new(Some(KEK), Some(KEK));
         let out = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
         assert_eq!(out, KEK);
-        assert_eq!(*store.plain.borrow(), None, "value-equal leftover plain is cleaned up");
+        assert_eq!(
+            *store.plain.borrow(),
+            None,
+            "value-equal leftover plain is cleaned up"
+        );
 
         // But if the leftover plain DIFFERS from the biometric item, it is LEFT IN PLACE (no blind
         // destroy). Use a distinct biometric value so the confirm read returns it (not the plain).
         let other: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_add(7));
         let store2 = FakeStore::new(Some(KEK), Some(other));
         let out2 = migrate_or_create_kek(&store2, "Unlock this folder").unwrap();
-        assert_eq!(out2, other, "steady-state read returns the biometric item value");
+        assert_eq!(
+            out2, other,
+            "steady-state read returns the biometric item value"
+        );
         assert_eq!(
             *store2.plain.borrow(),
             Some(KEK),
@@ -1487,7 +1505,9 @@ mod tests {
             Ok(self.dp.borrow().clone())
         }
         fn write_dp(&self, secret: &str) -> Result<()> {
-            self.log.borrow_mut().push(DpOp::WriteDp(secret.to_string()));
+            self.log
+                .borrow_mut()
+                .push(DpOp::WriteDp(secret.to_string()));
             if let Some(s) = self.dp_fail_status {
                 return Err(Self::dp_err(s));
             }
@@ -1512,7 +1532,9 @@ mod tests {
             Ok(())
         }
         fn write_legacy(&self, secret: &str) -> Result<()> {
-            self.log.borrow_mut().push(DpOp::WriteLegacy(secret.to_string()));
+            self.log
+                .borrow_mut()
+                .push(DpOp::WriteLegacy(secret.to_string()));
             *self.legacy.borrow_mut() = Some(secret.to_string());
             Ok(())
         }
@@ -1524,13 +1546,28 @@ mod tests {
         let store = FakeDp::new(None, Some(secret));
         let out = migrate_or_read_dp(&store).unwrap();
 
-        assert_eq!(out.as_deref(), Some(secret), "migrated value must be byte-identical");
-        assert_eq!(*store.dp.borrow(), Some(secret.to_string()), "DP item now holds the value");
-        assert_eq!(*store.legacy.borrow(), None, "legacy item removed after migration");
+        assert_eq!(
+            out.as_deref(),
+            Some(secret),
+            "migrated value must be byte-identical"
+        );
+        assert_eq!(
+            *store.dp.borrow(),
+            Some(secret.to_string()),
+            "DP item now holds the value"
+        );
+        assert_eq!(
+            *store.legacy.borrow(),
+            None,
+            "legacy item removed after migration"
+        );
 
         // Order proof: write DP → confirm-read DP → THEN delete legacy.
         let log = store.log();
-        let wrote = log.iter().position(|o| matches!(o, DpOp::WriteDp(_))).unwrap();
+        let wrote = log
+            .iter()
+            .position(|o| matches!(o, DpOp::WriteDp(_)))
+            .unwrap();
         let confirmed = log
             .iter()
             .enumerate()
@@ -1539,8 +1576,14 @@ mod tests {
             .map(|(i, _)| i)
             .expect("a confirming DP read must follow the write");
         let deleted = log.iter().position(|o| *o == DpOp::DeleteLegacy).unwrap();
-        assert!(wrote < confirmed && confirmed < deleted, "write→confirm→delete order (got {log:?})");
-        assert!(log.contains(&DpOp::WriteDp(secret.to_string())), "DP write uses the legacy bytes verbatim");
+        assert!(
+            wrote < confirmed && confirmed < deleted,
+            "write→confirm→delete order (got {log:?})"
+        );
+        assert!(
+            log.contains(&DpOp::WriteDp(secret.to_string())),
+            "DP write uses the legacy bytes verbatim"
+        );
     }
 
     #[test]
@@ -1549,14 +1592,24 @@ mod tests {
         let store = FakeDp::new(Some("mcp-token-xyz"), None);
         let out = migrate_or_read_dp(&store).unwrap();
         assert_eq!(out.as_deref(), Some("mcp-token-xyz"));
-        assert!(!store.log().contains(&DpOp::DeleteLegacy), "no legacy → no delete");
-        assert!(!store.log().iter().any(|o| matches!(o, DpOp::WriteDp(_))), "steady state writes nothing");
+        assert!(
+            !store.log().contains(&DpOp::DeleteLegacy),
+            "no legacy → no delete"
+        );
+        assert!(
+            !store.log().iter().any(|o| matches!(o, DpOp::WriteDp(_))),
+            "steady state writes nothing"
+        );
     }
 
     #[test]
     fn dp_absent_everywhere_returns_none() {
         let store = FakeDp::new(None, None);
-        assert_eq!(migrate_or_read_dp(&store).unwrap(), None, "no item anywhere → None (caller mints fresh)");
+        assert_eq!(
+            migrate_or_read_dp(&store).unwrap(),
+            None,
+            "no item anywhere → None (caller mints fresh)"
+        );
     }
 
     #[test]
@@ -1564,7 +1617,11 @@ mod tests {
         // Crash recovery: DP written, legacy not yet deleted, values equal → cleaned.
         let store = FakeDp::new(Some("k"), Some("k"));
         migrate_or_read_dp(&store).unwrap();
-        assert_eq!(*store.legacy.borrow(), None, "value-equal legacy leftover removed");
+        assert_eq!(
+            *store.legacy.borrow(),
+            None,
+            "value-equal legacy leftover removed"
+        );
 
         // Differing legacy is LEFT IN PLACE (never a blind destroy).
         let store2 = FakeDp::new(Some("dp-value"), Some("legacy-DIFFERENT"));
@@ -1588,7 +1645,9 @@ mod tests {
     #[test]
     fn marker_round_trips_and_is_specific_to_34018() {
         // The -34018 error built the way map_osstatus builds it IS recognized…
-        assert!(is_missing_entitlement(&missing_entitlement_err("read data-protection secret")));
+        assert!(is_missing_entitlement(&missing_entitlement_err(
+            "read data-protection secret"
+        )));
         // …while other keychain/secrets errors are NOT (no blanket catch-all).
         assert!(!is_missing_entitlement(&AppError::Secrets(
             "read data-protection secret: OSStatus -25300".into()
@@ -1600,7 +1659,9 @@ mod tests {
             "read data-protection secret: OSStatus -25308".into()
         )));
         // A KeychainDenied that does NOT carry the marker (e.g. a real deny) does not trigger fallback.
-        assert!(!is_missing_entitlement(&AppError::KeychainDenied("user denied".into())));
+        assert!(!is_missing_entitlement(&AppError::KeychainDenied(
+            "user denied".into()
+        )));
     }
 
     #[test]
@@ -1610,18 +1671,38 @@ mod tests {
         // SET: DP write fails -34018 → the secret lands in the legacy keyring.
         let store = FakeDp::failing_dp(MISSING_ENTITLEMENT_STATUS, None);
         dp_set_or_legacy(&store, secret).unwrap();
-        assert_eq!(*store.legacy.borrow(), Some(secret.to_string()), "fallback wrote to legacy");
-        assert_eq!(*store.dp.borrow(), None, "DP store stays empty on an unsigned build");
+        assert_eq!(
+            *store.legacy.borrow(),
+            Some(secret.to_string()),
+            "fallback wrote to legacy"
+        );
+        assert_eq!(
+            *store.dp.borrow(),
+            None,
+            "DP store stays empty on an unsigned build"
+        );
         assert!(store.log().contains(&DpOp::WriteLegacy(secret.to_string())));
 
         // GET: DP read fails -34018 → the value is read back from the legacy keyring (round-trip).
         let got = dp_get_or_legacy(&store).unwrap();
-        assert_eq!(got.as_deref(), Some(secret), "the secret written via the fallback reads back");
+        assert_eq!(
+            got.as_deref(),
+            Some(secret),
+            "the secret written via the fallback reads back"
+        );
 
         // DELETE: DP delete fails -34018 → the legacy item is removed; a subsequent get is None.
         dp_delete_or_legacy(&store).unwrap();
-        assert_eq!(*store.legacy.borrow(), None, "fallback delete cleared the legacy item");
-        assert_eq!(dp_get_or_legacy(&store).unwrap(), None, "deleted secret no longer reads back");
+        assert_eq!(
+            *store.legacy.borrow(),
+            None,
+            "fallback delete cleared the legacy item"
+        );
+        assert_eq!(
+            dp_get_or_legacy(&store).unwrap(),
+            None,
+            "deleted secret no longer reads back"
+        );
     }
 
     #[test]
@@ -1631,10 +1712,21 @@ mod tests {
         let store = FakeDp::new(None, None); // dp_fail_status = None ⇒ DP ops succeed
 
         dp_set_or_legacy(&store, secret).unwrap();
-        assert_eq!(*store.dp.borrow(), Some(secret.to_string()), "secret stays in the DP keychain");
-        assert_eq!(*store.legacy.borrow(), None, "legacy keyring is never written in a signed build");
+        assert_eq!(
+            *store.dp.borrow(),
+            Some(secret.to_string()),
+            "secret stays in the DP keychain"
+        );
+        assert_eq!(
+            *store.legacy.borrow(),
+            None,
+            "legacy keyring is never written in a signed build"
+        );
         assert!(
-            !store.log().iter().any(|o| matches!(o, DpOp::WriteLegacy(_))),
+            !store
+                .log()
+                .iter()
+                .any(|o| matches!(o, DpOp::WriteLegacy(_))),
             "the legacy fallback must NOT run when DP succeeds"
         );
 
@@ -1643,7 +1735,10 @@ mod tests {
         // The get path here is a DP read only (steady state) — never touches the legacy keyring as a
         // source of truth.
         assert!(
-            !store.log().iter().any(|o| *o == DpOp::ReadLegacy && store.dp_fail_status.is_some()),
+            !store
+                .log()
+                .iter()
+                .any(|o| *o == DpOp::ReadLegacy && store.dp_fail_status.is_some()),
             "no DP failure ⇒ no legacy read"
         );
     }
@@ -1658,17 +1753,29 @@ mod tests {
         // SET: DP write fails -50 → error propagates, legacy is NOT written.
         let store = FakeDp::failing_dp(real_fault, Some(legacy_present));
         let set_res = dp_set_or_legacy(&store, "new-secret");
-        assert!(set_res.is_err(), "a non-34018 DP write failure must propagate");
-        assert!(!is_missing_entitlement(&set_res.unwrap_err()), "and it is not the -34018 signal");
         assert!(
-            !store.log().iter().any(|o| matches!(o, DpOp::WriteLegacy(_))),
+            set_res.is_err(),
+            "a non-34018 DP write failure must propagate"
+        );
+        assert!(
+            !is_missing_entitlement(&set_res.unwrap_err()),
+            "and it is not the -34018 signal"
+        );
+        assert!(
+            !store
+                .log()
+                .iter()
+                .any(|o| matches!(o, DpOp::WriteLegacy(_))),
             "a non-34018 failure must NOT trigger the legacy fallback"
         );
 
         // GET: DP read fails -50 → error propagates; the stale legacy value is NOT resurrected.
         let store2 = FakeDp::failing_dp(real_fault, Some(legacy_present));
         let get_res = dp_get_or_legacy(&store2);
-        assert!(get_res.is_err(), "a non-34018 DP read failure must propagate, not fall back");
+        assert!(
+            get_res.is_err(),
+            "a non-34018 DP read failure must propagate, not fall back"
+        );
 
         // DELETE: DP delete fails -50 → error propagates.
         let store3 = FakeDp::failing_dp(real_fault, Some(legacy_present));
@@ -1684,9 +1791,16 @@ mod tests {
         // real DP store never surfaces it as an error to the router. Model the steady state: DP empty,
         // no legacy → None, with no legacy fallback / write triggered.
         let store = FakeDp::new(None, None);
-        assert_eq!(dp_get_or_legacy(&store).unwrap(), None, "absent everywhere → None");
+        assert_eq!(
+            dp_get_or_legacy(&store).unwrap(),
+            None,
+            "absent everywhere → None"
+        );
         assert!(
-            !store.log().iter().any(|o| matches!(o, DpOp::WriteLegacy(_))),
+            !store
+                .log()
+                .iter()
+                .any(|o| matches!(o, DpOp::WriteLegacy(_))),
             "a not-found is not a -34018 fallback"
         );
     }
@@ -1709,7 +1823,9 @@ mod tests {
 
         dev_set_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY, "brave-key-DEADBEEF").unwrap();
         assert_eq!(
-            dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(),
+            dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY)
+                .unwrap()
+                .as_deref(),
             Some("brave-key-DEADBEEF"),
             "a value set in the dev store reads back identically"
         );
@@ -1719,7 +1835,8 @@ mod tests {
 
     #[test]
     fn dev_store_delete_removes_the_value() {
-        let dir = std::env::temp_dir().join(format!("murmur-dev-secrets-del-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("murmur-dev-secrets-del-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dev-secrets-del.json");
         let _ = std::fs::remove_file(&path);
@@ -1739,7 +1856,8 @@ mod tests {
 
     #[test]
     fn dev_store_is_a_map_multiple_accounts_coexist() {
-        let dir = std::env::temp_dir().join(format!("murmur-dev-secrets-map-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("murmur-dev-secrets-map-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dev-secrets-map.json");
         let _ = std::fs::remove_file(&path);
@@ -1749,20 +1867,55 @@ mod tests {
         dev_set_secret_at(&path, ACCOUNT_ANTHROPIC_KEY, "anthropic-2").unwrap();
         dev_set_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY, "brave-3").unwrap();
 
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap().as_deref(), Some("mcp-token-1"));
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap().as_deref(), Some("anthropic-2"));
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(), Some("brave-3"));
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN)
+                .unwrap()
+                .as_deref(),
+            Some("mcp-token-1")
+        );
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("anthropic-2")
+        );
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("brave-3")
+        );
 
         // Replacing one account leaves the others intact.
         dev_set_secret_at(&path, ACCOUNT_ANTHROPIC_KEY, "anthropic-REPLACED").unwrap();
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY).unwrap().as_deref(), Some("anthropic-REPLACED"));
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap().as_deref(), Some("mcp-token-1"));
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(), Some("brave-3"));
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_ANTHROPIC_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("anthropic-REPLACED")
+        );
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN)
+                .unwrap()
+                .as_deref(),
+            Some("mcp-token-1")
+        );
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("brave-3")
+        );
 
         // Deleting one leaves the rest.
         dev_delete_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap();
         assert_eq!(dev_get_secret_at(&path, ACCOUNT_MCP_TOKEN).unwrap(), None);
-        assert_eq!(dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY).unwrap().as_deref(), Some("brave-3"));
+        assert_eq!(
+            dev_get_secret_at(&path, ACCOUNT_WEB_SEARCH_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("brave-3")
+        );
 
         let _ = std::fs::remove_file(&path);
     }

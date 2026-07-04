@@ -260,7 +260,13 @@ mod tests {
     fn sealed_folder_content_excluded_until_unlocked() {
         let db = temp_db();
         // Open folder note (always visible) + a folder we will seal.
-        seed_note(&db, "open", "Open Meeting", "OPEN-SECRET project Apollo", None);
+        seed_note(
+            &db,
+            "open",
+            "Open Meeting",
+            "OPEN-SECRET project Apollo",
+            None,
+        );
         seed_folder(&db, "f-locked");
         seed_note(
             &db,
@@ -287,8 +293,7 @@ mod tests {
 
         // Visibility-aware variant with an empty set agrees with the shim.
         let nothing = HashSet::new();
-        let (c0, _) =
-            build_vault_context_visible(&db, "SECRET", "anthropic", &nothing).unwrap();
+        let (c0, _) = build_vault_context_visible(&db, "SECRET", "anthropic", &nothing).unwrap();
         assert!(!c0.contains("LOCKED-SECRET"));
 
         // Session-unlock the folder → its content is now legitimately available.
@@ -296,7 +301,10 @@ mod tests {
         unlocked.insert("f-locked".to_string());
         let (corpus2, sources2) =
             build_vault_context_visible(&db, "SECRET", "anthropic", &unlocked).unwrap();
-        assert!(corpus2.contains("LOCKED-SECRET"), "unlocked content must reappear");
+        assert!(
+            corpus2.contains("LOCKED-SECRET"),
+            "unlocked content must reappear"
+        );
         assert!(sources2.iter().any(|s| s.meeting_id == "sealed"));
     }
 
@@ -306,7 +314,13 @@ mod tests {
     #[test]
     fn hybrid_corpus_respects_visibility_gate() {
         let db = temp_db();
-        seed_note(&db, "open", "Open Meeting", "OPEN-SECRET project Apollo budget", None);
+        seed_note(
+            &db,
+            "open",
+            "Open Meeting",
+            "OPEN-SECRET project Apollo budget",
+            None,
+        );
         seed_folder(&db, "f-locked");
         seed_note(
             &db,
@@ -330,8 +344,12 @@ mod tests {
 
         let nothing = HashSet::new();
         let (corpus, sources) =
-            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing).unwrap();
-        assert!(corpus.contains("OPEN-SECRET"), "open note must be in the hybrid corpus");
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing)
+                .unwrap();
+        assert!(
+            corpus.contains("OPEN-SECRET"),
+            "open note must be in the hybrid corpus"
+        );
         assert!(
             !corpus.contains("LOCKED-SECRET"),
             "sealed-not-unlocked content leaked into the hybrid corpus (gate violation)"
@@ -341,7 +359,11 @@ mod tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
         let (corpus2, _) =
-            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked).unwrap();
-        assert!(corpus2.contains("LOCKED-SECRET"), "unlocked content must reappear in hybrid corpus");
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked)
+                .unwrap();
+        assert!(
+            corpus2.contains("LOCKED-SECRET"),
+            "unlocked content must reappear in hybrid corpus"
+        );
     }
 }

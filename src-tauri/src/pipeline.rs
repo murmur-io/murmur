@@ -167,8 +167,11 @@ fn transcribe_stream(
             continue;
         }
         let offset_s = start as f64 / crate::audio::TARGET_RATE_HZ as f64;
-        let tx =
-            transcriber.transcribe_with(&samples_16k[start..end], lang, TranscribeQuality::Accurate)?;
+        let tx = transcriber.transcribe_with(
+            &samples_16k[start..end],
+            lang,
+            TranscribeQuality::Accurate,
+        )?;
         for mut seg in tx.segments {
             seg.idx = idx;
             seg.start_s += offset_s;
@@ -316,8 +319,12 @@ async fn run_inner(
                     mic_16k_archive = None; // feed and archive now share the AEC'd buffer
                     tracing::info!(target: "audio", "offline AEC applied to the mic track");
                 }
-                Ok(_) => tracing::warn!(target: "audio", "offline AEC length mismatch; raw mic kept"),
-                Err(e) => tracing::warn!(target: "audio", error = %e, "offline AEC failed; raw mic kept"),
+                Ok(_) => {
+                    tracing::warn!(target: "audio", "offline AEC length mismatch; raw mic kept")
+                }
+                Err(e) => {
+                    tracing::warn!(target: "audio", error = %e, "offline AEC failed; raw mic kept")
+                }
             }
         }
     }
@@ -375,10 +382,10 @@ async fn run_inner(
             let sys_master = wav_dir.join(format!("{meeting_id}.sys.wav"));
             if let Err(e) = audio::write_wav_f32(&sys_master, sys, *sys_rate, 1) {
                 tracing::warn!(target: "audio", error = %e, "system master write failed");
-            } else if let Err(e) = state
-                .db
-                .set_meeting_sys_master_path(meeting_id, Some(sys_master.to_string_lossy().as_ref()))
-            {
+            } else if let Err(e) = state.db.set_meeting_sys_master_path(
+                meeting_id,
+                Some(sys_master.to_string_lossy().as_ref()),
+            ) {
                 tracing::warn!(target: "audio", error = %e, "persisting system master path failed");
             }
         }
@@ -459,18 +466,19 @@ async fn run_inner(
 
     // Resolve diarization models (best-effort async download) when diarization is ON and there's a
     // system stream to diarize. Any failure → None → keep the single "others" label.
-    let diarize_models: Option<(std::path::PathBuf, std::path::PathBuf)> =
-        if config.diarize_others && has_system {
-            match crate::transcribe::ensure_diarization_models().await {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    tracing::warn!(target: "transcribe", error = %e, "diarization models unavailable; single 'others' label");
-                    None
-                }
+    let diarize_models: Option<(std::path::PathBuf, std::path::PathBuf)> = if config.diarize_others
+        && has_system
+    {
+        match crate::transcribe::ensure_diarization_models().await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(target: "transcribe", error = %e, "diarization models unavailable; single 'others' label");
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // VOICEPRINTS (opt-in, default OFF): capture a per-cluster voice biometric for the diarized
     // "others" clusters, but ONLY when diarization is on AND the explicit `voiceprint_enabled` flag is
@@ -768,7 +776,10 @@ pub(crate) fn build_transcript_feed(
 /// Regression: `summarize_egress_resolution_honors_revoke_landed_after_stop_snapshot`.
 fn resolve_summarize_egress(
     state: &AppState,
-) -> Result<(AppConfig, std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>)> {
+) -> Result<(
+    AppConfig,
+    std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>,
+)> {
     let config: AppConfig = {
         let guard = state
             .config
@@ -822,7 +833,9 @@ pub(crate) fn privacy_receipt_facts(
         None
     } else {
         match connection {
-            crate::summarize::PROVIDER_CLAUDE_CODE => Some("claude_code (Anthropic CLI)".to_string()),
+            crate::summarize::PROVIDER_CLAUDE_CODE => {
+                Some("claude_code (Anthropic CLI)".to_string())
+            }
             crate::summarize::PROVIDER_ANTHROPIC => Some("api.anthropic.com".to_string()),
             crate::summarize::PROVIDER_GATEWAY => gateway_host.map(str::to_string),
             crate::summarize::PROVIDER_OLLAMA => reqwest::Url::parse(&config.ollama_base_url)
@@ -1000,18 +1013,24 @@ async fn summarize_and_export(
         let m = crate::summarize::effective_model_requested(&notes_target, config);
         let m = m.trim().to_string();
         // A "" stays None so legacy notes don't get a blank string.
-        if m.is_empty() { None } else { Some(m) }
+        if m.is_empty() {
+            None
+        } else {
+            Some(m)
+        }
     };
     let gateway_host = if notes_target.connection == crate::summarize::PROVIDER_GATEWAY {
         reqwest::Url::parse(&config.gateway_base_url)
             .ok()
-            .and_then(|u| u.host_str().map(|h| {
-                if let Some(port) = u.port() {
-                    format!("{h}:{port}")
-                } else {
-                    h.to_string()
-                }
-            }))
+            .and_then(|u| {
+                u.host_str().map(|h| {
+                    if let Some(port) = u.port() {
+                        format!("{h}:{port}")
+                    } else {
+                        h.to_string()
+                    }
+                })
+            })
     } else {
         None
     };
@@ -1052,7 +1071,10 @@ async fn summarize_and_export(
     // the model ABSENT, `active_embedder()` is the hash StubEmbedder (not semantic) — writing those
     // into `vec_chunks` would pollute the index, so we skip (mirrors `reindex_embeddings`'s stub
     // refusal). This closes the flag-on-without-model gap.
-    if should_auto_index(config.semantic_search_enabled, crate::embed::embed_model_present()) {
+    if should_auto_index(
+        config.semantic_search_enabled,
+        crate::embed::embed_model_present(),
+    ) {
         let unlocked = state
             .unlocked_folders
             .lock()
@@ -1427,8 +1449,7 @@ fn resolve_model_path(config: &AppConfig) -> Result<PathBuf> {
     match transcribe::resolve_model_path(configured, &config.model_size, language)? {
         Some(p) => Ok(p),
         None => Err(AppError::Transcribe(
-            "no Whisper model found — pick a language + model in Settings and download it"
-                .into(),
+            "no Whisper model found — pick a language + model in Settings and download it".into(),
         )),
     }
 }
@@ -1492,7 +1513,10 @@ mod tests {
         // A local provider returns UNWRAPPED (no RedactingProvider), so no firewall ran → None.
         let meta = CallMeta::default();
         let facts = privacy_receipt_facts(crate::summarize::PROVIDER_OLLAMA, &cfg, None, &meta);
-        assert!(facts.local_only, "loopback ollama = nothing left the device");
+        assert!(
+            facts.local_only,
+            "loopback ollama = nothing left the device"
+        );
         assert_eq!(facts.egress_host, None);
         assert_eq!(facts.redacted_pii, None);
         // End-to-end through the SAME injector the pipeline calls.
@@ -1502,9 +1526,18 @@ mod tests {
             facts.egress_host.as_deref(),
             facts.redacted_pii,
         );
-        assert!(out.contains("privacy-cloud-calls: 0"), "local headline stamped: {out}");
-        assert!(!out.contains("privacy-egress-host"), "no host for a local note: {out}");
-        assert!(!out.contains("privacy-pii-redacted"), "no pii key for a local note: {out}");
+        assert!(
+            out.contains("privacy-cloud-calls: 0"),
+            "local headline stamped: {out}"
+        );
+        assert!(
+            !out.contains("privacy-egress-host"),
+            "no host for a local note: {out}"
+        );
+        assert!(
+            !out.contains("privacy-pii-redacted"),
+            "no pii key for a local note: {out}"
+        );
     }
 
     /// ANTHROPIC (cloud) ⇒ the non-PII host label + the firewall's REAL scrub total (summed across
@@ -1513,22 +1546,37 @@ mod tests {
     fn privacy_receipt_facts_anthropic_stamps_host_and_real_pii_count() {
         let cfg = AppConfig::default();
         let meta = CallMeta {
-            redactions: Some(RedactionCounts { email: 2, card: 0, phone: 1, name: 3 }),
+            redactions: Some(RedactionCounts {
+                email: 2,
+                card: 0,
+                phone: 1,
+                name: 3,
+            }),
             ..Default::default()
         };
         let facts = privacy_receipt_facts(crate::summarize::PROVIDER_ANTHROPIC, &cfg, None, &meta);
         assert!(!facts.local_only, "anthropic is cloud egress");
         assert_eq!(facts.egress_host.as_deref(), Some("api.anthropic.com"));
-        assert_eq!(facts.redacted_pii, Some(6), "2+0+1+3 = the real firewall total");
+        assert_eq!(
+            facts.redacted_pii,
+            Some(6),
+            "2+0+1+3 = the real firewall total"
+        );
         let out = crate::export::inject_privacy_receipt_frontmatter(
             "---\ntitle: T\n---\nBody.",
             facts.local_only,
             facts.egress_host.as_deref(),
             facts.redacted_pii,
         );
-        assert!(out.contains("privacy-egress-host: api.anthropic.com"), "host: {out}");
+        assert!(
+            out.contains("privacy-egress-host: api.anthropic.com"),
+            "host: {out}"
+        );
         assert!(out.contains("privacy-pii-redacted: 6"), "real count: {out}");
-        assert!(!out.contains("privacy-cloud-calls"), "no cloud-call count claimed: {out}");
+        assert!(
+            !out.contains("privacy-cloud-calls"),
+            "no cloud-call count claimed: {out}"
+        );
     }
 
     /// GATEWAY ⇒ the receipt reuses the already-computed non-PII endpoint `host:port` label.
@@ -1540,7 +1588,10 @@ mod tests {
             Some("127.0.0.1:4000"),
             &CallMeta::default(),
         );
-        assert!(!facts.local_only, "gateway is always cloud (a localhost gateway may forward)");
+        assert!(
+            !facts.local_only,
+            "gateway is always cloud (a localhost gateway may forward)"
+        );
         assert_eq!(facts.egress_host.as_deref(), Some("127.0.0.1:4000"));
     }
 
@@ -1556,9 +1607,16 @@ mod tests {
             ..Default::default()
         };
         let facts = privacy_receipt_facts(crate::summarize::PROVIDER_OLLAMA, &cfg, None, &meta);
-        assert!(!facts.local_only, "a remote ollama endpoint is cloud egress, not local");
+        assert!(
+            !facts.local_only,
+            "a remote ollama endpoint is cloud egress, not local"
+        );
         assert_eq!(facts.egress_host.as_deref(), Some("ollama.remote.example"));
-        assert_eq!(facts.redacted_pii, Some(0), "wrapped-but-zero scrubs = an honest 0");
+        assert_eq!(
+            facts.redacted_pii,
+            Some(0),
+            "wrapped-but-zero scrubs = an honest 0"
+        );
     }
 
     /// REFRESH-on-resummarize: each (re)summarize hands the injector a FRESH markdown (the LLM
@@ -1583,7 +1641,10 @@ mod tests {
             f1.egress_host.as_deref(),
             f1.redacted_pii,
         );
-        assert!(run1.contains("privacy-cloud-calls: 0"), "run 1 = local: {run1}");
+        assert!(
+            run1.contains("privacy-cloud-calls: 0"),
+            "run 1 = local: {run1}"
+        );
 
         // Run 2 (resummarize): provider switched to anthropic; the model produced a FRESH note.
         let f2 = privacy_receipt_facts(
@@ -1591,7 +1652,12 @@ mod tests {
             &AppConfig::default(),
             None,
             &CallMeta {
-                redactions: Some(RedactionCounts { email: 1, card: 0, phone: 0, name: 0 }),
+                redactions: Some(RedactionCounts {
+                    email: 1,
+                    card: 0,
+                    phone: 0,
+                    name: 0,
+                }),
                 ..Default::default()
             },
         );
@@ -1601,8 +1667,14 @@ mod tests {
             f2.egress_host.as_deref(),
             f2.redacted_pii,
         );
-        assert!(run2.contains("privacy-egress-host: api.anthropic.com"), "run 2 = cloud host: {run2}");
-        assert!(run2.contains("privacy-pii-redacted: 1"), "run 2 real count: {run2}");
+        assert!(
+            run2.contains("privacy-egress-host: api.anthropic.com"),
+            "run 2 = cloud host: {run2}"
+        );
+        assert!(
+            run2.contains("privacy-pii-redacted: 1"),
+            "run 2 real count: {run2}"
+        );
         assert!(
             !run2.contains("privacy-cloud-calls: 0"),
             "the local headline did NOT bleed into the cloud re-summary: {run2}"
@@ -1636,7 +1708,12 @@ mod tests {
 
         // The user revokes WHILE transcription runs (the real `revoke_cloud_egress` mutator,
         // as the Tauri command performs it).
-        state.config.lock().unwrap().revoke_cloud_egress(&state.db).unwrap();
+        state
+            .config
+            .lock()
+            .unwrap()
+            .revoke_cloud_egress(&state.db)
+            .unwrap();
 
         // FIXED: the summarize step resolves config + provider through the LIVE state → the
         // fail-closed consent gate refuses.
@@ -1662,7 +1739,10 @@ mod tests {
     fn auto_index_requires_both_flag_and_model() {
         // The gap this closes: flag ON but model ABSENT must NOT auto-index (would write hash-stub
         // vectors into vec_chunks). Only flag-AND-model-present writes real vectors.
-        assert!(should_auto_index(true, true), "flag on + model present → index");
+        assert!(
+            should_auto_index(true, true),
+            "flag on + model present → index"
+        );
         assert!(
             !should_auto_index(true, false),
             "flag on WITHOUT the model must NOT write stub vectors"
@@ -1760,11 +1840,14 @@ mod tests {
         assert!(feed.labeled);
         // The low-confidence line is marked; the confident one is not.
         assert!(
-            feed.summary_text.contains("(me) [UNCLEAR] the garbled acoustic span"),
+            feed.summary_text
+                .contains("(me) [UNCLEAR] the garbled acoustic span"),
             "low-confidence span must be prefixed [UNCLEAR]; got: {}",
             feed.summary_text
         );
-        assert!(feed.summary_text.contains("(others) the clear response here"));
+        assert!(feed
+            .summary_text
+            .contains("(others) the clear response here"));
         assert!(!feed.summary_text.contains("[UNCLEAR] the clear"));
         // Retrieval text is never perturbed by the marker.
         assert!(!feed.retrieval_text.contains("[UNCLEAR]"));
@@ -1856,7 +1939,10 @@ mod tests {
         {
             let _guard = ScratchWav::new(Some(p.clone()));
         } // dropped here
-        assert!(!p.exists(), "scratch WAV must be removed when its guard drops");
+        assert!(
+            !p.exists(),
+            "scratch WAV must be removed when its guard drops"
+        );
     }
 
     /// A `None` scratch guard (no AEC/system WAV produced) and a guard whose file was already
@@ -1864,10 +1950,8 @@ mod tests {
     #[test]
     fn scratch_wav_none_or_missing_is_noop() {
         drop(ScratchWav::new(None));
-        let p = std::env::temp_dir().join(format!(
-            "murmur-scratch-missing-{}.wav",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("murmur-scratch-missing-{}.wav", std::process::id()));
         let _ = std::fs::remove_file(&p);
         drop(ScratchWav::new(Some(p))); // file doesn't exist — must not panic
     }
@@ -1926,12 +2010,16 @@ mod tests {
         assert_eq!(notes_target.connection, "anthropic");
         let mid = "m-role-export";
         db.insert_meeting(&meeting(mid)).unwrap();
-        db.upsert_note(&note_row(mid, &notes_target.connection)).unwrap();
+        db.upsert_note(&note_row(mid, &notes_target.connection))
+            .unwrap();
 
         // The REAL production paired write.
         persist_note_exported_path(&db, &config, mid, Path::new("/vault/Role export.md")).unwrap();
 
-        let note = db.get_latest_note_for_meeting(mid).unwrap().expect("note row");
+        let note = db
+            .get_latest_note_for_meeting(mid)
+            .unwrap()
+            .expect("note row");
         assert_eq!(note.provider_id, "anthropic");
         assert_eq!(
             note.exported_path.as_deref(),
@@ -1958,9 +2046,15 @@ mod tests {
         ))
         .unwrap();
         persist_note_exported_path(&db, &legacy_cfg, mid2, Path::new("/vault/Legacy.md")).unwrap();
-        let legacy_note = db.get_latest_note_for_meeting(mid2).unwrap().expect("note row");
+        let legacy_note = db
+            .get_latest_note_for_meeting(mid2)
+            .unwrap()
+            .expect("note row");
         assert_eq!(legacy_note.provider_id, "claude_code");
-        assert_eq!(legacy_note.exported_path.as_deref(), Some("/vault/Legacy.md"));
+        assert_eq!(
+            legacy_note.exported_path.as_deref(),
+            Some("/vault/Legacy.md")
+        );
     }
 
     /// The no-vault branch of `summarize_and_export`: with no vault configured the note is saved
@@ -2011,7 +2105,10 @@ mod tests {
         assert_eq!(title, "Q3 Planning");
 
         // Note is saved to the canonical DB with NO export path.
-        let note = db.get_note(mid, "claude_code").unwrap().expect("note saved");
+        let note = db
+            .get_note(mid, "claude_code")
+            .unwrap()
+            .expect("note saved");
         assert_eq!(note.markdown, markdown);
         assert!(
             note.exported_path.is_none(),
@@ -2040,8 +2137,14 @@ mod tests {
         // Present ⇒ appended under a `## My notes` heading, verbatim (trimmed).
         let folded = fold_manual_notes(note, "ship Friday; Anna owns QA");
         assert!(folded.starts_with(note), "preserves the generated note");
-        assert!(folded.contains("## My notes"), "adds the My notes heading: {folded}");
-        assert!(folded.contains("ship Friday; Anna owns QA"), "embeds the typed notes verbatim");
+        assert!(
+            folded.contains("## My notes"),
+            "adds the My notes heading: {folded}"
+        );
+        assert!(
+            folded.contains("ship Friday; Anna owns QA"),
+            "embeds the typed notes verbatim"
+        );
     }
 
     /// ENHANCE-MY-NOTES: the mode switch. Empty notes ⇒ byte-identical in BOTH modes (the hard
@@ -2060,8 +2163,14 @@ mod tests {
             "append mode is byte-identical to today's fold"
         );
         let enhanced = finalize_note_markdown(note, "ship Friday", "enhance");
-        assert!(enhanced.contains("murmur_enhanced: true"), "marker stamped: {enhanced}");
-        assert!(!enhanced.contains("## My notes"), "no verbatim section in enhance mode");
+        assert!(
+            enhanced.contains("murmur_enhanced: true"),
+            "marker stamped: {enhanced}"
+        );
+        assert!(
+            !enhanced.contains("## My notes"),
+            "no verbatim section in enhance mode"
+        );
         assert!(enhanced.contains("# Sync"), "generated body preserved");
         assert_eq!(
             finalize_note_markdown(note, "x", "banana"),
@@ -2085,7 +2194,11 @@ mod tests {
         let bare = "# No front matter";
         assert_eq!(mark_enhanced(bare), bare, "no front-matter ⇒ unchanged");
         let unterminated = "---\ntitle: broken";
-        assert_eq!(mark_enhanced(unterminated), unterminated, "unterminated fm ⇒ unchanged");
+        assert_eq!(
+            mark_enhanced(unterminated),
+            unterminated,
+            "unterminated fm ⇒ unchanged"
+        );
     }
 
     /// brain2 realtime notes FOLD + COUNTEREXAMPLE B (the seam `summarize_and_export` runs, minus
@@ -2133,20 +2246,50 @@ mod tests {
 
         // First summarize: the note carries the typed notes under `## My notes`.
         finalize("---\ntitle: Roadmap\n---\n# Roadmap\n\nBody.");
-        let note = db.get_note(mid, "claude_code").unwrap().expect("note saved");
-        assert!(note.markdown.contains("## My notes"), "folded section present: {}", note.markdown);
-        assert!(note.markdown.contains(typed), "typed notes folded into the note");
+        let note = db
+            .get_note(mid, "claude_code")
+            .unwrap()
+            .expect("note saved");
+        assert!(
+            note.markdown.contains("## My notes"),
+            "folded section present: {}",
+            note.markdown
+        );
+        assert!(
+            note.markdown.contains(typed),
+            "typed notes folded into the note"
+        );
         // The buffer is DURABLE — still holds the canonical typed notes (not blanked).
-        assert_eq!(db.get_manual_notes(mid).unwrap(), typed, "manual_notes buffer is the durable canonical store");
+        assert_eq!(
+            db.get_manual_notes(mid).unwrap(),
+            typed,
+            "manual_notes buffer is the durable canonical store"
+        );
 
         // COUNTEREXAMPLE B: Resummarize regenerates a FRESH note (no `## My notes`); the fold re-reads
         // the durable buffer and re-appends it. The typed notes are NOT lost (and not duplicated).
         finalize("---\ntitle: Roadmap v2\n---\n# Roadmap v2\n\nDifferent body.");
-        let resummarized = db.get_note(mid, "claude_code").unwrap().expect("note saved");
-        assert!(resummarized.markdown.contains("Roadmap v2"), "note regenerated");
-        assert!(resummarized.markdown.contains("## My notes"), "resummarize keeps the typed-notes section");
-        assert!(resummarized.markdown.contains(typed), "resummarize re-folds the durable typed notes (B fixed)");
-        assert_eq!(resummarized.markdown.matches("## My notes").count(), 1, "exactly one My notes section (no dup)");
+        let resummarized = db
+            .get_note(mid, "claude_code")
+            .unwrap()
+            .expect("note saved");
+        assert!(
+            resummarized.markdown.contains("Roadmap v2"),
+            "note regenerated"
+        );
+        assert!(
+            resummarized.markdown.contains("## My notes"),
+            "resummarize keeps the typed-notes section"
+        );
+        assert!(
+            resummarized.markdown.contains(typed),
+            "resummarize re-folds the durable typed notes (B fixed)"
+        );
+        assert_eq!(
+            resummarized.markdown.matches("## My notes").count(),
+            1,
+            "exactly one My notes section (no dup)"
+        );
 
         let _ = std::fs::remove_file(temp_db_path("fold-manual"));
     }
@@ -2185,14 +2328,12 @@ mod tests {
     /// Count vec0 rows for a meeting via the GATED public read: if a chunk exists for `mid` AND the
     /// meeting is visible under `unlocked`, the query vector (same text) returns it. Returns true iff
     /// the meeting surfaces in the semantic results.
-    fn semantic_finds(
-        db: &crate::storage::Db,
-        mid: &str,
-        unlocked: &HashSet<String>,
-    ) -> bool {
+    fn semantic_finds(db: &crate::storage::Db, mid: &str, unlocked: &HashSet<String>) -> bool {
         let emb = crate::embed::active_embedder();
         let qv = emb
-            .embed(std::slice::from_ref(&"budget planning hiring quarter".to_string()))
+            .embed(std::slice::from_ref(
+                &"budget planning hiring quarter".to_string(),
+            ))
             .unwrap();
         let qvec = qv.into_iter().next().unwrap_or_default();
         db.search_semantic_visible(&qvec, 10, unlocked)
@@ -2221,9 +2362,15 @@ mod tests {
         );
 
         let corpus = ctx.expect("a visible related prior note must ground the new note (no flag)");
-        assert!(corpus.contains("id:m-prior"), "related prior note must be cited: {corpus}");
+        assert!(
+            corpus.contains("id:m-prior"),
+            "related prior note must be cited: {corpus}"
+        );
         // Self-exclusion: the meeting being summarized is never grounded in itself.
-        assert!(!corpus.contains("id:m-self"), "a note must never be grounded in itself");
+        assert!(
+            !corpus.contains("id:m-self"),
+            "a note must never be grounded in itself"
+        );
     }
 
     /// ALWAYS-ON graceful no-op: a fresh vault (no related prior notes) yields `related_context =
@@ -2244,7 +2391,10 @@ mod tests {
             "Budget planning for the next quarter and hiring runway.",
             "anthropic",
         );
-        assert!(ctx.is_none(), "no related notes ⇒ related_context = None (graceful no-op)");
+        assert!(
+            ctx.is_none(),
+            "no related notes ⇒ related_context = None (graceful no-op)"
+        );
     }
 
     /// LOCK INVARIANT under always-on: a sealed-and-NOT-session-unlocked related meeting must
@@ -2294,7 +2444,9 @@ mod tests {
             "anthropic",
         );
         assert!(
-            unlocked_ctx.map(|c| c.contains("id:m-sealed")).unwrap_or(false),
+            unlocked_ctx
+                .map(|c| c.contains("id:m-sealed"))
+                .unwrap_or(false),
             "unlocked related content must reappear in the grounding corpus"
         );
     }

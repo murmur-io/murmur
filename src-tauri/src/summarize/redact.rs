@@ -312,7 +312,10 @@ fn apply(
 /// UNIQUE matched value — duplicates reuse the same token). Iterate once and bucket by prefix.
 /// `name_count` is the number of name pairs returned by the `NameRedactor` (one per unique name).
 fn count_redactions(map: &HashMap<String, String>, name_count: usize) -> RedactionCounts {
-    let mut counts = RedactionCounts { name: name_count as u32, ..Default::default() };
+    let mut counts = RedactionCounts {
+        name: name_count as u32,
+        ..Default::default()
+    };
     for key in map.keys() {
         // Keys are `⟪KIND_n⟫`; strip the leading `⟪` (U+27EA) and match on the suffix.
         let inner = key.trim_start_matches('\u{27ea}');
@@ -398,7 +401,14 @@ impl RedactingProvider {
         destination: String,
         model_requested: String,
     ) -> Self {
-        Self { inner, names, sink, provider_id, destination, model_requested }
+        Self {
+            inner,
+            names,
+            sink,
+            provider_id,
+            destination,
+            model_requested,
+        }
     }
 }
 
@@ -438,10 +448,7 @@ impl SummarizerProvider for RedactingProvider {
     ///   format flags (an ISO date / language code / integer; scrubbing a date would false-positive
     ///   as a PHONE and garble the note). Any NEW string field MUST be classified here and is
     ///   caught by `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
-    async fn summarize_with_meta(
-        &self,
-        req: &SummarizeRequest,
-    ) -> Result<(String, CallMeta)> {
+    async fn summarize_with_meta(&self, req: &SummarizeRequest) -> Result<(String, CallMeta)> {
         // Shared regex map across the transcript AND the Phase-4 `related_context` so a value
         // redacted in either restores consistently in the reply. With `related_context = None`
         // (the default + flag-OFF case) the map is built from the transcript alone, exactly as the
@@ -560,11 +567,7 @@ impl SummarizerProvider for RedactingProvider {
     }
 
     /// Redact inputs, call inner provider (capturing `CallMeta`), restore outputs, record egress.
-    async fn complete_with_meta(
-        &self,
-        system: &str,
-        user: &str,
-    ) -> Result<(String, CallMeta)> {
+    async fn complete_with_meta(&self, system: &str, user: &str) -> Result<(String, CallMeta)> {
         // Shared map so a value redacted in either prompt restores consistently.
         let mut map = HashMap::new();
         let mut rev = HashMap::new();
@@ -628,7 +631,10 @@ impl SummarizerProvider for RedactingProvider {
         name_pairs.extend(more);
         // Forward to the INNER's own complete_json_with_meta — dispatches to the gateway's native
         // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
-        let (value, meta) = self.inner.complete_json_with_meta(&rsys, &ruser, schema).await?;
+        let (value, meta) = self
+            .inner
+            .complete_json_with_meta(&rsys, &ruser, schema)
+            .await?;
         // Restore PII in the returned Value via a JSON string round-trip. The ⟪TOKEN⟫ placeholders
         // are embedded verbatim in the JSON string values, so serialization preserves them and
         // the regex replacements find them correctly.
@@ -641,9 +647,7 @@ impl SummarizerProvider for RedactingProvider {
         let restored = restore_names(&serialized, &name_pairs);
         let restored = restore(&restored, &map);
         let out = serde_json::from_str::<Value>(&restored).map_err(|e| {
-            AppError::Summarize(format!(
-                "complete_json: restore produced invalid JSON: {e}"
-            ))
+            AppError::Summarize(format!("complete_json: restore produced invalid JSON: {e}"))
         })?;
         // Record a content-free audit entry with the REAL meta so timeline/graph calls
         // show actual token usage in the egress ledger (not the former CallMeta::default()).
@@ -842,7 +846,8 @@ mod tests {
             Arc::new(CaptureProvider(captured.clone())),
             Arc::new(FixtureNameRedactor),
         );
-        let out = block_on(prov.summarize(&sample_req("Anna Kowalska briefed Bob Smith."))).unwrap();
+        let out =
+            block_on(prov.summarize(&sample_req("Anna Kowalska briefed Bob Smith."))).unwrap();
         let sent = captured.lock().unwrap().clone();
         // The provider saw TOKENS, not names — no name leaked off-device.
         assert!(!sent.contains("Anna Kowalska"));
@@ -912,8 +917,14 @@ mod tests {
         let sent = captured.lock().unwrap().clone();
         // The name in the speaker tag was scrubbed to a token before egress; the labeled line survives.
         assert!(!sent.contains("Anna Kowalska"), "name must NOT egress");
-        assert!(sent.contains("\u{27ea}NAME_1\u{27eb}"), "name replaced by the stable token");
-        assert!(sent.contains("[0.0-2.0] ("), "the labeled line shape survives redaction");
+        assert!(
+            sent.contains("\u{27ea}NAME_1\u{27eb}"),
+            "name replaced by the stable token"
+        );
+        assert!(
+            sent.contains("[0.0-2.0] ("),
+            "the labeled line shape survives redaction"
+        );
     }
 
     // ── Phase D model plumbing + active factory ──────────────────────────────
@@ -936,7 +947,10 @@ mod tests {
         // On a clean machine the NER dir is absent ⇒ not present.
         let dir = ner_model_dir().unwrap();
         if !dir.is_dir() {
-            assert!(!ner_model_present(), "absent NER dir must report not-present");
+            assert!(
+                !ner_model_present(),
+                "absent NER dir must report not-present"
+            );
         }
     }
 
@@ -998,8 +1012,9 @@ mod tests {
             Arc::new(EchoProvider),
             Arc::new(FixtureNameRedactor),
         );
-        let out = block_on(prov.complete("You assist Anna Kowalska.", "Anna Kowalska asks: status?"))
-            .unwrap();
+        let out =
+            block_on(prov.complete("You assist Anna Kowalska.", "Anna Kowalska asks: status?"))
+                .unwrap();
         assert!(!out.contains("NAME_"));
         assert_eq!(out.matches("Anna Kowalska").count(), 2);
     }
@@ -1007,7 +1022,9 @@ mod tests {
     // ── Phase 2b — egress ledger ─────────────────────────────────────────────
 
     /// `CaptureEgressSink` captures every `EgressEntry` for assertion in tests.
-    struct CaptureEgressSink(std::sync::Arc<std::sync::Mutex<Vec<crate::summarize::egress_log::EgressEntry>>>);
+    struct CaptureEgressSink(
+        std::sync::Arc<std::sync::Mutex<Vec<crate::summarize::egress_log::EgressEntry>>>,
+    );
 
     impl crate::summarize::egress_log::EgressSink for CaptureEgressSink {
         fn record(&self, entry: crate::summarize::egress_log::EgressEntry) {
@@ -1020,35 +1037,52 @@ mod tests {
 
     #[async_trait]
     impl SummarizerProvider for EchoMetaProvider {
-        fn id(&self) -> &str { "echo-meta" }
-        async fn availability(&self) -> Availability { Availability::Available }
+        fn id(&self) -> &str {
+            "echo-meta"
+        }
+        async fn availability(&self) -> Availability {
+            Availability::Available
+        }
         async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
             Ok(req.transcript.clone())
         }
         async fn complete(&self, system: &str, user: &str) -> Result<String> {
             Ok(format!("{system}\n---\n{user}"))
         }
-        async fn summarize_with_meta(&self, req: &SummarizeRequest) -> Result<(String, crate::summarize::meta::CallMeta)> {
+        async fn summarize_with_meta(
+            &self,
+            req: &SummarizeRequest,
+        ) -> Result<(String, crate::summarize::meta::CallMeta)> {
             use crate::summarize::meta::CallMeta;
-            Ok((req.transcript.clone(), CallMeta {
-                model_served: Some("claude-opus-4-8-test".to_string()),
-                prompt_tokens: Some(42),
-                completion_tokens: Some(13),
-                total_tokens: Some(55),
-                cached_tokens: None,
-                redactions: None,
-            }))
+            Ok((
+                req.transcript.clone(),
+                CallMeta {
+                    model_served: Some("claude-opus-4-8-test".to_string()),
+                    prompt_tokens: Some(42),
+                    completion_tokens: Some(13),
+                    total_tokens: Some(55),
+                    cached_tokens: None,
+                    redactions: None,
+                },
+            ))
         }
-        async fn complete_with_meta(&self, system: &str, user: &str) -> Result<(String, crate::summarize::meta::CallMeta)> {
+        async fn complete_with_meta(
+            &self,
+            system: &str,
+            user: &str,
+        ) -> Result<(String, crate::summarize::meta::CallMeta)> {
             use crate::summarize::meta::CallMeta;
-            Ok((format!("{system}\n---\n{user}"), CallMeta {
-                model_served: Some("claude-opus-4-8-test".to_string()),
-                prompt_tokens: Some(10),
-                completion_tokens: Some(5),
-                total_tokens: Some(15),
-                cached_tokens: None,
-                redactions: None,
-            }))
+            Ok((
+                format!("{system}\n---\n{user}"),
+                CallMeta {
+                    model_served: Some("claude-opus-4-8-test".to_string()),
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    total_tokens: Some(15),
+                    cached_tokens: None,
+                    redactions: None,
+                },
+            ))
         }
     }
 
@@ -1086,7 +1120,10 @@ mod tests {
 
         // CallMeta propagated:
         assert_eq!(entry.meta.prompt_tokens, Some(10));
-        assert_eq!(entry.meta.model_served.as_deref(), Some("claude-opus-4-8-test"));
+        assert_eq!(
+            entry.meta.model_served.as_deref(),
+            Some("claude-opus-4-8-test")
+        );
 
         // call_kind:
         assert_eq!(entry.call_kind, "complete");
@@ -1102,7 +1139,10 @@ mod tests {
             "note text must NOT appear in egress entry debug: {debug}"
         );
         // Only non-PII metadata present:
-        assert!(debug.contains("api.anthropic.com"), "destination label is non-PII");
+        assert!(
+            debug.contains("api.anthropic.com"),
+            "destination label is non-PII"
+        );
     }
 
     /// Tier 4c (v1.1) — RED-before-GREEN: `summarize_with_meta` must SURFACE the firewall's scrub
@@ -1179,9 +1219,15 @@ mod tests {
 
         #[async_trait]
         impl SummarizerProvider for RecordingJsonProvider {
-            fn id(&self) -> &str { "recording-json" }
-            async fn availability(&self) -> Availability { Availability::Available }
-            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> { Ok(String::new()) }
+            fn id(&self) -> &str {
+                "recording-json"
+            }
+            async fn availability(&self) -> Availability {
+                Availability::Available
+            }
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> {
+                Ok(String::new())
+            }
             async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
                 // Must NOT be called when complete_json_with_meta override is wired correctly.
                 Ok(String::new())
@@ -1267,9 +1313,16 @@ mod tests {
         // 4. Egress sink: one entry, correct call_kind, correct redaction count, REAL meta,
         //    and content-free.
         let entries = captured_entries.lock().unwrap();
-        assert_eq!(entries.len(), 1, "exactly one egress entry per complete_json call");
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one egress entry per complete_json call"
+        );
         let entry = &entries[0];
-        assert_eq!(entry.call_kind, "complete_json", "call_kind must be 'complete_json'");
+        assert_eq!(
+            entry.call_kind, "complete_json",
+            "call_kind must be 'complete_json'"
+        );
         assert_eq!(entry.redactions.email, 1, "one email was redacted");
 
         // 5. The REAL CallMeta propagated — no longer CallMeta::default().
@@ -1380,7 +1433,10 @@ mod tests {
             "email-bearing vault title must NOT egress: {egress}"
         );
         assert!(
-            !egressed.vault_titles.iter().any(|t| t == "Offer - jane@doe.example"),
+            !egressed
+                .vault_titles
+                .iter()
+                .any(|t| t == "Offer - jane@doe.example"),
             "the PII title must be filtered out of the egressed list"
         );
         assert!(
