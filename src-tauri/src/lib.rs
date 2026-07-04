@@ -114,10 +114,12 @@ pub fn run() {
             // M3-CLIENT — sharing account + zero-knowledge link shares (mode A).
             commands::account_status,
             commands::account_signup,
+            commands::account_send_code,
             commands::account_login,
             commands::account_logout,
             commands::consent_to_share_egress,
             commands::revoke_share_egress,
+            commands::mark_sharing_choice_made,
             commands::share_note_to_link,
             commands::list_my_shares,
             commands::revoke_share,
