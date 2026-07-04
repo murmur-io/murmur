@@ -72,10 +72,12 @@ import { AiRoleRowsComponent } from "./ai-role-rows.component";
               <span class="field-label">Default AI</span>
               <!--
                 Disabled when posture is "fully_local" — the on-device pipeline
-                runs notes on the selected GGUF; this picker has no effect.
-                [attr.disabled] avoids the Angular reactive-forms decorator
-                warning while still setting the native disabled attribute that
-                Playwright's toBeDisabled() checks.
+                runs notes on the selected GGUF, so this picker has no effect.
+                Reactive-forms controls can't be disabled via [attr.disabled]
+                (the ControlValueAccessor strips it), so _syncProviderDisable
+                toggles the FormControl's own .disable()/.enable() — see its
+                comment below. save() uses getRawValue(), so a disabled
+                providerId still persists.
               -->
               <select
                 formControlName="providerId"
