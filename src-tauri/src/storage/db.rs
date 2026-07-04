@@ -1237,6 +1237,17 @@ impl Db {
     /// live recording a second call reconciles 0. Non-`RECORDING` rows (Complete/Error/…) are left
     /// untouched by the `WHERE status = 'RECORDING'` guard. Logs only meeting UUIDs + a count (no PII).
     pub fn reconcile_stuck_recordings(&self) -> Result<usize> {
+        self.reconcile_stuck_recordings_except(&[])
+    }
+
+    /// [`Self::reconcile_stuck_recordings`], but SKIPPING every meeting id in `claimed` — the rows the
+    /// STAGE-2 crash-salvage (`audio::spill`) is handling THIS launch. Salvage runs BEFORE reconcile
+    /// in setup and CLAIMS the recoverable ghosts (reconstructing their audio + running the pipeline,
+    /// which sets their final status itself); reconcile must NOT clobber a claimed row to `ERROR` in
+    /// the window before the async salvage worker transitions it. Every OTHER stuck `RECORDING` ghost
+    /// (no spill / not recoverable) is still flipped to the terminal `ERROR` state exactly as before.
+    /// Idempotent + additive (the per-row `AND status = RECORDING` guard). Logs ids + counts, no PII.
+    pub fn reconcile_stuck_recordings_except(&self, claimed: &[String]) -> Result<usize> {
         let conn = self.lock();
         // Collect the ghost ids first (UUIDs — not PII) so the reconcile is auditable in the log.
         let ids: Vec<String> = {
@@ -1251,22 +1262,30 @@ impl Db {
                 .map_err(map_err)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_err)?
         };
-        if ids.is_empty() {
+        // Exclude the rows salvage claimed this launch — it owns their final status.
+        let to_reconcile: Vec<&String> =
+            ids.iter().filter(|id| !claimed.contains(id)).collect();
+        if to_reconcile.is_empty() {
             return Ok(0);
         }
-        let n = conn
-            .execute(
-                "UPDATE meetings SET status = ?2 WHERE status = ?1",
-                rusqlite::params![
-                    MeetingStatus::Recording.as_str(),
-                    MeetingStatus::Error.as_str()
-                ],
-            )
-            .map_err(map_err)?;
+        let mut n = 0usize;
+        for id in &to_reconcile {
+            n += conn
+                .execute(
+                    "UPDATE meetings SET status = ?2 WHERE id = ?1 AND status = ?3",
+                    rusqlite::params![
+                        id,
+                        MeetingStatus::Error.as_str(),
+                        MeetingStatus::Recording.as_str()
+                    ],
+                )
+                .map_err(map_err)?;
+        }
         tracing::info!(
             target: "startup",
             reconciled = n,
-            ids = ?ids,
+            skipped_for_salvage = claimed.len(),
+            ids = ?to_reconcile,
             "reconciled stuck RECORDING meetings to ERROR (crash recovery)"
         );
         Ok(n)
@@ -6609,6 +6628,50 @@ mod tests {
         assert_eq!(
             db.get_meeting("ghost").unwrap().unwrap().status,
             MeetingStatus::Error
+        );
+    }
+
+    /// The load-bearing skip invariant the STAGE-2 crash-salvage ordering depends on:
+    /// `reconcile_stuck_recordings_except(&[claimed])` must LEAVE the claimed ghost in RECORDING
+    /// (salvage owns its final status), while every OTHER stuck RECORDING ghost still flips to ERROR.
+    /// Without this skip, reconcile would clobber a claimed row to ERROR in the window before the async
+    /// salvage worker transitions it — corrupting the salvage.
+    #[test]
+    fn reconcile_stuck_recordings_except_leaves_the_claimed_row_recording() {
+        let db = mem_db();
+
+        // Two crash ghosts, both stuck in RECORDING.
+        db.insert_meeting(&sample_meeting("claimed", "2026-07-04T09:00:00Z"))
+            .unwrap();
+        db.update_meeting_status("claimed", MeetingStatus::Recording)
+            .unwrap();
+        db.insert_meeting(&sample_meeting("unclaimed", "2026-07-04T09:05:00Z"))
+            .unwrap();
+        db.update_meeting_status("unclaimed", MeetingStatus::Recording)
+            .unwrap();
+
+        // Reconcile, EXCEPTing the salvage-claimed id: exactly the one un-claimed ghost flips.
+        let claimed = vec!["claimed".to_string()];
+        assert_eq!(db.reconcile_stuck_recordings_except(&claimed).unwrap(), 1);
+
+        // The claimed row is SKIPPED — still RECORDING, so the async salvage worker owns its fate.
+        assert_eq!(
+            db.get_meeting("claimed").unwrap().unwrap().status,
+            MeetingStatus::Recording,
+            "the claimed ghost must stay RECORDING for salvage to own its final status"
+        );
+        // The un-claimed ghost is reconciled to the terminal ERROR exactly as before.
+        assert_eq!(
+            db.get_meeting("unclaimed").unwrap().unwrap().status,
+            MeetingStatus::Error
+        );
+
+        // Idempotent: re-running with the same exclusion reconciles nothing (the claimed row is
+        // still RECORDING but skipped, the unclaimed one is already ERROR).
+        assert_eq!(db.reconcile_stuck_recordings_except(&claimed).unwrap(), 0);
+        assert_eq!(
+            db.get_meeting("claimed").unwrap().unwrap().status,
+            MeetingStatus::Recording
         );
     }
 
