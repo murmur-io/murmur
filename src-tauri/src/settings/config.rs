@@ -1611,9 +1611,11 @@ mod tests {
         assert_eq!(def.audio_storage_limit_gb, None);
         assert!(!def.audio_auto_prune);
 
-        let mut cfg = AppConfig::default();
-        cfg.audio_storage_limit_gb = Some(2);
-        cfg.audio_auto_prune = true;
+        let cfg = AppConfig {
+            audio_storage_limit_gb: Some(2),
+            audio_auto_prune: true,
+            ..AppConfig::default()
+        };
         cfg.save(&db).unwrap();
 
         let loaded = AppConfig::load(&db).unwrap();
