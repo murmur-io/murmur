@@ -314,8 +314,14 @@ export interface BrainModelDto {
   downloaded: boolean;
   /** Fits in this Mac's RAM (false → warn / discourage). */
   fitsRam: boolean;
-  /** Currently the selected brain model. */
+  /** Currently the selected brain model (the single last-selected `brain_model_id`, any class). */
   selected: boolean;
+  /** The EFFECTIVE light-class model (explicit `brain_light_model_id`, else registry default) — what
+   * realtime reactions run on. Reflects the true per-class choice, not just the single `selected`. */
+  selectedLight: boolean;
+  /** The EFFECTIVE heavy-class model (explicit `brain_heavy_model_id`, else registry default) — what
+   * local Notes/Ask run on. Drives the effort slider's position. */
+  selectedHeavy: boolean;
 }
 
 /**

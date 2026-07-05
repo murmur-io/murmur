@@ -5040,18 +5040,24 @@ fn total_ram_gb() -> Option<u64> {
 pub fn list_brain_models(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::reason::BrainModelDto>, AppError> {
-    let selected = {
+    let (selected, light, heavy) = {
         let c = state
             .config
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.brain_model_id.clone()
+        (
+            c.brain_model_id.clone(),
+            c.brain_light_model_id.clone(),
+            c.brain_heavy_model_id.clone(),
+        )
     };
     let dir = crate::transcribe::models_dir()?;
     Ok(crate::reason::brain_model_dtos(
         &dir,
         total_ram_gb(),
         selected.as_deref(),
+        light.as_deref(),
+        heavy.as_deref(),
     ))
 }
 
