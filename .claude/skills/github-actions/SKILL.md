@@ -37,7 +37,7 @@ Pin the **commit** sha, comment the version. Currently pinned in `ci.yml`:
 - **`Swatinem/rust-cache`** with `workspaces: src-tauri`, AFTER the toolchain is resolved. This is the single biggest win — the always-compiled ML tree (mistralrs/candle) is hundreds of MB cold.
 - **`actions/setup-node` with `cache: npm`** + `npm ci` (not `npm install`) for a reproducible, cached FE install.
 - **Prebuilt cargo tools via `taiki-e/install-action`** (`tool: cargo-audit,cargo-deny`) so `ci.sh` finds them on PATH and skips its slow `cargo install`.
-- **Split the heavy E2E off the per-PR path.** The `gate` job runs `MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh`; the `full-gate` job (weekly `schedule` + `workflow_dispatch` `run_e2e`) runs the whole thing with a **whisper-model `actions/cache`** + `brew install ffmpeg`. Don't make every PR download a 142 MB model.
+- **Cache the heavy E2E inputs.** Since the 2026-07-05 release-parity change every PR runs the COMPLETE ci.sh (incl. audio E2E); the cost is tamed with a **whisper-model `actions/cache`** + `brew install ffmpeg` — the 142 MB model downloads once, not per PR. `MURMUR_CI_SKIP_E2E=1` is local-only.
 - **Resolve the pinned toolchain with `rustup show`** (reads `rust-toolchain.toml` → 1.96.0 + clippy/rustfmt). Don't add a second `dtolnay/rust-toolchain` with a different version.
 - `timeout-minutes` on every job (a hung ML link shouldn't burn the full 6 h).
 
@@ -46,21 +46,18 @@ Pin the **commit** sha, comment the version. Currently pinned in `ci.yml`:
 ```yaml
 on:
   pull_request: { branches: [murmur] }
-  workflow_dispatch: { inputs: { run_e2e: { type: boolean, default: false } } }
+  workflow_dispatch: {}
   schedule: [ { cron: "0 6 * * 1" } ]
 permissions: { contents: read }
 concurrency: { group: ci-${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
 env: { MISTRALRS_METAL_PRECOMPILE: "0", CARGO_TERM_COLOR: always }
 jobs:
-  gate:                       # every PR — correctness + supply-chain, no E2E
+  gate:   # every PR + weekly + on-demand — the COMPLETE ci.sh (release parity)
     runs-on: macos-14
-    steps: [ checkout, setup-node(cache:npm), rustup show, rust-cache(src-tauri),
-             install-action(cargo-audit,cargo-deny), npm ci,
-             run: bash scripts/ci.sh  (env MURMUR_CI_SKIP_E2E=1) ]
-  full-gate:                  # weekly + on-demand — the complete ci.sh incl. E2E
-    if: schedule || (workflow_dispatch && inputs.run_e2e)
-    runs-on: macos-14
-    steps: [ …, brew install ffmpeg, cache(whisper model), npm ci, run: bash scripts/ci.sh ]
+    steps: [ checkout, setup-node(node-version-file: .nvmrc, cache:npm), rustup show,
+             rust-cache(src-tauri), install-action(cargo-audit,cargo-deny),
+             brew install ffmpeg, cache(whisper model), npm ci,
+             run: bash scripts/ci.sh ]
 ```
 
 ## Verify before you push
@@ -69,7 +66,7 @@ jobs:
 python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('yaml ok')"
 command -v actionlint >/dev/null && actionlint .github/workflows/ci.yml || echo "(install actionlint to lint)"
 # After it's on a branch, trigger and watch:
-gh workflow run CI -R murmur-io/murmur -f run_e2e=true      # manual full-gate
+gh workflow run CI -R murmur-io/murmur                      # manual gate run
 gh run watch -R murmur-io/murmur
 ```
 
