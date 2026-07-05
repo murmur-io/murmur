@@ -14,7 +14,6 @@ import { NG_VALUE_ACCESSOR, type ControlValueAccessor } from "@angular/forms";
  */
 @Component({
   selector: "mur-toggle",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./toggle.component.html",
   styleUrl: "./toggle.component.scss",

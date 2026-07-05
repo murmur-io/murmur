@@ -11,7 +11,6 @@ import {
  */
 @Component({
   selector: "mur-slider",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./slider.component.html",
   styleUrl: "./slider.component.scss",

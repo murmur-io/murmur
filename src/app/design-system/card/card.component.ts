@@ -6,7 +6,6 @@ import { ChangeDetectionStrategy, Component } from "@angular/core";
  */
 @Component({
   selector: "mur-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: { class: "card" },
   templateUrl: "./card.component.html",

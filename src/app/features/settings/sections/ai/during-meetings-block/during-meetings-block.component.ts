@@ -17,7 +17,6 @@ import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.c
  */
 @Component({
   selector: "app-during-meetings-block",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MurToggleComponent,ReactiveFormsModule],

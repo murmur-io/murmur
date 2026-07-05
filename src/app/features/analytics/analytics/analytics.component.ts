@@ -46,7 +46,6 @@ const STATUS_ORDER = [
 
 @Component({
   selector: "app-analytics",
-  standalone: true,
   imports: [EgressLedgerComponent, TopicThreadsComponent, WeeklyDigestComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./analytics.component.html",

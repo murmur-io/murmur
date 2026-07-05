@@ -38,7 +38,6 @@ interface HitRow {
  */
 @Component({
   selector: "mur-quick-search",
-  standalone: true,
   imports: [MurKbdComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./quick-search.component.html",

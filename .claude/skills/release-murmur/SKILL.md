@@ -1,12 +1,12 @@
 ---
 name: release-murmur
-description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 18). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → QueaT commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
+description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 22). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → QueaT commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
 ---
 
 # /release-murmur — the Murmur macOS release runbook
 
 You are cutting a distributable build of **Murmur** — a local-first macOS app
-(Tauri 2.11, Rust crate `murmur` / bin `Murmur` / lib `meetnotes_lib` + Angular 18
+(Tauri 2.11, Rust crate `murmur` / bin `Murmur` / lib `meetnotes_lib` + Angular 22
 zoneless). Output is a **universal (arm64 + x86_64), Developer-ID-signed,
 notarized, stapled `.dmg`** attached to a GitHub release on `murmur-io/murmur`.
 

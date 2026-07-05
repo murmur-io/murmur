@@ -74,7 +74,7 @@
         <app-folder-tree
           [nodes]="folderTree()"
           [selectedId]="activeFolderId()"
-          (select)="selectFolder($event)"
+          (selected)="selectFolder($event)"
           (dropNote)="onDropNote($event)"
         />
       }
@@ -492,7 +492,7 @@
                     [meetingId]="m.id"
                     [currentFolderId]="m.folderId ?? null"
                     (moved)="onMoved(m.id, $event)"
-                    (close)="closeMovePopover()"
+                    (closed)="closeMovePopover()"
                   />
                 </div>
               }

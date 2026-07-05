@@ -33,7 +33,6 @@ export interface ConnectionCardVm {
  */
 @Component({
   selector: "app-ai-connection-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MurToggleComponent,ReactiveFormsModule],

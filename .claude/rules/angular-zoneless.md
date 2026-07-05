@@ -1,8 +1,11 @@
-# Angular 18 Zoneless — Murmur `src/app` (binding ruleset)
+# Angular 22 Zoneless — Murmur `src/app` (binding ruleset)
 
 > The canonical FE ruleset for Murmur's Angular frontend. BINDING: every rule
-> here is enforced. The frontend is **zoneless** (`provideExperimentalZonelessChangeDetection()`
-> in `src/app/app.config.ts`) — there is no Zone.js, so change detection only runs
+> here is enforced. Murmur runs **Angular `^22.0.5`** on the **`@angular/build`**
+> builder (the Angular CLI needs **Node ≥ 24.15** — on this machine use nvm's
+> v24.18.0). The frontend is **zoneless** (`provideZonelessChangeDetection()`
+> in `src/app/app.config.ts`; `zone.js` is NOT a dependency and `polyfills` is
+> empty — never reintroduce it) — change detection only runs
 > when a **signal** changes, a template event fires, or an explicit
 > `markForCheck`-equivalent happens. Plain mutable fields do not trigger renders.
 > If your view is stale, the cause is almost always state living in a field that
@@ -18,7 +21,9 @@
 
 ## 1. Component shape (HARD)
 
-- **Standalone only.** No `NgModule`. `standalone: true` on every `@Component`.
+- **Standalone only.** No `NgModule`. Standalone is the DEFAULT since v19 —
+  do NOT write `standalone: true` (redundant; removed repo-wide in the v22
+  migration) and never `standalone: false`.
 - **`OnPush` always.** `changeDetection: ChangeDetectionStrategy.OnPush`. Under
   zoneless this is effectively mandatory; omitting it does not buy you anything.
 - **Directory per component, split files** (convention CHANGED 2026-07-04 with
@@ -213,27 +218,34 @@ prototype is the reference implementation). The concrete contract:
 | Hardcoded hex / spacing / radius / shadow | `var(--token)` from `src/styles.css` |
 | New npm package (FE) | ask the user; reuse `@angular/*` / `rxjs` / `@tauri-apps/api` |
 | `NgModule`, NgRx, a new facade/store abstraction | standalone component + `IpcService` + signals |
+| `standalone: true` in a decorator | omit it — standalone is the v19+ default |
+| `{ allowSignalWrites: true }` on `effect()` | delete it — writes are allowed since v19 (deprecated no-op) |
+| `provideExperimentalZonelessChangeDetection` | `provideZonelessChangeDetection` (stable) |
+| `@angular-devkit/build-angular` builders | `@angular/build:application` / `@angular/build:dev-server` |
+| `zone.js` (dependency or polyfill) | nothing — the app is zoneless |
 
 ## CRITICAL Murmur-specific traps
 
-### T1 — NG0600: signal write inside a tracked `effect()`
-Angular 18 throws **NG0600 ("Writing to signals is not allowed in a `computed`
-or an `effect` by default")** when an `effect()` writes a signal it could also
-read. The two real cases are IPC-on-input-change effects that set
-`loading`/`error` synchronously before `await`. Pass the flag:
+### T1 — signal writes inside a tracked `effect()` (Angular 22 semantics)
+Signal writes in effects are **allowed by default since v19** — NG0600 is gone
+and the old `allowSignalWrites` flag is a **deprecated no-op** (it still
+typechecks in v22 but does nothing). Never add it (it was removed repo-wide in
+the v22 migration; an AI trained on Angular 18 code will try to reintroduce
+it — refuse):
 
 ```ts
-private readonly _load = effect(
-  () => { const id = this.entityId(); this.loading.set(true); void this.fetch(id); },
-  { allowSignalWrites: true },   // REQUIRED in Angular 18
-);
+private readonly _load = effect(() => {
+  const id = this.entityId();
+  this.loading.set(true);          // fine in v22 — no flag needed
+  void this.fetch(id);
+});
 ```
 
-Live examples: `entity-detail.component.ts:305-315`, `graph.component.ts:512-520`.
-Prefer **deriving with `computed()`** where possible; only reach for
-`allowSignalWrites` when the effect genuinely orchestrates an async IPC fetch.
-(Note: Murmur is pinned to Angular `^18.2.0` where this option exists; do not
-assume v19 semantics.)
+The DISCIPLINE the flag used to enforce still binds: prefer **deriving with
+`computed()`**; an effect that writes signals is legitimate ONLY when it
+genuinely orchestrates an async IPC fetch (set loading → await → write result,
+with a stale-result guard). Live examples: `entity-detail.component.ts`,
+`graph.component.ts` (grep the `_load` / `_refetchOnLock` effects).
 
 ### T2 — mutually-recursive standalone components need `forwardRef`
 `FolderTreeComponent` ↔ `FolderRowComponent` render each other (a row renders

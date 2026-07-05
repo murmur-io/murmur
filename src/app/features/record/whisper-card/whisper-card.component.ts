@@ -24,7 +24,6 @@ import type { RailWhisperCard } from "../../../core/meeting-conversation.store";
  */
 @Component({
   selector: "app-whisper-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./whisper-card.component.html",

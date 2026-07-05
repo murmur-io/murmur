@@ -7,7 +7,7 @@
   [attr.aria-label]="
     entity().name + ' — ' + kindLabel() + ', ' + countLabel()
   "
-  (click)="select.emit(entity().id)"
+  (click)="entitySelected.emit(entity().id)"
 >
   <span class="ec-dot" aria-hidden="true"></span>
   <span class="ec-name">{{ entity().name }}</span>

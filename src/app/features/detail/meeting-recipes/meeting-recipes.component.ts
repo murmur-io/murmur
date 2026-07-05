@@ -33,7 +33,6 @@ import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
  */
 @Component({
   selector: "app-meeting-recipes",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MarkdownComponent],
   templateUrl: "./meeting-recipes.component.html",

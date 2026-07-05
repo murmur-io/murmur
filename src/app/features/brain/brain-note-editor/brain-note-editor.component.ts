@@ -27,7 +27,6 @@ import {
  */
 @Component({
   selector: "app-brain-note-editor",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./brain-note-editor.component.html",
   styleUrl: "./brain-note-editor.component.scss",

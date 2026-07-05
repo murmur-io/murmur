@@ -8,7 +8,6 @@ import { SettingsStore } from "../../settings.store";
  */
 @Component({
   selector: "app-settings-obsidian-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./settings-obsidian-section.component.html",
   styleUrl: "./settings-obsidian-section.component.scss",

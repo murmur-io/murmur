@@ -18,7 +18,6 @@ import { MicMuteToggleComponent } from "../../record/mic-mute-toggle/mic-mute-to
  */
 @Component({
   selector: "app-floating-bar",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MicMuteToggleComponent],
   host: { "(document:keydown.escape)": "hide()" },

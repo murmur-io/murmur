@@ -15,7 +15,6 @@ import type { VaultSource } from "../../core/models";
  */
 @Component({
   selector: "app-sources",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./sources.component.html",

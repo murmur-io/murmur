@@ -15,8 +15,9 @@ import { mockTauri } from "./mock-invoke";
  *       assertions fail = RED.
  *   (b) "Enable Murmur Brain Live" is absent even before Task 5 (was already
  *       removed in Task 2); this assertion is a regression guard.
- *   (c) The Default-AI select is NOT visible at load (it's inside the collapsed
- *       Advanced block) — green from Task 4; stays green here.
+ *   (c) The Advanced disclosure is collapsed at load (its Engines catalog is
+ *       hidden) while the Default-engine select stays visible in the
+ *       always-shown ai-setup-block.
  */
 test.describe("AI & Models section — final render order", () => {
   test.beforeEach(async ({ page }) => {
@@ -66,12 +67,20 @@ test.describe("AI & Models section — final render order", () => {
     await expect(page.getByText("Enable Murmur Brain Live")).toHaveCount(0);
   });
 
-  // ── (c) — Default-AI select is NOT visible at load (Advanced collapsed) ──
-  test("(c) Default-AI select is not visible at load (Advanced is collapsed)", async ({
+  // ── (c) — Advanced is collapsed at load; the Default-engine select is not ─
+  // behind it (it lives in the always-visible ai-setup-block since the
+  // posture-first redesign).
+  test("(c) Advanced is collapsed at load while the Default-engine select stays visible", async ({
     page,
   }) => {
+    // Wait for the async config load to settle first, so the negative
+    // assertion below can't pass vacuously against a half-rendered section.
     await expect(
       page.locator('select[formcontrolname="providerId"]'),
+    ).toBeVisible({ timeout: 10_000 });
+    // The Engines catalog (inside the Advanced disclosure) stays hidden.
+    await expect(
+      page.getByRole("heading", { name: "Engines" }),
     ).not.toBeVisible();
   });
 });
