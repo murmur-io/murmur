@@ -172,6 +172,8 @@ export class SettingsStore {
     jiraEnabled: false,
     jiraBaseUrl: "",
     jiraEmail: "",
+    // brain2 connectors (Phase 3) — Slack master toggle (NEW EGRESS; round-tripped).
+    slackEnabled: false,
     // AI Gateway (Phase 1) — base URL and model, round-tripped on save.
     gatewayBaseUrl: "",
     gatewayModel: "",
@@ -196,6 +198,8 @@ export class SettingsStore {
   readonly webKeyControl = new FormControl("", { nonNullable: true });
   /** BYO Jira API token input (Jira connector). Cleared after save. */
   readonly jiraTokenControl = new FormControl("", { nonNullable: true });
+  /** BYO Slack user token input (Slack connector). Cleared after save. */
+  readonly slackTokenControl = new FormControl("", { nonNullable: true });
 
   /**
    * PROTOTYPE auto-save (no Save button): every committed form change persists
@@ -445,6 +449,27 @@ export class SettingsStore {
   /** Surfaced if storing the Jira token rejects. */
   private readonly _jiraTokenError = signal<string | null>(null);
   readonly jiraTokenError = this._jiraTokenError.asReadonly();
+
+  // ── brain2 connectors — Slack (Phase 3, NEW EGRESS) ────────────────────
+
+  /** Slack egress consent state — drives the "Allow Slack access" row; round-tripped on save. */
+  private readonly _slackConsented = signal(false);
+  readonly slackConsented = this._slackConsented.asReadonly();
+  /** True while the one-time Slack consent command is in flight. */
+  private readonly _slackConsenting = signal(false);
+  readonly slackConsenting = this._slackConsenting.asReadonly();
+  /** Surfaced if granting Slack consent rejects. */
+  private readonly _slackConsentError = signal<string | null>(null);
+  readonly slackConsentError = this._slackConsentError.asReadonly();
+  /** Whether a Slack user token is stored (has-token check; never the value). */
+  private readonly _hasSlackToken = signal(false);
+  readonly hasSlackToken = this._hasSlackToken.asReadonly();
+  /** True while the BYO token is being saved. */
+  private readonly _savingSlackToken = signal(false);
+  readonly savingSlackToken = this._savingSlackToken.asReadonly();
+  /** Surfaced if storing the Slack token rejects. */
+  private readonly _slackTokenError = signal<string | null>(null);
+  readonly slackTokenError = this._slackTokenError.asReadonly();
 
   // ── AI Gateway (Phase 1) — key management + destination computed signals ──
 
@@ -1190,6 +1215,9 @@ export class SettingsStore {
       // brain2 connectors (Phase 2) — Jira consent is preserve-only (granted only via
       // consent_to_jira); snapshot it so save() round-trips it unchanged.
       this._jiraConsented.set(cfg.jiraConsented ?? false);
+      // brain2 connectors (Phase 3) — Slack consent is preserve-only (granted only via
+      // consent_to_slack); snapshot it so save() round-trips it unchanged.
+      this._slackConsented.set(cfg.slackConsented ?? false);
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -1236,6 +1264,8 @@ export class SettingsStore {
         jiraEnabled: cfg.jiraEnabled ?? false,
         jiraBaseUrl: cfg.jiraBaseUrl ?? "",
         jiraEmail: cfg.jiraEmail ?? "",
+        // brain2 connectors (Phase 3) — Slack toggle.
+        slackEnabled: cfg.slackEnabled ?? false,
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
         gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
         gatewayModel: cfg.gatewayModel ?? "",
@@ -1282,6 +1312,7 @@ export class SettingsStore {
       this._hasKey.set(await this.ipc.hasAnthropicKey());
       this._hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
       this._hasJiraToken.set(await this.ipc.hasJiraToken().catch(() => false));
+      this._hasSlackToken.set(await this.ipc.hasSlackToken().catch(() => false));
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
       this._modelPresent.set(await this.ipc.modelPresent());
       // Whisper transcribe-model download-progress stream (best-effort).
@@ -1943,6 +1974,11 @@ export class SettingsStore {
       jiraConsented: this.jiraConsented(),
       jiraBaseUrl: v.jiraBaseUrl,
       jiraEmail: v.jiraEmail,
+      // brain2 connectors (Phase 3) — Slack toggle is settable from the form; its
+      // consent is PRESERVE-ONLY (granted via allowSlack's dedicated command), so a
+      // save just carries the current value back.
+      slackEnabled: v.slackEnabled,
+      slackConsented: this.slackConsented(),
       // Round-trip the Stage E security flags so a settings save never silently
       // resets them. Cloud-egress consent is GRANTED only via the dedicated
       // command (allowCloudProcessing) — here we just carry the current value back.
@@ -2169,6 +2205,46 @@ export class SettingsStore {
       this._jiraConsentError.set(String(e));
     } finally {
       this._jiraConsenting.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors (Phase 3) — store/replace the BYO Slack user token in the
+   * Keychain, then re-probe presence so the "Token set ✓" pill flips. The value is
+   * cleared from the input after saving (it's never shown back). Mirrors saveJiraToken().
+   */
+  async saveSlackToken(): Promise<void> {
+    const key = this.slackTokenControl.value;
+    if (!key.trim()) return;
+    this._slackTokenError.set(null);
+    this._savingSlackToken.set(true);
+    try {
+      await this.ipc.setSlackToken(key);
+      this.slackTokenControl.setValue("");
+      this._hasSlackToken.set(await this.ipc.hasSlackToken());
+    } catch (e) {
+      this._slackTokenError.set(String(e));
+    } finally {
+      this._savingSlackToken.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors (Phase 3) — grant the one-time Slack egress consent via the
+   * dedicated command (an explicit, auditable user act — NOT a side effect of a normal
+   * settings save). After it resolves the brain may expose the Slack connector (when Slack
+   * is enabled AND a token is stored). Mirrors allowJira().
+   */
+  async allowSlack(): Promise<void> {
+    this._slackConsentError.set(null);
+    this._slackConsenting.set(true);
+    try {
+      await this.ipc.consentToSlack();
+      this._slackConsented.set(true);
+    } catch (e) {
+      this._slackConsentError.set(String(e));
+    } finally {
+      this._slackConsenting.set(false);
     }
   }
 

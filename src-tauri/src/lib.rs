@@ -139,6 +139,7 @@ pub fn run() {
             commands::revoke_cloud_egress,
             commands::consent_to_web_search,
             commands::consent_to_jira,
+            commands::consent_to_slack,
             // M3-CLIENT — sharing account + zero-knowledge link shares (mode A).
             commands::account_status,
             commands::account_signup,
@@ -172,6 +173,8 @@ pub fn run() {
             commands::has_web_search_key,
             commands::set_jira_token,
             commands::has_jira_token,
+            commands::set_slack_token,
+            commands::has_slack_token,
             commands::provider_statuses,
             commands::resummarize,
             commands::list_meetings,

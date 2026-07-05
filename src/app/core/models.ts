@@ -229,6 +229,20 @@ export interface AppConfigDto {
    */
   jiraEmail: string;
   /**
+   * brain2 connectors (Phase 3) — the SLACK connector MASTER toggle. NEW CLOUD EGRESS:
+   * when on (AND `slackConsented` AND a user token is configured), the brain/Ask answer
+   * may send a REDACTED query off-device to the user's Slack workspace. A settable flag,
+   * round-tripped on every `save_config`. Default false. Mirrors Rust `AppConfigDto.slack_enabled`.
+   */
+  slackEnabled: boolean;
+  /**
+   * brain2 connectors — one-time consent for the Slack egress. Like `jiraConsented`,
+   * PRESERVE-ONLY on `save_config` (a normal save carries the current value back, never
+   * flips it) and granted SOLELY by the dedicated `consent_to_slack` command. Default
+   * false (fail-closed). Mirrors Rust `AppConfigDto.slack_consented`.
+   */
+  slackConsented: boolean;
+  /**
    * Opt-in: pass the shell environment through to the `claude` CLI subprocess, so an env
    * `ANTHROPIC_API_KEY` (and proxy / base-url vars) reach it again — restores how older versions
    * authenticated the CLI before the env-hardening. Settable flag, round-tripped on `save_config`.
