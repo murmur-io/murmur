@@ -21,10 +21,21 @@
 - **Standalone only.** No `NgModule`. `standalone: true` on every `@Component`.
 - **`OnPush` always.** `changeDetection: ChangeDetectionStrategy.OnPush`. Under
   zoneless this is effectively mandatory; omitting it does not buy you anything.
-- **Inline `template` + inline `styles: [\`…\`]`.** No `templateUrl`, no
-  `styleUrl`/`styleUrls` — the whole tree is single-file components (see any
-  `src/app/features/**/*.component.ts`). The ESLint `processInlineTemplates`
-  processor lints the inline template, so template rules apply.
+- **Directory per component, split files** (convention CHANGED 2026-07-04 with
+  explicit user approval — supersedes the former inline-single-file rule):
+  every component lives in its own directory as `name/name.component.ts` +
+  `name.component.html` (`templateUrl`) + `name.component.scss` (`styleUrl`).
+  Exemplars: `src/app/design-system/nav-icon/`, `src/app/design-system/quick-search/`.
+  ESLint lints external templates via the `**/*.html` block in
+  `eslint.config.js` (templateRecommended + templateAccessibility).
+  EXCEPTION: the app-shell CHROME CSS stays GLOBAL in `styles.css` (the
+  WKWebView cold-launch FOUC fix — see app-shell.component.ts) — never move it
+  into component styles.
+- **Design system & tokens:** reusable UI primitives live in
+  `src/app/design-system/` (components in their own directories + the shared
+  `primitives.css` control language); every design variable lives in
+  `src/design-tokens/*.css` (imported at the top of `styles.css`) — components
+  consume `var(--token)` only, never a raw value.
 - **`inject()` only.** No constructor injection. `private readonly ipc = inject(IpcService);`.
 - **Selectors are `app-` kebab-case** for components and **`app` camelCase** for
   directives — enforced by `@angular-eslint/component-selector` /
@@ -115,9 +126,11 @@
 ## 6. Styling — tokens, opaque overlays, budget (HARD)
 
 - **`var(--token)` for every color, radius, spacing, shadow, motion value.** The
-  full token set is `:root` in `src/styles.css` (`--surface-*`, `--accent*`,
-  `--live*`, `--text-*`, `--space-1..8`, `--radius-*`, `--shadow-*`,
-  `--transition*`). Never hardcode a hex color or a spacing/radius value a token
+  full token set lives in **`src/design-tokens/*.css`** (`typography` / `colors` /
+  `layout` / `glass` / `theme-light`, imported at the top of `styles.css`):
+  `--surface-*`, `--accent*`, `--live*`, `--text-*`, `--space-1..8`,
+  `--radius-*`, `--shadow-*`, `--transition*`, `--glass-*`, `--shell-*`.
+  Never hardcode a hex color or a spacing/radius value a token
   already names. (One-off structural pixel sizes — a `min-width` — are fine; the
   rule is about the design language.)
 - **Overlays must be OPAQUE — not the frosted `.card`.** A popover / menu /
@@ -137,6 +150,38 @@
 - **Icons are inline SVG** in the template (no icon-font, no icon package).
 - **`@media (prefers-reduced-motion: reduce)`** is honored globally — don't
   fight it with `!important` animations.
+
+## 6b. Liquid Glass — the design model for every NEW view (HARD)
+
+New screens/views model on **macOS Liquid Glass** (HIG "Materials"; the shell
+prototype is the reference implementation). The concrete contract:
+
+- **Tokens are the ONLY source of design values.** Every color/radius/spacing/
+  shadow/blur comes from `src/design-tokens/*.css` (`typography` / `colors` /
+  `layout` / `glass` / `theme-light`). A value with no matching token means you
+  ADD a token there — always with its **light-theme override** in
+  `theme-light.css` (and the `prefers-color-scheme` system block) — never a raw
+  hex/px/rgba in component scss. `--glass-user-alpha` (the Settings
+  transparency slider + `prefers-reduced-transparency`) must keep working:
+  translucent chrome surfaces ride the `--shell-glass-veil` layer.
+- **Glass is CHROME, not content.** Floating rails/bars use the shared panel
+  (`<mur-sidebar>` / global `.drill-rail`, `--shell-glass-*` tokens: gradient
+  fill + lensing rim + 44px blur @ 210% saturation over the aurora field).
+  In-flow content panels use the frosted `.card` / `<mur-card>`. Floating
+  overlays stay OPAQUE per T3 — glass never stacks on glass.
+- **Neutral chrome, restrained accent.** Active/selected chrome items are the
+  neutral glass-on-glass pill (`--shell-active-bg/-text/-shadow`) — the accent
+  colors only the glyph/label. Native selections (menus, list rows) are the
+  flat `--accent` fill + `--text-on-accent` content.
+- **Reusable/atomic components live in `src/app/design-system/`** under the
+  `mur-` selector prefix, each in its own directory. Form controls implement
+  `ControlValueAccessor` (so `formControlName` binds directly — see
+  `mur-toggle`); number inputs stay native (`NumberValueAccessor` commits
+  numbers — the storage-limit lesson). Before writing ANY new control, check
+  the catalog: icon, sidebar, quick-search, toggle, input, select, slider,
+  segmented, kbd, spinner, banner, pill, card, empty-state — and
+  `primitives.css` for class-based primitives (`.btn`, `.seg`, `.menu`,
+  `.panel-card`, `.tabbar`…). Extending the catalog beats re-rolling a one-off.
 
 ## 7. No new dependencies (HARD)
 
@@ -164,7 +209,7 @@
 | `setTimeout` / `requestAnimationFrame` in a component | `afterNextRender(fn, { injector })` |
 | Ad-hoc `ResizeObserver`/`MutationObserver` in a component | a directive with `DestroyRef.onDestroy()` |
 | `invoke('cmd', …)` from a component | a typed method on `IpcService` |
-| `templateUrl` / `styleUrl` | inline `template` + `styles: [\`…\`]` |
+| single-file component (inline `template`/`styles`) | a component DIRECTORY: `name/name.component.{ts,html,scss}` (changed 2026-07-04, user-approved) |
 | Hardcoded hex / spacing / radius / shadow | `var(--token)` from `src/styles.css` |
 | New npm package (FE) | ask the user; reuse `@angular/*` / `rxjs` / `@tauri-apps/api` |
 | `NgModule`, NgRx, a new facade/store abstraction | standalone component + `IpcService` + signals |

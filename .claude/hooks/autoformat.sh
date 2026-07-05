@@ -7,7 +7,7 @@
 # MURMUR_AUTOFMT=1 in the environment.
 #
 # Only rustfmt on .rs (fast, standard, matches src-tauri). Frontend formatting
-# deliberately stays with `npx ng lint` (angular-zoneless rules: inline templates,
+# deliberately stays with `npx ng lint` (angular-zoneless rules: dir-per-component ts/html/scss,
 # strict per-component style budget) — a blind prettier pass would fight those.
 # Never blocks: always exit 0.
 # ─────────────────────────────────────────────────────────────────────────────

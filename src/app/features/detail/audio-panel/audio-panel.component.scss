@@ -1,0 +1,381 @@
+:host {
+  display: block;
+}
+.audio-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  animation: rise 320ms var(--transition) both;
+}
+
+/* 1) Slim, sticky player -------------------------------------------- */
+.player {
+  position: sticky;
+  top: var(--space-3);
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+}
+.player-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+.play {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: var(--accent-gradient);
+  color: var(--text-on-accent);
+  cursor: pointer;
+  box-shadow: var(--glass-highlight);
+  transition:
+    transform var(--transition-fast),
+    filter var(--transition);
+}
+.play:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+.play:active {
+  transform: translateY(0) scale(0.96);
+}
+.play:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.play.is-playing {
+  box-shadow: 0 0 0 1px var(--accent-ring);
+}
+.icon-play {
+  width: 0;
+  height: 0;
+  margin-left: 2px;
+  border-style: solid;
+  border-width: 7px 0 7px 12px;
+  border-color: transparent transparent transparent currentColor;
+}
+.icon-pause {
+  width: 11px;
+  height: 13px;
+  border-left: 4px solid currentColor;
+  border-right: 4px solid currentColor;
+  box-sizing: content-box;
+}
+.player-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.track {
+  position: relative;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: height var(--transition);
+}
+.track:hover,
+.track:focus-visible {
+  height: 9px;
+  outline: none;
+}
+.track:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.track-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  min-width: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-gradient);
+}
+.track-knob {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  transform: translate(50%, -50%);
+  border-radius: 50%;
+  background: var(--text-on-accent);
+  box-shadow: var(--shadow-sm);
+  opacity: 0;
+  transition: opacity var(--transition);
+}
+.track:hover .track-knob,
+.track:focus-visible .track-knob {
+  opacity: 1;
+}
+.times {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.time {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.time-total {
+  color: var(--text-muted);
+}
+
+/* Transport chips (±15s + rate) */
+.transport {
+  display: flex;
+  gap: var(--space-2);
+  padding-left: calc(44px + var(--space-4));
+}
+.chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition),
+    border-color var(--transition);
+}
+.chip-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.chip-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.chip-btn.rate {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Pin toast (accent variant of the shared .saved-toast box). */
+.saved-toast {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-start;
+  margin-top: var(--space-3);
+  padding: var(--space-1) var(--space-3);
+  min-height: 28px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  animation: rise 280ms var(--transition) both;
+}
+.pin-toast--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.pin-toast-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+/* Section blocks --------------------------------------------------- */
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.block-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.spacer {
+  flex: 1 1 auto;
+}
+.find {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 5px var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+}
+.find:focus-within {
+  border-color: var(--border-strong);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.find-icon {
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+.find-input {
+  width: 160px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+}
+.find-input:focus {
+  outline: none;
+}
+.find-clear {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.find-clear:hover {
+  color: var(--text-primary);
+}
+
+/* Turn-grouped transcript ------------------------------------------ */
+.transcript-card {
+  padding: var(--space-2);
+  max-height: 520px;
+  overflow: auto;
+}
+.turns {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.turn {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  scroll-margin: var(--space-4);
+  transition: background var(--transition);
+}
+.turn + .turn {
+  margin-top: 2px;
+}
+.turn.is-active {
+  background: var(--accent-soft);
+}
+.turn-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: 4px;
+}
+.turn-speaker {
+  flex: none;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  line-height: 1.5;
+}
+.turn-time {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  padding: 0;
+}
+.turn-time:hover:not(:disabled) {
+  color: var(--accent-hover);
+}
+.turn-time:disabled {
+  cursor: default;
+}
+.turn.is-active .turn-time {
+  color: var(--accent-hover);
+}
+.turn-text {
+  margin: 0;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+.turn.is-active .turn-text {
+  color: var(--text-primary);
+}
+/* Each segment is a click-to-seek fragment; the playing one karaokes.
+   Rendered inline inside the turn's <p> so words wrap naturally. */
+.frag {
+  display: inline;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+  vertical-align: baseline;
+  border-radius: var(--radius-sm);
+  transition:
+    color var(--transition),
+    background var(--transition);
+}
+.frag:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+.frag:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.frag:disabled {
+  cursor: default;
+}
+.frag.is-active {
+  color: var(--text-primary);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.turn-empty,
+.empty-card {
+  padding: var(--space-5);
+  text-align: center;
+}
+.empty-card {
+  padding: var(--space-6);
+}
+
+@media (max-width: 720px) {
+  .player-main {
+    flex-wrap: wrap;
+  }
+  .find-input {
+    width: 110px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .audio-panel,
+  .saved-toast {
+    animation: none;
+  }
+}
+    

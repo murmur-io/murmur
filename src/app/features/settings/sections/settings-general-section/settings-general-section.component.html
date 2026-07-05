@@ -1,0 +1,57 @@
+<div class="section-stack" [formGroup]="form">
+          <div class="card">
+            <fieldset>
+              <legend>General</legend>
+              <!-- The Provider select moved to Settings → AI & Models
+                   ("Default AI" — Stage-2 hub); same formControlName. -->
+
+              <label class="field">
+                <span class="field-label">Vault folder</span>
+                <span class="row">
+                  <input formControlName="vaultPath" placeholder="/path/to/vault" />
+                  <button type="button" class="btn" (click)="pickVault()">
+                    Browse…
+                  </button>
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">Vault subfolder</span>
+                <input formControlName="vaultSubfolder" placeholder="Meetings" />
+              </label>
+
+              <label class="field">
+                <span class="field-label"
+                  >Whisper model path (optional override)</span
+                >
+                <span class="row">
+                  <input
+                    formControlName="whisperModelPath"
+                    placeholder="leave blank — auto-managed by the model chosen in Settings → Transcription"
+                  />
+                  <button type="button" class="btn" (click)="pickModel()">
+                    Browse…
+                  </button>
+                </span>
+              </label>
+            </fieldset>
+          </div>
+
+          <div class="card setup-card">
+            <div class="setup-copy">
+              <span class="setup-title">First-run setup</span>
+              <span class="text-secondary setup-sub">
+                Re-open the guided wizard. Your existing settings are preserved
+                and prefilled.
+              </span>
+            </div>
+            <button
+              type="button"
+              class="btn btn-ghost"
+              (click)="rerunOnboarding()"
+            >
+              Run setup again
+            </button>
+          </div>
+</div>
+  

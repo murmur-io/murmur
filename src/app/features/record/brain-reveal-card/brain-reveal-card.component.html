@@ -1,0 +1,33 @@
+@if (show()) {
+  <div class="reveal" role="status" aria-live="polite">
+    <span class="reveal-ico" aria-hidden="true">🧠</span>
+    <div class="reveal-body">
+      <span class="reveal-kicker">Your brain is already working</span>
+      <p class="reveal-line">
+        Murmur mapped {{ peopleLabel() }} and {{ commitmentLabel() }} from
+        your meetings.
+      </p>
+    </div>
+    <div class="reveal-actions">
+      <a class="btn btn-primary btn-sm" routerLink="/people">See people</a>
+      <a class="btn btn-ghost btn-sm" routerLink="/graph">Open graph</a>
+    </div>
+    <button
+      type="button"
+      class="reveal-dismiss"
+      (click)="dismiss()"
+      aria-label="Dismiss"
+      title="Dismiss"
+    >
+      <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+        <path
+          d="M6 6l12 12M18 6L6 18"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+        />
+      </svg>
+    </button>
+  </div>
+}
+  

@@ -1,0 +1,86 @@
+<div class="card during-card" [formGroup]="form">
+  <!-- ── Live during meetings ────────────────────────────────────── -->
+  <div class="use-group">
+    <span class="use-group-label text-muted">Live during meetings</span>
+
+    <!-- The in-meeting voice assistant needs the on-device light engine for wake detection
+         (brain_live), which the Cloud posture turns off — so it CANNOT run there. Hide it in
+         Cloud rather than show a toggle that does nothing (the Cloud preset also forces it off
+         backend-side). It stays available in Hybrid / Fully local. -->
+    @if (posture() !== "cloud") {
+      <label class="toggle-row">
+        <span class="toggle-copy">
+          <span class="toggle-title">In-meeting voice assistant</span>
+          <span class="text-secondary toggle-sub">
+            Listen for your wake phrase during a recording and answer
+            grounded questions live, with sources. Off by default — it adds
+            listening and (for cloud) sends audio-derived text mid-meeting.
+          </span>
+        </span>
+        <mur-toggle formControlName="realtimeReactions" />
+      </label>
+    }
+
+    <label class="toggle-row">
+      <span class="toggle-copy">
+        <span class="toggle-title">Proactive brain hints</span>
+        <span class="text-secondary toggle-sub">
+          While recording, surface a dismissible recall card when the
+          conversation touches a past meeting, an open commitment, or a
+          known fact. 100% on-device — no cloud calls; at most one card
+          every two minutes.
+        </span>
+      </span>
+      <mur-toggle formControlName="proactiveHintsEnabled" />
+    </label>
+
+    <!--
+      Proactive cloud-egress consent (issue 20). The in-meeting assistant
+      dispatches voice actions through the LIVE role's resolved target —
+      since Stage 4 that need not be brainBackend/the default provider, so
+      the condition keys on liveTargetIsCloud (the store's resolver
+      mirror: explicit roleLiveConnection wins, "" falls back to the
+      brainBackend mapping, ollama is cloud only off-loopback). Surface
+      the requirement at enable time: realtime on, live target
+      cloud-classified, not consented. Reuses the existing consent flow
+      (allowCloudProcessing). In-flow warning, so the frosted banner is
+      correct (no opaque overlay needed).
+    -->
+    @if (
+      posture() !== "cloud" &&
+      form.controls.realtimeReactions.value &&
+      liveTargetIsCloud() &&
+      !cloudConsented()
+    ) {
+      <div class="banner is-warning realtime-consent">
+        <span class="realtime-consent-copy">
+          ⚠ The in-meeting assistant sends live meeting context to your
+          provider's cloud (redacted first). Allow cloud processing once,
+          or live answers stay off.
+        </span>
+        <div class="cloud-consent-row">
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="allowCloudProcessing()"
+            [disabled]="consenting()"
+          >
+            @if (consenting()) {
+              <span class="spin-ring" aria-hidden="true"></span>
+              Enabling…
+            } @else {
+              Allow
+            }
+          </button>
+          <span class="text-muted cloud-consent-hint">
+            One-time, redacted first. Same consent as cloud summaries.
+          </span>
+        </div>
+        @if (consentError(); as cerr) {
+          <p class="text-danger privacy-note">{{ cerr }}</p>
+        }
+      </div>
+    }
+  </div>
+</div>
+  

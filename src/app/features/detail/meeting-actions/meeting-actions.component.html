@@ -1,0 +1,85 @@
+@if (items().length) {
+  <div class="act card">
+    <div class="act-head">
+      <div class="act-head-text">
+        <h3 class="act-title">Action items</h3>
+        <span class="act-sub"
+          >Send them to Reminders, or write them into your note</span
+        >
+      </div>
+      <button
+        type="button"
+        class="btn btn-ghost act-patch"
+        title="Writes 📅 due-dates into your note as Tasks-plugin checkboxes."
+        [disabled]="patching()"
+        (click)="saveToTasks()"
+      >
+        @if (patchSaved()) {
+          <span class="act-patch-check" aria-hidden="true"></span>
+          Saved to vault
+        } @else {
+          {{ patching() ? "Saving…" : "Save to Obsidian Tasks" }}
+        }
+      </button>
+    </div>
+
+    <!-- Note-wide patch error (separate from per-row Reminder errors). -->
+    @if (patchError(); as err) {
+      <p class="act-patch-error" role="alert">{{ err }}</p>
+    }
+
+    <ul class="act-list">
+      @for (it of items(); track it.idx) {
+        <li class="act-row" [class.is-done]="it.done" [style.--i]="$index">
+          <span
+            class="act-mark"
+            [class.is-done]="it.done"
+            role="img"
+            [attr.aria-label]="it.done ? 'Done' : 'Not done'"
+          ></span>
+
+          <div class="act-body">
+            <span class="act-text">{{ it.text }}</span>
+            <div class="act-tags">
+              @if (it.owner; as owner) {
+                <span class="act-owner">{{ owner }}</span>
+              }
+              @if (it.dueDate; as due) {
+                <span class="act-due">
+                  <span class="act-due-cal" aria-hidden="true">📅</span>
+                  <span class="act-due-date">{{ due }}</span>
+                </span>
+              }
+            </div>
+          </div>
+
+          <!-- Reminders affordance: only for not-yet-done items. -->
+          @if (!it.done) {
+            <div class="act-row-action">
+              @if (addedIdx().has(it.idx)) {
+                <span class="act-added" role="status">Added ✓</span>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-ghost act-add"
+                  [disabled]="busyIdx().has(it.idx)"
+                  [attr.aria-label]="'Add to Reminders: ' + it.text"
+                  (click)="addToReminders(it)"
+                >
+                  {{
+                    busyIdx().has(it.idx) ? "Adding…" : "Add to Reminders"
+                  }}
+                </button>
+              }
+            </div>
+          }
+        </li>
+
+        @if (errorIdx().get(it.idx); as err) {
+          <li class="act-row-error" role="alert">{{ err }}</li>
+        }
+      }
+    </ul>
+  </div>
+}
+  

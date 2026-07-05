@@ -1,0 +1,40 @@
+:host {
+  display: inline-flex;
+}
+.seg {
+  display: inline-flex;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  width: fit-content;
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+}
+.seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius-pill);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.seg button:hover {
+  color: var(--text-primary);
+}
+.seg button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.seg button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}

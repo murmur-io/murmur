@@ -1,0 +1,720 @@
+:host {
+  display: block;
+}
+
+.tl {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  overflow: hidden;
+  animation: rise 420ms var(--transition) both;
+}
+/* A faint aurora wash to lift the glass above the page surface. */
+.tl::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    120% 90% at 12% -10%,
+    rgba(110, 118, 255, 0.1),
+    transparent 60%
+  );
+}
+.tl > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* --- Head --- */
+.tl-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+}
+.tl-title {
+  margin: 0;
+}
+.tl-sub {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+/* --- Shared axis + ticks --- */
+.tl-axis {
+  position: relative;
+  height: 30px;
+  margin-top: var(--space-1);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  outline: none;
+}
+.tl-axis::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 1px;
+  background: var(--border);
+}
+.tl-axis:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.tl-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+  pointer-events: none;
+}
+.tl-tick:first-child {
+  transform: translateX(0);
+  align-items: flex-start;
+}
+.tl-tick:last-child {
+  transform: translateX(-100%);
+  align-items: flex-end;
+}
+.tl-tick-mark {
+  width: 1px;
+  height: 6px;
+  background: var(--border-strong);
+}
+.tl-tick-label {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* --- Track groups --- */
+.tl-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.tl-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+}
+.tl-group-label {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* --- Legend --- */
+.tl-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
+}
+.legend-name {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 16ch;
+}
+.legend-time {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Click-to-rename a speaker (manual labelling) --- */
+.legend-rename {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px var(--space-2);
+  margin: -2px 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: text;
+  transition:
+    background var(--transition),
+    border-color var(--transition);
+}
+.legend-rename:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-subtle);
+}
+.legend-rename:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.legend-pencil {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  line-height: 1;
+  opacity: 0;
+  transform: translateY(0.5px);
+  transition: opacity var(--transition);
+  pointer-events: none;
+}
+.legend-rename:hover .legend-pencil,
+.legend-rename:focus-visible .legend-pencil {
+  opacity: 1;
+}
+.legend-edit {
+  width: auto;
+  max-width: 16ch;
+  height: 24px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  font-weight: 550;
+}
+
+/* --- Voiceprint suggestion chip ("Looks like Anna?") --- */
+.legend-suggest {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25ch;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--accent-soft);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.75rem;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--transition),
+    border-color var(--transition);
+}
+.legend-suggest:hover {
+  border-color: var(--accent);
+}
+.legend-suggest:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.legend-suggest-name {
+  font-weight: 650;
+}
+
+/* --- The shared scale tracks --- */
+.tl-track {
+  position: relative;
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  overflow: hidden;
+}
+.tl-track:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.tl-track--lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+}
+.tl-track--ribbon {
+  height: 40px;
+}
+.tl-lane {
+  position: relative;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* --- Speaker blocks --- */
+.tl-block {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 3px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transform-origin: left center;
+  animation: grow-in 460ms var(--ease-spring) both;
+  animation-delay: calc(var(--i, 0) * 22ms + 120ms);
+  transition:
+    filter var(--transition),
+    box-shadow var(--transition),
+    transform var(--transition-fast);
+}
+.tl-block:hover {
+  filter: brightness(1.14) saturate(1.1);
+  z-index: 5;
+}
+.tl-block:active {
+  transform: scaleY(0.92);
+}
+.tl-block:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-base),
+    0 0 0 4px var(--accent-ring);
+  z-index: 6;
+}
+.tl-block.is-active {
+  filter: brightness(1.22) saturate(1.15);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.55),
+    0 6px 18px rgba(0, 0, 0, 0.45);
+  z-index: 7;
+}
+
+/* --- Topic ribbon spans --- */
+.tl-topic {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  /* Floor short/adjacent chapters so they never collapse to an
+     unreadable sliver (label is hidden below the width threshold). */
+  min-width: 14px;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  overflow: hidden;
+  transform-origin: left center;
+  animation: grow-in 460ms var(--ease-spring) both;
+  animation-delay: calc(var(--i, 0) * 34ms + 200ms);
+  transition:
+    filter var(--transition),
+    box-shadow var(--transition),
+    transform var(--transition-fast);
+}
+.tl-topic:hover {
+  filter: brightness(1.12) saturate(1.08);
+  z-index: 5;
+}
+.tl-topic:active {
+  transform: scaleY(0.94);
+}
+.tl-topic:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-base),
+    0 0 0 4px var(--accent-ring);
+  z-index: 6;
+}
+.tl-topic.is-active {
+  filter: brightness(1.18) saturate(1.12);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.5),
+    0 6px 18px rgba(0, 0, 0, 0.45);
+  z-index: 7;
+}
+.tl-topic-label {
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+/* --- Hover tooltip (pure CSS, shared by blocks + topics) --- */
+.tl-tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%) translateY(4px);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 20;
+  transition:
+    opacity var(--transition),
+    transform var(--transition);
+}
+.tl-tip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: var(--surface-overlay);
+}
+.tl-block:hover .tl-tip,
+.tl-topic:hover .tl-tip,
+.tl-block:focus-visible .tl-tip,
+.tl-topic:focus-visible .tl-tip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.tl-tip-name {
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+.tl-tip-time {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Shared playhead --- */
+.tl-playhead {
+  position: absolute;
+  top: -6px;
+  bottom: -2px;
+  width: 0;
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 8;
+  transition: left 120ms linear;
+}
+.tl-playhead-knob {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  width: 9px;
+  height: 9px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: var(--text-primary);
+  box-shadow:
+    0 0 0 3px var(--surface-base),
+    var(--shadow-accent);
+}
+.tl-track-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-1px);
+  background: linear-gradient(
+    to bottom,
+    rgba(246, 246, 250, 0.95),
+    rgba(110, 118, 255, 0.6)
+  );
+  box-shadow: 0 0 10px rgba(110, 118, 255, 0.6);
+  pointer-events: none;
+  z-index: 8;
+  transition: left 120ms linear;
+}
+
+/* --- Skeleton (loading) --- */
+.tl-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.sk-label {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+.sk-track {
+  position: relative;
+  height: 58px;
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+}
+.sk-track--thin {
+  height: 40px;
+}
+.sk-bar {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0.04) 30%,
+    rgba(255, 255, 255, 0.11) 50%,
+    rgba(255, 255, 255, 0.04) 70%
+  );
+  background-size: 220% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  animation-delay: calc(var(--i, 0) * 120ms);
+}
+
+/* --- Unavailable note --- */
+.tl-unavailable {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+}
+.tl-unavailable-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.55;
+  flex: none;
+}
+.tl-unavailable-text {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  flex: 1 1 auto;
+}
+.tl-retry {
+  flex: none;
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+}
+
+/* --- Hover-scrub preview (axis bubble + per-track guide line) --- */
+.tl-group-hint {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.tl-scrub {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border-strong);
+  pointer-events: none;
+  z-index: 9;
+}
+.tl-scrub-bubble {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 4px);
+  transform: translateX(-50%);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tl-track-scrub {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  transform: translateX(-50%);
+  background: rgba(246, 246, 250, 0.28);
+  pointer-events: none;
+  z-index: 6;
+}
+
+/* --- Pin-this-moment (rides the axis playhead) --- */
+.tl-pin {
+  position: absolute;
+  top: -30px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  z-index: 10;
+  transition:
+    transform var(--transition-fast),
+    box-shadow var(--transition),
+    border-color var(--transition);
+}
+.tl-pin:hover {
+  transform: translateX(-50%) translateY(-1px) scale(1.08);
+  border-color: var(--accent);
+  box-shadow: var(--shadow-accent);
+}
+.tl-pin:active {
+  transform: translateX(-50%) scale(0.94);
+}
+.tl-pin:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.tl-pin-glyph {
+  font-size: 0.75rem;
+  line-height: 1;
+}
+.tl-pin-tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%) translateY(3px);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--transition),
+    transform var(--transition);
+}
+.tl-pin:hover .tl-pin-tip,
+.tl-pin:focus-visible .tl-pin-tip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* --- Chapters (topic spans as a clickable list) --- */
+.tl-chapters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.tl-chapter {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+  animation: rise 320ms var(--transition) both;
+  animation-delay: calc(var(--i, 0) * 30ms + 180ms);
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    color var(--transition),
+    transform var(--transition-fast);
+}
+.tl-chapter:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+.tl-chapter:active {
+  transform: translateY(0);
+}
+.tl-chapter:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.tl-chapter.is-active {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--text-primary);
+}
+.tl-chapter-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+.tl-chapter-label {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22ch;
+}
+.tl-chapter-time {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+}
+.tl-chapter.is-active .tl-chapter-time {
+  color: var(--accent-hover);
+}
+
+@keyframes grow-in {
+  from {
+    opacity: 0;
+    transform: scaleX(0);
+  }
+  to {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -130% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-block,
+  .tl-topic,
+  .tl-chapter {
+    animation: none;
+  }
+  .tl-playhead,
+  .tl-track-playhead {
+    transition: none;
+  }
+}
+    

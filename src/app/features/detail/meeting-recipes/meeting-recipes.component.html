@@ -1,0 +1,157 @@
+<div class="rec card">
+  <div class="rec-head">
+    <div class="rec-head-text">
+      <h3 class="rec-title">Generate</h3>
+      <span class="rec-sub"
+        >Run a recipe over this transcript — grounded only here</span
+      >
+    </div>
+  </div>
+
+  <!-- Recipe chips: builtin (label) + saved (title + tiny × delete). -->
+  <div class="rec-chips" role="group" aria-label="Recipes">
+    @for (b of builtin(); track b.id) {
+      <button
+        type="button"
+        class="rec-chip"
+        [style.--i]="$index"
+        [disabled]="pending()"
+        (click)="run(b.prompt)"
+      >
+        {{ b.label }}
+      </button>
+    }
+    @for (s of saved(); track s.id) {
+      <span
+        class="rec-chip rec-chip-saved"
+        [class.is-disabled]="pending()"
+        [style.--i]="builtin().length + $index"
+      >
+        <button
+          type="button"
+          class="rec-chip-run"
+          [disabled]="pending()"
+          (click)="run(s.prompt)"
+        >
+          {{ s.title }}
+        </button>
+        <button
+          type="button"
+          class="rec-chip-x"
+          [attr.aria-label]="'Delete recipe ' + s.title"
+          [disabled]="pending() || deletingId() === s.id"
+          (click)="removeRecipe(s.id)"
+        >
+          ×
+        </button>
+      </span>
+    }
+
+    <!-- "Custom…" affordance toggles a free-form prompt composer. -->
+    <button
+      type="button"
+      class="rec-chip rec-chip-custom"
+      [class.is-open]="customOpen()"
+      [style.--i]="builtin().length + saved().length"
+      [disabled]="pending()"
+      [attr.aria-expanded]="customOpen()"
+      (click)="toggleCustom()"
+    >
+      Custom…
+    </button>
+  </div>
+
+  <!-- Custom prompt composer (textarea + Run). -->
+  @if (customOpen()) {
+    <form class="rec-custom" (submit)="onCustomSubmit($event)">
+      <textarea
+        #custom
+        class="rec-custom-input"
+        rows="2"
+        autocapitalize="sentences"
+        autocomplete="off"
+        spellcheck="true"
+        aria-label="Custom prompt"
+        placeholder="e.g. Draft a follow-up email to the team…"
+        [value]="customDraft()"
+        [disabled]="pending()"
+        (input)="onCustomInput($event)"
+        (keydown)="onCustomKeydown($event)"
+      ></textarea>
+      <button
+        type="submit"
+        class="btn btn-primary rec-custom-run"
+        [disabled]="!canRunCustom()"
+      >
+        Run
+      </button>
+    </form>
+  }
+
+  <!-- "Generating…" indicator while a run is in flight. -->
+  @if (pending()) {
+    <div class="rec-pending" role="status" aria-live="polite">
+      <span class="rec-pending-spin" aria-hidden="true"></span>
+      <span>Generating…</span>
+    </div>
+  }
+
+  <!-- Inline error (keeps the last prompt so Retry can re-run it). -->
+  @if (error(); as err) {
+    <div class="rec-error" role="alert">
+      <span class="rec-error-text">{{ err }}</span>
+      <button
+        type="button"
+        class="btn btn-ghost rec-retry"
+        (click)="retry()"
+        [disabled]="pending() || !lastPrompt()"
+      >
+        Retry
+      </button>
+    </div>
+  }
+
+  <!-- OUTPUT card: returned Markdown as PLAIN text + Copy / Save affordances. -->
+  @if (output(); as out) {
+    <article
+      #output
+      class="rec-output"
+      role="region"
+      aria-label="Generated output"
+    >
+      <div class="rec-output-head">
+        <span class="rec-output-label">Result</span>
+        <div class="rec-output-actions">
+          <button
+            type="button"
+            class="btn btn-ghost rec-output-btn"
+            (click)="copy(out)"
+            [disabled]="pending()"
+          >
+            {{ copied() ? "Copied" : "Copy" }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost rec-output-btn"
+            (click)="saveAsRecipe()"
+            [disabled]="pending() || !lastPrompt()"
+          >
+            Save as recipe
+          </button>
+        </div>
+      </div>
+      <app-markdown class="rec-output-body" [markdown]="out" compact />
+    </article>
+  } @else if (!pending() && !error()) {
+    <!-- Empty / first-use hint. -->
+    <div class="rec-empty">
+      <span class="rec-empty-mark" aria-hidden="true"></span>
+      <p class="rec-empty-title">Turn this meeting into something useful</p>
+      <p class="rec-empty-copy">
+        Pick a recipe above — a summary, action items, a follow-up email —
+        or write your own. The result is grounded only in this transcript.
+      </p>
+    </div>
+  }
+</div>
+  

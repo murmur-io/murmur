@@ -1,0 +1,55 @@
+/* Stage-1 split: the host stays layout-transparent so this section's
+   cards remain direct flex items of the shell's .section-body (identical
+   spacing to the pre-split monolith); .section-stack reproduces the
+   .section-body column gap between this section's own cards. */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- Appearance / theme (segmented control now lives in mur-segmented) --- */
+.appearance-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.appearance-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.appearance-copy h3 {
+  margin: 0;
+}
+.appearance-copy p {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+/* --- Liquid Glass slider --- */
+.glass-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: 420px;
+}
+.glass-glyph {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+}
+.glass-value {
+  flex: none;
+  min-width: 44px;
+  text-align: right;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+    

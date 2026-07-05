@@ -1,0 +1,125 @@
+:host {
+  display: contents;
+}
+
+.setup-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.setup-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.setup-head h3 {
+  margin: 0;
+}
+.setup-sub {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+/* Stacked label + control (mirrors the other AI blocks). */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.field-label {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+.field-help {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* Select-or-input + catalog refresh. */
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.model-select,
+.model-input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.model-refresh {
+  flex: none;
+  white-space: nowrap;
+}
+
+.setup-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.setup-link {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 550;
+  transition: color var(--transition);
+}
+.setup-link:hover {
+  color: var(--text-primary);
+}
+
+/* Compact on-device status line (full picker lives under Advanced). */
+.od-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.od-line:first-of-type {
+  border-top: none;
+}
+.od-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.od-role {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.od-model {
+  font-size: 0.8125rem;
+}
+.od-dl {
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+.btn-sm {
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.custom-note {
+  margin: 0 0 var(--space-4);
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.custom-note strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+    

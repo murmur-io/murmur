@@ -1,0 +1,53 @@
+<div class="card conn-block">
+  <div class="conn-head">
+    <h3>Engines</h3>
+    <p class="text-secondary conn-sub">
+      Every engine a model can run on. Your posture above already picks which
+      one runs — “Ready” just means an engine is set up and available, not
+      that it’s running. Open this only to route a feature by hand or connect
+      your own engine.
+    </p>
+  </div>
+
+  @if (brainShown() || macCardsShown().length > 0) {
+    <div class="conn-group">
+      <span class="conn-group-label text-muted">On this Mac</span>
+      @if (brainShown()) {
+        <app-brain-engine-card [inUse]="brainInUse()" />
+      }
+      @for (c of macCardsShown(); track c.id) {
+        <app-ai-connection-card
+          [card]="c"
+          [testing]="testing()"
+          (toggleConfigure)="toggleConfigure(c.id)"
+          (probe)="test(c.id)"
+        />
+      }
+    </div>
+  }
+
+  @if (cloudCardsShown().length > 0) {
+    <div class="conn-group">
+      <span class="conn-group-label text-muted">Cloud (redacted first)</span>
+      @for (c of cloudCardsShown(); track c.id) {
+        <app-ai-connection-card
+          [card]="c"
+          [testing]="testing()"
+          (toggleConfigure)="toggleConfigure(c.id)"
+          (probe)="test(c.id)"
+        />
+      }
+    </div>
+  }
+
+  @if (hiddenCount() > 0) {
+    <button type="button" class="conn-showall" (click)="toggleShowAll()">
+      {{
+        showAll()
+          ? "Show fewer engines"
+          : "Show all engines (" + hiddenCount() + " more)"
+      }}
+    </button>
+  }
+</div>
+  

@@ -1,0 +1,264 @@
+:host {
+  display: block;
+}
+:host([hidden]) {
+  display: none;
+}
+
+.act {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  overflow: hidden;
+  animation: rise 420ms var(--transition) both;
+}
+/* A faint aurora wash to lift the glass above the page surface. */
+.act::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    120% 90% at 88% -10%,
+    rgba(157, 123, 255, 0.1),
+    transparent 60%
+  );
+}
+.act > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* --- Head --- */
+.act-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.act-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.act-title {
+  margin: 0;
+}
+.act-sub {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+.act-patch {
+  flex: none;
+  height: 34px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+.act-patch-check {
+  position: relative;
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--success);
+}
+.act-patch-check::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  width: 4px;
+  height: 9px;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.act-patch-error {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+/* --- List --- */
+.act-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.act-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  animation: rise 360ms var(--transition) both;
+  animation-delay: calc(var(--i, 0) * 45ms + 60ms);
+  transition:
+    border-color var(--transition),
+    background var(--transition);
+}
+.act-row:hover {
+  border-color: var(--border-strong);
+}
+
+/* Read-only done/not-done mark (mirrors the analysis checklist). */
+.act-mark {
+  flex: none;
+  position: relative;
+  width: 20px;
+  height: 20px;
+  margin-top: 0.1em;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+}
+.act-mark.is-done {
+  background: var(--accent-gradient);
+  border-color: transparent;
+}
+.act-mark.is-done::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid var(--text-on-accent);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.act-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.act-text {
+  color: var(--text-secondary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.act-row.is-done .act-text {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--text-muted);
+}
+.act-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Subtle owner pill. */
+.act-owner {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* Due-date chip — mono + tabular figures. */
+.act-due {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 22px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.act-due-cal {
+  font-size: 0.75rem;
+  line-height: 1;
+}
+.act-due-date {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* --- Per-row Reminders affordance --- */
+.act-row-action {
+  flex: none;
+  align-self: center;
+}
+.act-add {
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+.act-added {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--success-soft);
+  color: var(--success);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+  animation: rise 240ms var(--transition) both;
+}
+
+/* Per-row Reminder error (e.g. permission denied). */
+.act-row-error {
+  margin: calc(var(--space-1) * -1) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  animation: rise 200ms var(--transition) both;
+}
+
+@media (max-width: 720px) {
+  .act-row {
+    flex-wrap: wrap;
+  }
+  .act-row-action {
+    width: 100%;
+    align-self: stretch;
+  }
+  .act-add,
+  .act-added {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .act,
+  .act-row,
+  .act-added,
+  .act-row-error {
+    animation: none;
+  }
+}
+    

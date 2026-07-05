@@ -1,0 +1,92 @@
+<div class="section-stack" [formGroup]="form">
+  @if (report(); as r) {
+    <!-- Usage summary -->
+    <div class="card">
+      <div class="usage-head">
+        <span class="usage-total">{{ mb(r.usedBytes) }}</span>
+        @if (r.limitBytes !== null) {
+          <span class="text-muted"> / {{ mb(r.limitBytes) }}</span>
+        }
+      </div>
+      @if (r.limitBytes !== null) {
+        <div class="usage-bar" [attr.data-state]="barState()">
+          <span class="usage-fill" [style.width.%]="pct()"></span>
+        </div>
+      }
+      <div class="usage-legend text-secondary">
+        {{ r.recordingCount }} recordings ·
+        playback {{ mb(r.playbackBytes) }} ·
+        masters {{ mb(r.mastersBytes) }} ·
+        locked {{ mb(r.sealedBytes) }}
+      </div>
+      <div class="usage-path">
+        <code class="path">{{ r.audioDir }}</code>
+        <button type="button" class="btn btn-ghost" (click)="reveal()">Reveal in Finder</button>
+      </div>
+    </div>
+  } @else {
+    <div class="card"><p class="text-muted">Loading storage usage…</p></div>
+  }
+
+  <!-- Cap (GB) -->
+  <div class="card">
+    <label class="field">
+      <span class="field-label">Storage limit (GB)</span>
+      <input
+        type="number"
+        min="1"
+        step="1"
+        inputmode="numeric"
+        placeholder="No limit"
+        formControlName="audioStorageLimitGb"
+      />
+      <span class="field-help text-muted">
+        The most disk your recordings may use. Leave blank for no limit. Notes and
+        transcripts are always kept — only audio counts here.
+      </span>
+    </label>
+  </div>
+
+  <!-- Auto-prune toggle -->
+  <div class="card">
+    <label class="toggle-row">
+      <span class="toggle-copy">
+        <span class="toggle-title">Automatically delete old recordings</span>
+        <span class="text-secondary toggle-sub">
+          When over the limit, delete the OLDEST recordings' audio to make room
+          (heavy masters first). Your notes and transcripts are never deleted, and
+          recordings in locked folders are never touched.
+        </span>
+      </span>
+      <mur-toggle formControlName="audioAutoPrune" />
+    </label>
+  </div>
+
+  <!-- Manual free-up -->
+  <div class="card">
+    <div class="freeup-row">
+      <div class="toggle-copy">
+        <span class="toggle-title">Free up space now</span>
+        <span class="text-secondary toggle-sub">
+          @if (!hasCap()) {
+            Set a limit above to enable this.
+          } @else {
+            Delete oldest recordings' audio down to the limit right now. This can't be undone.
+          }
+        </span>
+        @if (lastFreed(); as f) {
+          <span class="pill is-success">Freed {{ mb(f) }}</span>
+        }
+      </div>
+      <button
+        type="button"
+        class="btn"
+        [disabled]="storageBusy() || !hasCap()"
+        (click)="onFreeUp()"
+      >
+        {{ storageBusy() ? "Freeing…" : "Free up space" }}
+      </button>
+    </div>
+  </div>
+</div>
+  

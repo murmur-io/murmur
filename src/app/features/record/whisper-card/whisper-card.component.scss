@@ -1,0 +1,80 @@
+.whisper-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  flex: none;
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  animation: rise 320ms var(--transition) both;
+}
+.whisper-ico {
+  display: inline-flex;
+  color: var(--warning);
+  line-height: 1;
+  flex: none;
+  margin-top: 1px;
+}
+.whisper-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.whisper-kind {
+  color: var(--warning);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.whisper-summary {
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  line-height: 1.4;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.whisper-quote {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+.whisper-quote q {
+  color: var(--text-primary);
+  font-style: italic;
+}
+.whisper-source {
+  margin-left: var(--space-1);
+  color: var(--accent);
+  font-weight: 550;
+  white-space: nowrap;
+}
+.whisper-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.whisper-dismiss:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.whisper-dismiss:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+    

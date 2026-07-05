@@ -1,0 +1,222 @@
+@let n = note();
+<div class="note" [class.is-thread]="!!n.thread">
+  <!-- ── A PERSISTED note line — the user's own jotting. It STAYS a note even
+       after "✨ ask brain" attaches a thread (the thread hangs BELOW). A
+       non-persisted @brain anchor instead shows its question as the thread's
+       first bubble, so it has no note line. ─────────────────────────────── -->
+  @if (n.persisted) {
+    <div class="note-line">
+      <span class="note-glyph" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+          <path
+            d="M5 4h11l3 3v13H5z"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linejoin="round"
+          />
+          <path
+            d="M8 10h8M8 14h6"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+          />
+        </svg>
+      </span>
+      <span class="line-text">{{ n.text }}</span>
+      <!-- ✨ ask brain — only on a note that has NO thread yet (retroactively
+           open a thread seeded from this note's text). Quiet; reveals on
+           hover/focus of the row. A note WITH a thread shows its toggle below. -->
+      @if (!n.thread) {
+        <button
+          type="button"
+          class="ask-brain"
+          (click)="store.askBrainOnNote(n.id)"
+          [disabled]="!store.loaded()"
+          title="Ask brain about this note"
+          aria-label="Ask brain about this note"
+        >
+          <span class="ask-spark" aria-hidden="true">✨</span>
+          <span class="ask-label">ask brain</span>
+        </button>
+      }
+    </div>
+  }
+
+  @if (n.thread) {
+    <!-- ── THREAD: a Slack-style collapsible toggle. Collapsed shows a short
+         snippet (the @brain question, or the note text for an ✨ thread). ─── -->
+    <button
+      type="button"
+      class="thread-toggle"
+      (click)="store.toggleThread(n.id)"
+      [attr.aria-expanded]="n.threadOpen"
+    >
+      <span class="caret" [class.is-open]="n.threadOpen" aria-hidden="true">
+        ▸
+      </span>
+      <span class="toggle-label">Thread</span>
+      @if (replyCount() > 0) {
+        <span class="reply-count">{{ replyCount() }}</span>
+      }
+      @if (!n.threadOpen) {
+        <span class="toggle-snippet">{{ snippet() }}</span>
+      }
+    </button>
+
+    <!-- ── The nested, collapsible thread — indented under the toggle ────── -->
+    @if (n.threadOpen) {
+      <div class="thread" role="group" aria-label="brain thread">
+        <!-- A @brain anchor shows its QUESTION as the user's first right-aligned
+             bubble (the leading turn is sliced from visibleTurns → no duplicate).
+             An ✨ thread on a persisted note already shows the text in the note
+             line above, so it does NOT repeat it as a bubble. -->
+        @if (!n.persisted) {
+          <div class="turn turn-user">
+            <div class="turn-bubble turn-bubble-user">{{ n.text }}</div>
+          </div>
+        }
+
+        @for (turn of visibleTurns(); track turn.id) {
+          @if (turn.role === "user") {
+            <div class="turn turn-user">
+              <div class="turn-bubble turn-bubble-user">{{ turn.text }}</div>
+            </div>
+          } @else {
+            <div class="turn turn-agent">
+              <div class="agent-id" aria-hidden="true">
+                <span class="agent-mark">🧠</span>
+                <span class="agent-name">brain</span>
+              </div>
+              <div class="turn-bubble turn-bubble-agent">
+                @let trace = visibleTrace(turn.trace);
+                @if (trace.length > 0) {
+                  <div class="trace" role="status" aria-label="Tool use">
+                    @for (t of trace; track t.id) {
+                      <span
+                        class="trace-chip"
+                        [class.is-running]="t.state === 'running'"
+                        [class.is-web]="t.tool === 'web_search'"
+                        [class.is-failed]="!t.ok"
+                      >
+                        <span class="trace-ico" aria-hidden="true">
+                          @if (t.state === "running") {
+                            <span class="trace-spin"></span>
+                          } @else if (!t.ok) {
+                            ⚠
+                          } @else {
+                            ✓
+                          }
+                        </span>
+                        {{ toolLabel(t.tool) }}
+                        @if (t.state === "done" && t.count) {
+                          <span class="trace-count">{{ t.count }}</span>
+                        }
+                      </span>
+                    }
+                  </div>
+                }
+                @if (turn.status === "pending" && trace.length === 0) {
+                  <span class="thinking" role="status">
+                    <span class="dots" aria-hidden="true">
+                      <span></span><span></span><span></span>
+                    </span>
+                    <span class="thinking-label">Thinking…</span>
+                  </span>
+                } @else if (turn.text) {
+                  <app-markdown [markdown]="turn.text" compact />
+                } @else if (turn.status !== "pending") {
+                  <span class="agent-note">{{ emptyNote(turn.status) }}</span>
+                }
+                @if (turn.citations.length > 0) {
+                  <app-assistant-sources [citations]="turn.citations" />
+                }
+
+                <!-- Propose → accept: shown ONLY when the agent proposed a
+                     NOTE (proposedNote != null). The DRAFT CONTENT is the
+                     point — show it prominently so the user can review it
+                     before accepting. A plain answer has no proposal. -->
+                @if (canAccept(turn)) {
+                  <div class="proposal">
+                    <span class="proposal-tag" aria-hidden="true">
+                      📝 Draft note
+                    </span>
+                    <!-- The actual draft the user is accepting — rendered as a
+                         readable quoted preview (not just the meta summary). -->
+                    <div class="draft-preview">
+                      <app-markdown [markdown]="turn.proposedNote!" compact />
+                    </div>
+                    <div class="turn-actions">
+                      <button
+                        type="button"
+                        class="accept-btn"
+                        (click)="store.acceptIntoNotes(n.id, turn.id)"
+                      >
+                        <span aria-hidden="true">✓</span> Add to notes
+                      </button>
+                      <button
+                        type="button"
+                        class="dismiss-btn"
+                        (click)="store.dismissTurn(n.id, turn.id)"
+                        aria-label="Dismiss this draft"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                } @else if (turn.accepted) {
+                  <span class="added-tag" aria-hidden="true">
+                    ✓ Added to notes
+                  </span>
+                } @else if (turn.dismissed) {
+                  <span class="dismissed-tag" aria-hidden="true">Dismissed</span>
+                }
+              </div>
+            </div>
+          }
+        }
+
+        <!-- The thread's OWN follow-up input — no @brain needed here. -->
+        <form class="follow" (submit)="submitFollow($event)">
+          <input
+            #fin
+            type="text"
+            class="follow-input"
+            autocomplete="off"
+            [value]="followDraft()"
+            [disabled]="n.threadPending"
+            [placeholder]="n.threadPending ? 'Thinking…' : 'Reply to brain…'"
+            (input)="onFollowInput($event)"
+            aria-label="Reply in this thread"
+          />
+          <button
+            type="submit"
+            class="follow-send"
+            [disabled]="!canFollow()"
+            aria-label="Send follow-up"
+          >
+            @if (n.threadPending) {
+              <span class="follow-spin" aria-hidden="true"></span>
+            } @else {
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M5 12h14M13 6l6 6-6 6"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            }
+          </button>
+        </form>
+      </div>
+    }
+  }
+</div>
+  

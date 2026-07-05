@@ -1,0 +1,212 @@
+<!-- Chrome is HIDDEN under any drill-down route (/settings, /library):
+     each drills down to its own two-column [rail | content] layout. -->
+@if (!inDrilldown()) {
+  @if (!pillMode()) {
+    <mur-sidebar class="app-sidebar">
+      <!-- Top drag strip: reserves room for the overlay traffic lights and
+           lets the user move the window. -->
+      <div class="sidebar-drag" data-tauri-drag-region></div>
+
+      <!-- Quick actions (Apple TV puts Search first in the rail). -->
+      <div class="sidebar-quick">
+        <button type="button" class="quick-row" (click)="openSearch()">
+          <mur-icon icon="search" />
+          <span class="nav-label">Search</span>
+          <mur-kbd class="quick-kbd">⌘K</mur-kbd>
+        </button>
+        <button type="button" class="quick-row" (click)="newNote()">
+          <mur-icon icon="plus" />
+          <span class="nav-label">New note</span>
+          <mur-kbd class="quick-kbd">⌘N</mur-kbd>
+        </button>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="Primary">
+        @for (item of navItems; track item.path) {
+          <a
+            [routerLink]="item.path"
+            routerLinkActive="active"
+            [attr.aria-label]="item.label"
+          >
+            <mur-icon [icon]="item.icon" />
+            <span class="nav-label">{{ item.label }}</span>
+          </a>
+        }
+      </nav>
+
+      <div class="sidebar-footer">
+        <!-- Session-privacy indicator: locked folders currently unlocked. -->
+        @if (unlockedCount() > 0) {
+          <span
+            class="unlocked-pill"
+            role="status"
+            [attr.aria-label]="
+              unlockedCount() +
+              ' locked folder' +
+              (unlockedCount() === 1 ? '' : 's') +
+              ' unlocked this session'
+            "
+            [attr.title]="
+              'These folders are decrypted into plaintext until you re-lock or a screen share starts.'
+            "
+          >
+            <svg
+              class="unlocked-glyph"
+              viewBox="0 0 16 16"
+              width="12"
+              height="12"
+              fill="none"
+              aria-hidden="true"
+            >
+              <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
+              <path d="M5.5 7V5.4a2.5 2.5 0 0 1 4.9-0.65" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+            <span class="unlocked-count">{{ unlockedCount() }}</span>
+            <span class="nav-label unlocked-label">unlocked</span>
+          </span>
+        }
+
+        <a
+          class="sidebar-settings"
+          routerLink="/settings"
+          routerLinkActive="active"
+          aria-label="Settings"
+        >
+          <mur-icon icon="settings" />
+          <span class="nav-label">Settings</span>
+        </a>
+
+        <button
+          type="button"
+          class="sidebar-collapse"
+          (click)="togglePillMode()"
+          aria-label="Collapse the sidebar into the top bar"
+          title="Collapse into the top bar"
+        >
+          <mur-icon icon="sidebar" />
+          <span class="nav-label">Collapse to bar</span>
+        </button>
+      </div>
+    </mur-sidebar>
+  } @else {
+    <!-- Pill mode: window-drag strip along the top edge, BEHIND the pill. -->
+    <div class="pill-drag" data-tauri-drag-region></div>
+
+    <nav class="pill-bar" aria-label="Primary">
+      <button
+        type="button"
+        class="pill-item"
+        (click)="togglePillMode()"
+        aria-label="Show sidebar"
+        title="Show sidebar"
+      >
+        <mur-icon icon="sidebar" />
+      </button>
+
+      <span class="pill-sep" aria-hidden="true"></span>
+
+      @for (item of navItems; track item.path) {
+        <a
+          class="pill-item"
+          [routerLink]="item.path"
+          routerLinkActive="active"
+          [attr.aria-label]="item.label"
+          [attr.title]="item.label"
+        >
+          <mur-icon [icon]="item.icon" />
+          <span class="nav-label">{{ item.label }}</span>
+        </a>
+      }
+
+      <span class="pill-sep" aria-hidden="true"></span>
+
+      <button
+        type="button"
+        class="pill-item"
+        (click)="openSearch()"
+        aria-label="Search (⌘K)"
+        title="Search (⌘K)"
+      >
+        <mur-icon icon="search" />
+      </button>
+      <button
+        type="button"
+        class="pill-item"
+        (click)="newNote()"
+        aria-label="New note (⌘N)"
+        title="New note (⌘N)"
+      >
+        <mur-icon icon="plus" />
+      </button>
+      <a
+        class="pill-item"
+        routerLink="/settings"
+        routerLinkActive="active"
+        aria-label="Settings"
+        title="Settings"
+      >
+        <mur-icon icon="settings" />
+      </a>
+
+      @if (unlockedCount() > 0) {
+        <span
+          class="pill-unlocked"
+          role="status"
+          [attr.aria-label]="unlockedCount() + ' unlocked this session'"
+          title="Locked folders decrypted for this session"
+        >
+          <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+            <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
+            <path d="M5.5 7V5.4a2.5 2.5 0 0 1 4.9-0.65" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+          <span class="unlocked-count">{{ unlockedCount() }}</span>
+        </span>
+      }
+    </nav>
+  }
+}
+
+<main class="app-main">
+  <router-outlet></router-outlet>
+</main>
+
+<!-- ⌘K quick-search spotlight (works from every route, drill-downs too). -->
+@if (searchOpen()) {
+  <mur-quick-search (closed)="searchOpen.set(false)" />
+}
+
+<!-- Toast viewport: renders the app-wide queue from ToastService. -->
+@if (toasts().length > 0) {
+  <div class="toast-viewport" aria-live="polite" aria-atomic="false">
+    @for (t of toasts(); track t.id) {
+      <div class="toast" [class]="'is-' + t.kind" role="status">
+        <span class="toast-msg">{{ t.message }}</span>
+        @if (t.action; as action) {
+          <button
+            type="button"
+            class="btn btn-primary toast-action"
+            (click)="runToastAction(t)"
+          >
+            {{ action.label }}
+          </button>
+        }
+        <button
+          type="button"
+          class="toast-close"
+          aria-label="Dismiss notification"
+          (click)="dismissToast(t.id)"
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <path
+              d="M4 4l8 8M12 4l-8 8"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </div>
+    }
+  </div>
+}
+  

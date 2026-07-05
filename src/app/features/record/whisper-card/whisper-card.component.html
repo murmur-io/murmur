@@ -1,0 +1,51 @@
+<div class="whisper-card" role="status" aria-label="Contradiction hint">
+  <span class="whisper-ico" aria-hidden="true">
+    <svg viewBox="0 0 24 24" width="16" height="16">
+      <path
+        d="M12 3.5 22 20H2L12 3.5Z"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.8"
+        stroke-linejoin="round"
+      />
+      <path
+        d="M12 10v4"
+        stroke="currentColor"
+        stroke-width="1.8"
+        stroke-linecap="round"
+      />
+      <circle cx="12" cy="17" r="1" fill="currentColor" />
+    </svg>
+  </span>
+  <span class="whisper-body">
+    <span class="whisper-kind">Possible contradiction</span>
+    <span class="whisper-summary" [title]="card().summary">{{
+      card().summary
+    }}</span>
+    <span class="whisper-quote">
+      Earlier: <q>{{ card().oldQuote }}</q>
+      @if (card().sourceMeetingId; as mid) {
+        <a class="whisper-source" [routerLink]="['/meeting', mid]">
+          open source
+        </a>
+      }
+    </span>
+  </span>
+  <button
+    type="button"
+    class="whisper-dismiss"
+    (click)="dismissed.emit()"
+    aria-label="Dismiss contradiction hint"
+    title="Dismiss"
+  >
+    <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+      <path
+        d="M6 6l12 12M18 6L6 18"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+      />
+    </svg>
+  </button>
+</div>
+  

@@ -1,0 +1,126 @@
+/* Stage-1 split: the host stays layout-transparent so this section's
+   cards remain direct flex items of the shell's .section-body (identical
+   spacing to the pre-split monolith); .section-stack reproduces the
+   .section-body column gap between this section's own cards. */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- Works-with-Obsidian card --- */
+.obsidian-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.obsidian-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+.obsidian-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  min-width: 52px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
+  /* Gentle staggered settle, in keeping with the global entrance language. */
+  animation: rise 460ms var(--ease-spring) both;
+  animation-delay: 80ms;
+  transition:
+    transform var(--transition),
+    box-shadow var(--transition),
+    border-color var(--transition);
+}
+.obsidian-card:hover .obsidian-mark {
+  transform: translateY(-1px) rotate(-3deg);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-accent), var(--glass-highlight);
+}
+.obsidian-mark svg {
+  display: block;
+  filter: drop-shadow(0 2px 6px rgba(110, 118, 255, 0.45));
+}
+.obsidian-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.obsidian-copy h3 {
+  margin: 0;
+}
+.obsidian-sub {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+.obsidian-sub strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* The free-Obsidian call-out: a quiet inset well with copyable URL + button. */
+.obsidian-get {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.obsidian-get-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.obsidian-url-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.obsidian-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 var(--space-3);
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  letter-spacing: -0.01em;
+  /* Selectable text — the user can also just copy it by hand. */
+  user-select: text;
+  -webkit-user-select: text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.obsidian-copy-btn {
+  flex: none;
+}
+.obsidian-copy-btn.is-copied {
+  color: var(--success);
+  border-color: rgba(74, 222, 128, 0.4);
+  background: var(--success-soft);
+}
+.obsidian-copy-icon {
+  flex: none;
+}
+    

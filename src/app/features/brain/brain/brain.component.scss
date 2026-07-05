@@ -1,0 +1,325 @@
+:host {
+  display: block;
+}
+.brain {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* — status header — a designed anchor bar, not a bare count line — */
+.b-head {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  overflow: hidden;
+}
+/* A faint accent wash gives the header intentional visual weight. */
+.b-head::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    130% 150% at 0% 0%,
+    rgba(110, 118, 255, 0.12),
+    transparent 55%
+  );
+}
+.b-head > * {
+  position: relative;
+  z-index: 1;
+}
+.b-head-top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-4) var(--space-5);
+}
+.b-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.b-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  color: var(--accent-hover);
+  line-height: 1;
+}
+.b-identity-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.b-title {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: -0.01em;
+}
+.b-tagline {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+/* Whole-brain stat units — number over label, divider-separated. */
+.b-stats {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  margin: 0;
+  flex: 1 1 auto;
+}
+.b-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.b-stat dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+}
+.b-stat dt {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.b-stat-sep {
+  flex: none;
+  width: 1px;
+  height: 30px;
+  background: var(--border-subtle);
+}
+.b-summary-state {
+  margin: 0;
+  flex: 1 1 auto;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+.b-summary-err {
+  color: var(--danger);
+}
+
+.b-head-side {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  margin-left: auto;
+}
+.b-badge {
+  color: var(--text-muted);
+}
+.b-badge-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: currentColor;
+  opacity: 0.55;
+}
+.b-badge.is-on {
+  border-color: transparent;
+  color: var(--success);
+  background: var(--success-soft);
+}
+.b-badge.is-on .b-badge-dot {
+  opacity: 1;
+  box-shadow: 0 0 8px var(--success);
+}
+.b-badge-action {
+  border-color: transparent;
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  text-decoration: none;
+  transition:
+    filter var(--transition),
+    transform var(--transition-fast);
+}
+.b-badge-action:hover {
+  filter: brightness(1.12);
+}
+.b-badge-action:active {
+  transform: translateY(1px);
+}
+.b-badge-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.b-ask {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.b-nudge {
+  align-items: center;
+}
+.b-nudge-glyph {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-hover);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+/* — sources — */
+.b-sources {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.b-sec-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.b-sec-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.b-sec-title {
+  margin: 0;
+  font-size: 1.0625rem;
+}
+.b-sec-sub {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+.b-folder {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 220px;
+}
+.b-folder-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.b-folder-select {
+  width: 100%;
+  height: 38px;
+}
+.b-add-hint {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.3;
+}
+.b-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-4);
+  /* Stretch so peer cards in a row share one height — no ragged bottoms,
+     and the bottom-pinned action rows line up across the three sources. */
+  align-items: stretch;
+}
+.b-list-err {
+  margin: 0;
+  color: var(--danger);
+}
+
+/* — connections (collapsible) — */
+.b-conn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.b-conn-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) 0;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+.b-conn-chevron {
+  flex: none;
+  color: var(--text-muted);
+  transition: transform var(--transition);
+}
+.b-conn-chevron.is-open {
+  transform: rotate(90deg);
+}
+.b-conn-title {
+  font-size: 1.0625rem;
+  font-weight: 600;
+}
+.b-conn-count {
+  flex: none;
+}
+.b-conn-sub {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.b-banner {
+  align-items: center;
+  animation: b-rise 320ms var(--transition) both;
+}
+.b-banner-glyph {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-hover);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+@keyframes b-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .b-banner,
+  .b-conn-chevron {
+    animation: none;
+    transition: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .b-stats {
+    justify-content: flex-start;
+    flex: 1 1 100%;
+    order: 3;
+  }
+  .b-head-side {
+    margin-left: 0;
+  }
+}
+    

@@ -1,0 +1,131 @@
+<div class="section-stack">
+          <div class="card obsidian-card">
+            <div class="obsidian-head">
+              <span class="obsidian-mark" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="30"
+                  height="30"
+                  fill="none"
+                  role="img"
+                  aria-label="Obsidian"
+                >
+                  <defs>
+                    <linearGradient
+                      id="obs-face-a"
+                      x1="3"
+                      y1="2"
+                      x2="20"
+                      y2="22"
+                      gradientUnits="userSpaceOnUse"
+                    >
+                      <stop stop-color="var(--accent-hover)" />
+                      <stop offset="1" stop-color="var(--accent-active)" />
+                    </linearGradient>
+                    <linearGradient
+                      id="obs-face-b"
+                      x1="11"
+                      y1="2"
+                      x2="22"
+                      y2="20"
+                      gradientUnits="userSpaceOnUse"
+                    >
+                      <stop stop-color="#b79bff" />
+                      <stop offset="1" stop-color="var(--accent)" />
+                    </linearGradient>
+                  </defs>
+                  <path
+                    d="M9.4 2.3 4 8.1l3.1 10.2L11 22l-1.3-9.5L9.4 2.3Z"
+                    fill="url(#obs-face-a)"
+                  />
+                  <path
+                    d="M9.4 2.3 9.7 12.5 11 22l5.6-4.2L20 8.4 14.6 2.6 9.4 2.3Z"
+                    fill="url(#obs-face-b)"
+                  />
+                  <path
+                    d="M9.7 12.5 9.4 2.3l5.2.3-.7 8 .9 1.9-5.1.0Z"
+                    fill="#ffffff"
+                    fill-opacity="0.16"
+                  />
+                </svg>
+              </span>
+              <div class="obsidian-copy">
+                <h3>Works with Obsidian</h3>
+                <p class="text-secondary obsidian-sub">
+                  Murmur saves each meeting as a Markdown note in your Obsidian
+                  vault. Obsidian is <strong>optional</strong> — you can read every
+                  recording, AI summary and transcript right here in Murmur (the
+                  Meetings tab, with audio playback). Want the full vault
+                  experience?
+                </p>
+              </div>
+            </div>
+
+            <div class="obsidian-get">
+              <span class="obsidian-get-label text-muted"
+                >Get Obsidian — it's free</span
+              >
+              <span class="obsidian-url-row">
+                <span class="obsidian-url" role="text">{{ obsidianUrl }}</span>
+                <button
+                  type="button"
+                  class="btn obsidian-copy-btn"
+                  [class.is-copied]="urlCopied()"
+                  (click)="copyObsidianUrl()"
+                  [attr.aria-label]="
+                    urlCopied() ? 'Copied' : 'Copy ' + obsidianUrl + ' to clipboard'
+                  "
+                >
+                  @if (urlCopied()) {
+                    <svg
+                      class="obsidian-copy-icon"
+                      viewBox="0 0 16 16"
+                      width="14"
+                      height="14"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M3 8.5 6.2 12 13 4.5"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                    Copied
+                  } @else {
+                    <svg
+                      class="obsidian-copy-icon"
+                      viewBox="0 0 16 16"
+                      width="14"
+                      height="14"
+                      aria-hidden="true"
+                    >
+                      <rect
+                        x="5.5"
+                        y="5.5"
+                        width="8"
+                        height="8"
+                        rx="2"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                      />
+                      <path
+                        d="M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                    Copy
+                  }
+                </button>
+              </span>
+            </div>
+          </div>
+</div>
+  

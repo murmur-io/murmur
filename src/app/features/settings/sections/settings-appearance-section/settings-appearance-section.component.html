@@ -1,0 +1,49 @@
+<div class="section-stack">
+          <div class="card appearance-card">
+            <div class="appearance-copy">
+              <h3>Appearance</h3>
+              <p class="text-secondary">
+                Choose how Murmur looks. <b>System</b> follows your macOS
+                Light/Dark setting automatically.
+              </p>
+            </div>
+            <mur-segmented
+              [options]="themeOptions"
+              [value]="themeMode()"
+              (valueChange)="setTheme($any($event))"
+              ariaLabel="Theme"
+            />
+          </div>
+
+          <!-- Liquid Glass intensity — how translucent the chrome panels
+               (sidebar / pill bar / rails) are. Applies live, auto-saved. -->
+          <div class="card appearance-card">
+            <div class="appearance-copy">
+              <h3>Liquid Glass</h3>
+              <p class="text-secondary">
+                How much of the background shows through the glass panels.
+                <b>0%</b> makes them solid — the same effect macOS applies
+                with “Reduce transparency”.
+              </p>
+            </div>
+            <div class="glass-row">
+              <svg class="glass-glyph is-min" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <rect x="3" y="3" width="14" height="14" rx="4" fill="currentColor" />
+              </svg>
+              <mur-slider
+                [min]="0"
+                [max]="100"
+                [step]="5"
+                [value]="glassLevel()"
+                (valueChange)="setGlass($event)"
+                ariaLabel="Liquid Glass transparency"
+              />
+              <svg class="glass-glyph" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                <rect x="3" y="3" width="14" height="14" rx="4" stroke="currentColor" stroke-width="1.5" opacity="0.55" />
+                <path d="M6.5 13.5c2.5-2.5 4.5-4.5 7-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.7" />
+              </svg>
+              <span class="glass-value">{{ glassLevel() }}%</span>
+            </div>
+          </div>
+</div>
+  

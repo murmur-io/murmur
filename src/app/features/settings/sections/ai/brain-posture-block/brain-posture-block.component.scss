@@ -1,0 +1,212 @@
+:host {
+  display: contents;
+}
+
+.posture-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* Retirement nudge — banner copy + action, stacked on narrow widths. */
+.retirement-banner {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.retirement-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.5;
+}
+.retirement-reason {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* ── Section intro header ── */
+.posture-head-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.posture-head-copy h3 {
+  margin: 0;
+}
+.posture-intro {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+/* ── Posture group heading ── */
+.use-group-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+
+/* ── Murmur Brain posture — segmented preset selector ── */
+.posture {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.posture-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.posture-custom-pill {
+  flex: none;
+}
+.posture-seg {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.posture-opt {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 140px;
+  min-width: 0;
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition);
+}
+.posture-opt:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.posture-opt.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.posture-opt:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.posture-opt:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.posture-opt-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.posture-opt-sub {
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+/* ── Selected-posture meaning line ── */
+.posture-meaning {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.posture-meaning-lead {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* ── Contextual state area ── */
+.posture-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+/* Confirm-before-download card: an explicit opt-in, not an auto-fetch. */
+.posture-confirm-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.posture-confirm-copy {
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.posture-confirm-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+.posture-confirm-actions .btn {
+  flex: none;
+}
+.brain-live-note {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.brain-live-ram-warn {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--warning);
+}
+.brain-error {
+  margin: 0;
+  font-size: 0.85rem;
+}
+.field-help {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* ── Download progress bar (reused from the embed model section) ── */
+.semantic-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 180px;
+  flex: 1 1 auto;
+}
+.semantic-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+.semantic-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--transition);
+}
+.semantic-progress-label {
+  font-size: 0.75rem;
+}
+
+/* Inline spinner on the "Switch to …" retirement button. */
+.spin-ring {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--text-on-accent);
+  animation: spin 0.8s linear infinite;
+  margin-right: var(--space-2);
+  vertical-align: -2px;
+  display: inline-block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin-ring {
+    animation: none;
+  }
+}
+    

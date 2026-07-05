@@ -1,0 +1,285 @@
+<section class="detail">
+  <a routerLink="/library" class="back">
+    <span class="back-arrow" aria-hidden="true">←</span>
+    <span>Meetings</span>
+  </a>
+
+  @if (detail(); as d) {
+    <header class="head print-keep">
+      <div class="head-text">
+        @if (renaming()) {
+          <div class="rename">
+            <input
+              #renameInput
+              type="text"
+              class="rename-input"
+              aria-label="Meeting title"
+              autocapitalize="sentences"
+              autocomplete="off"
+              [value]="titleDraft()"
+              [disabled]="savingRename()"
+              (input)="onTitleInput($event)"
+              (keydown.enter)="saveRename()"
+              (keydown.escape)="cancelRename()"
+            />
+            <div class="rename-actions">
+              <button
+                type="button"
+                class="btn btn-ghost rename-btn"
+                (click)="cancelRename()"
+                [disabled]="savingRename()"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary rename-btn"
+                (click)="saveRename()"
+                [disabled]="savingRename() || !titleDraft().trim()"
+              >
+                {{ savingRename() ? "Saving…" : "Save" }}
+              </button>
+            </div>
+          </div>
+        } @else {
+          <h2>{{ d.meeting.title || "(untitled)" }}</h2>
+        }
+        <div class="meta">
+          <span class="pill" [class]="statusPillClass(d.meeting.status)">
+            <span class="pill-dot"></span>
+            {{ d.meeting.status }}
+          </span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span class="meta-item">{{
+            formatDate(d.meeting.startedAt)
+          }}</span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span class="meta-item">{{
+            formatDuration(d.meeting.durationS)
+          }}</span>
+          <!-- Read-only folder + lock badge (where this note lives). -->
+          @if (folderBadge(); as fb) {
+            <span class="meta-sep" aria-hidden="true">·</span>
+            <span
+              class="meta-item"
+              style="display: inline-flex; align-items: center; gap: 4px"
+              [attr.title]="fb.name"
+            >
+              <app-lock-badge [exposure]="fb.exposure" />
+              {{ fb.name }}
+            </span>
+          }
+          <!-- ENHANCE-MY-NOTES: provenance badge — shown only when the backend
+               stamped murmur_enhanced: true in the front-matter. Derives from
+               the note() computed (parseNote over markdown) — nil for locked/
+               masked meetings where markdown is null, so no leak. -->
+          @if (note()?.enhanced) {
+            <span class="meta-sep" aria-hidden="true">·</span>
+            <span
+              class="pill pill-enhanced"
+              title="Your typed notes were used as the skeleton of this summary"
+            >✨ Enhanced from your notes</span>
+          }
+        </div>
+
+        <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags).
+             Hidden while locked — there is nothing to tag on a masked note. -->
+        @if (!locked()) {
+          <div class="tag-editor">
+            @for (t of tags(); track t) {
+              <span class="pill tag-chip">
+                {{ t }}
+                <button
+                  type="button"
+                  class="tag-x"
+                  [attr.aria-label]="'Remove tag ' + t"
+                  [disabled]="tagsBusy()"
+                  (click)="removeTag(t)"
+                >
+                  ×
+                </button>
+              </span>
+            }
+            <input
+              type="text"
+              class="tag-input"
+              placeholder="+ Add tag"
+              aria-label="Add tag"
+              autocapitalize="off"
+              autocomplete="off"
+              [value]="tagDraft()"
+              [disabled]="tagsBusy()"
+              (input)="onTagInput($event)"
+              (keydown.enter)="addTag()"
+            />
+          </div>
+          @if (tagsError(); as err) {
+            <span class="tag-error" role="alert">{{ err }}</span>
+          }
+        }
+      </div>
+    </header>
+
+    <!-- ============================================================= -->
+    <!-- LOCK GATE — shown when the backend masked this meeting (sealed, -->
+    <!-- not-session-unlocked folder). Replaces the tab bar + panels    -->
+    <!-- with a single card + a biometric Unlock action. The masked     -->
+    <!-- "🔒 Locked" identity header above still shows; the back-to-     -->
+    <!-- Meetings nav stays. Content masking is enforced server-side.    -->
+    <!-- ============================================================= -->
+    @if (locked()) {
+      <div
+        class="card empty-state lock-gate"
+        role="group"
+        aria-labelledby="lock-gate-title"
+      >
+        <span aria-hidden="true" class="lock-gate-mark">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none">
+            <rect
+              x="4.5"
+              y="10.5"
+              width="15"
+              height="10.5"
+              rx="2.4"
+              stroke="currentColor"
+              stroke-width="1.8"
+            />
+            <path
+              d="M7.75 10.5V7.75a4.25 4.25 0 0 1 8.5 0V10.5"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+            />
+            <circle cx="12" cy="15.4" r="1.6" fill="currentColor" />
+          </svg>
+        </span>
+        <p id="lock-gate-title" class="empty-title">
+          This meeting is locked
+        </p>
+        <p class="empty lock-gate-copy">
+          It lives in a locked folder. Unlock to view the note, transcript
+          and audio.
+        </p>
+        <button
+          #unlockButton
+          type="button"
+          class="btn btn-primary lock-gate-btn"
+          (click)="unlock()"
+          [disabled]="unlocking()"
+        >
+          {{ unlocking() ? "Unlocking…" : "🔒 Unlock (Touch ID)" }}
+        </button>
+      </div>
+    } @else {
+      <!-- TAB BAR (Note · Audio · Share) — page-scale segmented control. -->
+      <app-detail-tabs
+        [tabs]="detailTabs"
+        [active]="activeTab()"
+        (tabChange)="activeTab.set($event)"
+      />
+
+      <!-- One panel per active tab. Each owns its own inline styles (the
+           reason for the split) + hosts the reused sub-components. -->
+      @switch (activeTab()) {
+        @case ("note") {
+          <app-note-panel
+            [meetingId]="d.meeting.id"
+            [folderId]="d.meeting.folderId ?? null"
+            [note]="note()"
+            [interactions]="interactions()"
+            [exportedPath]="d.note?.exportedPath ?? null"
+            [provenanceLabel]="provenanceLabel()"
+            [busy]="busy()"
+            [renaming]="renaming()"
+            [editing]="editing()"
+            [saving]="saving()"
+            [exporting]="exporting()"
+            [exportingCanvas]="exportingCanvas()"
+            [linking]="linking()"
+            [keepsMasters]="keepsMasters()"
+            [hasAudio]="!!audioSrc()"
+            [moveOpen]="moveOpen()"
+            [msg]="msg()"
+            [exportMsg]="exportMsg()"
+            [exportError]="exportError()"
+            [canvasMsg]="canvasMsg()"
+            [canvasError]="canvasError()"
+            [graph]="graph()"
+            [graphError]="graphError()"
+            [justSaved]="justSaved()"
+            [pathCopied]="copied()"
+            [draft]="draft()"
+            [saveError]="saveError()"
+            [confirmingDelete]="confirmingDelete()"
+            [deleting]="deleting()"
+            [deleteError]="deleteError()"
+            (resummarize)="resummarize(d.meeting.id)"
+            (rename)="startRename()"
+            (move)="toggleMove()"
+            (moved)="onMoved($event)"
+            (closeMove)="closeMove()"
+            (delete)="askDelete()"
+            (cancelDelete)="cancelDelete()"
+            (confirmDelete)="confirmDelete(d.meeting.id)"
+            (copyMd)="copyMarkdown()"
+            (saveMd)="saveMarkdown(d.meeting.id, d.meeting.title)"
+            (savePdf)="saveAsPdf()"
+            (exportCanvas)="exportCanvas(d.meeting.id)"
+            (saveAudio)="saveAudio(d.meeting.id, d.meeting.title)"
+            (exportMaster)="
+              exportMaster($event, d.meeting.id, d.meeting.title)
+            "
+            (linkGraph)="linkGraph()"
+            (edit)="startEdit()"
+            (cancelEdit)="cancelEdit()"
+            (saveNote)="saveNote()"
+            (draftInput)="draft.set($event)"
+            (copyPath)="copy(d.note?.exportedPath ?? '')"
+            (openRelated)="openRelated($event)"
+          />
+        }
+        @case ("audio") {
+          <app-audio-panel
+            [audioSrc]="audioSrc()"
+            [segments]="d.segments"
+            [timeline]="timeline()"
+            [timelineTotal]="timelineTotal()"
+            [timelineLoading]="timelineLoading()"
+            [timelineError]="timelineError()"
+            [speakerSuggestions]="speakerSuggestions()"
+            [pinMsg]="pinMsg()"
+            [pinError]="pinError()"
+            (retryTimeline)="loadTimeline()"
+            (pin)="onPin($event)"
+            (renameSpeaker)="onRenameSpeaker($event)"
+          />
+        }
+        @case ("share") {
+          <!-- Password-FIRST link-share flow (Configure → Created →
+               Manage) + precondition gate + mode-B person share, all
+               self-contained in app-share-panel (owns its own IpcService
+               + share state, spec §6). The link key L lives ONLY in the
+               panel's transient session signal. -->
+          <app-share-panel
+            [meetingId]="d.meeting.id"
+            [active]="activeTab() === 'share'"
+            [editing]="editing()"
+            [locked]="locked()"
+            (setupSharing)="goToSharingSettings()"
+          />
+        }
+      }
+    }
+  } @else if (loading()) {
+    <div class="card state-card">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else {
+    <div class="card empty-card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Meeting not found</p>
+      <p class="empty">It may have been deleted.</p>
+    </div>
+  }
+</section>
+  

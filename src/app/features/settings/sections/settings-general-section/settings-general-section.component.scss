@@ -1,0 +1,76 @@
+/* Stage-1 split: the host stays layout-transparent so this section's
+   cards remain direct flex items of the shell's .section-body (identical
+   spacing to the pre-split monolith); .section-stack reproduces the
+   .section-body column gap between this section's own cards. */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- General: re-run setup call-out --- */
+.setup-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+.setup-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.setup-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.setup-sub {
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+/* --- Cards stack their fieldset flush (card already provides padding) --- */
+.card fieldset {
+  border: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.card fieldset legend {
+  padding: 0;
+  margin-bottom: var(--space-4);
+  float: left;
+  width: 100%;
+  font-size: 0.8125rem;
+}
+
+/* --- Stacked label + control --- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.field-label {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+}
+.row input {
+  flex: 1;
+}
+.row .btn {
+  flex: none;
+}
+    
