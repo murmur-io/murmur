@@ -1,0 +1,208 @@
+<div class="card posture-card">
+  <!-- Intro header — frames the section before the posture chooser. -->
+  <div class="posture-head-copy">
+    <h3>Where your AI runs</h3>
+    <p class="text-secondary posture-intro">
+      Pick how much runs on this Mac. Everything below adapts to your choice — no jargon to untangle.
+    </p>
+  </div>
+
+  <!--
+    Installed-base migration nudge: the persisted on-device model was
+    retired for licensing → offer the Apache-licensed replacement.
+    In-flow alert, so the frosted .banner is correct (not opaque overlay).
+  -->
+  @if (retirementNudge(); as nudge) {
+    <div class="banner is-warning retirement-banner">
+      <span class="retirement-copy">
+        ⚠ Your on-device brain model was retired for licensing — switch to
+        {{ nudge.replacementName }}.
+        <span class="text-muted retirement-reason">{{ nudge.reason }}</span>
+      </span>
+      <button
+        type="button"
+        class="btn btn-primary"
+        (click)="applyRetirement()"
+        [disabled]="applyingRetirement()"
+      >
+        @if (applyingRetirement()) {
+          <span class="spin-ring" aria-hidden="true"></span>
+          Switching…
+        } @else {
+          Switch to {{ nudge.replacementName }}
+        }
+      </button>
+    </div>
+  }
+
+  <!--
+    Murmur Brain posture: a 3-way preset selector. "custom" is a
+    display-only state (no preset forced) — its own pill shows and no
+    segment button is active.
+  -->
+  <div class="posture">
+    <div class="posture-head">
+      <span class="use-group-label text-muted">Murmur Brain posture</span>
+      @if (posture() === "custom") {
+        <span class="pill posture-custom-pill">
+          <span class="pill-dot"></span>
+          Custom
+        </span>
+      }
+    </div>
+    <div class="posture-seg" role="group" aria-label="Murmur Brain posture">
+      <button
+        type="button"
+        class="posture-opt"
+        [class.is-active]="posture() === 'cloud'"
+        [disabled]="postureBusy()"
+        (click)="setPosture('cloud')"
+      >
+        <span class="posture-opt-title">Cloud</span>
+        <span class="posture-opt-sub text-muted">
+          Your Default engine does everything
+        </span>
+      </button>
+      <button
+        type="button"
+        class="posture-opt"
+        [class.is-active]="posture() === 'hybrid'"
+        [disabled]="postureBusy()"
+        (click)="setPosture('hybrid')"
+      >
+        <span class="posture-opt-title">Hybrid ⭐</span>
+        <span class="posture-opt-sub text-muted">
+          Cloud notes + realtime reactions on this Mac
+        </span>
+      </button>
+      <button
+        type="button"
+        class="posture-opt"
+        [class.is-active]="posture() === 'fully_local'"
+        [disabled]="postureBusy()"
+        (click)="setPosture('fully_local')"
+      >
+        <span class="posture-opt-title">Fully local</span>
+        <span class="posture-opt-sub text-muted">
+          Nothing leaves this Mac
+        </span>
+      </button>
+    </div>
+
+    <!--
+      Plain-language meaning of the SELECTED posture (keyed on posture()),
+      so the choice reads in words, not jargon. Shown for every posture
+      incl. the derived "custom" state; hidden pre-load (null).
+    -->
+    @if (postureMeaning(); as meaning) {
+      <p class="posture-meaning">
+        <span class="posture-meaning-lead">{{ meaning.lead }}</span>
+        {{ meaning.body }}
+      </p>
+    }
+
+    <!--
+      Contextual state area — replaces the old static field-help and the
+      Brain Live enablement card. Shows either the pending-download
+      progress (Cancel available) or the committed-posture summary.
+
+      NOTE: during a pending download the committed posture (posture())
+      is still the OLD value; neededModels() would return [] for "cloud".
+      We therefore look up the downloading model by brainDownloadingId()
+      in brainModels() for the progress label, rather than iterating
+      neededModels() in the pending branch.
+    -->
+    <div class="posture-state">
+      @if (pendingConfirm(); as confirm) {
+        <!--
+          CONFIRM step (opt-in): the picked posture needs an on-device model, so
+          we ASK before fetching — what model, how big, what it does + a button.
+          A multi-GB download never starts on a single tap.
+        -->
+        <p class="posture-confirm-title">
+          {{ pendingLabel(confirm) }} needs
+          {{ confirmModels().length > 1 ? "models" : "a model" }} on your Mac
+        </p>
+        @for (n of confirmModels(); track n.role) {
+          <span class="pill" [class.is-success]="n.model?.downloaded">
+            <span class="pill-dot"></span>{{ n.role === "notes" ? "Notes &amp; Ask" : "Reactions" }}: {{ n.model?.name ?? "—" }}@if (n.model) { · {{ sizeLabel(n.model.approxSizeBytes) }} }@if (n.model?.downloaded) { ✓ ready }
+          </span>
+        }
+        <span class="text-secondary posture-confirm-copy">
+          {{ confirmDescription(confirm) }}
+        </span>
+        @if (confirmDownloadBytes() > 0) {
+          <span class="text-muted brain-live-note">
+            One-time {{ sizeLabel(confirmDownloadBytes()) }} download from Hugging
+            Face — it stays on this Mac.
+          </span>
+        }
+        @if (!brainLiveRamOk()) {
+          <span class="brain-live-ram-warn">
+            ⚠ Your Mac may not have enough RAM to run this smoothly alongside
+            recording.
+          </span>
+        }
+        <div class="posture-confirm-actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="confirmPostureDownload()"
+          >
+            Download &amp; enable {{ pendingLabel(confirm) }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="cancelPendingPosture()"
+          >
+            Cancel
+          </button>
+        </div>
+      } @else if (pendingPosture()) {
+        <p class="text-secondary">
+          {{ downloadingLabel() }} — downloading on-device models…
+        </p>
+        @if (brainDownloadingId()) {
+          <div class="semantic-progress" role="status">
+            <div class="semantic-progress-track" aria-hidden="true">
+              <div
+                class="semantic-progress-fill"
+                [style.width.%]="brainDownloadFrac() * 100"
+              ></div>
+            </div>
+            <span class="semantic-progress-label text-muted">
+              {{ downloadingModelName() }} · {{ brainPct() }}
+            </span>
+          </div>
+        }
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="cancelPostureDownload()"
+        >
+          Cancel
+        </button>
+        <span class="field-help text-muted">
+          Staying on your current setup until it's ready.
+        </span>
+      } @else {
+        @for (n of neededModels(); track n.role) {
+          <span class="pill" [class.is-success]="n.model?.downloaded">
+            <span class="pill-dot"></span>{{ n.role === "notes" ? "Notes & Ask" : "Reactions" }}: {{ n.model?.name ?? "—" }}{{ n.model?.downloaded ? " ✓" : "" }}
+          </span>
+        }
+        @if (!brainLiveRamOk()) {
+          <span class="brain-live-ram-warn">
+            ⚠ Your Mac may not have enough RAM to run this smoothly
+            alongside recording.
+          </span>
+        }
+      }
+      @if (postureError(); as perr) {
+        <p class="text-danger brain-error">{{ perr }}</p>
+      }
+    </div>
+  </div>
+</div>
+  

@@ -1,0 +1,163 @@
+<div class="section-stack" [formGroup]="form">
+          <!-- Microphone input device -->
+          <div class="card">
+            <label class="field">
+              <span class="field-label">Microphone</span>
+              <select formControlName="inputDevice">
+                <option value="">System default</option>
+                @for (dev of inputDevices(); track dev.name) {
+                  <option [value]="dev.name">
+                    {{ dev.name }}{{ dev.isDefault ? " (default)" : "" }}
+                  </option>
+                }
+              </select>
+              <span class="field-help text-muted">
+                Which microphone to record. “System default” follows your macOS input
+                selection; a chosen device falls back to the default if it’s unplugged.
+              </span>
+            </label>
+          </div>
+
+          <!-- Capture system audio — toggle row -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Capture system audio</span>
+                <span class="text-secondary toggle-sub">
+                  Capture the other side of a Zoom / Meet / Teams call, not just
+                  your mic — needs the Screen Recording permission on first use.
+                </span>
+              </span>
+              <mur-toggle formControlName="captureSystemAudio" />
+            </label>
+          </div>
+
+          <!-- Smart transcription (VAD) — toggle row -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Smart speech detection</span>
+                <span class="text-secondary toggle-sub">
+                  Skips silence and resets context between pauses for cleaner, faster
+                  transcripts (voice-activity detection). Recommended.
+                </span>
+              </span>
+              <mur-toggle formControlName="vadEnabled" />
+            </label>
+          </div>
+
+          <!-- High-fidelity masters — toggle row -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Keep high-fidelity masters</span>
+                <span class="text-secondary toggle-sub">
+                  Archive faithful per-stream float32 recordings (mic + system)
+                  alongside the standard mix. Best quality; roughly doubles audio disk
+                  use per meeting.
+                </span>
+              </span>
+              <mur-toggle formControlName="keepHiresMasters" />
+            </label>
+          </div>
+
+          <!-- Speaker diarization — toggle row -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Split “Others” into individual speakers</span>
+                <span class="text-secondary toggle-sub">
+                  Label individual people on the other side of the call (Speaker
+                  1/2/3) instead of one “Others”. Experimental — verify the
+                  quality on your calls. Needs system-audio capture; downloads
+                  ~40 MB of models on first use.
+                </span>
+              </span>
+              <mur-toggle formControlName="diarizeOthers" />
+            </label>
+          </div>
+
+          <!-- Speaker voiceprints — cross-meeting re-identification (opt-in). -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Recognise speakers across meetings</span>
+                <span class="text-secondary toggle-sub">
+                  Recognise the same speaker across meetings, fully on-device.
+                  Experimental — accuracy unverified; captures a voice fingerprint
+                  of remote participants (opt-in). Needs “Split Others into
+                  individual speakers” above.
+                </span>
+              </span>
+              <mur-toggle formControlName="voiceprintEnabled" />
+            </label>
+
+            <!-- Management list — the captured voiceprints, each forgettable. -->
+            @if (voiceprints().length) {
+              <div class="vp-list">
+                <div class="vp-list-head">
+                  <span class="vp-list-title text-secondary">
+                    {{ voiceprints().length }} stored
+                    {{ voiceprints().length === 1 ? "voiceprint" : "voiceprints" }}
+                  </span>
+                  <button
+                    type="button"
+                    class="btn btn-ghost vp-clear"
+                    [disabled]="voiceprintBusy()"
+                    (click)="clearVoiceprints()"
+                  >
+                    Forget all
+                  </button>
+                </div>
+                @for (vp of voiceprints(); track vp.id) {
+                  <div class="vp-row">
+                    <span class="vp-name">
+                      {{ vp.label || "Speaker " + vp.clusterIndex }}
+                    </span>
+                    <button
+                      type="button"
+                      class="vp-forget"
+                      [disabled]="voiceprintBusy()"
+                      [attr.aria-label]="
+                        'Forget voiceprint ' + (vp.label || vp.clusterIndex)
+                      "
+                      (click)="forgetVoiceprint(vp.id)"
+                    >
+                      Forget
+                    </button>
+                  </div>
+                }
+              </div>
+            }
+          </div>
+
+          <!-- On-device echo removal (post-processing) — toggle row -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Remove speaker echo from recordings</span>
+                <span class="text-secondary toggle-sub">
+                  After each recording, cancel the other participants' voices out of your
+                  microphone track using the captured system audio — fixes the doubled
+                  voice when recording on speakers. Runs fully on-device.
+                </span>
+              </span>
+              <mur-toggle formControlName="postAecEnabled" />
+            </label>
+          </div>
+
+          <!-- Voice trigger — toggle row -->
+          <div class="card">
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Voice trigger</span>
+                <span class="text-secondary toggle-sub">
+                  Start recording hands-free when you say “start recording”. Listens
+                  with your Whisper model while idle.
+                </span>
+              </span>
+              <mur-toggle formControlName="voiceTrigger" />
+            </label>
+          </div>
+</div>
+  

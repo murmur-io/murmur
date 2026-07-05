@@ -1,0 +1,86 @@
+<div class="card map-card">
+  <div class="map-head">
+    <h3>What runs where</h3>
+    <p class="text-secondary map-sub">
+      Every AI job and the engine serving it right now — grouped by where your
+      words go.
+    </p>
+  </div>
+
+  @if (rows().length === 0) {
+    <p class="text-muted map-empty">Loading the routing map…</p>
+  } @else {
+    <!-- ☁ Cloud group — text leaves the Mac (redacted first). -->
+    <div class="map-group">
+      <p class="map-group-label">☁ Goes to the cloud — redacted first</p>
+      @if (groups().cloud.length > 0) {
+        @for (row of groups().cloud; track row.job) {
+          <div class="map-row" [class.is-inactive]="!row.active">
+            <span class="map-title">{{ row.title }}</span>
+            <span class="map-engine">
+              {{ row.engine }}
+              @if (row.model) {
+                <span class="map-model text-muted">· {{ row.model }}</span>
+              }
+              @if (!row.active) {
+                <span class="map-off text-muted">— off</span>
+              }
+            </span>
+            <span class="pill map-loc">
+              <span class="pill-dot"></span>
+              {{ row.redacted ? "Cloud · redacted" : "Cloud" }}
+            </span>
+            @if (row.routable) {
+              <button
+                type="button"
+                class="btn btn-ghost btn-sm map-change"
+                (click)="change(row.job)"
+              >
+                Change
+              </button>
+            } @else {
+              <span class="map-change-spacer" aria-hidden="true"></span>
+            }
+          </div>
+        }
+      } @else {
+        <p class="map-empty-cloud">✓ Nothing leaves this Mac.</p>
+      }
+    </div>
+
+    <!-- 🖥 On-Mac group — always private. -->
+    <div class="map-group">
+      <p class="map-group-label">🖥 Stays on your Mac — always private</p>
+      @for (row of groups().mac; track row.job) {
+        <div class="map-row" [class.is-inactive]="!row.active">
+          <span class="map-title">{{ row.title }}</span>
+          <span class="map-engine">
+            {{ row.engine }}
+            @if (row.model) {
+              <span class="map-model text-muted">· {{ row.model }}</span>
+            }
+            @if (!row.active) {
+              <span class="map-off text-muted">— off</span>
+            }
+          </span>
+          <span class="pill map-loc is-success">
+            <span class="pill-dot"></span>
+            On this Mac
+          </span>
+          @if (row.routable) {
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm map-change"
+              (click)="change(row.job)"
+            >
+              Change
+            </button>
+          } @else {
+            <span class="map-change-spacer" aria-hidden="true"></span>
+          }
+        </div>
+      }
+    </div>
+  }
+</div>
+  

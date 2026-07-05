@@ -1,0 +1,19 @@
+<button
+  type="button"
+  class="ec"
+  [class.is-project]="isProject()"
+  [class.is-selected]="selected()"
+  [attr.aria-pressed]="selected()"
+  [attr.aria-label]="
+    entity().name + ' — ' + kindLabel() + ', ' + countLabel()
+  "
+  (click)="select.emit(entity().id)"
+>
+  <span class="ec-dot" aria-hidden="true"></span>
+  <span class="ec-name">{{ entity().name }}</span>
+  <span class="ec-kind" aria-hidden="true">{{ kindLabel() }}</span>
+  <span class="count ec-count" [attr.title]="countLabel()">
+    {{ entity().mentionCount }}
+  </span>
+</button>
+  

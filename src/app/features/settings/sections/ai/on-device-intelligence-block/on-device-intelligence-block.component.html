@@ -1,0 +1,118 @@
+<div class="card ondevice-card" [formGroup]="form">
+  <!-- ── On-device intelligence ──────────────────────────────────── -->
+  <div class="use-group">
+    <span class="use-group-label text-muted">Search index</span>
+
+    <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
+    <div class="semantic">
+      <label class="toggle-row">
+        <span class="toggle-copy">
+          <span class="toggle-title">Semantic search (multilingual)</span>
+          <span class="text-secondary toggle-sub">
+            Finds notes by meaning + across languages — needs the embedding
+            model.
+          </span>
+        </span>
+        <mur-toggle formControlName="semanticSearchEnabled" />
+      </label>
+
+      <!-- Embedding model: present pill, or a download control with progress -->
+      <div class="semantic-model-row">
+        @if (embedModelPresent() === true) {
+          <span class="pill is-success">
+            <span class="pill-dot"></span>
+            Embedding model ready ✓
+          </span>
+          <span class="text-muted semantic-note">
+            Stored on this Mac — used to index + search your notes.
+          </span>
+        } @else if (embedModelPresent() === false) {
+          @if (downloadingEmbedModel()) {
+            <div class="semantic-progress" role="status">
+              <div class="semantic-progress-track" aria-hidden="true">
+                <div
+                  class="semantic-progress-fill"
+                  [style.width.%]="embedDownloadFrac() * 100"
+                ></div>
+              </div>
+              <span class="semantic-progress-label text-muted">
+                Downloading embedding model… {{ embedPct() }}
+              </span>
+            </div>
+          } @else {
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              (click)="downloadEmbedModel()"
+            >
+              Download embedding model (~470 MB)
+            </button>
+            <span class="text-muted semantic-note">
+              One time, on-device — required before semantic search can
+              index.
+            </span>
+          }
+        } @else {
+          <span class="pill">
+            <span class="pill-dot"></span>
+            Checking…
+          </span>
+        }
+      </div>
+      @if (embedDownloadError(); as eerr) {
+        <p class="text-danger brain-error">{{ eerr }}</p>
+      }
+
+      <!-- Re-index notes: backfill the semantic vector index over all notes -->
+      <div class="semantic-reindex">
+        <button
+          type="button"
+          class="btn btn-sm"
+          (click)="reindexEmbeddings()"
+          [disabled]="reindexing()"
+        >
+          @if (reindexing()) {
+            <span class="spin-ring" aria-hidden="true"></span>
+            Re-indexing…
+          } @else {
+            Re-index notes
+          }
+        </button>
+        <span class="text-muted semantic-note">
+          Builds the semantic index over your notes — run it after turning
+          this on, or after downloading the model.
+        </span>
+      </div>
+      @if (reindexing()) {
+        <div class="semantic-progress" role="status">
+          <div class="semantic-progress-track" aria-hidden="true">
+            <div
+              class="semantic-progress-fill"
+              [style.width.%]="reindexFrac() * 100"
+            ></div>
+          </div>
+          <span class="semantic-progress-label text-muted">
+            Indexing notes… {{ reindexPct() }}
+          </span>
+        </div>
+      }
+      @if (reindexResult(); as rr) {
+        @if (rr.status === "model_missing") {
+          <p class="semantic-nudge text-secondary">
+            Download the embedding model above first — semantic search
+            can't index without it.
+          </p>
+        } @else {
+          <span class="pill is-success semantic-done-pill">
+            <span class="pill-dot"></span>
+            Indexed {{ rr.indexed }} of {{ rr.total }} notes
+          </span>
+        }
+      }
+      @if (reindexError(); as rerr) {
+        <p class="text-danger brain-error">{{ rerr }}</p>
+      }
+    </div>
+  </div>
+</div>
+  

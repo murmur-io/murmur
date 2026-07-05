@@ -1,0 +1,116 @@
+:host {
+  display: block;
+}
+.nb {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+.nb-svg {
+  display: block;
+  width: 100%;
+  max-width: 340px;
+  height: auto;
+  overflow: visible;
+}
+
+/* Hub brand wave. */
+.nb-bar {
+  fill: url(#nbWave);
+}
+
+/* Edges grow in from the hub on entrance only — never loop. */
+.nb-edge {
+  stroke: var(--border-strong);
+  opacity: 0;
+  stroke-linecap: round;
+  animation: nb-edge-in 360ms var(--transition) both;
+  animation-delay: calc(var(--i, 0) * 40ms + 80ms);
+  transition: stroke var(--transition);
+}
+
+.nb-sat {
+  cursor: pointer;
+  animation: nb-sat-in 360ms var(--ease-spring) both;
+  animation-delay: calc(var(--i, 0) * 40ms + 120ms);
+}
+.nb-sat-hit {
+  fill: transparent;
+}
+.nb-sat-dot {
+  fill: var(--accent);
+  stroke: var(--surface-base);
+  stroke-width: 2;
+  transition:
+    r var(--transition-fast),
+    fill var(--transition);
+}
+.nb-sat.is-project .nb-sat-dot {
+  fill: #9d7bff;
+}
+.nb-sat-label {
+  fill: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 550;
+  pointer-events: none;
+  transition: fill var(--transition);
+}
+.nb-sat:hover .nb-sat-dot,
+.nb-sat:focus-visible .nb-sat-dot {
+  r: 7.5;
+}
+.nb-sat:hover .nb-sat-label,
+.nb-sat:focus-visible .nb-sat-label {
+  fill: var(--text-primary);
+}
+.nb-sat:focus-visible {
+  outline: none;
+}
+.nb-sat:focus-visible .nb-sat-dot {
+  stroke: var(--accent-hover);
+  stroke-width: 2.5;
+}
+
+.nb-cap,
+.nb-empty {
+  margin: 0;
+  max-width: 32ch;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+@keyframes nb-edge-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 0.7;
+  }
+}
+@keyframes nb-sat-in {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+    transform-origin: center;
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nb-edge,
+  .nb-sat {
+    animation: none;
+    opacity: 1;
+  }
+  .nb-edge {
+    opacity: 0.7;
+  }
+}
+    

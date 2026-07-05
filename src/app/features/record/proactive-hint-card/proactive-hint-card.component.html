@@ -1,0 +1,31 @@
+<div class="hint-card" role="status" aria-label="Brain hint">
+  <span class="hint-ico" aria-hidden="true">{{ icon() }}</span>
+  <span class="hint-body">
+    <span class="hint-kind">{{ kindLabel() }}</span>
+    <span class="hint-title" [title]="hint().title">{{
+      hint().title
+    }}</span>
+  </span>
+  @if (hint().meetingId; as mid) {
+    <a class="btn btn-ghost hint-open" [routerLink]="['/meeting', mid]">
+      Open
+    </a>
+  }
+  <button
+    type="button"
+    class="hint-dismiss"
+    (click)="dismissed.emit()"
+    aria-label="Dismiss hint"
+    title="Dismiss"
+  >
+    <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+      <path
+        d="M6 6l12 12M18 6L6 18"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+      />
+    </svg>
+  </button>
+</div>
+  

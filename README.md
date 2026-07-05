@@ -64,6 +64,9 @@ bundled on-device model, **none of it ever leaves the device.**
 - 🧩 **One store, three surfaces.** An encrypted SQLite DB is the single source of truth; the app, a
   read-only **MCP server**, and your Obsidian vault are thin readers — never diverging copies.
 - 📁 **You own the output.** Notes are plain Markdown (and Obsidian-friendly) — no proprietary format, no lock-in.
+- 🪟 **A Liquid Glass shell (macOS 26).** Floating glass rails that collapse into an Apple TV-style pill bar,
+  a **⌘K** spotlight over your whole vault, **⌘N** for a new note, light/dark, and a transparency slider that
+  honors macOS "Reduce transparency".
 
 ---
 

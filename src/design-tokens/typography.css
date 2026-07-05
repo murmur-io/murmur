@@ -1,0 +1,7 @@
+/* Design tokens — generated split of the former styles.css :root (prototype).
+   Every value the UI uses lives HERE; components consume var(--token) only. */
+:root {  /* --- Font --------------------------------------------------------------- */
+  --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, system-ui,
+    sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+}

@@ -1,0 +1,266 @@
+<div class="section-stack">
+          <div class="card privacy-card" [formGroup]="form">
+            <div class="privacy-head">
+              <span class="privacy-mark" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="26"
+                  height="26"
+                  fill="none"
+                  role="img"
+                  aria-label="Privacy"
+                >
+                  <path
+                    d="M12 2.5 4.5 5.5v5.2c0 4.6 3.1 8.1 7.5 9.3 4.4-1.2 7.5-4.7 7.5-9.3V5.5L12 2.5Z"
+                    fill="var(--accent-soft)"
+                    stroke="var(--accent-hover)"
+                    stroke-width="1.3"
+                    stroke-linejoin="round"
+                  />
+                  <path
+                    d="M9.4 11.8 11.2 13.6 14.8 9.8"
+                    fill="none"
+                    stroke="var(--accent-hover)"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+              <div class="privacy-copy">
+                <h3>Privacy &amp; integrations</h3>
+                <p class="text-secondary privacy-sub">
+                  How Murmur protects your text and connects to your tools.
+                </p>
+              </div>
+            </div>
+
+            <!-- (1) Redaction firewall -->
+            <div class="privacy-section">
+              <span class="privacy-section-label text-muted"
+                >Redaction firewall</span
+              >
+              <p class="text-secondary privacy-note">
+                Emails, card numbers and phone numbers are automatically
+                scrubbed before any text leaves this Mac — that covers the Anthropic
+                API, Claude Code (the <code>claude</code> CLI uploads your
+                transcript to Anthropic too), a Kong AI Gateway, and a remote Ollama
+                server — then restored in your notes. Only Ollama running on this
+                Mac keeps everything on-device.
+              </p>
+            </div>
+
+            <!-- (1a) On-device name redaction (Phase D — NER model) -->
+            <div class="privacy-section">
+              <span class="privacy-section-label text-muted"
+                >Name redaction</span
+              >
+              @if (nerModelPresent() === true) {
+                <p class="text-secondary privacy-note">
+                  An on-device name-redaction model is installed, so people's
+                  NAMES are additionally masked before any redacted text leaves
+                  this Mac (Polish + English), then restored in your notes.
+                </p>
+                <span class="pill is-success ner-pill">
+                  <span class="pill-dot"></span>
+                  Name redaction on
+                </span>
+              } @else {
+                <!-- HONEST copy: without the model, do NOT claim names are
+                     redacted — only emails / cards / phones are by default. -->
+                <p class="text-secondary privacy-note">
+                  By default only emails, card numbers and phone numbers are
+                  redacted — people's NAMES are not. The pattern firewall alone
+                  can't catch names, so they can leave your device alongside the
+                  transcript when you use a cloud provider. Download the optional
+                  on-device name-redaction model to additionally mask names
+                  (Polish + English) before any text leaves this Mac.
+                </p>
+                @if (downloadingNerModel()) {
+                  <div class="dl-progress" role="status">
+                    <div class="dl-progress-track" aria-hidden="true">
+                      <div
+                        class="dl-progress-fill"
+                        [style.width.%]="nerDownloadFrac() * 100"
+                      ></div>
+                    </div>
+                    <span class="dl-progress-label text-muted">
+                      @if (nerDownloadFrac() > 0) {
+                        Downloading… {{ nerPct() }}
+                      } @else {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Downloading…
+                      }
+                    </span>
+                  </div>
+                } @else {
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="downloadNerModel()"
+                    [disabled]="nerModelPresent() === null"
+                  >
+                    Enable name redaction (download model)
+                  </button>
+                  <span class="text-muted ner-hint">
+                    One time, on-device, no meeting content is sent.
+                  </span>
+                }
+                @if (nerDownloadError(); as nerr) {
+                  <p class="text-danger privacy-note">{{ nerr }}</p>
+                }
+              }
+            </div>
+
+            <!-- (1b) Cloud processing consent (E10) -->
+            <div class="privacy-section">
+              <span class="privacy-section-label text-muted">Cloud processing</span>
+              <p class="text-secondary privacy-note">
+                Cloud providers — Claude Code, the Anthropic API, a Kong AI Gateway, or
+                a remote Ollama server — send your (redacted) transcript off this
+                Mac to write each summary. Only Ollama running on this Mac stays
+                fully on-device. Until you allow this once, cloud summaries are
+                turned off and won't run.
+              </p>
+              @if (cloudConsented()) {
+                <span class="pill is-success cloud-consent-pill">
+                  <span class="pill-dot"></span>
+                  Cloud processing allowed
+                </span>
+              } @else {
+                <div class="cloud-consent-row">
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    (click)="allowCloudProcessing()"
+                    [disabled]="consenting()"
+                  >
+                    @if (consenting()) {
+                      <span class="spin-ring" aria-hidden="true"></span>
+                      Enabling…
+                    } @else {
+                      Allow cloud processing
+                    }
+                  </button>
+                  <span class="text-muted cloud-consent-hint">
+                    One-time. You can keep using a local Ollama with no cloud at all.
+                  </span>
+                </div>
+              }
+              @if (consentError(); as cerr) {
+                <p class="text-danger privacy-note">{{ cerr }}</p>
+              }
+            </div>
+
+            <!-- (1c) Cross-meeting user memory -->
+            <div class="privacy-section">
+              <span class="privacy-section-label text-muted"
+                >Cross-meeting memory</span
+              >
+              <label class="toggle-row">
+                <span class="toggle-copy">
+                  <span class="toggle-title">Remember facts about you</span>
+                  <span class="text-secondary toggle-sub">
+                    The brain remembers durable facts about you across
+                    meetings — how you like to work, what you own, your
+                    commitments — so it can answer with context. Everything
+                    is stored locally on this Mac, gated behind your locked
+                    folders, and forgettable: review or clear it any time on
+                    the <a routerLink="/brain">Brain page</a>. Turn this off
+                    to stop learning and inject nothing.
+                  </span>
+                </span>
+                <mur-toggle formControlName="userMemoryEnabled" />
+              </label>
+            </div>
+
+            <!-- (2) Locked folders (honest encryption boundary) -->
+            <div class="privacy-section">
+              <span class="privacy-section-label text-muted">Locked folders</span>
+              <p class="text-secondary privacy-note">
+                Locked folders are encrypted and pulled out of your Obsidian vault;
+                open notes remain plaintext .md files Obsidian can read.
+              </p>
+            </div>
+
+            <!-- (3) Local MCP server -->
+            <div class="privacy-section">
+              <span class="privacy-section-label text-muted">Local MCP server</span>
+              <p class="text-secondary privacy-note">
+                Murmur runs a localhost MCP server that exposes your meetings
+                (read-only) to Claude Desktop and Claude Code at
+                <span class="privacy-inline-url">{{ mcpUrl }}</span
+                >.
+              </p>
+
+              <div class="mcp-config">
+                <div class="mcp-config-head">
+                  <span class="mcp-config-label text-muted">Config</span>
+                  <button
+                    type="button"
+                    class="btn mcp-copy-btn"
+                    [class.is-copied]="configCopied()"
+                    (click)="copyMcpConfig()"
+                    [attr.aria-label]="
+                      configCopied() ? 'Copied' : 'Copy config to clipboard'
+                    "
+                  >
+                    @if (configCopied()) {
+                      <svg
+                        class="mcp-copy-icon"
+                        viewBox="0 0 16 16"
+                        width="14"
+                        height="14"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M3 8.5 6.2 12 13 4.5"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.8"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      Copied
+                    } @else {
+                      <svg
+                        class="mcp-copy-icon"
+                        viewBox="0 0 16 16"
+                        width="14"
+                        height="14"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          x="5.5"
+                          y="5.5"
+                          width="8"
+                          height="8"
+                          rx="2"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.5"
+                        />
+                        <path
+                          d="M10.5 5.5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v4.5a2 2 0 0 0 2 2h1.5"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.5"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      Copy config
+                    }
+                  </button>
+                </div>
+                <pre class="mcp-config-block" role="text">{{ mcpConfig }}</pre>
+              </div>
+
+              <span class="mcp-hint text-muted">
+                Add this to your Claude Desktop config, then restart Claude Desktop.
+              </span>
+            </div>
+          </div>
+</div>
+  

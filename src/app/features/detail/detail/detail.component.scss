@@ -1,0 +1,211 @@
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  animation: rise 380ms var(--transition) both;
+}
+
+/* --- Back link --- */
+.back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-start;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  font-weight: 550;
+}
+.back:hover {
+  color: var(--text-primary);
+}
+.back:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.back-arrow {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+/* --- Header: title, status + meta, primary action --- */
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.head-text,
+.graph-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.head h2 {
+  margin: 0;
+}
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+/* --- Tag editor (chips + inline add) --- */
+.tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.tag-chip {
+  height: 26px;
+  padding: 0 var(--space-1) 0 var(--space-3);
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.tag-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: inherit;
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.7;
+  transition:
+    background var(--transition),
+    opacity var(--transition);
+}
+.tag-x:hover:not(:disabled) {
+  background: var(--surface-hover);
+  opacity: 1;
+}
+.tag-x:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.tag-x:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+.tag-input {
+  width: auto;
+  flex: 0 1 9rem;
+  height: 26px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  font-size: 0.75rem;
+}
+.tag-error {
+  color: var(--danger);
+  font-size: 0.8125rem;
+}
+
+/* --- Inline title rename --- */
+.rename {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.rename-input {
+  flex: 1 1 16rem;
+  min-width: 0;
+  height: 44px;
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+.rename-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.rename-btn {
+  height: 36px;
+  padding: 0 var(--space-3);
+  font-size: 0.875rem;
+}
+
+/* --- Lock gate (masked meeting; replaces the tabs + panels) --- */
+.lock-gate {
+  animation: rise 420ms var(--transition) both;
+}
+.lock-gate-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+.lock-gate-copy {
+  max-width: 42ch;
+}
+.lock-gate-btn {
+  margin-top: var(--space-2);
+}
+
+/* Print / Save-as-PDF — isolate the note. Invoked from the Note tab's
+   ⋯ menu, so <app-note-panel> is always present. Driven by
+   window.print(); the app chrome outside this component is hidden
+   globally via body.murmur-printing. The note panel carries its own
+   @media print rules for its internal affordances. */
+@media print {
+  /* Hide the shell's own children, then re-reveal the identity header
+     + the note panel host. */
+  .detail > *,
+  .back {
+    display: none !important;
+  }
+  .detail > .print-keep,
+  .detail app-note-panel {
+    display: block !important;
+  }
+  .head.print-keep {
+    display: flex !important;
+    justify-content: flex-start;
+  }
+  /* Flatten frosted cards + force ink-friendly dark text. */
+  .card,
+  .section,
+  .meta-card {
+    background: #fff !important;
+    border-color: #ccc !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+    break-inside: avoid;
+  }
+  .print-keep,
+  .print-keep * {
+    color: #000 !important;
+    animation: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .detail,
+  .lock-gate {
+    animation: none;
+  }
+}
+    

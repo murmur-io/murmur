@@ -1,0 +1,23 @@
+@if (related().length) {
+  <section class="rel" aria-label="Powiązane wg znaczenia">
+    <h3 class="rel-title">Powiązane wg znaczenia</h3>
+    <ul class="rel-list">
+      @for (r of related(); track r.meeting.id) {
+        <li>
+          <button type="button" class="rel-row" (click)="open.emit(r.meeting.id)">
+            <span class="rel-head">
+              <span class="rel-name">{{
+                r.meeting.title || "(untitled)"
+              }}</span>
+              <span class="rel-date">{{ fmtDate(r.meeting.startedAt) }}</span>
+            </span>
+            @if (r.snippet) {
+              <span class="rel-snippet">{{ r.snippet }}</span>
+            }
+          </button>
+        </li>
+      }
+    </ul>
+  </section>
+}
+  

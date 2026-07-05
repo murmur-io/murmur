@@ -6,7 +6,7 @@ export const routes: Routes = [
   {
     path: "bar",
     loadComponent: () =>
-      import("./features/bar/bar.component").then(
+      import("./features/bar/bar/bar.component").then(
         (m) => m.FloatingBarComponent,
       ),
   },
@@ -18,73 +18,73 @@ export const routes: Routes = [
   {
     path: "",
     loadComponent: () =>
-      import("./app-shell.component").then((m) => m.AppShellComponent),
+      import("./app-shell/app-shell.component").then((m) => m.AppShellComponent),
     children: [
       {
         path: "record",
         loadComponent: () =>
-          import("./features/record/record.component").then(
+          import("./features/record/record/record.component").then(
             (m) => m.RecordComponent,
           ),
       },
       {
         path: "settings",
         loadComponent: () =>
-          import("./features/settings/settings.component").then(
+          import("./features/settings/settings/settings.component").then(
             (m) => m.SettingsComponent,
           ),
       },
       {
         path: "library",
         loadComponent: () =>
-          import("./features/library/library.component").then(
+          import("./features/library/library/library.component").then(
             (m) => m.LibraryComponent,
           ),
       },
       {
         path: "meeting/:id",
         loadComponent: () =>
-          import("./features/detail/detail.component").then(
+          import("./features/detail/detail/detail.component").then(
             (m) => m.DetailComponent,
           ),
       },
       {
         path: "analytics",
         loadComponent: () =>
-          import("./features/analytics/analytics.component").then(
+          import("./features/analytics/analytics/analytics.component").then(
             (m) => m.AnalyticsComponent,
           ),
       },
       {
         path: "ask",
         loadComponent: () =>
-          import("./features/ask/ask.component").then((m) => m.AskComponent),
+          import("./features/ask/ask/ask.component").then((m) => m.AskComponent),
       },
       {
         path: "graph",
         loadComponent: () =>
-          import("./features/graph/graph.component").then(
+          import("./features/graph/graph/graph.component").then(
             (m) => m.GraphComponent,
           ),
       },
       {
         path: "people",
         loadComponent: () =>
-          import("./features/people/people.component").then(
+          import("./features/people/people/people.component").then(
             (m) => m.PeopleComponent,
           ),
       },
       {
         path: "brain",
         loadComponent: () =>
-          import("./features/brain/brain.component").then(
+          import("./features/brain/brain/brain.component").then(
             (m) => m.BrainComponent,
           ),
       },
       {
         path: "onboarding",
         loadComponent: () =>
-          import("./features/onboarding/onboarding.component").then(
+          import("./features/onboarding/onboarding/onboarding.component").then(
             (m) => m.OnboardingComponent,
           ),
       },
@@ -94,7 +94,7 @@ export const routes: Routes = [
         // onboarding gate when `!sharingChoiceMade && !accountStatus.loggedIn`.
         path: "welcome",
         loadComponent: () =>
-          import("./features/sharing/sharing-gateway.component").then(
+          import("./features/sharing/sharing-gateway/sharing-gateway.component").then(
             (m) => m.SharingGatewayComponent,
           ),
       },

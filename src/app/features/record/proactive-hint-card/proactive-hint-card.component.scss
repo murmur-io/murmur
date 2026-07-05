@@ -1,0 +1,69 @@
+.hint-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  animation: rise 320ms var(--transition) both;
+}
+.hint-ico {
+  font-size: 1.05rem;
+  line-height: 1;
+  flex: none;
+}
+.hint-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.hint-kind {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.hint-title {
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  line-height: 1.4;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.hint-open {
+  flex: none;
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.82rem;
+}
+.hint-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.hint-dismiss:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.hint-dismiss:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+    

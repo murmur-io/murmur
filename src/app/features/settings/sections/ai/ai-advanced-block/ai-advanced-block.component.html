@@ -1,0 +1,38 @@
+<div class="adv-wrap">
+  <button
+    type="button"
+    class="adv-toggle"
+    (click)="toggle()"
+    [attr.aria-expanded]="expanded()"
+  >
+    <svg
+      class="adv-chevron"
+      [class.is-open]="expanded()"
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M4 2l4 4-4 4"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+    ⚙ Advanced — per-feature overrides &amp; all engines
+  </button>
+
+  @if (expanded()) {
+    <div class="adv-body">
+      <!-- Block 1: every engine's connection card (keys, URLs, Test). -->
+      <app-ai-connection-cards />
+
+      <!-- Block 2: per-feature overrides (Ask / Notes / Live). -->
+      <app-ai-role-rows />
+    </div>
+  }
+</div>
+  

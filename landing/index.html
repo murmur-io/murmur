@@ -65,6 +65,27 @@
 
       --maxw: 1120px;
       color-scheme: dark;
+
+      /* Liquid Glass (mirrored from src/design-tokens/glass.css) */
+      --glass-border: rgba(255, 255, 255, 0.16);
+      --shell-glass-bg: linear-gradient(
+        160deg,
+        rgba(255, 255, 255, 0.10) 0%,
+        rgba(255, 255, 255, 0.035) 55%,
+        rgba(255, 255, 255, 0.065) 100%
+      );
+      --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.30),
+        inset 1px 0 0 rgba(255, 255, 255, 0.10),
+        inset -1px 0 0 rgba(255, 255, 255, 0.07),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.30),
+        inset 0 18px 38px -22px rgba(255, 255, 255, 0.16);
+      --shell-glass-blur: 44px;
+      --shell-glass-saturate: 210%;
+      --aurora-field:
+        radial-gradient(46% 38% at 16% 8%, rgba(110, 118, 255, 0.20), transparent 60%),
+        radial-gradient(42% 34% at 88% 14%, rgba(74, 196, 240, 0.11), transparent 62%),
+        radial-gradient(48% 46% at 78% 92%, rgba(157, 123, 255, 0.15), transparent 64%),
+        radial-gradient(40% 40% at 10% 96%, rgba(255, 122, 92, 0.08), transparent 60%);
     }
 
     /* Light theme — derived from the dark palette, same accent identity */
@@ -87,6 +108,24 @@
       --nav-bg: rgba(244, 244, 250, 0.80);
       --safe-text: #1e9e3a;
       --live-text: #d9532e;
+      --glass-border: rgba(255, 255, 255, 0.78);
+      --shell-glass-bg: linear-gradient(
+        160deg,
+        rgba(255, 255, 255, 0.60) 0%,
+        rgba(255, 255, 255, 0.38) 55%,
+        rgba(255, 255, 255, 0.52) 100%
+      );
+      --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 1),
+        inset 1px 0 0 rgba(255, 255, 255, 0.75),
+        inset -1px 0 0 rgba(255, 255, 255, 0.55),
+        inset 0 -1px 0 rgba(18, 18, 40, 0.09),
+        inset 0 18px 38px -22px rgba(255, 255, 255, 0.95);
+      --aurora-field:
+        radial-gradient(52% 44% at 10% 12%, rgba(110, 118, 255, 0.34), transparent 62%),
+        radial-gradient(40% 34% at 30% 0%, rgba(74, 196, 240, 0.26), transparent 62%),
+        radial-gradient(46% 40% at 92% 8%, rgba(157, 123, 255, 0.24), transparent 62%),
+        radial-gradient(50% 46% at 6% 88%, rgba(255, 122, 92, 0.18), transparent 62%),
+        radial-gradient(44% 40% at 88% 94%, rgba(110, 118, 255, 0.18), transparent 64%);
     }
     /* System theme follows the OS when it prefers light */
     @media (prefers-color-scheme: light) {
@@ -109,6 +148,24 @@
         --nav-bg: rgba(244, 244, 250, 0.80);
         --safe-text: #1e9e3a;
         --live-text: #d9532e;
+        --glass-border: rgba(255, 255, 255, 0.78);
+        --shell-glass-bg: linear-gradient(
+        160deg,
+          rgba(255, 255, 255, 0.60) 0%,
+          rgba(255, 255, 255, 0.38) 55%,
+          rgba(255, 255, 255, 0.52) 100%
+        );
+        --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 1),
+          inset 1px 0 0 rgba(255, 255, 255, 0.75),
+          inset -1px 0 0 rgba(255, 255, 255, 0.55),
+          inset 0 -1px 0 rgba(18, 18, 40, 0.09),
+          inset 0 18px 38px -22px rgba(255, 255, 255, 0.95);
+        --aurora-field:
+          radial-gradient(52% 44% at 10% 12%, rgba(110, 118, 255, 0.34), transparent 62%),
+          radial-gradient(40% 34% at 30% 0%, rgba(74, 196, 240, 0.26), transparent 62%),
+          radial-gradient(46% 40% at 92% 8%, rgba(157, 123, 255, 0.24), transparent 62%),
+          radial-gradient(50% 46% at 6% 88%, rgba(255, 122, 92, 0.18), transparent 62%),
+          radial-gradient(44% 40% at 88% 94%, rgba(110, 118, 255, 0.18), transparent 64%);
       }
     }
 
@@ -128,15 +185,14 @@
       transition: background-color .25s ease, color .25s ease;
     }
 
-    /* Ambient background glow — the "voice orb" bleeding through the ground */
+    /* The ambient aurora field the Liquid Glass chrome refracts — mirrored
+       from the app (edge-hugging blobs; punchy pastels in light mode). */
     body::before {
       content: "";
       position: fixed;
-      inset: 0;
-      background:
-        radial-gradient(680px 480px at 78% -6%, rgba(110, 118, 255, 0.22), transparent 60%),
-        radial-gradient(720px 520px at 6% 8%, rgba(157, 123, 255, 0.14), transparent 62%),
-        radial-gradient(900px 700px at 50% 118%, rgba(255, 122, 92, 0.08), transparent 60%);
+      inset: -10%;
+      background: var(--aurora-field);
+      filter: saturate(120%);
       pointer-events: none;
       z-index: 0;
     }
@@ -177,7 +233,7 @@
     .star-count { display: inline-flex; align-items: center; padding-left: 9px; margin-left: 1px; border-left: 1px solid var(--border-strong); color: var(--text-primary); font-weight: 700; font-variant-numeric: tabular-nums; }
 
     /* ── Theme switch (Light / Dark / System) ────────────────── */
-    .theme-switch { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: var(--radius-pill); background: var(--surface-raised); border: 1px solid var(--border); }
+    .theme-switch { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: var(--radius-pill); background: var(--surface-hover); border: 1px solid var(--glass-border); }
     .theme-switch button { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 0; background: transparent; color: var(--text-muted); border-radius: var(--radius-pill); cursor: pointer; transition: background .15s ease, color .15s ease; }
     .theme-switch button svg { width: 16px; height: 16px; }
     .theme-switch button:hover { color: var(--text-secondary); }
@@ -185,13 +241,21 @@
     @media (max-width: 480px) { .theme-switch { display: none; } }
 
     /* ── Nav ─────────────────────────────────────────────────── */
+    /* Floating liquid-glass pill (the app's Apple TV chrome, on the web) */
     header.nav {
-      position: sticky; top: 0; z-index: 40;
-      backdrop-filter: blur(14px);
-      background: var(--nav-bg);
-      border-bottom: 1px solid var(--border);
+      position: sticky; top: 12px; z-index: 40;
     }
-    .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+    .nav-inner {
+      display: flex; align-items: center; justify-content: space-between;
+      height: 60px;
+      padding: 0 18px;
+      border-radius: var(--radius-pill);
+      background: var(--shell-glass-bg);
+      -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      border: 1px solid var(--glass-border);
+      box-shadow: var(--shadow-md), var(--shell-glass-inner);
+    }
     .brand { display: flex; align-items: center; gap: 11px; font-weight: 600; font-size: 18px; letter-spacing: -0.03em; }
     .brand img { width: 30px; height: 30px; border-radius: 8px; }
     .nav-links { display: flex; align-items: center; gap: 28px; }
@@ -239,7 +303,7 @@
       box-shadow: var(--shadow-lg);
       overflow: hidden;
     }
-    .shot::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,0.06); pointer-events: none; }
+    .shot::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), inset 0 -1px 0 rgba(0,0,0,0.25); pointer-events: none; }
     .shot img { display: block; width: 100%; height: auto; }
     .shot-glow { position: relative; }
     .shot-glow::before {
@@ -264,7 +328,15 @@
     /* How it works — 3 steps */
     .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
     @media (max-width: 820px) { .steps { grid-template-columns: 1fr; } }
-    .step { background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 28px; }
+    .step {
+      background: var(--shell-glass-bg);
+      -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      padding: 28px;
+      box-shadow: var(--shell-glass-inner);
+    }
     .step-n { font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--accent-hover); letter-spacing: 0.05em; }
     .step h3 { font-size: 20px; margin: 12px 0 8px; }
     .step p { color: var(--text-secondary); font-size: 15px; }
@@ -278,7 +350,16 @@
     .privacy-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
     @media (max-width: 920px) { .privacy-grid { grid-template-columns: 1fr 1fr; } }
     @media (max-width: 620px) { .privacy-grid { grid-template-columns: 1fr; } }
-    .pcard { background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 26px; transition: border-color .2s, transform .2s; }
+    .pcard {
+      background: var(--shell-glass-bg);
+      -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+      box-shadow: var(--shell-glass-inner);
+      transition: border-color .2s, transform .2s;
+    }
     .pcard:hover { border-color: var(--accent-ring); transform: translateY(-3px); }
     .pcard .ic { width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-hover); margin-bottom: 16px; }
     .pcard.green .ic { background: var(--safe-soft); color: var(--safe-text); }
@@ -314,7 +395,16 @@
     .pricing { background: linear-gradient(180deg, transparent, rgba(110,118,255,0.04)); }
     .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; align-items: stretch; }
     @media (max-width: 920px) { .plans { grid-template-columns: 1fr; max-width: 460px; margin: 0 auto; } }
-    .plan { position: relative; display: flex; flex-direction: column; background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 32px 28px; }
+    .plan {
+      position: relative; display: flex; flex-direction: column;
+      background: var(--shell-glass-bg);
+      -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-xl);
+      padding: 32px 28px;
+      box-shadow: var(--shell-glass-inner);
+    }
     .plan.featured { border-color: var(--accent-ring); background: linear-gradient(180deg, rgba(110,118,255,0.10), var(--surface-raised)); box-shadow: var(--shadow-accent); }
     .plan.soon { opacity: 0.82; }
     .plan-badge { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 11.5px; font-weight: 700; padding: 5px 13px; border-radius: var(--radius-pill); letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; font-family: var(--font-mono); }
@@ -334,7 +424,17 @@
 
     /* ── Final CTA ───────────────────────────────────────────── */
     .cta-final { text-align: center; }
-    .cta-card { background: linear-gradient(135deg, rgba(110,118,255,0.14), rgba(157,123,255,0.08)); border: 1px solid var(--accent-ring); border-radius: var(--radius-xl); padding: 60px 32px; box-shadow: var(--shadow-md); }
+    .cta-card {
+      background:
+        linear-gradient(135deg, rgba(110,118,255,0.14), rgba(157,123,255,0.08)),
+        var(--shell-glass-bg);
+      -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-xl);
+      padding: 60px 32px;
+      box-shadow: var(--shadow-md), var(--shell-glass-inner);
+    }
     .cta-card h2 { font-size: clamp(28px, 4vw, 44px); line-height: 1.08; margin-bottom: 16px; }
     .cta-card p { color: var(--text-secondary); font-size: 18px; max-width: 30em; margin: 0 auto 30px; }
     .cta-actions { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
@@ -423,7 +523,7 @@
       </div>
       <div class="shot-glow">
         <div class="shot">
-          <img src="./assets/record-brain.png" alt="Asking Murmur's on-device assistant a question mid-meeting and getting a grounded answer with sources — while the recording keeps rolling" loading="eager" />
+          <img src="./assets/record-brain.jpg" alt="Asking Murmur's on-device assistant a question mid-meeting and getting a grounded answer with sources — while the recording keeps rolling" loading="eager" />
         </div>
       </div>
     </div>
@@ -550,7 +650,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional consent-gated web — off by default</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/ask.png" alt="Ask Your Vault — grounded Q&A across months of meetings, every claim linked to its source" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/ask.jpg" alt="Ask Your Vault — grounded Q&A across months of meetings, every claim linked to its source" loading="lazy" /></div>
       </div>
 
       <!-- Feature 2 -->
@@ -565,7 +665,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A floating recorder bar — record from anywhere (⌘⇧R)</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/transcript.png" alt="The merged Me / Others transcript, time-indexed" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/transcript.jpg" alt="The merged Me / Others transcript, time-indexed" loading="lazy" /></div>
       </div>
 
       <!-- Feature 3 -->
@@ -580,7 +680,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Action items can push to Apple Reminders</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/graph.png" alt="People & Projects knowledge graph, extracted automatically" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/graph.jpg" alt="People & Projects knowledge graph, extracted automatically" loading="lazy" /></div>
       </div>
 
       <!-- Feature 4 -->
@@ -595,7 +695,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> No proprietary format, ever</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/detail-note.png" alt="A structured note — summary, decisions, action items, quotes" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/detail-note.jpg" alt="A structured note — summary, decisions, action items, quotes" loading="lazy" /></div>
       </div>
     </div>
   </section>

@@ -1,0 +1,252 @@
+<section class="brain">
+  <!-- 1 — STATUS HEADER ------------------------------------------------- -->
+  <header class="b-head card">
+    <div class="b-head-top">
+      <div class="b-identity">
+        <span class="b-mark" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" width="24" height="24">
+            <path
+              d="M10 4.2c-1.9-1.6-5-.6-5 1.9 0 .5-1.2.9-1.2 2.6 0 1.1.8 1.6.8 2.3 0 1.9 2.1 3 4 2.3M10 4.2c1.9-1.6 5-.6 5 1.9 0 .5 1.2.9 1.2 2.6 0 1.1-.8 1.6-.8 2.3 0 1.9-2.1 3-4 2.3M10 4.2v11.4"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </span>
+        <div class="b-identity-text">
+          <h2 class="b-title">Brain</h2>
+          <p class="b-tagline">Everything your assistant can reason over.</p>
+        </div>
+      </div>
+
+      @if (overview(); as ov) {
+        <dl class="b-stats" aria-label="What’s in your brain">
+          <div class="b-stat">
+            <dd>{{ ov.meetingCount }}</dd>
+            <dt>Meetings</dt>
+          </div>
+          <span class="b-stat-sep" aria-hidden="true"></span>
+          <div class="b-stat">
+            <dd>{{ ov.documentCount }}</dd>
+            <dt>Documents</dt>
+          </div>
+          <span class="b-stat-sep" aria-hidden="true"></span>
+          <div class="b-stat">
+            <dd>{{ ov.noteCount }}</dd>
+            <dt>Notes</dt>
+          </div>
+        </dl>
+      } @else if (overviewError()) {
+        <p class="b-summary-state b-summary-err">
+          Couldn’t load the brain summary.
+        </p>
+      } @else {
+        <p class="b-summary-state">Loading the brain summary…</p>
+      }
+
+      <div class="b-head-side">
+        @if (modelMissing()) {
+          <a class="pill b-badge b-badge-action" routerLink="/settings">
+            <span class="b-badge-dot" aria-hidden="true"></span>
+            Enable AI search
+          </a>
+        } @else {
+          <span class="pill b-badge" [class.is-on]="semanticOn()">
+            <span class="b-badge-dot" aria-hidden="true"></span>
+            {{ semanticBadge() }}
+          </span>
+        }
+        <a class="btn btn-ghost b-ask" routerLink="/ask">
+          Ask
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+            <path
+              d="M5.5 3.5h7v7M12.5 3.5 4 12"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </a>
+      </div>
+    </div>
+
+    @if (nudge(); as msg) {
+      <div class="banner is-accent b-nudge" role="status">
+        <span class="b-nudge-glyph" aria-hidden="true"></span>
+        <span>{{ msg }} <a routerLink="/settings">Open Settings</a></span>
+      </div>
+    }
+  </header>
+
+  <!-- 2 — KNOWLEDGE SOURCES --------------------------------------------- -->
+  <section class="b-sources">
+    <header class="b-sec-head">
+      <div class="b-sec-text">
+        <h3 class="b-sec-title">Knowledge sources</h3>
+        <p class="b-sec-sub">
+          What the brain reasons over — your meetings, plus any documents and
+          notes you add.
+        </p>
+      </div>
+      <label class="b-folder">
+        <span class="b-folder-label">Folder</span>
+        <select
+          class="b-folder-select"
+          aria-label="Choose a folder"
+          [value]="selectedFolderId() ?? ''"
+          (change)="onFolderChange($event)"
+        >
+          @for (o of folderOptions(); track o.id) {
+            <option [value]="o.id">{{ o.label }}</option>
+          }
+        </select>
+        @if (addHint(); as h) {
+          <span class="b-add-hint">{{ h }}</span>
+        }
+      </label>
+    </header>
+
+    <div class="b-cards">
+      <app-brain-source-card
+        icon="meetings"
+        title="Meetings"
+        subtitle="Recorded and transcribed — added by recording."
+        [count]="overview()?.meetingCount ?? 0"
+        linkTo="/library"
+        linkLabel="Open meetings"
+      />
+
+      <app-brain-source-card
+        icon="documents"
+        title="Documents"
+        [subtitle]="
+          isAll()
+            ? 'Markdown / text files across your brain.'
+            : 'Markdown / text files you’ve added to this folder.'
+        "
+        [count]="documents().length"
+        [items]="documents()"
+        [expanded]="docsExpanded()"
+        [loading]="listLoading()"
+        [busy]="importing()"
+        [deletingId]="deletingId()"
+        [blocked]="selectedBlocked()"
+        addLabel="Add document"
+        [emptyLabel]="
+          isAll() ? 'No documents yet.' : 'No documents in this folder yet.'
+        "
+        (add)="pickAndImportDocument()"
+        (deleteItem)="removeItem($event)"
+        (toggleList)="docsExpanded.set(!docsExpanded())"
+      />
+
+      <app-brain-source-card
+        icon="notes"
+        title="Notes"
+        [subtitle]="
+          isAll()
+            ? 'Typed or pasted text across your brain.'
+            : 'Typed or pasted text you’ve added to this folder.'
+        "
+        [count]="notes().length"
+        [items]="notes()"
+        [expanded]="notesExpanded()"
+        [loading]="listLoading()"
+        [busy]="savingNote()"
+        [deletingId]="deletingId()"
+        [blocked]="selectedBlocked()"
+        addLabel="Add note"
+        [emptyLabel]="
+          isAll() ? 'No notes yet.' : 'No notes in this folder yet.'
+        "
+        (add)="openNoteEditor()"
+        (deleteItem)="removeItem($event)"
+        (toggleList)="notesExpanded.set(!notesExpanded())"
+      />
+    </div>
+
+    @if (listError()) {
+      <p class="empty b-list-err">{{ listError() }}</p>
+    }
+  </section>
+
+  <!-- 3 — CONNECTIONS (collapsible, demoted) ---------------------------- -->
+  <section class="b-conn">
+    <button
+      type="button"
+      class="b-conn-toggle"
+      [attr.aria-expanded]="connOpen()"
+      (click)="connOpen.set(!connOpen())"
+    >
+      <svg
+        class="b-conn-chevron"
+        [class.is-open]="connOpen()"
+        viewBox="0 0 16 16"
+        width="14"
+        height="14"
+        fill="none"
+        aria-hidden="true"
+      >
+        <path
+          d="M5.5 4l5 4-5 4"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span class="b-conn-title">Connections</span>
+      @if (nodeCount() > 0) {
+        <span class="count b-conn-count">{{ nodeCount() }}</span>
+      }
+      <span class="b-conn-sub">
+        How people and projects link across your brain.
+      </span>
+    </button>
+
+    @if (connOpen()) {
+      @if (graphLoading()) {
+        <div class="card state-card">
+          <p class="empty">Loading the map…</p>
+        </div>
+      } @else if (graphError()) {
+        <div class="card empty-state">
+          <span class="empty-mark" aria-hidden="true"></span>
+          <p class="empty-title">Couldn’t load the map</p>
+          <p class="empty">{{ graphError() }}</p>
+        </div>
+      } @else if (nodeCount() === 0) {
+        <div class="card empty-state">
+          <span class="empty-mark" aria-hidden="true"></span>
+          <p class="empty-title">The map builds itself as you record</p>
+          <p class="empty">
+            As Murmur recognises the people and projects you talk about,
+            they’ll appear here — connected by the meetings they share.
+          </p>
+        </div>
+      } @else {
+        @if (disclosure(); as msg) {
+          <div class="banner is-accent b-banner" role="status">
+            <span class="b-banner-glyph" aria-hidden="true"></span>
+            <span>{{ msg }}</span>
+          </div>
+        }
+        <app-brain-map [data]="graphData()" />
+      }
+    }
+  </section>
+
+  <!-- 4 — MEMORY: "what the brain knows about you" (collapsible) --------- -->
+  <app-brain-memory />
+
+  @if (noteEditorOpen()) {
+    <app-brain-note-editor
+      [saving]="savingNote()"
+      (save)="onSaveNote($event)"
+      (dismiss)="closeNoteEditor()"
+    />
+  }
+</section>
+  
