@@ -434,7 +434,8 @@ export class AiRoleRowsComponent {
   );
 
   /** The three override rows, derived from the store's role/catalog signals. */
-  readonly rows = computed<RoleRowVm[]>(() => [
+  readonly rows = computed<RoleRowVm[]>(() => {
+    const all: RoleRowVm[] = [
     this.buildRow(
       "notes",
       "Meeting notes",
@@ -471,7 +472,15 @@ export class AiRoleRowsComponent {
       this.store.roleLiveModelValue(),
       this.store.assistantInheritSummary(),
     ),
-  ]);
+    ];
+    // "Live during meetings" (@brain threads + the voice assistant) is HIDDEN under the Cloud posture:
+    // the voice assistant can't run there (it needs the on-device light engine, which Cloud turns off),
+    // and @brain threads just inherit the cloud default — so a per-feature override is moot. Shown in
+    // Hybrid / Fully local / Custom.
+    return this.store.posture() === "cloud"
+      ? all.filter((r) => r.role !== "live")
+      : all;
+  });
 
   private buildRow(
     role: RoleRowVm["role"],
