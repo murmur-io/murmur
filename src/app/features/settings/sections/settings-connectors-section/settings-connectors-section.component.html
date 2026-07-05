@@ -115,6 +115,247 @@
                 }
               </div>
             }
+
+            <!-- Jira connector -->
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Jira</span>
+                <span class="text-secondary toggle-sub">
+                  When enabled (and allowed below, with a site, email, and API
+                  token), the assistant can search your Jira issues and cite them.
+                  Answers stay grounded in your notes first; Jira results are added
+                  as “via Jira” sources.
+                </span>
+              </span>
+              <mur-toggle formControlName="jiraEnabled" />
+            </label>
+
+            @if (form.controls.jiraEnabled.value) {
+              <!-- Egress banner — make the new off-device path impossible to miss. -->
+              <p class="banner is-warning connector-egress" role="note">
+                <strong>This sends data off your Mac.</strong> When the brain runs a
+                Jira search, your (redacted) query and the matching issue summaries
+                pass through your configured AI model and your Jira Cloud site. Only
+                the query is sent to Jira — never your notes or transcript. Disable
+                this, or skip the consent below, to keep everything local.
+              </p>
+
+              <!-- Site + account (non-secret) -->
+              <fieldset class="connector-fieldset">
+                <legend>Jira site</legend>
+                <span class="row">
+                  <input
+                    type="text"
+                    formControlName="jiraBaseUrl"
+                    placeholder="https://your-site.atlassian.net"
+                    autocomplete="off"
+                  />
+                </span>
+                <span class="row">
+                  <input
+                    type="text"
+                    formControlName="jiraEmail"
+                    placeholder="you@company.com"
+                    autocomplete="off"
+                  />
+                </span>
+                <span class="field-help text-muted">
+                  Your Atlassian site URL and the account email paired with the API
+                  token below (used for Basic auth).
+                </span>
+              </fieldset>
+
+              <!-- BYO API token -->
+              <fieldset class="connector-fieldset">
+                <legend>Jira API token</legend>
+                <div class="key-status">
+                  <span class="text-secondary">Status</span>
+                  @if (hasJiraToken()) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Token set ✓
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Not set
+                    </span>
+                  }
+                </div>
+                <span class="row">
+                  <input
+                    type="password"
+                    [formControl]="jiraTokenControl"
+                    placeholder="Jira API token"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="saveJiraToken()"
+                    [disabled]="savingJiraToken()"
+                  >
+                    {{ savingJiraToken() ? "Saving…" : "Save token" }}
+                  </button>
+                </span>
+                <span class="field-help text-muted">
+                  Bring your own token — it's stored in your macOS Keychain, never
+                  logged, and never leaves with your notes.
+                </span>
+                @if (jiraTokenError(); as jkerr) {
+                  <p class="text-danger brain-error">{{ jkerr }}</p>
+                }
+              </fieldset>
+
+              <!-- One-time egress consent (mirrors the web-search UX) -->
+              <div class="privacy-section connector-consent">
+                <span class="privacy-section-label text-muted"
+                  >Allow Jira access</span
+                >
+                <p class="text-secondary privacy-note">
+                  Your search query leaves this device for your Jira Cloud site
+                  (redacted first). Until you allow this once, Jira search stays off
+                  and no query is ever sent.
+                </p>
+                @if (jiraConsented()) {
+                  <span class="pill is-success cloud-consent-pill">
+                    <span class="pill-dot"></span>
+                    Jira access allowed
+                  </span>
+                } @else {
+                  <div class="cloud-consent-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="allowJira()"
+                      [disabled]="jiraConsenting()"
+                    >
+                      @if (jiraConsenting()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Enabling…
+                      } @else {
+                        Allow Jira access (one-time consent)
+                      }
+                    </button>
+                    <span class="text-muted cloud-consent-hint">
+                      One-time. The brain works fully offline on your notes without
+                      it.
+                    </span>
+                  </div>
+                }
+                @if (jiraConsentError(); as jcerr) {
+                  <p class="text-danger privacy-note">{{ jcerr }}</p>
+                }
+              </div>
+            }
+
+            <!-- Slack connector -->
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Slack</span>
+                <span class="text-secondary toggle-sub">
+                  When enabled (and allowed below, with a user token), the assistant
+                  can search your Slack messages and cite them. Answers stay grounded
+                  in your notes first; Slack results are added as “via Slack” sources.
+                </span>
+              </span>
+              <mur-toggle formControlName="slackEnabled" />
+            </label>
+
+            @if (form.controls.slackEnabled.value) {
+              <!-- Egress banner — make the new off-device path impossible to miss. -->
+              <p class="banner is-warning connector-egress" role="note">
+                <strong>This sends data off your Mac.</strong> When the brain runs a
+                Slack search, your (redacted) query and the matching messages pass
+                through your configured AI model and your Slack workspace. Only the
+                query is sent to Slack — never your notes or transcript. Disable this,
+                or skip the consent below, to keep everything local.
+              </p>
+
+              <!-- BYO user token -->
+              <fieldset class="connector-fieldset">
+                <legend>Slack user token</legend>
+                <div class="key-status">
+                  <span class="text-secondary">Status</span>
+                  @if (hasSlackToken()) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Token set ✓
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Not set
+                    </span>
+                  }
+                </div>
+                <span class="row">
+                  <input
+                    type="password"
+                    [formControl]="slackTokenControl"
+                    placeholder="Slack user token (xoxp-…)"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="saveSlackToken()"
+                    [disabled]="savingSlackToken()"
+                  >
+                    {{ savingSlackToken() ? "Saving…" : "Save token" }}
+                  </button>
+                </span>
+                <span class="field-help text-muted">
+                  Paste a user token (xoxp-…) from a single-workspace Slack app with
+                  the search:read scope. It's stored in your macOS Keychain, never
+                  logged, and never leaves with your notes.
+                </span>
+                @if (slackTokenError(); as skerr) {
+                  <p class="text-danger brain-error">{{ skerr }}</p>
+                }
+              </fieldset>
+
+              <!-- One-time egress consent (mirrors the Jira UX) -->
+              <div class="privacy-section connector-consent">
+                <span class="privacy-section-label text-muted"
+                  >Allow Slack access</span
+                >
+                <p class="text-secondary privacy-note">
+                  Your search query leaves this device for your Slack workspace
+                  (redacted first). Until you allow this once, Slack search stays off
+                  and no query is ever sent.
+                </p>
+                @if (slackConsented()) {
+                  <span class="pill is-success cloud-consent-pill">
+                    <span class="pill-dot"></span>
+                    Slack access allowed
+                  </span>
+                } @else {
+                  <div class="cloud-consent-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="allowSlack()"
+                      [disabled]="slackConsenting()"
+                    >
+                      @if (slackConsenting()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Enabling…
+                      } @else {
+                        Allow Slack access (one-time consent)
+                      }
+                    </button>
+                    <span class="text-muted cloud-consent-hint">
+                      One-time. The brain works fully offline on your notes without
+                      it.
+                    </span>
+                  </div>
+                }
+                @if (slackConsentError(); as scerr) {
+                  <p class="text-danger privacy-note">{{ scerr }}</p>
+                }
+              </div>
+            }
           </div>
 </div>
   

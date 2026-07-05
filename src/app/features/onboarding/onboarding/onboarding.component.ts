@@ -13,13 +13,15 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import { hostIsLoopback } from "../../../core/loopback";
 import type { AppConfigDto, ProviderStatus } from "../../../core/models";
+import { BrainEnableCardComponent } from "../../brain/brain-enable-card/brain-enable-card.component";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
-type Step = "welcome" | "model" | "provider" | "vault" | "done";
+type Step = "welcome" | "model" | "provider" | "brain" | "vault" | "done";
 const STEPS: readonly Step[] = [
   "welcome",
   "model",
   "provider",
+  "brain",
   "vault",
   "done",
 ];
@@ -79,6 +81,7 @@ const SIZE_HINTS: Record<string, string> = {
   selector: "app-onboarding",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [BrainEnableCardComponent],
   templateUrl: "./onboarding.component.html",
   styleUrl: "./onboarding.component.scss",
 })
@@ -552,6 +555,16 @@ export class OnboardingComponent implements OnInit {
       // the snapshot so onboarding never resets them, both default off (no egress).
       webSearchEnabled: base?.webSearchEnabled ?? false,
       webSearchConsented: base?.webSearchConsented ?? false,
+      // brain2 connectors (Phase 2) — Jira toggle + preserve-only consent + non-secret
+      // site/email; round-trip the snapshot so onboarding never resets them (default off).
+      jiraEnabled: base?.jiraEnabled ?? false,
+      jiraConsented: base?.jiraConsented ?? false,
+      jiraBaseUrl: base?.jiraBaseUrl ?? "",
+      jiraEmail: base?.jiraEmail ?? "",
+      // brain2 connectors (Phase 3) — Slack toggle + preserve-only consent; round-trip
+      // the snapshot so onboarding never resets them (default off, no egress).
+      slackEnabled: base?.slackEnabled ?? false,
+      slackConsented: base?.slackConsented ?? false,
       // Opt-in claude-CLI env inheritance — round-trip the snapshot so onboarding never resets it.
       claudeCodeInheritEnv: base?.claudeCodeInheritEnv ?? false,
       // AI Gateway — the base URL is now wizard-editable (the gateway tile);

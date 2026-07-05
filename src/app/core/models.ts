@@ -204,6 +204,45 @@ export interface AppConfigDto {
    */
   webSearchConsented: boolean;
   /**
+   * brain2 connectors (Phase 2) — the JIRA connector MASTER toggle. NEW CLOUD EGRESS:
+   * when on (AND `jiraConsented` AND a base URL + email + API token are configured),
+   * the brain/Ask answer may send a REDACTED query off-device to the user's Jira Cloud
+   * site. A settable flag, round-tripped on every `save_config`. Default false.
+   * Mirrors Rust `AppConfigDto.jira_enabled`.
+   */
+  jiraEnabled: boolean;
+  /**
+   * brain2 connectors — one-time consent for the Jira egress. Like `webSearchConsented`,
+   * PRESERVE-ONLY on `save_config` (a normal save carries the current value back, never
+   * flips it) and granted SOLELY by the dedicated `consent_to_jira` command. Default
+   * false (fail-closed). Mirrors Rust `AppConfigDto.jira_consented`.
+   */
+  jiraConsented: boolean;
+  /**
+   * The Jira Cloud site base URL, e.g. `https://acme.atlassian.net` (non-secret).
+   * Settable, round-tripped on `save_config`. Default "". Mirrors Rust `AppConfigDto.jira_base_url`.
+   */
+  jiraBaseUrl: string;
+  /**
+   * The Atlassian account email paired with the API token for Basic auth (non-secret).
+   * Settable, round-tripped on `save_config`. Default "". Mirrors Rust `AppConfigDto.jira_email`.
+   */
+  jiraEmail: string;
+  /**
+   * brain2 connectors (Phase 3) — the SLACK connector MASTER toggle. NEW CLOUD EGRESS:
+   * when on (AND `slackConsented` AND a user token is configured), the brain/Ask answer
+   * may send a REDACTED query off-device to the user's Slack workspace. A settable flag,
+   * round-tripped on every `save_config`. Default false. Mirrors Rust `AppConfigDto.slack_enabled`.
+   */
+  slackEnabled: boolean;
+  /**
+   * brain2 connectors — one-time consent for the Slack egress. Like `jiraConsented`,
+   * PRESERVE-ONLY on `save_config` (a normal save carries the current value back, never
+   * flips it) and granted SOLELY by the dedicated `consent_to_slack` command. Default
+   * false (fail-closed). Mirrors Rust `AppConfigDto.slack_consented`.
+   */
+  slackConsented: boolean;
+  /**
    * Opt-in: pass the shell environment through to the `claude` CLI subprocess, so an env
    * `ANTHROPIC_API_KEY` (and proxy / base-url vars) reach it again — restores how older versions
    * authenticated the CLI before the env-hardening. Settable flag, round-tripped on `save_config`.
@@ -630,6 +669,20 @@ export interface NoteDto {
   providerId: string;
   markdown: string;
   exportedPath: string | null;
+}
+
+/**
+ * One deterministic note-verify finding: a ticket claim in the note checked against LIVE Jira.
+ * Mirrors Rust `crate::verify::VerifyFinding`. NOTE the serde casing — `Verdict` derives
+ * `#[serde(rename_all = "lowercase")]`, so `Verdict::NotFound` serializes as `"notfound"`
+ * (NOT `"not_found"`); keep this union in lockstep with the backend enum.
+ */
+export interface VerifyFindingDto {
+  lineNo: number;
+  key: string;
+  verdict: "confirmed" | "notfound" | "conflict";
+  detail: string;
+  url: string;
 }
 
 export interface StartResult {

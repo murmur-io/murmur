@@ -249,6 +249,37 @@ pub struct AppConfigDto {
     /// neither grant nor clear web-search egress consent. `#[serde(default)]` = false (fail-closed).
     #[serde(default)]
     pub web_search_consented: bool,
+    /// brain2 connectors (Phase 2) — the JIRA master toggle. Settable from the DTO (the Settings UI
+    /// owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`), so a
+    /// partial/older save can never silently enable it. Even ON, the connector is exposed only once
+    /// `jira_consented` is granted AND a base URL + email + token are configured.
+    #[serde(default)]
+    pub jira_enabled: bool,
+    /// brain2 connectors — one-time JIRA egress consent. PRESERVE-ONLY on this DTO, exactly like
+    /// `web_search_consented`: `get_config` carries the current value OUT (so the FE can show consent
+    /// status), but `dto_to_config` IGNORES the incoming value and PRESERVES the stored one. The ONLY
+    /// mutator is the dedicated `consent_to_jira` command. `#[serde(default)]` = false (fail-closed).
+    #[serde(default)]
+    pub jira_consented: bool,
+    /// The Jira Cloud site base URL (non-secret). Settable from the DTO. Default `""` (unset).
+    #[serde(default)]
+    pub jira_base_url: String,
+    /// The Atlassian account email paired with the token for Basic auth (non-secret). Settable from
+    /// the DTO. Default `""` (unset).
+    #[serde(default)]
+    pub jira_email: String,
+    /// brain2 connectors (Phase 3) — the SLACK master toggle. Settable from the DTO (the Settings UI
+    /// owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`), so a
+    /// partial/older save can never silently enable it. Even ON, the connector is exposed only once
+    /// `slack_consented` is granted AND a user token is configured.
+    #[serde(default)]
+    pub slack_enabled: bool,
+    /// brain2 connectors — one-time SLACK egress consent. PRESERVE-ONLY on this DTO, exactly like
+    /// `jira_consented`: `get_config` carries the current value OUT (so the FE can show consent
+    /// status), but `dto_to_config` IGNORES the incoming value and PRESERVES the stored one. The ONLY
+    /// mutator is the dedicated `consent_to_slack` command. `#[serde(default)]` = false (fail-closed).
+    #[serde(default)]
+    pub slack_consented: bool,
     /// Opt-in: inherit the shell environment into the `claude` CLI subprocess (restores the older
     /// behavior where an env `ANTHROPIC_API_KEY` reached the CLI). Settable from the DTO (the Settings
     /// UI owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`) = the
@@ -1182,6 +1213,121 @@ pub fn update_note(
         meeting_id,
         provider_id: existing.provider_id,
         markdown,
+        exported_path: existing.exported_path,
+    })
+}
+
+/// VERIFY PASS (read-only): extract Jira issue keys from the meeting's note and check each against
+/// LIVE Jira. GATED: sealed-not-unlocked meetings refuse (a verify against a blanked note would be
+/// nonsense AND a read-gate bypass). Consent-gated: rides the Jira connector's enable+consent+key
+/// gate (fail-closed `NeedsConsent` maps to `AppError::Unavailable`). NEVER called proactively —
+/// FE-invoked only. Findings are computed against the note WITH OLD MARKERS STRIPPED so line
+/// numbers line up with `apply_verify_markers`' post-strip numbering.
+#[tauri::command]
+pub async fn verify_note_sources(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::verify::VerifyFinding>, AppError> {
+    verify_note_sources_inner(state.inner(), meeting_id).await
+}
+
+pub(crate) async fn verify_note_sources_inner(
+    state: &AppState,
+    meeting_id: String,
+) -> Result<Vec<crate::verify::VerifyFinding>, AppError> {
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to verify the note".into(),
+        ));
+    }
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    // Strip our own old markers so extraction/judgment sees the canonical note lines.
+    let stripped = crate::verify::apply_verify_markers(&note.markdown, &[]);
+    let keys = crate::verify::extract_issue_keys(&stripped);
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Other(anyhow::anyhow!("config lock")))?
+        .clone();
+    let registry = crate::connectors::ConnectorRegistry::build(&config);
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut findings = Vec::with_capacity(keys.len());
+    for (line_no, key) in keys {
+        let snap = registry.jira_lookup(&key).await.map_err(AppError::from)?;
+        let line_text = lines.get(line_no - 1).copied().unwrap_or("");
+        let (verdict, detail) = crate::verify::judge(line_text, &key, snap.as_ref());
+        let url = snap.map(|s| s.url).unwrap_or_default();
+        findings.push(crate::verify::VerifyFinding {
+            line_no,
+            key,
+            verdict,
+            detail,
+            url,
+        });
+    }
+    Ok(findings)
+}
+
+/// Apply verify markers to the note (WRITE — same gate + save/re-export tail as `update_note`).
+/// Takes the findings the user just reviewed in the panel; validates every key's strict shape.
+#[tauri::command]
+pub fn apply_note_verify_markers(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    findings: Vec<crate::verify::VerifyFinding>,
+) -> Result<NoteDto, AppError> {
+    apply_note_verify_markers_inner(state.inner(), meeting_id, findings)
+}
+
+pub(crate) fn apply_note_verify_markers_inner(
+    state: &AppState,
+    meeting_id: String,
+    findings: Vec<crate::verify::VerifyFinding>,
+) -> Result<NoteDto, AppError> {
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to edit the note".into(),
+        ));
+    }
+    for f in &findings {
+        let ok = crate::verify::extract_issue_keys(&f.key)
+            .first()
+            .map(|(_, k)| k == &f.key)
+            .unwrap_or(false);
+        if !ok {
+            return Err(AppError::InvalidArg("invalid issue key in findings".into()));
+        }
+    }
+    let existing = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let marked = crate::verify::apply_verify_markers(&existing.markdown, &findings);
+    // Save + re-export — the exact `update_note` tail, with `marked`.
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: existing.provider_id.clone(),
+        markdown: marked.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
+    })?;
+    if let Some(path) = existing.exported_path.as_deref() {
+        crate::export::overwrite_note(std::path::Path::new(path), &marked)?;
+    }
+    Ok(NoteDto {
+        meeting_id,
+        provider_id: existing.provider_id,
+        markdown: marked,
         exported_path: existing.exported_path,
     })
 }
@@ -3803,6 +3949,72 @@ pub fn consent_to_web_search(state: State<'_, AppState>) -> Result<(), AppError>
     Ok(())
 }
 
+/// One-time Jira egress consent — the ONLY way `jira_consented` flips true. Persists the flag AND
+/// updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the jira tool
+/// (provided Jira is also enabled + configured + a token is stored). Idempotent.
+#[tauri::command]
+pub fn consent_to_jira(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_jira_consent(&state.db)?;
+    Ok(())
+}
+
+/// Store/replace the BYO Jira API token in the Keychain (account "jira_api_token"). An empty input
+/// clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
+#[tauri::command]
+pub fn set_jira_token(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return secrets::delete_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT);
+    }
+    secrets::set_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT, key.trim())
+}
+
+/// Whether a Jira token is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_jira_token() -> Result<bool, AppError> {
+    Ok(
+        secrets::get_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT)?
+            .filter(|k| !k.trim().is_empty())
+            .is_some(),
+    )
+}
+
+/// One-time Slack egress consent — the ONLY way `slack_consented` flips true. Persists the flag AND
+/// updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the slack tool
+/// (provided Slack is also enabled + a token is stored). Idempotent.
+#[tauri::command]
+pub fn consent_to_slack(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_slack_consent(&state.db)?;
+    Ok(())
+}
+
+/// Store/replace the BYO Slack user token in the Keychain (account "slack_user_token"). An empty
+/// input clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
+#[tauri::command]
+pub fn set_slack_token(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return secrets::delete_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT);
+    }
+    secrets::set_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT, key.trim())
+}
+
+/// Whether a Slack token is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_slack_token() -> Result<bool, AppError> {
+    Ok(
+        secrets::get_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT)?
+            .filter(|k| !k.trim().is_empty())
+            .is_some(),
+    )
+}
+
 fn config_to_dto(c: &AppConfig) -> AppConfigDto {
     AppConfigDto {
         provider_id: c.provider_id.clone(),
@@ -3851,6 +4063,16 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
         // in `dto_to_config`).
         web_search_consented: c.web_search_consented,
+        jira_enabled: c.jira_enabled,
+        // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
+        // in `dto_to_config`).
+        jira_consented: c.jira_consented,
+        jira_base_url: c.jira_base_url.clone(),
+        jira_email: c.jira_email.clone(),
+        slack_enabled: c.slack_enabled,
+        // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
+        // in `dto_to_config`).
+        slack_consented: c.slack_consented,
         claude_code_inherit_env: c.claude_code_inherit_env,
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
@@ -3997,6 +4219,23 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // live value (BLK-4 mirror). Only `consent_to_web_search` may flip it, so a settings save can
         // neither grant nor clear web-search egress consent.
         web_search_consented: current.web_search_consented,
+        // brain2 connectors (Phase 2): the Jira master toggle + non-secret base URL/email ARE settable
+        // from the DTO (Settings owns them). An omitted toggle already defaulted to OFF on the DTO, so
+        // a partial save can't enable it.
+        jira_enabled: d.jira_enabled,
+        // brain2 connectors (NEW EGRESS CLASS): consent is NEVER set from the DTO — preserved from the
+        // live value (BLK-4 mirror). Only `consent_to_jira` may flip it, so a settings save can
+        // neither grant nor clear Jira egress consent.
+        jira_consented: current.jira_consented,
+        jira_base_url: d.jira_base_url,
+        jira_email: d.jira_email,
+        // brain2 connectors (Phase 3): the Slack master toggle IS settable from the DTO (Settings owns
+        // it). An omitted toggle already defaulted to OFF on the DTO, so a partial save can't enable it.
+        slack_enabled: d.slack_enabled,
+        // brain2 connectors (NEW EGRESS CLASS): consent is NEVER set from the DTO — preserved from the
+        // live value (BLK-4 mirror). Only `consent_to_slack` may flip it, so a settings save can
+        // neither grant nor clear Slack egress consent.
+        slack_consented: current.slack_consented,
         // Opt-in env inheritance for the `claude` CLI IS settable from the DTO (the Settings UI owns
         // the toggle). Default OFF on the DTO (`#[serde(default)]`), so a partial/older save can never
         // silently enable it. Even ON, the DB keys are never inherited (claude_code.rs `harden_env`).
@@ -10095,6 +10334,74 @@ mod lifecycle_tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// PHASE-4 lock gate (RED-before-GREEN): `verify_note_sources` + `apply_note_verify_markers` on a
+    /// SEALED-and-not-session-unlocked meeting MUST refuse with `AppError::Locked` BEFORE any note
+    /// read / connector egress — a locked note can neither be verified nor marker-written. Runs with
+    /// NO Jira configured, so once session-unlocked the verify falls through to the fail-closed
+    /// connector gate (`Unavailable`), proving `Locked` was the FIRST gate, not a downstream error.
+    #[test]
+    fn verify_commands_refuse_a_sealed_meeting() {
+        let state = build_state("verify-lockgate");
+        make_open_folder(&state.db, "f-vlock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vlock".to_string(),
+                started_at: "2026-07-05T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-vlock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vlock".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-05T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-vlock", Some("f-vlock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-vlock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: both commands fail closed with Locked.
+        let e1 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
+        assert!(matches!(e1, AppError::Locked(_)), "verify must fail Locked, got: {e1:?}");
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::NotFound,
+            detail: "PROJ-1 not found in Jira".into(),
+            url: String::new(),
+        };
+        let e2 =
+            apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding]).unwrap_err();
+        assert!(matches!(e2, AppError::Locked(_)), "apply must fail Locked, got: {e2:?}");
+
+        // Session-unlock → the lock gate passes; verify now falls to the fail-closed connector gate
+        // (no Jira configured ⇒ jira_lookup NeedsConsent ⇒ Unavailable), proving Locked was the gate.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-vlock".to_string());
+        let e3 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
+        assert!(
+            matches!(e3, AppError::Unavailable(_)),
+            "past the lock gate, an unconfigured Jira verify fails Unavailable, got: {e3:?}"
+        );
     }
 
     /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked

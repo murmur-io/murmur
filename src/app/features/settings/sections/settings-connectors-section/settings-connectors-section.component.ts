@@ -29,11 +29,45 @@ export class SettingsConnectorsSectionComponent {
   readonly webConsenting = this.store.webConsenting;
   readonly webConsentError = this.store.webConsentError;
 
+  // brain2 connectors (Phase 2) — Jira.
+  readonly jiraTokenControl = this.store.jiraTokenControl;
+  readonly hasJiraToken = this.store.hasJiraToken;
+  readonly savingJiraToken = this.store.savingJiraToken;
+  readonly jiraTokenError = this.store.jiraTokenError;
+  readonly jiraConsented = this.store.jiraConsented;
+  readonly jiraConsenting = this.store.jiraConsenting;
+  readonly jiraConsentError = this.store.jiraConsentError;
+
+  // brain2 connectors (Phase 3) — Slack.
+  readonly slackTokenControl = this.store.slackTokenControl;
+  readonly hasSlackToken = this.store.hasSlackToken;
+  readonly savingSlackToken = this.store.savingSlackToken;
+  readonly slackTokenError = this.store.slackTokenError;
+  readonly slackConsented = this.store.slackConsented;
+  readonly slackConsenting = this.store.slackConsenting;
+  readonly slackConsentError = this.store.slackConsentError;
+
   saveWebKey(): void {
     void this.store.saveWebKey();
   }
 
   allowWebSearch(): void {
     void this.store.allowWebSearch();
+  }
+
+  saveJiraToken(): void {
+    void this.store.saveJiraToken();
+  }
+
+  allowJira(): void {
+    void this.store.allowJira();
+  }
+
+  saveSlackToken(): void {
+    void this.store.saveSlackToken();
+  }
+
+  allowSlack(): void {
+    void this.store.allowSlack();
   }
 }
