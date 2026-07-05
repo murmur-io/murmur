@@ -97,6 +97,22 @@ pub(crate) fn hkdf_expand32(ikm: &[u8], salt: Option<&[u8]>, info: &[u8]) -> Res
     Ok(out)
 }
 
+/// AAD binding the AT-REST wrap of a retained mode-B note key (NK) under the account MK. Domain-
+/// separated + share-scoped, so a wrapped NK cannot be lifted onto a different share row and is
+/// independent of the per-recipient HPKE grant. The retained NK is wrapped under MK (NOT merely the
+/// whole-DB SQLCipher DEK), so a re-locked session can no longer decrypt an already-shared envelope
+/// (CK/MK protects even while the DB is open); only `share_rewrap_pending` — which holds the MK
+/// session — unwraps it.
+pub(crate) fn outbound_nk_at_rest_aad(share_id: &str) -> String {
+    format!("murmur-wrap/v1:outbound-nk-at-rest|{share_id}")
+}
+
+/// Seal a 32-byte key under `key` bound to `aad` (the inverse of [`unwrap_key32`]) → the AES-256-GCM
+/// cell `nonce||ct||tag`. Used to wrap a retained NK under the account MK before it is persisted.
+pub(crate) fn wrap_key32(key: &[u8; 32], secret: &[u8; 32], aad: &[u8]) -> Result<Vec<u8>> {
+    murmur_protocol::cell::seal(key, secret, aad).map_err(map_proto)
+}
+
 /// Open a cell known to wrap a 32-byte key, returning it in zeroizing memory. The intermediate
 /// plaintext `Vec` is itself zeroized. Fails closed on any AEAD/AAD mismatch.
 pub(crate) fn unwrap_key32(key: &[u8; 32], cell_bytes: &[u8], aad: &[u8]) -> Result<Key32> {
@@ -164,6 +180,40 @@ mod tests {
         assert!(open_content(&nk, &cell, "share-2", 1).is_err());
         // Wrong key fails closed.
         assert!(open_content(&random_key32().unwrap(), &cell, "share-1", 1).is_err());
+    }
+
+    /// #1 (0.7 security fast-follow): the retained mode-B NK is wrapped under the account MK (with a
+    /// share-scoped AAD) before persist, and unwraps byte-identical only under the SAME MK + share_id.
+    /// A wrong MK, a wrong share_id (AAD swap), or a tampered cell all fail CLOSED — so a re-locked
+    /// session (no MK) can no longer decrypt an already-shared envelope from the retained blob.
+    #[test]
+    fn retained_nk_wraps_under_mk_and_round_trips_byte_identical() {
+        let mk = random_key32().unwrap();
+        let nk = random_key32().unwrap();
+        let share_id = "share-nk-1";
+        let aad = outbound_nk_at_rest_aad(share_id);
+
+        let wrapped = wrap_key32(&mk, &nk, aad.as_bytes()).unwrap();
+        // The wrapped blob never contains the raw NK bytes.
+        assert!(
+            !wrapped.windows(32).any(|w| w == &nk[..]),
+            "the wrapped NK must not leak the raw key"
+        );
+
+        // Correct MK + share_id → byte-identical NK back.
+        let back = unwrap_key32(&mk, &wrapped, aad.as_bytes()).unwrap();
+        assert_eq!(&*back, &*nk);
+
+        // Wrong MK → fails closed (a re-locked session with no MK cannot unwrap).
+        assert!(unwrap_key32(&random_key32().unwrap(), &wrapped, aad.as_bytes()).is_err());
+        // Wrong share_id (AAD swap onto another share row) → fails closed.
+        let other = outbound_nk_at_rest_aad("share-nk-2");
+        assert!(unwrap_key32(&mk, &wrapped, other.as_bytes()).is_err());
+        // Tampered cell → fails closed.
+        let mut tampered = wrapped.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(unwrap_key32(&mk, &tampered, aad.as_bytes()).is_err());
     }
 
     #[test]
