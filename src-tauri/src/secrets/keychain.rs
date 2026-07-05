@@ -852,6 +852,15 @@ impl MacKekStore {
 /// numeric status + context — never the key value — so it is safe to log under the no-secret rule.
 #[cfg(target_os = "macos")]
 fn map_osstatus(ctx: &str, status: core_foundation::base::OSStatus) -> AppError {
+    // Every data-protection-keychain failure funnels through here — trace it (ctx + raw OSStatus
+    // only, NEVER key material) so a field failure on a signed build is diagnosable from
+    // `murmur.log` instead of vanishing into a generic FE toast (the pre-0.7.3 blind spot).
+    tracing::warn!(
+        target: "secrets",
+        context = %ctx,
+        osstatus = status,
+        "data-protection keychain operation failed"
+    );
     if status == sec_consts::ERR_SEC_INTERACTION_NOT_ALLOWED {
         // The keychain is locked / no UI context — treat as a denied access, recoverable.
         return AppError::KeychainDenied(format!("{ctx}: OSStatus {status}"));
