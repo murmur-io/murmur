@@ -27,6 +27,13 @@
   color: var(--text-primary);
   font-weight: 550;
 }
+/* Honest name-masking caveat — aligned under the cloud line, calm. */
+.strip-subnote {
+  margin: 0;
+  padding-left: calc(8px + var(--space-2));
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
 .strip-dot {
   width: 8px;
   height: 8px;

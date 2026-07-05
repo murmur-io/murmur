@@ -1,9 +1,9 @@
 <div class="card posture-card">
   <!-- Intro header — frames the section before the posture chooser. -->
   <div class="posture-head-copy">
-    <h3>What Murmur uses</h3>
+    <h3>Where your AI runs</h3>
     <p class="text-secondary posture-intro">
-      One choice powers everything Murmur writes; tune individual features under Advanced.
+      Pick how much runs on this Mac. Everything below adapts to your choice — no jargon to untangle.
     </p>
   </div>
 
@@ -60,7 +60,7 @@
       >
         <span class="posture-opt-title">Cloud</span>
         <span class="posture-opt-sub text-muted">
-          Your Default AI does everything
+          Your Default engine does everything
         </span>
       </button>
       <button
@@ -72,7 +72,7 @@
       >
         <span class="posture-opt-title">Hybrid ⭐</span>
         <span class="posture-opt-sub text-muted">
-          Cloud notes + on-device reactions
+          Cloud notes + realtime reactions on this Mac
         </span>
       </button>
       <button
@@ -90,6 +90,18 @@
     </div>
 
     <!--
+      Plain-language meaning of the SELECTED posture (keyed on posture()),
+      so the choice reads in words, not jargon. Shown for every posture
+      incl. the derived "custom" state; hidden pre-load (null).
+    -->
+    @if (postureMeaning(); as meaning) {
+      <p class="posture-meaning">
+        <span class="posture-meaning-lead">{{ meaning.lead }}</span>
+        {{ meaning.body }}
+      </p>
+    }
+
+    <!--
       Contextual state area — replaces the old static field-help and the
       Brain Live enablement card. Shows either the pending-download
       progress (Cancel available) or the committed-posture summary.
@@ -101,9 +113,55 @@
       neededModels() in the pending branch.
     -->
     <div class="posture-state">
-      @if (pendingPosture(); as pend) {
+      @if (pendingConfirm(); as confirm) {
+        <!--
+          CONFIRM step (opt-in): the picked posture needs an on-device model, so
+          we ASK before fetching — what model, how big, what it does + a button.
+          A multi-GB download never starts on a single tap.
+        -->
+        <p class="posture-confirm-title">
+          {{ pendingLabel(confirm) }} needs
+          {{ confirmModels().length > 1 ? "models" : "a model" }} on your Mac
+        </p>
+        @for (n of confirmModels(); track n.role) {
+          <span class="pill" [class.is-success]="n.model?.downloaded">
+            <span class="pill-dot"></span>{{ n.role === "notes" ? "Notes &amp; Ask" : "Reactions" }}: {{ n.model?.name ?? "—" }}@if (n.model) { · {{ sizeLabel(n.model.approxSizeBytes) }} }@if (n.model?.downloaded) { ✓ ready }
+          </span>
+        }
+        <span class="text-secondary posture-confirm-copy">
+          {{ confirmDescription(confirm) }}
+        </span>
+        @if (confirmDownloadBytes() > 0) {
+          <span class="text-muted brain-live-note">
+            One-time {{ sizeLabel(confirmDownloadBytes()) }} download from Hugging
+            Face — it stays on this Mac.
+          </span>
+        }
+        @if (!brainLiveRamOk()) {
+          <span class="brain-live-ram-warn">
+            ⚠ Your Mac may not have enough RAM to run this smoothly alongside
+            recording.
+          </span>
+        }
+        <div class="posture-confirm-actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="confirmPostureDownload()"
+          >
+            Download &amp; enable {{ pendingLabel(confirm) }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="cancelPendingPosture()"
+          >
+            Cancel
+          </button>
+        </div>
+      } @else if (pendingPosture()) {
         <p class="text-secondary">
-          {{ pendingLabel(pend) }} — downloading on-device models…
+          {{ downloadingLabel() }} — downloading on-device models…
         </p>
         @if (brainDownloadingId()) {
           <div class="semantic-progress" role="status">
@@ -129,7 +187,6 @@
           Staying on your current setup until it's ready.
         </span>
       } @else {
-        <p class="text-secondary posture-now">{{ postureStateLine() }}</p>
         @for (n of neededModels(); track n.role) {
           <span class="pill" [class.is-success]="n.model?.downloaded">
             <span class="pill-dot"></span>{{ n.role === "notes" ? "Notes & Ask" : "Reactions" }}: {{ n.model?.name ?? "—" }}{{ n.model?.downloaded ? " ✓" : "" }}

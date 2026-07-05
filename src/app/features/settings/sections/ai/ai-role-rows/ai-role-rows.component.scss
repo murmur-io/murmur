@@ -47,6 +47,25 @@
   background: var(--surface-input);
   border: 1px solid var(--border-subtle);
 }
+/* Flash when the map's "Change" scrolls to this row (accent ring pulse). */
+.role-row.hl {
+  animation: role-hl 1.6s ease;
+  border-color: var(--accent);
+}
+@keyframes role-hl {
+  0%,
+  100% {
+    box-shadow: none;
+  }
+  25% {
+    box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .role-row.hl {
+    animation: none;
+  }
+}
 .role-row-head {
   display: flex;
   align-items: baseline;

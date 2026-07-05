@@ -18,6 +18,12 @@
           Not set up
         </span>
       }
+      @if (card().inUse) {
+        <span class="pill conn-inuse">
+          <span class="pill-dot"></span>
+          In use now
+        </span>
+      }
     </div>
     <div class="conn-actions">
       <button
@@ -61,6 +67,11 @@
         : "On this Mac — nothing leaves"
     }}
   </span>
+  @if (card().id === "ollama") {
+    <span class="conn-reason text-muted">
+      Your own local model server — separate from the built-in models.
+    </span>
+  }
   @if (unavailableReason(); as reason) {
     <span class="conn-reason text-muted">{{ reason }}</span>
   }

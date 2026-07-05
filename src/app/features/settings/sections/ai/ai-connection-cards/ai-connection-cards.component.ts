@@ -5,11 +5,12 @@ import {
   inject,
   signal,
 } from "@angular/core";
-import { SettingsStore } from "../../../settings.store";
+import { BRAIN_ENGINE_ID, SettingsStore } from "../../../settings.store";
 import {
   AiConnectionCardComponent,
   type ConnectionCardVm,
 } from "../ai-connection-card/ai-connection-card.component";
+import { BrainEngineCardComponent } from "../brain-engine-card/brain-engine-card.component";
 
 /** One selectable connection (implicit singleton — no named registry yet). */
 interface ConnectionDef {
@@ -43,7 +44,7 @@ const CONNECTIONS: readonly ConnectionDef[] = [
   selector: "app-ai-connection-cards",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AiConnectionCardComponent],
+  imports: [AiConnectionCardComponent, BrainEngineCardComponent],
   templateUrl: "./ai-connection-cards.component.html",
   styleUrl: "./ai-connection-cards.component.scss",
 })
@@ -56,24 +57,79 @@ export class AiConnectionCardsComponent {
   /** True while a Test probe is in flight — disables every Test button. */
   readonly testing = signal(false);
 
-  /** Cards for the "On this Mac" group — Ollama, while its URL is loopback. */
-  readonly localCards = computed(() => this.buildCards(false));
+  /** Reveal the engines outside the current posture's lane (default: collapsed). */
+  readonly showAll = signal(false);
 
-  /** Cards for the "Cloud (redacted first)" group — everything else. */
-  readonly cloudCards = computed(() => this.buildCards(true));
+  readonly posture = this.store.posture;
+  private readonly inUse = this.store.inUseConnections;
 
-  private buildCards(cloud: boolean): ConnectionCardVm[] {
+  /** The built-in on-device engine is "in use now" when the posture routes to it. */
+  readonly brainInUse = computed(() => this.inUse().has(BRAIN_ENGINE_ID));
+
+  /** The built-in engine belongs to every posture's lane except pure Cloud. */
+  readonly brainShown = computed(
+    () =>
+      this.posture() !== "cloud" ||
+      this.brainInUse() ||
+      this.showAll(),
+  );
+
+  /** Every connection card VM, with its live group + "in use now" flag. */
+  private readonly allCards = computed<ConnectionCardVm[]>(() => {
     const statuses = this.store.providers();
     const expanded = this._expanded();
     const ollamaRemote = this.store.ollamaIsRemote();
-    return CONNECTIONS.filter((c) =>
-      c.id === "ollama" ? ollamaRemote === cloud : cloud,
-    ).map((c) => ({
-      ...c,
-      status: statuses.find((p) => p.id === c.id) ?? null,
-      expanded: expanded.has(c.id),
-      cloud,
-    }));
+    const inUse = this.inUse();
+    return CONNECTIONS.map((c) => {
+      const cloud = c.id === "ollama" ? ollamaRemote : true;
+      return {
+        ...c,
+        status: statuses.find((p) => p.id === c.id) ?? null,
+        expanded: expanded.has(c.id),
+        cloud,
+        inUse: inUse.has(c.id),
+      };
+    });
+  });
+
+  /**
+   * Is this connection part of the current posture's default lane? Cloud
+   * providers belong to every posture except Fully local; Ollama (a BYO local
+   * server) only to Fully local / Custom. An engine actually IN USE is always
+   * shown, so the active engine can never be hidden behind "Show all".
+   */
+  private relevant(id: string): boolean {
+    if (this.inUse().has(id)) return true;
+    const p = this.posture();
+    if (id === "ollama") return p === "fully_local" || p === "custom";
+    return p !== "fully_local";
+  }
+
+  /** On-this-Mac cards (loopback Ollama) inside the posture's lane, or all when expanded. */
+  readonly macCardsShown = computed(() =>
+    this.allCards().filter(
+      (c) => !c.cloud && (this.relevant(c.id) || this.showAll()),
+    ),
+  );
+
+  /** Cloud cards inside the posture's lane, or all when expanded. */
+  readonly cloudCardsShown = computed(() =>
+    this.allCards().filter(
+      (c) => c.cloud && (this.relevant(c.id) || this.showAll()),
+    ),
+  );
+
+  /** How many engines sit OUTSIDE the current posture's lane (0 → no toggle). */
+  readonly hiddenCount = computed(() => {
+    const hiddenConns = this.allCards().filter(
+      (c) => !this.relevant(c.id),
+    ).length;
+    const brainHidden = this.posture() === "cloud" && !this.brainInUse() ? 1 : 0;
+    return hiddenConns + brainHidden;
+  });
+
+  toggleShowAll(): void {
+    this.showAll.update((v) => !v);
   }
 
   toggleConfigure(id: string): void {

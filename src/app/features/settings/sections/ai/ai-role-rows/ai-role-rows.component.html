@@ -26,35 +26,42 @@
   </button>
 
   @if (expanded()) {
-    <div class="role-rows">
+    <div class="role-rows" #rolesContainer>
       @for (row of rows(); track row.role) {
-        <div class="role-row">
+        <div class="role-row" [attr.data-role]="row.role">
           <div class="role-row-head">
             <span class="role-title">{{ row.title }}</span>
             <span class="role-what text-muted">{{ row.what }}</span>
           </div>
 
           <!--
-            The Notes row deliberately offers NO Local/Off: notes, digests,
-            briefs, recipes and the graph are SummarizerProvider surfaces,
-            and the backend's provider_for REFUSES reasoner-only targets
-            for them (every summary would hard-error) — the lock-security
-            carry-over from the stage-3 review. "Local notes" already has
-            a first-class answer: Ollama.
+            EVERY role may run on the built-in on-device model ("local" =
+            LocalSummarizerProvider — exactly what the Fully-local posture
+            sets for Notes/Ask/Live, so the Notes select MUST offer it or its
+            value shows blank on Fully local). Only Ask/Live additionally
+            offer "off" (retrieval-only stub): "off" builds NO
+            SummarizerProvider, so provider_for REFUSES it for Notes (every
+            summary would hard-error) — hence it stays gated behind
+            offersReasonerTargets. (roles.rs: local builds a summarizer,
+            off/apple do not.)
           -->
           <select
             [formControlName]="row.connCtrl"
             (change)="onConnectionChange(row.role, $event)"
           >
             <option value="">Inherit default</option>
-            <option value="claude_code">Claude Code</option>
-            <option value="anthropic">Anthropic API</option>
-            <option value="ollama">Ollama</option>
-            <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
-            @if (row.offersReasonerTargets) {
-              <option value="local">Local model — on-device</option>
-              <option value="off">Off — retrieval only</option>
-            }
+            <optgroup label="Built-in (on this Mac)">
+              <option value="local">Murmur Brain — on-device</option>
+              @if (row.offersReasonerTargets) {
+                <option value="off">Off — retrieval only</option>
+              }
+            </optgroup>
+            <optgroup label="Your engines">
+              <option value="claude_code">Claude Code</option>
+              <option value="anthropic">Anthropic API</option>
+              <option value="ollama">Ollama</option>
+              <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
+            </optgroup>
           </select>
 
           @if (!row.conn) {
@@ -144,7 +151,7 @@
             } @else {
               <span class="field-help text-muted">
                 Runs on-device with the shared local model — pick or
-                download it under Local models below.
+                download it under Engines → On this Mac → Configure.
               </span>
             }
           }
@@ -153,11 +160,14 @@
 
       <!--
         The GGUF registry is GLOBAL (it owns brainModelId — the resolver's
-        local default for every role), so it renders once, shared by every
-        row set to "Local model", not per-row. Extracted to LocalModelsListComponent (Task 3).
+        local default for every role). It now lives under Engines → Murmur
+        Brain → Configure (Task 5); the row just points there.
       -->
       @if (anyLocal()) {
-        <app-local-models-list />
+        <p class="field-help text-muted">
+          On-device models are managed under Engines above (On this Mac →
+          Configure).
+        </p>
       }
     </div>
   }

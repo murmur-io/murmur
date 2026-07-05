@@ -44,42 +44,14 @@
       </div>
     </div>
 
-    <!-- (1) Sharing server base URL -->
-    <div class="account-section">
-      <span class="account-section-label text-muted">Sharing server</span>
-      <p class="text-secondary account-note">
-        The server that stores the encrypted note. It can't read your notes —
-        only ciphertext and wrapped keys leave this Mac.
-      </p>
-      <div class="server-row">
-        <input
-          type="url"
-          class="text-input server-input"
-          [formControl]="serverControl"
-          placeholder="https://share.example.com"
-          autocomplete="off"
-          spellcheck="false"
-          aria-label="Sharing server base URL"
-        />
-        <button
-          type="button"
-          class="btn"
-          (click)="saveServer()"
-          [disabled]="savingServer()"
-        >
-          {{ savingServer() ? "Saving…" : "Save server" }}
-        </button>
-      </div>
-      @if (serverError(); as serr) {
-        <p class="text-danger account-note">{{ serr }}</p>
-      }
-    </div>
-
     @if (status(); as st) {
       @if (st.loggedIn) {
-        <!-- (2a) Signed-in state -->
+        <!-- (2a) Signed-in state. IDENTITY (who you are) is separated from
+             the SESSION share-key state (loaded this run or not) — the two
+             used to be conflated into a contradictory "signed in / sign in
+             to share". -->
         <div class="account-section">
-          <span class="account-section-label text-muted">Signed in</span>
+          <span class="account-section-label text-muted">Signed in as</span>
           <div class="signed-in-row">
             <span class="pill is-success signed-pill">
               <span class="pill-dot"></span>
@@ -98,20 +70,48 @@
             Your notes live on this Mac. Signing out only turns off sharing —
             it never deletes, moves, or uploads a note.
           </p>
-          @if (!st.unlockedForSharing) {
+
+          <!-- SESSION share-key state — distinct from identity above. -->
+          @if (st.unlockedForSharing) {
+            <span class="pill is-success signed-pill">
+              <span class="pill-dot"></span>
+              Ready to share this session
+            </span>
+          } @else {
             <p class="text-secondary account-note">
-              Sign in again to share — your account key isn't loaded in this
-              session.
+              @if (canBiometricUnlock()) {
+                Sharing is locked this session — unlock with Touch ID to
+                share without re-entering your password.
+              } @else {
+                Sharing is locked this session — sign in again to load your
+                account key.
+              }
             </p>
             <div class="account-actions">
-              <button
-                type="button"
-                class="btn btn-primary"
-                (click)="openFlow()"
-              >
-                Sign in to share
-              </button>
+              @if (canBiometricUnlock()) {
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  (click)="unlockWithBiometric()"
+                  [disabled]="unlocking()"
+                >
+                  {{ unlocking() ? "Unlocking…" : "Unlock with Touch ID" }}
+                </button>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  (click)="openFlow()"
+                >
+                  Sign in to share
+                </button>
+              }
             </div>
+            @if (unlockError(); as uerr) {
+              <p class="text-secondary account-note" role="status">
+                {{ uerr }}
+              </p>
+            }
           }
         </div>
       } @else {

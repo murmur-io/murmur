@@ -86,19 +86,6 @@
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-.server-row {
-  display: flex;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-}
-.server-input {
-  flex: 1 1 18rem;
-  min-width: 0;
-}
-.server-row .btn {
-  flex: none;
-}
-
 .account-actions {
   display: flex;
   align-items: center;

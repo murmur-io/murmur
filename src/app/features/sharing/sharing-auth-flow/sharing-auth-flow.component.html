@@ -64,44 +64,6 @@
         </button>
       </div>
 
-      @if (advancedOpen()) {
-        <div class="adv-well">
-          <span class="flow-label text-muted">Sharing server</span>
-          <p class="flow-note text-secondary">
-            The server that stores the encrypted note. It can't read your
-            notes — only ciphertext and wrapped keys leave this Mac.
-          </p>
-          <div class="row">
-            <input
-              type="url"
-              class="field-input"
-              [value]="serverUrl()"
-              (input)="onServerUrl($event)"
-              placeholder="https://share.example.com"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Sharing server base URL"
-            />
-            <button
-              type="button"
-              class="btn"
-              (click)="saveServer()"
-              [disabled]="serverSaving()"
-            >
-              {{ serverSaving() ? "Saving…" : "Save" }}
-            </button>
-          </div>
-        </div>
-      } @else {
-        <button
-          type="button"
-          class="link-btn text-muted adv-toggle"
-          (click)="toggleAdvanced()"
-        >
-          Advanced — sharing server
-        </button>
-      }
-
       <div class="flow-nav">
         <button
           type="button"
@@ -137,40 +99,6 @@
           [disabled]="busy()"
         />
       </label>
-
-      @if (advancedOpen()) {
-        <div class="adv-well">
-          <span class="flow-label text-muted">Sharing server</span>
-          <div class="row">
-            <input
-              type="url"
-              class="field-input"
-              [value]="serverUrl()"
-              (input)="onServerUrl($event)"
-              placeholder="https://share.example.com"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Sharing server base URL"
-            />
-            <button
-              type="button"
-              class="btn"
-              (click)="saveServer()"
-              [disabled]="serverSaving()"
-            >
-              {{ serverSaving() ? "Saving…" : "Save" }}
-            </button>
-          </div>
-        </div>
-      } @else {
-        <button
-          type="button"
-          class="link-btn text-muted adv-toggle"
-          (click)="toggleAdvanced()"
-        >
-          Advanced — sharing server
-        </button>
-      }
 
       @if (error(); as err) {
         <p class="flow-error text-danger" role="alert">{{ err }}</p>
@@ -303,7 +231,6 @@
           </span>
         </span>
         <input
-          class="switch"
           type="checkbox"
           [checked]="saveRecovery()"
           (change)="onSaveRecovery($event)"

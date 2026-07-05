@@ -21,8 +21,6 @@ import type {
   GraphPayload,
   MeetingDetail,
   MeetingTimeline,
-  RecipientPreview,
-  Segment,
   SpeakerSuggestion,
 } from "../../../core/models";
 import {
@@ -30,82 +28,26 @@ import {
   type FolderExposure,
 } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
-import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
-import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
-import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
-import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
-import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
-import { MeetingRecipesComponent } from "../meeting-recipes/meeting-recipes.component";
-import { MeetingTimelineComponent } from "../meeting-timeline/meeting-timeline.component";
-import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
+import { AudioPanelComponent } from "../audio-panel/audio-panel.component";
 import {
-  ShareVerifySheetComponent,
-  type ShareVerifyMode,
-} from "../share-verify-sheet/share-verify-sheet.component";
+  DetailTabsComponent,
+  type DetailTab,
+  type DetailTabDef,
+} from "../detail-tabs/detail-tabs.component";
+import {
+  NotePanelComponent,
+  type AssistantQa,
+  type NoteSection,
+  type ParsedCitation,
+  type ParsedNote,
+} from "../note-panel/note-panel.component";
+import { SharePanelComponent } from "../share-panel/share-panel.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
   done: boolean;
   text: string;
-}
-
-/**
- * M5-CLIENT — the step the in-flow "Share with a person" panel is showing.
- * The floating fingerprint sheet is tracked separately (`verifyMode`).
- */
-type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
-
-/** A parsed `## Heading` section of the note body. */
-interface NoteSection {
-  heading: string;
-  /** Normalised kind drives which renderer the template uses. */
-  kind: "actions" | "bullets" | "prose";
-  /** Plain prose paragraphs (kind === 'prose'). */
-  paragraphs: string[];
-  /** Bullet lines, leading marker stripped (kind === 'bullets'). */
-  bullets: string[];
-  /** Checklist entries (kind === 'actions'). */
-  actions: ActionItem[];
-}
-
-/**
- * One grounding citation, parsed from the persisted `string[]` the backend
- * stores per interaction. The backend writes `[[Title]]` for a vault source and
- * a `(web)` / `(https://…)` form for a web source — we split the two so the FE
- * can render `[[vault]]` chips vs distinct "via web" links (mirroring the live
- * assistant-actions card, whose live store carries structured citations).
- */
-interface ParsedCitation {
-  kind: "vault" | "web";
-  /** Display label (vault title, or the host/label for a web source). */
-  label: string;
-  /** Resolved URL for a web source; null for a vault citation. */
-  url: string | null;
-}
-
-/** A persisted assistant Q&A interaction enriched with parsed citations. */
-interface AssistantQa {
-  /** Stable id for `@for` tracking (createdAt + index — interactions are append-only). */
-  id: string;
-  command: string;
-  answer: string;
-  citations: ParsedCitation[];
-  status: string;
-  sourceLabel: string | null;
-  createdAt: string;
-}
-
-/** The whole note, decomposed into front-matter + body sections. */
-interface ParsedNote {
-  tags: string[];
-  participants: string[];
-  sections: NoteSection[];
-  /** Set only when the body contained no `## ` sections — raw fallback. */
-  raw: string | null;
-  /** ENHANCE-MY-NOTES: true when the backend stamped `murmur_enhanced: true` (the note's
-   *  skeleton was the user's typed notes). Derived ONLY from note.markdown — lock-safe. */
-  enhanced: boolean;
 }
 
 @Component({
@@ -114,16 +56,11 @@ interface ParsedNote {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
-    MeetingTimelineComponent,
-    MeetingActionsComponent,
-    MeetingChatComponent,
-    MeetingRecipesComponent,
     LockBadgeComponent,
-    MoveToMenuComponent,
-    MarkdownComponent,
-    AssistantSourcesComponent,
-    RelatedMeetingsComponent,
-    ShareVerifySheetComponent,
+    DetailTabsComponent,
+    NotePanelComponent,
+    AudioPanelComponent,
+    SharePanelComponent,
   ],
   templateUrl: "./detail.component.html",
   styleUrl: "./detail.component.scss",
@@ -136,9 +73,6 @@ export class DetailComponent implements OnInit {
   private readonly destroyRef = inject(DestroyRef);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
-
-  /** Exposed so the template can format aria values. */
-  protected readonly Math = Math;
 
   readonly detail = signal<MeetingDetail | null>(null);
   readonly loading = signal(true);
@@ -229,51 +163,17 @@ export class DetailComponent implements OnInit {
   /** Tracked so we can cancel the pending export-label reset on destroy. */
   private exportResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // --- Share as link (M3-CLIENT: zero-knowledge note link share) -----------
-  /** True while a `shareNoteToLink` IPC call is in flight (disables the button). */
-  readonly sharing = signal(false);
-  /** The created share URL; the `#…` fragment holds the decryption key (kept local). */
-  readonly shareUrl = signal<string | null>(null);
-  /** Optional password for the NEXT link share — recipients must enter it in the viewer to decrypt.
-   * Transient: mixed into the link key (Argon2id) at share time and cleared right after. */
-  readonly sharePassword = signal("");
-  /** True when the last-created link was password-protected (drives the "share the password
-   * separately" hint). */
-  readonly sharedWithPassword = signal(false);
-  /** Inline error surfaced when sharing fails or is refused (not logged in, etc.). */
-  readonly shareError = signal<string | null>(null);
-  /**
-   * True after the first-share check finds share-egress consent NOT yet granted:
-   * the template shows an inline one-time consent panel before the upload runs.
-   * The meeting id is stashed so Confirm can proceed without re-plumbing it.
-   */
-  readonly needsShareConsent = signal(false);
-  private pendingShareMeetingId: string | null = null;
-  /** Brief "Copied" confirmation for the share-link copy button. */
-  readonly shareLinkCopied = signal(false);
-
-  // --- Share with a person (M5-CLIENT: Murmur↔Murmur, mode B) ---------------
-  /** The meeting being shared (captured when the person flow opens). */
-  private personShareMeetingId: string | null = null;
-  /** Whether the in-flow person-share panel (email/suggest-link/consent/result) is open. */
-  readonly personShareOpen = signal(false);
-  /** The panel's current step. `verifyMode` drives the separate floating sheet. */
-  readonly personStep = signal<PersonShareStep>("email");
-  /** The recipient email being entered/shared (input event → signal). */
-  readonly personEmail = signal("");
-  /** The last recipient preview (carries the fingerprint for the verify sheet). */
-  readonly personPreview = signal<RecipientPreview | null>(null);
-  /** True while a preview / share IPC call for the person flow is in flight. */
-  readonly personBusy = signal(false);
-  /** Inline error for the person flow (also fed to the verify sheet). */
-  readonly personError = signal<string | null>(null);
-  /** The success line shown at the 'result' step ("Sent" / "Invited — …"). */
-  readonly personResult = signal<string | null>(null);
-  /**
-   * When non-null, the floating OPAQUE fingerprint verification SHEET is open in
-   * this mode (first contact vs a changed key). Null = closed.
-   */
-  readonly verifyMode = signal<ShareVerifyMode | null>(null);
+  // --- Page tabs (Note · Audio · Share) ------------------------------------
+  /** The tab bar entries (order = display order). Extensible: add an id + a
+   *  shell `@switch` branch. Each id has a matching `@case` panel in the
+   *  template, so no tab renders blank. */
+  readonly detailTabs: DetailTabDef[] = [
+    { id: "note", label: "Note" },
+    { id: "audio", label: "Audio" },
+    { id: "share", label: "Share" },
+  ];
+  /** The active detail tab (Note default). Reset per meeting in `loadMeeting`. */
+  readonly activeTab = signal<DetailTab>("note");
 
   /**
    * Whether this install keeps high-fidelity per-stream master archives (the
@@ -305,26 +205,21 @@ export class DetailComponent implements OnInit {
   /** Inline error surfaced when a tag add/remove fails. */
   readonly tagsError = signal("");
 
-  // --- Audio player state (driven by the <audio> event bindings) ----------
-  private readonly audio = viewChild<ElementRef<HTMLAudioElement>>("player");
-  readonly currentTime = signal(0);
-  readonly duration = signal(0);
-  readonly playing = signal(false);
+  /**
+   * Whether the "Copy path" button in the note panel just copied (feeds the
+   * panel's `pathCopied` input). Playback state (currentTime/duration/playing)
+   * now lives in `app-audio-panel`, which owns the `<audio>` element.
+   */
   readonly copied = signal(false);
 
-  /** Asset-protocol URL for the recording, or null when there is no audio. */
+  /**
+   * Asset-protocol URL for the recording, or null when there is no audio.
+   * Passed to the audio panel (the player) and, as `!!audioSrc()`, to the note
+   * panel (gates Save-audio / master exports).
+   */
   readonly audioSrc = computed(() => {
     const path = this.detail()?.meeting.audioPath;
     return path ? convertFileSrc(path) : null;
-  });
-
-  /** Progress as a 0–100 percentage for the seek-bar fill. */
-  readonly progressPct = computed(() => {
-    const dur = this.duration();
-    if (dur <= 0) {
-      return 0;
-    }
-    return Math.min(100, (this.currentTime() / dur) * 100);
   });
 
   /** The note's markdown decomposed into front-matter + body sections. */
@@ -438,6 +333,15 @@ export class DetailComponent implements OnInit {
   }
 
   /**
+   * The Share-panel precondition gate's CTA — route to Settings (the Account
+   * section hosts the sharing server / sign-in / unlock controls). Fired via the
+   * panel's `setupSharing` output.
+   */
+  async goToSharingSettings(): Promise<void> {
+    await this.router.navigate(["/settings"]);
+  }
+
+  /**
    * Load (or reload) a meeting by id into the view. Resets the per-meeting
    * signals that aren't derived from `detail()` so an in-place reload never
    * shows the previous meeting's timeline/tags/graph or a stale open editor.
@@ -457,11 +361,11 @@ export class DetailComponent implements OnInit {
     this.renaming.set(false);
     this.moveOpen.set(false);
     this.confirmingDelete.set(false);
-    // Reset audio-playback signals so an in-place meeting→meeting nav never shows the
-    // previous meeting's position/play-state until a media event self-corrects.
-    this.playing.set(false);
-    this.currentTime.set(0);
-    this.duration.set(0);
+    // Land on the Note tab for every meeting (identity-first default).
+    this.activeTab.set("note");
+    // (Audio-playback state now lives in <app-audio-panel>, which owns the
+    // <audio> element + currentTime/duration/playing signals. The panel is
+    // re-instantiated per active tab, so there is nothing to reset here.)
     try {
       this.detail.set(await this.ipc.getMeetingDetail(id));
     } finally {
@@ -944,118 +848,6 @@ export class DetailComponent implements OnInit {
     }
   }
 
-  // --- Audio player controls ----------------------------------------------
-
-  private get el(): HTMLAudioElement | null {
-    return this.audio()?.nativeElement ?? null;
-  }
-
-  togglePlay(): void {
-    const el = this.el;
-    if (!el) {
-      return;
-    }
-    if (el.paused) {
-      void el.play();
-    } else {
-      el.pause();
-    }
-  }
-
-  onLoaded(): void {
-    const el = this.el;
-    if (el && Number.isFinite(el.duration)) {
-      this.duration.set(el.duration);
-    }
-  }
-
-  onTimeUpdate(): void {
-    const el = this.el;
-    if (el) {
-      this.currentTime.set(el.currentTime);
-    }
-  }
-
-  onEnded(): void {
-    this.playing.set(false);
-    this.currentTime.set(this.duration());
-  }
-
-  /** Seek to a click position on the progress track. */
-  seekFromEvent(event: MouseEvent): void {
-    const el = this.el;
-    const dur = this.duration();
-    if (!el || dur <= 0) {
-      return;
-    }
-    const bar = event.currentTarget as HTMLElement;
-    const rect = bar.getBoundingClientRect();
-    const ratio = Math.min(
-      1,
-      Math.max(0, (event.clientX - rect.left) / rect.width),
-    );
-    el.currentTime = ratio * dur;
-    this.currentTime.set(el.currentTime);
-  }
-
-  /** Keyboard seeking on the focusable track (← / → by 5s, Home/End). */
-  onTrackKey(event: KeyboardEvent): void {
-    const el = this.el;
-    const dur = this.duration();
-    if (!el || dur <= 0) {
-      return;
-    }
-    let next: number | null = null;
-    switch (event.key) {
-      case "ArrowLeft":
-        next = Math.max(0, el.currentTime - 5);
-        break;
-      case "ArrowRight":
-        next = Math.min(dur, el.currentTime + 5);
-        break;
-      case "Home":
-        next = 0;
-        break;
-      case "End":
-        next = dur;
-        break;
-      case " ":
-      case "Enter":
-        event.preventDefault();
-        this.togglePlay();
-        return;
-      default:
-        return;
-    }
-    event.preventDefault();
-    el.currentTime = next;
-    this.currentTime.set(next);
-  }
-
-  /**
-   * Click-to-seek from a transcript row or a timeline block: jump to `startS`
-   * + play. With no audio element (audioPath null) we still advance the
-   * `currentTime` signal so the timeline highlight + playhead respond.
-   */
-  seekTo(startS: number): void {
-    const el = this.el;
-    if (!el) {
-      const total = this.timelineTotal();
-      const clamped = total > 0 ? Math.min(total, Math.max(0, startS)) : startS;
-      this.currentTime.set(clamped);
-      return;
-    }
-    el.currentTime = startS;
-    this.currentTime.set(startS);
-    void el.play();
-  }
-
-  /** True when playback is inside [startS, endS) — highlights the live row. */
-  isActiveSegment(startS: number, endS: number): boolean {
-    const t = this.currentTime();
-    return t >= startS && t < endS;
-  }
-
   /** Copy a path to the clipboard (no external <a href> navigation). */
   async copy(text: string): Promise<void> {
     try {
@@ -1271,292 +1063,6 @@ export class DetailComponent implements OnInit {
     });
   }
 
-  // --- Share as link (zero-knowledge note link share) ----------------------
-
-  /**
-   * Create a zero-knowledge link share of this note and copy the URL. Guards
-   * first on the sharing-account session (server set? logged in + unlocked?),
-   * then on the one-time share-egress consent: the FIRST share pauses on an
-   * inline consent panel ({@link needsShareConsent}) until the user confirms.
-   *
-   * The returned URL is NEVER logged — its `#…` fragment is the decryption key
-   * and only ever lands in the signal + clipboard.
-   */
-  async shareAsLink(meetingId: string): Promise<void> {
-    if (this.editing() || this.sharing()) {
-      return;
-    }
-    this.shareError.set(null);
-    this.shareUrl.set(null);
-    let st;
-    try {
-      st = await this.ipc.accountStatus();
-    } catch (e) {
-      this.shareError.set(String(e));
-      return;
-    }
-    if (!st.serverConfigured) {
-      this.shareError.set("Set a sharing server in Settings → Account first.");
-      return;
-    }
-    if (!st.loggedIn || !st.unlockedForSharing) {
-      this.shareError.set(
-        "Sign in to your sharing account first (Settings → Account).",
-      );
-      return;
-    }
-    if (!st.shareConsented) {
-      // First share — surface the inline one-time consent panel and stop here.
-      this.pendingShareMeetingId = meetingId;
-      this.needsShareConsent.set(true);
-      return;
-    }
-    await this.doShare(meetingId);
-  }
-
-  /** Confirm the one-time share-egress consent, then proceed with the pending share. */
-  async confirmShareConsent(): Promise<void> {
-    const id = this.pendingShareMeetingId;
-    this.needsShareConsent.set(false);
-    this.pendingShareMeetingId = null;
-    if (!id) {
-      return;
-    }
-    this.shareError.set(null);
-    try {
-      await this.ipc.consentToShareEgress();
-    } catch (e) {
-      this.shareError.set(String(e));
-      return;
-    }
-    await this.doShare(id);
-  }
-
-  /** Cancel the pending first-share (dismiss the consent panel, upload nothing). */
-  cancelShareConsent(): void {
-    this.needsShareConsent.set(false);
-    this.pendingShareMeetingId = null;
-  }
-
-  /**
-   * Perform the actual upload + copy. Consent/login are already verified by the
-   * caller. The URL goes to the signal + clipboard only (never the console).
-   */
-  private async doShare(meetingId: string): Promise<void> {
-    this.sharing.set(true);
-    const pw = this.sharePassword().trim();
-    try {
-      const url = await this.ipc.shareNoteToLink(
-        meetingId,
-        undefined,
-        pw.length > 0 ? pw : undefined,
-      );
-      this.shareUrl.set(url);
-      this.sharedWithPassword.set(pw.length > 0);
-      this.sharePassword.set(""); // clear the transient password once it's baked into the link
-      try {
-        await navigator.clipboard.writeText(url);
-        this.shareLinkCopied.set(true);
-      } catch {
-        // Clipboard unavailable — the URL stays visible + selectable to copy.
-      }
-    } catch (e) {
-      this.shareError.set(String(e));
-    } finally {
-      this.sharing.set(false);
-    }
-  }
-
-  /** Copy the created share link to the clipboard (the readonly-field button). */
-  async copyShareLink(): Promise<void> {
-    const url = this.shareUrl();
-    if (!url) {
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(url);
-      this.shareLinkCopied.set(true);
-    } catch {
-      // Clipboard unavailable — the URL stays visible + selectable.
-    }
-  }
-
-  // --- Share with a person (M5-CLIENT: invite a colleague by email) ---------
-
-  /** Open the in-flow person-share panel at the email step (resets prior state). */
-  openPersonShare(meetingId: string): void {
-    if (this.editing()) {
-      return;
-    }
-    this.personShareMeetingId = meetingId;
-    this.personEmail.set("");
-    this.personPreview.set(null);
-    this.personError.set(null);
-    this.personResult.set(null);
-    this.personStep.set("email");
-    this.verifyMode.set(null);
-    this.personShareOpen.set(true);
-  }
-
-  /** Fully close the person flow (panel + any floating sheet) and clear its state. */
-  closePersonShare(): void {
-    this.personShareOpen.set(false);
-    this.verifyMode.set(null);
-    this.personStep.set("email");
-    this.personEmail.set("");
-    this.personPreview.set(null);
-    this.personError.set(null);
-    this.personResult.set(null);
-  }
-
-  /** Bind the recipient-email input into its signal. */
-  onPersonEmailInput(event: Event): void {
-    this.personEmail.set((event.target as HTMLInputElement).value);
-  }
-
-  /**
-   * Preview the recipient, then branch: unregistered → suggest a protected
-   * link; first contact / changed key → the floating verification sheet;
-   * otherwise send straight away. Gates on the sharing account first (server
-   * configured + signed in + unlocked), mirroring {@link shareAsLink}.
-   */
-  async submitPersonEmail(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    const email = this.personEmail().trim();
-    if (!email) {
-      this.personError.set("Enter an email address.");
-      return;
-    }
-    this.personError.set(null);
-    this.personBusy.set(true);
-    try {
-      const st = await this.ipc.accountStatus();
-      if (!st.serverConfigured) {
-        this.personError.set(
-          "Set a sharing server in Settings → Account first.",
-        );
-        return;
-      }
-      if (!st.loggedIn || !st.unlockedForSharing) {
-        this.personError.set(
-          "Sign in to your sharing account first (Settings → Account).",
-        );
-        return;
-      }
-      const preview = await this.ipc.previewShareRecipient(email);
-      this.personPreview.set(preview);
-      if (!preview.registered) {
-        this.personStep.set("suggest-link");
-      } else if (preview.keyChanged) {
-        // BLOCKING re-verify: never a silent send on a changed key.
-        this.personShareOpen.set(false);
-        this.verifyMode.set("key-changed");
-      } else if (preview.firstContact) {
-        this.personShareOpen.set(false);
-        this.verifyMode.set("first-contact");
-      } else {
-        // Known, verified recipient — share directly.
-        await this.sendToUser();
-      }
-    } catch (e) {
-      this.personError.set(String(e));
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /** The "suggest-link" primary: fall back to the existing protected-link flow. */
-  sendProtectedLinkInstead(): void {
-    const id = this.personShareMeetingId;
-    this.closePersonShare();
-    if (id) {
-      void this.shareAsLink(id);
-    }
-  }
-
-  /** The "suggest-link" secondary: invite the (unregistered) recipient anyway. */
-  async inviteAnyway(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    this.personBusy.set(true);
-    try {
-      await this.sendToUser();
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /** The verify-sheet confirm: the user verified out of band → send. */
-  async confirmVerifiedSend(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    this.personBusy.set(true);
-    try {
-      await this.sendToUser();
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /** Grant the one-time share-egress consent, then retry the pending person share. */
-  async confirmPersonShareConsent(): Promise<void> {
-    if (this.personBusy()) {
-      return;
-    }
-    this.personBusy.set(true);
-    this.personError.set(null);
-    try {
-      await this.ipc.consentToShareEgress();
-      await this.sendToUser();
-    } catch (e) {
-      this.personError.set(String(e));
-    } finally {
-      this.personBusy.set(false);
-    }
-  }
-
-  /**
-   * Perform the actual `shareNoteToUser` call and render the outcome. Callers own
-   * the `personBusy` toggle. A thrown "not consented" surfaces the in-flow
-   * consent step (mirroring the link flow's one-time consent); any other throw
-   * (a locked meeting, a server-side changed-key BLOCK) surfaces inline —
-   * never a silent proceed.
-   */
-  private async sendToUser(): Promise<void> {
-    const id = this.personShareMeetingId;
-    if (!id) {
-      return;
-    }
-    const email = this.personEmail().trim();
-    this.personError.set(null);
-    try {
-      const res = await this.ipc.shareNoteToUser(id, email);
-      this.verifyMode.set(null);
-      this.personShareOpen.set(true);
-      this.personStep.set("result");
-      this.personResult.set(
-        res.status === "invited"
-          ? `Invited — they'll get it when they join Murmur. Ask them to install Murmur (macOS) and sign in with ${email}.`
-          : "Sent.",
-      );
-    } catch (e) {
-      const msg = String(e);
-      if (/consent/i.test(msg)) {
-        // First share needs the one-time egress consent — surface it in-flow.
-        this.verifyMode.set(null);
-        this.personShareOpen.set(true);
-        this.personStep.set("consent");
-        this.personError.set(null);
-      } else {
-        this.personError.set(msg);
-      }
-    }
-  }
-
   /** Build a filesystem-safe filename stem from a meeting title. */
   private sanitizeTitle(title: string | null): string {
     const cleaned = (title || "")
@@ -1628,43 +1134,6 @@ export class DetailComponent implements OnInit {
       return new URL(url).host;
     } catch {
       return null;
-    }
-  }
-
-  /** Map an interaction status to a global `.pill` variant (mirrors the live card). */
-  protected qaStatusPillClass(status: string): string {
-    switch (status) {
-      case "ok":
-        return "is-success";
-      case "needs_consent":
-        return "is-warning";
-      case "unavailable":
-      case "unrecognized":
-        return "is-accent";
-      case "nothing_heard":
-        return "";
-      default:
-        return "is-danger";
-    }
-  }
-
-  /** Short human label for the status pill. */
-  protected qaStatusLabel(status: string): string {
-    switch (status) {
-      case "ok":
-        return "Odpowiedziano";
-      case "needs_consent":
-        return "Wymaga zgody";
-      case "unavailable":
-        return "Niedostępne";
-      case "unrecognized":
-        return "Nierozpoznane";
-      case "nothing_heard":
-        return "Nic nie usłyszano";
-      case "error":
-        return "Błąd";
-      default:
-        return status;
     }
   }
 
@@ -1821,57 +1290,6 @@ export class DetailComponent implements OnInit {
   /** Strip surrounding quotes/whitespace from a YAML scalar. */
   private cleanScalar(s: string): string {
     return s.trim().replace(/^["']/, "").replace(/["']$/, "").trim();
-  }
-
-  /**
-   * Map a transcript segment's `speaker` to a small presentational chip:
-   * "Me" (the local mic, accent) vs "Others" (captured system audio, neutral/
-   * violet). Returns null for legacy / mic-only segments (`null` / unknown) so
-   * they render unlabeled exactly as before. This is independent of the AI
-   * timeline's manual speaker-rename — that feature relabels timeline lanes, not
-   * these per-segment Me/Others tags.
-   */
-  speakerChip(
-    speaker: Segment["speaker"],
-  ): { label: string; bg: string; fg: string } | null {
-    switch (speaker) {
-      case "me":
-        // Local mic — the calm accent.
-        return {
-          label: "Me",
-          bg: "var(--accent-soft)",
-          fg: "var(--accent-hover)",
-        };
-      case "others":
-        // Captured system audio — a neutral violet, distinct from "Me".
-        return {
-          label: "Others",
-          bg: "rgba(157, 123, 255, 0.16)",
-          fg: "#b9a4ff",
-        };
-      default: {
-        // A diarized remote cluster tag ("others-{n}") → a "Speaker {n+1}" chip (same neutral
-        // violet as "Others"). Presentational only; independent of the timeline lanes' LLM/renamed
-        // labels. Any other/legacy value stays unlabeled (null).
-        const m = /^others-(\d+)$/.exec(speaker ?? "");
-        if (m) {
-          return {
-            label: `Speaker ${Number(m[1]) + 1}`,
-            bg: "rgba(157, 123, 255, 0.16)",
-            fg: "#b9a4ff",
-          };
-        }
-        return null;
-      }
-    }
-  }
-
-  /** Seconds → m:ss for timestamps + player times. */
-  fmt(s: number): string {
-    const total = Math.max(0, Math.floor(s || 0));
-    const m = Math.floor(total / 60);
-    const sec = total % 60;
-    return `${m}:${sec.toString().padStart(2, "0")}`;
   }
 
   /** Maps a meeting status to a status-pill state modifier (presentation only). */

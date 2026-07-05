@@ -134,32 +134,6 @@
   font-size: 1.05rem;
 }
 
-.row {
-  display: flex;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-}
-.row .field-input {
-  flex: 1 1 16rem;
-  min-width: 0;
-}
-.row .btn {
-  flex: none;
-}
-
-/* Advanced disclosure — a quiet inset well, still tokenized. */
-.adv-toggle {
-  align-self: flex-start;
-}
-.adv-well {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
-  border: 1px solid var(--border-subtle);
-}
 .link-btn {
   padding: 0;
   border: none;

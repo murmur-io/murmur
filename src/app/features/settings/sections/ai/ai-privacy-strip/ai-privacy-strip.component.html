@@ -21,6 +21,21 @@
           {{ dest.connection }} → {{ dest.destination }}
         </span>
       </div>
+      <!--
+        Honest caveat (fast-follow #3): personal-NAME masking is best-effort
+        and only active once the optional on-device NER model is downloaded.
+        Emails / phones / cards are always regex-scrubbed regardless. Shown
+        only when text actually leaves the Mac AND the model is absent — a
+        calm nudge, not an alarm. Enable it in the Privacy section.
+      -->
+      @if (nerModelPresent() === false) {
+        <p class="strip-subnote text-muted">
+          Personal names aren't masked before this leaves your Mac yet —
+          on-device name masking needs the optional model, and names are only
+          masked once it's downloaded (in Privacy &amp; integrations). Emails,
+          phone numbers and card numbers are always scrubbed.
+        </p>
+      }
     }
   </div>
 
