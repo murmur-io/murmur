@@ -1,0 +1,466 @@
+<div class="share-panel">
+  @if (!gateReady()) {
+    <!-- ============================================================== -->
+    <!-- 2.2 PRECONDITION GATE — fail closed, honest about WHY.          -->
+    <!-- Renders only the FAILING preconditions + the right CTA.         -->
+    <!-- ============================================================== -->
+    <div class="panel-card gate empty-state">
+      <span class="gate-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </svg>
+      </span>
+      <p class="empty-title">Sharing isn't set up yet</p>
+      <p class="gate-copy">
+        Murmur can share this note as an end-to-end encrypted link. It uploads
+        only the <strong>encrypted</strong> note — the decryption key never
+        leaves your Mac.
+      </p>
+      <ul class="gate-reasons">
+        @for (r of gateReasons(); track r.key) {
+          <li>{{ r.text }}</li>
+        }
+      </ul>
+      @if (gateError(); as err) {
+        <p class="msg msg-error" role="alert">{{ err }}</p>
+      }
+      <!-- When the ONLY missing precondition is the session share-key and a
+           cached account key exists, offer a one-tap Touch ID unlock inline;
+           otherwise route to the password path via the shell (setupSharing). -->
+      @if (canBiometricUnlock()) {
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="unlockWithBiometric()"
+          [disabled]="unlocking()"
+        >
+          {{ unlocking() ? "Unlocking…" : "Unlock with Touch ID" }}
+        </button>
+      } @else {
+        <button type="button" class="btn btn-primary" (click)="setupSharing.emit()">
+          {{ gateCta() }}
+        </button>
+      }
+    </div>
+  } @else {
+    <!-- ============================================================== -->
+    <!-- CONFIGURE (2.3) — password FIRST → expires → open limit →       -->
+    <!-- consent → Create link. Replaced by CREATED after a create.     -->
+    <!-- ============================================================== -->
+    @if (step() === "configure") {
+      <div class="panel-card create" role="group" aria-label="Create a share link">
+        <span class="section-label">Create a share link</span>
+
+        <!-- PASSWORD (first, focused). -->
+        <div class="field">
+          <span class="field-label">Password</span>
+          <div class="pw-row">
+            <input
+              [type]="showPassword() ? 'text' : 'password'"
+              class="input pw-input"
+              [value]="password()"
+              (input)="onPasswordInput($event)"
+              [disabled]="noPassword()"
+              placeholder="Add a password"
+              autocomplete="new-password"
+              aria-label="Share-link password"
+            />
+            <button
+              type="button"
+              class="btn btn-ghost pw-toggle"
+              (click)="showPassword.set(!showPassword())"
+              [attr.aria-label]="showPassword() ? 'Hide password' : 'Show password'"
+              [attr.aria-pressed]="showPassword()"
+            >
+              {{ showPassword() ? "Hide" : "Show" }}
+            </button>
+          </div>
+          @if (!noPassword() && password().length > 0) {
+            <div class="pw-strength" [attr.data-level]="strength().level" aria-hidden="true">
+              <span class="pw-bars">
+                <i></i><i></i><i></i><i></i>
+              </span>
+              <span class="pw-strength-label">{{ strength().label }}</span>
+            </div>
+          }
+          <span class="hint">
+            A password strengthens the encryption, not just a gate. Share it
+            out of band — never in the same message as the link.
+          </span>
+          <label class="check">
+            <input
+              type="checkbox"
+              [checked]="noPassword()"
+              (change)="onNoPasswordChange($event)"
+            />
+            <span>No password <span class="hint-inline">(the link key alone protects it)</span></span>
+          </label>
+        </div>
+
+        <!-- EXPIRES (.seg, default 7 days). -->
+        <div class="field">
+          <span class="field-label">Expires</span>
+          <div class="seg" role="group" aria-label="Link expiry">
+            @for (o of expiryOptions; track o.value) {
+              <button
+                type="button"
+                class="seg-btn"
+                [class.is-active]="expiry() === o.value"
+                [attr.aria-pressed]="expiry() === o.value"
+                (click)="expiry.set(o.value)"
+              >
+                {{ o.label }}
+              </button>
+            }
+          </div>
+        </div>
+
+        <!-- OPEN LIMIT (checkbox → stepper). -->
+        <div class="field">
+          <span class="field-label">Open limit</span>
+          <label class="check">
+            <input
+              type="checkbox"
+              [checked]="limitOpens()"
+              (change)="onLimitOpensChange($event)"
+            />
+            <span>Limit the number of opens</span>
+          </label>
+          @if (limitOpens()) {
+            <div class="stepper" role="group" aria-label="Maximum opens">
+              <button
+                type="button"
+                class="btn btn-ghost step-btn"
+                (click)="stepOpens(-1)"
+                [disabled]="maxOpens() <= 1"
+                aria-label="Fewer opens"
+              >
+                −
+              </button>
+              <span class="step-value" aria-live="polite">{{ maxOpens() }}</span>
+              <button
+                type="button"
+                class="btn btn-ghost step-btn"
+                (click)="stepOpens(1)"
+                aria-label="More opens"
+              >
+                +
+              </button>
+              <span class="hint-inline">opens</span>
+            </div>
+          }
+        </div>
+
+        <!-- One-time share-egress CONSENT, inline (iff not yet consented). -->
+        @if (!shareConsented()) {
+          <div class="consent" role="group">
+            <p class="consent-copy">
+              <span class="consent-mark" aria-hidden="true">ⓘ</span>
+              Uploads the <strong>encrypted</strong> note to your sharing
+              server. The decryption key stays on your Mac.
+            </p>
+            <button type="button" class="btn btn-ghost" (click)="grantConsent()" [disabled]="consenting()">
+              {{ consenting() ? "…" : "I understand" }}
+            </button>
+          </div>
+        }
+
+        @if (createError(); as err) {
+          <p class="msg msg-error" role="alert">{{ err }}</p>
+        }
+
+        <button
+          type="button"
+          class="btn btn-primary create-btn"
+          (click)="createLink()"
+          [disabled]="!shareConsented() || creating() || editing()"
+        >
+          {{ creating() ? "Creating…" : "Create link" }}
+        </button>
+      </div>
+    }
+
+    <!-- ============================================================== -->
+    <!-- CREATED (2.4) — one-time reveal. The URL lives ONLY in the      -->
+    <!-- transient createdUrl signal, cleared on Done / navigate.        -->
+    <!-- ============================================================== -->
+    @if (step() === "created" && createdUrl(); as url) {
+      <div class="panel-card created" role="group" aria-label="Share link created">
+        <span class="section-label created-head">
+          <span class="created-tick" aria-hidden="true">✓</span> Link created
+        </span>
+
+        <div class="link-row">
+          <input
+            type="text"
+            class="input link-input"
+            [value]="url"
+            readonly
+            aria-label="Share link"
+          />
+          <button type="button" class="btn" (click)="copyCreated()">
+            {{ createdCopied() ? "Copied" : "Copy" }}
+          </button>
+        </div>
+
+        <p class="warn">
+          <span class="warn-mark" aria-hidden="true">⚠</span>
+          This is the only time we can show this link. The decryption key
+          lives in the link itself and is never stored. If you lose it, revoke
+          and create a new one — we can't show it again.
+        </p>
+
+        <div class="created-meta">
+          @if (createdWithPassword()) {
+            <span class="meta-chip">🔒 Password-protected</span>
+            <span class="dot" aria-hidden="true">·</span>
+          }
+          <span class="meta-chip">{{ createdExpiryLabel() }}</span>
+          @if (createdMaxLabel(); as ml) {
+            <span class="dot" aria-hidden="true">·</span>
+            <span class="meta-chip">{{ ml }}</span>
+          }
+        </div>
+
+        <div class="created-actions">
+          <button type="button" class="btn btn-primary" (click)="createAnother()">
+            Create another
+          </button>
+          <button type="button" class="btn btn-ghost" (click)="done()">Done</button>
+        </div>
+      </div>
+    }
+
+    <!-- ============================================================== -->
+    <!-- MANAGE (2.5) — active links for THIS note. Always visible.      -->
+    <!-- No Copy for links not created this session (key not stored).    -->
+    <!-- ============================================================== -->
+    <div class="panel-card manage">
+      <div class="manage-head">
+        <span class="section-label">Active links for this note</span>
+        <span class="count">{{ linkRows().length }}</span>
+        <button
+          type="button"
+          class="btn btn-ghost mini-btn"
+          (click)="refresh()"
+          [disabled]="loading()"
+        >
+          {{ loading() ? "Refreshing…" : "Refresh" }}
+        </button>
+        @if (listError(); as err) {
+          <span class="msg msg-error" role="alert">{{ err }}</span>
+        }
+      </div>
+
+      @if (loading() && !linkRows().length) {
+        <div class="skeleton" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+      } @else {
+        <ul class="list">
+          @for (r of linkRows(); track r.shareId) {
+            <li class="row">
+              <div class="row-meta">
+                @switch (r.state) {
+                  @case ("revoked") {
+                    <span class="pill is-muted"><i class="pill-dot"></i>Revoked</span>
+                  }
+                  @case ("limit") {
+                    <span class="pill is-warning"><i class="pill-dot"></i>Limit reached</span>
+                  }
+                  @case ("expired") {
+                    <span class="pill is-muted"><i class="pill-dot"></i>Expired</span>
+                  }
+                  @default {
+                    <span class="pill is-success"><i class="pill-dot"></i>Active</span>
+                  }
+                }
+                @if (r.locked) {
+                  <span class="row-lock">🔒 Locked</span>
+                } @else {
+                  <span class="row-when">Created {{ formatShareDate(r.createdAt) }}</span>
+                  <span class="row-sep" aria-hidden="true">·</span>
+                  @if (r.copyUrl) {
+                    <span>{{ r.passwordProtected ? "🔒" : "no pw" }}</span>
+                    <span class="row-sep" aria-hidden="true">·</span>
+                  }
+                  <span>{{ r.usageLabel }}</span>
+                  <span class="row-sep" aria-hidden="true">·</span>
+                  <span>{{ r.expiryLabel }}</span>
+                }
+              </div>
+              <div class="row-actions">
+                @if (r.state !== "revoked") {
+                  <button
+                    type="button"
+                    class="btn btn-ghost mini-btn"
+                    (click)="copyRow(r.shareId)"
+                    [disabled]="!r.copyUrl"
+                    [attr.title]="
+                      r.copyUrl
+                        ? null
+                        : 'The link key isn’t stored on this device — revoke and create a new link to share again.'
+                    "
+                  >
+                    {{ copiedRowId() === r.shareId ? "Copied" : "Copy" }}
+                  </button>
+                  @if (confirmingRevokeId() === r.shareId) {
+                    <span class="hint-inline">Revoke?</span>
+                    <button
+                      type="button"
+                      class="btn btn-danger mini-btn"
+                      (click)="revokeRow(r.shareId)"
+                      [disabled]="revokingId() === r.shareId"
+                    >
+                      {{ revokingId() === r.shareId ? "Revoking…" : "Confirm" }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost mini-btn"
+                      (click)="confirmingRevokeId.set(null)"
+                      [disabled]="revokingId() === r.shareId"
+                    >
+                      Cancel
+                    </button>
+                  } @else {
+                    <button
+                      type="button"
+                      class="btn btn-ghost mini-btn revoke-btn"
+                      (click)="confirmingRevokeId.set(r.shareId)"
+                    >
+                      Revoke
+                    </button>
+                  }
+                }
+              </div>
+            </li>
+          } @empty {
+            <li class="row-empty">
+              <p class="empty">No active links for this note. Create one above.</p>
+            </li>
+          }
+        </ul>
+        @if (linkRows().length > 0) {
+          <p class="hint manage-note">
+            Links can't be shown again after creation. To re-share, create a new
+            link.
+          </p>
+        }
+      }
+    </div>
+
+    <!-- ============================================================== -->
+    <!-- 2.6 SHARE WITH A PERSON (mode B) — same gate, existing flow.    -->
+    <!-- ============================================================== -->
+    <div class="panel-card person">
+      <div class="manage-head">
+        <span class="section-label">Share with a person</span>
+        @if (peopleShareCount() > 0) {
+          <span class="hint-inline">
+            Shared with {{ peopleShareCount() }}
+            {{ peopleShareCount() === 1 ? "person" : "people" }}
+          </span>
+        }
+      </div>
+
+      @if (!personOpen() && !verifyMode()) {
+        <button
+          type="button"
+          class="btn btn-ghost person-btn"
+          (click)="openPerson()"
+          [disabled]="personBusy() || editing()"
+        >
+          Share with a Murmur user
+        </button>
+      }
+
+      @if (personOpen()) {
+        <div class="person-flow" role="group" aria-label="Share with a person">
+          @switch (personStep()) {
+            @case ("email") {
+              <p class="consent-copy">
+                Share this note directly with another Murmur user. It's
+                end-to-end encrypted to their account key.
+              </p>
+              <div class="person-row">
+                <input
+                  type="email"
+                  class="input person-input"
+                  [value]="personEmail()"
+                  (input)="onPersonEmailInput($event)"
+                  (keydown.enter)="submitPersonEmail()"
+                  placeholder="colleague@example.com"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="Recipient email"
+                  [disabled]="personBusy()"
+                />
+                <button type="button" class="btn btn-primary" (click)="submitPersonEmail()" [disabled]="personBusy() || !personEmail().trim()">
+                  {{ personBusy() ? "Checking…" : "Continue" }}
+                </button>
+                <button type="button" class="btn btn-ghost" (click)="closePerson()" [disabled]="personBusy()">
+                  Cancel
+                </button>
+              </div>
+            }
+            @case ("suggest-link") {
+              <p class="consent-copy">
+                They don't use Murmur yet — send a protected link instead?
+                <span class="pill is-accent">Recommended</span>
+              </p>
+              <div class="person-row">
+                <button type="button" class="btn btn-primary" (click)="sendProtectedLinkInstead()" [disabled]="personBusy()">
+                  Send a protected link
+                </button>
+                <button type="button" class="btn btn-ghost" (click)="inviteAnyway()" [disabled]="personBusy()">
+                  {{ personBusy() ? "Inviting…" : "Invite them anyway" }}
+                </button>
+                <button type="button" class="btn btn-ghost" (click)="closePerson()" [disabled]="personBusy()">
+                  Cancel
+                </button>
+              </div>
+            }
+            @case ("consent") {
+              <p class="consent-copy">
+                This uploads the encrypted note to your sharing server. The note
+                is end-to-end encrypted — the server can't read it — but it does
+                leave this Mac.
+              </p>
+              <div class="person-row">
+                <button type="button" class="btn btn-primary" (click)="confirmPersonConsent()" [disabled]="personBusy()">
+                  {{ personBusy() ? "Sharing…" : "Confirm & share" }}
+                </button>
+                <button type="button" class="btn btn-ghost" (click)="closePerson()" [disabled]="personBusy()">
+                  Cancel
+                </button>
+              </div>
+            }
+            @case ("result") {
+              <p class="person-result">{{ personResult() }}</p>
+              <div class="person-row">
+                <button type="button" class="btn" (click)="closePerson()">Done</button>
+              </div>
+            }
+          }
+          @if (personError(); as perr) {
+            <p class="msg msg-error" role="alert">{{ perr }}</p>
+          }
+        </div>
+      }
+    </div>
+
+    @if (verifyMode(); as mode) {
+      <app-share-verify-sheet
+        [email]="personEmail()"
+        [fingerprint]="personPreview()?.fingerprint ?? ''"
+        [mode]="mode"
+        [busy]="personBusy()"
+        [error]="personError()"
+        (confirm)="confirmVerifiedSend()"
+        (cancelled)="closePerson()"
+      />
+    }
+  }
+</div>
+  

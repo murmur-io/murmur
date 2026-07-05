@@ -31,6 +31,12 @@ export class AiPrivacyStripComponent {
   readonly revoking = this.store.revoking;
   readonly revokeError = this.store.revokeError;
   readonly defaultEgressDestination = this.store.defaultEgressDestination;
+  /**
+   * Whether the on-device PERSON-name NER model is present. `false` (not `null`)
+   * gates the honest name-masking caveat, so it never flashes during the
+   * initial "not yet checked" window.
+   */
+  readonly nerModelPresent = this.store.nerModelPresent;
 
   /** True while the inline "Really revoke?" confirm step is showing. */
   readonly confirmingRevoke = signal(false);

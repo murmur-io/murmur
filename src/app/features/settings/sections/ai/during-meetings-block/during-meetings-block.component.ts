@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
-import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 import { SettingsStore } from "../../../settings.store";
+import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 
 /**
  * AI & Models → "Live during meetings" block (Task 5).
@@ -32,6 +32,9 @@ export class DuringMeetingsBlockComponent {
   readonly consenting = this.store.consenting;
   readonly consentError = this.store.consentError;
   readonly liveTargetIsCloud = this.store.liveTargetIsCloud;
+  /** The derived brain posture — the in-meeting voice assistant is hidden under `cloud` (it needs the
+   * on-device light engine, which Cloud turns off, so it can't be enabled there). */
+  readonly posture = this.store.posture;
 
   allowCloudProcessing(): void {
     void this.store.allowCloudProcessing();

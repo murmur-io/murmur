@@ -7,6 +7,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import { hostIsLoopback } from "../../core/loopback";
 import type {
+  AiMapRow,
   AppConfigDto,
   AppInfo,
   BrainBackend,
@@ -36,6 +37,13 @@ const PROVIDER_CONNECTION_IDS: readonly string[] = [
   "ollama",
   "gateway",
 ];
+
+/**
+ * Synthetic id for the built-in on-device engine (the brain-engine-card) in the
+ * `inUseConnections` set — it is not a provider CONNECTION, so it needs its own
+ * token to be markable "In use now" alongside the real connection ids.
+ */
+export const BRAIN_ENGINE_ID = "__brain__";
 
 /**
  * Heuristic: does this string look like a filesystem PATH to a `.gguf` file
@@ -563,6 +571,30 @@ export class SettingsStore {
   });
 
   /**
+   * Which engines the CURRENT posture actively routes work to right now — the
+   * source for the "In use now" badge in Advanced → Engines. Derived from the
+   * posture-preset semantics (NOT re-implementing the resolver row-by-row):
+   * cloud/hybrid clear the role overrides so the DEFAULT engine writes
+   * Notes/Ask/Live; hybrid/fully_local run the built-in on-device brain
+   * (reactions / all local roles). It is a usage HINT, not a locality label —
+   * the card's own group heading and the "What runs where" map carry the
+   * cloud-vs-Mac truth. It never marks an engine a preset does not use; on the
+   * derived `custom` posture it best-effort marks the default engine (which
+   * always writes Notes) plus the built-in brain when `brain_backend=local`.
+   */
+  readonly inUseConnections = computed<ReadonlySet<string>>(() => {
+    const p = this.posture();
+    const provider = this._providerIdValue();
+    const s = new Set<string>();
+    if (provider && (p === "cloud" || p === "hybrid" || p === "custom"))
+      s.add(provider);
+    if (p === "hybrid" || p === "fully_local") s.add(BRAIN_ENGINE_ID);
+    if (p === "custom" && this._brainBackendValue() === "local")
+      s.add(BRAIN_ENGINE_ID);
+    return s;
+  });
+
+  /**
    * Where the DEFAULT provider sends text, for the "Where your text goes"
    * privacy strip: `null` when the default is a local (loopback) Ollama —
    * nothing leaves, the line is hidden — otherwise the connection's display
@@ -740,7 +772,7 @@ export class SettingsStore {
 
   /** Notes-row Inherit summary — Notes always falls back to the Default AI triple. */
   readonly notesInheritSummary = computed(
-    () => `Follows Default AI: ${this.defaultAiSummary()}`,
+    () => `Follows the Default engine: ${this.defaultAiSummary()}`,
   );
 
   /**
@@ -752,11 +784,11 @@ export class SettingsStore {
   readonly assistantInheritSummary = computed(() => {
     switch (this._brainBackendValue()) {
       case "local":
-        return "Follows the assistant fallback: Local model — on-device";
+        return "Follows the assistant fallback: Murmur Brain — on-device";
       case "off":
         return "Follows the assistant fallback: Off — retrieval only";
       default:
-        return `Follows Default AI: ${this.defaultAiSummary()}`;
+        return `Follows the Default engine: ${this.defaultAiSummary()}`;
     }
   });
 
@@ -879,12 +911,84 @@ export class SettingsStore {
   private readonly _postureError = signal<string | null>(null);
   readonly postureError = this._postureError.asReadonly();
 
+  // ── "What runs where" resolved map ──────────────────────────────────────
+  /** The backend-resolved per-job routing rows (resolved_ai_map). */
+  private readonly _aiMap = signal<AiMapRow[]>([]);
+  readonly aiMap = this._aiMap.asReadonly();
+
+  /** Re-fetch the resolved map (load, after save, after a posture apply). Keeps last on failure. */
+  async refreshAiMap(): Promise<void> {
+    try {
+      this._aiMap.set(await this.ipc.resolvedAiMap());
+    } catch {
+      // keep the last known map — the card renders its loading/emptiness state
+    }
+  }
+
+  /**
+   * Advanced-disclosure open state, HOISTED from AiAdvancedBlockComponent so the
+   * map card's "Change" affordance can open it from outside.
+   */
+  readonly advancedExpanded = signal(false);
+  expandAdvanced(): void {
+    this.advancedExpanded.set(true);
+  }
+
+  /**
+   * The per-feature role row the map's "Change" wants the Advanced block to
+   * scroll to + flash. Written by `requestHighlightRole`, consumed by
+   * `AiRoleRowsComponent` (which opens the disclosure, scrolls the row into
+   * view, and flashes it), then cleared via `clearHighlightRole` once handled.
+   */
+  private readonly _highlightRole = signal<"notes" | "ask" | "live" | null>(
+    null,
+  );
+  readonly highlightRole = this._highlightRole.asReadonly();
+
+  /**
+   * Ask the role rows to scroll to + flash `role`. The null-then-set makes a
+   * REPEAT click on the same row's "Change" re-fire the highlight even when the
+   * value is unchanged (a plain `.set(role)` would be a no-op for the effect).
+   */
+  requestHighlightRole(role: "notes" | "ask" | "live"): void {
+    this._highlightRole.set(null);
+    this._highlightRole.set(role);
+  }
+
+  /** Clear the highlight request once the role rows have handled it. */
+  clearHighlightRole(): void {
+    this._highlightRole.set(null);
+  }
+
   /**
    * The posture mid-download (drives the target-card progress indicator).
    * Non-null only while `setPosture` is downloading absent needed models.
    */
   private readonly _pendingPosture = signal<Posture | null>(null);
   readonly pendingPosture = this._pendingPosture.asReadonly();
+
+  /**
+   * A posture the user PICKED that needs an on-device download, awaiting explicit
+   * confirmation. Non-null shows the confirm card (what model, size, what it does
+   * + a Download button) — nothing downloads until `confirmPostureDownload()`. This
+   * is the deliberate opt-in step: a multi-GB download never starts on a single tap.
+   */
+  private readonly _pendingConfirm = signal<Posture | null>(null);
+  readonly pendingConfirm = this._pendingConfirm.asReadonly();
+
+  /** The models the pending-confirm posture would download (name/size for the card). */
+  readonly confirmModels = computed(() => {
+    const p = this._pendingConfirm();
+    return p ? this.neededModelsFor(p) : [];
+  });
+
+  /** Total bytes the pending-confirm download would fetch (absent models only). */
+  readonly confirmDownloadBytes = computed(() =>
+    this.confirmModels()
+      .map((n) => n.model)
+      .filter((m): m is BrainModelDto => !!m && !m.downloaded)
+      .reduce((sum, m) => sum + m.approxSizeBytes, 0),
+  );
 
   /** Flip to true via `cancelPostureDownload()` to abort an in-flight download loop. */
   private _cancelDownload = false;
@@ -912,28 +1016,9 @@ export class SettingsStore {
     this.neededModelsFor(this.posture()),
   );
 
-  /**
-   * The "right now" one-sentence summary for the active posture — for the
-   * posture state-line in the redesigned AI & Models block (Task 2).
-   *
-   * Returns "" when `posture()` is null (not yet loaded), so the template never
-   * shows "Custom" as a pre-load flash. "Custom" is returned only for the actual
-   * `"custom"` posture value.
-   */
-  readonly postureStateLine = computed((): string => {
-    switch (this.posture()) {
-      case "cloud":
-        return "Claude Code writes everything — notes, answers, briefs. Only transcription runs on this Mac.";
-      case "hybrid":
-        return "Claude writes notes; your Mac runs realtime reactions and keeps fact-extraction on-device.";
-      case "fully_local":
-        return "Everything runs on this Mac. Nothing leaves. @brain answers run on-device (private, a little slower live).";
-      case "custom":
-        return "Custom — some features run on-device, some in the cloud.";
-      default:
-        return ""; // null = posture not yet loaded — show nothing rather than a misleading "Custom"
-    }
-  });
+  // (The old `postureStateLine` summary was replaced by the per-posture
+  // `postureMeaning()` line in brain-posture-block — more accurate about which
+  // jobs stay on-device, and not hardcoded to "Claude Code" as the writer.)
 
   /**
    * The installed-base retirement nudge (`brain_model_retirement_nudge`), or null.
@@ -1169,7 +1254,9 @@ export class SettingsStore {
       // Phase H — brain model registry + download-progress stream (best-effort).
       await this.subscribeBrainDownload();
       await this.refreshBrainModels();
-      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement nudge.
+      // Murmur Brain — derived posture (Cloud/Hybrid/Fully local) + retirement
+      // nudge. refreshPosture() also refreshes the resolved "what runs where"
+      // AI map, so no separate refreshAiMap() call is needed here.
       await this.refreshPosture();
       // Brain Live RAM headroom (best-effort; true = never warn behind a failed probe).
       this._brainLiveRamOk.set(
@@ -1341,6 +1428,10 @@ export class SettingsStore {
     this._retirementNudge.set(
       await this.ipc.brainModelRetirementNudge().catch(() => null),
     );
+    // Posture/roles just changed → the resolved "what runs where" map may have
+    // shifted. Refresh it here so every posture caller (setPosture, role/provider
+    // saves, retirement apply, load) keeps the map in sync.
+    void this.refreshAiMap();
   }
 
   /**
@@ -1360,7 +1451,7 @@ export class SettingsStore {
   async setPosture(p: Posture): Promise<void> {
     if (p === "custom") return; // derived-only label — never settable
     this._postureError.set(null);
-    this._postureBusy.set(true);
+    this._pendingConfirm.set(null);
 
     const needed = this.neededModelsFor(p);
     const absent = needed
@@ -1368,9 +1459,11 @@ export class SettingsStore {
       .filter((m): m is BrainModelDto => !!m && !m.downloaded);
 
     if (absent.length === 0) {
-      // Fast path: all needed models already on disk — select them all, then commit.
-      // Selecting unconditionally ensures the backend role pins point at the
-      // auto-picked models, not the registry default (which may differ and be absent).
+      // Fast path: all needed models already on disk (Cloud, or a local posture whose
+      // models are present) — select them all, then commit immediately. Selecting
+      // unconditionally pins the backend roles at the auto-picked models, not the
+      // registry default (which may differ and be absent).
+      this._postureBusy.set(true);
       try {
         await this.selectNeeded(needed);
         await this.commitPosture(p);
@@ -1382,7 +1475,36 @@ export class SettingsStore {
       return;
     }
 
-    // Slow path: at least one model needs downloading before we can commit.
+    // Needs a download → ASK FIRST. Show the confirm card (model, size, what it does
+    // + a Download button); nothing downloads until confirmPostureDownload(). A
+    // multi-GB fetch must never start on a single tap.
+    this._pendingConfirm.set(p);
+  }
+
+  /** Dismiss the pending-confirm card without downloading. The posture stays unchanged. */
+  cancelPendingPosture(): void {
+    this._pendingConfirm.set(null);
+  }
+
+  /**
+   * Confirm the pending posture: download its absent on-device models (progress via
+   * `pendingPosture`/`brainDownloadFrac`), then select all needed models and commit.
+   * On failure/cancel, clears state, surfaces `postureError` (cancel is silent), and
+   * refreshes the display back to the unchanged backend posture. Never commits an
+   * incomplete state.
+   */
+  async confirmPostureDownload(): Promise<void> {
+    const p = this._pendingConfirm();
+    if (!p) return;
+    this._pendingConfirm.set(null);
+    this._postureError.set(null);
+    this._postureBusy.set(true);
+
+    const needed = this.neededModelsFor(p);
+    const absent = needed
+      .map((n) => n.model)
+      .filter((m): m is BrainModelDto => !!m && !m.downloaded);
+
     this._pendingPosture.set(p);
     this._cancelDownload = false;
     try {
@@ -1399,9 +1521,8 @@ export class SettingsStore {
       // Honor cancel between the last download and the select+commit, so a cancel
       // during the only/final download does not still commit the posture.
       if (this._cancelDownload) throw new Error("cancelled");
-      // Select ALL needed models (not just the newly-downloaded subset) so that a
-      // model that was already on disk but not selected also gets pinned to the
-      // right role before the posture commit.
+      // Select ALL needed models (not just the newly-downloaded subset) so a model
+      // already on disk but unselected also gets pinned to the right role first.
       await this.selectNeeded(needed);
       await this.commitPosture(p);
     } catch (e) {
@@ -1418,7 +1539,7 @@ export class SettingsStore {
     }
   }
 
-  /** Abort an in-flight `setPosture` download loop. The posture stays unchanged. */
+  /** Abort an in-flight download loop. The posture stays unchanged. */
   cancelPostureDownload(): void {
     this._cancelDownload = true;
   }

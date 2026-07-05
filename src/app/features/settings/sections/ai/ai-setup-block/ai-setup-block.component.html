@@ -1,0 +1,206 @@
+@for (card of setupCards(); track card) {
+  @switch (card) {
+    @case ("engine") {
+      <div class="card setup-card" [formGroup]="form">
+        <div class="setup-head">
+          <h3>Your default AI engine</h3>
+          <p class="text-secondary setup-sub">
+            Writes your notes, answers and briefs. Cloud engines are redacted
+            before anything leaves.
+          </p>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Engine</span>
+          <select formControlName="providerId" (change)="onEngineChanged($event)">
+            <option value="claude_code">Claude Code (default)</option>
+            <option value="anthropic">Anthropic API</option>
+            <option value="ollama">Ollama</option>
+            <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
+          </select>
+        </label>
+
+        <!--
+          Model + reasoning-effort. providerModel steers ONLY the claude_code
+          /anthropic arms (gateway/ollama read their own connection-card
+          model), so the picker renders for those two — for gateway/ollama we
+          point at the connection card, now under Advanced.
+        -->
+        @switch (form.controls.providerId.value) {
+          @case ("gateway") {
+            <p class="field-help text-muted">
+              The model for Kong AI Gateway is set in its connection card
+              under Advanced.
+            </p>
+          }
+          @case ("ollama") {
+            <p class="field-help text-muted">
+              The model for Ollama is set in its connection card under
+              Advanced.
+            </p>
+          }
+          @default {
+            <div class="field">
+              <span class="field-label">Model</span>
+              <div class="model-row">
+                @if (defaultModelCatalog().length > 0) {
+                  <select formControlName="providerModel" class="model-select">
+                    <option value="">Default (provider's pick)</option>
+                    @for (id of defaultModelCatalog(); track id) {
+                      <option [value]="id">{{ id }}</option>
+                    }
+                    @if (defaultModelIsCustom()) {
+                      <option [value]="form.controls.providerModel.value">
+                        {{ form.controls.providerModel.value }} (custom)
+                      </option>
+                    }
+                  </select>
+                } @else {
+                  <input
+                    formControlName="providerModel"
+                    placeholder="Model id (blank = provider's pick)"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="model-input"
+                  />
+                }
+                <button
+                  type="button"
+                  class="btn btn-ghost model-refresh"
+                  (click)="refreshDefaultModels()"
+                  [disabled]="defaultModelsLoading()"
+                  title="Fetch this provider's model list"
+                >
+                  @if (defaultModelsLoading()) {
+                    Loading…
+                  } @else {
+                    ↻ Refresh
+                  }
+                </button>
+              </div>
+            </div>
+          }
+        }
+
+        @if (form.controls.providerId.value === "anthropic") {
+          <label class="field">
+            <span class="field-label">Reasoning effort</span>
+            <select formControlName="providerEffort">
+              <option value="">Default</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+        }
+
+        <div class="setup-foot">
+          @if (providerIsCloud()) {
+            <span class="pill">
+              <span class="pill-dot"></span>
+              Cloud · redacted first
+            </span>
+          } @else {
+            <span class="pill is-success">
+              <span class="pill-dot"></span>
+              On this Mac · nothing leaves
+            </span>
+          }
+          <button type="button" class="setup-link" (click)="expandAdvanced()">
+            Set up &amp; test engines →
+          </button>
+        </div>
+      </div>
+    }
+
+    @case ("reactions") {
+      <div class="card setup-card">
+        <div class="setup-head">
+          <h3>On-device model</h3>
+          <p class="text-secondary setup-sub">
+            Realtime reactions run live on this Mac — nothing leaves.
+          </p>
+        </div>
+        @for (l of reactionsLines(); track l.role) {
+          <div class="od-line">
+            <div class="od-info">
+              <span class="od-role">{{ l.role }}</span>
+              <span class="od-model text-muted">{{ l.model?.name ?? "—" }}</span>
+            </div>
+            @if (l.model; as m) {
+              @if (brainDownloadingId() === m.id) {
+                <span class="od-dl text-muted">Downloading… {{ brainPct() }}</span>
+              } @else if (m.downloaded) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Ready
+                </span>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                  (click)="download(m.id)"
+                  [disabled]="brainDownloadingId() !== null"
+                >
+                  Download {{ sizeLabel(m.approxSizeBytes) }}
+                </button>
+              }
+            }
+          </div>
+        }
+        <button type="button" class="setup-link" (click)="expandAdvanced()">
+          Customize models →
+        </button>
+      </div>
+    }
+
+    @case ("local") {
+      <div class="card setup-card">
+        <div class="setup-head">
+          <h3>On-device model</h3>
+          <p class="text-secondary setup-sub">
+            Everything runs on this Mac — nothing leaves.
+          </p>
+        </div>
+        @for (l of localLines(); track l.role) {
+          <div class="od-line">
+            <div class="od-info">
+              <span class="od-role">{{ l.role }}</span>
+              <span class="od-model text-muted">{{ l.model?.name ?? "—" }}</span>
+            </div>
+            @if (l.model; as m) {
+              @if (brainDownloadingId() === m.id) {
+                <span class="od-dl text-muted">Downloading… {{ brainPct() }}</span>
+              } @else if (m.downloaded) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Ready
+                </span>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                  (click)="download(m.id)"
+                  [disabled]="brainDownloadingId() !== null"
+                >
+                  Download {{ sizeLabel(m.approxSizeBytes) }}
+                </button>
+              }
+            }
+          </div>
+        }
+        <button type="button" class="setup-link" (click)="expandAdvanced()">
+          Customize models →
+        </button>
+      </div>
+    }
+
+    @case ("custom-note") {
+      <p class="custom-note text-muted">
+        Custom mix — you've routed features individually. See
+        <strong>What runs where</strong> below, tune under <strong>Advanced</strong>.
+      </p>
+    }
+  }
+}
+  

@@ -146,7 +146,7 @@ mod tests {
             .unwrap()
             .message;
         let (upload_bytes, reg_export_key) =
-            client_registration_finish(creg.state, password, &sresp.serialize().to_vec()).unwrap();
+            client_registration_finish(creg.state, password, &sresp.serialize()).unwrap();
         let upload = RegistrationUpload::<CS>::deserialize(&upload_bytes).unwrap();
         let password_file = ServerRegistration::<CS>::finish(upload)
             .serialize()
@@ -196,7 +196,7 @@ mod tests {
             .unwrap()
             .message;
         let (upload_bytes, _) =
-            client_registration_finish(creg.state, b"right", &sresp.serialize().to_vec()).unwrap();
+            client_registration_finish(creg.state, b"right", &sresp.serialize()).unwrap();
         let password_file = ServerRegistration::<CS>::finish(
             RegistrationUpload::<CS>::deserialize(&upload_bytes).unwrap(),
         )

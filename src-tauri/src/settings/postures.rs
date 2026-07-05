@@ -130,6 +130,10 @@ pub fn apply_posture(cfg: &mut AppConfig, posture: Posture) {
     match posture {
         Posture::Cloud => {
             cfg.brain_live = false;
+            // The in-meeting voice assistant is "only meaningful while brain_live is on" (it needs the
+            // on-device light engine for wake detection), so it CANNOT run in Cloud — force it off so
+            // the state matches the UI (which hides it) and it can never be a dangling-on setting.
+            cfg.realtime_reactions = false;
             cfg.brain_backend = BrainBackend::Cloud;
             clear_role(cfg, Role::Notes);
             clear_role(cfg, Role::Ask);

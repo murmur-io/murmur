@@ -7,9 +7,9 @@ import {
   output,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
-import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 import type { ProviderStatus } from "../../../../../core/models";
 import { SettingsStore } from "../../../settings.store";
+import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 
 /** Render-ready view-model for one connection card (built by the parent). */
 export interface ConnectionCardVm {
@@ -18,6 +18,8 @@ export interface ConnectionCardVm {
   readonly status: ProviderStatus | null;
   readonly expanded: boolean;
   readonly cloud: boolean;
+  /** True when the current posture actively routes work to this engine now. */
+  readonly inUse: boolean;
 }
 
 /**

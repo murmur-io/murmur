@@ -1,0 +1,216 @@
+<div class="picker">
+  @if (reactionsOnly()) {
+    <div class="head">
+      <h3>On-device model — realtime reactions</h3>
+      <p class="sub text-secondary">
+        A small model runs live during meetings, on this Mac.
+      </p>
+    </div>
+
+    <div class="block">
+      <span class="label">Language</span>
+      <div class="seg" role="group" aria-label="Model language">
+        <button
+          type="button"
+          [class.on]="family() === 'multi'"
+          (click)="setFamily('multi')"
+        >
+          🌍 Multilingual
+        </button>
+        <button
+          type="button"
+          [class.on]="family() === 'pl'"
+          (click)="setFamily('pl')"
+        >
+          🇵🇱 Polish-native
+        </button>
+      </div>
+    </div>
+
+    <div class="block">
+      @if (selectedLight(); as m) {
+        <div class="resolved" [class.notready]="!m.downloaded">
+          <div class="r-info">
+            <div class="r-name">{{ m.name }}</div>
+            <div class="r-meta">
+              {{ familyLabel() }} · {{ sizeLabel(m.approxSizeBytes) }} · needs
+              ≥{{ m.minRamGb }} GB RAM
+            </div>
+          </div>
+          @if (brainDownloadingId() === m.id) {
+            <div class="brain-progress" role="status">
+              <div class="brain-progress-track" aria-hidden="true">
+                <div
+                  class="brain-progress-fill"
+                  [style.width.%]="brainDownloadFrac() * 100"
+                ></div>
+              </div>
+              <span class="brain-progress-label text-muted">
+                {{ brainPct() }}
+              </span>
+            </div>
+          } @else if (m.downloaded) {
+            <span class="pill is-success">
+              <span class="pill-dot"></span>
+              Ready
+            </span>
+          } @else {
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              (click)="downloadAndUse(m.id)"
+              [disabled]="brainDownloadingId() !== null"
+            >
+              Download {{ sizeLabel(m.approxSizeBytes) }}
+            </button>
+          }
+        </div>
+      } @else {
+        <p class="r-meta text-muted">
+          No realtime model available for this language yet.
+        </p>
+      }
+    </div>
+  } @else {
+    <div class="head">
+      <h3>On-device model</h3>
+      <p class="sub text-secondary">
+        Runs your notes &amp; answers on this Mac. More effort = a heavier,
+        smarter model — slower and needs more RAM.
+      </p>
+    </div>
+
+    <div class="block">
+      <span class="label">Language</span>
+      <div class="seg" role="group" aria-label="Model language">
+        <button
+          type="button"
+          [class.on]="family() === 'multi'"
+          (click)="setFamily('multi')"
+        >
+          🌍 Multilingual
+        </button>
+        <button
+          type="button"
+          [class.on]="family() === 'pl'"
+          (click)="setFamily('pl')"
+        >
+          🇵🇱 Polish-native
+        </button>
+      </div>
+    </div>
+
+    <div class="block">
+      @if (heavyModels().length > 1) {
+        <div class="row-between">
+          <span class="label">Effort</span>
+          <span class="r-meta text-muted">{{ effortLabel() }}</span>
+        </div>
+        <div class="slider-wrap">
+          <input
+            type="range"
+            min="0"
+            [max]="heavyModels().length - 1"
+            step="1"
+            [value]="heavyIdx()"
+            (input)="onSlide($event)"
+            [style.--fill.%]="fillPct()"
+            aria-label="On-device model effort"
+          />
+          <div class="ends">
+            <span>⚡ Faster</span>
+            <span>Smarter 🧠</span>
+          </div>
+          <div class="ticks">
+            @for (m of heavyModels(); track m.id; let i = $index) {
+              <span class="tick" [class.on]="i === heavyIdx()">
+                {{ sizeLabel(m.approxSizeBytes) }}
+              </span>
+            }
+          </div>
+        </div>
+      }
+
+      @if (selectedHeavy(); as m) {
+        <div class="resolved" [class.notready]="!m.downloaded">
+          <div class="r-info">
+            <div class="r-name">{{ m.name }}</div>
+            <div class="r-meta">
+              {{ familyLabel() }} · {{ sizeLabel(m.approxSizeBytes) }} · needs
+              ≥{{ m.minRamGb }} GB RAM
+            </div>
+          </div>
+          @if (brainDownloadingId() === m.id) {
+            <div class="brain-progress" role="status">
+              <div class="brain-progress-track" aria-hidden="true">
+                <div
+                  class="brain-progress-fill"
+                  [style.width.%]="brainDownloadFrac() * 100"
+                ></div>
+              </div>
+              <span class="brain-progress-label text-muted">
+                {{ brainPct() }}
+              </span>
+            </div>
+          } @else if (m.downloaded) {
+            <span class="pill is-success">
+              <span class="pill-dot"></span>
+              Ready
+            </span>
+          } @else {
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              (click)="downloadAndUse(m.id)"
+              [disabled]="brainDownloadingId() !== null"
+            >
+              Download {{ sizeLabel(m.approxSizeBytes) }}
+            </button>
+          }
+        </div>
+
+        @if (m.fitsRam === false) {
+          <p class="ram-warn">
+            ⚠ {{ m.name }} needs ≥{{ m.minRamGb }} GB RAM — may be slow
+            alongside recording on this Mac.
+          </p>
+        }
+      } @else {
+        <p class="r-meta text-muted">
+          No on-device model available for this language yet.
+        </p>
+      }
+
+      <p class="auto-note">
+        <b>Live reactions</b> during the meeting use the smallest model of
+        your family ({{ lightModel()?.name ?? "—" }}) — fast, low-RAM,
+        automatic.
+      </p>
+
+      <button type="button" class="adv-link" (click)="toggleGguf()">
+        ＋ Use a custom GGUF file instead
+      </button>
+      @if (ggufOpen()) {
+        <label class="field gguf-field">
+          <span class="field-label">Custom GGUF model</span>
+          <input
+            [value]="customGgufValue()"
+            (input)="setCustomGguf($any($event.target).value)"
+            placeholder="/path/to/model.gguf or a registry id"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="field-help text-muted">
+            Point at your own .gguf file, or type a registry id. Saved with
+            your settings.
+          </span>
+        </label>
+      }
+    </div>
+  }
+
+  @if (brainError(); as berr) {
+    <p class="text-danger picker-error">{{ berr }}</p>
+  }
+</div>
+  
