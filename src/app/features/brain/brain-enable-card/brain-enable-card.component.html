@@ -1,0 +1,31 @@
+<div class="card enable-card">
+  <div class="enable-copy">
+    <h3>Enable the brain</h3>
+    <p class="text-secondary">
+      Downloads two on-device models ({{ sizeHint() }} total). They run
+      entirely on your Mac — nothing is sent anywhere. This switches on
+      <strong>memory</strong> (the brain remembers facts about you) and
+      <strong>semantic search</strong> (find things by meaning, not keywords).
+    </p>
+  </div>
+
+  @if (stage() === "done" || allReady()) {
+    <span class="pill is-success"><span class="pill-dot"></span> Brain enabled</span>
+  } @else if (running()) {
+    <div class="enable-progress">
+      @if (stage() === "brain") {
+        <span class="text-secondary">Downloading the brain model… {{ brainPct() }}</span>
+      } @else {
+        <span class="text-secondary">Downloading the search model…</span>
+      }
+    </div>
+  } @else {
+    <button type="button" class="btn btn-primary" (click)="enable()">
+      Enable the brain
+    </button>
+  }
+
+  @if (error(); as e) {
+    <p class="banner is-warning" role="alert">Download failed: {{ e }} — try again.</p>
+  }
+</div>

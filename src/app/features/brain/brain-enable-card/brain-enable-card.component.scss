@@ -1,0 +1,13 @@
+.enable-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.enable-copy h3 {
+  margin: 0 0 var(--space-1);
+}
+.enable-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
