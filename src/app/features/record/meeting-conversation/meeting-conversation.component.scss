@@ -1,0 +1,290 @@
+/* The surface fills its host (the record screen makes it the full-height
+   main view) so the notes flow grows to the bottom. */
+:host {
+  display: block;
+  height: 100%;
+}
+.surface {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  height: 100%;
+  min-height: 0;
+}
+.surface-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.head-orb {
+  --orb-size: 22px;
+}
+.surface-title {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.surface-hint {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+/* ── The scrollable notes flow (oldest → newest) ─────────────────────── */
+/* Reactions rail — the recall + contradiction lanes stacked above the flow. */
+.reactions-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: none;
+}
+/* Shadow-mode calibration — an in-flow accent prompt (not a floating overlay). */
+.shadow-calibration {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex: none;
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+}
+.shadow-copy {
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  line-height: 1.45;
+  flex: 1 1 200px;
+  min-width: 0;
+}
+.shadow-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.shadow-actions .btn-sm {
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.8rem;
+}
+.flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-height: 180px;
+  overflow-y: auto;
+  padding-right: var(--space-1);
+}
+.flow-empty {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+/* inline keycap (head + empty-state hint) */
+.kbd {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.74rem;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+
+/* ── input row: voice mic + text composer, pinned at the foot ───────── */
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  flex: none;
+}
+/* Positioned wrapper so the caret-anchored @brain popover can be placed
+   relative to the textarea. */
+.composer-editor {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── @brain mention popover — FLOATS over the composer → OPAQUE (trap T3).
+   NOT the frosted .card: a translucent surface would bleed the notes flow
+   behind it through (a broken-looking menu). ──────────────────────────── */
+.mention-menu {
+  position: absolute;
+  z-index: 20;
+  min-width: 200px;
+  max-width: 260px;
+  padding: var(--space-1);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--transition);
+}
+.mention-item:hover,
+.mention-item:focus-visible {
+  outline: none;
+  background: var(--accent-soft);
+}
+.mention-ico {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.mention-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.mention-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.mention-hint {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+.mic-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--accent-ring);
+  border-radius: 50%;
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  cursor: pointer;
+  transition:
+    transform var(--transition-fast),
+    background var(--transition),
+    box-shadow var(--transition),
+    color var(--transition);
+}
+.mic-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  transform: scale(1.05);
+}
+.mic-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+.mic-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.mic-btn.is-listening {
+  background: var(--accent-gradient);
+  color: var(--text-on-accent);
+  border-color: transparent;
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+.mic-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+@keyframes mic-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--accent-ring);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(110, 118, 255, 0);
+  }
+}
+.composer-input {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  max-height: 140px;
+  padding: var(--space-2) var(--space-3);
+  resize: none;
+  line-height: 1.45;
+  font-size: 0.9rem;
+}
+.composer-send {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  justify-content: center;
+}
+/* When the line is an @brain ask, the send button reads as the accent
+   "ask" affordance (vs the calmer save-note default). */
+.composer-send.is-brain {
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.composer-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mic-btn.is-listening {
+    animation: none;
+  }
+}
+
+/* ── ENHANCE-MY-NOTES: one-shot Quiet-Weave sweep over the note lines ── */
+.flow app-note-item {
+  display: block;
+  transition: box-shadow var(--transition);
+}
+.flow.is-enhancing app-note-item {
+  border-radius: var(--radius-sm);
+  background-image: linear-gradient(
+    100deg,
+    transparent 32%,
+    color-mix(in srgb, var(--accent) 12%, transparent) 50%,
+    transparent 68%
+  );
+  background-size: 250% 100%;
+  background-repeat: no-repeat;
+  background-position: 200% 0; /* parked off-canvas after the single pass */
+  animation: enhance-sweep 900ms ease-in-out both;
+  box-shadow: inset 2px 0 0
+    color-mix(in srgb, var(--accent) 35%, transparent);
+}
+@keyframes enhance-sweep {
+  from {
+    background-position: -150% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+.surface-hint.is-enhancing,
+.surface-hint.is-settled {
+  color: var(--accent);
+  animation: rise 200ms var(--transition) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow.is-enhancing app-note-item {
+    animation: none;
+    background-image: none; /* the static inset accent edge remains as the cue */
+  }
+  .surface-hint.is-enhancing,
+  .surface-hint.is-settled {
+    animation: none;
+  }
+}
+    

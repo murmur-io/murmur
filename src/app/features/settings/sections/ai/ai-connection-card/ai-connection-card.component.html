@@ -1,0 +1,331 @@
+<div class="conn-card" [formGroup]="form">
+  <div class="conn-row">
+    <div class="conn-main">
+      <span class="conn-name">{{ card().name }}</span>
+      @if (card().status?.available) {
+        <span class="pill is-success">
+          <span class="pill-dot"></span>
+          Ready
+        </span>
+      } @else if (card().status) {
+        <span class="pill is-warning">
+          <span class="pill-dot"></span>
+          Needs setup
+        </span>
+      } @else {
+        <span class="pill">
+          <span class="pill-dot"></span>
+          Not set up
+        </span>
+      }
+    </div>
+    <div class="conn-actions">
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        (click)="probe.emit()"
+        [disabled]="testing()"
+      >
+        {{ testing() ? "Testing…" : "Test" }}
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
+        (click)="toggleConfigure.emit()"
+        [attr.aria-expanded]="card().expanded"
+      >
+        Configure
+        <svg
+          class="conn-chevron"
+          [class.is-open]="card().expanded"
+          viewBox="0 0 16 16"
+          width="12"
+          height="12"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M4 6.5 8 10.5 12 6.5" />
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <span class="conn-privacy text-muted">
+    {{
+      card().cloud
+        ? "Cloud — redacted first"
+        : "On this Mac — nothing leaves"
+    }}
+  </span>
+  @if (unavailableReason(); as reason) {
+    <span class="conn-reason text-muted">{{ reason }}</span>
+  }
+
+  @if (card().expanded) {
+    <div class="conn-config">
+      @switch (card().id) {
+        @case ("claude_code") {
+          <label class="field">
+            <span class="field-label">Claude binary</span>
+            <input formControlName="claudeBinary" />
+          </label>
+
+          <label class="toggle-row">
+            <span class="toggle-copy">
+              <span class="toggle-title"
+                >Pass shell environment to the Claude CLI</span
+              >
+              <span class="text-secondary toggle-sub">
+                Restores older-version behavior: an ANTHROPIC_API_KEY (and
+                proxy / base-URL vars) set in your shell reach the claude
+                CLI again, so it can authenticate via your env key. Off by
+                default for security — your database encryption keys are
+                never passed through.
+              </span>
+            </span>
+            <input class="switch" type="checkbox" formControlName="claudeCodeInheritEnv" />
+          </label>
+        }
+        @case ("anthropic") {
+          <div class="key-status">
+            <span class="text-secondary">API key</span>
+            @if (hasKey()) {
+              <span class="pill is-success">
+                <span class="pill-dot"></span>
+                Set
+              </span>
+            } @else {
+              <span class="pill">
+                <span class="pill-dot"></span>
+                Not set
+              </span>
+            }
+          </div>
+          <span class="row">
+            <input
+              type="password"
+              [formControl]="keyControl"
+              placeholder="sk-ant-…"
+            />
+            <button type="button" class="btn" (click)="saveKey()">
+              Save key
+            </button>
+          </span>
+        }
+        @case ("ollama") {
+          <label class="field">
+            <span class="field-label">Ollama base URL</span>
+            <input formControlName="ollamaBaseUrl" />
+            <span class="field-help text-muted">
+              A non-localhost URL makes Ollama count as cloud — the card
+              moves to the Cloud group and its text is redacted and
+              consent-gated like any other cloud provider.
+            </span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Ollama model</span>
+            <input formControlName="ollamaModel" />
+          </label>
+        }
+        @case ("gateway") {
+          <label class="field">
+            <span class="field-label">Base URL</span>
+            <input
+              formControlName="gatewayBaseUrl"
+              placeholder="http://localhost:4000/v1"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            @if (gatewayUrlWarning()) {
+              <span class="field-help text-danger">
+                Use https:// (http:// is allowed only for localhost).
+              </span>
+            }
+            <span class="field-help text-muted">
+              Enter your gateway's OpenAI-compatible base URL (e.g.
+              https://…/v1) — or the full chat-completions endpoint if your
+              gateway uses a custom route (e.g. a Kong serverless route
+              like https://…/test).
+            </span>
+          </label>
+
+          <div class="field">
+            <span class="field-label">Model</span>
+            <div class="gateway-model-row">
+              @if (gatewayModels().length > 0) {
+                <select
+                  formControlName="gatewayModel"
+                  class="gateway-model-select"
+                >
+                  <option value="">Gateway default</option>
+                  @for (m of gatewayModels(); track m.id) {
+                    <option [value]="m.id">{{ m.id }}</option>
+                  }
+                  <!--
+                    If the currently-saved model is not in the catalog (e.g. the
+                    catalog changed), keep it selectable so a manually-typed value
+                    is never silently lost. gatewayModelIsCustom() is a computed
+                    to avoid arrow-function syntax in the template.
+                  -->
+                  @if (gatewayModelIsCustom()) {
+                    <option [value]="form.controls.gatewayModel.value">
+                      {{ form.controls.gatewayModel.value }} (custom)
+                    </option>
+                  }
+                </select>
+              } @else {
+                <input
+                  formControlName="gatewayModel"
+                  placeholder="gpt-4o (leave blank to use the gateway default)"
+                  autocomplete="off"
+                  spellcheck="false"
+                  class="gateway-model-input"
+                />
+              }
+              <button
+                type="button"
+                class="btn btn-ghost gateway-model-refresh"
+                (click)="refreshGatewayModels()"
+                [disabled]="gatewayModelsLoading()"
+                title="Fetch models from the gateway's /v1/models endpoint"
+              >
+                @if (gatewayModelsLoading()) {
+                  Loading…
+                } @else {
+                  ↻ Refresh models
+                }
+              </button>
+            </div>
+            @if (gatewayModelError()) {
+              <span class="field-help text-muted">
+                Couldn't load models — check the base URL and key, or type
+                the model id manually.
+              </span>
+            } @else {
+              <span class="field-help text-muted">
+                Sent as the <code>model</code> field in every request —
+                leave blank to let the gateway choose.
+              </span>
+            }
+          </div>
+
+          <!-- Gateway health probe -->
+          <div class="gateway-health-row">
+            <span class="text-secondary">Gateway status</span>
+            <div class="gateway-health-status">
+              @if (gatewayHealth(); as h) {
+                @if (h.reachable) {
+                  <span class="pill is-success">
+                    <span class="pill-dot"></span>
+                    {{ h.modelCount }}
+                    {{ h.modelCount === 1 ? "model" : "models" }} reachable
+                  </span>
+                } @else {
+                  <span class="pill">
+                    <span class="pill-dot gateway-dot-unreachable"></span>
+                    Gateway unreachable
+                  </span>
+                }
+              } @else {
+                <span class="text-muted gateway-health-hint"
+                  >Not checked</span
+                >
+              }
+              <button
+                type="button"
+                class="btn btn-ghost gateway-health-btn"
+                (click)="checkGatewayHealth()"
+                [disabled]="gatewayHealthChecking()"
+              >
+                @if (gatewayHealthChecking()) {
+                  Checking…
+                } @else {
+                  Check
+                }
+              </button>
+            </div>
+          </div>
+
+          <!-- Gateway API key (optional) -->
+          <div class="key-status">
+            <span class="text-secondary">
+              API key
+              <span class="text-muted">(optional)</span>
+            </span>
+            @if (hasGatewayKey()) {
+              <span class="pill is-success">
+                <span class="pill-dot"></span>
+                Set
+              </span>
+            } @else {
+              <span class="pill">
+                <span class="pill-dot"></span>
+                Not set
+              </span>
+            }
+          </div>
+          <span class="row">
+            <input
+              type="password"
+              [formControl]="gatewayKeyControl"
+              placeholder="sk-… or any bearer token"
+              autocomplete="new-password"
+            />
+            <button
+              type="button"
+              class="btn"
+              (click)="saveGatewayKey()"
+              [disabled]="!gatewayKeyControl.value.trim()"
+            >
+              Save key
+            </button>
+            @if (hasGatewayKey()) {
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="removeGatewayKey()"
+              >
+                Clear
+              </button>
+            }
+          </span>
+          @if (gatewayKeyError()) {
+            <p class="text-danger gateway-key-error">
+              {{ gatewayKeyError() }}
+            </p>
+          }
+
+          <!-- Destination banner: calmer note for localhost, warning for remote -->
+          @if (gatewayDestination(); as dest) {
+            @if (dest.isRemote) {
+              <div class="banner is-warning gateway-banner">
+                <span class="banner-icon" aria-hidden="true">!</span>
+                <span>
+                  Content will be sent to
+                  <strong>{{ dest.host }}</strong> over the network —
+                  always scrubbed by the redaction firewall first and
+                  requires cloud-egress consent.
+                </span>
+              </div>
+            } @else {
+              <div class="banner gateway-banner">
+                <span class="banner-icon" aria-hidden="true">i</span>
+                <span>
+                  Localhost gateway — a local gateway can still forward to
+                  the cloud, so content is still redacted and
+                  consent-gated.
+                </span>
+              </div>
+            }
+          }
+        }
+      }
+    </div>
+  }
+</div>
+  

@@ -1,0 +1,459 @@
+:host {
+  display: block;
+}
+.note {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* ── A plain note — the user's own jotting, quiet + clearly "a note" ──── */
+.note-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-left: 2px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+.note-glyph {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  transform: translateY(2px);
+}
+.line-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── "✨ ask brain" — a quiet affordance on a plain note (no thread yet).
+   Revealed on row hover OR keyboard focus (a11y); stays clear of floating
+   overlays (it's in-flow, so trap T3 N/A). var(--token) only. ──────────── */
+.ask-brain {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: center;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--transition),
+    background var(--transition),
+    color var(--transition);
+}
+/* Reveal on hover of the whole note line, or whenever the button is focused. */
+.note-line:hover .ask-brain,
+.ask-brain:focus-visible {
+  opacity: 1;
+}
+.ask-brain:hover {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.ask-brain:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+/* While notes are still hydrating (loaded() false) the affordance is inert;
+   keep it muted + non-interactive even if the row is hovered. */
+.note-line:hover .ask-brain:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ask-spark {
+  font-size: 0.78rem;
+  line-height: 1;
+}
+/* Touch / coarse-pointer devices have no hover — keep it always visible. */
+@media (hover: none) {
+  .ask-brain {
+    opacity: 0.7;
+  }
+}
+
+/* ── @brain THREAD toggle (Slack-style header): caret + "Thread (N)" + a
+   short snippet of the user's question when collapsed. The question itself
+   renders as the user's first RIGHT-aligned bubble once expanded. ───────── */
+.thread-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition);
+}
+.thread-toggle:hover {
+  color: var(--accent-hover);
+  background: var(--surface-hover);
+}
+.thread-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.caret {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  transition: transform var(--transition);
+}
+.caret.is-open {
+  transform: rotate(90deg);
+}
+.toggle-label {
+  flex: 0 0 auto;
+  letter-spacing: 0.01em;
+}
+.reply-count {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.7rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* A muted one-line preview of the question while collapsed. */
+.toggle-snippet {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 450;
+  color: var(--text-muted);
+}
+
+/* ── The nested thread — indented under the toggle (Slack-style) ─────── */
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-left: var(--space-3);
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-subtle);
+}
+.turn {
+  display: flex;
+  flex-direction: column;
+}
+.turn-user {
+  align-items: flex-end;
+}
+.turn-agent {
+  align-items: flex-start;
+}
+.agent-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 0 3px 2px;
+}
+.agent-mark {
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.agent-name {
+  color: var(--accent-hover);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+.turn-bubble {
+  max-width: 92%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  animation: rise 200ms var(--transition) both;
+}
+.turn-bubble-user {
+  background: var(--accent-gradient);
+  color: var(--text-on-accent);
+  border-bottom-right-radius: var(--radius-sm);
+  white-space: pre-wrap;
+}
+.turn-bubble-agent {
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  border-bottom-left-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.agent-note {
+  color: var(--text-secondary);
+}
+
+/* the clean "Thinking…" state */
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+}
+.thinking-label {
+  font-size: 0.82rem;
+}
+
+/* ── propose → accept affordance (only for a NOTE proposal) ──────────── */
+.proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+.proposal-tag {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* The actual draft the user reviews before accepting — a quiet quoted card
+   so the CONTENT (not just the agent's meta summary) is what they see. */
+.draft-preview {
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+.turn-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.accept-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px var(--space-3);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.accept-btn:hover {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.accept-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.dismiss-btn {
+  padding: 3px var(--space-2);
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: color var(--transition);
+}
+.dismiss-btn:hover {
+  color: var(--text-secondary);
+}
+.added-tag {
+  margin-top: 2px;
+  color: var(--accent-hover);
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* Dismiss → a muted "Dismissed" tag (NOT "✓ Added to notes" — nothing saved). */
+.dismissed-tag {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* ── the thread's own follow-up input ──────────────────────────────── */
+.follow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: 2px;
+}
+.follow-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 34px;
+  padding: 0 var(--space-3);
+  font-size: 0.85rem;
+}
+.follow-send {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--accent-ring);
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.follow-send:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.follow-send:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.follow-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.follow-spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-ring);
+  border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+
+/* ── live tool trace ──────────────────────────────────────────────── */
+.trace {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.trace-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.2;
+}
+.trace-chip.is-running {
+  color: var(--text-primary);
+}
+.trace-chip.is-web {
+  background: color-mix(in srgb, var(--live) 16%, transparent);
+  border-color: color-mix(in srgb, var(--live) 35%, transparent);
+}
+.trace-chip.is-failed {
+  opacity: 0.6;
+}
+.trace-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 11px;
+  font-size: 0.66rem;
+  color: var(--accent);
+}
+.trace-chip.is-web .trace-ico {
+  color: var(--live);
+}
+.trace-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.trace-spin {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-ring);
+  border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.dots {
+  display: inline-flex;
+  gap: 3px;
+}
+.dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: blink 1.2s ease-in-out infinite both;
+}
+.dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.3;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .turn-bubble,
+  .dots span,
+  .trace-spin,
+  .follow-spin {
+    animation: none;
+  }
+  .dots span {
+    opacity: 0.7;
+  }
+}
+    

@@ -1,0 +1,211 @@
+.gw {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 120px);
+  padding: var(--space-5) 0 var(--space-7);
+}
+.gw-stage {
+  position: relative;
+  width: 100%;
+  max-width: 620px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  animation: gw-in 460ms var(--ease-spring) both;
+}
+@keyframes gw-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Hero. */
+.gw-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-3);
+}
+.orb-brand {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 88px;
+  height: 88px;
+  margin-bottom: var(--space-1);
+}
+.orb-core {
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  box-shadow:
+    var(--shadow-accent),
+    0 0 40px rgba(110, 118, 255, 0.55),
+    inset 0 2px 6px rgba(255, 255, 255, 0.4);
+  animation: orb-float 4s ease-in-out infinite;
+}
+.orb-brand::before,
+.orb-brand::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  opacity: 0.5;
+  animation: orb-ring 3s ease-in-out infinite;
+}
+.orb-brand::after {
+  animation-delay: 1.5s;
+}
+@keyframes orb-ring {
+  0% {
+    transform: scale(0.66);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.1);
+    opacity: 0;
+  }
+}
+@keyframes orb-float {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(-6px) scale(1.03);
+  }
+}
+.gw-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  font-size: 1.6rem;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  max-width: 22ch;
+}
+.brand-dot {
+  width: 10px;
+  height: 10px;
+  min-width: 10px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  box-shadow: var(--shadow-accent);
+}
+.gw-lede {
+  margin: 0;
+  max-width: 46ch;
+  font-size: 1.0125rem;
+  line-height: 1.6;
+}
+
+/* The two choice cards. */
+.gw-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+}
+@media (max-width: 560px) {
+  .gw-cards {
+    grid-template-columns: 1fr;
+  }
+}
+.gw-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  text-align: left;
+  padding: var(--space-5);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition),
+    box-shadow var(--transition),
+    transform var(--transition-fast);
+}
+.gw-card:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  transform: translateY(-2px);
+}
+.gw-card:active {
+  transform: translateY(0);
+}
+.gw-card:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.gw-card:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+.gw-card.is-accent {
+  border-color: transparent;
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent-ring);
+}
+.gw-card-icon {
+  display: inline-flex;
+  color: var(--accent-hover);
+  margin-bottom: var(--space-1);
+}
+.gw-card-name {
+  font-size: 1.02rem;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+.gw-card-sub {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  flex: 1;
+}
+.gw-card-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  color: var(--accent-hover);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.cta-arrow {
+  transition: transform var(--transition);
+}
+.gw-card:hover .cta-arrow {
+  transform: translateX(3px);
+}
+
+/* Account panel — a full-bleed frosted card hosting the reusable flow.
+   This is a whole PAGE (in-flow), so the frosted .card is correct here;
+   the OPAQUE-overlay rule (T3) governs the Settings floating modal. */
+.gw-panel {
+  padding: var(--space-6);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-core,
+  .orb-brand::before,
+  .orb-brand::after,
+  .gw-stage {
+    animation: none !important;
+  }
+}
+    

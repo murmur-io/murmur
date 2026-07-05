@@ -1,0 +1,707 @@
+/* Full-bleed focused wizard — fills the view, centres the panel. The app
+   header stays, but the stage owns the vertical space below it. */
+.ob {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 120px);
+  padding: var(--space-5) 0 var(--space-7);
+}
+.ob-stage {
+  position: relative;
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* ── Progress: filling dots + counter ─────────────────────────────── */
+.ob-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  animation: rise 420ms var(--transition) both;
+}
+.dots {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--border-strong);
+  transition:
+    width var(--transition),
+    background var(--transition),
+    box-shadow var(--transition);
+}
+.dot.is-done {
+  background: var(--accent);
+}
+.dot.is-active {
+  width: 26px;
+  background: var(--accent-gradient);
+  box-shadow: 0 0 12px rgba(110, 118, 255, 0.6);
+}
+.step-count {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+/* ── The panel — one frosted card, re-animated per step ───────────── */
+.ob-panel {
+  padding: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-height: 320px;
+  justify-content: center;
+}
+/* Keying the animation off data-step replays the entrance on each step. */
+.ob-panel[data-step] {
+  animation: panel-in 460ms var(--ease-spring) both;
+}
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ── Shared step copy ─────────────────────────────────────────────── */
+.ob-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.ob-eyebrow {
+  color: var(--accent-hover);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.ob-title {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+}
+.ob-sub {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+.ob-error {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* ── Welcome splash ───────────────────────────────────────────────── */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-4);
+  padding: var(--space-4) 0;
+}
+.orb-brand {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 96px;
+  height: 96px;
+  margin-bottom: var(--space-2);
+}
+.orb-core {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  box-shadow:
+    var(--shadow-accent),
+    0 0 40px rgba(110, 118, 255, 0.55),
+    inset 0 2px 6px rgba(255, 255, 255, 0.4);
+  animation: orb-float 4s ease-in-out infinite;
+}
+/* Two breathing rings echoing the record-screen orb language. */
+.orb-brand::before,
+.orb-brand::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  opacity: 0.5;
+  animation: orb-ring 3s ease-in-out infinite;
+}
+.orb-brand::after {
+  animation-delay: 1.5s;
+}
+@keyframes orb-ring {
+  0% {
+    transform: scale(0.66);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.1);
+    opacity: 0;
+  }
+}
+@keyframes orb-float {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(-6px) scale(1.03);
+  }
+}
+.welcome-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: 1.65rem;
+}
+.brand-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  box-shadow: var(--shadow-accent);
+}
+.ob-lede {
+  margin: 0;
+  max-width: 38ch;
+  color: var(--text-secondary);
+  font-size: 1.0625rem;
+  line-height: 1.55;
+}
+.ob-fineprint {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+.ob-cta {
+  height: 46px;
+  padding: 0 var(--space-5);
+  font-size: 1rem;
+  margin-top: var(--space-2);
+}
+.cta-arrow {
+  transition: transform var(--transition);
+}
+.ob-cta:hover .cta-arrow {
+  transform: translateX(3px);
+}
+
+/* ── Form fields (model step) ─────────────────────────────────────── */
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+}
+@media (max-width: 520px) {
+  .field-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.field-label {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+.model-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  min-height: 40px;
+}
+.model-note {
+  font-size: 0.85rem;
+}
+
+/* Whisper model-download progress bar (mirrors the settings brain-progress). */
+.dl-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 220px;
+  flex: 1;
+}
+.dl-progress-track {
+  height: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+.dl-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--radius-sm);
+  transition: width var(--transition);
+}
+.dl-progress-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.85rem;
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+}
+.row input {
+  flex: 1;
+  min-width: 0;
+}
+.row .btn {
+  flex: none;
+}
+
+/* Inline spinner — reuses the record-screen spin language for buttons. */
+.spin-ring {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--text-on-accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.dl-arrow,
+.vault-folder {
+  display: inline-flex;
+}
+
+/* ── A3 privacy-posture chooser (two big cards) ───────────────────── */
+.postures {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+@media (max-width: 520px) {
+  .postures {
+    grid-template-columns: 1fr;
+  }
+}
+.posture {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  text-align: left;
+  padding: var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition),
+    box-shadow var(--transition),
+    transform var(--transition-fast);
+}
+.posture:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.posture:active {
+  transform: translateY(1px);
+}
+.posture:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.posture.is-selected {
+  border-color: transparent;
+  background: var(--accent-soft);
+  box-shadow:
+    0 0 0 1px var(--accent),
+    var(--glass-highlight);
+}
+.posture-icon {
+  display: inline-flex;
+  color: var(--accent-hover);
+}
+.posture-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.posture-sub {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+.posture-recommended {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+/* Persistent, visible privacy-posture badge. */
+.privacy-badge {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--glass-border);
+}
+.privacy-badge.is-local {
+  background: var(--success-soft);
+}
+.privacy-badge-dot {
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+.privacy-badge.is-local .privacy-badge-dot {
+  background: var(--success);
+}
+.privacy-badge-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.privacy-badge-detail {
+  font-size: 0.8125rem;
+}
+
+/* ── Provider chooser ─────────────────────────────────────────────── */
+.providers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.provider {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  padding-right: var(--space-7);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition),
+    transform var(--transition-fast),
+    box-shadow var(--transition);
+}
+.provider:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.provider:active {
+  transform: translateY(1px);
+}
+.provider:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.provider.is-selected {
+  border-color: transparent;
+  background: var(--accent-soft);
+  box-shadow:
+    0 0 0 1px var(--accent),
+    var(--glass-highlight);
+}
+.provider-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.provider-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.provider-reason {
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.provider-check {
+  position: absolute;
+  top: 50%;
+  right: var(--space-4);
+  transform: translateY(-50%) scale(0.5);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  color: var(--text-on-accent);
+  opacity: 0;
+  transition:
+    opacity var(--transition),
+    transform var(--transition);
+}
+.provider.is-selected .provider-check {
+  opacity: 1;
+  transform: translateY(-50%) scale(1);
+}
+
+/* Contextual provider setup help. */
+.setup-well {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  animation: rise 320ms var(--transition) both;
+}
+.setup-well.is-ok {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.setup-title {
+  margin: 0;
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+.setup-text {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+.inline-url {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--text-primary);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.inline-cmd {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  user-select: text;
+  -webkit-user-select: text;
+  white-space: nowrap;
+}
+
+/* Consent-at-selection note for a cloud-classified pick (in-flow banner). */
+.consent-note {
+  font-size: 0.875rem;
+  line-height: 1.55;
+  animation: rise 320ms var(--transition) both;
+}
+.banner-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  font-weight: 700;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+/* ── Vault step ───────────────────────────────────────────────────── */
+.vault-pick {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+.vault-cta {
+  height: 46px;
+  padding: 0 var(--space-5);
+}
+.vault-chosen {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.vault-folder {
+  color: var(--accent-hover);
+  flex: none;
+}
+.vault-path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.vault-skip-note {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* ── Done step ────────────────────────────────────────────────────── */
+.done {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-3);
+}
+.done-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: var(--space-1);
+  border-radius: 50%;
+  background: var(--success-soft);
+  color: var(--success);
+  box-shadow:
+    0 0 0 1px rgba(74, 222, 128, 0.3),
+    0 0 32px rgba(74, 222, 128, 0.28);
+  animation: pop-in 520ms var(--ease-spring) both;
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.done-title {
+  margin: 0;
+}
+.done-sub {
+  margin: 0 0 var(--space-2);
+}
+.tips {
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+}
+.tip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  text-align: left;
+  animation: rise 420ms var(--transition) both;
+  animation-delay: calc(120ms + var(--d) * 80ms);
+}
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  min-width: 34px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 500;
+  flex: none;
+}
+.kbd-glyph {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+/* ── Footer nav ───────────────────────────────────────────────────── */
+.ob-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  animation: rise 460ms var(--transition) both;
+  animation-delay: 60ms;
+}
+.ob-nav-spacer {
+  flex: 1;
+}
+.ob-skip {
+  color: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-core,
+  .orb-brand::before,
+  .orb-brand::after,
+  .spin-ring {
+    animation: none !important;
+  }
+}
+    

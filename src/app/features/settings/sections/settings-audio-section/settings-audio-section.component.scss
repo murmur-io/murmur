@@ -1,0 +1,108 @@
+/* Stage-1 split: the host stays layout-transparent so this section's
+   cards remain direct flex items of the shell's .section-body (identical
+   spacing to the pre-split monolith); .section-stack reproduces the
+   .section-body column gap between this section's own cards. */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- Stacked label + control --- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.field-label {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+
+/* One-line helper that tracks the selected summary style. */
+.field-help {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* --- Capture-system-audio toggle row --- */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  cursor: pointer;
+}
+.toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.toggle-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.toggle-sub {
+  font-size: 0.85rem;
+}
+
+/* --- Speaker-voiceprint management list (under the toggle) --- */
+.vp-list {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.vp-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.vp-list-title {
+  font-size: 0.8125rem;
+}
+.vp-clear {
+  padding: var(--space-1) var(--space-2);
+  font-size: 0.8125rem;
+}
+.vp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.vp-name {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vp-forget {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+.vp-forget:hover:not(:disabled) {
+  color: var(--live);
+  background: var(--surface-raised);
+}
+.vp-forget:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+    

@@ -1,0 +1,307 @@
+<div class="tl card" [class.is-busy]="loading()">
+  <div class="tl-head">
+    <h3 class="tl-title">Timeline</h3>
+    @if (ready()) {
+      <span class="tl-sub">Who spoke when &amp; what was discussed</span>
+    }
+  </div>
+
+  @if (loading()) {
+    <!-- Shimmer skeleton while the LLM derives + caches the timeline. -->
+    <div class="tl-skeleton" aria-busy="true" aria-live="polite">
+      <span class="sk-label">Analysing speakers &amp; topics…</span>
+      <div class="sk-track">
+        @for (b of skeletonBars; track $index) {
+          <span
+            class="sk-bar"
+            [style.left.%]="b.left"
+            [style.width.%]="b.width"
+            [style.--i]="$index"
+          ></span>
+        }
+      </div>
+      <div class="sk-track sk-track--thin">
+        @for (b of skeletonRibbon; track $index) {
+          <span
+            class="sk-bar"
+            [style.left.%]="b.left"
+            [style.width.%]="b.width"
+            [style.--i]="$index + 4"
+          ></span>
+        }
+      </div>
+    </div>
+  } @else if (unavailable()) {
+    <!-- Quiet, non-blocking fallback with a retry affordance. -->
+    <div class="tl-unavailable">
+      <span class="tl-unavailable-dot" aria-hidden="true"></span>
+      <span class="tl-unavailable-text">Timeline unavailable</span>
+      <button
+        type="button"
+        class="btn btn-ghost tl-retry"
+        (click)="retry.emit()"
+      >
+        Retry
+      </button>
+    </div>
+  } @else {
+    <!-- Shared axis: a thin baseline with 3–4 mono time ticks. -->
+    <div
+      class="tl-axis"
+      role="slider"
+      tabindex="0"
+      aria-label="Seek timeline"
+      [attr.aria-valuemin]="0"
+      [attr.aria-valuemax]="totalRounded()"
+      [attr.aria-valuenow]="currentRounded()"
+      (click)="seekFromTrack($event)"
+      (mousemove)="onScrubMove($event)"
+      (mouseleave)="onScrubLeave()"
+      (keydown)="onAxisKey($event)"
+    >
+      @for (t of ticks(); track t.pct) {
+        <span class="tl-tick" [style.left.%]="t.pct">
+          <span class="tl-tick-mark" aria-hidden="true"></span>
+          <span class="tl-tick-label">{{ t.label }}</span>
+        </span>
+      }
+      <!-- Hover-scrub preview: a thin line + a m:ss bubble at the cursor. -->
+      @if (hoverPct(); as hp) {
+        <span class="tl-scrub" [style.left.%]="hp" aria-hidden="true">
+          <span class="tl-scrub-bubble">{{ hoverLabel() }}</span>
+        </span>
+      }
+      <!-- Shared playhead — sits in the axis, spans up over both tracks. -->
+      @if (showPlayhead()) {
+        <span
+          class="tl-playhead"
+          [style.left.%]="playheadPct()"
+          aria-hidden="true"
+        >
+          <span class="tl-playhead-knob"></span>
+        </span>
+        <!-- Pin-this-moment: emits the current playhead time (seconds). -->
+        <button
+          type="button"
+          class="tl-pin"
+          [style.left.%]="playheadPct()"
+          [attr.aria-label]="'Pin this moment at ' + fmt(currentTime())"
+          (click)="onPin($event)"
+        >
+          <span class="tl-pin-glyph" aria-hidden="true">📌</span>
+          <span class="tl-pin-tip" aria-hidden="true">Pin moment</span>
+        </button>
+      }
+    </div>
+
+    <!-- SPEAKER TIMELINE — one lane per unique speaker. -->
+    @if (lanes().length) {
+      <div class="tl-group">
+        <div class="tl-group-head">
+          <span class="tl-group-label">Speakers</span>
+          <div class="tl-legend">
+            @for (lane of lanes(); track lane.speaker) {
+              <span class="legend-item">
+                <span
+                  class="legend-dot"
+                  [style.background]="dotColor(lane.hue)"
+                  aria-hidden="true"
+                ></span>
+                @if (editingLabel() === lane.speaker) {
+                  <!-- Inline rename field — commits on Enter/blur, cancels on Escape. -->
+                  <input
+                    #renameInput
+                    type="text"
+                    class="legend-edit"
+                    aria-label="Speaker name"
+                    autocapitalize="words"
+                    autocomplete="off"
+                    spellcheck="false"
+                    [value]="labelDraft()"
+                    (input)="onRenameInput($event)"
+                    (keydown.enter)="commitRename(lane.speaker)"
+                    (keydown.escape)="cancelRename($event)"
+                    (blur)="commitRename(lane.speaker)"
+                    (click)="$event.stopPropagation()"
+                  />
+                } @else {
+                  <button
+                    type="button"
+                    class="legend-rename"
+                    [attr.aria-label]="'Rename ' + lane.speaker"
+                    (click)="startRename($event, lane.speaker)"
+                  >
+                    <span class="legend-name">{{ lane.speaker }}</span>
+                    <span class="legend-pencil" aria-hidden="true">✎</span>
+                  </button>
+                  <!-- Voiceprint suggestion — one-tap accept renames + enrols. -->
+                  @if (suggestionByLabel().get(lane.speaker); as name) {
+                    <button
+                      type="button"
+                      class="legend-suggest"
+                      [attr.aria-label]="
+                        'Rename ' + lane.speaker + ' to ' + name
+                      "
+                      (click)="acceptSuggestion(lane.speaker)"
+                    >
+                      Looks like <span class="legend-suggest-name">{{ name }}</span>?
+                    </button>
+                  }
+                }
+                <span class="legend-time">{{ fmt(lane.talkS) }}</span>
+              </span>
+            }
+          </div>
+        </div>
+
+        <div
+          class="tl-track tl-track--lanes"
+          role="slider"
+          tabindex="0"
+          aria-label="Seek speaker timeline"
+          [attr.aria-valuemin]="0"
+          [attr.aria-valuemax]="totalRounded()"
+          [attr.aria-valuenow]="currentRounded()"
+          (click)="seekFromTrack($event)"
+          (mousemove)="onScrubMove($event)"
+          (mouseleave)="onScrubLeave()"
+          (keydown)="onAxisKey($event)"
+        >
+          @if (hoverPct(); as hp) {
+            <span
+              class="tl-track-scrub"
+              [style.left.%]="hp"
+              aria-hidden="true"
+            ></span>
+          }
+          @for (lane of lanes(); track lane.speaker) {
+            <div class="tl-lane">
+              @for (blk of lane.blocks; track blk.order) {
+                <button
+                  type="button"
+                  class="tl-block"
+                  [class.is-active]="isActive(blk.startS, blk.endS)"
+                  [style.left.%]="blk.left"
+                  [style.width.%]="blk.width"
+                  [style.--i]="blk.order"
+                  [style.background]="blockColor(blk.hue)"
+                  [style.border-color]="edgeColor(blk.hue)"
+                  [attr.aria-label]="
+                    lane.speaker + ', ' + range(blk.startS, blk.endS)
+                  "
+                  (click)="onBlock($event, blk.startS)"
+                >
+                  <span class="tl-tip" aria-hidden="true">
+                    <span class="tl-tip-name">{{ lane.speaker }}</span>
+                    <span class="tl-tip-time">{{
+                      range(blk.startS, blk.endS)
+                    }}</span>
+                  </span>
+                </button>
+              }
+            </div>
+          }
+          @if (showPlayhead()) {
+            <span
+              class="tl-track-playhead"
+              [style.left.%]="playheadPct()"
+              aria-hidden="true"
+            ></span>
+          }
+        </div>
+      </div>
+    }
+
+    <!-- TOPIC TIMELINE — a single ribbon of labelled spans, same scale. -->
+    @if (topics().length) {
+      <div class="tl-group">
+        <div class="tl-group-head">
+          <span class="tl-group-label">Topics</span>
+          <span class="tl-group-hint">Jump to a chapter</span>
+        </div>
+
+        <!-- CHAPTERS — the topic spans as a clickable chapter list. -->
+        <div class="tl-chapters" role="list" aria-label="Chapters">
+          @for (ch of chapters(); track ch.order) {
+            <button
+              type="button"
+              class="tl-chapter"
+              role="listitem"
+              [class.is-active]="isActiveChapter(ch.startS, ch.endS)"
+              [style.--i]="ch.order"
+              [attr.aria-label]="
+                'Chapter ' + ch.label + ', starts ' + fmt(ch.startS)
+              "
+              (click)="onBlock($event, ch.startS)"
+            >
+              <span
+                class="tl-chapter-dot"
+                [style.background]="dotColor(ch.hue)"
+                aria-hidden="true"
+              ></span>
+              <span class="tl-chapter-label">{{ ch.label }}</span>
+              <span class="tl-chapter-time">{{ fmt(ch.startS) }}</span>
+            </button>
+          }
+        </div>
+
+        <div
+          class="tl-track tl-track--ribbon"
+          role="slider"
+          tabindex="0"
+          aria-label="Seek topic timeline"
+          [attr.aria-valuemin]="0"
+          [attr.aria-valuemax]="totalRounded()"
+          [attr.aria-valuenow]="currentRounded()"
+          (click)="seekFromTrack($event)"
+          (mousemove)="onScrubMove($event)"
+          (mouseleave)="onScrubLeave()"
+          (keydown)="onAxisKey($event)"
+        >
+          @if (hoverPct(); as hp) {
+            <span
+              class="tl-track-scrub"
+              [style.left.%]="hp"
+              aria-hidden="true"
+            ></span>
+          }
+          @for (top of topics(); track top.order) {
+            <button
+              type="button"
+              class="tl-topic"
+              [class.is-active]="isActive(top.startS, top.endS)"
+              [style.left.%]="top.left"
+              [style.width.%]="top.width"
+              [style.--i]="top.order"
+              [style.background]="topicColor(top.hue)"
+              [style.border-color]="edgeColor(top.hue)"
+              [attr.aria-label]="
+                top.label + ', ' + range(top.startS, top.endS)
+              "
+              [attr.title]="top.label"
+              (click)="onBlock($event, top.startS)"
+            >
+              @if (!top.narrow) {
+                <span class="tl-topic-label">{{ top.label }}</span>
+              }
+              <span class="tl-tip" aria-hidden="true">
+                <span class="tl-tip-name">{{ top.label }}</span>
+                <span class="tl-tip-time">{{
+                  range(top.startS, top.endS)
+                }}</span>
+              </span>
+            </button>
+          }
+          @if (showPlayhead()) {
+            <span
+              class="tl-track-playhead"
+              [style.left.%]="playheadPct()"
+              aria-hidden="true"
+            ></span>
+          }
+        </div>
+      </div>
+    }
+  }
+</div>
+  

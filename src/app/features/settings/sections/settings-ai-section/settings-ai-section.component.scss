@@ -1,0 +1,7 @@
+/* Layout-transparent (like every section child): each block's .card is
+   a direct flex item of the shell's .section-body, keeping the same
+   inter-card spacing as the other sections. */
+:host {
+  display: contents;
+}
+    

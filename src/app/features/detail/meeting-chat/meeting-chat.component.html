@@ -1,0 +1,134 @@
+<div class="chat card">
+  <div class="chat-head">
+    <div class="chat-head-text">
+      <h3 class="chat-title">Ask about this meeting</h3>
+      <span class="chat-sub"
+        >Answers are grounded only in this transcript</span
+      >
+    </div>
+    @if (conversation().length) {
+      <button
+        type="button"
+        class="btn btn-ghost chat-clear"
+        (click)="clear()"
+        [disabled]="pending()"
+      >
+        Clear
+      </button>
+    }
+  </div>
+
+  <!-- Message list (also the scroll region) -->
+  <div
+    #scroller
+    class="chat-log"
+    role="log"
+    aria-live="polite"
+    aria-label="Conversation"
+  >
+    @if (conversation().length === 0 && !pending()) {
+      <!-- Empty state: a friendly prompt + tappable starter chips. -->
+      <div class="chat-empty">
+        <span class="chat-empty-mark" aria-hidden="true"></span>
+        <p class="chat-empty-title">Chat with this meeting</p>
+        <p class="chat-empty-copy">
+          Ask anything about what was said — decisions, owners, follow-ups.
+        </p>
+        <div
+          class="chat-starters"
+          role="group"
+          aria-label="Suggested questions"
+        >
+          @for (s of starters; track s) {
+            <button
+              type="button"
+              class="chat-chip"
+              [style.--i]="$index"
+              (click)="ask(s)"
+            >
+              {{ s }}
+            </button>
+          }
+        </div>
+      </div>
+    } @else {
+      @for (turn of conversation(); track $index) {
+        <div
+          class="chat-row"
+          [class.is-user]="turn.role === 'user'"
+          [class.is-assistant]="turn.role === 'assistant'"
+        >
+          <div
+            class="chat-bubble"
+            [attr.aria-label]="
+              (turn.role === 'user' ? 'You' : 'Assistant') + ' said'
+            "
+          >
+            @if (turn.role === "assistant") {
+              <app-markdown [markdown]="turn.content" compact />
+            } @else {
+              {{ turn.content }}
+            }
+          </div>
+        </div>
+      }
+
+      <!-- "Thinking…" typing indicator while a reply is in flight. -->
+      @if (pending()) {
+        <div class="chat-row is-assistant">
+          <div class="chat-bubble chat-typing" aria-label="Thinking">
+            <span class="chat-dot"></span>
+            <span class="chat-dot"></span>
+            <span class="chat-dot"></span>
+          </div>
+        </div>
+      }
+    }
+
+    <!-- Inline error with a retry affordance (keeps the question intact). -->
+    @if (error(); as err) {
+      <div class="chat-error" role="alert">
+        <span class="chat-error-text">{{ err }}</span>
+        <button
+          type="button"
+          class="btn btn-ghost chat-retry"
+          (click)="retry()"
+          [disabled]="pending()"
+        >
+          Retry
+        </button>
+      </div>
+    }
+  </div>
+
+  <!-- Composer: textarea (Enter sends · Shift+Enter newline) + Send. -->
+  <form class="chat-composer" (submit)="onSubmit($event)">
+    <textarea
+      #input
+      class="chat-input"
+      rows="1"
+      autocapitalize="sentences"
+      autocomplete="off"
+      spellcheck="true"
+      aria-label="Your question"
+      placeholder="Ask about this meeting…"
+      [value]="draft()"
+      [disabled]="pending()"
+      (input)="onDraftInput($event)"
+      (keydown)="onKeydown($event)"
+    ></textarea>
+    <button
+      type="submit"
+      class="btn btn-primary chat-send"
+      [disabled]="!canSend()"
+      [attr.aria-label]="pending() ? 'Sending' : 'Send'"
+    >
+      @if (pending()) {
+        <span class="chat-send-spin" aria-hidden="true"></span>
+      } @else {
+        <span class="chat-send-arrow" aria-hidden="true"></span>
+      }
+    </button>
+  </form>
+</div>
+  

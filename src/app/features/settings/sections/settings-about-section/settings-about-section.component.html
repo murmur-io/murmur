@@ -1,0 +1,68 @@
+<div class="section-stack">
+          <div class="card about-card">
+            @if (appInfo(); as info) {
+              <div class="about-head">
+                <span class="about-name">{{ info.name }}</span>
+                <span class="about-version text-muted"
+                  >Version {{ info.version }}</span
+                >
+              </div>
+              <p class="text-secondary about-desc">{{ info.description }}</p>
+            } @else {
+              <p class="text-secondary about-desc">
+                Loading product info…
+              </p>
+            }
+
+            <div class="about-update">
+              <span class="about-section-label text-muted"
+                >Software update</span
+              >
+              <div class="about-update-row">
+                <button
+                  type="button"
+                  class="btn"
+                  (click)="checkForUpdates()"
+                  [disabled]="updateStatus() === 'checking'"
+                >
+                  @if (updateStatus() === "checking") {
+                    <span class="spin-ring" aria-hidden="true"></span>
+                    Checking…
+                  } @else {
+                    Check for updates
+                  }
+                </button>
+
+                @switch (updateStatus()) {
+                  @case ("available") {
+                    @if (latestUpdate(); as upd) {
+                      <span class="about-update-result">
+                        <span class="text-secondary"
+                          >Version {{ upd.latestVersion }} is available.</span
+                        >
+                        <button
+                          type="button"
+                          class="btn btn-primary"
+                          (click)="downloadUpdate(upd.releaseUrl)"
+                        >
+                          Download
+                        </button>
+                      </span>
+                    }
+                  }
+                  @case ("upToDate") {
+                    <span class="text-muted about-update-line"
+                      >You're up to date.</span
+                    >
+                  }
+                  @case ("error") {
+                    <span class="text-danger about-update-line"
+                      >Couldn't check for updates.</span
+                    >
+                  }
+                }
+              </div>
+            </div>
+          </div>
+</div>
+  

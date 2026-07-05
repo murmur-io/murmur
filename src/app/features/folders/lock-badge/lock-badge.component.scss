@@ -1,0 +1,56 @@
+:host {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: var(--radius-pill);
+  transition:
+    color var(--transition),
+    background var(--transition),
+    transform var(--transition-fast);
+}
+:host svg {
+  display: block;
+}
+:host.is-open {
+  color: var(--text-muted);
+}
+:host.is-locked {
+  color: var(--text-secondary);
+}
+:host.is-session {
+  color: var(--accent-hover);
+}
+.open-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.45;
+}
+/* A gentle one-shot pop when a folder seals/unseals, never a loop. */
+:host.is-session,
+:host.is-locked {
+  animation: lock-pop 220ms var(--ease-spring) both;
+}
+@keyframes lock-pop {
+  from {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :host,
+  :host.is-session,
+  :host.is-locked {
+    animation: none;
+    transition: none;
+  }
+}
+    

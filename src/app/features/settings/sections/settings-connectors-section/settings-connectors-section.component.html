@@ -1,0 +1,120 @@
+<div class="section-stack" [formGroup]="form">
+          <div class="card connectors-card">
+            <div class="brain-copy">
+              <h3>Connectors</h3>
+              <p class="text-secondary brain-sub">
+                Let the brain reach beyond your notes. Connectors are
+                <strong>off by default</strong> — each one that leaves this Mac asks
+                for an explicit, one-time consent first.
+              </p>
+            </div>
+
+            <!-- Web search (Brave) connector -->
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Web search</span>
+                <span class="text-secondary toggle-sub">
+                  When enabled (and allowed below, with a key), the assistant can
+                  look facts up on the web and cite them. Answers stay grounded in
+                  your notes first; web results are added as “via web” sources.
+                </span>
+              </span>
+              <input class="switch" type="checkbox" formControlName="webSearchEnabled" />
+            </label>
+
+            @if (form.controls.webSearchEnabled.value) {
+              <!-- Egress banner — make the new off-device path impossible to miss. -->
+              <p class="banner is-warning connector-egress" role="note">
+                <strong>This sends data off your Mac.</strong> When the brain runs a
+                web search, your (redacted) query leaves the device and goes to the
+                search provider (Brave). Only the query is sent — never your notes or
+                transcript. Disable this, or skip the consent below, to keep
+                everything local.
+              </p>
+
+              <!-- BYO API key (Brave) -->
+              <fieldset class="connector-fieldset">
+                <legend>Brave Search API key</legend>
+                <div class="key-status">
+                  <span class="text-secondary">Status</span>
+                  @if (hasWebKey()) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Key set ✓
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Not set
+                    </span>
+                  }
+                </div>
+                <span class="row">
+                  <input
+                    type="password"
+                    [formControl]="webKeyControl"
+                    placeholder="Brave Search API key"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="saveWebKey()"
+                    [disabled]="savingWebKey()"
+                  >
+                    {{ savingWebKey() ? "Saving…" : "Save key" }}
+                  </button>
+                </span>
+                <span class="field-help text-muted">
+                  Bring your own key — it's stored in your macOS Keychain, never
+                  logged, and never leaves with your notes.
+                </span>
+                @if (webKeyError(); as wkerr) {
+                  <p class="text-danger brain-error">{{ wkerr }}</p>
+                }
+              </fieldset>
+
+              <!-- One-time egress consent (mirrors the Cloud-processing UX) -->
+              <div class="privacy-section connector-consent">
+                <span class="privacy-section-label text-muted"
+                  >Allow web search</span
+                >
+                <p class="text-secondary privacy-note">
+                  Your search query leaves this device for the search provider
+                  (redacted first). Until you allow this once, web search stays off
+                  and no query is ever sent.
+                </p>
+                @if (webConsented()) {
+                  <span class="pill is-success cloud-consent-pill">
+                    <span class="pill-dot"></span>
+                    Web search allowed
+                  </span>
+                } @else {
+                  <div class="cloud-consent-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="allowWebSearch()"
+                      [disabled]="webConsenting()"
+                    >
+                      @if (webConsenting()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Enabling…
+                      } @else {
+                        Allow web search
+                      }
+                    </button>
+                    <span class="text-muted cloud-consent-hint">
+                      One-time. The brain works fully offline on your notes without
+                      it.
+                    </span>
+                  </div>
+                }
+                @if (webConsentError(); as wcerr) {
+                  <p class="text-danger privacy-note">{{ wcerr }}</p>
+                }
+              </div>
+            }
+          </div>
+</div>
+  

@@ -1,0 +1,425 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
+  computed,
+  inject,
+  output,
+  signal,
+  viewChild,
+} from "@angular/core";
+import { FormControl, ReactiveFormsModule } from "@angular/forms";
+import { IpcService } from "../../../core/ipc.service";
+import type { AccountStatus } from "../../../core/models";
+
+/**
+ * The reusable multi-step sharing-account flow. One state machine, two entry
+ * doors (create / sign in), driven by the SAME component whether it is launched
+ * from the init gateway (`/welcome`) or from Settings → Account.
+ */
+type Step =
+  | "choose" // "Create account" | "I already have one"
+  | "create-email" // email input + [Send code]
+  | "create-code" // 6-digit code input (verified later, inside account_signup)
+  | "create-password" // password + confirm + optional recovery → [Create account]
+  | "create-recovery" // reveal the 24-word phrase (only when saveRecovery)
+  | "signin" // email + password → [Sign in]
+  | "done"; // brief success, completed already emitted
+
+/**
+ * SharingAuthFlowComponent — the ONE reusable account surface (contract §4).
+ *
+ * SURFACE-AGNOSTIC: `:host { display: contents }` and NO own frosted/opaque
+ * background — the HOST owns the surface (the gateway wraps this in a full-bleed
+ * `.card` over the aurora; Settings wraps it in an OPAQUE `--surface-overlay`
+ * modal). That is what keeps this clear of trap T3 — this component never paints
+ * a floating panel of its own.
+ *
+ * State: non-secret step state lives in signals; passwords live ONLY in
+ * transient `FormControl`s, read at submit and cleared immediately after — never
+ * a persistent signal, never logged (mirrors the retired inline form's
+ * discipline). IPC results (an `AccountStatus`) land in the `completed` output.
+ *
+ * THE BUG THIS FIXES: the create path's first leg calls `accountSendCode(email)`
+ * → `account_send_code` → `ShareClient::signup` → `POST /v1/auth/signup`, which
+ * is what actually triggers the server to EMAIL the 6-digit code. The retired
+ * form never issued that call, so no code was ever sent. After collecting the
+ * code we call the existing `account_signup` (which verify_email-exchanges the
+ * code internally) and CHAIN `account_login` so the user ends up signed in in
+ * one pass (account_signup opens no session).
+ */
+@Component({
+  selector: "app-sharing-auth-flow",
+  standalone: true,
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [ReactiveFormsModule],
+  templateUrl: "./sharing-auth-flow.component.html",
+  styleUrl: "./sharing-auth-flow.component.scss",
+})
+export class SharingAuthFlowComponent {
+  private readonly ipc = inject(IpcService);
+  private readonly injector = inject(Injector);
+
+  /** Fired once the session is logged in (after sign-in, or signup → auto-login). */
+  readonly completed = output<AccountStatus>();
+  /** Fired when the user backs all the way out of the 'choose' step. */
+  readonly dismissed = output<void>();
+
+  // ── Non-secret step state (signals) ──────────────────────────────────────
+  readonly step = signal<Step>("choose");
+  /** Shared across create + sign-in. */
+  readonly email = signal("");
+  readonly code = signal("");
+  readonly saveRecovery = signal(false);
+  /** Debounces every IPC leg. */
+  readonly busy = signal(false);
+  readonly error = signal<string | null>(null);
+  /** A neutral "code sent" notice (never reveals whether the email exists). */
+  readonly notice = signal<string | null>(null);
+  /** Gates advance from create-email (a code was requested at least once). */
+  readonly codeSent = signal(false);
+  /** The 24-word phrase, shown once on create-recovery when saveRecovery is on. */
+  readonly recoveryPhrase = signal<string | null>(null);
+  readonly recoveryCopied = signal(false);
+
+  // ── Secrets: FormControls ONLY, read at submit + cleared right after ──────
+  readonly passwordControl = new FormControl("", { nonNullable: true });
+  readonly confirmControl = new FormControl("", { nonNullable: true });
+  readonly signinPwControl = new FormControl("", { nonNullable: true });
+
+  // ── Advanced (optional) sharing-server disclosure ────────────────────────
+  readonly advancedOpen = signal(false);
+  readonly serverUrl = signal("");
+  private readonly _serverSaving = signal(false);
+  readonly serverSaving = this._serverSaving.asReadonly();
+
+  /** The AccountStatus captured at auto-login, emitted after the recovery step. */
+  private capturedStatus: AccountStatus | null = null;
+
+  // ── Per-step focus targets ───────────────────────────────────────────────
+  private readonly emailField =
+    viewChild<ElementRef<HTMLInputElement>>("emailField");
+  private readonly codeField =
+    viewChild<ElementRef<HTMLInputElement>>("codeField");
+  private readonly passwordField =
+    viewChild<ElementRef<HTMLInputElement>>("passwordField");
+  private readonly signinEmailField =
+    viewChild<ElementRef<HTMLInputElement>>("signinEmailField");
+
+  /** Create sub-flow progress (null on choose/signin/done). */
+  readonly createProgress = computed<{ index: number; total: number } | null>(
+    () => {
+      const order: Step[] = [
+        "create-email",
+        "create-code",
+        "create-password",
+        "create-recovery",
+      ];
+      const idx = order.indexOf(this.step());
+      if (idx < 0) {
+        return null;
+      }
+      return { index: idx + 1, total: this.saveRecovery() ? 4 : 3 };
+    },
+  );
+
+  /** The dot indices to render for the current create-progress total. */
+  readonly progressDots = computed<number[]>(() => {
+    const prog = this.createProgress();
+    if (!prog) {
+      return [];
+    }
+    return Array.from({ length: prog.total }, (_, i) => i);
+  });
+
+  constructor() {
+    // Fire-and-forget one-shot: seed the Advanced server field from config so
+    // it's prefilled if the user opens the disclosure. No signal is read here,
+    // so no effect / NG0600.
+    void this.seedServer();
+  }
+
+  private async seedServer(): Promise<void> {
+    try {
+      const cfg = await this.ipc.getConfig();
+      this.serverUrl.set(cfg.shareBaseUrl ?? "");
+      // Only auto-expand when no server is set (the Railway default means this
+      // is usually already configured → the disclosure stays collapsed).
+      if (!(cfg.shareBaseUrl ?? "").trim()) {
+        this.advancedOpen.set(true);
+      }
+    } catch {
+      // No config yet — leave the field empty + collapsed.
+    }
+  }
+
+  // ── Input handlers (non-secret signals) ──────────────────────────────────
+  onEmail(event: Event): void {
+    this.email.set((event.target as HTMLInputElement).value);
+  }
+
+  onCode(event: Event): void {
+    const digits = (event.target as HTMLInputElement).value
+      .replace(/\D/g, "")
+      .slice(0, 6);
+    this.code.set(digits);
+  }
+
+  onSaveRecovery(event: Event): void {
+    this.saveRecovery.set((event.target as HTMLInputElement).checked);
+  }
+
+  onServerUrl(event: Event): void {
+    this.serverUrl.set((event.target as HTMLInputElement).value);
+  }
+
+  toggleAdvanced(): void {
+    this.advancedOpen.update((v) => !v);
+  }
+
+  /** Persist the Advanced sharing-server URL through the normal config round-trip. */
+  async saveServer(): Promise<void> {
+    if (this._serverSaving()) {
+      return;
+    }
+    this._serverSaving.set(true);
+    this.error.set(null);
+    try {
+      const cfg = await this.ipc.getConfig();
+      await this.ipc.saveConfig({
+        ...cfg,
+        shareBaseUrl: this.serverUrl().trim(),
+      });
+    } catch (e) {
+      this.error.set(this.friendly(e));
+    } finally {
+      this._serverSaving.set(false);
+    }
+  }
+
+  // ── Navigation ───────────────────────────────────────────────────────────
+  startCreate(): void {
+    this.error.set(null);
+    this.notice.set(null);
+    this.goto("create-email");
+  }
+
+  startSignin(): void {
+    this.error.set(null);
+    this.goto("signin");
+  }
+
+  backToChoose(): void {
+    this.error.set(null);
+    this.goto("choose");
+  }
+
+  goEmail(): void {
+    this.error.set(null);
+    this.goto("create-email");
+  }
+
+  goCode(): void {
+    this.error.set(null);
+    this.goto("create-code");
+  }
+
+  cancel(): void {
+    this.dismissed.emit();
+  }
+
+  private goto(step: Step): void {
+    this.step.set(step);
+    // Focus this step's primary field AFTER it renders — the sanctioned zoneless
+    // pattern (rule §5). Called from click handlers (outside the field-init
+    // injection context), so pass the injector.
+    afterNextRender(
+      () => {
+        switch (step) {
+          case "create-email":
+            this.emailField()?.nativeElement.focus();
+            break;
+          case "create-code":
+            this.codeField()?.nativeElement.focus();
+            break;
+          case "create-password":
+            this.passwordField()?.nativeElement.focus();
+            break;
+          case "signin":
+            this.signinEmailField()?.nativeElement.focus();
+            break;
+          default:
+            break;
+        }
+      },
+      { injector: this.injector },
+    );
+  }
+
+  // ── create-email [Send code] ─────────────────────────────────────────────
+  async sendCode(): Promise<void> {
+    if (this.busy()) {
+      return;
+    }
+    const email = this.email().trim();
+    if (!email) {
+      this.error.set("Enter your email.");
+      return;
+    }
+    this.error.set(null);
+    this.notice.set(null);
+    this.busy.set(true);
+    try {
+      await this.ipc.accountSendCode(email);
+      this.codeSent.set(true);
+      // The server always 202s (anti-enumeration), so this notice is honest and
+      // privacy-preserving — never a "user exists" signal.
+      this.notice.set(`If ${email} is valid, a 6-digit code is on its way.`);
+      this.goto("create-code");
+    } catch (e) {
+      this.error.set(this.friendly(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /** Re-send the code without advancing (stays on create-code). */
+  async resendCode(): Promise<void> {
+    if (this.busy()) {
+      return;
+    }
+    const email = this.email().trim();
+    if (!email) {
+      this.error.set("Enter your email.");
+      return;
+    }
+    this.error.set(null);
+    this.busy.set(true);
+    try {
+      await this.ipc.accountSendCode(email);
+      this.notice.set("Code re-sent — check your inbox.");
+    } catch (e) {
+      this.error.set(this.friendly(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  // ── create-code [Continue] (no server call — verified inside account_signup) ─
+  codeContinue(): void {
+    if (this.code().trim().length === 0) {
+      this.error.set("Enter the 6-digit code from your email.");
+      return;
+    }
+    this.error.set(null);
+    this.goto("create-password");
+  }
+
+  // ── create-password [Create account] → auto-login chain ──────────────────
+  async createAccount(): Promise<void> {
+    if (this.busy()) {
+      return;
+    }
+    const password = this.passwordControl.value;
+    const confirm = this.confirmControl.value;
+    if (password.length < 8) {
+      this.error.set("Password must be at least 8 characters.");
+      return;
+    }
+    if (password !== confirm) {
+      this.error.set("Passwords do not match.");
+      return;
+    }
+    this.error.set(null);
+    this.busy.set(true);
+    try {
+      const phrase = await this.ipc.accountSignup(
+        this.email().trim(),
+        this.code().trim(),
+        password,
+        this.saveRecovery(),
+      );
+      // account_signup opens NO session — chain a login so the user ends up
+      // signed in in one pass.
+      const status = await this.ipc.accountLogin(this.email().trim(), password);
+      // Clear the secrets immediately after the successful round-trip.
+      this.passwordControl.setValue("");
+      this.confirmControl.setValue("");
+      this.capturedStatus = status;
+      if (phrase) {
+        this.recoveryPhrase.set(phrase);
+        this.goto("create-recovery");
+      } else {
+        this.goto("done");
+        this.completed.emit(status);
+      }
+    } catch (e) {
+      // Bad/expired code, weak password, or email taken — surface it and let the
+      // user step Back to the code to correct it.
+      this.error.set(this.friendly(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  // ── create-recovery [I've saved it] ──────────────────────────────────────
+  recoveryDone(): void {
+    this.goto("done");
+    if (this.capturedStatus) {
+      this.completed.emit(this.capturedStatus);
+    }
+  }
+
+  async copyRecovery(phrase: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(phrase);
+      this.recoveryCopied.set(true);
+    } catch {
+      // Clipboard unavailable — the phrase stays visible and selectable.
+    }
+  }
+
+  // ── signin [Sign in] ─────────────────────────────────────────────────────
+  async signIn(): Promise<void> {
+    if (this.busy()) {
+      return;
+    }
+    const email = this.email().trim();
+    const password = this.signinPwControl.value;
+    if (!email || !password) {
+      this.error.set("Enter your email and password.");
+      return;
+    }
+    this.error.set(null);
+    this.busy.set(true);
+    try {
+      const status = await this.ipc.accountLogin(email, password);
+      this.signinPwControl.setValue("");
+      this.goto("done");
+      this.completed.emit(status);
+    } catch (e) {
+      this.error.set(this.friendly(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /** Map a raw backend error to a friendly, non-crashy inline message. */
+  private friendly(e: unknown): string {
+    const raw = String(e);
+    // Only a genuine connectivity / no-server-set problem gets the "can't reach" guidance. A 4xx
+    // (wrong or expired code, too many tries, bad password) is NOT unreachability — it arrives as a
+    // clear sentence we surface as-is (below).
+    if (/could not reach|unreachable|no sharing server|failed to build|network|timed? ?out/i.test(raw)) {
+      return "Can't reach the sharing server. Check the server URL under Advanced, then try again.";
+    }
+    // AppError serializes as "invalid argument: <msg>" / "authentication error: <msg>" etc. — strip
+    // the variant prefix so the user reads the clean message.
+    return raw.replace(
+      /^(invalid argument|authentication error|provider unavailable|config error|storage error|secrets error|locked): /i,
+      "",
+    );
+  }
+}

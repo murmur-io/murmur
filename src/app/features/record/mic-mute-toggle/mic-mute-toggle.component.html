@@ -1,0 +1,79 @@
+<button
+  type="button"
+  class="mic"
+  [class.is-muted]="muted()"
+  [class.is-compact]="compact()"
+  [disabled]="busy()"
+  [attr.aria-pressed]="muted()"
+  [attr.aria-label]="muted() ? 'Unmute microphone' : 'Mute microphone'"
+  [title]="muted() ? 'Unmute microphone' : 'Mute microphone'"
+  (click)="toggle()"
+>
+  @if (muted()) {
+    <!-- Mic-off: mic body + a diagonal slash. -->
+    <svg
+      class="mic-ico"
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path
+        d="M9 9V5a3 3 0 0 1 5.12-2.12M15 9.34V10a3 3 0 0 1-3 3"
+        stroke="currentColor"
+        stroke-width="1.9"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+      <path
+        d="M17 11a5 5 0 0 1-.54 2.27M5 11a7 7 0 0 0 7 7m0 0v3m0-3a6.97 6.97 0 0 0 1.6-.18"
+        stroke="currentColor"
+        stroke-width="1.9"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+      <path
+        d="M3 3l18 18"
+        stroke="currentColor"
+        stroke-width="1.9"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+  } @else {
+    <!-- Mic-on: classic capsule mic + stand. -->
+    <svg
+      class="mic-ico"
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <rect
+        x="9"
+        y="2"
+        width="6"
+        height="12"
+        rx="3"
+        stroke="currentColor"
+        stroke-width="1.9"
+      />
+      <path
+        d="M5 11a7 7 0 0 0 14 0M12 18v3"
+        stroke="currentColor"
+        stroke-width="1.9"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+  }
+  @if (!compact()) {
+    <span class="mic-label">{{ muted() ? "Muted" : "Mute" }}</span>
+  }
+</button>
+@if (muted() && !compact()) {
+  <span class="mic-hint" role="status">
+    Mic muted — still capturing others
+  </span>
+}
+  

@@ -1,0 +1,70 @@
+<div class="card panel">
+  <div class="panel-head">
+    <h3>Topic threads</h3>
+    @if (!loading() && threads().length) {
+      <span class="panel-note">{{ threads().length }} tracked</span>
+    }
+  </div>
+
+  @if (loading()) {
+    <p class="empty">Loading…</p>
+  } @else if (error()) {
+    <div class="banner is-danger" role="alert">{{ error() }}</div>
+  } @else if (threads().length === 0) {
+    <div class="threads-hint">
+      <span class="threads-hint-mark" aria-hidden="true"></span>
+      <p class="empty">Open a few meetings to build topic threads</p>
+    </div>
+  } @else {
+    <ul class="thread-list">
+      @for (t of threads(); track t.label; let i = $index) {
+        <li class="thread" [style.--i]="i">
+          <button
+            type="button"
+            class="thread-head"
+            [class.is-open]="isOpen(t.label)"
+            [attr.aria-expanded]="isOpen(t.label)"
+            (click)="toggle(t.label)"
+          >
+            <span class="thread-caret" aria-hidden="true"></span>
+            <span class="thread-label">{{ t.label }}</span>
+            <span
+              class="count thread-count"
+              [attr.aria-label]="
+                t.count + (t.count === 1 ? ' meeting' : ' meetings')
+              "
+            >
+              {{ t.count }}
+            </span>
+          </button>
+
+          @if (isOpen(t.label)) {
+            <ul class="mention-list">
+              @for (m of t.mentions; track m.meetingId + "@" + m.startS) {
+                <li class="mention">
+                  <a
+                    class="mention-link"
+                    [routerLink]="['/meeting', m.meetingId]"
+                  >
+                    <span class="mention-title">{{
+                      m.title || "Untitled meeting"
+                    }}</span>
+                    <span class="mention-meta">
+                      <span class="mention-date">{{
+                        formatDate(m.startedAt)
+                      }}</span>
+                      <span class="mention-at">{{
+                        formatStamp(m.startS)
+                      }}</span>
+                    </span>
+                  </a>
+                </li>
+              }
+            </ul>
+          }
+        </li>
+      }
+    </ul>
+  }
+</div>
+  

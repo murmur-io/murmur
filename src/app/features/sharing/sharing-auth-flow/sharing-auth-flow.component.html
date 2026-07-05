@@ -1,0 +1,464 @@
+<div class="flow">
+  @switch (step()) {
+    <!-- ─────────────────────────── CHOOSE ─────────────────────────── -->
+    @case ("choose") {
+      <div class="flow-head">
+        <h2 class="flow-title">Sharing account</h2>
+        <p class="flow-sub text-secondary">
+          Share a note as a private, end-to-end-encrypted link. Only
+          ciphertext and wrapped keys ever leave this Mac — the server can
+          never read your notes.
+        </p>
+      </div>
+      <div class="doors">
+        <button
+          type="button"
+          class="door"
+          (click)="startCreate()"
+          [disabled]="busy()"
+        >
+          <span class="door-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
+              <circle
+                cx="10"
+                cy="7"
+                r="3.2"
+                stroke="currentColor"
+                stroke-width="1.5"
+              />
+              <path
+                d="M4.5 16.2c.9-2.6 3-4 5.5-4s4.6 1.4 5.5 4"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+          </span>
+          <span class="door-name">Create an account</span>
+          <span class="door-sub text-secondary">
+            New here — set up sharing in a few steps.
+          </span>
+        </button>
+
+        <button
+          type="button"
+          class="door"
+          (click)="startSignin()"
+          [disabled]="busy()"
+        >
+          <span class="door-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
+              <path
+                d="M9 3.5H5.5A1.5 1.5 0 0 0 4 5v10a1.5 1.5 0 0 0 1.5 1.5H9M12.5 13l3-3-3-3M15 10H8"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </span>
+          <span class="door-name">I already have one</span>
+          <span class="door-sub text-secondary">
+            Sign in to this Mac to start sharing.
+          </span>
+        </button>
+      </div>
+
+      @if (advancedOpen()) {
+        <div class="adv-well">
+          <span class="flow-label text-muted">Sharing server</span>
+          <p class="flow-note text-secondary">
+            The server that stores the encrypted note. It can't read your
+            notes — only ciphertext and wrapped keys leave this Mac.
+          </p>
+          <div class="row">
+            <input
+              type="url"
+              class="field-input"
+              [value]="serverUrl()"
+              (input)="onServerUrl($event)"
+              placeholder="https://share.example.com"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Sharing server base URL"
+            />
+            <button
+              type="button"
+              class="btn"
+              (click)="saveServer()"
+              [disabled]="serverSaving()"
+            >
+              {{ serverSaving() ? "Saving…" : "Save" }}
+            </button>
+          </div>
+        </div>
+      } @else {
+        <button
+          type="button"
+          class="link-btn text-muted adv-toggle"
+          (click)="toggleAdvanced()"
+        >
+          Advanced — sharing server
+        </button>
+      }
+
+      <div class="flow-nav">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="cancel()"
+          [disabled]="busy()"
+        >
+          Cancel
+        </button>
+      </div>
+    }
+
+    <!-- ─────────────────────────── CREATE — EMAIL ──────────────────── -->
+    @case ("create-email") {
+      <div class="flow-head">
+        <h2 class="flow-title">Create your account</h2>
+        <p class="flow-sub text-secondary">
+          Enter your email and we'll send a 6-digit code to confirm it.
+        </p>
+      </div>
+      <label class="field">
+        <span class="flow-label">Email</span>
+        <input
+          #emailField
+          type="email"
+          class="field-input"
+          [value]="email()"
+          (input)="onEmail($event)"
+          (keydown.enter)="sendCode()"
+          placeholder="you@example.com"
+          autocomplete="username"
+          spellcheck="false"
+          [disabled]="busy()"
+        />
+      </label>
+
+      @if (advancedOpen()) {
+        <div class="adv-well">
+          <span class="flow-label text-muted">Sharing server</span>
+          <div class="row">
+            <input
+              type="url"
+              class="field-input"
+              [value]="serverUrl()"
+              (input)="onServerUrl($event)"
+              placeholder="https://share.example.com"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Sharing server base URL"
+            />
+            <button
+              type="button"
+              class="btn"
+              (click)="saveServer()"
+              [disabled]="serverSaving()"
+            >
+              {{ serverSaving() ? "Saving…" : "Save" }}
+            </button>
+          </div>
+        </div>
+      } @else {
+        <button
+          type="button"
+          class="link-btn text-muted adv-toggle"
+          (click)="toggleAdvanced()"
+        >
+          Advanced — sharing server
+        </button>
+      }
+
+      @if (error(); as err) {
+        <p class="flow-error text-danger" role="alert">{{ err }}</p>
+      }
+
+      <div class="flow-nav">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="backToChoose()"
+          [disabled]="busy()"
+        >
+          Back
+        </button>
+        <span class="flow-nav-spacer"></span>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="sendCode()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Sending…" : "Send code" }}
+        </button>
+      </div>
+    }
+
+    <!-- ─────────────────────────── CREATE — CODE ───────────────────── -->
+    @case ("create-code") {
+      <div class="flow-head">
+        <h2 class="flow-title">Enter the code</h2>
+        <p class="flow-sub text-secondary">
+          We sent a 6-digit code to
+          <span class="flow-email">{{ email() }}</span
+          >. Enter it below. If it doesn't arrive, check your spam or resend.
+        </p>
+      </div>
+      <label class="field">
+        <span class="flow-label">Verification code</span>
+        <input
+          #codeField
+          type="text"
+          inputmode="numeric"
+          class="field-input code-input"
+          [value]="code()"
+          (input)="onCode($event)"
+          (keydown.enter)="codeContinue()"
+          placeholder="000000"
+          autocomplete="one-time-code"
+          spellcheck="false"
+          maxlength="6"
+          [disabled]="busy()"
+        />
+      </label>
+
+      @if (notice(); as note) {
+        <p class="flow-note text-secondary" role="status">{{ note }}</p>
+      }
+      @if (error(); as err) {
+        <p class="flow-error text-danger" role="alert">{{ err }}</p>
+      }
+
+      <div class="flow-nav">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="goEmail()"
+          [disabled]="busy()"
+        >
+          Back
+        </button>
+        <button
+          type="button"
+          class="link-btn text-muted resend"
+          (click)="resendCode()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Sending…" : "Resend code" }}
+        </button>
+        <span class="flow-nav-spacer"></span>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="codeContinue()"
+          [disabled]="busy()"
+        >
+          Continue
+        </button>
+      </div>
+    }
+
+    <!-- ─────────────────────────── CREATE — PASSWORD ───────────────── -->
+    @case ("create-password") {
+      <div class="flow-head">
+        <h2 class="flow-title">Choose a password</h2>
+        <p class="flow-sub text-secondary">
+          Your password never leaves this Mac — it unlocks your account key
+          on-device.
+        </p>
+      </div>
+      <label class="field">
+        <span class="flow-label">Password</span>
+        <input
+          #passwordField
+          type="password"
+          class="field-input"
+          [formControl]="passwordControl"
+          (keydown.enter)="createAccount()"
+          placeholder="At least 8 characters"
+          autocomplete="new-password"
+        />
+      </label>
+      <label class="field">
+        <span class="flow-label">Confirm password</span>
+        <input
+          type="password"
+          class="field-input"
+          [formControl]="confirmControl"
+          (keydown.enter)="createAccount()"
+          placeholder="Re-enter your password"
+          autocomplete="new-password"
+        />
+      </label>
+
+      <label class="toggle-row">
+        <span class="toggle-copy">
+          <span class="toggle-title">Save a recovery phrase</span>
+          <span class="text-secondary toggle-sub">
+            Generates a 24-word recovery phrase — the only way to recover a
+            forgotten password. You can skip this.
+          </span>
+        </span>
+        <input
+          class="switch"
+          type="checkbox"
+          [checked]="saveRecovery()"
+          (change)="onSaveRecovery($event)"
+          [disabled]="busy()"
+        />
+      </label>
+
+      @if (error(); as err) {
+        <p class="flow-error text-danger" role="alert">{{ err }}</p>
+      }
+
+      <div class="flow-nav">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="goCode()"
+          [disabled]="busy()"
+        >
+          Back
+        </button>
+        <span class="flow-nav-spacer"></span>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="createAccount()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Creating…" : "Create account" }}
+        </button>
+      </div>
+    }
+
+    <!-- ─────────────────────────── CREATE — RECOVERY ───────────────── -->
+    @case ("create-recovery") {
+      <div class="flow-head">
+        <h2 class="flow-title">Save your recovery phrase</h2>
+        <p class="flow-sub text-secondary">
+          These 24 words are the ONLY way to recover a forgotten password.
+          Write them down and keep them somewhere safe — they're shown once.
+        </p>
+      </div>
+      @if (recoveryPhrase(); as phrase) {
+        <p class="recovery-block" role="text">{{ phrase }}</p>
+        <div class="flow-nav">
+          <button type="button" class="btn" (click)="copyRecovery(phrase)">
+            {{ recoveryCopied() ? "Copied" : "Copy" }}
+          </button>
+          <span class="flow-nav-spacer"></span>
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="recoveryDone()"
+          >
+            I've saved it — continue
+          </button>
+        </div>
+      }
+    }
+
+    <!-- ─────────────────────────── SIGN IN ─────────────────────────── -->
+    @case ("signin") {
+      <div class="flow-head">
+        <h2 class="flow-title">Sign in</h2>
+        <p class="flow-sub text-secondary">
+          Sign in to load your account key on this Mac so you can share.
+        </p>
+      </div>
+      <label class="field">
+        <span class="flow-label">Email</span>
+        <input
+          #signinEmailField
+          type="email"
+          class="field-input"
+          [value]="email()"
+          (input)="onEmail($event)"
+          (keydown.enter)="signIn()"
+          placeholder="you@example.com"
+          autocomplete="username"
+          spellcheck="false"
+          [disabled]="busy()"
+        />
+      </label>
+      <label class="field">
+        <span class="flow-label">Password</span>
+        <input
+          type="password"
+          class="field-input"
+          [formControl]="signinPwControl"
+          (keydown.enter)="signIn()"
+          placeholder="Password"
+          autocomplete="current-password"
+        />
+      </label>
+
+      @if (error(); as err) {
+        <p class="flow-error text-danger" role="alert">{{ err }}</p>
+      }
+
+      <div class="flow-nav">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="backToChoose()"
+          [disabled]="busy()"
+        >
+          Back
+        </button>
+        <span class="flow-nav-spacer"></span>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="signIn()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Signing in…" : "Sign in" }}
+        </button>
+      </div>
+    }
+
+    <!-- ─────────────────────────── DONE ────────────────────────────── -->
+    @case ("done") {
+      <div class="flow-done">
+        <span class="done-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26">
+            <path
+              d="M5 12.5 10 17.5 19.5 7"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </span>
+        <h2 class="flow-title">You're signed in</h2>
+        <p class="flow-sub text-secondary">Your account is ready to share.</p>
+      </div>
+    }
+  }
+
+  <!-- Step progress (create sub-flow only). -->
+  @if (createProgress(); as prog) {
+    <div class="flow-progress" role="group" aria-label="Account setup progress">
+      <div class="dots">
+        @for (i of progressDots(); track i) {
+          <span
+            class="dot"
+            [class.is-done]="i < prog.index - 1"
+            [class.is-active]="i === prog.index - 1"
+            aria-hidden="true"
+          ></span>
+        }
+      </div>
+      <span class="step-count">Step {{ prog.index }} of {{ prog.total }}</span>
+    </div>
+  }
+</div>
+  

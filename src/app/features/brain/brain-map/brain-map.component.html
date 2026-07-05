@@ -1,0 +1,82 @@
+<div class="bm">
+  <div class="bm-frame">
+    <canvas
+      appNeuralScene
+      class="bm-canvas"
+      tabindex="0"
+      role="img"
+      [attr.aria-label]="ariaLabel()"
+      [sceneNodes]="sceneNodes()"
+      [sceneEdges]="sceneEdges()"
+      [selectedId]="selectedId()"
+      [mode]="mode()"
+      (nodePick)="onPick($event)"
+      (nodeHover)="hoverId.set($event)"
+      (keydown)="onCanvasKeydown($event)"
+    ></canvas>
+
+    <div class="bm-toolbar" role="toolbar" aria-label="Map controls">
+      <div class="bm-pill bm-legend" aria-hidden="true">
+        <span class="bm-legend-item">
+          <span class="bm-dot is-person"></span>People
+        </span>
+        <span class="bm-legend-item">
+          <span class="bm-dot is-project"></span>Projects
+        </span>
+      </div>
+
+      <div class="bm-controls">
+        <div class="bm-pill bm-seg" role="group" aria-label="Projection">
+          <button
+            type="button"
+            class="bm-segbtn"
+            [class.is-on]="mode() === '3d'"
+            [attr.aria-pressed]="mode() === '3d'"
+            (click)="setMode('3d')"
+          >
+            3D
+          </button>
+          <button
+            type="button"
+            class="bm-segbtn"
+            [class.is-on]="mode() === '2d'"
+            [attr.aria-pressed]="mode() === '2d'"
+            (click)="setMode('2d')"
+          >
+            2D
+          </button>
+        </div>
+        <div class="bm-pill bm-zoom">
+          <button
+            type="button"
+            class="bm-zbtn"
+            aria-label="Zoom in"
+            (click)="zoomIn()"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            class="bm-zbtn"
+            aria-label="Zoom out"
+            (click)="zoomOut()"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            class="bm-zbtn bm-zreset"
+            aria-label="Reset view"
+            (click)="resetView()"
+          >
+            Reset
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="bm-hint">{{ hint() }}</p>
+  <span class="bm-sr" aria-live="polite">{{ announcement() }}</span>
+</div>
+  
