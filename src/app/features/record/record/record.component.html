@@ -274,6 +274,13 @@
        gated on a resolved note; one-time dismissible. ──────────────────── -->
   @if (store.stage() === "done") {
     <app-brain-reveal-card [active]="!!store.lastNote()" />
+    <!-- ── Re-Truth — the vault heals itself: surface the facts this meeting
+         supersedes from earlier notes; one tap appends a reversible
+         [!superseded] callout. In-flow, gated on the resolved note + its id. ── -->
+    <app-re-truth-card
+      [active]="!!store.lastNote()"
+      [meetingId]="store.meetingId()"
+    />
   }
 
   <!-- ── Minimal stats strip — hidden once the conversation thread is the

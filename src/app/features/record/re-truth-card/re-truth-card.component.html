@@ -1,0 +1,94 @@
+@if (show()) {
+  <div class="retruth card" role="group" aria-label="Re-Truth">
+    @if (healed(); as res) {
+      <!-- ── Healed state — vault is current, all reversible ──────────────── -->
+      <div class="rt-head">
+        <span class="rt-ico rt-ico-done" aria-hidden="true">✓</span>
+        <div class="rt-head-body">
+          <span class="rt-kicker rt-kicker-done">🕰 Re-Truth · your vault healed</span>
+          <p class="rt-headline">
+            Vault is current — {{ stampedLabel() }} stamped, all reversible.
+          </p>
+          @if (res.skippedSealed > 0) {
+            <p class="rt-note">
+              {{ skippedLabel() }} skipped — sealed folders stay locked.
+            </p>
+          }
+        </div>
+      </div>
+      @if (error(); as e) {
+        <p class="rt-error" role="alert">Couldn't undo: {{ e }}</p>
+      }
+      <div class="rt-actions">
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          (click)="undo()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Restoring…" : "↩︎ Undo — restore originals" }}
+        </button>
+      </div>
+    } @else {
+      <!-- ── Offer state — the vault moved on ─────────────────────────────── -->
+      <div class="rt-head">
+        <span class="rt-ico" aria-hidden="true">🕰</span>
+        <div class="rt-head-body">
+          <span class="rt-kicker">Re-Truth · your vault moved on</span>
+          <p class="rt-headline">{{ headline() }}</p>
+          <p class="rt-hint">Adds a note to your file · reversible</p>
+        </div>
+      </div>
+
+      <ul class="rt-list">
+        @for (it of items(); track it.id) {
+          <li class="rt-row">
+            <label class="rt-check">
+              <input
+                type="checkbox"
+                class="rt-box"
+                [checked]="isSelected(it.id)"
+                (change)="toggle(it.id)"
+              />
+              <span class="rt-row-body">
+                <span class="rt-fact">
+                  <span class="rt-entity">{{ it.entity }}</span>
+                  <span class="rt-mid" aria-hidden="true">·</span>
+                  <span class="rt-pred">{{ it.predicate }}</span>
+                </span>
+                <span class="rt-change">
+                  <span class="rt-old">{{ it.oldValue }}</span>
+                  <span class="rt-arrow" aria-hidden="true">→</span>
+                  <span class="pill is-success rt-new">{{ it.newValue }}</span>
+                </span>
+                <span class="rt-source">
+                  stale in <span class="rt-wikilink">[[{{ it.sourceNoteTitle }}]]</span>
+                  <span class="rt-from">· now {{ supersedingLabel(it) }}</span>
+                </span>
+              </span>
+            </label>
+          </li>
+        }
+      </ul>
+
+      @if (error(); as e) {
+        <p class="rt-error" role="alert">Couldn't heal the vault: {{ e }}</p>
+      }
+
+      <div class="rt-actions">
+        <button
+          type="button"
+          class="btn btn-primary btn-sm"
+          (click)="heal()"
+          [disabled]="selectedCount() === 0 || busy()"
+        >
+          @if (busy()) {
+            Healing…
+          } @else {
+            Heal my vault <span class="count rt-count">{{ selectedCount() }}</span>
+          }
+        </button>
+      </div>
+    }
+  </div>
+}

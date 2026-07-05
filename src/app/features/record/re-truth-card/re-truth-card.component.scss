@@ -1,0 +1,183 @@
+.retruth {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  /* Re-Truth identity: a quiet accent rim on the in-flow card. */
+  border-color: var(--accent-ring);
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+.rt-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.rt-ico {
+  font-size: 1.25rem;
+  line-height: 1.2;
+  flex: none;
+}
+.rt-ico-done {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-pill);
+  background: var(--success-soft);
+  color: var(--success);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+.rt-head-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.rt-kicker {
+  color: var(--accent-hover);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.rt-kicker-done {
+  color: var(--success);
+}
+.rt-headline {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.rt-hint,
+.rt-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+/* ── Supersession list ───────────────────────────────────────────────────── */
+.rt-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.rt-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-hover);
+  transition: border-color var(--transition);
+}
+.rt-row:hover {
+  border-color: var(--accent-ring);
+}
+.rt-check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  cursor: pointer;
+}
+.rt-box {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.rt-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.rt-fact {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.rt-entity {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+.rt-mid {
+  color: var(--text-muted);
+}
+.rt-pred {
+  color: var(--text-primary);
+  font-weight: 650;
+  font-size: 0.85rem;
+}
+
+.rt-change {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+.rt-old {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--danger);
+}
+.rt-arrow {
+  color: var(--text-muted);
+  flex: none;
+}
+.rt-new {
+  /* rides the global `.pill.is-success` — nudge to fit the inline change row */
+  height: auto;
+  padding: 2px var(--space-2);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.rt-source {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+.rt-wikilink {
+  color: var(--accent-hover);
+  font-weight: 550;
+}
+.rt-from {
+  color: var(--text-muted);
+}
+
+/* ── Feedback + actions ──────────────────────────────────────────────────── */
+.rt-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+.rt-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.rt-actions .btn-sm {
+  height: 34px;
+  padding: 0 var(--space-4);
+  font-size: 0.85rem;
+}
+.rt-count {
+  min-width: 20px;
+  height: 20px;
+  margin-left: var(--space-1);
+  background: rgba(255, 255, 255, 0.18);
+  border-color: transparent;
+  color: var(--text-on-accent);
+}
