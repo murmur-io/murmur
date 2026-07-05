@@ -204,6 +204,10 @@ impl Connector for WebConnector {
         EgressClass::External
     }
 
+    fn egress_attribution(&self) -> (&'static str, &'static str) {
+        ("web_search", "web search (connector)")
+    }
+
     async fn search(&self, redacted_query: &str) -> ConnectorResult {
         let trimmed = redacted_query.trim();
         if trimmed.is_empty() {
