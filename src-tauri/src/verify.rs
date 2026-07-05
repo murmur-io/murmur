@@ -282,7 +282,7 @@ mod tests {
             detail: "note says 2026-07-08, PROJ-1 due 2026-07-10".into(),
             url: "https://x/browse/PROJ-1".into(),
         };
-        let once = apply_verify_markers(md, &[f.clone()]);
+        let once = apply_verify_markers(md, std::slice::from_ref(&f));
         assert!(once.contains("\n> ⧗ note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira)\n"));
         // Idempotent: applying again yields byte-identical output (old markers stripped first).
         let twice = apply_verify_markers(&once, &[f]);
@@ -310,7 +310,7 @@ mod tests {
             detail: "PROJ-1 · Status: Done\ninjected line".into(),
             url: String::new(),
         };
-        let once = apply_verify_markers(md, &[f.clone()]);
+        let once = apply_verify_markers(md, std::slice::from_ref(&f));
         // Every marker-originated line is strippable: re-applying with no findings removes ALL of it.
         let cleaned = apply_verify_markers(&once, &[]);
         assert_eq!(cleaned, md, "a multiline detail must not leave residue after strip");

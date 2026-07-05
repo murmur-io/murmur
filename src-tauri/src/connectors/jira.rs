@@ -7,6 +7,7 @@
 //! - `config.jira_consented` (one-time consent, preserve-only, flipped solely by `consent_to_jira`), AND
 //! - `config.jira_base_url` + `config.jira_email` are non-empty, AND
 //! - an API token is present in the Keychain (`jira_api_token`).
+//!
 //! Otherwise [`JiraConnector::from_config_if_available`] returns `None` (fail-closed: the tool does
 //! not exist for the session). The framework redacts the query BEFORE it reaches [`Connector::search`].
 //!

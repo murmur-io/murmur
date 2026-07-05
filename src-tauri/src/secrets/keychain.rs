@@ -78,7 +78,40 @@ pub fn get_or_create_db_dek() -> Result<String> {
             return Ok(dev);
         }
     }
-    if let Some(dek) = get_secret(ACCOUNT_DB_DEK)? {
+
+    // CATASTROPHIC-SAFETY (the DEK is the whole-DB SQLCipher key): if the read below ever WRONGLY
+    // reports the existing DEK as absent, the mint at the end silently re-keys — permanently
+    // orphaning the entire encrypted database. On a signed release macOS build the data-protection
+    // keychain MUST be available (the embedded Developer-ID provisioning profile grants the
+    // entitlement); an errSecMissingEntitlement (-34018) there means a MIS-SIGNED build, NOT a
+    // genuinely-absent DEK. The generic `get_secret` would, on -34018, fall back to the (empty for a
+    // DP-era user) legacy keyring and return Ok(None) → mint → DB loss. So for the DEK specifically we
+    // read STRICTLY: -34018 becomes a hard error (graceful startup dialog), never a masked Ok(None).
+    // A genuine legacy-keyring DEK still migrates — migrate_or_read_dp reads legacy when the DP query
+    // SUCCEEDS-but-empty; only a FAILED (-34018) DP query is refused here.
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    let existing = {
+        let store = MacDpStore {
+            account: leak_account(ACCOUNT_DB_DEK),
+        };
+        match migrate_or_read_dp(&store) {
+            Ok(v) => v,
+            Err(e) if is_missing_entitlement(&e) => {
+                tracing::error!(
+                    target: "secrets",
+                    "DEK read hit errSecMissingEntitlement on a release build (mis-signed / missing DP entitlement) — REFUSING to mint a replacement DEK (it would orphan the whole database)"
+                );
+                return Err(AppError::Secrets(
+                    "the database key could not be read (the app appears mis-signed) — refusing to create a new one, which would make your existing database unreadable".into(),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
+    let existing = get_secret(ACCOUNT_DB_DEK)?;
+
+    if let Some(dek) = existing {
         return Ok(dek);
     }
     // Mint a fresh DEK. Zeroize the raw byte buffer once the hex form is derived (the hex is the
@@ -179,7 +212,33 @@ pub fn master_kek_with_policy(reason: &str, allow_mint: bool) -> Result<[u8; 32]
 /// data, ONE user-presence prompt) plus the legacy plain item, so the unlock can try each candidate
 /// against the wrapped content key. Read-only — never writes or deletes anything. Candidate COUNT
 /// may be logged by callers; the bytes never are, and the list zeroizes on drop.
+///
+/// LENIENT: an enumeration FAILURE (cancelled/failed Touch ID, transient fault) is swallowed and the
+/// legacy candidate is still returned. That is SAFE for the unlock/remove-lock recovery paths — an
+/// empty/partial set just makes the unlock fail (content untouched, retry). It is NOT safe for a
+/// DESTRUCTIVE decision, which must NEVER read a failed enumeration as "no key exists" — the discard
+/// path uses [`list_master_kek_candidates_strict`] instead (2026-07-05 lock-security finding).
 pub fn list_master_kek_candidates(reason: &str) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
+    collect_master_kek_candidates(reason, false)
+}
+
+/// As [`list_master_kek_candidates`] but STRICT: a candidate-enumeration failure PROPAGATES as `Err`
+/// instead of being swallowed. The DESTRUCTIVE discard path (`discard_unrecoverable_folder_lock`)
+/// requires this — it may conclude a folder is unrecoverable ONLY from an enumeration that
+/// AUTHORITATIVELY completed and returned no unwrapping candidate. A cancelled/failed Touch ID or a
+/// transient keychain fault must abort the discard (`Err`), never be mistaken for "the keychain
+/// holds no key" (which would irreversibly wipe a still-recoverable folder).
+pub fn list_master_kek_candidates_strict(reason: &str) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
+    collect_master_kek_candidates(reason, true)
+}
+
+/// Shared enumeration for both candidate-list variants. `strict` decides whether a failure to
+/// enumerate the biometric items propagates (`true`, for the destructive path) or is swallowed with
+/// only the legacy candidate returned (`false`, for the recovery path).
+fn collect_master_kek_candidates(
+    reason: &str,
+    strict: bool,
+) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
     let mut out: zeroize::Zeroizing<Vec<[u8; 32]>> = zeroize::Zeroizing::new(Vec::new());
 
     // Dev hatch first (mirrors the resolution order).
@@ -194,8 +253,12 @@ pub fn list_master_kek_candidates(reason: &str) -> Result<zeroize::Zeroizing<Vec
     {
         match MacKekStore.read_biometric_all(reason) {
             Ok(items) => out.extend(items),
+            Err(e) if strict => {
+                // Destructive path: a failed/cancelled enumeration is NOT proof of absence — abort.
+                return Err(e);
+            }
             Err(e) => {
-                // Enumeration failing must not mask the legacy candidate below — log and continue.
+                // Recovery path: enumeration failing must not mask the legacy candidate below.
                 tracing::warn!(
                     target: "secrets",
                     error = %e,
@@ -203,14 +266,21 @@ pub fn list_master_kek_candidates(reason: &str) -> Result<zeroize::Zeroizing<Vec
                 );
             }
         }
-        if let Ok(Some(plain)) = MacKekStore.read_plain() {
-            out.push(plain);
+        // The legacy plain KEK is also a candidate. In STRICT mode a read FAILURE here (a transient
+        // keychain fault) must ALSO propagate — an `Ok(empty)` set may only mean "authoritatively no
+        // key" (both reads returned a clean not-found), never "a read failed" (2026-07-05
+        // lock-security finding, the read_plain half of the strict-enumeration gap).
+        match MacKekStore.read_plain() {
+            Ok(Some(plain)) => out.push(plain),
+            Ok(None) => {}
+            Err(e) if strict => return Err(e),
+            Err(_) => {}
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = reason;
+        let _ = (reason, strict);
         if let Ok(Some(hex)) = get_secret(ACCOUNT_MASTER_KEK) {
             if let Some(k) = hex_to_key32(&hex) {
                 out.push(k);
@@ -393,6 +463,16 @@ fn dp_biometric_write(account: &str, key: &[u8; 32]) -> Result<()> {
         return Ok(());
     }
     if status == errSecDuplicateItem {
+        // Replace via delete-then-add. This is DELIBERATELY different from the master-KEK write
+        // (which REFUSES on duplicate to preserve hidden generations): the account-MK cache is a
+        // SINGLE-VALUE cache that MUST be overwritten when it changes — logging in as a different
+        // account (or after a key rotation) has to replace the cached MK, or a later biometric
+        // restore would pair the NEW account's tokens with the OLD account's MK. Unlike the KEK,
+        // there are no multi-generation semantics to preserve: `cache_account_mk_biometric` is
+        // called exactly once per login with the account's deterministic MK (never in a probe-lie
+        // mint loop), so no divergent generations ever accumulate under ACCOUNT_SHARE_MK, and the
+        // MK is always re-derivable from a password login — a lost cache costs one re-login, never
+        // data. `dp_biometric_delete` is scoped to this one account name.
         dp_biometric_delete(account)?;
         let status2 = add(&access);
         if status2 == errSecSuccess {
@@ -1307,7 +1387,13 @@ impl DpStringStore for MacDpStore {
             return Ok(());
         }
         if status == errSecDuplicateItem {
-            // Lost a race with another writer — delete + retry once.
+            // Lost a race with another writer — delete + retry once. Safe here (unlike the master-KEK
+            // write, which REFUSES): these are NON-gated single-value secrets (DEK / MCP token / API
+            // keys / share tokens) with no multi-generation semantics, and `delete_dp` is scoped to
+            // this one account. The brief delete-before-add window is inherent to SecItem* (there is
+            // no write-to-temp-then-atomic-rename); every value here is regenerable or re-enterable
+            // (re-set / re-paste / re-login), and the DEK's only writer is its first-ever mint (never
+            // re-written in steady state), so nothing at-rest is orphaned by a crash in the window.
             self.delete_dp()?;
             let s2 = add();
             if s2 == errSecSuccess {
@@ -1496,6 +1582,20 @@ fn leak_account(account: &str) -> &'static str {
         ACCOUNT_JIRA_TOKEN => ACCOUNT_JIRA_TOKEN,
         ACCOUNT_SLACK_TOKEN => ACCOUNT_SLACK_TOKEN,
         ACCOUNT_GATEWAY_KEY => ACCOUNT_GATEWAY_KEY,
+        // The 7 sharing-session accounts (share::mod KC_* constants). Matched by literal so the
+        // hot set/get/delete paths (account_status → load_tokens is FE-polled) return a &'static str
+        // with NO allocation — otherwise every call `Box::leak`s a fresh copy of the (non-secret,
+        // fixed) account NAME, accruing a few KB/day for a heavy sharing user. The token VALUES are
+        // never involved here. Keep these in sync with share/mod.rs.
+        "murmur_share_access_token" => "murmur_share_access_token",
+        "murmur_share_refresh_token" => "murmur_share_refresh_token",
+        "murmur_share_device_id" => "murmur_share_device_id",
+        "murmur_share_account_email" => "murmur_share_account_email",
+        "murmur_share_account_id" => "murmur_share_account_id",
+        "murmur_share_generation" => "murmur_share_generation",
+        "murmur_share_access_expires_at" => "murmur_share_access_expires_at",
+        // Last-resort for a genuinely-unknown account name (never a real Murmur account) — bounded,
+        // one-time-per-distinct-name, non-secret.
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }

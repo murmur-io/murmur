@@ -578,7 +578,14 @@ fn run_informational(
         // gate as every other prompt segment — NO new egress class (design spec C3). Suppressed
         // entirely when memory is turned off (`user_memory_enabled == false`).
         let memory_brief = gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled);
-        let system = assistant_system_prompt(&live, &typed_notes, &memory_brief);
+        // Is a recording LIVE right now? (recorder present ⇒ capture in progress.) This lets the
+        // prompt scope "this meeting/conversation" to the recording in progress even before any
+        // caption lands — so an empty live buffer no longer sends the agent off to describe OTHER
+        // saved meetings. Best-effort: a poisoned lock degrades to `false` (the vault-grounding
+        // branch), never a failure.
+        let recording_in_progress = state.recorder.lock().map(|g| g.is_some()).unwrap_or(false);
+        let system =
+            assistant_system_prompt(&live, &typed_notes, &memory_brief, recording_in_progress);
         match crate::agent::run_agentic_loop(
             &*reasoner,
             &system,
@@ -1203,7 +1210,12 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// to the pre-feature output (the section is simply absent). Both the injected transcript AND the typed
 /// notes egress through the SAME redaction firewall as every other prompt
 /// (`RedactingProvider::complete` scrubs `system` + `user`) — they are NOT a new egress class.
-fn assistant_system_prompt(live_transcript: &str, typed_notes: &str, memory_brief: &str) -> String {
+fn assistant_system_prompt(
+    live_transcript: &str,
+    typed_notes: &str,
+    memory_brief: &str,
+    recording_in_progress: bool,
+) -> String {
     let base = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
                 sentences). Do not invent facts; if you cannot find the answer, say so plainly. \
                 Decide what the user wants: for a plain QUESTION or conversation, just ANSWER it. \
@@ -1213,10 +1225,29 @@ fn assistant_system_prompt(live_transcript: &str, typed_notes: &str, memory_brie
                 user to review and accept; do NOT call propose_note for ordinary questions.";
     let t = live_transcript.trim();
     let mut prompt = if t.is_empty() {
-        format!(
-            "{base} Ground answers in tool results from the user's own gated vault (and web / \
-             calendar when you use them)."
-        )
+        if recording_in_progress {
+            // A recording is LIVE but nothing has been transcribed yet (it just started, the user
+            // hasn't spoken, or captions lag). "This meeting / this conversation / ta rozmowa" means
+            // the recording IN PROGRESS — never other saved meetings. Do NOT let the model search the
+            // vault and describe unrelated saved notes as if they were the current meeting (the
+            // "brain talks about other recordings" bug): with no live content, the honest answer is
+            // that the meeting just started.
+            format!(
+                "{base} A meeting is being recorded RIGHT NOW. When the user asks about \"this \
+                 meeting\", \"this conversation\", \"ta rozmowa\" or similar, they mean the recording \
+                 IN PROGRESS — NOT any other saved meeting. Nothing has been transcribed from it yet \
+                 (it just started or the user has not spoken much). If you cannot answer from the \
+                 current meeting, say plainly that the meeting just started and little has been \
+                 captured so far — do NOT search the vault for other saved meetings and describe them \
+                 as if they were this one. Use your gated vault tools ONLY when the user EXPLICITLY \
+                 asks about their saved notes/past meetings."
+            )
+        } else {
+            format!(
+                "{base} Ground answers in tool results from the user's own gated vault (and web / \
+                 calendar when you use them)."
+            )
+        }
     } else {
         let tail = tail_chars(t, LIVE_TRANSCRIPT_INJECT_CHARS);
         // HONESTY: the buffer is mic-stream-only and carries no speaker labels — the prompt must
@@ -1224,7 +1255,9 @@ fn assistant_system_prompt(live_transcript: &str, typed_notes: &str, memory_brie
         format!(
             "{base} A meeting is being recorded RIGHT NOW — use the LIVE TRANSCRIPT below to answer \
              questions about THIS current meeting (its topic and what has been said so far), and your \
-             gated tools for anything in the user's saved notes/vault.\n\nLIVE TRANSCRIPT — an \
+             gated tools for anything in the user's saved notes/vault. When the user asks what this \
+             meeting/conversation is about, answer FROM THE LIVE TRANSCRIPT — do NOT substitute other \
+             saved meetings as if they were this one.\n\nLIVE TRANSCRIPT — an \
              UNATTRIBUTED, possibly-partial rolling capture of the recent portion of the meeting from \
              the user's microphone side; it may be garbled and it does NOT indicate who said what, so \
              never attribute a statement to a specific speaker:\n{tail}"
@@ -1852,7 +1885,7 @@ mod tests {
     /// attribution from it would be hallucinated).
     #[test]
     fn assistant_system_prompt_is_honest_about_attribution() {
-        let p = assistant_system_prompt("we shipped the beta", "", "");
+        let p = assistant_system_prompt("we shipped the beta", "", "", false);
         let lower = p.to_lowercase();
         assert!(
             lower.contains("unattributed"),
@@ -1865,6 +1898,44 @@ mod tests {
         assert!(
             !p.contains("its topic, decisions, who said what"),
             "must not claim the transcript knows who said what: {p}"
+        );
+    }
+
+    /// A recording is LIVE but nothing has been transcribed yet (0:31 in, captions still lagging).
+    /// The prompt MUST scope "this meeting/conversation" to the recording in progress and MUST NOT
+    /// invite a vault search that describes OTHER saved meetings as if they were this one — the
+    /// user-reported "brain talks about my other recordings" bug. RED before this fix: with an
+    /// empty live buffer the prompt said only "Ground answers in tool results from the user's own
+    /// gated vault", so the agent semantic-searched the vault and summarized unrelated meetings.
+    #[test]
+    fn assistant_system_prompt_scopes_empty_buffer_to_the_live_recording() {
+        let p = assistant_system_prompt("", "", "", /* recording_in_progress */ true);
+        assert!(
+            p.contains("recorded RIGHT NOW"),
+            "must tell the model a meeting is being recorded now: {p}"
+        );
+        assert!(
+            p.contains("meeting just started"),
+            "must offer the honest 'meeting just started' answer when nothing is captured: {p}"
+        );
+        assert!(
+            p.contains("do NOT search the vault for other saved meetings"),
+            "must forbid substituting other saved meetings for the current one: {p}"
+        );
+        assert!(
+            !p.contains("Ground answers in tool results from the user's own gated vault"),
+            "the empty-recording branch must NOT invite a vault search: {p}"
+        );
+        // When NOT recording, the same empty buffer keeps the old vault-grounding behavior (Ask /
+        // out-of-meeting card) — no regression.
+        let idle = assistant_system_prompt("", "", "", /* recording_in_progress */ false);
+        assert!(
+            idle.contains("Ground answers in tool results from the user's own gated vault"),
+            "out-of-meeting empty prompt keeps vault-grounding: {idle}"
+        );
+        assert!(
+            !idle.contains("recorded RIGHT NOW"),
+            "no live-recording claim when not recording: {idle}"
         );
     }
 
@@ -1935,7 +2006,7 @@ mod tests {
             notes.is_empty(),
             "sealed-not-unlocked meeting must inject NO typed notes"
         );
-        let prompt = assistant_system_prompt(&tail, &notes, "");
+        let prompt = assistant_system_prompt(&tail, &notes, "", false);
         assert!(
             !prompt.contains("LIVE TRANSCRIPT"),
             "no live section for a sealed meeting: {prompt}"
@@ -2047,7 +2118,7 @@ mod tests {
     #[test]
     fn assistant_system_prompt_injects_transcript_only_when_present() {
         // No live transcript (not recording / no captions yet) ⇒ the base prompt, no transcript section.
-        let base = assistant_system_prompt("", "", "");
+        let base = assistant_system_prompt("", "", "", false);
         assert!(
             !base.contains("LIVE TRANSCRIPT"),
             "no transcript section when empty: {base}"
@@ -2055,7 +2126,7 @@ mod tests {
         assert!(base.contains("in-meeting assistant"));
         // With a transcript ⇒ it is embedded + the brain is told to use it for the current meeting.
         let with =
-            assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "", "");
+            assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "", "", false);
         assert!(
             with.contains("LIVE TRANSCRIPT"),
             "names the transcript section: {with}"
@@ -2076,8 +2147,8 @@ mod tests {
     #[test]
     fn assistant_system_prompt_instructs_propose_note_decision() {
         for prompt in [
-            assistant_system_prompt("", "", ""),
-            assistant_system_prompt("we shipped the beta", "", ""),
+            assistant_system_prompt("", "", "", false),
+            assistant_system_prompt("we shipped the beta", "", "", false),
         ] {
             assert!(
                 prompt.contains("propose_note"),
@@ -2100,7 +2171,7 @@ mod tests {
         // A very long transcript is truncated to the RECENT tail (so a 2-hour meeting can't blow the
         // context) and marked elided.
         let long = "x ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS); // way over the inject budget
-        let p = assistant_system_prompt(&long, "", "");
+        let p = assistant_system_prompt(&long, "", "", false);
         assert!(p.contains('…'), "elision marker present when truncated");
         assert!(
             p.chars().count() < long.chars().count(),
@@ -2114,20 +2185,20 @@ mod tests {
     fn assistant_system_prompt_injects_typed_notes_and_empty_is_byte_identical() {
         // Empty typed notes ⇒ no typed-notes section, AND byte-identical to the no-notes prompt for
         // BOTH the no-transcript and with-transcript branches.
-        let no_tx = assistant_system_prompt("", "", "");
+        let no_tx = assistant_system_prompt("", "", "", false);
         assert!(
             !no_tx.contains("TYPED NOTES"),
             "no typed-notes section when empty: {no_tx}"
         );
         let tx = "we shipped the beta and assigned the deck to Anna";
         assert_eq!(
-            assistant_system_prompt(tx, "", ""),
-            assistant_system_prompt(tx, "   ", ""),
+            assistant_system_prompt(tx, "", "", false),
+            assistant_system_prompt(tx, "   ", "", false),
             "whitespace-only typed notes must be byte-identical to none (no regression)"
         );
 
         // Present typed notes ⇒ embedded under the labeled section, alongside the transcript.
-        let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.", "");
+        let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.", "", false);
         assert!(
             with.contains("TYPED NOTES"),
             "names the typed-notes section: {with}"
@@ -2142,7 +2213,7 @@ mod tests {
         );
 
         // Typed notes inject even with NO transcript (the user can type before any caption lands).
-        let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker", "");
+        let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker", "", false);
         assert!(
             notes_only.contains("TYPED NOTES"),
             "typed notes inject without a transcript"
@@ -2155,7 +2226,7 @@ mod tests {
 
         // A very long typed-notes buffer is truncated to the recent tail (bounded like the transcript).
         let long = "y ".repeat(LIVE_TRANSCRIPT_INJECT_CHARS);
-        let p = assistant_system_prompt("", &long, "");
+        let p = assistant_system_prompt("", &long, "", false);
         assert!(
             p.contains('…'),
             "elision marker present when typed notes truncated"
@@ -2171,20 +2242,20 @@ mod tests {
     fn assistant_system_prompt_injects_memory_brief_and_empty_is_byte_identical() {
         // Empty brief ⇒ no memory section, AND byte-identical to the no-brief prompt for BOTH the
         // no-transcript and with-transcript branches.
-        let no_brief = assistant_system_prompt("", "", "");
+        let no_brief = assistant_system_prompt("", "", "", false);
         assert!(
             !no_brief.to_uppercase().contains("KNOW ABOUT THE USER"),
             "no memory section when empty"
         );
         assert_eq!(
-            assistant_system_prompt("we shipped the beta", "", ""),
-            assistant_system_prompt("we shipped the beta", "", "   "),
+            assistant_system_prompt("we shipped the beta", "", "", false),
+            assistant_system_prompt("we shipped the beta", "", "   ", false),
             "whitespace-only brief must be byte-identical to none (no regression)"
         );
 
         // Present brief ⇒ embedded under the labeled memory section, alongside transcript + notes.
         let brief = "- You prefer: Polish replies\n- You work on: Project Atlas";
-        let with = assistant_system_prompt("we shipped the beta", "ship Friday", brief);
+        let with = assistant_system_prompt("we shipped the beta", "ship Friday", brief, false);
         assert!(
             with.to_uppercase().contains("KNOW ABOUT THE USER"),
             "names the memory section: {with}"
@@ -2200,7 +2271,7 @@ mod tests {
         );
 
         // The brief injects even with NO transcript and NO notes.
-        let brief_only = assistant_system_prompt("", "", brief);
+        let brief_only = assistant_system_prompt("", "", brief, false);
         assert!(
             brief_only.to_uppercase().contains("KNOW ABOUT THE USER"),
             "brief injects standalone"
@@ -2246,7 +2317,7 @@ mod tests {
             brief_open.contains("Polish replies"),
             "an open-folder user fact must be in the brief"
         );
-        let prompt_open = assistant_system_prompt("", "", &brief_open);
+        let prompt_open = assistant_system_prompt("", "", &brief_open, false);
         assert!(
             prompt_open.contains("Polish replies"),
             "and injected into the prompt"
@@ -2267,7 +2338,7 @@ mod tests {
             brief_sealed.is_empty(),
             "sealed-source fact must NOT appear in the injected brief"
         );
-        let prompt_sealed = assistant_system_prompt("", "", &brief_sealed);
+        let prompt_sealed = assistant_system_prompt("", "", &brief_sealed, false);
         assert!(
             !prompt_sealed.contains("Polish replies"),
             "the sealed fact must not reach the prompt"
