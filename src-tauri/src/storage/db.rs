@@ -3501,6 +3501,19 @@ impl Db {
         .map(Option::flatten)
     }
 
+    /// Does ANY sealed folder exist? Drives the master-KEK mint guard: while sealed content exists,
+    /// a missing KEK keychain item must NEVER be silently replaced by a freshly-minted one (the
+    /// fresh KEK cannot unwrap the existing folders' content keys — 2026-07-05 field incident).
+    pub fn any_locked_folder(&self) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE locked = 1)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(map_err)
+    }
+
     /// Direct CHILD folders of `parent_id` (one level only — not transitive). Used by
     /// `rename_folder`/`delete_folder` to walk the subtree so a rename can re-prefix descendant
     /// paths and a delete can refuse a non-empty tree.
