@@ -28,6 +28,7 @@
 
 pub mod calendar;
 pub mod jira;
+pub mod slack;
 pub mod web;
 
 use std::sync::Arc;
@@ -174,6 +175,9 @@ impl ConnectorRegistry {
             connectors.push(Box::new(c));
         }
         if let Some(c) = jira::JiraConnector::from_config_if_available(config) {
+            connectors.push(Box::new(c));
+        }
+        if let Some(c) = slack::SlackConnector::from_config_if_available(config) {
             connectors.push(Box::new(c));
         }
         Self {
@@ -611,6 +615,62 @@ mod tests {
         assert!(
             !row.destination.to_lowercase().contains("web search"),
             "a jira destination must not read as a web search: {}",
+            row.destination
+        );
+    }
+
+    /// (c, cont.) PER-CONNECTOR ATTRIBUTION for Slack — a `"slack"`-id connector must record its OWN
+    /// truthful ledger attribution ("slack_search" / "Slack (connector)"), NOT the web-search label.
+    /// Mirrors `jira_connector_search_is_attributed_to_jira_not_web`.
+    #[test]
+    fn slack_connector_search_is_attributed_to_slack_not_web() {
+        struct SlackLikeConnector;
+        #[async_trait::async_trait]
+        impl Connector for SlackLikeConnector {
+            fn id(&self) -> &str {
+                "slack"
+            }
+            fn egress_class(&self) -> EgressClass {
+                EgressClass::External
+            }
+            fn egress_attribution(&self) -> (&'static str, &'static str) {
+                ("slack_search", "Slack (connector)")
+            }
+            async fn search(&self, _redacted_query: &str) -> ConnectorResult {
+                Ok(vec![ConnectorHit {
+                    title: "t".into(),
+                    snippet: "s".into(),
+                    url: "https://acme.slack.com/archives/C1/p1".into(),
+                    source_label: "slack · fake".into(),
+                }])
+            }
+        }
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(SlackLikeConnector)],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
+        );
+        block_on(registry.search("slack", "what did we decide about launch")).unwrap();
+
+        let rows = recorded.lock().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one ledger row for the slack search");
+        let row = &rows[0];
+        assert_eq!(row.provider_id, "slack");
+        assert!(
+            row.call_kind.contains("slack"),
+            "a slack egress must be attributed to slack, not web: call_kind={}",
+            row.call_kind
+        );
+        assert_eq!(row.call_kind, "slack_search");
+        assert_eq!(row.destination, "Slack (connector)");
+        assert_ne!(
+            row.call_kind, "web_search",
+            "a slack egress must NOT be mislabeled as a web search"
+        );
+        assert!(
+            !row.destination.to_lowercase().contains("web search"),
+            "a slack destination must not read as a web search: {}",
             row.destination
         );
     }
