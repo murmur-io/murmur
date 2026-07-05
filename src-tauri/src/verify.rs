@@ -199,7 +199,17 @@ pub fn apply_verify_markers(note_md: &str, findings: &[VerifyFinding]) -> String
                 Verdict::NotFound => "⚠",
                 Verdict::Conflict => "⧗",
             };
-            out.push(format!("> {glyph} {} (via Jira)", f.detail));
+            // Collapse any CR/LF in the FE-round-tripped detail to a single space (trimmed) so the
+            // marker is ALWAYS one line ending in "(via Jira)" — a newline would spawn a second line
+            // that `is_verify_marker` can't strip → residue that accumulates on re-apply + injects
+            // markdown into the user's own note. Defense at the formatting point covers every caller.
+            let detail = f
+                .detail
+                .replace(['\r', '\n'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(format!("> {glyph} {detail} (via Jira)"));
         }
     }
     let mut s = out.join("\n");
@@ -288,6 +298,25 @@ mod tests {
         let out = apply_verify_markers(md, &[]);
         assert!(!out.contains("(via Jira)"), "stale markers removed");
         assert!(out.contains("- done PROJ-1"));
+    }
+
+    #[test]
+    fn multiline_detail_cannot_break_marker_idempotency() {
+        let md = "# N\n- Ship PROJ-1\n";
+        let f = VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: Verdict::Confirmed,
+            detail: "PROJ-1 · Status: Done\ninjected line".into(),
+            url: String::new(),
+        };
+        let once = apply_verify_markers(md, &[f.clone()]);
+        // Every marker-originated line is strippable: re-applying with no findings removes ALL of it.
+        let cleaned = apply_verify_markers(&once, &[]);
+        assert_eq!(cleaned, md, "a multiline detail must not leave residue after strip");
+        // And idempotency holds.
+        let twice = apply_verify_markers(&once, &[f]);
+        assert_eq!(once, twice);
     }
 
     #[test]

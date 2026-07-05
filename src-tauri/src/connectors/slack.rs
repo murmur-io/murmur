@@ -110,7 +110,7 @@ impl Connector for SlackConnector {
         if q.is_empty() {
             return Ok(Vec::new());
         }
-        let client = reqwest::Client::new();
+        let client = super::http_client();
         let resp = client
             .get("https://slack.com/api/search.messages")
             .query(&[("query", q), ("count", "8")])
