@@ -107,7 +107,7 @@ impl JiraConnector {
         &self,
         key: &str,
     ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
-        let client = reqwest::Client::new();
+        let client = super::http_client();
         let resp = client
             .get(format!(
                 "{}/rest/api/3/issue/{key}?fields=summary,status,duedate",
@@ -179,7 +179,7 @@ impl Connector for JiraConnector {
             "maxResults": 8,
             "fields": ["summary", "status", "assignee", "duedate"],
         });
-        let client = reqwest::Client::new();
+        let client = super::http_client();
         let resp = client
             .post(format!("{}/rest/api/3/search/jql", self.base_url))
             .basic_auth(&self.email, Some(&self.api_token))

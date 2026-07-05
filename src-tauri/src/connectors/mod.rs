@@ -38,6 +38,17 @@ use crate::summarize::egress_log::{active_sink, EgressEntry, EgressSink};
 use crate::summarize::meta::CallMeta;
 use crate::summarize::redact::{active_name_redactor, redact_connector_query, NameRedactor};
 
+/// Shared HTTP client for connector calls — bounded so a stalled external service can never hang
+/// the scoped tool worker or the Ask loop indefinitely. 20s overall per request.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        // Builder only fails on TLS-backend misconfig; fall back to the default client rather
+        // than panicking (default has no timeout, but a request still goes out).
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Whether a connector reaches OFF the device. The framework gates every [`External`] connector
 /// behind enable + consent; a [`Local`] connector (none yet) would be exempt, exactly as `ollama` is
 /// exempt from the cloud-egress gate.
