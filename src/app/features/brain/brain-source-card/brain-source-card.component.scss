@@ -1,0 +1,188 @@
+:host {
+  display: block;
+  height: 100%;
+}
+.sc {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  /* Fill the stretched grid cell so peer cards share a height. */
+  height: 100%;
+  transition:
+    border-color var(--transition),
+    transform var(--transition-fast),
+    box-shadow var(--transition);
+}
+.sc:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md), var(--glass-highlight);
+}
+.sc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+/* Accent-tinted icon tile — the same visual family as the header's brain
+   mark (.b-mark) and the record Ask button, so the sources read as native
+   Murmur chrome rather than generic cards. */
+.sc-tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  color: var(--accent-hover);
+  line-height: 1;
+  transition:
+    background var(--transition),
+    border-color var(--transition);
+}
+.sc:hover .sc-tile {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--text-on-accent);
+}
+.sc-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.sc-title {
+  margin: 0;
+  font-size: 1.0625rem;
+}
+.sc-sub {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.sc-count {
+  flex: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.sc-link {
+  align-self: flex-start;
+  /* Pin to the card's bottom so the link/add rows align across sources. */
+  margin-top: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sc-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+/* Pin the add-row to the bottom ONLY when it's the trailing content (the
+   collapsed, unblocked case) so peer cards' add-rows align. When a locked
+   note or an expanded list follows, it flows normally (no gap). */
+.sc-actions:last-child {
+  margin-top: auto;
+}
+.sc-add {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sc-locked {
+  align-items: center;
+}
+.sc-locked-glyph {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-hover);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+.sc-state {
+  margin: 0;
+  padding: var(--space-2) 0;
+}
+
+.sc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.sc-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  transition: border-color var(--transition);
+}
+.sc-item:hover {
+  border-color: var(--border-strong);
+}
+.sc-item-glyph {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-muted);
+  line-height: 1;
+}
+.sc-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.sc-item-name {
+  color: var(--text-primary);
+  font-size: 0.9375rem;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sc-item-date {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.sc-del {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: var(--text-muted);
+}
+.sc-del:hover {
+  color: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sc {
+    transition: none;
+  }
+  .sc:hover {
+    transform: none;
+  }
+}
+    

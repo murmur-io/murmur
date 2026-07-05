@@ -1,0 +1,64 @@
+<div class="card panel">
+  <div class="panel-head">
+    <h3>Weekly digest</h3>
+    <span class="panel-note">Synthesise your recent meetings</span>
+  </div>
+
+  <!-- Controls: range segmented control + generate. -->
+  <div class="digest-controls">
+    <div class="seg" role="group" aria-label="Digest range">
+      @for (r of ranges; track r) {
+        <button
+          type="button"
+          class="seg-btn"
+          [class.is-active]="range() === r"
+          [attr.aria-pressed]="range() === r"
+          [disabled]="pending()"
+          (click)="setRange(r)"
+        >
+          {{ r }} days
+        </button>
+      }
+    </div>
+    <button
+      type="button"
+      class="btn btn-primary digest-go"
+      [disabled]="pending()"
+      (click)="generate()"
+    >
+      @if (pending()) {
+        <span class="digest-spin" aria-hidden="true"></span>
+        Synthesising…
+      } @else {
+        Generate digest
+      }
+    </button>
+  </div>
+
+  @if (error(); as err) {
+    <div class="banner is-danger" role="alert">{{ err }}</div>
+  }
+
+  @if (result(); as r) {
+    @if (savedPath()) {
+      <p class="digest-saved">
+        Saved to your vault:
+        <span class="digest-path">{{ savedPath() }}</span>
+      </p>
+    }
+    <!-- Plain-text render: markdown shown verbatim, no innerHTML. -->
+    <div
+      class="digest-output"
+      role="region"
+      aria-label="Generated digest"
+      tabindex="0"
+    >
+      <app-markdown [markdown]="r.markdown" />
+    </div>
+  } @else if (!pending() && !error()) {
+    <p class="empty">
+      Pick a range and generate a synthesis of your recent meetings.
+    </p>
+  }
+</div>
+  

@@ -1,0 +1,100 @@
+<div class="card strip-card">
+  <div class="strip-head">
+    <h3>Where your text goes</h3>
+  </div>
+
+  <div class="strip-lines">
+    <div class="strip-line">
+      <span class="strip-dot is-local" aria-hidden="true"></span>
+      <span class="text-secondary">
+        <strong class="strip-strong">Stays on this Mac:</strong>
+        transcription, embeddings, name redaction, proactive hints, local
+        models
+      </span>
+    </div>
+
+    @if (defaultEgressDestination(); as dest) {
+      <div class="strip-line">
+        <span class="strip-dot is-cloud" aria-hidden="true"></span>
+        <span class="text-secondary">
+          <strong class="strip-strong">Leaves this Mac (redacted first):</strong>
+          {{ dest.connection }} → {{ dest.destination }}
+        </span>
+      </div>
+    }
+  </div>
+
+  <div class="strip-consent">
+    <span class="text-secondary">Cloud processing</span>
+    @if (cloudConsented()) {
+      <span class="pill is-success">
+        <span class="pill-dot"></span>
+        Allowed ✓
+      </span>
+      @if (confirmingRevoke()) {
+        <span class="revoke-confirm">
+          <span class="text-secondary revoke-question">
+            Really revoke? Cloud AI will stop working until re-allowed.
+          </span>
+          <button
+            type="button"
+            class="btn revoke-btn"
+            (click)="confirmRevoke()"
+            [disabled]="revoking()"
+          >
+            @if (revoking()) {
+              <span class="spin-ring" aria-hidden="true"></span>
+              Revoking…
+            } @else {
+              Revoke consent
+            }
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="cancelRevoke()"
+            [disabled]="revoking()"
+          >
+            Keep
+          </button>
+        </span>
+      } @else {
+        <button
+          type="button"
+          class="btn btn-ghost revoke-btn"
+          (click)="startRevoke()"
+        >
+          Revoke
+        </button>
+      }
+    } @else {
+      <span class="pill">
+        <span class="pill-dot"></span>
+        Not granted
+      </span>
+      <button
+        type="button"
+        class="btn btn-primary"
+        (click)="allowCloudProcessing()"
+        [disabled]="consenting()"
+      >
+        @if (consenting()) {
+          <span class="spin-ring" aria-hidden="true"></span>
+          Enabling…
+        } @else {
+          Allow
+        }
+      </button>
+      <span class="text-muted strip-hint">
+        One-time, redacted first — required before any cloud provider runs.
+      </span>
+    }
+  </div>
+  @if (consentError(); as cerr) {
+    <p class="text-danger strip-error">{{ cerr }}</p>
+  }
+  @if (revokeError(); as rerr) {
+    <p class="text-danger strip-error">{{ rerr }}</p>
+  }
+</div>
+  

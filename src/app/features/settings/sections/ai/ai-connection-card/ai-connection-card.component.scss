@@ -1,0 +1,177 @@
+/* One connection = an inset row card (the brain-model-row language). */
+.conn-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.conn-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.conn-main {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.conn-name {
+  color: var(--text-primary);
+  font-weight: 550;
+  font-size: 0.95rem;
+}
+.conn-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.conn-privacy,
+.conn-reason {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.conn-chevron {
+  margin-left: var(--space-1);
+  transition: transform var(--transition-fast);
+}
+.conn-chevron.is-open {
+  transform: rotate(180deg);
+}
+.btn-sm {
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+}
+
+/* The Configure DISCLOSURE — in-flow (expands the card), NOT a floating
+   overlay, so the frosted/inset surfaces are correct (no opacity trap). */
+.conn-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* --- Stacked label + control (shared section language) --- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.field-label {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+.field-help {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.row {
+  display: flex;
+  gap: var(--space-2);
+}
+.row input {
+  flex: 1;
+  min-width: 0;
+}
+.row .btn {
+  flex: none;
+}
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  cursor: pointer;
+}
+.toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.toggle-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.toggle-sub {
+  font-size: 0.85rem;
+}
+.key-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* --- AI Gateway rows (moved verbatim from the old Providers section) --- */
+.gateway-model-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.gateway-model-select,
+.gateway-model-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.gateway-model-refresh {
+  flex: none;
+  height: 36px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+.gateway-health-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.gateway-health-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.gateway-health-hint {
+  font-size: 0.8125rem;
+}
+.gateway-dot-unreachable {
+  background: var(--text-muted);
+}
+.gateway-health-btn {
+  height: 28px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+.gateway-key-error {
+  margin: 0;
+  font-size: 0.85rem;
+}
+.banner-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  font-weight: 700;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+    

@@ -1,0 +1,192 @@
+<div class="card surface" role="group" aria-label="In-meeting notes">
+  <div class="surface-head">
+    <app-ai-orb class="head-orb" [state]="orbStateView()" />
+    <span class="surface-title">Notes</span>
+    <span
+      class="surface-hint"
+      role="status"
+      aria-live="polite"
+      [class.is-enhancing]="enhancing()"
+      [class.is-settled]="settled()"
+    >
+      @if (enhancing()) {
+        Enhancing your notes…
+      } @else if (settled()) {
+        ✨ Notes enhanced — your bullets became the outline.
+      } @else if (enhanceAware() && store.hasPersistedNotes()) {
+        ✨ These bullets will shape your summary
+      } @else {
+        Type <span class="kbd">&#64;brain</span> to ask in a thread
+      }
+    </span>
+  </div>
+
+  <!-- Reactions rail — PINNED above the notes flow (not inside the scroller,
+       so cards can't scroll away mid-meeting). Two lanes: the proactive RECALL
+       hint (at most one; hintsEnabled is the FE half of its global mute) and
+       the realtime CONTRADICTION whisper cards. Both are PURGED on any lock
+       transition (Lock all / screen-share auto-relock / seal) by the store so
+       content that already crossed to the FE never outlives the gate. -->
+  @if (
+    (hintsEnabled() && store.hint()) ||
+    store.whisperCards().length > 0 ||
+    store.showShadowCalibration()
+  ) {
+    <div class="reactions-rail">
+      @if (hintsEnabled() && store.hint(); as h) {
+        <app-proactive-hint-card
+          [hint]="h"
+          (dismissed)="store.dismissHint()"
+        />
+      }
+      @for (w of store.whisperCards(); track w.id) {
+        <app-whisper-card
+          [card]="w"
+          (dismissed)="store.dismissWhisper(w.id)"
+        />
+      }
+
+      <!-- Shadow-mode calibration — offer to switch on contradiction cards
+           once the user's OWN recording would have flagged enough of them. -->
+      @if (store.showShadowCalibration()) {
+        <div class="shadow-calibration" role="status">
+          <span class="shadow-copy">
+            The brain would have flagged {{ store.shadowCount() }}
+            {{ store.shadowCount() === 1 ? "contradiction" : "contradictions" }}
+            in this session — show them live?
+          </span>
+          <div class="shadow-actions">
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              (click)="store.enableContradictionCards()"
+            >
+              Show live
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm"
+              (click)="store.dismissShadowCalibration()"
+            >
+              Not now
+            </button>
+          </div>
+        </div>
+      }
+    </div>
+  }
+
+  <div class="flow" #flow [class.is-enhancing]="enhancing()">
+    @if (!store.hasNotes()) {
+      <p class="flow-empty text-muted">
+        Jot your notes here — they're saved with the meeting. Type
+        <span class="kbd">&#64;brain</span> + a question to open a thread; the
+        assistant answers there and you choose what to add to your notes.
+      </p>
+    }
+    @for (n of store.notes(); track n.id; let i = $index) {
+      <app-note-item
+        [note]="n"
+        (followed)="scrollToBottom()"
+        [style.animation-delay.ms]="enhancing() ? sweepDelay(i) : null"
+      />
+    }
+  </div>
+
+  <form class="composer" (submit)="submit($event)">
+    <button
+      type="button"
+      class="mic-btn"
+      [class.is-listening]="store.listening()"
+      [disabled]="store.processing()"
+      (click)="toggleAsk()"
+      [attr.aria-pressed]="store.listening()"
+      [attr.aria-label]="
+        store.listening() ? 'Stop listening and ask' : 'Ask by voice'
+      "
+      [title]="store.listening() ? 'Stop & ask' : 'Ask by voice'"
+    >
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path
+          d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+          fill="currentColor"
+        />
+        <path
+          d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+          fill="currentColor"
+          opacity="0.85"
+        />
+      </svg>
+    </button>
+    <div class="composer-editor">
+      <textarea
+        #ta
+        class="composer-input"
+        rows="1"
+        autocomplete="off"
+        spellcheck="true"
+        [disabled]="!store.loaded()"
+        [placeholder]="
+          store.loaded()
+            ? 'write a note… (@brain to open a thread)'
+            : 'Loading notes…'
+        "
+        [value]="draft()"
+        (input)="onInput($event)"
+        (keydown)="onKeydown($event)"
+        (blur)="onBlur()"
+        aria-label="Note or @brain question"
+      ></textarea>
+
+      @if (menuOpen()) {
+        <div
+          class="mention-menu"
+          role="listbox"
+          aria-label="Mention"
+          [style.top.px]="menuTop()"
+          [style.left.px]="menuLeft()"
+        >
+          <button
+            type="button"
+            class="mention-item"
+            role="option"
+            [attr.aria-selected]="true"
+            (mousedown)="$event.preventDefault()"
+            (click)="chooseBrain()"
+          >
+            <span class="mention-ico" aria-hidden="true">🧠</span>
+            <span class="mention-text">
+              <span class="mention-label">brain</span>
+              <span class="mention-hint">open a thread + ask</span>
+            </span>
+          </button>
+        </div>
+      }
+    </div>
+    <button
+      type="submit"
+      class="btn btn-primary composer-send"
+      [class.is-brain]="draftIsBrain()"
+      [disabled]="!canSend()"
+      [attr.aria-label]="draftIsBrain() ? 'Open a @brain thread' : 'Save note'"
+      [title]="draftIsBrain() ? 'Ask (Enter)' : 'Save note (Enter)'"
+    >
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        aria-hidden="true"
+      >
+        <path
+          d="M5 12h14M13 6l6 6-6 6"
+          stroke="currentColor"
+          stroke-width="2.2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+    </button>
+  </form>
+</div>
+  

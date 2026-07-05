@@ -1,0 +1,140 @@
+<figure class="nb">
+  <svg
+    class="nb-svg"
+    [attr.viewBox]="'0 0 ' + size + ' ' + size"
+    role="img"
+    [attr.aria-label]="ariaLabel()"
+  >
+    <defs>
+      <linearGradient id="nbWave" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#6e76ff" />
+        <stop offset="1" stop-color="#9d7bff" />
+      </linearGradient>
+      <radialGradient id="nbHubGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0" stop-color="rgba(110,118,255,0.35)" />
+        <stop offset="1" stop-color="rgba(110,118,255,0)" />
+      </radialGradient>
+    </defs>
+
+    <!-- Edges first, under the nodes. -->
+    <g class="nb-edges" aria-hidden="true">
+      @for (s of satellites(); track s.id) {
+        <line
+          class="nb-edge"
+          [attr.x1]="center"
+          [attr.y1]="center"
+          [attr.x2]="s.cx"
+          [attr.y2]="s.cy"
+          [attr.stroke-width]="s.strokeWidth"
+          [style.--i]="$index"
+        />
+      }
+    </g>
+
+    <!-- Soft hub glow + the centred brand wave. -->
+    <circle
+      [attr.cx]="center"
+      [attr.cy]="center"
+      r="46"
+      fill="url(#nbHubGlow)"
+      aria-hidden="true"
+    />
+    <g
+      class="nb-hub"
+      [attr.transform]="
+        'translate(' + (center - 14) + ',' + (center - 14) + ')'
+      "
+      aria-hidden="true"
+    >
+      <rect
+        class="nb-bar b1"
+        x="4.4"
+        y="10"
+        width="2.4"
+        height="8"
+        rx="1.2"
+      />
+      <rect
+        class="nb-bar b2"
+        x="8.4"
+        y="7"
+        width="2.4"
+        height="14"
+        rx="1.2"
+      />
+      <rect
+        class="nb-bar b3"
+        x="12.4"
+        y="4"
+        width="2.4"
+        height="20"
+        rx="1.2"
+      />
+      <rect
+        class="nb-bar b4"
+        x="16.4"
+        y="7"
+        width="2.4"
+        height="14"
+        rx="1.2"
+      />
+      <rect
+        class="nb-bar b5"
+        x="20.4"
+        y="10"
+        width="2.4"
+        height="8"
+        rx="1.2"
+      />
+    </g>
+
+    <!-- Satellites: each a clickable group (node + label). -->
+    <g class="nb-sats">
+      @for (s of satellites(); track s.id) {
+        <g
+          class="nb-sat"
+          [class.is-project]="s.kind === 'project'"
+          role="button"
+          tabindex="0"
+          [attr.aria-label]="satLabel(s)"
+          [style.--i]="$index"
+          (click)="select.emit(s.id)"
+          (keydown.enter)="select.emit(s.id)"
+          (keydown.space)="onSpace($event, s.id)"
+        >
+          <circle
+            class="nb-sat-hit"
+            [attr.cx]="s.cx"
+            [attr.cy]="s.cy"
+            r="16"
+          />
+          <circle
+            class="nb-sat-dot"
+            [attr.cx]="s.cx"
+            [attr.cy]="s.cy"
+            [attr.r]="satR"
+          />
+          <text
+            class="nb-sat-label"
+            [attr.x]="s.labelX"
+            [attr.y]="s.cy + 4"
+            [attr.text-anchor]="s.textAnchor"
+          >
+            {{ s.name }}
+          </text>
+        </g>
+      }
+    </g>
+  </svg>
+
+  @if (satellites().length === 0) {
+    <figcaption class="nb-empty">
+      No connections yet — this entity stands alone in your visible graph.
+    </figcaption>
+  } @else {
+    <figcaption class="nb-cap">
+      Edge thickness reflects how many meetings they share.
+    </figcaption>
+  }
+</figure>
+  

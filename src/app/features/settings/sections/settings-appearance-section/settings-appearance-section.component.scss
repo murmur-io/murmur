@@ -1,0 +1,131 @@
+/* Stage-1 split: the host stays layout-transparent so this section's
+   cards remain direct flex items of the shell's .section-body (identical
+   spacing to the pre-split monolith); .section-stack reproduces the
+   .section-body column gap between this section's own cards. */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- Appearance / theme --- */
+.appearance-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.appearance-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.appearance-copy h3 {
+  margin: 0;
+}
+.appearance-copy p {
+  margin: 0;
+  font-size: 0.875rem;
+}
+.theme-seg {
+  display: inline-flex;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  width: fit-content;
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+}
+.theme-seg button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius-pill);
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.theme-seg button svg {
+  width: 16px;
+  height: 16px;
+}
+.theme-seg button:hover {
+  color: var(--text-primary);
+}
+.theme-seg button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* --- Liquid Glass slider --- */
+.glass-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: 420px;
+}
+.glass-glyph {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+}
+.glass-value {
+  flex: none;
+  min-width: 44px;
+  text-align: right;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.glass-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.glass-slider::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+}
+.glass-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7.5px;
+  border-radius: 50%;
+  background: var(--text-on-accent);
+  border: none;
+  box-shadow:
+    0 0 0 1px var(--border-strong),
+    var(--shadow-sm);
+  transition: transform var(--transition-fast);
+}
+.glass-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.08);
+}
+.glass-slider:focus,
+.glass-slider:focus-visible {
+  outline: none;
+}
+.glass-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+    

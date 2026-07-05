@@ -1,0 +1,22 @@
+@if (sources().length) {
+  <div class="src">
+    <span class="src-label">Sources</span>
+    @for (s of visible(); track s.meetingId) {
+      <a class="src-chip" [routerLink]="['/meeting', s.meetingId]">
+        <span class="src-dot"></span>
+        <span class="src-title">{{ s.title }}</span>
+        <span class="src-date">{{ fmt(s.startedAt) }}</span>
+      </a>
+    }
+    @if (sources().length > limit()) {
+      <button type="button" class="src-more" (click)="toggle()">
+        {{
+          expanded()
+            ? "Show less"
+            : "+" + (sources().length - limit()) + " more"
+        }}
+      </button>
+    }
+  </div>
+}
+  

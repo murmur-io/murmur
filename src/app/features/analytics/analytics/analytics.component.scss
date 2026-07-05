@@ -1,0 +1,304 @@
+.analytics {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.head h2 {
+  margin: 0;
+}
+
+/* --- Hero stat cards --- */
+.hero {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--space-4);
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-5);
+  animation: rise 420ms var(--transition) both;
+  transition:
+    transform var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+.stat:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-lg), var(--glass-highlight);
+}
+.stat-label {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.stat-value {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 1.85rem;
+  font-weight: 600;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+.stat-sub {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Panels --- */
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  animation: rise 420ms var(--transition) both;
+}
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.panel-head h3 {
+  margin: 0;
+}
+.panel-note {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+}
+
+/* --- 30-day activity chart --- */
+.chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 132px;
+}
+.chart-col {
+  flex: 1 1 0;
+  height: 100%;
+  min-width: 0;
+}
+.chart-track {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  height: 100%;
+}
+.chart-bar {
+  position: relative;
+  width: 100%;
+  min-height: 2px;
+  border-radius: var(--radius-sm) var(--radius-sm) 3px 3px;
+  background: var(--accent-gradient);
+  box-shadow: 0 0 0 1px rgba(110, 118, 255, 0.18);
+  transform-origin: bottom;
+  animation: grow-bar 560ms var(--ease-spring) both;
+  transition:
+    filter var(--transition),
+    box-shadow var(--transition);
+}
+.chart-bar.is-zero {
+  min-height: 3px;
+  height: 3px !important;
+  background: var(--surface-hover);
+  box-shadow: none;
+  border-radius: var(--radius-pill);
+  align-self: flex-end;
+}
+.chart-col:hover .chart-bar:not(.is-zero) {
+  filter: brightness(1.15);
+  box-shadow: var(--shadow-accent);
+}
+.chart-col:hover .chart-tip {
+  opacity: 1;
+  transform: translate(-50%, -6px);
+}
+@keyframes grow-bar {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+.chart-tip {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translate(-50%, 0);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--transition),
+    transform var(--transition);
+  z-index: 2;
+}
+
+.chart-axis {
+  display: flex;
+  gap: 3px;
+  margin-top: calc(-1 * var(--space-2));
+}
+.chart-axis-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+.chart-tick {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+/* --- Two-column lower grid --- */
+.grid {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: var(--space-4);
+  align-items: start;
+}
+
+/* --- Status breakdown --- */
+.status-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.status-row {
+  display: grid;
+  grid-template-columns: 116px 1fr auto;
+  align-items: center;
+  gap: var(--space-3);
+}
+.status-row .pill {
+  justify-content: flex-start;
+}
+.status-track {
+  position: relative;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+.status-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  min-width: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-gradient);
+  animation: grow-fill 560ms var(--ease-spring) both;
+  transform-origin: left;
+}
+/* Reuse the pill colour vocabulary for the fill, but as solid bars.
+   (Accent reuses the base gradient; only the status colours override.) */
+.status-fill.is-success {
+  background: var(--success);
+}
+.status-fill.is-danger {
+  background: var(--danger);
+}
+@keyframes grow-fill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+.status-count {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* --- Small tiles --- */
+.tiles {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4) var(--space-5);
+  animation: rise 420ms var(--transition) both;
+  transition:
+    transform var(--transition),
+    border-color var(--transition);
+}
+.tile:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+}
+.tile-label {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.tile-value {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.tile-value--text {
+  font-family: var(--font-sans);
+  font-size: 1.0625rem;
+  letter-spacing: -0.01em;
+}
+
+/* --- Empty / loading states (.count/.state-card/.empty* are global) --- */
+
+/* --- Responsive --- */
+@media (max-width: 720px) {
+  .hero {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+    

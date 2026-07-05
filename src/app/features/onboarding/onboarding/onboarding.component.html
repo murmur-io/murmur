@@ -1,0 +1,586 @@
+<div class="ob">
+  <div class="ob-stage">
+    <!-- Progress: dots + step counter, hidden on the welcome splash. -->
+    @if (currentStep() !== "welcome") {
+      <div class="ob-progress" role="group" aria-label="Setup progress">
+        <div class="dots">
+          @for (s of steps; track s; let i = $index) {
+            <span
+              class="dot"
+              [class.is-done]="i < stepIndex()"
+              [class.is-active]="i === stepIndex()"
+              aria-hidden="true"
+            ></span>
+          }
+        </div>
+        <span class="step-count">
+          Step {{ stepIndex() }} of {{ steps.length - 1 }}
+        </span>
+      </div>
+    }
+
+    <!-- One panel renders at a time; @switch keys the entrance animation. -->
+    <div class="ob-panel card" [attr.data-step]="currentStep()">
+      @switch (currentStep()) {
+        <!-- ───────────────────────── WELCOME ───────────────────────── -->
+        @case ("welcome") {
+          <div class="welcome">
+            <span class="orb-brand" aria-hidden="true">
+              <span class="orb-core"></span>
+            </span>
+            <h1 class="ob-title welcome-title">
+              <span class="brand-dot" aria-hidden="true"></span>
+              Welcome to Murmur
+            </h1>
+            <p class="ob-lede">
+              On-device meeting notes. Your audio never leaves this Mac.
+            </p>
+            <button
+              type="button"
+              class="btn btn-primary ob-cta"
+              (click)="next()"
+            >
+              Get started
+              <span class="cta-arrow" aria-hidden="true">→</span>
+            </button>
+            <p class="ob-fineprint text-muted">
+              Takes about a minute · everything runs locally
+            </p>
+          </div>
+        }
+
+        <!-- ────────────────────── TRANSCRIPTION MODEL ───────────────── -->
+        @case ("model") {
+          <div class="ob-head">
+            <span class="ob-eyebrow">On-device transcription</span>
+            <h2 class="ob-title">Choose your transcription model</h2>
+            <p class="ob-sub text-secondary">
+              Whisper runs entirely on your Mac. Pick a language and quality
+              — we’ll fetch the matching model once.
+            </p>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span class="field-label">Language</span>
+              <select
+                [value]="language()"
+                (change)="onLanguage($event)"
+                [disabled]="downloading()"
+              >
+                <option value="">Auto-detect</option>
+                <option value="en">English</option>
+                <option value="pl">Polski</option>
+                <option value="de">Deutsch</option>
+                <option value="es">Español</option>
+                <option value="fr">Français</option>
+                <option value="it">Italiano</option>
+                <option value="pt">Português</option>
+                <option value="uk">Українська</option>
+                <option value="nl">Nederlands</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span class="field-label">Quality</span>
+              <select
+                [value]="modelSize()"
+                (change)="onModelSize($event)"
+                [disabled]="downloading()"
+              >
+                <option value="tiny">Tiny — fastest (~75 MB)</option>
+                <option value="base">Base (~150 MB)</option>
+                <option value="small">Small — recommended (~470 MB)</option>
+                <option value="medium">Medium — accurate (~1.5 GB)</option>
+                <option value="large-v3">Large — best (~3 GB)</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="model-state">
+            @if (modelPresent() === true) {
+              <span class="pill is-success">
+                <span class="pill-dot"></span>
+                Model ready
+              </span>
+              <span class="text-muted model-note">
+                Stored on this Mac — used for every recording.
+              </span>
+            } @else if (modelPresent() === false) {
+              @if (downloading()) {
+                <div class="dl-progress" role="status">
+                  <div class="dl-progress-track" aria-hidden="true">
+                    <div
+                      class="dl-progress-fill"
+                      [style.width.%]="downloadFrac() * 100"
+                    ></div>
+                  </div>
+                  <span class="dl-progress-label text-muted">
+                    @if (downloadFrac() > 0) {
+                      Downloading… {{ downloadPct() }}
+                    } @else {
+                      <span class="spin-ring" aria-hidden="true"></span>
+                      Downloading…
+                    }
+                  </span>
+                </div>
+                <span class="text-muted model-note">
+                  Fetching the model — large models can take a few minutes.
+                </span>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  (click)="downloadModel()"
+                >
+                  <span class="dl-arrow" aria-hidden="true">↓</span>
+                  Download model ({{ sizeHint() }})
+                </button>
+                <span class="text-muted model-note">
+                  {{ sizeHint() }}, one time, on-device.
+                </span>
+              }
+            } @else {
+              <span class="pill">
+                <span class="pill-dot"></span>
+                Checking…
+              </span>
+            }
+          </div>
+          @if (downloadError(); as derr) {
+            <p class="ob-error text-danger">{{ derr }}</p>
+          }
+        }
+
+        <!-- ───────────────────────── AI PROVIDER ────────────────────── -->
+        @case ("provider") {
+          <div class="ob-head">
+            <span class="ob-eyebrow">Privacy &amp; summaries</span>
+            <h2 class="ob-title">How should your notes get written?</h2>
+            <p class="ob-sub text-secondary">
+              After transcription, an AI turns the transcript into a clean
+              summary. First, choose where that happens — this is a conscious
+              privacy choice.
+            </p>
+          </div>
+
+          <!-- A3 — the explicit two-posture choice. Cloud is the default. -->
+          <div
+            class="postures"
+            role="radiogroup"
+            aria-label="Where notes get written"
+          >
+            <button
+              type="button"
+              class="posture"
+              [class.is-selected]="posture() === 'local'"
+              (click)="selectPosture('local')"
+              role="radio"
+              [attr.aria-checked]="posture() === 'local'"
+            >
+              <span class="posture-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
+                  <rect
+                    x="3"
+                    y="4"
+                    width="14"
+                    height="9"
+                    rx="1.6"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                  />
+                  <path
+                    d="M7 16.5h6M10 13.5v3"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                  />
+                </svg>
+              </span>
+              <span class="posture-name">Fully local</span>
+              <span class="posture-sub text-secondary">
+                Ollama on this Mac. Nothing leaves your Mac.
+              </span>
+            </button>
+
+            <button
+              type="button"
+              class="posture"
+              [class.is-selected]="posture() === 'cloud'"
+              (click)="selectPosture('cloud')"
+              role="radio"
+              [attr.aria-checked]="posture() === 'cloud'"
+            >
+              <span class="posture-recommended">Default</span>
+              <span class="posture-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
+                  <path
+                    d="M6 14.5a3.5 3.5 0 0 1-.3-6.98A4.5 4.5 0 0 1 14.4 8.2 3 3 0 0 1 14 14.5H6Z"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+              <span class="posture-name">Cloud via redaction firewall</span>
+              <span class="posture-sub text-secondary">
+                A cloud AI. Only redacted text ever leaves.
+              </span>
+            </button>
+          </div>
+
+          <!-- Persistent, visible privacy-posture badge (A3). -->
+          <div
+            class="privacy-badge"
+            [class.is-local]="posture() === 'local'"
+            role="status"
+          >
+            <span class="privacy-badge-dot" aria-hidden="true"></span>
+            <span class="privacy-badge-label">{{
+              privacyBadge().label
+            }}</span>
+            <span class="privacy-badge-detail text-muted">
+              {{ privacyBadge().detail }}
+            </span>
+          </div>
+
+          <div class="providers">
+            @for (p of providerTiles(); track p.id) {
+              <button
+                type="button"
+                class="provider"
+                [class.is-selected]="provider() === p.id"
+                [class.is-available]="p.available"
+                (click)="selectProvider(p.id)"
+                [attr.aria-pressed]="provider() === p.id"
+              >
+                <span class="provider-main">
+                  <span class="provider-name">{{ labelFor(p.id) }}</span>
+                  @if (p.available) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Available
+                    </span>
+                  } @else {
+                    <span class="pill is-warning">
+                      <span class="pill-dot"></span>
+                      Needs setup
+                    </span>
+                  }
+                </span>
+                @if (!p.available && p.reason) {
+                  <span class="provider-reason text-muted">{{
+                    p.reason
+                  }}</span>
+                }
+                <span class="provider-check" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" width="13" height="13">
+                    <path
+                      d="M3 8.5 6.2 12 13 4.5"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </span>
+              </button>
+            }
+          </div>
+
+          <!-- Contextual setup help for the chosen provider. -->
+          @switch (provider()) {
+            @case ("anthropic") {
+              @if (!isProviderAvailable("anthropic")) {
+                <div class="setup-well">
+                  <p class="setup-title">Paste your Anthropic API key</p>
+                  <p class="setup-text text-secondary">
+                    Create a key at
+                    <span class="inline-url">console.anthropic.com</span>,
+                    then paste it here. Stored securely on this Mac.
+                  </p>
+                  <div class="row">
+                    <input
+                      type="password"
+                      placeholder="sk-ant-…"
+                      [value]="apiKey()"
+                      (input)="onApiKey($event)"
+                      [disabled]="savingKey()"
+                      autocomplete="off"
+                    />
+                    <button
+                      type="button"
+                      class="btn"
+                      (click)="saveAnthropicKey()"
+                      [disabled]="
+                        savingKey() || apiKey().trim().length === 0
+                      "
+                    >
+                      {{ savingKey() ? "Saving…" : "Save key" }}
+                    </button>
+                  </div>
+                  @if (keyError(); as kerr) {
+                    <p class="ob-error text-danger">{{ kerr }}</p>
+                  }
+                </div>
+              }
+            }
+            @case ("ollama") {
+              @if (!isProviderAvailable("ollama")) {
+                <div class="setup-well">
+                  <p class="setup-title">Run Ollama locally</p>
+                  <p class="setup-text text-secondary">
+                    Install Ollama, then in a terminal run
+                    <code class="inline-cmd">ollama serve</code> and pull a
+                    model with
+                    <code class="inline-cmd">ollama pull llama3.1</code>.
+                  </p>
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="recheckProviders()"
+                    [disabled]="checking()"
+                  >
+                    {{ checking() ? "Checking…" : "Re-check" }}
+                  </button>
+                </div>
+              }
+            }
+            @case ("claude_code") {
+              @if (!isProviderAvailable("claude_code")) {
+                <div class="setup-well">
+                  <p class="setup-title">Install the Claude CLI</p>
+                  <p class="setup-text text-secondary">
+                    Install the
+                    <span class="inline-url">claude</span> command-line tool
+                    and sign in, then re-check below.
+                  </p>
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="recheckProviders()"
+                    [disabled]="checking()"
+                  >
+                    {{ checking() ? "Checking…" : "Re-check" }}
+                  </button>
+                </div>
+              } @else {
+                <div class="setup-well is-ok">
+                  <span class="pill is-success">
+                    <span class="pill-dot"></span>
+                    Claude Code detected
+                  </span>
+                  <span class="setup-text text-secondary">
+                    You’re set — nothing to configure.
+                  </span>
+                </div>
+              }
+            }
+            @case ("gateway") {
+              <div class="setup-well">
+                <p class="setup-title">Connect your Kong AI Gateway</p>
+                <p class="setup-text text-secondary">
+                  Enter your gateway's OpenAI-compatible base URL (e.g.
+                  https://…/v1). An API key can be added later in
+                  Settings → AI &amp; Models.
+                </p>
+                <div class="row">
+                  <input
+                    placeholder="https://gateway.example.com/v1"
+                    [value]="gatewayBaseUrl()"
+                    (input)="onGatewayUrl($event)"
+                    (change)="persistGatewayUrl()"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="persistGatewayUrl()"
+                    [disabled]="checking()"
+                  >
+                    {{ checking() ? "Checking…" : "Re-check" }}
+                  </button>
+                </div>
+              </div>
+            }
+          }
+
+          <!--
+            Consent-at-selection (research trap 11): a cloud-classified pick
+            (mirrors the backend's egress_is_cloud — claude_code / anthropic /
+            gateway, plus ollama on a non-loopback URL) needs the one-time
+            cloud-egress consent, or the FIRST note fails by design. Say so
+            here; finishing the wizard grants it — unless the choice was
+            deferred via skip (then no grant, and this line hides so
+            "Finishing setup allows this once" is never a false promise).
+          -->
+          @if (pickIsCloud() && !cloudConsented() && !skippedProvider()) {
+            <div class="banner consent-note">
+              <span class="banner-icon" aria-hidden="true">i</span>
+              <span>
+                {{ labelFor(provider()) }} runs in the cloud — your
+                transcript is redacted first, then sent to write each note.
+                Finishing setup allows this once; you can revoke it anytime
+                in Settings → AI &amp; Models.
+              </span>
+            </div>
+          }
+        }
+
+        <!-- ──────────────────────── VAULT (OPTIONAL) ────────────────── -->
+        @case ("vault") {
+          <div class="ob-head">
+            <span class="ob-eyebrow">Optional</span>
+            <h2 class="ob-title">Export to Obsidian?</h2>
+            <p class="ob-sub text-secondary">
+              Everything is viewable right here in Murmur — the Meetings tab
+              keeps every recording, summary and transcript. Optionally also
+              export each note to your Obsidian vault.
+            </p>
+          </div>
+
+          <div class="vault-pick">
+            @if (vaultPath(); as vp) {
+              <div class="vault-chosen">
+                <span class="vault-folder" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" width="18" height="18">
+                    <path
+                      d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.2l1.4 1.6H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 15.6H4A1.5 1.5 0 0 1 2.5 14V5.5Z"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.4"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </span>
+                <span class="vault-path" [title]="vp">{{ vp }}</span>
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Linked
+                </span>
+              </div>
+              <button type="button" class="btn" (click)="pickVault()">
+                Change folder
+              </button>
+            } @else {
+              <button
+                type="button"
+                class="btn btn-primary vault-cta"
+                (click)="pickVault()"
+              >
+                <span class="vault-folder" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" width="18" height="18">
+                    <path
+                      d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.2l1.4 1.6H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 15.6H4A1.5 1.5 0 0 1 2.5 14V5.5Z"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </span>
+                Choose vault folder
+              </button>
+              <p class="vault-skip-note text-muted">
+                Not using Obsidian? Skip this — your notes still live in
+                Murmur.
+              </p>
+            }
+          </div>
+        }
+
+        <!-- ───────────────────────────── DONE ───────────────────────── -->
+        @case ("done") {
+          <div class="done">
+            <span class="done-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="30" height="30">
+                <path
+                  d="M5 12.5 10 17.5 19.5 7"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+            <h2 class="ob-title done-title">You’re all set</h2>
+            <p class="ob-sub text-secondary done-sub">
+              Murmur is ready. A few things worth knowing:
+            </p>
+            <ul class="tips">
+              <li class="tip" style="--d: 0">
+                <span class="kbd" aria-hidden="true">⌘R</span>
+                <span>Start &amp; stop recording instantly</span>
+              </li>
+              <li class="tip" style="--d: 1">
+                <span class="kbd" aria-hidden="true">⌘⇧R</span>
+                <span>Pop out the floating recorder bar</span>
+              </li>
+              <li class="tip" style="--d: 2">
+                <span class="kbd kbd-glyph" aria-hidden="true">◌</span>
+                <span
+                  >Find Murmur in your menu bar, always a click away</span
+                >
+              </li>
+            </ul>
+            <button
+              type="button"
+              class="btn btn-primary ob-cta"
+              (click)="finish()"
+              [disabled]="finishing()"
+            >
+              @if (finishing()) {
+                <span class="spin-ring" aria-hidden="true"></span>
+                Starting…
+              } @else {
+                Start recording
+                <span class="cta-arrow" aria-hidden="true">→</span>
+              }
+            </button>
+          </div>
+        }
+      }
+    </div>
+
+    <!-- Footer nav: Back + (Continue / Skip) on the working steps. -->
+    @if (currentStep() !== "welcome" && currentStep() !== "done") {
+      <div class="ob-nav">
+        <button type="button" class="btn btn-ghost" (click)="back()">
+          Back
+        </button>
+        <span class="ob-nav-spacer"></span>
+        @if (currentStep() === "provider") {
+          <button
+            type="button"
+            class="btn btn-ghost ob-skip"
+            (click)="skipProvider()"
+          >
+            I’ll set this up later
+          </button>
+        }
+        @if (currentStep() === "vault") {
+          <button
+            type="button"
+            class="btn btn-ghost ob-skip"
+            (click)="next()"
+          >
+            Skip — keep notes in Murmur
+          </button>
+        }
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="next()"
+          [disabled]="!canAdvance()"
+        >
+          Continue
+          <span class="cta-arrow" aria-hidden="true">→</span>
+        </button>
+      </div>
+    }
+  </div>
+</div>
+  

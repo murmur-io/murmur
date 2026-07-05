@@ -1,0 +1,385 @@
+:host {
+  display: block;
+}
+.row-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding-left: calc(var(--depth, 0) * var(--space-4));
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+.row-line:hover {
+  background: var(--surface-hover);
+}
+
+/* --- Drop target (a note dragged from the list) --------------------- */
+/* Armed: every folder shows a faint dashed hint the instant a drag starts. */
+.row-line.is-drop-armed {
+  border-color: var(--border-strong);
+  border-style: dashed;
+}
+/* Active: the folder under the pointer lights up with the accent. */
+.row-line.is-drop-target {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.row-line.is-drop-target .folder,
+.row-line.is-drop-target .folder-icon {
+  color: var(--accent-hover);
+}
+
+.caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    transform var(--transition),
+    color var(--transition),
+    background var(--transition);
+}
+.caret:hover {
+  color: var(--text-primary);
+  background: var(--surface-input);
+}
+.caret.is-open {
+  transform: rotate(90deg);
+}
+.caret:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.caret--leaf {
+  cursor: default;
+}
+
+.folder {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--space-2) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition),
+    border-color var(--transition);
+}
+.folder:hover {
+  color: var(--text-primary);
+}
+.folder:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* Selected: the shell's neutral glass-on-glass pill (accent on the
+   glyph/label only — matches every other rail in the app). */
+.folder.is-selected {
+  color: var(--shell-active-text);
+  background: var(--shell-active-bg);
+  box-shadow: var(--shell-active-shadow);
+}
+.folder-icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-muted);
+}
+.folder.is-selected .folder-icon {
+  color: var(--shell-active-text);
+}
+.folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-count {
+  margin-left: auto;
+  min-width: 22px;
+  height: 20px;
+}
+
+/* --- ONE lock control: state + action in a single button ----------- */
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-right: 2px;
+}
+.lock-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  /* OPEN folders: the lock action is quiet until the row is hovered. */
+  opacity: 0;
+  transition:
+    color var(--transition),
+    background var(--transition),
+    border-color var(--transition),
+    opacity var(--transition),
+    transform var(--transition-fast);
+}
+.row-line:hover .lock-toggle,
+.row-line:focus-within .lock-toggle {
+  opacity: 1;
+}
+/* LOCKED / SESSION: always visible — the control IS the state badge. */
+.lock-toggle.is-locked,
+.lock-toggle.is-session {
+  opacity: 1;
+  background: var(--surface-input);
+}
+.lock-toggle.is-locked {
+  color: var(--text-secondary);
+}
+.lock-toggle.is-session {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  /* a gentle one-shot pop when a folder unseals for the session */
+  animation: lock-pop 220ms var(--ease-spring) both;
+}
+.lock-toggle:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+.lock-toggle.is-session:hover:not(:disabled) {
+  color: var(--accent-hover);
+  border-color: var(--accent);
+}
+.lock-toggle:active:not(:disabled) {
+  transform: scale(0.92);
+}
+.lock-toggle:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.lock-toggle:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+@keyframes lock-pop {
+  from {
+    transform: scale(0.55);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lock-toggle.is-session {
+    animation: none;
+  }
+}
+
+/* --- Inline rename field (replaces the folder name button) ---------- */
+.rename-form {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--space-2) var(--space-2);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+}
+.rename-input:hover,
+.rename-input:focus {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  outline: none;
+}
+
+/* --- ⋯ folder-actions menu ----------------------------------------- */
+.menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  /* Quiet until the row is hovered/focused (like the lock toggle). */
+  opacity: 0;
+  transition:
+    color var(--transition),
+    background var(--transition),
+    border-color var(--transition),
+    opacity var(--transition);
+}
+.row-line:hover .menu-trigger,
+.row-line:focus-within .menu-trigger,
+.menu-trigger.is-open {
+  opacity: 1;
+}
+.menu-trigger:hover:not(:disabled),
+.menu-trigger.is-open {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+.menu-trigger:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.menu-trigger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Floating popover OVER the tree → OPAQUE surface (never the frosted .card). */
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 196px;
+  padding: var(--space-1);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition);
+}
+.menu-item:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.menu-item:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.menu-item.is-danger {
+  color: var(--danger);
+}
+.menu-item.is-danger:hover {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.menu-item.is-danger .menu-icon {
+  color: var(--danger);
+}
+
+/* Load-bearing delete confirm (names the consequence). */
+.confirm {
+  padding: var(--space-2);
+}
+.confirm-body {
+  margin: 0 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.confirm-error {
+  margin: 0 0 var(--space-2);
+  color: var(--danger);
+  font-size: 0.78rem;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+.confirm-actions .btn {
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.8rem;
+}
+
+.row-error {
+  margin: var(--space-1) 0 var(--space-2);
+  padding-left: calc(var(--depth, 0) * var(--space-4) + var(--space-5));
+  color: var(--danger);
+  font-size: 0.78rem;
+}
+    

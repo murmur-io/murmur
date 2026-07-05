@@ -1,0 +1,165 @@
+<div class="role-block" [formGroup]="form">
+  <button
+    type="button"
+    class="role-toggle"
+    (click)="toggleExpanded()"
+    [attr.aria-expanded]="expanded()"
+  >
+    <svg
+      class="role-chevron"
+      [class.is-open]="expanded()"
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M4 2l4 4-4 4"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+    Customize per feature
+  </button>
+
+  @if (expanded()) {
+    <div class="role-rows">
+      @for (row of rows(); track row.role) {
+        <div class="role-row">
+          <div class="role-row-head">
+            <span class="role-title">{{ row.title }}</span>
+            <span class="role-what text-muted">{{ row.what }}</span>
+          </div>
+
+          <!--
+            The Notes row deliberately offers NO Local/Off: notes, digests,
+            briefs, recipes and the graph are SummarizerProvider surfaces,
+            and the backend's provider_for REFUSES reasoner-only targets
+            for them (every summary would hard-error) — the lock-security
+            carry-over from the stage-3 review. "Local notes" already has
+            a first-class answer: Ollama.
+          -->
+          <select
+            [formControlName]="row.connCtrl"
+            (change)="onConnectionChange(row.role, $event)"
+          >
+            <option value="">Inherit default</option>
+            <option value="claude_code">Claude Code</option>
+            <option value="anthropic">Anthropic API</option>
+            <option value="ollama">Ollama</option>
+            <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
+            @if (row.offersReasonerTargets) {
+              <option value="local">Local model — on-device</option>
+              <option value="off">Off — retrieval only</option>
+            }
+          </select>
+
+          @if (!row.conn) {
+            <span class="field-help text-muted">
+              {{ row.inheritSummary }}
+            </span>
+          }
+
+          @if (row.isProviderConn) {
+            <div class="role-model-row">
+              @if (row.models.length > 0) {
+                <select
+                  [formControlName]="row.modelCtrl"
+                  class="role-model-select"
+                >
+                  <option value="">Default (connection's pick)</option>
+                  @for (id of row.models; track id) {
+                    <option [value]="id">{{ id }}</option>
+                  }
+                  <!--
+                    Keep a manually-typed model selectable when it's not in
+                    the catalog — never silently lose it (the gateway
+                    picker's keep-manually-typed pattern).
+                  -->
+                  @if (row.modelIsCustom) {
+                    <option [value]="row.modelValue">
+                      {{ row.modelValue }} (custom)
+                    </option>
+                  }
+                </select>
+              } @else {
+                <input
+                  [formControlName]="row.modelCtrl"
+                  placeholder="Model id (blank = connection default)"
+                  autocomplete="off"
+                  spellcheck="false"
+                  class="role-model-input"
+                />
+              }
+              <button
+                type="button"
+                class="btn btn-ghost role-model-refresh"
+                (click)="refreshModels(row.conn)"
+                [disabled]="row.modelsLoading"
+                title="Fetch this connection's model list"
+              >
+                @if (row.modelsLoading) {
+                  Loading…
+                } @else {
+                  ↻ Refresh
+                }
+              </button>
+            </div>
+
+            @if (row.conn === "anthropic") {
+              <label class="field">
+                <span class="field-label">Reasoning effort</span>
+                <select [formControlName]="row.effortCtrl">
+                  <option value="">Default</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </label>
+            }
+          }
+
+          @if (row.conn === "off") {
+            <span class="field-help text-muted">
+              @if (row.role === "ask") {
+                Ask answers become retrieval-only (no AI model). The
+                in-meeting voice assistant toggle stays independent.
+              } @else {
+                Live answers become retrieval-only (no AI model). The
+                in-meeting voice assistant toggle stays independent.
+              }
+            </span>
+          }
+
+          @if (row.conn === "local") {
+            @if (row.role === "live") {
+              <span class="field-help text-muted">
+                Big local models are slow for the realtime voice assistant
+                — your default AI is recommended for live answers. Local is
+                best for private, non-time-critical analysis.
+              </span>
+            } @else {
+              <span class="field-help text-muted">
+                Runs on-device with the shared local model — pick or
+                download it under Local models below.
+              </span>
+            }
+          }
+        </div>
+      }
+
+      <!--
+        The GGUF registry is GLOBAL (it owns brainModelId — the resolver's
+        local default for every role), so it renders once, shared by every
+        row set to "Local model", not per-row. Extracted to LocalModelsListComponent (Task 3).
+      -->
+      @if (anyLocal()) {
+        <app-local-models-list />
+      }
+    </div>
+  }
+</div>
+  

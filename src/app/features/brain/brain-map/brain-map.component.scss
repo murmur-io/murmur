@@ -1,0 +1,183 @@
+:host {
+  display: block;
+}
+.bm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.bm-frame {
+  position: relative;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--glass-border);
+}
+.bm-canvas {
+  display: block;
+  width: 100%;
+  height: clamp(420px, 62vh, 680px);
+  /* #080914 — the scene's FIXED deep-indigo floor (mirrors the
+     directive's BG). Deliberately NOT a surface token: glow only works
+     on dark, so the map stays a dark field even in the light theme
+     (design review R3 mandate). */
+  background: #080914;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+.bm-canvas:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: -2px;
+  border-radius: var(--radius-lg);
+}
+
+/* Floating chrome INSIDE the map frame. Controls are OPAQUE pills
+   (--surface-overlay, never the frosted .card) — they float over the
+   scene, so translucency would bleed the neurons through (rule T3). */
+.bm-toolbar {
+  position: absolute;
+  top: var(--space-3);
+  left: var(--space-3);
+  right: var(--space-3);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  pointer-events: none;
+}
+.bm-toolbar > * {
+  pointer-events: auto;
+}
+.bm-controls {
+  display: flex;
+  gap: var(--space-2);
+}
+.bm-pill {
+  display: inline-flex;
+  align-items: center;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: none;
+}
+
+.bm-legend {
+  gap: var(--space-4);
+  padding: 0 var(--space-4);
+  height: 32px;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+.bm-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.bm-dot {
+  /* #5bbdff — the scene's PERSON azure (mirrors the directive's
+     palette). R3 mandate: ≥60° hue separation from the project-purple;
+     var(--accent) sits only ~26° away, unreadable as an encoding. */
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-pill);
+  background: #5bbdff;
+  box-shadow: 0 0 6px rgba(91, 189, 255, 0.5);
+}
+.bm-dot.is-project {
+  /* #9d7bff — the established project-purple (matches --accent-gradient's
+     end stop + the node paint in the scene). */
+  background: #9d7bff;
+  box-shadow: 0 0 6px rgba(157, 123, 255, 0.5);
+}
+
+.bm-seg {
+  padding: 2px;
+  gap: 2px;
+}
+.bm-segbtn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: 600 0.75rem var(--font-sans);
+  letter-spacing: 0.02em;
+  height: 26px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.bm-segbtn:hover {
+  color: var(--text-primary);
+}
+.bm-segbtn.is-on {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+.bm-segbtn:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+
+.bm-zoom {
+  padding: 2px;
+  gap: 2px;
+}
+.bm-zbtn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: 500 0.9375rem/1 var(--font-sans);
+  min-width: 28px;
+  height: 26px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.bm-zbtn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.bm-zbtn:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+.bm-zreset {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.bm-hint {
+  margin: 0;
+  text-align: center;
+  /* --text-secondary, not muted — the muted grey fell below AA on the
+     page background (design-panel R4 contrast finding). */
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+/* Screen-reader-only live region for selection announcements. */
+.bm-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bm-segbtn,
+  .bm-zbtn {
+    transition: none;
+  }
+}
+    

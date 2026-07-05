@@ -1,0 +1,86 @@
+<div class="scrim">
+  <div
+    #panel
+    class="sheet"
+    [class.sheet--danger]="mode() === 'key-changed'"
+    role="dialog"
+    aria-modal="true"
+    [attr.aria-label]="
+      mode() === 'key-changed'
+        ? 'Security key changed — re-verify before sharing'
+        : 'Verify recipient before sharing'
+    "
+    tabindex="-1"
+    (keydown.escape)="cancelled.emit()"
+  >
+    @if (mode() === "key-changed") {
+      <h3 class="sheet-title sheet-title--warn">
+        <span aria-hidden="true">⚠️</span> Security key changed
+      </h3>
+      <p class="sheet-copy">
+        <strong>{{ email() }}</strong
+        >'s security key <strong>changed</strong> since you last shared. This
+        can be normal (they reset their account) or a sign of tampering.
+        Re-verify the safety words out of band before sharing.
+      </p>
+    } @else {
+      <h3 class="sheet-title">Verify it's really them</h3>
+      <p class="sheet-copy">
+        First time sharing with <strong>{{ email() }}</strong
+        >. To be sure it's really them, compare these safety words out of
+        band (a call, or in person).
+      </p>
+    }
+
+    @if (words().length > 1) {
+      <div class="fingerprint" role="group" aria-label="Safety words">
+        @for (w of words(); track $index) {
+          <span class="fp-word">{{ w }}</span>
+        }
+      </div>
+    } @else {
+      <p
+        class="fingerprint fingerprint--mono"
+        role="group"
+        aria-label="Safety words"
+      >
+        {{ fingerprint() }}
+      </p>
+    }
+
+    @if (error(); as err) {
+      <p class="sheet-error" role="alert">{{ err }}</p>
+    }
+
+    <div class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        (click)="cancelled.emit()"
+        [disabled]="busy()"
+      >
+        Cancel
+      </button>
+      @if (mode() === "key-changed") {
+        <button
+          type="button"
+          class="btn btn-danger"
+          (click)="confirm.emit()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Sending…" : "I re-verified — send anyway" }}
+        </button>
+      } @else {
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="confirm.emit()"
+          [disabled]="busy()"
+        >
+          {{ busy() ? "Sending…" : "Verify & send" }}
+        </button>
+      }
+    </div>
+  </div>
+</div>
+  

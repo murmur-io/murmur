@@ -1,0 +1,39 @@
+<div class="card conn-block">
+  <div class="conn-head">
+    <h3>Providers</h3>
+    <p class="text-secondary conn-sub">
+      The connections Murmur can run models on. Set each one up once here —
+      then pick which one Murmur uses in the block below.
+    </p>
+  </div>
+
+  <div class="conn-group">
+    <span class="conn-group-label text-muted">On this Mac</span>
+    @for (c of localCards(); track c.id) {
+      <app-ai-connection-card
+        [card]="c"
+        [testing]="testing()"
+        (toggleConfigure)="toggleConfigure(c.id)"
+        (probe)="test(c.id)"
+      />
+    } @empty {
+      <p class="conn-empty text-muted">
+        No local connection right now — Ollama counts as local only while
+        its base URL points at this Mac.
+      </p>
+    }
+  </div>
+
+  <div class="conn-group">
+    <span class="conn-group-label text-muted">Cloud (redacted first)</span>
+    @for (c of cloudCards(); track c.id) {
+      <app-ai-connection-card
+        [card]="c"
+        [testing]="testing()"
+        (toggleConfigure)="toggleConfigure(c.id)"
+        (probe)="test(c.id)"
+      />
+    }
+  </div>
+</div>
+  

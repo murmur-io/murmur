@@ -1,0 +1,159 @@
+:host {
+  display: block;
+}
+.people {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- Head --- */
+.p-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.p-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.p-title {
+  margin: 0;
+}
+.p-intro {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+}
+.p-total {
+  flex: none;
+  margin-top: 6px;
+}
+
+/* --- Two-pane layout (directory | sticky detail) --- */
+.p-layout {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-5);
+  align-items: start;
+}
+.p-layout.has-detail {
+  grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr);
+}
+.p-detail {
+  position: sticky;
+  top: 84px;
+}
+
+/* --- Cards --- */
+.p-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-3);
+  min-width: 0;
+}
+.p-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-4);
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    transform var(--transition-fast);
+}
+.p-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+.p-card:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.p-card.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.p-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  color: var(--accent-hover);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.p-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.p-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.p-last {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+.p-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+.p-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+}
+.p-chip.is-active {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+}
+
+/* --- Responsive: one column, detach the sticky panel. --- */
+@media (max-width: 760px) {
+  .p-layout.has-detail {
+    grid-template-columns: 1fr;
+  }
+  .p-detail {
+    position: static;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .p-card {
+    transition: none;
+  }
+}
+    
