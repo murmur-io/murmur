@@ -70,6 +70,11 @@ pub enum ToolCall {
     /// [`execute_tool`] does not have. So, like `WebSearch`, it is dispatched ONLY via the async
     /// [`execute_calendar_search`], NEVER through `execute_tool`.
     CalendarLookup { query: String },
+    /// CONNECTOR — LIVE JIRA SEARCH (consent-gated EXTERNAL connector). Like [`Self::WebSearch`],
+    /// dispatched exclusively via the async [`execute_jira_search`], and ONLY when the Jira connector
+    /// is exposed (enabled + consented + configured + token). It EGRESSES: the redacted query reaches
+    /// the user's Jira Cloud site through the consent-gated, redacting connector framework.
+    JiraSearch { query: String },
 }
 
 /// Model-facing description of one tool the agentic brain may call. `parameters` is a JSON-schema
@@ -157,6 +162,15 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "calendar_lookup",
             description: "Look up the user's local (on-device) calendar for recent/upcoming events.",
             parameters: str_arg("query", "What meeting / agenda detail to find."),
+            write: false,
+        },
+        ToolSpec {
+            name: "jira_search",
+            description: "Search the user's Jira issues (summary, status, assignee, due date). Only \
+                          available when the user has enabled + consented to the Jira connector; \
+                          results are loud-attributed '(via Jira)'. Use for questions about tickets, \
+                          deadlines, sprint work, or to check an issue's current state.",
+            parameters: str_arg("query", "What to look for in Jira, in the user's own language."),
             write: false,
         },
         ToolSpec {
@@ -375,6 +389,17 @@ pub fn execute_tool(
                     .to_string(),
             ))
         }
+        ToolCall::JiraSearch { .. } => {
+            // EGRESS GUARD (mirror of WebSearch): the synchronous, egress-free `execute_tool` is the
+            // MCP surface's only entry, so it MUST NOT run a connector that reaches off-device. Jira
+            // search is dispatched exclusively via the async `execute_jira_search`. Reaching here is a
+            // programming error in a caller, never a leak — refuse loudly, egress nothing.
+            Err(AppError::InvalidArg(
+                "JiraSearch is an egress connector and cannot run through the egress-free tool path; \
+                 use execute_jira_search"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -414,6 +439,29 @@ pub async fn execute_web_search(query: &str, config: &AppConfig) -> Result<Strin
             Ok("Web search is not available (not configured).".to_string())
         }
         // A real external failure (network/HTTP/parse) is surfaced; the caller logs + skips it.
+        Err(e @ crate::connectors::ConnectorError::Failed(_)) => Err(e.into()),
+    }
+}
+
+/// CONNECTOR DISPATCH — run a LIVE JIRA search through the connector seam. Mirrors
+/// [`execute_web_search`]: fail-closed sentinel when not exposed (NOTHING egresses), redaction +
+/// egress-ledger applied by [`crate::connectors::ConnectorRegistry::search`], loud attribution.
+pub async fn execute_jira_search(query: &str, config: &AppConfig) -> Result<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok("No Jira results for an empty query.".to_string());
+    }
+    let registry = crate::connectors::ConnectorRegistry::build(config);
+    match registry.search("jira", q).await {
+        Ok(hits) if hits.is_empty() => Ok(format!("No Jira results for \"{q}\".")),
+        Ok(hits) => Ok(format_web_hits(&hits)),
+        Err(crate::connectors::ConnectorError::NeedsConsent) => Ok(
+            "Jira search is not available (not enabled, not consented, or not configured)."
+                .to_string(),
+        ),
+        Err(crate::connectors::ConnectorError::Unconfigured(_)) => {
+            Ok("Jira search is not available (not configured).".to_string())
+        }
         Err(e @ crate::connectors::ConnectorError::Failed(_)) => Err(e.into()),
     }
 }
@@ -598,7 +646,7 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             .into_iter()
             .filter(|s| match s.name {
                 // Connectors require the AppHandle (async sidecar / consent path).
-                "web_search" | "calendar_lookup" => has_app,
+                "web_search" | "calendar_lookup" | "jira_search" => has_app,
                 // The draft tool is advertised only on surfaces with a notes flow / Accept
                 // affordance (in-meeting yes, the vault-wide Ask page no).
                 "propose_note" => self.note_drafts,
@@ -692,6 +740,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 None => Err(AppError::InvalidArg(
                     "calendar_lookup needs an AppHandle".into(),
                 )),
+            },
+            "jira_search" => match self.app {
+                Some(_) => block_on_tool(execute_jira_search(&s("query"), self.config)),
+                None => Err(AppError::InvalidArg("jira_search needs an AppHandle".into())),
             },
             // ── PROPOSE (always-on, NO DB side effect): the model signals the user asked for a note.
             //    Records the draft in interior-mutable scratch; the caller threads it onto the result so
@@ -889,6 +941,34 @@ mod tests {
             matches!(res, Err(AppError::InvalidArg(_))),
             "the synchronous tool path must refuse CalendarLookup (needs the async AppHandle path)"
         );
+    }
+
+    /// EGRESS GUARD: the synchronous, egress-free `execute_tool` MUST refuse a `JiraSearch` — like
+    /// `WebSearch`, it can never run a connector that reaches off-device.
+    #[test]
+    fn sync_execute_tool_refuses_jira_search() {
+        let db = tmp_db();
+        let nothing = HashSet::new();
+        let cfg = AppConfig::default();
+        let res = execute_tool(
+            &ToolCall::JiraSearch { query: "login bug".into() },
+            &db,
+            &nothing,
+            &cfg,
+        );
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "the egress-free tool path must refuse JiraSearch (no connector through MCP)"
+        );
+    }
+
+    /// FAIL-CLOSED: with the default config (jira disabled + unconsented), `execute_jira_search`
+    /// returns the graceful "not available" sentinel and EGRESSES NOTHING — no token, no network.
+    #[test]
+    fn jira_search_fail_closed_returns_sentinel_no_egress() {
+        let cfg = AppConfig::default(); // jira disabled + unconsented
+        let out = block_on(execute_jira_search("login bug", &cfg)).unwrap();
+        assert!(out.contains("not available"), "fail-closed sentinel, no egress: {out}");
     }
 
     /// LOUD: calendar hits render with their `[calendar]` source label + the bounded context block,
