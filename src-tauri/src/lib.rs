@@ -58,12 +58,39 @@ pub fn run() {
     // startup, before any thread that could read the env. (Mirror guard in `Transcriber::load`.)
     std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Persist logs to a FILE as well as stderr. When the app is launched via LaunchServices (the normal
+    // double-click / DMG install) its stderr is discarded, so a signed/release build was previously
+    // un-diagnosable — every keychain/share failure was invisible. Logs carry NO PII (IDs, stages,
+    // counts, durations only — see the no-PII rule), so persisting them on-device is safe. Fresh file
+    // per launch (truncate at start); O_APPEND so concurrent writes stay line-atomic. Best-effort: if the
+    // file can't be opened we fall back to stderr-only rather than fail startup.
+    let log_file = dirs::data_dir()
+        .map(|b| b.join(crate::state::app_dir_name()))
+        .and_then(|dir| {
+            std::fs::create_dir_all(&dir).ok()?;
+            let path = dir.join("murmur.log");
+            let _ = std::fs::write(&path, b""); // truncate for a fresh per-session log
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+        });
+    match log_file {
+        Some(file) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter)
+                .with_ansi(false)
+                .with_writer(
+                    std::io::stderr.and(move || file.try_clone().expect("clone murmur.log fd")),
+                )
+                .init()
+        }
+        None => tracing_subscriber::fmt().with_env_filter(log_filter).init(),
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

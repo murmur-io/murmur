@@ -7909,7 +7909,15 @@ async fn valid_access_token(state: &AppState) -> Result<String, AppError> {
     if !crate::share::access_token_needs_refresh(expires_at.as_deref(), chrono::Utc::now()) {
         return Ok(token);
     }
-    refresh_session(state, &token).await
+    // DEFANGED (0.7.2): do NOT auto-refresh here. The refresh path (#205) called `clear_account_mk()` on
+    // any refresh failure (refresh_session's Auth arm), and the login often omits `access_expires_at`
+    // (⇒ access_token_needs_refresh fires on EVERY share op) — so a single spurious refresh failure wiped
+    // the biometric account-MK cache and forced a full password re-login on every restart instead of a
+    // one-tap Touch ID unlock. Return the cached token (the 0.7.0 behavior): a genuinely-expired token
+    // still fails closed at the server, but the cached account key is never destroyed, so sharing
+    // survives a restart. Re-enable `refresh_session` once `/v1/auth/refresh` is verified end-to-end —
+    // now diagnosable via the persistent `murmur.log` added in this release.
+    Ok(token)
 }
 
 /// Redeem the persisted (single-use) refresh token for a fresh session pair, SINGLE-FLIGHTED so two
@@ -7917,6 +7925,9 @@ async fn valid_access_token(state: &AppState) -> Result<String, AppError> {
 /// reuse detection and revoke the whole family, logging the user out mid-share). `stale_token` is the
 /// access token the caller saw as expiring; if a racing op already refreshed while we waited for the
 /// guard, we return THAT fresh token rather than spending our now-stale refresh token again.
+// Kept (not deleted) for a clean re-enable once `/v1/auth/refresh` is verified end-to-end — see the
+// DEFANGED note in `valid_access_token`. Dead until then.
+#[allow(dead_code)]
 async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, AppError> {
     // Serialize refreshes; this async guard is deliberately held ACROSS the network call below (unlike
     // the std mutexes here, which are never held across an `await`).
@@ -9786,6 +9797,7 @@ mod lifecycle_tests {
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
