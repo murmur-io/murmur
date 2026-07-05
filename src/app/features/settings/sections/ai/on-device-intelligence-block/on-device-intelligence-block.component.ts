@@ -1,5 +1,6 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
+import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 import { SettingsStore } from "../../../settings.store";
 
 /**
@@ -16,7 +17,8 @@ import { SettingsStore } from "../../../settings.store";
   selector: "app-on-device-intelligence-block",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [
+    MurToggleComponent,ReactiveFormsModule],
   templateUrl: "./on-device-intelligence-block.component.html",
   styleUrl: "./on-device-intelligence-block.component.scss",
 })

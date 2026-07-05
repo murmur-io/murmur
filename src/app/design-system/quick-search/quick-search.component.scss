@@ -49,17 +49,6 @@
   letter-spacing: -0.01em;
 }
 .qs-input::placeholder { color: var(--text-muted); }
-.qs-kbd {
-  flex: none;
-  padding: 2px 7px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  background: var(--surface-input);
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 0.68rem;
-  line-height: 1.5;
-}
 .qs-actions { padding: var(--space-2); }
 .qs-results {
   flex: 1 1 auto;

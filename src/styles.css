@@ -270,15 +270,7 @@ app-shell {
 }
 .quick-kbd {
   flex: none;
-  margin-left: auto;
-  padding: 1px 6px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  background: var(--surface-input);
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
-  line-height: 1.5;
+  margin-left: auto; /* chrome lives inside mur-kbd; this class only positions it */
 }
 
 /* --- Sidebar nav + footer rows (shared row shape) -------------------------- */

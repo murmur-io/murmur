@@ -6,6 +6,7 @@ import {
   inject,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
+import { MurToggleComponent } from "../../../../design-system/toggle/toggle.component";
 import { SettingsStore } from "../../settings.store";
 
 /** Settings → Storage: recordings location + usage, the GB cap, opt-in auto-prune, and a
@@ -14,7 +15,8 @@ import { SettingsStore } from "../../settings.store";
   selector: "app-settings-storage-section",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [
+    MurToggleComponent,ReactiveFormsModule],
   templateUrl: "./settings-storage-section.component.html",
   styleUrl: "./settings-storage-section.component.scss",
 })

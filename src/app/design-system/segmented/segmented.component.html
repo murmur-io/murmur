@@ -1,0 +1,15 @@
+<div class="seg" role="group" [attr.aria-label]="ariaLabel()">
+  @for (o of options(); track o.value) {
+    <button
+      type="button"
+      [class.active]="value() === o.value"
+      [attr.aria-pressed]="value() === o.value"
+      (click)="select(o.value)"
+    >
+      @if (o.icon; as icon) {
+        <mur-icon [icon]="icon" />
+      }
+      {{ o.label }}
+    </button>
+  }
+</div>

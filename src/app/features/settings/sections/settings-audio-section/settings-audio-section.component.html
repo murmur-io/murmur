@@ -28,7 +28,7 @@
                   your mic — needs the Screen Recording permission on first use.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="captureSystemAudio" />
+              <mur-toggle formControlName="captureSystemAudio" />
             </label>
           </div>
 
@@ -42,7 +42,7 @@
                   transcripts (voice-activity detection). Recommended.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="vadEnabled" />
+              <mur-toggle formControlName="vadEnabled" />
             </label>
           </div>
 
@@ -57,7 +57,7 @@
                   use per meeting.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="keepHiresMasters" />
+              <mur-toggle formControlName="keepHiresMasters" />
             </label>
           </div>
 
@@ -73,7 +73,7 @@
                   ~40 MB of models on first use.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="diarizeOthers" />
+              <mur-toggle formControlName="diarizeOthers" />
             </label>
           </div>
 
@@ -89,7 +89,7 @@
                   individual speakers” above.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="voiceprintEnabled" />
+              <mur-toggle formControlName="voiceprintEnabled" />
             </label>
 
             <!-- Management list — the captured voiceprints, each forgettable. -->
@@ -142,7 +142,7 @@
                   voice when recording on speakers. Runs fully on-device.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="postAecEnabled" />
+              <mur-toggle formControlName="postAecEnabled" />
             </label>
           </div>
 
@@ -156,7 +156,7 @@
                   with your Whisper model while idle.
                 </span>
               </span>
-              <input class="switch" type="checkbox" formControlName="voiceTrigger" />
+              <mur-toggle formControlName="voiceTrigger" />
             </label>
           </div>
 </div>

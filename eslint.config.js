@@ -26,7 +26,9 @@ module.exports = tseslint.config(
         "error",
         {
           type: "element",
-          prefix: "app",
+          // "mur" = the design-system components (<mur-toggle>, <mur-sidebar>…),
+          // "app" = feature components.
+          prefix: ["app", "mur"],
           style: "kebab-case",
         },
       ],
@@ -38,6 +40,22 @@ module.exports = tseslint.config(
       ...angular.configs.templateRecommended,
       ...angular.configs.templateAccessibility,
     ],
-    rules: {},
+    rules: {
+      // The design-system form controls (CVA components) count as labelable —
+      // the native input they render IS a DOM descendant of the <label>, so
+      // the implicit association still works; the rule just can't see through
+      // the component boundary.
+      "@angular-eslint/template/label-has-associated-control": [
+        "error",
+        {
+          controlComponents: [
+            "mur-toggle",
+            "mur-input",
+            "mur-select",
+            "mur-slider",
+          ],
+        },
+      ],
+    },
   }
 );

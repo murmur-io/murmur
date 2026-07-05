@@ -25,7 +25,7 @@
         (keydown.arrowUp)="move(-1); $event.preventDefault()"
         (keydown.enter)="confirm()"
       />
-      <kbd class="qs-kbd">esc</kbd>
+      <mur-kbd>esc</mur-kbd>
     </div>
 
     @if (!searching()) {
@@ -37,7 +37,7 @@
             </svg>
           </span>
           <span class="qs-row-title">New note</span>
-          <kbd class="qs-kbd">⌘N</kbd>
+          <mur-kbd>⌘N</mur-kbd>
         </button>
       </div>
       <p class="qs-hint">Type to search your vault — everything stays on device.</p>

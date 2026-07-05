@@ -12,6 +12,7 @@ import {
 import { RouterLink } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
 import { NavHistoryService } from "../../../core/nav-history.service";
+import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
 import type {
   FolderNode,
   Meeting,
@@ -47,6 +48,7 @@ interface SnippetPart {
   // Declarative host listener — Angular owns its lifecycle (mirrors settings).
   host: { "(document:keydown.escape)": "onEscape()" },
   imports: [
+    MurSidebarComponent,
     RouterLink,
     FolderTreeComponent,
     LockBadgeComponent,

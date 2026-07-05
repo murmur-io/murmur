@@ -2,7 +2,7 @@
      each drills down to its own two-column [rail | content] layout. -->
 @if (!inDrilldown()) {
   @if (!pillMode()) {
-    <aside class="app-sidebar">
+    <mur-sidebar class="app-sidebar">
       <!-- Top drag strip: reserves room for the overlay traffic lights and
            lets the user move the window. -->
       <div class="sidebar-drag" data-tauri-drag-region></div>
@@ -29,14 +29,14 @@
       <!-- Quick actions (Apple TV puts Search first in the rail). -->
       <div class="sidebar-quick">
         <button type="button" class="quick-row" (click)="openSearch()">
-          <app-nav-icon icon="search" />
+          <mur-icon icon="search" />
           <span class="nav-label">Search</span>
-          <kbd class="quick-kbd">⌘K</kbd>
+          <mur-kbd class="quick-kbd">⌘K</mur-kbd>
         </button>
         <button type="button" class="quick-row" (click)="newNote()">
-          <app-nav-icon icon="plus" />
+          <mur-icon icon="plus" />
           <span class="nav-label">New note</span>
-          <kbd class="quick-kbd">⌘N</kbd>
+          <mur-kbd class="quick-kbd">⌘N</mur-kbd>
         </button>
       </div>
 
@@ -47,7 +47,7 @@
             routerLinkActive="active"
             [attr.aria-label]="item.label"
           >
-            <app-nav-icon [icon]="item.icon" />
+            <mur-icon [icon]="item.icon" />
             <span class="nav-label">{{ item.label }}</span>
           </a>
         }
@@ -91,7 +91,7 @@
           routerLinkActive="active"
           aria-label="Settings"
         >
-          <app-nav-icon icon="settings" />
+          <mur-icon icon="settings" />
           <span class="nav-label">Settings</span>
         </a>
 
@@ -102,11 +102,11 @@
           aria-label="Collapse the sidebar into the top bar"
           title="Collapse into the top bar"
         >
-          <app-nav-icon icon="sidebar" />
+          <mur-icon icon="sidebar" />
           <span class="nav-label">Collapse to bar</span>
         </button>
       </div>
-    </aside>
+    </mur-sidebar>
   } @else {
     <!-- Pill mode: window-drag strip along the top edge, BEHIND the pill. -->
     <div class="pill-drag" data-tauri-drag-region></div>
@@ -119,7 +119,7 @@
         aria-label="Show sidebar"
         title="Show sidebar"
       >
-        <app-nav-icon icon="sidebar" />
+        <mur-icon icon="sidebar" />
       </button>
 
       <span class="pill-sep" aria-hidden="true"></span>
@@ -132,7 +132,7 @@
           [attr.aria-label]="item.label"
           [attr.title]="item.label"
         >
-          <app-nav-icon [icon]="item.icon" />
+          <mur-icon [icon]="item.icon" />
           <span class="nav-label">{{ item.label }}</span>
         </a>
       }
@@ -146,7 +146,7 @@
         aria-label="Search (⌘K)"
         title="Search (⌘K)"
       >
-        <app-nav-icon icon="search" />
+        <mur-icon icon="search" />
       </button>
       <button
         type="button"
@@ -155,7 +155,7 @@
         aria-label="New note (⌘N)"
         title="New note (⌘N)"
       >
-        <app-nav-icon icon="plus" />
+        <mur-icon icon="plus" />
       </button>
       <a
         class="pill-item"
@@ -164,7 +164,7 @@
         aria-label="Settings"
         title="Settings"
       >
-        <app-nav-icon icon="settings" />
+        <mur-icon icon="settings" />
       </a>
 
       @if (unlockedCount() > 0) {
@@ -191,7 +191,7 @@
 
 <!-- ⌘K quick-search spotlight (works from every route, drill-downs too). -->
 @if (searchOpen()) {
-  <app-quick-search (closed)="searchOpen.set(false)" />
+  <mur-quick-search (closed)="searchOpen.set(false)" />
 }
 
 <!-- Toast viewport: renders the app-wide queue from ToastService. -->
