@@ -164,6 +164,13 @@ pub struct AccountSession {
     /// RFC3339 expiry of `access_token` (mirror of the Keychain copy). `None` ⇒ unknown ⇒ the next
     /// share op refreshes proactively. Updated in place on a successful `/v1/auth/refresh`.
     pub access_expires_at: Option<String>,
+    /// The CURRENT single-use refresh token. The RAM copy is the SOURCE OF TRUTH for rotation
+    /// (`refresh_session` presents and replaces THIS value); the Keychain copy is a best-effort
+    /// mirror for restart restore. Rationale: if a rotation succeeded server-side but the Keychain
+    /// persist failed, re-presenting the stale Keychain token would trip the server's reuse
+    /// detection and revoke the whole family (forced logout) — the RAM copy makes the live session
+    /// immune to a flaky persist.
+    pub refresh_token: String,
 }
 
 /// Does an access token with this RFC3339 `expires_at` need a proactive refresh at `now`? A missing or
