@@ -248,6 +248,114 @@
                 }
               </div>
             }
+
+            <!-- Slack connector -->
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Slack</span>
+                <span class="text-secondary toggle-sub">
+                  When enabled (and allowed below, with a user token), the assistant
+                  can search your Slack messages and cite them. Answers stay grounded
+                  in your notes first; Slack results are added as “via Slack” sources.
+                </span>
+              </span>
+              <mur-toggle formControlName="slackEnabled" />
+            </label>
+
+            @if (form.controls.slackEnabled.value) {
+              <!-- Egress banner — make the new off-device path impossible to miss. -->
+              <p class="banner is-warning connector-egress" role="note">
+                <strong>This sends data off your Mac.</strong> When the brain runs a
+                Slack search, your (redacted) query and the matching messages pass
+                through your configured AI model and your Slack workspace. Only the
+                query is sent to Slack — never your notes or transcript. Disable this,
+                or skip the consent below, to keep everything local.
+              </p>
+
+              <!-- BYO user token -->
+              <fieldset class="connector-fieldset">
+                <legend>Slack user token</legend>
+                <div class="key-status">
+                  <span class="text-secondary">Status</span>
+                  @if (hasSlackToken()) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Token set ✓
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Not set
+                    </span>
+                  }
+                </div>
+                <span class="row">
+                  <input
+                    type="password"
+                    [formControl]="slackTokenControl"
+                    placeholder="Slack user token (xoxp-…)"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="saveSlackToken()"
+                    [disabled]="savingSlackToken()"
+                  >
+                    {{ savingSlackToken() ? "Saving…" : "Save token" }}
+                  </button>
+                </span>
+                <span class="field-help text-muted">
+                  Paste a user token (xoxp-…) from a single-workspace Slack app with
+                  the search:read scope. It's stored in your macOS Keychain, never
+                  logged, and never leaves with your notes.
+                </span>
+                @if (slackTokenError(); as skerr) {
+                  <p class="text-danger brain-error">{{ skerr }}</p>
+                }
+              </fieldset>
+
+              <!-- One-time egress consent (mirrors the Jira UX) -->
+              <div class="privacy-section connector-consent">
+                <span class="privacy-section-label text-muted"
+                  >Allow Slack access</span
+                >
+                <p class="text-secondary privacy-note">
+                  Your search query leaves this device for your Slack workspace
+                  (redacted first). Until you allow this once, Slack search stays off
+                  and no query is ever sent.
+                </p>
+                @if (slackConsented()) {
+                  <span class="pill is-success cloud-consent-pill">
+                    <span class="pill-dot"></span>
+                    Slack access allowed
+                  </span>
+                } @else {
+                  <div class="cloud-consent-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="allowSlack()"
+                      [disabled]="slackConsenting()"
+                    >
+                      @if (slackConsenting()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Enabling…
+                      } @else {
+                        Allow Slack access (one-time consent)
+                      }
+                    </button>
+                    <span class="text-muted cloud-consent-hint">
+                      One-time. The brain works fully offline on your notes without
+                      it.
+                    </span>
+                  </div>
+                }
+                @if (slackConsentError(); as scerr) {
+                  <p class="text-danger privacy-note">{{ scerr }}</p>
+                }
+              </div>
+            }
           </div>
 </div>
   
