@@ -28,6 +28,7 @@ pub mod tools;
 pub mod transcribe;
 pub mod update;
 pub mod user_memory;
+pub mod verify;
 pub mod voice_action;
 
 use tauri::window::{Effect, EffectsBuilder};
