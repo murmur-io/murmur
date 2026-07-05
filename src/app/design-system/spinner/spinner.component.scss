@@ -1,0 +1,21 @@
+:host {
+  display: inline-flex;
+  flex: none;
+}
+.ring {
+  display: block;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: mur-spin 700ms linear infinite;
+}
+@keyframes mur-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ring {
+    animation-duration: 1.6s;
+  }
+}

@@ -17,10 +17,12 @@ import {
 import { filter, map } from "rxjs";
 import { isDrilldownRoute } from "../core/nav-history.service";
 import {
-  NavIconComponent,
+  MurIconComponent,
   type ShellIcon,
-} from "../design-system/nav-icon/nav-icon.component";
-import { QuickSearchComponent } from "../design-system/quick-search/quick-search.component";
+} from "../design-system/icon/icon.component";
+import { MurKbdComponent } from "../design-system/kbd/kbd.component";
+import { MurQuickSearchComponent } from "../design-system/quick-search/quick-search.component";
+import { MurSidebarComponent } from "../design-system/sidebar/sidebar.component";
 import { FoldersService } from "../services/folders.service";
 import { ToastService, type Toast } from "../services/toast.service";
 
@@ -60,8 +62,10 @@ interface NavItem {
     RouterOutlet,
     RouterLink,
     RouterLinkActive,
-    NavIconComponent,
-    QuickSearchComponent,
+    MurIconComponent,
+    MurKbdComponent,
+    MurQuickSearchComponent,
+    MurSidebarComponent,
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto

@@ -7,6 +7,7 @@ import {
   output,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
+import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 import type { ProviderStatus } from "../../../../../core/models";
 import { SettingsStore } from "../../../settings.store";
 
@@ -32,7 +33,8 @@ export interface ConnectionCardVm {
   selector: "app-ai-connection-card",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [
+    MurToggleComponent,ReactiveFormsModule],
   templateUrl: "./ai-connection-card.component.html",
   styleUrl: "./ai-connection-card.component.scss",
 })

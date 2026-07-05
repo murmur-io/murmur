@@ -10,6 +10,7 @@ import { toSignal } from "@angular/core/rxjs-interop";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { startWith } from "rxjs";
 import { NavHistoryService } from "../../../core/nav-history.service";
+import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
 import { SettingsStore } from "../settings.store";
 import { SettingsAppearanceSectionComponent } from "../sections/settings-appearance-section/settings-appearance-section.component";
 import { SettingsGeneralSectionComponent } from "../sections/settings-general-section/settings-general-section.component";
@@ -69,6 +70,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   host: { "(document:keydown.escape)": "onEscape()" },
   providers: [SettingsStore],
   imports: [
+    MurSidebarComponent,
     ReactiveFormsModule,
     SettingsAppearanceSectionComponent,
     SettingsGeneralSectionComponent,

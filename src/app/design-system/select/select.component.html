@@ -1,0 +1,8 @@
+<select
+  [value]="value()"
+  [disabled]="disabled()"
+  [attr.aria-label]="ariaLabel()"
+  (change)="onChangeEvent($event)"
+>
+  <ng-content />
+</select>
