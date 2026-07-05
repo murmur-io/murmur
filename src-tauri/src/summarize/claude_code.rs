@@ -22,9 +22,10 @@ const PASSTHROUGH_ENV: &[&str] = &[
 ];
 
 /// Vars that MUST NEVER reach the `claude` child even when the user opted into env inheritance: the
-/// DB encryption keys decrypt the ENTIRE library, and the child talks to the cloud — so they are
-/// stripped unconditionally. Everything else is the user's call (the inherit opt-in).
-const NEVER_INHERIT_ENV: &[&str] = &["MURMUR_DEV_DEK", "MURMUR_DEV_KEK"];
+/// DB encryption keys decrypt the ENTIRE library and the account master key (`MURMUR_DEV_ACCOUNT_MK`)
+/// unwraps every retained share key — and the child talks to the cloud, so all three key-material dev
+/// hatches are stripped unconditionally. Everything else is the user's call (the inherit opt-in).
+const NEVER_INHERIT_ENV: &[&str] = &["MURMUR_DEV_DEK", "MURMUR_DEV_KEK", "MURMUR_DEV_ACCOUNT_MK"];
 
 /// Apply the environment policy to a tokio `Command`.
 ///
@@ -584,6 +585,11 @@ mod tests {
             envs.get(std::ffi::OsStr::new("MURMUR_DEV_KEK")),
             Some(&None),
             "the DB KEK must be stripped even in inherit mode"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("MURMUR_DEV_ACCOUNT_MK")),
+            Some(&None),
+            "the account MK dev hatch must be stripped even in inherit mode"
         );
         // PATH is still pinned so a GUI-launched app can find `claude` + its `node`.
         let path = envs.get(std::ffi::OsStr::new("PATH"));
