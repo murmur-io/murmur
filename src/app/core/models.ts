@@ -314,8 +314,14 @@ export interface BrainModelDto {
   downloaded: boolean;
   /** Fits in this Mac's RAM (false → warn / discourage). */
   fitsRam: boolean;
-  /** Currently the selected brain model. */
+  /** Currently the selected brain model (the single last-selected `brain_model_id`, any class). */
   selected: boolean;
+  /** The EFFECTIVE light-class model (explicit `brain_light_model_id`, else registry default) — what
+   * realtime reactions run on. Reflects the true per-class choice, not just the single `selected`. */
+  selectedLight: boolean;
+  /** The EFFECTIVE heavy-class model (explicit `brain_heavy_model_id`, else registry default) — what
+   * local Notes/Ask run on. Drives the effort slider's position. */
+  selectedHeavy: boolean;
 }
 
 /**
@@ -328,6 +334,18 @@ export interface BrainModelDto {
  * SETTABLE via `set_brain_posture`; `"custom"` is a read-only display state.
  */
 export type Posture = "cloud" | "hybrid" | "fully_local" | "custom";
+
+/** One row of the Settings "What runs where" map (mirrors Rust `AiMapRow`, camelCase). */
+export interface AiMapRow {
+  job: string;
+  title: string;
+  engine: string;
+  model: string;
+  onDevice: boolean;
+  redacted: boolean;
+  active: boolean;
+  routable: boolean;
+}
 
 /**
  * The installed-base migration nudge (`brain_model_retirement_nudge`): non-null
@@ -1276,6 +1294,13 @@ export interface AccountStatus {
   shareConsented: boolean;
   /** A sharing server base URL is configured (sharing is impossible without one). */
   serverConfigured: boolean;
+  /**
+   * A one-tap Touch ID unlock is possible: logged in AND a cached account key
+   * exists on this device, so `unlock_sharing_with_biometric` can restore the
+   * session MK with a single biometric sheet (no password re-entry). When false,
+   * fall back to the password sign-in flow to re-unlock for sharing.
+   */
+  biometricUnlockAvailable: boolean;
 }
 
 /** Mirrors Rust `commands::MyShareEntry` — one row of the user's shares. Content-free: `title` is
@@ -1290,6 +1315,16 @@ export interface MyShareEntry {
   expiresAt: string | null;
   revoked: boolean;
   downloadCount: number;
+  /**
+   * The LOCAL meeting this share belongs to — the filter key for THIS note's Active-links list.
+   * `null` when the share was created on another device (no local `outbound_shares` row → masked,
+   * same as `title`).
+   */
+  meetingId: string | null;
+  /** The server-enforced open cap (`null` ⇒ uncapped) driving the `X / Y opens` label. Display-only. */
+  maxDownloads: number | null;
+  /** `link` (mode-A zero-knowledge link) vs `user` (mode-B Murmur↔Murmur grant). */
+  mode: "link" | "user";
 }
 
 // ── M5-CLIENT: Murmur↔Murmur (mode B) ──

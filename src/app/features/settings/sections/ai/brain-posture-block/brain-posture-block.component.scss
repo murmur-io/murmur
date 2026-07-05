@@ -109,16 +109,45 @@
   line-height: 1.4;
 }
 
+/* ── Selected-posture meaning line ── */
+.posture-meaning {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.posture-meaning-lead {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 /* ── Contextual state area ── */
 .posture-state {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
 }
-.posture-now {
+/* Confirm-before-download card: an explicit opt-in, not an auto-fetch. */
+.posture-confirm-title {
   margin: 0;
-  font-size: 0.875rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.posture-confirm-copy {
+  font-size: 0.85rem;
   line-height: 1.55;
+}
+.posture-confirm-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+.posture-confirm-actions .btn {
+  flex: none;
+}
+.brain-live-note {
+  font-size: 0.8125rem;
+  line-height: 1.5;
 }
 .brain-live-ram-warn {
   font-size: 0.8125rem;

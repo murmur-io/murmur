@@ -1,30 +1,7 @@
 <div class="card ondevice-card" [formGroup]="form">
   <!-- ── On-device intelligence ──────────────────────────────────── -->
   <div class="use-group">
-    <span class="use-group-label text-muted">On-device intelligence</span>
-
-    <!--
-      Fixed "always on-device" badges — these stages are NOT routable to
-      any provider (they activate on local model presence), so they stay
-      out of every picker above. Honesty line, not controls.
-    -->
-    <div class="ondevice-badges">
-      <span class="pill">
-        <span class="pill-dot"></span>
-        Embeddings
-      </span>
-      <span class="pill">
-        <span class="pill-dot"></span>
-        Name redaction
-      </span>
-      <span class="pill">
-        <span class="pill-dot"></span>
-        Transcription
-      </span>
-      <span class="text-muted ondevice-note">
-        Always run on this Mac — never sent to any provider.
-      </span>
-    </div>
+    <span class="use-group-label text-muted">Search index</span>
 
     <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
     <div class="semantic">

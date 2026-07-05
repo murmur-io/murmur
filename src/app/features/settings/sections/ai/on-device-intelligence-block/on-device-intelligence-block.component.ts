@@ -1,15 +1,15 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
-import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 import { SettingsStore } from "../../../settings.store";
+import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 
 /**
- * AI & Models → "On-device intelligence" block (Task 5).
+ * AI & Models → "Search index" block.
  *
- * Extracted verbatim from AiDefaultsBlockComponent as a standalone card.
- * Owns the always-on-device honesty badges (Embeddings / Name redaction /
- * Transcription), the semantic-search toggle, the embedding-model download
- * flow, and the re-index controls.
+ * Owns the semantic-search toggle, the embedding-model download flow, and the
+ * re-index controls. The always-on-device honesty rows (Embeddings / Name
+ * redaction / Transcription) now live in the "What runs where" map card, so
+ * the badges that used to sit here were removed.
  *
  * All work is on-device — no cloud calls, no consent requirement.
  */

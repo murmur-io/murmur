@@ -9,7 +9,6 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { IpcService } from "../../../../core/ipc.service";
 import type {
   AccountStatus,
@@ -46,7 +45,7 @@ interface FolderOption {
   selector: "app-settings-account-section",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, SharingAuthFlowComponent],
+  imports: [SharingAuthFlowComponent],
   templateUrl: "./settings-account-section.component.html",
   styleUrl: "./settings-account-section.component.scss",
 })
@@ -66,6 +65,37 @@ export class SettingsAccountSectionComponent {
   private readonly _accountError = signal<string | null>(null);
   readonly accountError = this._accountError.asReadonly();
 
+  /** True while the one-tap Touch ID unlock IPC is in flight ("Unlocking…"). */
+  private readonly _unlocking = signal(false);
+  readonly unlocking = this._unlocking.asReadonly();
+
+  /** A friendly, non-crashy message shown when the Touch ID unlock fails. */
+  private readonly _unlockError = signal<string | null>(null);
+  readonly unlockError = this._unlockError.asReadonly();
+
+  /**
+   * Latches true when a Touch ID unlock attempt fails, so the row falls back to
+   * the password "Sign in to share" path instead of looping the biometric sheet.
+   * Cleared on the next status reload (a fresh state re-enables Touch ID).
+   */
+  private readonly _biometricFailed = signal(false);
+
+  /**
+   * Whether to offer the one-tap Touch ID unlock: logged in, NOT yet unlocked
+   * this session, a cached account key exists, and no prior attempt just failed.
+   * When false the password sign-in flow is the fallback.
+   */
+  readonly canBiometricUnlock = computed(() => {
+    const st = this._status();
+    return (
+      !!st &&
+      st.loggedIn &&
+      !st.unlockedForSharing &&
+      st.biometricUnlockAvailable &&
+      !this._biometricFailed()
+    );
+  });
+
   /** Whether the reusable-flow modal is open. */
   private readonly _showFlow = signal(false);
   readonly showFlow = this._showFlow.asReadonly();
@@ -75,11 +105,6 @@ export class SettingsAccountSectionComponent {
     viewChild<ElementRef<HTMLElement>>("flowPanel");
 
   // ── Server base URL ──────────────────────────────────────────────────────
-  readonly serverControl = new FormControl("", { nonNullable: true });
-  private readonly _savingServer = signal(false);
-  readonly savingServer = this._savingServer.asReadonly();
-  private readonly _serverError = signal<string | null>(null);
-  readonly serverError = this._serverError.asReadonly();
 
   // ── Incoming shares (M5-CLIENT inbox) ────────────────────────────────────
   private readonly _inbox = signal<ShareInboxItem[]>([]);
@@ -130,21 +155,15 @@ export class SettingsAccountSectionComponent {
 
   /** Load the current account status + seed the server URL input from config. */
   private async reload(): Promise<void> {
+    // A fresh status re-enables the Touch ID path (drops any prior fail latch).
+    this._biometricFailed.set(false);
+    this._unlockError.set(null);
     let st: AccountStatus | null = null;
     try {
       st = await this.ipc.accountStatus();
       this._status.set(st);
     } catch (e) {
       this._accountError.set(String(e));
-    }
-    try {
-      const cfg = await this.ipc.getConfig();
-      // Only seed the input if the user hasn't typed something unsaved.
-      if (!this.serverControl.dirty) {
-        this.serverControl.setValue(cfg.shareBaseUrl ?? "");
-      }
-    } catch {
-      // Leave the input empty on a config read failure.
     }
     // Load the incoming-share inbox only when it's usable (signed in + a server).
     if (st?.loggedIn && st.serverConfigured) {
@@ -200,24 +219,41 @@ export class SettingsAccountSectionComponent {
     await this.reload();
   }
 
-  /** Persist the sharing-server base URL through the normal config round-trip. */
-  async saveServer(): Promise<void> {
-    if (this._savingServer()) return;
-    this._serverError.set(null);
-    this._savingServer.set(true);
+
+  /**
+   * One-tap Touch ID unlock for sharing: presents a single biometric sheet,
+   * restores the session MK, and flips the row to "Ready to share". On ANY
+   * failure it fails closed to the password sign-in flow (latch the fallback +
+   * surface a friendly message) — never a dead end.
+   */
+  async unlockWithBiometric(): Promise<void> {
+    if (this._unlocking()) return;
+    this._unlocking.set(true);
+    this._unlockError.set(null);
     try {
-      const cfg = await this.ipc.getConfig();
-      await this.ipc.saveConfig({
-        ...cfg,
-        shareBaseUrl: this.serverControl.value.trim(),
-      });
-      this.serverControl.markAsPristine();
-      await this.reload();
+      const st = await this.ipc.unlockSharingWithBiometric();
+      this._status.set(st);
+      if (!st.unlockedForSharing) {
+        // Resolved but still locked — fall back to the password path.
+        this._biometricFailed.set(true);
+        this._unlockError.set(
+          "Couldn't unlock this session. Sign in with your password to share.",
+        );
+      }
     } catch (e) {
-      this._serverError.set(String(e));
+      this._biometricFailed.set(true);
+      this._unlockError.set(this.friendlyUnlockError(String(e)));
     } finally {
-      this._savingServer.set(false);
+      this._unlocking.set(false);
     }
+  }
+
+  /** Turn a raw biometric-unlock error into a friendly fall-back message. */
+  private friendlyUnlockError(raw: string): string {
+    if (/cancel/i.test(raw)) {
+      return "Touch ID was cancelled. Sign in with your password to share instead.";
+    }
+    return "Couldn't unlock with Touch ID. Sign in with your password to share instead.";
   }
 
   /** Sign out (server family-revoke + clear tokens + drop session MK), then reload. */

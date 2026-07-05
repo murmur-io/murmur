@@ -1,14 +1,17 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
   computed,
   effect,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { SettingsStore } from "../../../settings.store";
-import { LocalModelsListComponent } from "../local-models-list/local-models-list.component";
 
 /** Provider-backed connection ids (a per-role model select makes sense on these). */
 const PROVIDER_CONNECTION_IDS: readonly string[] = [
@@ -26,7 +29,8 @@ interface RoleRowVm {
   readonly connCtrl: string;
   readonly modelCtrl: string;
   readonly effortCtrl: string;
-  /** Ask/Live only — the Notes row must NOT offer Local/Off (see template comment). */
+  /** Whether to offer the "Off — retrieval only" target (Ask/Live only). Notes can't:
+   *  "off" builds no SummarizerProvider so provider_for refuses it. All roles offer "local". */
   readonly offersReasonerTargets: boolean;
   readonly conn: string;
   readonly isProviderConn: boolean;
@@ -45,28 +49,66 @@ interface RoleRowVm {
  * instead). The Ask row is the successor of the old "Assistant backend"
  * select (its Local/Off targets live here now, and changing it compat-writes
  * the legacy `brainBackend` — see SettingsStore.setRoleConnection). The
- * global GGUF registry block (owns `brainModelId`) renders below the rows
- * whenever Ask or Live picks "Local model" — it is shared, not per-role.
+ * global GGUF registry (owns `brainModelId`) now lives under Engines →
+ * Murmur Brain → Configure, not in these rows — it is shared, not per-role.
  */
 @Component({
   selector: "app-ai-role-rows",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, LocalModelsListComponent],
+  imports: [ReactiveFormsModule],
   templateUrl: "./ai-role-rows.component.html",
   styleUrl: "./ai-role-rows.component.scss",
 })
 export class AiRoleRowsComponent {
   private readonly store = inject(SettingsStore);
+  private readonly injector = inject(Injector);
 
   readonly form = this.store.form;
 
   /** Disclosure state — collapsed by default (overrides are the power path). */
   readonly expanded = signal(false);
 
+  /** The `.role-rows` container — the anchor for the map's "Change" scroll. */
+  private readonly rolesContainer =
+    viewChild<ElementRef<HTMLElement>>("rolesContainer");
+
   toggleExpanded(): void {
     this.expanded.update((v) => !v);
   }
+
+  /**
+   * When the map's "Change" asks for a role (store.highlightRole()), open the
+   * disclosure and, after the row renders, scroll it into view + flash it, then
+   * clear the request. `allowSignalWrites` covers the synchronous `expanded`
+   * write (the store clear runs later, inside afterNextRender, so it's outside
+   * this effect's reactive context — no NG0600 either way). The store's
+   * null-then-set makes a repeat Change on the same row re-fire this effect.
+   */
+  private readonly _highlight = effect(
+    () => {
+      const role = this.store.highlightRole();
+      if (!role) return;
+      this.expanded.set(true);
+      afterNextRender(
+        () => {
+          const el = this.rolesContainer()?.nativeElement.querySelector<HTMLElement>(
+            `[data-role="${role}"]`,
+          );
+          if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            // Restart the flash even if the class is already present.
+            el.classList.remove("hl");
+            void el.offsetWidth; // force reflow
+            el.classList.add("hl");
+          }
+          this.store.clearHighlightRole();
+        },
+        { injector: this.injector },
+      );
+    },
+    { allowSignalWrites: true },
+  );
 
   /**
    * Auto-open once when any override is active (loaded from config or just
@@ -100,7 +142,8 @@ export class AiRoleRowsComponent {
   );
 
   /** The three override rows, derived from the store's role/catalog signals. */
-  readonly rows = computed<RoleRowVm[]>(() => [
+  readonly rows = computed<RoleRowVm[]>(() => {
+    const all: RoleRowVm[] = [
     this.buildRow(
       "notes",
       "Meeting notes",
@@ -137,7 +180,15 @@ export class AiRoleRowsComponent {
       this.store.roleLiveModelValue(),
       this.store.assistantInheritSummary(),
     ),
-  ]);
+    ];
+    // "Live during meetings" (@brain threads + the voice assistant) is HIDDEN under the Cloud posture:
+    // the voice assistant can't run there (it needs the on-device light engine, which Cloud turns off),
+    // and @brain threads just inherit the cloud default — so a per-feature override is moot. Shown in
+    // Hybrid / Fully local / Custom.
+    return this.store.posture() === "cloud"
+      ? all.filter((r) => r.role !== "live")
+      : all;
+  });
 
   private buildRow(
     role: RoleRowVm["role"],

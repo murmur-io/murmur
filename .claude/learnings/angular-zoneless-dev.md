@@ -58,6 +58,40 @@
 - **Caught by:** adversarial-verifier live Playwright pass (RED observed pre-fix, GREEN post-fix);
   `ng build`/`ng lint` were green the whole time.
 - **Status:** journaled
+### [2026-07-05 detail redesign — #194] a botched multi-agent component split
+- **Pattern:** Splitting a 4600-line `detail.component` into panels across workflow phases left it
+  NON-BUILDING: the Split-phase agent DIED mid-response ("API Error: Connection closed") so the panel
+  components were created-but-UNWIRED (imported but never rendered), the old inline markup stayed, and
+  stale `<app-move-to-menu>` / `<app-share-verify-sheet>` refs remained after their imports were
+  stripped → NG8001. Separately, a panel had a HARD syntax error: BACKTICKS inside an HTML comment
+  (`<!-- `createdUrl` -->`) INSIDE an inline `template: \`…\`` terminated the template literal early →
+  a cascade of phantom "@Component argument" errors that made the panel look half-built.
+- **Caught by:** operator (running `ng build` + grepping the actual template) — the workflow's own
+  verify phase had run on the broken tree and still reported PASS.
+- **Lesson:** After a big split/refactor, RUN `ng build` yourself and GREP the result: is every new
+  panel actually rendered (`<app-x-panel>` present in the parent template)? are stale component refs +
+  their `imports:` entries gone? A "done" report from an agent describes intent, not a building tree.
+  Never put backticks inside an inline `template: \`…\`` — even inside an HTML `<!-- … -->` comment they
+  silently end the literal. When a workflow phase agent dies mid-response, expect a half-applied tree.
+- **Status:** journal
+
+### [2026-07-04 PR#181 Murmur Brain] Preset command + reactive form dual-write → the stale form CLOBBERS the preset on next save (CRITICAL)
+- **Pattern:** a "posture" preset was applied via a Tauri command that wrote the `role_*` / `brain_backend`
+  DB config keys directly. But the Settings page's reactive form still held the STALE key values from its
+  one-time `load()`, and the ordinary `save()` re-serialized `form.getRawValue()` verbatim → the next
+  unrelated Save overwrote the preset's keys back to `""` → a Fully-Local (zero-egress) posture silently
+  reverted to cloud egress. TWO writers of the same keys (a command + the form) that never reconcile.
+  Fix: after the preset command succeeds, re-fetch fresh config and `patchValue` ONLY the preset-owned
+  controls (mirror `load()`'s config→form mapping) so the form no longer clobbers; and refresh the derived
+  label (`refreshPosture()`) after `save()` + per-role edits so the shown posture never lies. Also: a
+  readiness `computed()` that checks "ANY model downloaded" is a FALSE POSITIVE when the backend resolves a
+  SPECIFIC selected/default model — mirror the backend's exact resolution.
+- **Caught by:** deep-review Workflow (wiring/FE dimension, adversarially verified) — CRITICAL.
+- **Lesson:** when a backend command writes config keys that a reactive form ALSO owns, the form is a
+  stale SECOND writer — after the command, re-`patchValue` the affected controls from fresh backend
+  config, or the next `save()` clobbers the command's write. A derived display label (posture / status /
+  badge) must be re-fetched after ANY config-affecting action, never left optimistic.
+- **Status:** journal
 
 ### [2026-07-02 seed] Distilled from angular-zoneless.md traps T1–T4
 - **Pattern:** the four Murmur-specific FE traps + the signals/IPC/template hard rules.

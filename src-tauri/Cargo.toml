@@ -1,9 +1,13 @@
 [package]
 name = "murmur"
-version = "0.6.4"
+version = "0.7.0"
 description = "Murmur — local meeting capture, transcription, and AI notes for Obsidian"
 edition = "2021"
 rust-version = "1.77"
+# Murmur is a Tauri desktop app, never published to crates.io (it path-depends on
+# murmur-protocol, which crates.io disallows). Declaring this lets `cargo deny`'s
+# allow-wildcard-paths apply to the murmur-protocol path dep (bans check).
+publish = false
 
 [[bin]]
 name = "Murmur"
@@ -143,7 +147,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ── macOS biometric (Touch ID) + screen-share detection (Stage E) ──
 # These objc2 crates are already in the dependency graph transitively (via tauri/tao);
-# we pin the same 0.6/0.3 family. LocalAuthentication = Touch ID KEK gate.
+# we pin the same 0.6/0.3 family. The Touch ID gate moved to the Keychain user-presence ACL on the
+# master KEK (secrets/keychain.rs), so LAContext/LAError are no longer referenced — the
+# objc2-local-authentication dep was dropped (0.7 security-review fast-follow).
 # Screen-share auto-relock uses the PURE CoreGraphics C window-list API (no ObjC msg_send / no
 # NSException risk): objc2-core-graphics CGWindow + objc2-core-foundation CFArray/CFDictionary/
 # CFString for reading window owner + title. macOS-only — gated under cfg(target_os = "macos").
@@ -152,7 +158,6 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
-objc2-local-authentication = { version = "0.3", features = ["LAContext", "LAError", "block2"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString"] }
 # v0.3.2 — BIOMETRIC-GATED master KEK. The KEK is stored as a generic-password Keychain item with a

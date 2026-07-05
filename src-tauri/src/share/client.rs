@@ -15,8 +15,8 @@ use murmur_protocol::dto::{
     AcceptShareResponse, AttachKeyRequest, CreateShareRequest, CreateShareResponse, InboxResponse,
     KeyLookupRequest, KeyLookupResponse, LoginFinishRequest, LoginFinishResponse,
     LoginStartRequest, LoginStartResponse, ProvisionFinishRequest, ProvisionFinishResponse,
-    ProvisionRequest, ProvisionResponse, SharesResponse, SignupRequest, VerifyEmailRequest,
-    VerifyEmailResponse,
+    ProvisionRequest, ProvisionResponse, RefreshRequest, RefreshResponse, SharesResponse,
+    SignupRequest, VerifyEmailRequest, VerifyEmailResponse,
 };
 use reqwest::StatusCode;
 
@@ -219,6 +219,23 @@ impl ShareClient {
                 },
             },
             "login-finish",
+        )
+        .await
+    }
+
+    /// `POST /v1/auth/refresh {refreshToken}` → a ROTATED session pair (a fresh access token + a fresh
+    /// refresh token, same family). The presented refresh token is SINGLE-USE: the caller MUST persist
+    /// the returned pair and never re-present the old token — re-presenting it triggers server-side
+    /// family revocation (§3.3 reuse detection). A 401 here means the refresh token itself is
+    /// expired/revoked/reused ⇒ the session is unrecoverable and the user must sign in again.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<RefreshResponse> {
+        self.post_json(
+            "/v1/auth/refresh",
+            None,
+            &RefreshRequest {
+                refresh_token: refresh_token.to_string(),
+            },
+            "refresh-session",
         )
         .await
     }

@@ -27,6 +27,12 @@
   font-weight: 550;
   font-size: 0.95rem;
 }
+/* "In use now" — accent (not the green Ready) so availability vs active read apart. */
+.conn-inuse {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
 .conn-actions {
   display: inline-flex;
   align-items: center;

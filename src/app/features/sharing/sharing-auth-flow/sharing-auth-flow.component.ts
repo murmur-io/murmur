@@ -89,12 +89,6 @@ export class SharingAuthFlowComponent {
   readonly confirmControl = new FormControl("", { nonNullable: true });
   readonly signinPwControl = new FormControl("", { nonNullable: true });
 
-  // ── Advanced (optional) sharing-server disclosure ────────────────────────
-  readonly advancedOpen = signal(false);
-  readonly serverUrl = signal("");
-  private readonly _serverSaving = signal(false);
-  readonly serverSaving = this._serverSaving.asReadonly();
-
   /** The AccountStatus captured at auto-login, emitted after the recovery step. */
   private capturedStatus: AccountStatus | null = null;
 
@@ -134,27 +128,6 @@ export class SharingAuthFlowComponent {
     return Array.from({ length: prog.total }, (_, i) => i);
   });
 
-  constructor() {
-    // Fire-and-forget one-shot: seed the Advanced server field from config so
-    // it's prefilled if the user opens the disclosure. No signal is read here,
-    // so no effect / NG0600.
-    void this.seedServer();
-  }
-
-  private async seedServer(): Promise<void> {
-    try {
-      const cfg = await this.ipc.getConfig();
-      this.serverUrl.set(cfg.shareBaseUrl ?? "");
-      // Only auto-expand when no server is set (the Railway default means this
-      // is usually already configured → the disclosure stays collapsed).
-      if (!(cfg.shareBaseUrl ?? "").trim()) {
-        this.advancedOpen.set(true);
-      }
-    } catch {
-      // No config yet — leave the field empty + collapsed.
-    }
-  }
-
   // ── Input handlers (non-secret signals) ──────────────────────────────────
   onEmail(event: Event): void {
     this.email.set((event.target as HTMLInputElement).value);
@@ -169,34 +142,6 @@ export class SharingAuthFlowComponent {
 
   onSaveRecovery(event: Event): void {
     this.saveRecovery.set((event.target as HTMLInputElement).checked);
-  }
-
-  onServerUrl(event: Event): void {
-    this.serverUrl.set((event.target as HTMLInputElement).value);
-  }
-
-  toggleAdvanced(): void {
-    this.advancedOpen.update((v) => !v);
-  }
-
-  /** Persist the Advanced sharing-server URL through the normal config round-trip. */
-  async saveServer(): Promise<void> {
-    if (this._serverSaving()) {
-      return;
-    }
-    this._serverSaving.set(true);
-    this.error.set(null);
-    try {
-      const cfg = await this.ipc.getConfig();
-      await this.ipc.saveConfig({
-        ...cfg,
-        shareBaseUrl: this.serverUrl().trim(),
-      });
-    } catch (e) {
-      this.error.set(this.friendly(e));
-    } finally {
-      this._serverSaving.set(false);
-    }
   }
 
   // ── Navigation ───────────────────────────────────────────────────────────
@@ -409,11 +354,11 @@ export class SharingAuthFlowComponent {
   /** Map a raw backend error to a friendly, non-crashy inline message. */
   private friendly(e: unknown): string {
     const raw = String(e);
-    // Only a genuine connectivity / no-server-set problem gets the "can't reach" guidance. A 4xx
+    // Only a genuine connectivity problem gets the "can't reach" guidance. A 4xx
     // (wrong or expired code, too many tries, bad password) is NOT unreachability — it arrives as a
     // clear sentence we surface as-is (below).
     if (/could not reach|unreachable|no sharing server|failed to build|network|timed? ?out/i.test(raw)) {
-      return "Can't reach the sharing server. Check the server URL under Advanced, then try again.";
+      return "Can't reach the sharing server. Check your connection, then try again.";
     }
     // AppError serializes as "invalid argument: <msg>" / "authentication error: <msg>" etc. — strip
     // the variant prefix so the user reads the clean message.

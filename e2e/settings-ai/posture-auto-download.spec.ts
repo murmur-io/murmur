@@ -2,15 +2,16 @@ import { test, expect } from "@playwright/test";
 import { mockTauri } from "./mock-invoke";
 
 /**
- * Verifies that picking "Fully local" posture auto-downloads the absent heavy
- * model BEFORE committing the posture, AND selects ALL needed models (not just
- * the newly-downloaded subset). The expected order is:
+ * Verifies the CONFIRM-FIRST flow: picking "Fully local" when a model is absent
+ * shows a confirm card and starts NOTHING; only clicking "Download & enable" runs
+ * the download, then selects ALL needed models (not just the newly-downloaded
+ * subset) and commits. The expected order after confirming is:
  *   1. download_brain_model (heavy, absent)
  *   2. select_brain_model  (heavy — just downloaded)
  *   3. select_brain_model  (light — already on disk but not selected)
  *   4. set_brain_posture   (commit)
  */
-test("picking Fully local auto-downloads the absent heavy model then selects all needed and commits", async ({
+test("picking Fully local asks first, then on confirm downloads + selects all needed + commits", async ({
   page,
 }) => {
   await mockTauri(page, {
@@ -71,11 +72,22 @@ test("picking Fully local auto-downloads the absent heavy model then selects all
   await page.goto("/settings");
   // Reveal the AI & Models section
   await page.getByText("AI & Models").first().click();
-  // Click the "Fully local" posture button
+  // Click the "Fully local" posture button — this must ASK, not download.
   await page.getByRole("button", { name: /Fully local/ }).click();
 
-  // The store must: (1) download the absent heavy model, (2) select ALL needed
-  // models in neededModelsFor order (heavy → light), (3) commit posture.
+  // Confirm card is shown; NOTHING has downloaded/committed on the single tap.
+  await expect(page.getByText(/Fully local needs/)).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__test_calls__ ?? [])).toEqual(
+    [],
+  );
+
+  // Explicit opt-in: click "Download & enable Fully local".
+  await page
+    .getByRole("button", { name: /Download .* enable Fully local/ })
+    .click();
+
+  // Now: (1) download the absent heavy model, (2) select ALL needed models in
+  // neededModelsFor order (heavy → light), (3) commit posture.
   await expect
     .poll(
       () =>
