@@ -11,8 +11,8 @@ use crate::embed::Embedder;
 use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
-    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, PersonCard,
-    RecipeRecord, SearchHit, StatusCount, VaultSource,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, PendingShareAccept,
+    PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
 };
 use crate::transcribe::types::Segment;
 
@@ -629,14 +629,39 @@ impl Db {
                meeting_id     TEXT NOT NULL,
                sender_acct_id TEXT,
                accepted_at    TEXT NOT NULL
+             );
+             -- Durable RESUME record for a mode-B accept whose server row was flipped to `accepted`
+             -- but whose local verify+ingest has not yet committed (spec §7). Written between the
+             -- server flip and the vault write, dropped the instant ingest commits — so a post-flip
+             -- failure is recoverable (the server no longer lists an accepted share; a re-accept
+             -- 404s), never a stranded share. All bytes are opaque + SQLCipher-encrypted at rest.
+             CREATE TABLE IF NOT EXISTS pending_share_accepts (
+               share_id         TEXT PRIMARY KEY,
+               blob_id          TEXT NOT NULL,
+               target_folder_id TEXT NOT NULL,
+               sender_user_id   TEXT NOT NULL,
+               sender_fingerprint TEXT NOT NULL,
+               wrapped_key      BLOB NOT NULL,
+               grant_sig        BLOB NOT NULL,
+               rev              INTEGER NOT NULL,
+               key_generation   INTEGER NOT NULL,
+               created_at       TEXT NOT NULL
              );",
         )
         .map_err(map_err)?;
         // Additive columns on `outbound_shares` for mode B (spec §7 schema: `nk BLOB`,
-        // `recipient_acct_id?`). The retained `nk` + `content_hash` let `share_rewrap_pending` re-wrap
-        // to a newly-registered recipient WITHOUT re-reading meeting content (only key material). Both
-        // are protected at rest by the whole-DB SQLCipher DEK. Guarded so migrate() stays idempotent.
+        // `recipient_acct_id?`). The retained NK + `content_hash` let `share_rewrap_pending` re-wrap
+        // to a newly-registered recipient WITHOUT re-reading meeting content (only key material).
+        // Guarded so migrate() stays idempotent.
+        //
+        // `nk` (legacy, pre-0.7): the retained NK stored RAW, protected only by the whole-DB
+        // SQLCipher DEK — a re-locked live session could still decrypt an already-shared envelope from
+        // it. `nk_wrapped` (0.7 security fast-follow): the retained NK wrapped under the account MK
+        // (`e2ee::wrap_key32`, share-scoped AAD). New shares write `nk_wrapped` and leave `nk` NULL;
+        // legacy rows keep their raw `nk` and still re-wrap (unwrap = identity). ADDITIVE only — no
+        // DROP, no rewrite of existing rows.
         Self::add_column_if_missing(&conn, "outbound_shares", "nk", "BLOB")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "nk_wrapped", "BLOB")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_acct_id", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_email", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "content_hash", "BLOB")?;
@@ -1132,11 +1157,13 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// Record a mode-B OUTBOUND share. Stores the retained note key `nk` + the `content_hash`
-    /// (SHA-256 of the sealed cell) so a later `share_rewrap_pending` can re-wrap to a newly-registered
-    /// recipient WITHOUT re-reading meeting content — plus `share_id`+`meeting_id` for the gated title
-    /// derivation (NO title column, spec §7). `state` = `'sent'` (registered) or `'awaiting_key'`
-    /// (invited/unregistered). `nk`/`content_hash` are at-rest-protected by the whole-DB SQLCipher DEK.
+    /// Record a mode-B OUTBOUND share. Stores the retained note key WRAPPED under the account MK
+    /// (`nk_wrapped`, via `e2ee::wrap_key32` — NOT the raw key) + the `content_hash` (SHA-256 of the
+    /// sealed cell) so a later `share_rewrap_pending` (which holds the MK session) can unwrap + re-wrap
+    /// to a newly-registered recipient WITHOUT re-reading meeting content — plus `share_id`+`meeting_id`
+    /// for the gated title derivation (NO title column, spec §7). `state` = `'sent'` (registered) or
+    /// `'awaiting_key'` (invited/unregistered). New rows leave the legacy raw `nk` column NULL; the
+    /// wrapped key means a re-locked session (no MK) can no longer decrypt an already-shared envelope.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_outbound_user_share(
         &self,
@@ -1145,7 +1172,7 @@ impl Db {
         rev: u32,
         created_at: &str,
         state: &str,
-        nk: &[u8],
+        nk_wrapped: &[u8],
         recipient_acct_id: &str,
         recipient_email: &str,
         content_hash: &[u8],
@@ -1154,7 +1181,7 @@ impl Db {
         conn.execute(
             "INSERT OR REPLACE INTO outbound_shares
                (share_id, meeting_id, mode, rev, state, created_at,
-                nk, recipient_acct_id, recipient_email, content_hash)
+                nk_wrapped, recipient_acct_id, recipient_email, content_hash)
              VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 share_id,
@@ -1162,7 +1189,7 @@ impl Db {
                 rev as i64,
                 state,
                 created_at,
-                nk,
+                nk_wrapped,
                 recipient_acct_id,
                 recipient_email,
                 content_hash
@@ -1173,26 +1200,41 @@ impl Db {
     }
 
     /// Every mode-B outbound share still `'awaiting_key'` (the recipient was unregistered at share
-    /// time). Returns `(share_id, rev, nk, recipient_email, content_hash)` for the on-launch re-wrap.
+    /// time). Returns `(share_id, rev, nk_bytes, nk_is_wrapped, recipient_email, content_hash)` for the
+    /// on-launch re-wrap. `nk_is_wrapped` = the bytes are the MK-wrapped NK (`nk_wrapped`, new rows) vs
+    /// the legacy RAW NK (`nk`, pre-0.7 rows — the caller treats unwrap as identity). New rows are
+    /// preferred; a legacy row is read only when `nk_wrapped` is absent, so existing shares still
+    /// re-wrap after the migration.
     #[allow(clippy::type_complexity)]
-    pub fn list_awaiting_rewrap(&self) -> Result<Vec<(String, u32, Vec<u8>, String, Vec<u8>)>> {
+    pub fn list_awaiting_rewrap(
+        &self,
+    ) -> Result<Vec<(String, u32, Vec<u8>, bool, String, Vec<u8>)>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT share_id, rev, nk, recipient_email, content_hash
+                "SELECT share_id, rev, nk, nk_wrapped, recipient_email, content_hash
                  FROM outbound_shares
                  WHERE mode = 'user' AND state = 'awaiting_key'
-                   AND nk IS NOT NULL AND recipient_email IS NOT NULL AND content_hash IS NOT NULL",
+                   AND (nk IS NOT NULL OR nk_wrapped IS NOT NULL)
+                   AND recipient_email IS NOT NULL AND content_hash IS NOT NULL",
             )
             .map_err(map_err)?;
         let rows = stmt
             .query_map([], |r| {
+                let nk: Option<Vec<u8>> = r.get(2)?;
+                let nk_wrapped: Option<Vec<u8>> = r.get(3)?;
+                // Prefer the MK-wrapped key; fall back to the legacy raw NK (unwrap = identity).
+                let (bytes, is_wrapped) = match nk_wrapped {
+                    Some(w) => (w, true),
+                    None => (nk.unwrap_or_default(), false),
+                };
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)? as u32,
-                    r.get::<_, Vec<u8>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Vec<u8>>(4)?,
+                    bytes,
+                    is_wrapped,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
                 ))
             })
             .map_err(map_err)?
@@ -1231,6 +1273,74 @@ impl Db {
         )
         .optional()
         .map_err(map_err)
+    }
+
+    /// Persist the durable RESUME record for a mode-B accept whose server row was just flipped to
+    /// `accepted`, BEFORE the local verify+ingest. `INSERT OR REPLACE` (idempotent on `share_id`) so a
+    /// retry that re-flips is harmless. Dropped by [`delete_pending_share_accept`] once ingest commits.
+    pub fn insert_pending_share_accept(&self, p: &PendingShareAccept) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_share_accepts
+               (share_id, blob_id, target_folder_id, sender_user_id, sender_fingerprint,
+                wrapped_key, grant_sig, rev, key_generation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                p.share_id,
+                p.blob_id,
+                p.target_folder_id,
+                p.sender_user_id,
+                p.sender_fingerprint,
+                p.wrapped_key,
+                p.grant_sig,
+                p.rev as i64,
+                p.key_generation as i64,
+                p.created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The durable resume record for a mode-B accept that flipped `accepted` server-side but never
+    /// finished ingesting locally, or `None`. Drives the `accept_share` RESUME path (re-fetch + finish
+    /// without a fresh inbox item, closing the post-flip strand).
+    pub fn get_pending_share_accept(&self, share_id: &str) -> Result<Option<PendingShareAccept>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT share_id, blob_id, target_folder_id, sender_user_id, sender_fingerprint,
+                    wrapped_key, grant_sig, rev, key_generation, created_at
+               FROM pending_share_accepts WHERE share_id = ?1",
+            rusqlite::params![share_id],
+            |r| {
+                Ok(PendingShareAccept {
+                    share_id: r.get(0)?,
+                    blob_id: r.get(1)?,
+                    target_folder_id: r.get(2)?,
+                    sender_user_id: r.get(3)?,
+                    sender_fingerprint: r.get(4)?,
+                    wrapped_key: r.get(5)?,
+                    grant_sig: r.get(6)?,
+                    rev: r.get::<_, i64>(7)? as u32,
+                    key_generation: r.get::<_, i64>(8)? as u32,
+                    created_at: r.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Drop the resume record once the accept's ingest has committed (the strand window is closed).
+    /// Idempotent (`DELETE` of a missing row is a no-op).
+    pub fn delete_pending_share_accept(&self, share_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM pending_share_accepts WHERE share_id = ?1",
+            rusqlite::params![share_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     /// Aggregate the `egress_log` table over the last `days` calendar days and return a rich
@@ -9110,6 +9220,44 @@ mod lock_tests {
 
     fn file_db(label: &str) -> Db {
         Db::open_with_key(&temp_db_path(label), TEST_DEK).unwrap()
+    }
+
+    /// #5 (0.7 security fast-follow): the durable accept-resume record round-trips (insert → get →
+    /// idempotent overwrite → delete → None). Proves the additive `pending_share_accepts` table +
+    /// its methods — the persistence that makes a post-flip accept RECOVERABLE, not stranded.
+    #[test]
+    fn pending_share_accept_round_trips_and_deletes() {
+        let db = file_db("pending-accept");
+        assert!(db.get_pending_share_accept("s-1").unwrap().is_none());
+        let p = PendingShareAccept {
+            share_id: "s-1".to_string(),
+            blob_id: "blob-9".to_string(),
+            target_folder_id: "f-shared".to_string(),
+            sender_user_id: "u-sender".to_string(),
+            sender_fingerprint: "ABCDE-FGHIJ".to_string(),
+            wrapped_key: vec![1, 2, 3, 4],
+            grant_sig: vec![9, 8, 7],
+            rev: 2,
+            key_generation: 3,
+            created_at: "2026-07-04T10:00:00Z".to_string(),
+        };
+        db.insert_pending_share_accept(&p).unwrap();
+        let got = db.get_pending_share_accept("s-1").unwrap().unwrap();
+        assert_eq!(got.blob_id, "blob-9");
+        assert_eq!(got.target_folder_id, "f-shared");
+        assert_eq!(got.sender_user_id, "u-sender");
+        assert_eq!(got.sender_fingerprint, "ABCDE-FGHIJ");
+        assert_eq!(got.wrapped_key, vec![1, 2, 3, 4]);
+        assert_eq!(got.grant_sig, vec![9, 8, 7]);
+        assert_eq!(got.rev, 2);
+        assert_eq!(got.key_generation, 3);
+        // Idempotent overwrite on the same share_id (a retry that re-flips is harmless).
+        db.insert_pending_share_accept(&p).unwrap();
+        assert!(db.get_pending_share_accept("s-1").unwrap().is_some());
+        // Drop it (commit) → gone; delete is idempotent.
+        db.delete_pending_share_accept("s-1").unwrap();
+        assert!(db.get_pending_share_accept("s-1").unwrap().is_none());
+        db.delete_pending_share_accept("s-1").unwrap();
     }
 
     fn seed_folder(db: &Db, id: &str, name: &str) -> Folder {
