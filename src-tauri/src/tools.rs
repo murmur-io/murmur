@@ -75,6 +75,11 @@ pub enum ToolCall {
     /// is exposed (enabled + consented + configured + token). It EGRESSES: the redacted query reaches
     /// the user's Jira Cloud site through the consent-gated, redacting connector framework.
     JiraSearch { query: String },
+    /// CONNECTOR — LIVE SLACK SEARCH (consent-gated EXTERNAL connector). Like [`Self::WebSearch`],
+    /// dispatched exclusively via the async [`execute_slack_search`], and ONLY when the Slack connector
+    /// is exposed (enabled + consented + user token). It EGRESSES: the redacted query reaches the
+    /// user's Slack workspace through the consent-gated, redacting connector framework.
+    SlackSearch { query: String },
 }
 
 /// Model-facing description of one tool the agentic brain may call. `parameters` is a JSON-schema
@@ -171,6 +176,15 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                           results are loud-attributed '(via Jira)'. Use for questions about tickets, \
                           deadlines, sprint work, or to check an issue's current state.",
             parameters: str_arg("query", "What to look for in Jira, in the user's own language."),
+            write: false,
+        },
+        ToolSpec {
+            name: "slack_search",
+            description: "Search the user's Slack messages (channels + DMs their token can see). Only \
+                          available when the user has enabled + consented to the Slack connector; \
+                          results are loud-attributed '(via Slack)'. Use for 'what did we say/decide \
+                          about X in Slack' questions.",
+            parameters: str_arg("query", "What to look for in Slack, in the user's own language."),
             write: false,
         },
         ToolSpec {
@@ -400,6 +414,17 @@ pub fn execute_tool(
                     .to_string(),
             ))
         }
+        ToolCall::SlackSearch { .. } => {
+            // EGRESS GUARD (mirror of WebSearch): the synchronous, egress-free `execute_tool` is the
+            // MCP surface's only entry, so it MUST NOT run a connector that reaches off-device. Slack
+            // search is dispatched exclusively via the async `execute_slack_search`. Reaching here is a
+            // programming error in a caller, never a leak — refuse loudly, egress nothing.
+            Err(AppError::InvalidArg(
+                "SlackSearch is an egress connector and cannot run through the egress-free tool path; \
+                 use execute_slack_search"
+                    .to_string(),
+            ))
+        }
     }
 }
 
@@ -461,6 +486,29 @@ pub async fn execute_jira_search(query: &str, config: &AppConfig) -> Result<Stri
         ),
         Err(crate::connectors::ConnectorError::Unconfigured(_)) => {
             Ok("Jira search is not available (not configured).".to_string())
+        }
+        Err(e @ crate::connectors::ConnectorError::Failed(_)) => Err(e.into()),
+    }
+}
+
+/// CONNECTOR DISPATCH — run a LIVE SLACK search through the connector seam. Mirrors
+/// [`execute_web_search`]: fail-closed sentinel when not exposed (NOTHING egresses), redaction +
+/// egress-ledger applied by [`crate::connectors::ConnectorRegistry::search`], loud attribution.
+pub async fn execute_slack_search(query: &str, config: &AppConfig) -> Result<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok("No Slack results for an empty query.".to_string());
+    }
+    let registry = crate::connectors::ConnectorRegistry::build(config);
+    match registry.search("slack", q).await {
+        Ok(hits) if hits.is_empty() => Ok(format!("No Slack results for \"{q}\".")),
+        Ok(hits) => Ok(format_web_hits(&hits)),
+        Err(crate::connectors::ConnectorError::NeedsConsent) => Ok(
+            "Slack search is not available (not enabled, not consented, or not configured)."
+                .to_string(),
+        ),
+        Err(crate::connectors::ConnectorError::Unconfigured(_)) => {
+            Ok("Slack search is not available (not configured).".to_string())
         }
         Err(e @ crate::connectors::ConnectorError::Failed(_)) => Err(e.into()),
     }
@@ -646,7 +694,7 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             .into_iter()
             .filter(|s| match s.name {
                 // Connectors require the AppHandle (async sidecar / consent path).
-                "web_search" | "calendar_lookup" | "jira_search" => has_app,
+                "web_search" | "calendar_lookup" | "jira_search" | "slack_search" => has_app,
                 // The draft tool is advertised only on surfaces with a notes flow / Accept
                 // affordance (in-meeting yes, the vault-wide Ask page no).
                 "propose_note" => self.note_drafts,
@@ -744,6 +792,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             "jira_search" => match self.app {
                 Some(_) => block_on_tool(execute_jira_search(&s("query"), self.config)),
                 None => Err(AppError::InvalidArg("jira_search needs an AppHandle".into())),
+            },
+            "slack_search" => match self.app {
+                Some(_) => block_on_tool(execute_slack_search(&s("query"), self.config)),
+                None => Err(AppError::InvalidArg("slack_search needs an AppHandle".into())),
             },
             // ── PROPOSE (always-on, NO DB side effect): the model signals the user asked for a note.
             //    Records the draft in interior-mutable scratch; the caller threads it onto the result so
@@ -968,6 +1020,34 @@ mod tests {
     fn jira_search_fail_closed_returns_sentinel_no_egress() {
         let cfg = AppConfig::default(); // jira disabled + unconsented
         let out = block_on(execute_jira_search("login bug", &cfg)).unwrap();
+        assert!(out.contains("not available"), "fail-closed sentinel, no egress: {out}");
+    }
+
+    /// EGRESS GUARD: the synchronous, egress-free `execute_tool` MUST refuse a `SlackSearch` — like
+    /// `WebSearch`, it can never run a connector that reaches off-device.
+    #[test]
+    fn sync_execute_tool_refuses_slack_search() {
+        let db = tmp_db();
+        let nothing = HashSet::new();
+        let cfg = AppConfig::default();
+        let res = execute_tool(
+            &ToolCall::SlackSearch { query: "raport".into() },
+            &db,
+            &nothing,
+            &cfg,
+        );
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "the egress-free tool path must refuse SlackSearch (no connector through MCP)"
+        );
+    }
+
+    /// FAIL-CLOSED: with the default config (slack disabled + unconsented), `execute_slack_search`
+    /// returns the graceful "not available" sentinel and EGRESSES NOTHING — no token, no network.
+    #[test]
+    fn slack_search_fail_closed_returns_sentinel_no_egress() {
+        let cfg = AppConfig::default(); // slack disabled + unconsented
+        let out = block_on(execute_slack_search("raport", &cfg)).unwrap();
         assert!(out.contains("not available"), "fail-closed sentinel, no egress: {out}");
     }
 
