@@ -6354,17 +6354,33 @@ pub async fn unlock_folder(
                     crate::secrets::get_or_create_master_kek_with_reason("Unlock this folder")
                 })
                 .await
-                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))??;
+                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))?
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        target: "lock",
+                        folder = %folder_id,
+                        error = %e,
+                        "unlock_folder: master-KEK release failed (keychain/biometric)"
+                    );
+                })?;
                 Zeroizing::new(bytes)
             }
         }
     };
     // Wrapped CK is bound to the folder id (legacy folders fall back to empty AAD transparently).
-    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
-        &kek,
-        &wrapped,
-        &aad_wrapped_ck(&folder_id),
-    )?);
+    // A failure HERE with a successfully-released KEK means the CK was wrapped under a DIFFERENT
+    // KEK than the one just read (store divergence / replaced item) — the exact signature worth
+    // distinguishing in the field from a biometric refusal, so trace it separately.
+    let ck_bytes = Zeroizing::new(
+        crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id)).inspect_err(|e| {
+            tracing::warn!(
+                target: "lock",
+                folder = %folder_id,
+                error = %e,
+                "unlock_folder: content-key unwrap failed — the folder was sealed under a different master KEK than the one released"
+            );
+        })?,
+    );
     let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
         ck_bytes
             .as_slice()
@@ -6419,6 +6435,7 @@ pub async fn unlock_folder(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.insert(folder_id.clone());
     }
+    tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
 
     // Return the refreshed node.
     let counts = state.db.count_notes_per_folder()?;
@@ -7909,25 +7926,55 @@ async fn valid_access_token(state: &AppState) -> Result<String, AppError> {
     if !crate::share::access_token_needs_refresh(expires_at.as_deref(), chrono::Utc::now()) {
         return Ok(token);
     }
-    // DEFANGED (0.7.2): do NOT auto-refresh here. The refresh path (#205) called `clear_account_mk()` on
-    // any refresh failure (refresh_session's Auth arm), and the login often omits `access_expires_at`
-    // (⇒ access_token_needs_refresh fires on EVERY share op) — so a single spurious refresh failure wiped
-    // the biometric account-MK cache and forced a full password re-login on every restart instead of a
-    // one-tap Touch ID unlock. Return the cached token (the 0.7.0 behavior): a genuinely-expired token
-    // still fails closed at the server, but the cached account key is never destroyed, so sharing
-    // survives a restart. Re-enable `refresh_session` once `/v1/auth/refresh` is verified end-to-end —
-    // now diagnosable via the persistent `murmur.log` added in this release.
-    Ok(token)
+    // RE-ENABLED (0.7.3): proactively redeem the refresh token when the bearer is at/near its 30-min
+    // server-side expiry. Without this (the 0.7.2 defang) a restart-restored session — password OR
+    // Touch ID — holds a DEAD bearer and every share op 401s until a full password re-login: the
+    // access token TTL is 30 min and no other path ever renews it. The 0.7.1 field failures that
+    // motivated the defang were server-side session-store resets during the 0.7.x deploy churn
+    // (every refresh family revoked ⇒ refresh 401 ⇒ the Auth arm wiped the session), not a client
+    // bug: the deployed `/v1/auth/refresh` answers correctly (401 only for an invalid token) and the
+    // login response has carried `accessExpiresAt` since M1. Hardening on the re-enable: rotation is
+    // RAM-first (see `refresh_session`) and the failure policy below never lets a TRANSIENT refresh
+    // failure destroy a working session.
+    match refresh_session(state, &token).await {
+        Ok(fresh) => Ok(fresh),
+        Err(e) => refresh_failure_fallback(e, token),
+    }
 }
 
-/// Redeem the persisted (single-use) refresh token for a fresh session pair, SINGLE-FLIGHTED so two
+/// Failure policy for a proactive token refresh (pure, unit-tested): a DEFINITIVE `Auth` refusal
+/// propagates — the refresh token itself was refused, the session is unrecoverable and
+/// `refresh_session` has already cleared it, so the FE must route to sign-in. ANY other failure
+/// (network, 5xx, keychain) falls back to the cached bearer: it may still be valid inside the 120 s
+/// refresh skew, and if it is genuinely dead the server fails closed with the same 401 the caller
+/// already handles — a transient hiccup must never kill a working session (the 0.7.1 regression).
+fn refresh_failure_fallback(err: AppError, cached_token: String) -> Result<String, AppError> {
+    match err {
+        AppError::Auth(_) => Err(err),
+        other => {
+            tracing::warn!(
+                target: "share",
+                error = %other,
+                "token refresh failed transiently — continuing with the cached bearer"
+            );
+            Ok(cached_token)
+        }
+    }
+}
+
+/// Redeem the session's (single-use) refresh token for a fresh session pair, SINGLE-FLIGHTED so two
 /// concurrent share ops can never double-spend the same refresh token (which would trip the server's
 /// reuse detection and revoke the whole family, logging the user out mid-share). `stale_token` is the
 /// access token the caller saw as expiring; if a racing op already refreshed while we waited for the
 /// guard, we return THAT fresh token rather than spending our now-stale refresh token again.
-// Kept (not deleted) for a clean re-enable once `/v1/auth/refresh` is verified end-to-end — see the
-// DEFANGED note in `valid_access_token`. Dead until then.
-#[allow(dead_code)]
+///
+/// Rotation is RAM-FIRST: the in-RAM session's tokens are updated the moment the server rotation
+/// succeeds, and only THEN is the Keychain mirror written (best-effort, loud on failure). The reverse
+/// order (0.7.1/#205) had a catastrophic failure mode: persist-then-RAM meant a Keychain write
+/// failure left the just-SPENT refresh token as the stored "current" one, so the next refresh
+/// re-presented it, tripped the server's reuse detection, and revoked the whole family — a forced
+/// logout from a local disk/keychain hiccup. With RAM-first, a failed persist costs at most the
+/// session not surviving the NEXT restart (password re-login), never the live session.
 async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, AppError> {
     // Serialize refreshes; this async guard is deliberately held ACROSS the network call below (unlike
     // the std mutexes here, which are never held across an `await`).
@@ -7935,7 +7982,9 @@ async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, 
 
     // Double-check under the guard: a racing op may have refreshed already. If the session's token
     // changed AND is now fresh, use it — do not spend our (now-stale) refresh token a second time.
-    {
+    // The session (NOT the Keychain) is the source of truth for the current refresh token — see the
+    // RAM-first rationale above; the identity fields ride along for the best-effort persist below.
+    let (refresh_token, device_id, email, account_id, generation) = {
         let g = state
             .account_session
             .lock()
@@ -7949,52 +7998,111 @@ async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, 
         {
             return Ok(s.access_token.clone());
         }
-    }
-
-    // The Keychain is the source of truth for the single-use refresh token.
-    let tokens = crate::share::load_tokens()?
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+        (
+            s.refresh_token.clone(),
+            s.device_id.clone(),
+            s.email.clone(),
+            s.account_id.clone(),
+            s.generation,
+        )
+    };
     let base = share_base_url(state)?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
-    let rotated = match client.refresh(&tokens.refresh_token).await {
+    let rotated = match client.refresh(&refresh_token).await {
         Ok(r) => r,
         Err(AppError::Auth(_)) => {
             // The refresh token itself is expired/revoked/reused ⇒ the session is unrecoverable. Clear
             // the in-RAM session FIRST (drops + zeroizes MK), then the Keychain tokens + biometric MK
             // cache, so `account_status` reports logged-out and the FE routes to a fresh sign-in.
+            tracing::warn!(
+                target: "share",
+                "session refresh REFUSED by the server (401) — the refresh token is expired/revoked/reused; clearing the session"
+            );
             if let Ok(mut sess) = state.account_session.lock() {
                 *sess = None;
             }
-            let _ = crate::share::clear_tokens();
-            let _ = crate::secrets::keychain::clear_account_mk();
+            if let Err(e) = crate::share::clear_tokens() {
+                tracing::warn!(
+                    target: "share",
+                    error = %e,
+                    "session-expired cleanup: clearing the Keychain tokens failed"
+                );
+            }
+            if let Err(e) = crate::secrets::keychain::clear_account_mk() {
+                tracing::warn!(
+                    target: "share",
+                    error = %e,
+                    "session-expired cleanup: clearing the biometric MK cache failed"
+                );
+            }
             return Err(AppError::Auth(
                 "your sharing session expired — sign in again".into(),
             ));
         }
         // A network/5xx failure is NOT an auth problem — propagate as-is and keep the session so a
         // later op can still refresh (never clear tokens on a transient error).
-        Err(e) => return Err(e),
+        Err(e) => {
+            tracing::warn!(
+                target: "share",
+                error = %e,
+                "session refresh failed transiently (network/server) — session kept"
+            );
+            return Err(e);
+        }
     };
 
-    // Persist the ROTATED pair (+ new expiry) immediately — re-presenting the OLD refresh token would
-    // revoke the family, so the new one must land before it is used again.
-    crate::share::store_tokens(&crate::share::PersistedTokens {
+    // RAM FIRST: the rotated pair becomes the live session immediately — the old refresh token is
+    // SPENT server-side, so nothing may ever present it again (MK + generation untouched).
+    let session_live = {
+        match state.account_session.lock() {
+            Ok(mut sess) => match sess.as_mut() {
+                Some(s) => {
+                    s.access_token = rotated.access_token.clone();
+                    s.access_expires_at = Some(rotated.access_expires_at.clone());
+                    s.refresh_token = rotated.refresh_token.clone();
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    };
+    // A logout raced the refresh (the session vanished while the network call was in flight): do NOT
+    // resurrect the rotated pair into the Keychain after an explicit sign-out — drop it on the floor
+    // (nothing holds it → the server family dies by TTL) and fail the op closed. The egress still
+    // happened, so the ledger row below is recorded first.
+    if !session_live {
+        crate::share::ledger_row(&state.db, &client.host(), "session_refresh", 0);
+        tracing::warn!(
+            target: "share",
+            "session vanished during a token refresh (logout raced it) — rotated tokens discarded"
+        );
+        return Err(AppError::Unavailable(
+            "not signed in to the sharing account".into(),
+        ));
+    }
+
+    // Best-effort Keychain mirror so the rotated pair survives a restart. A failure here is LOUD but
+    // NON-FATAL: the live session already holds the fresh pair; worst case the next restart falls
+    // back to a password login. Failing the op instead would strand a spent token as "current" and
+    // get the family revoked on the next refresh (the #205 failure mode).
+    if let Err(e) = crate::share::store_tokens(&crate::share::PersistedTokens {
         access_token: rotated.access_token.clone(),
         refresh_token: rotated.refresh_token,
-        device_id: tokens.device_id,
-        email: tokens.email,
-        account_id: tokens.account_id,
-        generation: tokens.generation,
+        device_id,
+        email,
+        account_id,
+        generation,
         access_expires_at: Some(rotated.access_expires_at.clone()),
-    })?;
-
-    // Update the in-RAM session's cached token + expiry in place (MK + generation untouched).
-    if let Ok(mut sess) = state.account_session.lock() {
-        if let Some(s) = sess.as_mut() {
-            s.access_token = rotated.access_token.clone();
-            s.access_expires_at = Some(rotated.access_expires_at.clone());
-        }
+    }) {
+        tracing::error!(
+            target: "share",
+            error = %e,
+            "rotated session tokens could NOT be persisted to the Keychain — session stays live in RAM but will not survive a restart"
+        );
+    } else {
+        tracing::info!(target: "share", "session refreshed (rotated pair persisted)");
     }
 
     // Content-free egress-ledger row (host + 0 bytes), consistent with `account_login`.
@@ -8247,7 +8355,7 @@ pub async fn account_login(
     // Persist tokens + the non-secret generation to the Keychain (never SQLite, never logged).
     crate::share::store_tokens(&crate::share::PersistedTokens {
         access_token: access_token.clone(),
-        refresh_token,
+        refresh_token: refresh_token.clone(),
         device_id: device_id.clone(),
         email: acct_id.clone(),
         account_id: acct_id.clone(),
@@ -8269,6 +8377,7 @@ pub async fn account_login(
             generation,
             access_token,
             access_expires_at,
+            refresh_token,
         });
     }
 
@@ -8329,9 +8438,17 @@ pub async fn unlock_sharing_with_biometric(
 
     // Release the cached MK behind a Touch ID prompt (signed build). Held zeroizing from here on;
     // fails closed if no cache exists or the user cancels the sheet.
-    let mk = Zeroizing::new(crate::secrets::keychain::read_account_mk_biometric(
-        "Unlock Murmur sharing",
-    )?);
+    let mk = Zeroizing::new(
+        crate::secrets::keychain::read_account_mk_biometric("Unlock Murmur sharing").inspect_err(
+            |e| {
+                tracing::warn!(
+                    target: "share",
+                    error = %e,
+                    "unlock_sharing_with_biometric: account-MK release failed (keychain/biometric)"
+                );
+            },
+        )?,
+    );
 
     // Rebuild the session from the persisted tokens + released MK (MK moved in, zeroized on drop).
     {
@@ -8349,8 +8466,13 @@ pub async fn unlock_sharing_with_biometric(
             // Carry the persisted expiry so the first share op refreshes proactively when the restored
             // token is already past its 30-min TTL (the common case after any real restart).
             access_expires_at: tokens.access_expires_at,
+            refresh_token: tokens.refresh_token,
         });
     }
+    tracing::info!(
+        target: "share",
+        "unlock_sharing_with_biometric: session restored from the biometric MK cache"
+    );
 
     account_status(state)
 }
@@ -9890,6 +10012,164 @@ mod lifecycle_tests {
             matches!(err2, AppError::Unavailable(_)),
             "past the lock gate, an unconsented/logged-out share fails Unavailable, got: {err2:?}"
         );
+    }
+
+    // ── session-refresh (0.7.3 re-enable) tests ─────────────────────────────────────────────────
+
+    /// Snapshot-and-restore guard for the DEV secret file (`MeetNotes-dev/dev-secrets.json`): the
+    /// refresh path's best-effort Keychain mirror writes REAL dev-store keys in a debug test run, and
+    /// this test must not clobber the developer's live dev-app share session. Restores on drop (also
+    /// on panic).
+    struct DevSecretsSnapshot {
+        path: std::path::PathBuf,
+        original: Option<Vec<u8>>,
+    }
+    impl DevSecretsSnapshot {
+        fn take() -> Self {
+            let path = dirs::data_dir()
+                .expect("data dir")
+                .join(crate::state::app_dir_name())
+                .join("dev-secrets.json");
+            let original = std::fs::read(&path).ok();
+            Self { path, original }
+        }
+    }
+    impl Drop for DevSecretsSnapshot {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// RED-before-GREEN for the 0.7.2 "sharing dies after a restart" regression: a session whose
+    /// bearer is PAST its 30-min server-side expiry MUST be proactively redeemed via
+    /// `/v1/auth/refresh` — the defanged `valid_access_token` returned the dead cached bearer, so
+    /// every share op after a restart 401'd until a full password re-login. Drives the REAL refresh
+    /// path against a local one-shot HTTP server (loopback `http` is allowed by the URL guardrails)
+    /// and proves the RAM-FIRST rotation: the fresh pair lands in the in-RAM session.
+    #[test]
+    fn valid_access_token_refreshes_a_stale_bearer() {
+        let _guard = DevSecretsSnapshot::take();
+
+        // One-shot local `/v1/auth/refresh`: read the full request, answer with a rotated pair.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read until the JSON body's closing brace has arrived (tiny body, no keep-alive reuse).
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if n == 0 || (text.contains("\r\n\r\n") && text.trim_end().ends_with('}')) {
+                    break;
+                }
+            }
+            let body = r#"{"accessToken":"fresh-access","refreshToken":"fresh-refresh","deviceId":"dev-1","accessExpiresAt":"2099-01-01T00:00:00Z"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            String::from_utf8_lossy(&req).to_string()
+        });
+
+        let state = build_state("refresh-stale-bearer");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "acct-1".into(),
+            email: "user@example.com".into(),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "stale-access".into(),
+            // Long past expiry ⇒ `access_token_needs_refresh` fires ⇒ the refresh MUST happen.
+            access_expires_at: Some("2020-01-01T00:00:00Z".into()),
+            refresh_token: "r0".into(),
+        });
+
+        let token = block_on(valid_access_token(&state)).unwrap();
+        assert_eq!(
+            token, "fresh-access",
+            "the bearer must be the ROTATED token, not the dead cached one (the 0.7.2 defang bug)"
+        );
+
+        let req = server.join().unwrap();
+        assert!(
+            req.contains("POST /v1/auth/refresh"),
+            "must redeem the refresh token at /v1/auth/refresh, got: {req}"
+        );
+        assert!(req.contains("r0"), "must present the CURRENT refresh token");
+
+        // RAM-first rotation: the fresh pair is live in the session immediately.
+        let g = state.account_session.lock().unwrap();
+        let s = g.as_ref().unwrap();
+        assert_eq!(s.access_token, "fresh-access");
+        assert_eq!(
+            s.refresh_token, "fresh-refresh",
+            "the rotated refresh token must land in the in-RAM session (RAM-first)"
+        );
+        assert_eq!(s.access_expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+    }
+
+    /// A TRANSIENT refresh failure (server unreachable) must NOT kill the session: the cached bearer
+    /// comes back (it may still be inside the 120 s skew; a genuinely dead one fails closed at the
+    /// server) and the session — including the biometric restore path's state — stays intact. This is
+    /// the OTHER half of the 0.7.1 (#205) regression, where any refresh hiccup wiped the session.
+    #[test]
+    fn transient_refresh_failure_keeps_the_cached_session() {
+        // A bound-then-dropped port: connecting fails fast (connection refused), no server runs.
+        let dead_addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+
+        let state = build_state("refresh-transient");
+        state.config.lock().unwrap().share_base_url = format!("http://{dead_addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "acct-1".into(),
+            email: "user@example.com".into(),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "cached-access".into(),
+            access_expires_at: Some("2020-01-01T00:00:00Z".into()),
+            refresh_token: "r0".into(),
+        });
+
+        let token = block_on(valid_access_token(&state)).unwrap();
+        assert_eq!(
+            token, "cached-access",
+            "a transient refresh failure must fall back to the cached bearer, not error"
+        );
+
+        // The session survives untouched — nothing cleared, refresh token still spendable.
+        let g = state.account_session.lock().unwrap();
+        let s = g.as_ref().expect("session must NOT be cleared on a transient failure");
+        assert_eq!(s.refresh_token, "r0");
+    }
+
+    /// The pure failure policy: a DEFINITIVE `Auth` refusal propagates (the session is dead and
+    /// `refresh_session` already cleared it — the FE must route to sign-in); every other failure
+    /// domain falls back to the cached bearer.
+    #[test]
+    fn refresh_failure_fallback_policy() {
+        let auth = refresh_failure_fallback(AppError::Auth("refused".into()), "cached".into());
+        assert!(matches!(auth, Err(AppError::Auth(_))));
+        let net =
+            refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
+        assert_eq!(net.unwrap(), "cached");
+        let storage = refresh_failure_fallback(AppError::Storage("disk".into()), "cached".into());
+        assert_eq!(storage.unwrap(), "cached");
     }
 
     // ── M5-CLIENT (mode B) tests ──────────────────────────────────────────────────────────────────

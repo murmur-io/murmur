@@ -371,12 +371,16 @@ export class SharePanelComponent {
     }
   }
 
-  /** Turn a raw biometric-unlock error into a friendly fall-back message. */
+  /**
+   * Turn a raw biometric-unlock error into a friendly fall-back message. The raw backend error is
+   * APPENDED (not swallowed) — field debugging of the signed build depends on the real cause
+   * reaching the screen (keychain OSStatus, "no cached account key", …), not a generic apology.
+   */
   private friendlyUnlockError(raw: string): string {
     if (/cancel/i.test(raw)) {
       return "Touch ID was cancelled. Use Unlock for sharing to unlock with your password.";
     }
-    return "Couldn't unlock with Touch ID. Use Unlock for sharing to unlock with your password.";
+    return `Couldn't unlock with Touch ID — ${raw}. Use Unlock for sharing to unlock with your password.`;
   }
 
   // --- CONFIGURE handlers ---------------------------------------------------
