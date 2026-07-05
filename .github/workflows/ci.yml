@@ -69,7 +69,7 @@ jobs:
         run: rustup show
 
       - name: Cache Rust build (registry + git + src-tauri/target)
-        uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
 
@@ -82,7 +82,7 @@ jobs:
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 
       - name: Cache whisper model (ggml-base.en.bin, ~142 MB)
-        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/Library/Application Support/MeetNotes/models
           key: whisper-ggml-base-en-v1

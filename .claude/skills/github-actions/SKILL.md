@@ -29,8 +29,13 @@ gh api repos/Swatinem/rust-cache/git/tags/<that-sha> --jq '.object.sha'       # 
 
 Pin the **commit** sha, comment the version. Currently pinned in `ci.yml`:
 `actions/checkout@…11bd719 # v4.2.2`, `actions/setup-node@…39370e3 # v4.1.0`,
-`Swatinem/rust-cache@…82a92a6 # v2.7.5`, `taiki-e/install-action@…678b06b # v2.44.60`,
-`actions/cache@…6849a64 # v4.1.2`.
+`Swatinem/rust-cache@…c193711 # v2.9.1`, `taiki-e/install-action@…678b06b # v2.44.60`,
+`actions/cache@…55cc834 # v6.1.0`.
+
+**Cache-service deprecation (bitten 2026-07-05):** GitHub killed the legacy cache
+backend — `actions/cache` < v4.2 and `Swatinem/rust-cache` < v2.7.8 are AUTO-FAILED
+at job setup ("deprecated version of actions/cache"). If a run dies before the first
+step with that error, bump BOTH cache actions to current tags (resolve SHAs live).
 
 ## Make it fast (or the team routes around it)
 
