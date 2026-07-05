@@ -7,6 +7,9 @@
 .playwright-mcp/
 /settings-audio-controls.png
 .claude/worktrees/
+.codex/worktrees/
+.codex/tmp/
+.codex/claude-settings.local.migrated.json
 *.gguf
 *.wav
 *.mp4

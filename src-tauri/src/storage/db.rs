@@ -437,7 +437,35 @@ impl Db {
                created_at TEXT NOT NULL,
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );
-             CREATE INDEX IF NOT EXISTS idx_voiceprints_meeting ON speaker_voiceprints(meeting_id);",
+             CREATE INDEX IF NOT EXISTS idx_voiceprints_meeting ON speaker_voiceprints(meeting_id);
+
+             -- Re-Truth (the vault heals itself). One row per SUPERSESSION: a fact asserted in
+             -- `superseding_meeting_id` invalidated an older fact sourced in `source_meeting_id`.
+             -- Surfaced for REVIEW; on apply we APPEND an Obsidian callout to the source note
+             -- (append-only = never mangling prose) and snapshot the exact pre-image bytes of each
+             -- stamped note (`*_pre_image`) so undo restores them byte-identical. `applied_at` NULL =
+             -- pending; a stamp instant once applied. DELIBERATELY carries NO foreign key: a row
+             -- references TWO meetings, so a single FK can't cover both — `delete_meeting` purges
+             -- rows referencing EITHER meeting via `purge_supersessions_tx` instead. The pre-images
+             -- hold plaintext note bytes, so a sealed source contributes NONE (the read command is
+             -- folder-lock + unlock gated, and rows are only ever recorded for open-folder sources).
+             CREATE TABLE IF NOT EXISTS supersessions (
+               id TEXT PRIMARY KEY,
+               superseding_meeting_id TEXT NOT NULL,
+               source_meeting_id TEXT NOT NULL,
+               entity TEXT NOT NULL,
+               predicate TEXT NOT NULL,
+               old_value TEXT NOT NULL,
+               new_value TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               applied_at TEXT,
+               source_pre_image BLOB,
+               superseding_pre_image BLOB
+             );
+             CREATE INDEX IF NOT EXISTS idx_supersessions_superseding
+               ON supersessions(superseding_meeting_id);
+             CREATE INDEX IF NOT EXISTS idx_supersessions_source
+               ON supersessions(source_meeting_id);",
         )
         .map_err(map_err)?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
@@ -665,6 +693,14 @@ impl Db {
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_acct_id", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_email", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "content_hash", "BLOB")?;
+
+        // Re-Truth: guarded ALTERs for the supersession undo pre-images. The columns are also in the
+        // `CREATE TABLE IF NOT EXISTS supersessions` above (so a fresh DB gets them there and these are
+        // no-ops), but a dev DB that created the table in an EARLIER iteration of this branch — before
+        // the pre-image columns existed — would otherwise lack them and error "no such column" in
+        // `store_supersession_pre_images`. Additive + idempotent, per the migration rule.
+        Self::add_column_if_missing(&conn, "supersessions", "source_pre_image", "BLOB")?;
+        Self::add_column_if_missing(&conn, "supersessions", "superseding_pre_image", "BLOB")?;
 
         // WS8 / capture-default: one-time flip of the SYSTEM-AUDIO-CAPTURE default to ON for the
         // INSTALLED base (fresh installs already default ON via `AppConfig::default().capture_system_audio`
@@ -1812,6 +1848,10 @@ impl Db {
         // Phase F0: drop this meeting's correction-log rows too (same tx) — a deleted meeting leaves
         // no plaintext-derived training data behind.
         Self::purge_corrections_tx(&tx, &[id.to_string()])?;
+        // Re-Truth: drop supersession rows referencing this meeting on EITHER side (no FK — see
+        // purge_supersessions_tx). Their pre-images hold plaintext note bytes; a deleted meeting must
+        // leave none behind.
+        Self::purge_supersessions_tx(&tx, &[id.to_string()])?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
@@ -2089,6 +2129,13 @@ impl Db {
         // the SAME seal tx — a sealed meeting's remote-speaker voiceprint must not linger at rest,
         // same purge-on-seal contract as `user_facts` above. Re-derivable on a later re-diarize.
         Self::purge_speaker_voiceprints_tx(&tx, meeting_ids)?;
+        // Re-Truth LOCK-SAFETY: an APPLIED supersession stores the PLAINTEXT note pre-image (undo
+        // scratch). Drop every supersession referencing a sealed meeting (either side) in the SAME
+        // seal tx so no plaintext note content lingers at rest for a sealed folder — identical
+        // purge-on-seal contract as `facts` / `user_facts` above. The stamp itself rides INSIDE the
+        // sealed note content and returns (with the stamp) on unlock/remove-lock; only the undo
+        // scratch is dropped.
+        Self::purge_supersessions_tx(&tx, meeting_ids)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -2104,6 +2151,22 @@ impl Db {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM facts WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Re-Truth cascade: delete every `supersessions` row referencing `meeting_ids` on EITHER side
+    /// (superseding OR source) within an EXISTING transaction, so a deleted meeting leaves no dangling
+    /// supersession behind. The table carries no foreign key (a row references two meetings), so this
+    /// explicit purge — mirroring `purge_facts_tx` — is what keeps `delete_meeting` clean. Idempotent.
+    fn purge_supersessions_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM supersessions
+                   WHERE superseding_meeting_id = ?1 OR source_meeting_id = ?1",
                 rusqlite::params![mid],
             )
             .map_err(map_err)?;
@@ -3514,6 +3577,170 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// DESTRUCTIVE escape hatch for a folder whose master KEK is GENUINELY UNRECOVERABLE (the caller
+    /// — `discard_unrecoverable_folder_lock` — has already PROVEN, via the full read-first + candidate
+    /// recovery ladder, that no key unwraps this folder's content key). Discards ONLY this folder's
+    /// sealed payload and returns the folder to an open, usable state. The encrypted `*_blob`
+    /// ciphertext is unrecoverable anyway (its key is gone), so this destroys nothing that was
+    /// otherwise readable — it just stops the folder being permanently bricked.
+    ///
+    /// In one transaction, scoped to THIS folder's meetings + documents: NULL every sealed blob and
+    /// blank the (already-empty) plaintext columns, purge every derived table that could hold
+    /// sealed-content-derived data (chunks/vectors/facts/user-facts/correction-log/assistant-log/
+    /// voiceprints), then clear the folder's `wrapped_key` and set `locked = 0`. Returns the at-rest
+    /// audio columns of the folder's meetings so the caller can delete the orphaned `.enc` files on
+    /// disk (the DB layer stays pure-SQL). NEVER call this without the caller's non-recoverability
+    /// proof — it is the one path that discards sealed content by design (and now provably only the
+    /// sealed, unrecoverable part — never a readable never-sealed buffer).
+    pub fn discard_folder_seal(&self, folder_id: &str) -> Result<Vec<String>> {
+        // Meetings that belong to THIS folder (folder_id lives on the notes row — the same join the
+        // seal/relock paths use). Documents anchor on the folder row directly.
+        const FOLDER_MEETINGS: &str =
+            "SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1";
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+
+        // Collect ONLY the SEALED (`.enc`) audio paths to unlink — a never-sealed plaintext WAV is
+        // readable content and is left untouched (file kept, column kept).
+        let mut enc_paths: Vec<String> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT audio_path, mic_master_path, sys_master_path FROM meetings \
+                       WHERE id IN ({FOLDER_MEETINGS})"
+                ))
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![folder_id], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(map_err)?;
+            for r in rows {
+                let (a, m, s) = r.map_err(map_err)?;
+                for p in [a, m, s].into_iter().flatten() {
+                    if p.ends_with(".enc") {
+                        enc_paths.push(p);
+                    }
+                }
+            }
+        }
+
+        // Notes: blank plaintext + export path ONLY of rows that WERE sealed (blob present); a
+        // never-sealed row (blob NULL) keeps its readable plaintext. Then drop the unrecoverable blob.
+        tx.execute(
+            "UPDATE notes SET markdown = '', exported_path = NULL WHERE folder_id = ?1 AND content_blob IS NOT NULL",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE notes SET content_blob = NULL WHERE folder_id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        // Transcript segments + timeline.
+        tx.execute(
+            &format!("UPDATE segments SET text = '' WHERE text_blob IS NOT NULL AND meeting_id IN ({FOLDER_MEETINGS})"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("UPDATE segments SET text_blob = NULL WHERE meeting_id IN ({FOLDER_MEETINGS})"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("UPDATE timelines SET data = '' WHERE data_blob IS NOT NULL AND meeting_id IN ({FOLDER_MEETINGS})"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("UPDATE timelines SET data_blob = NULL WHERE meeting_id IN ({FOLDER_MEETINGS})"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        // Typed realtime notes.
+        tx.execute(
+            &format!("UPDATE meetings SET manual_notes = '' WHERE manual_notes_blob IS NOT NULL AND id IN ({FOLDER_MEETINGS})"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!("UPDATE meetings SET manual_notes_blob = NULL WHERE id IN ({FOLDER_MEETINGS})"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        // At-rest audio: null ONLY the SEALED (`.enc`) columns; a plaintext WAV column is preserved.
+        for col in ["audio_path", "mic_master_path", "sys_master_path"] {
+            tx.execute(
+                &format!("UPDATE meetings SET {col} = NULL WHERE {col} LIKE '%.enc' AND id IN ({FOLDER_MEETINGS})"),
+                rusqlite::params![folder_id],
+            )
+            .map_err(map_err)?;
+        }
+
+        // Derived / invertible tables — purge anything keyed on the folder's meetings (vectors first
+        // by chunk_id, then the source rows), mirroring the seal-time purge in
+        // `reblank_locked_folders_at_rest` but scoped to this one folder. Surviving never-sealed
+        // plaintext re-derives its chunks/vectors on next access.
+        tx.execute(
+            &format!("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM note_chunks WHERE meeting_id IN ({FOLDER_MEETINGS}))"),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        for table in [
+            "note_chunks",
+            "correction_log",
+            "assistant_interactions",
+            "facts",
+            "user_facts",
+            "speaker_voiceprints",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE meeting_id IN ({FOLDER_MEETINGS})"),
+                rusqlite::params![folder_id],
+            )
+            .map_err(map_err)?;
+        }
+
+        // Documents anchored on this folder: drop sealed ciphertext + plaintext + their chunks/vectors.
+        tx.execute(
+            "DELETE FROM doc_vec_chunks WHERE chunk_id IN \
+               (SELECT id FROM doc_chunks WHERE document_id IN \
+                  (SELECT id FROM documents WHERE folder_id = ?1))",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM doc_chunks WHERE document_id IN (SELECT id FROM documents WHERE folder_id = ?1)",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE documents SET text = '' WHERE text_blob IS NOT NULL AND folder_id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE documents SET text_blob = NULL WHERE folder_id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+
+        // Finally flip the folder OPEN and drop its (now-useless) wrapped content key.
+        tx.execute(
+            "UPDATE folders SET locked = 0, wrapped_key = NULL WHERE id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+
+        tx.commit().map_err(map_err)?;
+        Ok(enc_paths)
+    }
+
     /// Direct CHILD folders of `parent_id` (one level only — not transitive). Used by
     /// `rename_folder`/`delete_folder` to walk the subtree so a rename can re-prefix descendant
     /// paths and a delete can refuse a non-empty tree.
@@ -3773,6 +4000,10 @@ impl Db {
             // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
             // nothing to the flywheel.
             Self::purge_corrections_tx(&tx, &meeting_ids)?;
+            // Re-Truth LOCK-SAFETY: drop supersession rows referencing any meeting in these
+            // (re-blanked / sealed) folders — an applied row's plaintext note pre-image must not
+            // linger at rest for a sealed folder (same purge-on-seal contract as corrections above).
+            Self::purge_supersessions_tx(&tx, &meeting_ids)?;
             // NOTE: the typed-notes (`manual_notes`) re-blank does NOT live here — it is SEALED-AND-
             // RESTORED content (not a derived/purgeable artifact like chunks/corrections), so its
             // plaintext is re-blanked only WHERE the `manual_notes_blob` exists, by
@@ -3879,6 +4110,21 @@ impl Db {
         // voiceprint at rest after a restart. Same purge-on-seal contract as `user_facts` above.
         tx.execute(
             &format!("DELETE FROM speaker_voiceprints WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // Re-Truth LOCK-SAFETY: purge every supersession referencing a locked meeting on EITHER side,
+        // in this same reconciliation transaction — so a crash-while-unlocked (which may have applied a
+        // stamp + stored plaintext note pre-images, or recorded old/new fact-value strings against a
+        // since-sealed meeting) cannot leave those plaintext bytes/strings at rest after a restart.
+        // Same purge-on-seal contract as `facts` / `user_facts` above; the row references two meetings
+        // so it matches on both `source_meeting_id` and `superseding_meeting_id`.
+        tx.execute(
+            &format!(
+                "DELETE FROM supersessions \
+                   WHERE source_meeting_id IN ({LOCKED_MEETINGS}) \
+                      OR superseding_meeting_id IN ({LOCKED_MEETINGS})"
+            ),
             [],
         )
         .map_err(map_err)?;
@@ -5308,6 +5554,200 @@ impl Db {
         Ok(out)
     }
 
+    // ── Re-Truth (supersessions) ────────────────────────────────────────────────
+    //
+    // These are RAW lifecycle reads/writes of the `supersessions` table; the CONTENT gate
+    // (folder-lock + `meeting_is_unlocked`) lives in the commands, exactly like `facts_for_entities`
+    // (raw) vs `list_facts_visible` (gated). Rows are only ever RECORDED for open-folder sources, and
+    // the read command re-gates, so a raw list never leaks a sealed source note's bytes.
+
+    /// Record supersession rows, skipping any whose natural key already exists (idempotent across
+    /// re-summarize — a plain re-summarize reconciles to `NoOp` and emits no new `Invalidate`, but
+    /// this dedupe is the belt-and-suspenders guard). Returns how many NEW rows were inserted. Each
+    /// row is inserted UNAPPLIED (`applied_at` + both pre-images NULL); the pre-images are filled only
+    /// at apply time. One atomic transaction for the batch.
+    pub fn record_supersessions(&self, rows: &[crate::storage::models::SupersessionRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let mut inserted = 0usize;
+        for r in rows {
+            // Natural key = the full assertion (both meetings + entity/predicate/old/new). A duplicate
+            // is a no-op regardless of applied state, so a re-record never resurrects a stamped row.
+            let exists: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM supersessions
+                       WHERE superseding_meeting_id = ?1 AND source_meeting_id = ?2
+                         AND entity = ?3 AND predicate = ?4 AND old_value = ?5 AND new_value = ?6",
+                    rusqlite::params![
+                        r.superseding_meeting_id,
+                        r.source_meeting_id,
+                        r.entity,
+                        r.predicate,
+                        r.old_value,
+                        r.new_value,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            if exists > 0 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO supersessions
+                   (id, superseding_meeting_id, source_meeting_id, entity, predicate,
+                    old_value, new_value, created_at, applied_at, source_pre_image,
+                    superseding_pre_image)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)",
+                rusqlite::params![
+                    r.id,
+                    r.superseding_meeting_id,
+                    r.source_meeting_id,
+                    r.entity,
+                    r.predicate,
+                    r.old_value,
+                    r.new_value,
+                    r.created_at,
+                ],
+            )
+            .map_err(map_err)?;
+            inserted += 1;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(inserted)
+    }
+
+    /// RAW read: UNAPPLIED supersession rows for one superseding meeting, oldest first. The command
+    /// re-gates each row on its SOURCE meeting (folder-lock + unlock) before surfacing it.
+    pub fn unapplied_supersessions_for(
+        &self,
+        superseding_meeting_id: &str,
+    ) -> Result<Vec<crate::storage::models::SupersessionRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, superseding_meeting_id, source_meeting_id, entity, predicate,
+                        old_value, new_value, created_at, applied_at, source_pre_image,
+                        superseding_pre_image
+                   FROM supersessions
+                  WHERE superseding_meeting_id = ?1 AND applied_at IS NULL
+                  ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![superseding_meeting_id], row_to_supersession)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// RAW read: EVERY supersession row that touches `meeting_id` on either side (source OR
+    /// superseding), oldest first. Used by partial-undo to enumerate the SURVIVOR stamps on a note
+    /// file (rows NOT being undone that remain applied) so their on-disk stamps can be replayed after
+    /// the file is reverted to pristine. `path ↔ meeting` is 1:1 (each note has a unique `.md`), so a
+    /// meeting id keys the file's survivors.
+    pub fn supersessions_touching_meeting(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Vec<crate::storage::models::SupersessionRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, superseding_meeting_id, source_meeting_id, entity, predicate,
+                        old_value, new_value, created_at, applied_at, source_pre_image,
+                        superseding_pre_image
+                   FROM supersessions
+                  WHERE source_meeting_id = ?1 OR superseding_meeting_id = ?1
+                  ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], row_to_supersession)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// RAW read: one supersession row by id (for apply/undo).
+    pub fn get_supersession(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::storage::models::SupersessionRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, superseding_meeting_id, source_meeting_id, entity, predicate,
+                    old_value, new_value, created_at, applied_at, source_pre_image,
+                    superseding_pre_image
+               FROM supersessions WHERE id = ?1",
+            rusqlite::params![id],
+            row_to_supersession,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// DURABLE-BEFORE-WRITE undo capture: persist the exact PRISTINE (pre-batch) pre-image bytes of
+    /// the note(s) a supersession is about to stamp, BEFORE the `.md` is written, so a crash between
+    /// the write and `mark_supersession_applied` still leaves a recoverable un-stamped pre-image. The
+    /// apply path resolves the bytes from a per-note-file pristine cache and calls this at most once
+    /// per field — and never re-snapshots a possibly-stamped file. `COALESCE` makes a `None` argument
+    /// a NO-OP for that column (it never clobbers an already-stored pristine backup — e.g. a retry
+    /// where the superseding note has since sealed). `applied_at` is left untouched (still NULL until
+    /// the write completes).
+    pub fn store_supersession_pre_images(
+        &self,
+        id: &str,
+        source_pre_image: Option<&[u8]>,
+        superseding_pre_image: Option<&[u8]>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE supersessions
+                SET source_pre_image = COALESCE(?2, source_pre_image),
+                    superseding_pre_image = COALESCE(?3, superseding_pre_image)
+              WHERE id = ?1",
+            rusqlite::params![id, source_pre_image, superseding_pre_image],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Mark a supersession APPLIED: stamp `applied_at` ONLY. The pre-images are captured separately
+    /// (and durably) by `store_supersession_pre_images` BEFORE the file write — so `applied_at` is the
+    /// LAST write, flipped only once the note(s) are safely stamped.
+    pub fn mark_supersession_applied(&self, id: &str, applied_at: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE supersessions SET applied_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, applied_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear the APPLIED state (undo): `applied_at` back to NULL and both pre-images dropped, once the
+    /// caller has restored the note bytes on disk. The pre-images are transient undo scratch — they do
+    /// not linger once the stamp is reverted.
+    pub fn clear_supersession_applied(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE supersessions
+                SET applied_at = NULL, source_pre_image = NULL, superseding_pre_image = NULL
+              WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// GATED `/people` personal-CRM rollup: one [`PersonCard`] per VISIBLE Person entity, built
     /// ENTIRELY from the existing gated graph/facts/commitment readers — NO new or ungated query.
     ///
@@ -5863,6 +6303,27 @@ fn row_to_user_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
         recorded_at: row.get(6)?,
         meeting_id: row.get(7)?,
         confidence: row.get(8)?,
+    })
+}
+
+/// Map a `supersessions` row (id, superseding_meeting_id, source_meeting_id, entity, predicate,
+/// old_value, new_value, created_at, applied_at, source_pre_image, superseding_pre_image) to a row
+/// struct.
+fn row_to_supersession(
+    row: &Row<'_>,
+) -> rusqlite::Result<crate::storage::models::SupersessionRow> {
+    Ok(crate::storage::models::SupersessionRow {
+        id: row.get(0)?,
+        superseding_meeting_id: row.get(1)?,
+        source_meeting_id: row.get(2)?,
+        entity: row.get(3)?,
+        predicate: row.get(4)?,
+        old_value: row.get(5)?,
+        new_value: row.get(6)?,
+        created_at: row.get(7)?,
+        applied_at: row.get(8)?,
+        source_pre_image: row.get(9)?,
+        superseding_pre_image: row.get(10)?,
     })
 }
 
@@ -10215,6 +10676,151 @@ mod lock_tests {
         assert!(
             db.facts_for_entities(&[atlas]).unwrap().is_empty(),
             "FK CASCADE drops facts"
+        );
+    }
+
+    // ── Re-Truth (supersessions): record/dedup/lifecycle + purge-on-delete + purge-on-seal ──
+
+    fn supersession_row(id: &str, superseding: &str, source: &str) -> crate::storage::models::SupersessionRow {
+        crate::storage::models::SupersessionRow {
+            id: id.to_string(),
+            superseding_meeting_id: superseding.to_string(),
+            source_meeting_id: source.to_string(),
+            entity: "Atlas".to_string(),
+            predicate: "status".to_string(),
+            old_value: "in-progress".to_string(),
+            new_value: "shipped".to_string(),
+            created_at: "2026-06-20T00:00:00Z".to_string(),
+            applied_at: None,
+            source_pre_image: None,
+            superseding_pre_image: None,
+        }
+    }
+
+    /// record → unapplied read → DEDUP on natural key → mark applied (with pre-images) → applied row
+    /// leaves the unapplied set → clear (undo) restores it as pending + drops the pre-images.
+    #[test]
+    fn supersessions_record_dedup_and_lifecycle() {
+        let db = file_db("retruth-lifecycle");
+        assert_eq!(
+            db.record_supersessions(&[supersession_row("s1", "m2", "m1")])
+                .unwrap(),
+            1
+        );
+        // Re-record the SAME natural key → deduped (0 new), one row total.
+        assert_eq!(
+            db.record_supersessions(&[supersession_row("s1-dup", "m2", "m1")])
+                .unwrap(),
+            0,
+            "identical natural key is deduped"
+        );
+        let pending = db.unapplied_supersessions_for("m2").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "s1");
+        assert!(pending[0].applied_at.is_none());
+
+        // Durably store a pre-image (undo scratch), THEN mark applied (applied_at is the last write).
+        db.store_supersession_pre_images("s1", Some(&b"ORIGINAL"[..]), None)
+            .unwrap();
+        db.mark_supersession_applied("s1", "2026-06-21T00:00:00Z").unwrap();
+        assert!(
+            db.unapplied_supersessions_for("m2").unwrap().is_empty(),
+            "an applied row is no longer pending"
+        );
+        let got = db.get_supersession("s1").unwrap().unwrap();
+        assert_eq!(got.applied_at.as_deref(), Some("2026-06-21T00:00:00Z"));
+        assert_eq!(got.source_pre_image.as_deref(), Some(&b"ORIGINAL"[..]));
+
+        // Clear (undo) → pending again, pre-image dropped.
+        db.clear_supersession_applied("s1").unwrap();
+        let after = db.get_supersession("s1").unwrap().unwrap();
+        assert!(after.applied_at.is_none());
+        assert!(after.source_pre_image.is_none());
+        assert_eq!(db.unapplied_supersessions_for("m2").unwrap().len(), 1);
+    }
+
+    /// delete_meeting purges supersessions referencing that meeting on EITHER side (no FK — the
+    /// explicit `purge_supersessions_tx`). RED-before-GREEN: without the purge the row survives.
+    #[test]
+    fn delete_meeting_purges_supersessions_either_side() {
+        let db = file_db("retruth-delete");
+        // Row where the deleted meeting is the SOURCE.
+        db.record_supersessions(&[supersession_row("s-src", "m2", "m1")])
+            .unwrap();
+        db.delete_meeting("m1").unwrap();
+        assert!(
+            db.get_supersession("s-src").unwrap().is_none(),
+            "deleting the source meeting purges its supersession"
+        );
+        // Row where the deleted meeting is the SUPERSEDING side.
+        db.record_supersessions(&[supersession_row("s-sup", "m3", "m4")])
+            .unwrap();
+        db.delete_meeting("m3").unwrap();
+        assert!(
+            db.get_supersession("s-sup").unwrap().is_none(),
+            "deleting the superseding meeting purges its supersession"
+        );
+    }
+
+    /// PURGE-ON-SEAL: the seal purge tx (`purge_chunks_for_meetings`) also drops supersessions
+    /// referencing the sealed meeting — an applied row's PLAINTEXT note pre-image must not linger at
+    /// rest for a sealed folder. RED-before-GREEN: without the `purge_supersessions_tx` call the row
+    /// (and its plaintext pre-image) survives the seal.
+    #[test]
+    fn seal_purges_supersessions() {
+        let db = file_db("retruth-seal");
+        db.record_supersessions(&[supersession_row("s1", "m2", "m1")])
+            .unwrap();
+        // Simulate apply having stored the plaintext pre-image + marked applied.
+        db.store_supersession_pre_images("s1", Some(&b"PLAINTEXT NOTE"[..]), None)
+            .unwrap();
+        db.mark_supersession_applied("s1", "2026-06-21T00:00:00Z").unwrap();
+        // Seal the source meeting's folder → the seal purge tx runs for m1.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert!(
+            db.get_supersession("s1").unwrap().is_none(),
+            "a sealed meeting's supersession (+ its plaintext pre-image) must be purged on seal"
+        );
+    }
+
+    /// STARTUP crash-while-unlocked reconcile: `reblank_locked_folders_at_rest` must purge every
+    /// supersession referencing a locked meeting on EITHER side — so an applied row's plaintext note
+    /// pre-images + fact-value strings do not linger at rest behind the lock after a restart. Mirrors
+    /// `seal_purges_supersessions` but drives the STARTUP path. RED-before-GREEN: without the
+    /// supersessions DELETE in that fn, both rows survive the reblank.
+    #[test]
+    fn reblank_at_rest_purges_supersessions() {
+        let db = file_db("retruth-reblank");
+        seed_folder(&db, "f-src", "Work");
+        seed_folder(&db, "f-open", "Reviews");
+        seed_note(&db, "m1", "source note", Some("f-src"));
+        seed_note(&db, "m2", "other note", Some("f-open"));
+        // Row A: the to-be-locked meeting m1 is the SOURCE. Row B: m1 is the SUPERSEDING side.
+        db.record_supersessions(&[supersession_row("s-src", "m2", "m1")])
+            .unwrap();
+        db.record_supersessions(&[supersession_row("s-sup", "m1", "m2")])
+            .unwrap();
+        // Simulate both APPLIED with plaintext pre-images (the leak-at-rest scratch).
+        for id in ["s-src", "s-sup"] {
+            db.store_supersession_pre_images(id, Some(&b"PLAINTEXT NOTE"[..]), None)
+                .unwrap();
+            db.mark_supersession_applied(id, "2026-06-21T00:00:00Z").unwrap();
+        }
+        assert!(db.get_supersession("s-src").unwrap().is_some());
+        assert!(db.get_supersession("s-sup").unwrap().is_some());
+
+        // Lock m1's folder on disk, then run the startup at-rest reblank (crash-while-unlocked path).
+        db.set_folder_locked("f-src", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        db.reblank_locked_folders_at_rest().unwrap();
+
+        assert!(
+            db.get_supersession("s-src").unwrap().is_none(),
+            "source-side supersession (+ plaintext pre-image) purged at rest"
+        );
+        assert!(
+            db.get_supersession("s-sup").unwrap().is_none(),
+            "superseding-side supersession (+ plaintext pre-image) purged at rest"
         );
     }
 

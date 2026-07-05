@@ -82,12 +82,17 @@ pub fn run() {
     match log_file {
         Some(file) => {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
+            // Wrap the file in an Arc ONCE and tee stderr + the file. tracing-subscriber implements
+            // MakeWriter for Arc<W> where &W: io::Write (std impls Write for &File), so every event
+            // writes through the shared handle with NO per-event fd clone. The previous
+            // `move || file.try_clone().expect(...)` closure ran a `dup(2)` per log line and PANICKED
+            // on fd exhaustion — inside the logging subsystem whose whole job is to stay alive through
+            // exactly the resource pressure this app has hit in the field. No panic on the log hot path.
+            let file = std::sync::Arc::new(file);
             tracing_subscriber::fmt()
                 .with_env_filter(log_filter)
                 .with_ansi(false)
-                .with_writer(
-                    std::io::stderr.and(move || file.try_clone().expect("clone murmur.log fd")),
-                )
+                .with_writer(std::io::stderr.and(file))
                 .init()
         }
         None => tracing_subscriber::fmt().with_env_filter(log_filter).init(),
@@ -133,6 +138,10 @@ pub fn run() {
             commands::get_user_memory,
             commands::forget_user_fact,
             commands::clear_user_memory,
+            // Re-Truth (the vault heals itself) — supersession review + one-tap stamp + undo.
+            commands::preview_supersessions,
+            commands::apply_supersessions,
+            commands::undo_supersessions,
             commands::get_config,
             commands::save_config,
             commands::get_storage_report,
@@ -259,6 +268,8 @@ pub fn run() {
             commands::relock_folder,
             commands::relock_all,
             commands::remove_lock,
+            commands::discard_unrecoverable_folder_lock,
+            commands::discard_unrecoverable_meeting_lock,
             update::check_for_update,
             update::app_info,
             update::open_release_page,

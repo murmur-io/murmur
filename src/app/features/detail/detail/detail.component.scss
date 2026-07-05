@@ -163,6 +163,21 @@
 .lock-gate-btn {
   margin-top: var(--space-2);
 }
+.lock-gate-reset {
+  margin-top: var(--space-3);
+  font-size: 0.875rem;
+  opacity: 0.75;
+}
+.lock-gate-reset-warn {
+  margin-top: var(--space-3);
+  color: var(--danger);
+}
+.lock-gate-reset-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: center;
+  margin-top: var(--space-2);
+}
 
 /* Print / Save-as-PDF — isolate the note. Invoked from the Note tab's
    ⋯ menu, so <app-note-panel> is always present. Driven by
