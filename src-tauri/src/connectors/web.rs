@@ -104,7 +104,7 @@ impl WebSearchProvider for BraveSearch {
     }
 
     async fn search(&self, redacted_query: &str, api_key: &str) -> ConnectorResult {
-        let client = reqwest::Client::new();
+        let client = super::http_client();
         let resp = client
             .get(&self.base_url)
             .query(&[("q", redacted_query)])
