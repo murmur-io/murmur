@@ -1,0 +1,33 @@
+.verify-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.verify-head {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+.verify-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.verify-item {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+
+  &.is-conflict .verify-glyph {
+    color: var(--warning);
+  }
+  &.is-notfound .verify-glyph {
+    color: var(--text-secondary);
+  }
+  &.is-confirmed .verify-glyph {
+    color: var(--success);
+  }
+}

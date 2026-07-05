@@ -671,6 +671,20 @@ export interface NoteDto {
   exportedPath: string | null;
 }
 
+/**
+ * One deterministic note-verify finding: a ticket claim in the note checked against LIVE Jira.
+ * Mirrors Rust `crate::verify::VerifyFinding`. NOTE the serde casing — `Verdict` derives
+ * `#[serde(rename_all = "lowercase")]`, so `Verdict::NotFound` serializes as `"notfound"`
+ * (NOT `"not_found"`); keep this union in lockstep with the backend enum.
+ */
+export interface VerifyFindingDto {
+  lineNo: number;
+  key: string;
+  verdict: "confirmed" | "notfound" | "conflict";
+  detail: string;
+  url: string;
+}
+
 export interface StartResult {
   meetingId: string;
 }
