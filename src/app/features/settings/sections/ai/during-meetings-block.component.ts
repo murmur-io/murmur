@@ -25,17 +25,23 @@ import { SettingsStore } from "../../settings.store";
       <div class="use-group">
         <span class="use-group-label text-muted">Live during meetings</span>
 
-        <label class="toggle-row">
-          <span class="toggle-copy">
-            <span class="toggle-title">In-meeting voice assistant</span>
-            <span class="text-secondary toggle-sub">
-              Listen for your wake phrase during a recording and answer
-              grounded questions live, with sources. Off by default — it adds
-              listening and (for cloud) sends audio-derived text mid-meeting.
+        <!-- The in-meeting voice assistant needs the on-device light engine for wake detection
+             (brain_live), which the Cloud posture turns off — so it CANNOT run there. Hide it in
+             Cloud rather than show a toggle that does nothing (the Cloud preset also forces it off
+             backend-side). It stays available in Hybrid / Fully local. -->
+        @if (posture() !== "cloud") {
+          <label class="toggle-row">
+            <span class="toggle-copy">
+              <span class="toggle-title">In-meeting voice assistant</span>
+              <span class="text-secondary toggle-sub">
+                Listen for your wake phrase during a recording and answer
+                grounded questions live, with sources. Off by default — it adds
+                listening and (for cloud) sends audio-derived text mid-meeting.
+              </span>
             </span>
-          </span>
-          <input type="checkbox" formControlName="realtimeReactions" />
-        </label>
+            <input type="checkbox" formControlName="realtimeReactions" />
+          </label>
+        }
 
         <label class="toggle-row">
           <span class="toggle-copy">
@@ -63,6 +69,7 @@ import { SettingsStore } from "../../settings.store";
           correct (no opaque overlay needed).
         -->
         @if (
+          posture() !== "cloud" &&
           form.controls.realtimeReactions.value &&
           liveTargetIsCloud() &&
           !cloudConsented()
@@ -209,6 +216,9 @@ export class DuringMeetingsBlockComponent {
   readonly consenting = this.store.consenting;
   readonly consentError = this.store.consentError;
   readonly liveTargetIsCloud = this.store.liveTargetIsCloud;
+  /** The derived brain posture — the in-meeting voice assistant is hidden under `cloud` (it needs the
+   * on-device light engine, which Cloud turns off, so it can't be enabled there). */
+  readonly posture = this.store.posture;
 
   allowCloudProcessing(): void {
     void this.store.allowCloudProcessing();
