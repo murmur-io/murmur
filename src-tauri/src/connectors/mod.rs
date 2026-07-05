@@ -138,6 +138,15 @@ pub trait Connector: Send + Sync {
     /// Run the search for an ALREADY-REDACTED query (the registry redacts before calling this — see
     /// [`ConnectorRegistry::search`]). Returns the hits, each carrying a loud `source_label`.
     async fn search(&self, redacted_query: &str) -> ConnectorResult;
+
+    /// OPTIONAL identifier lookup (verify pass). Default: unsupported. `id` is a strict,
+    /// caller-validated identifier (e.g. a Jira issue key), never free text.
+    async fn lookup(
+        &self,
+        _id: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        Err(ConnectorError::Unconfigured("lookup not supported".into()))
+    }
 }
 
 /// The registry of connectors AVAILABLE to the brain for the current config. It exposes ONLY the
@@ -248,6 +257,46 @@ impl ConnectorRegistry {
         }
 
         connector.search(&redacted).await
+    }
+
+    /// VERIFY-PASS lookup: fetch one Jira issue's live state through the SAME fail-closed +
+    /// ledgered discipline as [`ConnectorRegistry::search`]. The key is a strict issue identifier
+    /// (validated here via [`crate::verify::extract_issue_keys`] round-trip), not free text — no PII
+    /// redaction applies, but the attempt IS recorded content-free. A malformed key is refused
+    /// BEFORE any exposure/egress; an unexposed jira connector fails closed WITHOUT a ledger row.
+    pub async fn jira_lookup(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        // Strict shape guard BEFORE anything else (defense-in-depth against URL injection): the key
+        // must round-trip through the issue-key scanner as EXACTLY itself.
+        let valid = crate::verify::extract_issue_keys(key)
+            .first()
+            .map(|(_, k)| k == key)
+            .unwrap_or(false);
+        if !valid {
+            return Err(ConnectorError::Failed("invalid issue key".into()));
+        }
+        let Some(connector) = self.connectors.iter().find(|c| c.id() == "jira") else {
+            // Not exposed → fail closed. NOTHING egresses, so nothing is recorded.
+            return Err(ConnectorError::NeedsConsent);
+        };
+        // Record ONE content-free ledger row for this external egress ATTEMPT, BEFORE the network
+        // call. A lookup is a DISTINCT call_kind from a search — attribute it truthfully as such.
+        if connector.egress_class() == EgressClass::External {
+            self.sink.record(EgressEntry {
+                provider_id: "jira".to_string(),
+                destination: "Jira issue lookup (connector)".to_string(),
+                model_requested: String::new(),
+                call_kind: "connector_lookup",
+                meta: CallMeta::default(),
+                redactions: Default::default(),
+                system_bytes: 0,
+                user_bytes: key.len(),
+                meeting_id: None,
+            });
+        }
+        connector.lookup(key).await
     }
 
     /// TEST-ONLY: build a registry around injected connectors + an explicit name redactor + sink, so
@@ -432,6 +481,33 @@ mod tests {
             !ConnectorRegistry::build(&consented_disabled).has("web"),
             "consented-but-disabled web search must be excluded (fail-closed on enable)"
         );
+    }
+
+    #[test]
+    fn jira_lookup_fails_closed_without_ledger_when_not_exposed() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(captured.clone())),
+        );
+        let res = block_on(registry.jira_lookup("PROJ-1"));
+        assert!(matches!(res, Err(ConnectorError::NeedsConsent)));
+        assert!(captured.lock().unwrap().is_empty(), "no egress ⇒ no ledger row");
+    }
+
+    #[test]
+    fn jira_lookup_rejects_malformed_keys_without_egress() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(captured.clone())),
+        );
+        // Even before exposure is checked, a key that isn't a strict issue key is refused.
+        let res = block_on(registry.jira_lookup("not a key; DROP TABLE"));
+        assert!(res.is_err());
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     #[test]
