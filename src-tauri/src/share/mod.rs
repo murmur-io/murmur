@@ -44,6 +44,17 @@ const KC_ACCOUNT_ID: &str = "murmur_share_account_id";
 /// alongside the tokens so a biometric session restore can rebuild the identity-slot AAD without a
 /// re-login — the MK itself is cached separately + biometric-gated (see `secrets::keychain`).
 const KC_GENERATION: &str = "murmur_share_generation";
+/// Keychain account name for the ACCESS token's RFC3339 expiry (non-secret). Persisted so the client
+/// can PROACTIVELY redeem the refresh token via `/v1/auth/refresh` shortly BEFORE the 30-min access
+/// token lapses — without it, every share op after 30 min 401s ("not authenticated") because the
+/// bearer is dead but the in-RAM session still looks logged in. Absent for sessions persisted before
+/// this field existed ⇒ `None` ⇒ treated as "refresh now" (fail-safe; see [`access_token_needs_refresh`]).
+const KC_ACCESS_EXPIRES_AT: &str = "murmur_share_access_expires_at";
+
+/// Refresh the access token this many seconds BEFORE its server-side expiry, so a share op never races
+/// the 30-min TTL boundary (also absorbs modest client/server clock skew). Refreshes are cheap and
+/// rotate the token family safely, so a generous buffer costs nothing.
+const ACCESS_REFRESH_SKEW_SECS: i64 = 120;
 
 /// The persisted (Keychain) half of a login: what survives an app restart so a share can be created
 /// without re-logging-in, as long as the MK can be recovered. NOTE: the MK is NOT persisted here — the
@@ -62,6 +73,10 @@ pub struct PersistedTokens {
     /// `AccountSession` on a biometric restore; defaults to 1 for sessions persisted before this field
     /// existed (see `load_tokens`).
     pub generation: u32,
+    /// RFC3339 expiry of `access_token` (non-secret), from the server's login/refresh response. `None`
+    /// for a session persisted before this field existed ⇒ the next share op refreshes proactively
+    /// (fail-safe). Drives [`access_token_needs_refresh`].
+    pub access_expires_at: Option<String>,
 }
 
 /// Persist the session tokens + device id + account identity to the Keychain (delete-before-add
@@ -73,6 +88,12 @@ pub fn store_tokens(t: &PersistedTokens) -> Result<()> {
     crate::secrets::set_secret(KC_ACCOUNT_EMAIL, &t.email)?;
     crate::secrets::set_secret(KC_ACCOUNT_ID, &t.account_id)?;
     crate::secrets::set_secret(KC_GENERATION, &t.generation.to_string())?;
+    // Write the expiry when known; otherwise DELETE any stale prior value so a refresh that omitted it
+    // never leaves an old expiry behind (which would suppress the next proactive refresh).
+    match &t.access_expires_at {
+        Some(exp) => crate::secrets::set_secret(KC_ACCESS_EXPIRES_AT, exp)?,
+        None => crate::secrets::delete_secret(KC_ACCESS_EXPIRES_AT)?,
+    }
     Ok(())
 }
 
@@ -95,6 +116,8 @@ pub fn load_tokens() -> Result<Option<PersistedTokens>> {
     let generation = crate::secrets::get_secret(KC_GENERATION)?
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(1);
+    // Absent for a session persisted before this field existed ⇒ `None` ⇒ refresh on the next share op.
+    let access_expires_at = crate::secrets::get_secret(KC_ACCESS_EXPIRES_AT)?;
     Ok(Some(PersistedTokens {
         access_token,
         refresh_token,
@@ -102,6 +125,7 @@ pub fn load_tokens() -> Result<Option<PersistedTokens>> {
         email,
         account_id,
         generation,
+        access_expires_at,
     }))
 }
 
@@ -118,6 +142,7 @@ pub fn clear_tokens() -> Result<()> {
     crate::secrets::delete_secret(KC_ACCOUNT_EMAIL)?;
     crate::secrets::delete_secret(KC_ACCOUNT_ID)?;
     crate::secrets::delete_secret(KC_GENERATION)?;
+    crate::secrets::delete_secret(KC_ACCESS_EXPIRES_AT)?;
     Ok(())
 }
 
@@ -136,6 +161,26 @@ pub struct AccountSession {
     pub generation: u32,
     /// The session ACCESS token (mirror of the Keychain copy; the bearer for `POST /v1/shares`).
     pub access_token: String,
+    /// RFC3339 expiry of `access_token` (mirror of the Keychain copy). `None` ⇒ unknown ⇒ the next
+    /// share op refreshes proactively. Updated in place on a successful `/v1/auth/refresh`.
+    pub access_expires_at: Option<String>,
+}
+
+/// Does an access token with this RFC3339 `expires_at` need a proactive refresh at `now`? A missing or
+/// unparseable expiry returns `true` (fail-safe: better one wasted refresh than a dead-token 401), as
+/// does an expiry within [`ACCESS_REFRESH_SKEW_SECS`] of `now`. Pure so the decision is unit-testable
+/// without a clock or a server.
+pub(crate) fn access_token_needs_refresh(
+    expires_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(raw) = expires_at else {
+        return true; // unknown expiry ⇒ refresh now (covers pre-feature sessions + omitted fields).
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(exp) => now + chrono::Duration::seconds(ACCESS_REFRESH_SKEW_SECS) >= exp.with_timezone(&chrono::Utc),
+        Err(_) => true, // malformed ⇒ refresh (never trust an unparseable expiry).
+    }
 }
 
 // ─────────────────────────── Content-free share egress ledger ───────────────────────────
@@ -217,6 +262,29 @@ mod tests {
         assert!(matches!(
             require_login(&none),
             Err(AppError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn access_token_refresh_decision() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Unknown expiry (pre-feature session / omitted field) ⇒ refresh (fail-safe).
+        assert!(access_token_needs_refresh(None, now));
+        // Malformed expiry ⇒ refresh (never trust an unparseable value).
+        assert!(access_token_needs_refresh(Some("not-a-timestamp"), now));
+        // Already expired ⇒ refresh.
+        assert!(access_token_needs_refresh(Some("2026-07-05T11:45:00Z"), now));
+        // Within the skew window (< ACCESS_REFRESH_SKEW_SECS to expiry) ⇒ refresh proactively.
+        assert!(access_token_needs_refresh(Some("2026-07-05T12:01:00Z"), now));
+        // Comfortably in the future (a fresh 30-min token) ⇒ do NOT refresh.
+        assert!(!access_token_needs_refresh(Some("2026-07-05T12:29:00Z"), now));
+        // A non-UTC offset that still resolves comfortably ahead ⇒ no refresh (offset handled).
+        assert!(!access_token_needs_refresh(
+            Some("2026-07-05T14:29:00+02:00"),
+            now
         ));
     }
 }

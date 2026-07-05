@@ -173,6 +173,13 @@ pub struct AppState {
     /// live in the Keychain (source of truth) — this cache only holds MK + non-secret metadata so a
     /// share can be sealed without re-prompting for the password. Cleared on logout.
     pub account_session: Mutex<Option<crate::share::AccountSession>>,
+    /// SINGLE-FLIGHT guard for the OPAQUE access-token refresh (`/v1/auth/refresh`). A refresh token is
+    /// single-use — two share ops racing to refresh with the SAME token would trip the server's reuse
+    /// detection and revoke the whole family (logging the user out mid-share). This async mutex
+    /// serializes the refresh critical section (held ACROSS the network call, unlike the std `Mutex`es
+    /// here which are never held across an `await`); the winner rotates + persists the new pair, losers
+    /// re-read the freshened session token. `()` because it guards a section, not state.
+    pub share_refresh_lock: tokio::sync::Mutex<()>,
     /// BLK-1 coarse LIFECYCLE lock. Serializes the folder-lock state machine
     /// (`lock_folder` / `unlock_folder` / `relock_folder` / `relock_all_inner` / `remove_lock` /
     /// the seal half of `move_note`) so two of them can NEVER interleave their multi-step
@@ -259,6 +266,7 @@ impl AppState {
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),
         })
     }
