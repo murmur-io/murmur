@@ -337,6 +337,20 @@ pub struct AppConfig {
     /// `""` (unset). `#[serde(default)]` ⇒ pre-existing configs load as `""`.
     #[serde(default)]
     pub jira_email: String,
+    /// brain2 connector framework (Phase 3) — master toggle for the SLACK connector (Settings ▸
+    /// Connectors). Default OFF (`#[serde(default)]` ⇒ a config persisted before this field existed
+    /// loads as `false`). Even when ON, the connector is exposed only once `slack_consented` is
+    /// granted AND a user token is in the Keychain — see
+    /// `connectors::slack::SlackConnector::from_config_if_available`.
+    #[serde(default)]
+    pub slack_enabled: bool,
+    /// brain2 connector framework — one-time SLACK egress consent. The Slack connector reaches an
+    /// EXTERNAL service (a NEW EGRESS CLASS): the outgoing (redacted) query leaves the device.
+    /// PRESERVE-ONLY: `dto_to_config` ignores the incoming DTO value and a plain `save` never writes
+    /// it, so a normal settings save can neither grant nor clear it. Flipped true SOLELY by the
+    /// dedicated `consent_to_slack` command. `#[serde(default)]` ⇒ pre-existing configs load as `false`.
+    #[serde(default)]
+    pub slack_consented: bool,
     /// Opt-in: restore the OLDER-VERSION behavior of INHERITING the shell environment into the
     /// `claude` CLI subprocess, so env vars set in the user's shell — `ANTHROPIC_API_KEY`,
     /// `ANTHROPIC_BASE_URL`, proxy vars (`HTTPS_PROXY`) — reach the CLI again. The F2 audit hardening
@@ -497,6 +511,8 @@ impl Default for AppConfig {
             jira_consented: false,
             jira_base_url: String::new(),
             jira_email: String::new(),
+            slack_enabled: false,
+            slack_consented: false,
             claude_code_inherit_env: false,
             gateway_base_url: String::new(),
             gateway_model: String::new(),
@@ -571,6 +587,8 @@ const K_JIRA_ENABLED: &str = "jira_enabled";
 const K_JIRA_CONSENTED: &str = "jira_consented";
 const K_JIRA_BASE_URL: &str = "jira_base_url";
 const K_JIRA_EMAIL: &str = "jira_email";
+const K_SLACK_ENABLED: &str = "slack_enabled";
+const K_SLACK_CONSENTED: &str = "slack_consented";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
@@ -746,6 +764,12 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_JIRA_EMAIL)? {
             cfg.jira_email = v;
+        }
+        if let Some(v) = db.get_setting(K_SLACK_ENABLED)? {
+            cfg.slack_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_SLACK_CONSENTED)? {
+            cfg.slack_consented = v == "true";
         }
         if let Some(v) = db.get_setting(K_CLAUDE_CODE_INHERIT_ENV)? {
             cfg.claude_code_inherit_env = v == "true";
@@ -1012,6 +1036,13 @@ impl AppConfig {
         db.set_setting(K_JIRA_BASE_URL, &self.jira_base_url)?;
         db.set_setting(K_JIRA_EMAIL, &self.jira_email)?;
         db.set_setting(
+            K_SLACK_ENABLED,
+            if self.slack_enabled { "true" } else { "false" },
+        )?;
+        // PRESERVE-ONLY: `slack_consented` is NEVER written by a plain save — it is persisted solely
+        // by `grant_slack_consent`, so a settings save can neither grant nor clear the egress consent
+        // (stronger than the DTO-layer preserve; a save carrying `false` can never clobber the grant).
+        db.set_setting(
             K_CLAUDE_CODE_INHERIT_ENV,
             if self.claude_code_inherit_env {
                 "true"
@@ -1155,6 +1186,20 @@ impl AppConfig {
     pub fn grant_jira_consent(&mut self, db: &Db) -> Result<()> {
         db.set_setting(K_JIRA_CONSENTED, "true")?;
         self.jira_consented = true;
+        Ok(())
+    }
+
+    /// brain2 connectors (Phase 3) — record the user's one-time consent to send the (redacted) Slack
+    /// search query to an EXTERNAL service. Mirrors [`grant_jira_consent`]: the ONLY supported mutator
+    /// of `slack_consented` (deliberately separate from `save_config`), so Slack egress consent can
+    /// never be granted as an incidental side effect of a settings write. Until granted, the Slack
+    /// connector is absent from the brain's tool registry.
+    ///
+    /// FAIL-CLOSED ORDERING — persist FIRST, flip the in-memory flag ONLY on a durable success, so a
+    /// failed write leaves the session unconsented (no Slack egress on a consent that wasn't recorded).
+    pub fn grant_slack_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_SLACK_CONSENTED, "true")?;
+        self.slack_consented = true;
         Ok(())
     }
 }
@@ -1666,6 +1711,48 @@ mod tests {
         assert!(
             AppConfig::load(&db).unwrap().jira_consented,
             "grant_jira_consent's durable record survives; consent flips true only via the grant path"
+        );
+    }
+
+    #[test]
+    fn slack_flags_default_off_and_round_trip() {
+        let db = temp_db();
+        // Fail-closed defaults: both flags OFF until explicitly set/granted.
+        let cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.slack_enabled, "slack must default OFF");
+        assert!(!cfg.slack_consented, "slack consent must default ungranted");
+
+        let cfg = AppConfig {
+            slack_enabled: true,
+            ..cfg
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert!(loaded.slack_enabled);
+        // PRESERVE-ONLY: a save can never grant consent.
+        assert!(!loaded.slack_consented);
+    }
+
+    #[test]
+    fn slack_consent_grant_persists_and_save_cannot_clobber() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        cfg.grant_slack_consent(&db).unwrap();
+        assert!(cfg.slack_consented);
+        assert!(AppConfig::load(&db).unwrap().slack_consented);
+        // Durable record persisted (persist-first).
+        assert_eq!(
+            db.get_setting(K_SLACK_CONSENTED).unwrap().as_deref(),
+            Some("true"),
+            "durable slack consent record persisted (persist-first)"
+        );
+        // A later plain save must PRESERVE the granted consent — a plain `save` never writes the flag,
+        // so this proves the durable record is not clobbered by a save that carries false.
+        let cfg2 = AppConfig { slack_consented: false, ..AppConfig::load(&db).unwrap() };
+        cfg2.save(&db).unwrap();
+        assert!(
+            AppConfig::load(&db).unwrap().slack_consented,
+            "grant_slack_consent's durable record survives; consent flips true only via the grant path"
         );
     }
 
