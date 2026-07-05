@@ -167,6 +167,11 @@ export class SettingsStore {
     semanticSearchEnabled: false,
     // brain2 connectors — web-search master toggle (NEW EGRESS; round-tripped).
     webSearchEnabled: false,
+    // brain2 connectors (Phase 2) — Jira master toggle (NEW EGRESS) + non-secret
+    // base URL / email, round-tripped on save.
+    jiraEnabled: false,
+    jiraBaseUrl: "",
+    jiraEmail: "",
     // AI Gateway (Phase 1) — base URL and model, round-tripped on save.
     gatewayBaseUrl: "",
     gatewayModel: "",
@@ -189,6 +194,8 @@ export class SettingsStore {
   readonly keyControl = new FormControl("", { nonNullable: true });
   /** BYO Brave Search API key input (web-search connector). Cleared after save. */
   readonly webKeyControl = new FormControl("", { nonNullable: true });
+  /** BYO Jira API token input (Jira connector). Cleared after save. */
+  readonly jiraTokenControl = new FormControl("", { nonNullable: true });
 
   /**
    * PROTOTYPE auto-save (no Save button): every committed form change persists
@@ -417,6 +424,27 @@ export class SettingsStore {
   /** Surfaced if storing the web-search key rejects. */
   private readonly _webKeyError = signal<string | null>(null);
   readonly webKeyError = this._webKeyError.asReadonly();
+
+  // ── brain2 connectors — Jira (Phase 2, NEW EGRESS) ─────────────────────
+
+  /** Jira egress consent state — drives the "Allow Jira access" row; round-tripped on save. */
+  private readonly _jiraConsented = signal(false);
+  readonly jiraConsented = this._jiraConsented.asReadonly();
+  /** True while the one-time Jira consent command is in flight. */
+  private readonly _jiraConsenting = signal(false);
+  readonly jiraConsenting = this._jiraConsenting.asReadonly();
+  /** Surfaced if granting Jira consent rejects. */
+  private readonly _jiraConsentError = signal<string | null>(null);
+  readonly jiraConsentError = this._jiraConsentError.asReadonly();
+  /** Whether a Jira API token is stored (has-token check; never the value). */
+  private readonly _hasJiraToken = signal(false);
+  readonly hasJiraToken = this._hasJiraToken.asReadonly();
+  /** True while the BYO token is being saved. */
+  private readonly _savingJiraToken = signal(false);
+  readonly savingJiraToken = this._savingJiraToken.asReadonly();
+  /** Surfaced if storing the Jira token rejects. */
+  private readonly _jiraTokenError = signal<string | null>(null);
+  readonly jiraTokenError = this._jiraTokenError.asReadonly();
 
   // ── AI Gateway (Phase 1) — key management + destination computed signals ──
 
@@ -1159,6 +1187,9 @@ export class SettingsStore {
       // brain2 connectors — web-search consent is preserve-only (granted only via
       // consent_to_web_search); snapshot it so save() round-trips it unchanged.
       this._webConsented.set(cfg.webSearchConsented ?? false);
+      // brain2 connectors (Phase 2) — Jira consent is preserve-only (granted only via
+      // consent_to_jira); snapshot it so save() round-trips it unchanged.
+      this._jiraConsented.set(cfg.jiraConsented ?? false);
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -1201,6 +1232,10 @@ export class SettingsStore {
         // Mirrors backend default semantic_search_enabled = true (settings/config.rs; #159/#160).
         semanticSearchEnabled: cfg.semanticSearchEnabled ?? true,
         webSearchEnabled: cfg.webSearchEnabled ?? false,
+        // brain2 connectors (Phase 2) — Jira toggle + non-secret base URL/email.
+        jiraEnabled: cfg.jiraEnabled ?? false,
+        jiraBaseUrl: cfg.jiraBaseUrl ?? "",
+        jiraEmail: cfg.jiraEmail ?? "",
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
         gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
         gatewayModel: cfg.gatewayModel ?? "",
@@ -1246,6 +1281,7 @@ export class SettingsStore {
       this._voiceprints.set(await this.ipc.listVoiceprints().catch(() => []));
       this._hasKey.set(await this.ipc.hasAnthropicKey());
       this._hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
+      this._hasJiraToken.set(await this.ipc.hasJiraToken().catch(() => false));
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
       this._modelPresent.set(await this.ipc.modelPresent());
       // Whisper transcribe-model download-progress stream (best-effort).
@@ -1900,6 +1936,13 @@ export class SettingsStore {
       // just carries the current value back instead of letting the backend default it.
       webSearchEnabled: v.webSearchEnabled,
       webSearchConsented: this.webConsented(),
+      // brain2 connectors (Phase 2) — Jira toggle + non-secret base URL/email are
+      // settable from the form; its consent is PRESERVE-ONLY (granted via allowJira's
+      // dedicated command), so a save just carries the current value back.
+      jiraEnabled: v.jiraEnabled,
+      jiraConsented: this.jiraConsented(),
+      jiraBaseUrl: v.jiraBaseUrl,
+      jiraEmail: v.jiraEmail,
       // Round-trip the Stage E security flags so a settings save never silently
       // resets them. Cloud-egress consent is GRANTED only via the dedicated
       // command (allowCloudProcessing) — here we just carry the current value back.
@@ -2086,6 +2129,46 @@ export class SettingsStore {
       this._webConsentError.set(String(e));
     } finally {
       this._webConsenting.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors (Phase 2) — store/replace the BYO Jira API token in the
+   * Keychain, then re-probe presence so the "Token set ✓" pill flips. The value is
+   * cleared from the input after saving (it's never shown back). Mirrors saveWebKey().
+   */
+  async saveJiraToken(): Promise<void> {
+    const key = this.jiraTokenControl.value;
+    if (!key.trim()) return;
+    this._jiraTokenError.set(null);
+    this._savingJiraToken.set(true);
+    try {
+      await this.ipc.setJiraToken(key);
+      this.jiraTokenControl.setValue("");
+      this._hasJiraToken.set(await this.ipc.hasJiraToken());
+    } catch (e) {
+      this._jiraTokenError.set(String(e));
+    } finally {
+      this._savingJiraToken.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors (Phase 2) — grant the one-time Jira egress consent via the
+   * dedicated command (an explicit, auditable user act — NOT a side effect of a normal
+   * settings save). After it resolves the brain may expose the Jira connector (when Jira
+   * is enabled AND configured AND a token is stored). Mirrors allowWebSearch().
+   */
+  async allowJira(): Promise<void> {
+    this._jiraConsentError.set(null);
+    this._jiraConsenting.set(true);
+    try {
+      await this.ipc.consentToJira();
+      this._jiraConsented.set(true);
+    } catch (e) {
+      this._jiraConsentError.set(String(e));
+    } finally {
+      this._jiraConsenting.set(false);
     }
   }
 

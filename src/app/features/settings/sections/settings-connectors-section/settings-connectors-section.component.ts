@@ -29,11 +29,28 @@ export class SettingsConnectorsSectionComponent {
   readonly webConsenting = this.store.webConsenting;
   readonly webConsentError = this.store.webConsentError;
 
+  // brain2 connectors (Phase 2) — Jira.
+  readonly jiraTokenControl = this.store.jiraTokenControl;
+  readonly hasJiraToken = this.store.hasJiraToken;
+  readonly savingJiraToken = this.store.savingJiraToken;
+  readonly jiraTokenError = this.store.jiraTokenError;
+  readonly jiraConsented = this.store.jiraConsented;
+  readonly jiraConsenting = this.store.jiraConsenting;
+  readonly jiraConsentError = this.store.jiraConsentError;
+
   saveWebKey(): void {
     void this.store.saveWebKey();
   }
 
   allowWebSearch(): void {
     void this.store.allowWebSearch();
+  }
+
+  saveJiraToken(): void {
+    void this.store.saveJiraToken();
+  }
+
+  allowJira(): void {
+    void this.store.allowJira();
   }
 }

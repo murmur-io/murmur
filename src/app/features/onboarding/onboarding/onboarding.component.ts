@@ -555,6 +555,12 @@ export class OnboardingComponent implements OnInit {
       // the snapshot so onboarding never resets them, both default off (no egress).
       webSearchEnabled: base?.webSearchEnabled ?? false,
       webSearchConsented: base?.webSearchConsented ?? false,
+      // brain2 connectors (Phase 2) — Jira toggle + preserve-only consent + non-secret
+      // site/email; round-trip the snapshot so onboarding never resets them (default off).
+      jiraEnabled: base?.jiraEnabled ?? false,
+      jiraConsented: base?.jiraConsented ?? false,
+      jiraBaseUrl: base?.jiraBaseUrl ?? "",
+      jiraEmail: base?.jiraEmail ?? "",
       // Opt-in claude-CLI env inheritance — round-trip the snapshot so onboarding never resets it.
       claudeCodeInheritEnv: base?.claudeCodeInheritEnv ?? false,
       // AI Gateway — the base URL is now wizard-editable (the gateway tile);
