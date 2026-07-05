@@ -3,24 +3,25 @@ import {
   Component,
   computed,
   inject,
+  input,
   signal,
 } from "@angular/core";
 import { SettingsStore } from "../../settings.store";
-import { LocalModelsListComponent } from "./local-models-list.component";
+import { ModelEffortPickerComponent } from "./model-effort-picker.component";
 
 /**
  * Engines → "Murmur Brain" card: the BUILT-IN on-device engine (managed GGUF
  * downloads, light/heavy classes). Rendered first in the "On this Mac" group
  * so the built-in brain and Ollama (an external local server) stop being
- * conflated. The Configure disclosure hosts the shared GGUF registry
- * (LocalModelsListComponent — moved here from the role rows). In-flow
+ * conflated. The Configure disclosure hosts the Claude-style on-device model
+ * picker (ModelEffortPickerComponent — effort slider + language toggle). In-flow
  * disclosure, not an overlay (T3).
  */
 @Component({
   selector: "app-brain-engine-card",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [LocalModelsListComponent],
+  imports: [ModelEffortPickerComponent],
   template: `
     <div class="brain-card">
       <div class="brain-row">
@@ -35,6 +36,12 @@ import { LocalModelsListComponent } from "./local-models-list.component";
             <span class="pill">
               <span class="pill-dot"></span>
               No model downloaded
+            </span>
+          }
+          @if (inUse()) {
+            <span class="pill brain-inuse">
+              <span class="pill-dot"></span>
+              In use now
             </span>
           }
         </div>
@@ -68,7 +75,7 @@ import { LocalModelsListComponent } from "./local-models-list.component";
       </span>
       @if (expanded()) {
         <div class="brain-config">
-          <app-local-models-list />
+          <app-model-effort-picker />
         </div>
       }
     </div>
@@ -104,6 +111,12 @@ import { LocalModelsListComponent } from "./local-models-list.component";
         font-weight: 600;
         color: var(--text-primary);
       }
+      /* "In use now" — accent (not the green Ready) so availability vs active read apart. */
+      .brain-inuse {
+        color: var(--accent-hover);
+        background: var(--accent-soft);
+        border-color: transparent;
+      }
       .brain-privacy {
         font-size: 0.8125rem;
       }
@@ -123,6 +136,9 @@ import { LocalModelsListComponent } from "./local-models-list.component";
 })
 export class BrainEngineCardComponent {
   private readonly store = inject(SettingsStore);
+
+  /** True when the current posture actively routes work to the built-in engine. */
+  readonly inUse = input<boolean>(false);
 
   /** Whether the Configure disclosure is open. */
   readonly expanded = signal(false);
