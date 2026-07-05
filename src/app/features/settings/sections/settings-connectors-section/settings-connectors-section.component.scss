@@ -18,6 +18,10 @@
   gap: var(--space-4);
 }
 .connector-egress {
+  /* The global .banner is a FLEX row (icon + copy layouts elsewhere); here the content is one
+     prose paragraph with an inline <strong>, which flex splits into two columns ("This sends
+     data off your Mac." stacking one word per line). Flow it as a normal paragraph. */
+  display: block;
   margin: 0;
   font-size: 0.875rem;
   line-height: 1.55;
