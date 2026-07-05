@@ -1,4 +1,9 @@
 <section class="brain">
+  <!-- 0 — ENABLE-THE-BRAIN NUDGE (only while an on-device model is missing) -->
+  @if (brainReady() === false) {
+    <app-brain-enable-card (enabled)="onBrainEnabled()" />
+  }
+
   <!-- 1 — STATUS HEADER ------------------------------------------------- -->
   <header class="b-head card">
     <div class="b-head-top">
