@@ -1,0 +1,330 @@
+<section class="record">
+  @if (modelPresent() === false) {
+    <div class="banner is-accent model-banner" role="alert">
+      <span class="banner-icon" aria-hidden="true">↓</span>
+      <div class="model-banner-body">
+        <p class="model-banner-title">Transcription model needed</p>
+        <p class="model-banner-text">
+          Whisper runs on-device. Download it once to enable recording.
+        </p>
+        @if (modelDownloadError(); as derr) {
+          <p class="model-banner-error">{{ derr }}</p>
+        }
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="downloadModel()"
+          [disabled]="downloadingModel()"
+        >
+          {{ downloadingModel() ? "Downloading…" : "Download model" }}
+        </button>
+      </div>
+    </div>
+  } @else if (showVaultNotice()) {
+    <!-- Calm, NON-blocking notice: notes are always saved in Murmur (the DB is the
+         canonical store). A vault is optional and export-only — never a recording blocker. -->
+    <div class="banner is-accent vault-notice" role="note">
+      <span class="banner-icon" aria-hidden="true">i</span>
+      <span class="vault-notice-body">
+        No Obsidian vault set — your notes are saved in
+        <strong>Murmur</strong>. Add a vault folder in Settings to also
+        export them as Markdown.
+      </span>
+      <span class="vault-notice-actions">
+        <a class="btn btn-ghost btn-sm" routerLink="/settings">Settings</a>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          (click)="dismissVaultNotice()"
+        >
+          Dismiss
+        </button>
+      </span>
+    </div>
+  }
+
+  @if (headphonesHint()) {
+    <div class="banner is-accent" role="note">
+      <span class="banner-icon" aria-hidden="true">🎧</span>
+      <span>
+        Capturing system audio — use <strong>headphones</strong> so the
+        other participants' voices don't echo back into your microphone.
+      </span>
+    </div>
+  }
+
+  <!-- ── Slim recording bar — ambient status, NOT the hero ─────────────── -->
+  @if (store.isRecording()) {
+    <!-- Recording is now ambient: a compact horizontal bar carrying the orb,
+         timer, level meter, the LIVE caption ticker, mic-mute, Ask, and Stop.
+         The conversation thread below is the hero. -->
+    <div class="rec-strip is-recording" role="status">
+      <span class="orb live" aria-hidden="true"></span>
+      <span class="timer">{{ elapsedLabel() }}</span>
+      <div class="wave" [style.--level]="store.level()" aria-hidden="true">
+        @for (b of bars; track b) {
+          <span class="wbar" [style.--i]="b"></span>
+        }
+      </div>
+
+      <!-- Live caption ticker — rides inline in the strip. -->
+      <p class="cc-line" aria-live="polite">
+        @if (liveCaption(); as cc) {
+          @for (rev of [cc]; track rev) {
+            <span class="cc-text">{{ cc }}</span>
+          }
+        } @else {
+          <span class="cc-idle">Listening…</span>
+        }
+      </p>
+
+      <!-- Honesty hint: live captions are mic-only until Stop (matches the
+           README "Live captions are mic-only until you stop"). The other
+           side's system audio is captured in parallel and folded into the
+           full Me / Others transcript only after you stop. Compact + muted +
+           flex:none so it never crowds the ticker (which absorbs the flex). -->
+      <span
+        class="cc-scope"
+        role="note"
+        title="Live captions show your side (your microphone) during the meeting. The other participants are captured now and added to the full Me / Others transcript after you stop."
+      >
+        <svg
+          class="cc-scope-ico"
+          viewBox="0 0 16 16"
+          width="12"
+          height="12"
+          aria-hidden="true"
+        >
+          <circle
+            cx="8"
+            cy="8"
+            r="6.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+          />
+          <path
+            d="M8 7.2v4"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+          />
+          <circle cx="8" cy="4.6" r="0.9" fill="currentColor" />
+        </svg>
+        <span class="cc-scope-text">Your side · full transcript after Stop</span>
+      </span>
+
+      <!-- Mic-mute: silences only the local mic; system audio keeps recording.
+           Compact (icon-only) so the strip stays uncrowded. -->
+      <app-mic-mute-toggle [compact]="true" #micToggle />
+      <!-- Ask AI — CLICK-TO-STOP voice toggle. The spoken answer lands in the
+           conversation thread below (the one home for asking mid-meeting). -->
+      <button
+        type="button"
+        class="ask-btn"
+        [class.is-listening]="assistant.listening()"
+        [disabled]="assistant.processing()"
+        (click)="toggleAsk()"
+        [attr.aria-pressed]="assistant.listening()"
+        [attr.aria-label]="
+          assistant.listening()
+            ? 'Stop listening and ask'
+            : 'Ask the AI assistant'
+        "
+      >
+        <svg
+          class="ask-ico"
+          viewBox="0 0 24 24"
+          width="18"
+          height="18"
+          aria-hidden="true"
+        >
+          <path
+            d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+            fill="currentColor"
+          />
+          <path
+            d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+            fill="currentColor"
+            opacity="0.85"
+          />
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="stop-btn"
+        (click)="store.stop()"
+        aria-label="Stop recording"
+      >
+        <span class="stop-ico" aria-hidden="true"></span>
+      </button>
+    </div>
+  } @else {
+    <!-- Not recording — a compact start header (nudge + brief + the start
+         control). Still calm; the thread remains the main surface. -->
+    <div class="rec-strip is-idle">
+      <!-- Meeting-app nudge: a subtle, dismissible suggestion to hit record. -->
+      @if (showNudge()) {
+        <div class="nudge" role="status">
+          <span class="nudge-dot" aria-hidden="true"></span>
+          <span class="nudge-text">
+            <strong>{{ detectedApp() }}</strong> is running — start recording?
+          </span>
+          <span class="nudge-actions">
+            <button
+              type="button"
+              class="btn btn-primary btn-sm"
+              (click)="startFromNudge()"
+            >
+              Start recording
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm"
+              (click)="dismissNudge()"
+            >
+              Dismiss
+            </button>
+          </span>
+        </div>
+      }
+
+      @if (isProcessing()) {
+        <div class="proc-inline" role="status">
+          <span class="orb proc" aria-hidden="true"></span>
+          <span class="proc-label">{{ procLabel() }}</span>
+          <div class="proc-track" aria-hidden="true">
+            <div class="proc-shimmer"></div>
+          </div>
+        </div>
+      } @else {
+        <button
+          type="button"
+          class="start-btn"
+          (click)="store.start()"
+          [disabled]="!canRecord()"
+        >
+          <span class="orb ready" aria-hidden="true"></span>
+          <span class="start-text">
+            {{
+              store.stage() === "done" ? "Record again" : "Start recording"
+            }}
+          </span>
+          <span class="kbd" aria-hidden="true">⌘R</span>
+        </button>
+      }
+
+      <span class="rec-strip-hint">{{ hint() }}</span>
+      <button type="button" class="popout" (click)="popOut()">
+        Pop out
+        <span class="kbd-inline">⌘⇧R</span>
+      </button>
+    </div>
+  }
+
+  <!-- ── The notes + @brain threads surface — the full-height main view ── -->
+  <!-- The main flow is the user's NOTES (persisted to manual_notes); the one
+       composer splits a line by @brain (a plain note vs opening a thread). -->
+  @if (showAssistant()) {
+    <app-meeting-conversation
+      class="conversation"
+      [meetingId]="store.meetingId()"
+      [hintsEnabled]="hintsEnabled()"
+      [enhancing]="enhancingNotes()"
+      [settled]="enhanceSettled()"
+      [enhanceAware]="enhanceMode()"
+    />
+  }
+
+  @if (store.error(); as err) {
+    @if (needsCloudConsent()) {
+      <div class="banner is-accent cloud-consent" role="alert">
+        <span class="banner-icon" aria-hidden="true">☁</span>
+        <div class="cloud-consent-copy">
+          <strong>Cloud processing isn't enabled</strong>
+          <span>
+            {{ providerLabel() }} sends your transcript (redacted first) to
+            {{ cloudDestination() }} to write the summary — your data leaves
+            this Mac. Allow it once to finish this note, or switch to a
+            local provider in Settings to stay fully on-device.
+          </span>
+        </div>
+        <div class="cloud-consent-actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="allowCloudAndRetry()"
+            [disabled]="consenting()"
+          >
+            {{ consenting() ? "Enabling…" : "Allow & finish note" }}
+          </button>
+          <a class="btn btn-ghost" routerLink="/settings">Settings</a>
+        </div>
+      </div>
+    } @else {
+      <div class="banner is-danger" role="alert">
+        <span class="banner-icon" aria-hidden="true">!</span>
+        <span>{{ err }}</span>
+      </div>
+    }
+  }
+
+  <!-- ── Brain reveal — after the first note lands, surface the already-alive
+       shallow brain (people + open commitments) mapped on defaults. In-flow,
+       gated on a resolved note; one-time dismissible. ──────────────────── -->
+  @if (store.stage() === "done") {
+    <app-brain-reveal-card [active]="!!store.lastNote()" />
+  }
+
+  <!-- ── Minimal stats strip — hidden once the conversation thread is the
+       hero (recording / a live ask), so the thread fills the screen. ───── -->
+  @if (!showAssistant() && analytics(); as a) {
+    @if (a.totalMeetings > 0) {
+      <div class="card stats" role="group" aria-label="Your stats">
+        <dl class="figures">
+          <div class="figure" style="--d: 0">
+            <dt>Meetings</dt>
+            <dd>{{ a.totalMeetings }}</dd>
+          </div>
+          <span class="sep" aria-hidden="true"></span>
+          <div class="figure" style="--d: 1">
+            <dt>Total time</dt>
+            <dd>{{ formatDuration(a.totalDurationS) }}</dd>
+          </div>
+          <span class="sep" aria-hidden="true"></span>
+          <div class="figure" style="--d: 2">
+            <dt>This week</dt>
+            <dd>{{ a.meetings7d }}</dd>
+          </div>
+        </dl>
+
+        @if (spark().length > 0) {
+          <div
+            class="spark"
+            aria-hidden="true"
+            title="Meetings over the last 30 days"
+          >
+            @for (s of spark(); track s.date) {
+              <span class="spark-bar" [style.--h.%]="s.h"></span>
+            }
+          </div>
+        }
+
+        <a class="stats-link" routerLink="/analytics">
+          View analytics
+          <span class="arrow" aria-hidden="true">→</span>
+        </a>
+      </div>
+    } @else {
+      <div class="card stats stats-empty">
+        <span class="stats-mark" aria-hidden="true"></span>
+        <p class="stats-empty-text">Your stats will appear here</p>
+        <a class="stats-link" routerLink="/analytics">
+          View analytics
+          <span class="arrow" aria-hidden="true">→</span>
+        </a>
+      </div>
+    }
+  }
+</section>
+  

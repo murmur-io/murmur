@@ -1,0 +1,181 @@
+<aside class="dossier card" aria-label="Person dossier">
+  <button
+    type="button"
+    class="dossier-close btn btn-ghost"
+    aria-label="Close dossier"
+    (click)="close.emit()"
+  >
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path
+        d="M4 4l8 8M12 4l-8 8"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+      />
+    </svg>
+  </button>
+
+  @if (loading()) {
+    <div class="dossier-state">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else if (error()) {
+    <div class="dossier-state">
+      <p class="empty-title">Couldn’t load this dossier</p>
+      <p class="empty">{{ error() }}</p>
+    </div>
+  } @else if (dossier()) {
+    @if (dossier(); as d) {
+      <header class="dossier-head">
+        <span
+          class="dossier-dot"
+          [class.is-project]="d.entity.kind === 'project'"
+          aria-hidden="true"
+        ></span>
+        <div class="dossier-head-text">
+          <h3 class="dossier-name">{{ d.entity.name }}</h3>
+          <span class="dossier-sub">
+            {{ d.entity.kind === "project" ? "Project" : "Person" }}
+            · {{ summaryLabel() }}
+          </span>
+        </div>
+      </header>
+
+      <!-- 🕑 Timeline of mentioning meetings (newest first). -->
+      <section class="dossier-section">
+        <h4 class="dossier-section-title">
+          <span class="dossier-section-emoji" aria-hidden="true">🕑</span>
+          Timeline
+        </h4>
+        <ol class="tl">
+          @for (m of d.meetings; track m.meetingId) {
+            <li class="tl-row">
+              <a class="tl-link" [routerLink]="['/meeting', m.meetingId]">
+                <span class="tl-node" aria-hidden="true"></span>
+                <span class="tl-date">{{ fmtDate(m.startedAt) }}</span>
+                <span class="tl-title">{{ m.title || "(untitled)" }}</span>
+              </a>
+            </li>
+          } @empty {
+            <li class="dossier-empty-row">
+              <p class="empty">
+                No visible meetings mention this person yet.
+              </p>
+            </li>
+          }
+        </ol>
+      </section>
+
+      <!-- ⏳ Who owes what — open commitments tied to this person. -->
+      <section class="dossier-section">
+        <h4 class="dossier-section-title">
+          <span class="dossier-section-emoji" aria-hidden="true">⏳</span>
+          Who owes what
+          @if (d.commitments.length) {
+            <span class="count dossier-count">{{
+              d.commitments.length
+            }}</span>
+          }
+        </h4>
+        <ul class="ci-list">
+          @for (c of d.commitments; track c.meetingId + "|" + c.text) {
+            <li class="ci">
+              <div class="ci-main">
+                @if (ownerLabel(c); as o) {
+                  <span class="ci-owner">{{ o }}</span>
+                }
+                <span class="ci-text">{{ c.text }}</span>
+              </div>
+              <div class="ci-meta">
+                @if (c.dueDate) {
+                  <span class="pill is-warning ci-due"
+                    >due {{ c.dueDate }}</span
+                  >
+                }
+                <a class="ci-src" [routerLink]="['/meeting', c.meetingId]">
+                  {{ c.meetingTitle || "(untitled)" }}
+                </a>
+              </div>
+            </li>
+          } @empty {
+            <li class="dossier-empty-row">
+              <p class="empty">All caught up — no open commitments.</p>
+            </li>
+          }
+        </ul>
+      </section>
+
+      <!-- 🔵 Facts — current state (open) + what changed (closed history). -->
+      @if (d.facts.length) {
+        <section class="dossier-section">
+          <h4 class="dossier-section-title">
+            <span class="dossier-section-emoji" aria-hidden="true">🔵</span>
+            Facts
+          </h4>
+
+          @if (currentFacts().length) {
+            <p class="dossier-sub-label">Current</p>
+            <ul class="fact-list">
+              @for (f of currentFacts(); track f.id) {
+                <li class="fact fact-current">
+                  <span class="fact-pred">{{ f.predicate }}</span>
+                  <span class="fact-obj">{{ f.object }}</span>
+                  <span class="fact-since"
+                    >since {{ fmtDate(f.validFrom) }}</span
+                  >
+                </li>
+              }
+            </ul>
+          }
+
+          @if (changedFacts().length) {
+            <p class="dossier-sub-label">What changed</p>
+            <ul class="fact-list">
+              @for (f of changedFacts(); track f.id) {
+                <li class="fact fact-changed">
+                  <span class="fact-pred">{{ f.predicate }}</span>
+                  <span class="fact-obj">was “{{ f.object }}”</span>
+                  <span class="fact-since">
+                    {{ fmtDate(f.validFrom) }} → {{ fmtDate(f.validTo) }}
+                  </span>
+                </li>
+              }
+            </ul>
+          }
+        </section>
+      }
+
+      <!-- 🧭 Co-occurring neighbours — click to pivot the pane. -->
+      @if (d.neighbors.length) {
+        <section class="dossier-section">
+          <h4 class="dossier-section-title">
+            <span class="dossier-section-emoji" aria-hidden="true">🧭</span>
+            Also appears with
+          </h4>
+          <ul class="nb-list">
+            @for (nb of d.neighbors; track nb.id) {
+              <li>
+                <button
+                  type="button"
+                  class="nb"
+                  [class.is-project]="nb.kind === 'project'"
+                  (click)="select.emit(nb.id)"
+                >
+                  <span class="nb-dot" aria-hidden="true"></span>
+                  <span class="nb-name">{{ nb.name }}</span>
+                  <span
+                    class="count nb-count"
+                    [attr.title]="sharedLabel(nb)"
+                  >
+                    {{ nb.sharedMeetings }}
+                  </span>
+                </button>
+              </li>
+            }
+          </ul>
+        </section>
+      }
+    }
+  }
+</aside>
+  

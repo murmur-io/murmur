@@ -1,0 +1,1094 @@
+<section class="detail">
+  <a routerLink="/library" class="back">
+    <span class="back-arrow" aria-hidden="true">←</span>
+    <span>Meetings</span>
+  </a>
+
+  @if (detail(); as d) {
+    <header class="head print-keep">
+      <div class="head-text">
+        @if (renaming()) {
+          <div class="rename">
+            <input
+              #renameInput
+              type="text"
+              class="rename-input"
+              aria-label="Meeting title"
+              autocapitalize="sentences"
+              autocomplete="off"
+              [value]="titleDraft()"
+              [disabled]="savingRename()"
+              (input)="onTitleInput($event)"
+              (keydown.enter)="saveRename()"
+              (keydown.escape)="cancelRename()"
+            />
+            <div class="rename-actions">
+              <button
+                type="button"
+                class="btn btn-ghost rename-btn"
+                (click)="cancelRename()"
+                [disabled]="savingRename()"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary rename-btn"
+                (click)="saveRename()"
+                [disabled]="savingRename() || !titleDraft().trim()"
+              >
+                {{ savingRename() ? "Saving…" : "Save" }}
+              </button>
+            </div>
+          </div>
+        } @else {
+          <h2>{{ d.meeting.title || "(untitled)" }}</h2>
+        }
+        <div class="meta">
+          <span class="pill" [class]="statusPillClass(d.meeting.status)">
+            <span class="pill-dot"></span>
+            {{ d.meeting.status }}
+          </span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span class="meta-item">{{
+            formatDate(d.meeting.startedAt)
+          }}</span>
+          <span class="meta-sep" aria-hidden="true">·</span>
+          <span class="meta-item">{{
+            formatDuration(d.meeting.durationS)
+          }}</span>
+          <!-- Read-only folder + lock badge (where this note lives). -->
+          @if (folderBadge(); as fb) {
+            <span class="meta-sep" aria-hidden="true">·</span>
+            <span
+              class="meta-item"
+              style="display: inline-flex; align-items: center; gap: var(--space-1)"
+              [attr.title]="fb.name"
+            >
+              <app-lock-badge [exposure]="fb.exposure" />
+              {{ fb.name }}
+            </span>
+          }
+          <!-- ENHANCE-MY-NOTES: provenance badge — shown only when the backend
+               stamped murmur_enhanced: true in the front-matter. Derives from
+               the note() computed (parseNote over markdown) — nil for locked/
+               masked meetings where markdown is null, so no leak. -->
+          @if (note()?.enhanced) {
+            <span class="meta-sep" aria-hidden="true">·</span>
+            <span
+              class="pill pill-enhanced"
+              title="Your typed notes were used as the skeleton of this summary"
+            >✨ Enhanced from your notes</span>
+          }
+        </div>
+
+        <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags).
+             Hidden while locked — there is nothing to tag on a masked note. -->
+        @if (!locked()) {
+          <div class="tag-editor">
+            @for (t of tags(); track t) {
+              <span class="pill tag-chip">
+                {{ t }}
+                <button
+                  type="button"
+                  class="tag-x"
+                  [attr.aria-label]="'Remove tag ' + t"
+                  [disabled]="tagsBusy()"
+                  (click)="removeTag(t)"
+                >
+                  ×
+                </button>
+              </span>
+            }
+            <input
+              type="text"
+              class="tag-input"
+              placeholder="+ Add tag"
+              aria-label="Add tag"
+              autocapitalize="off"
+              autocomplete="off"
+              [value]="tagDraft()"
+              [disabled]="tagsBusy()"
+              (input)="onTagInput($event)"
+              (keydown.enter)="addTag()"
+            />
+          </div>
+          @if (tagsError(); as err) {
+            <span class="tag-error" role="alert">{{ err }}</span>
+          }
+        }
+      </div>
+
+      @if (!locked()) {
+        <div class="actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="resummarize(d.meeting.id)"
+            [disabled]="busy() || renaming()"
+          >
+            Re-summarize
+          </button>
+          @if (!renaming()) {
+            <button
+              type="button"
+              class="btn btn-ghost"
+              (click)="startRename()"
+              [disabled]="busy()"
+            >
+              Rename
+            </button>
+            <button
+              type="button"
+              class="btn btn-danger"
+              (click)="askDelete()"
+              [disabled]="busy()"
+            >
+              Delete
+            </button>
+
+            <!-- MOVE TO FOLDER: opens the folder picker popover. The picker
+               itself owns the load-bearing encrypt/decrypt confirm. Layout
+               is inline (no component-stylesheet rule) so it stays anchored
+               to its trigger without growing the per-component style budget. -->
+            <div style="position: relative; display: inline-flex">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                [attr.aria-expanded]="moveOpen()"
+                aria-haspopup="menu"
+                (click)="toggleMove()"
+                [disabled]="busy()"
+              >
+                Move to folder
+              </button>
+              @if (moveOpen()) {
+                <div
+                  style="position: absolute; top: calc(100% + var(--space-2)); left: 0; z-index: 30"
+                >
+                  <app-move-to-menu
+                    [meetingId]="d.meeting.id"
+                    [currentFolderId]="d.meeting.folderId ?? null"
+                    (moved)="onMoved($event)"
+                    (close)="closeMove()"
+                  />
+                </div>
+              }
+            </div>
+          }
+
+          <!-- EXPORT menu: copy / save note / save audio / print-to-PDF.
+             Gated on a parsed note existing; disabled while editing it. -->
+          @if (note() && !renaming()) {
+            <div class="export" role="group" aria-label="Export">
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="copyMarkdown()"
+                [disabled]="editing() || busy()"
+              >
+                {{
+                  exportMsg() === "md-copied" ? "Copied" : "Copy Markdown"
+                }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="saveMarkdown(d.meeting.id, d.meeting.title)"
+                [disabled]="editing() || exporting()"
+              >
+                {{
+                  exportMsg() === "md-saved" ? "Saved" : "Save Markdown…"
+                }}
+              </button>
+              @if (audioSrc()) {
+                <button
+                  type="button"
+                  class="btn btn-ghost export-btn"
+                  (click)="saveAudio(d.meeting.id, d.meeting.title)"
+                  [disabled]="editing() || exporting()"
+                >
+                  {{
+                    exportMsg() === "audio-saved" ? "Saved" : "Save audio…"
+                  }}
+                </button>
+              }
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="saveAsPdf()"
+                [disabled]="editing()"
+              >
+                Save as PDF
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="exportCanvas(d.meeting.id)"
+                [disabled]="editing() || exportingCanvas()"
+              >
+                {{ exportingCanvas() ? "Exporting…" : "Export Canvas" }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="shareAsLink(d.meeting.id)"
+                [disabled]="editing() || sharing()"
+              >
+                {{ sharing() ? "Sharing…" : "Share as link" }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="openPersonShare(d.meeting.id)"
+                [disabled]="editing() || personBusy()"
+              >
+                Share with a person
+              </button>
+            </div>
+            <!-- Optional password for the NEXT "Share as link". Mixed into the link key on
+                 device (Argon2id) — the server never sees it; the viewer prompts for it. -->
+            <div class="share-pw-row">
+              <input
+                #pwField
+                type="password"
+                class="share-pw-input"
+                [value]="sharePassword()"
+                (input)="sharePassword.set(pwField.value)"
+                placeholder="Link password (optional)"
+                autocomplete="off"
+                aria-label="Optional password for the share link"
+              />
+              <span class="share-pw-hint text-secondary">
+                Set a password → recipients must enter it to open the link. Share
+                the password separately.
+              </span>
+            </div>
+          }
+
+          <!-- Share-as-link: one-time egress consent panel, the created
+               link, or an inline error. The consent panel is IN-FLOW (not a
+               floating overlay) so a frosted .card is correct here. -->
+          @if (needsShareConsent()) {
+            <div class="card share-consent" role="group">
+              <p class="share-consent-copy">
+                This uploads the encrypted note to your sharing server. The
+                note is end-to-end encrypted — the server can't read it — but
+                it does leave this Mac.
+              </p>
+              <div class="share-consent-actions">
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  (click)="confirmShareConsent()"
+                >
+                  Confirm &amp; share
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  (click)="cancelShareConsent()"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          }
+          @if (shareUrl(); as url) {
+            <div class="share-result" role="group" aria-label="Share link">
+              @if (sharedWithPassword()) {
+                <span class="pill is-success share-pw-badge">
+                  🔒 Password-protected
+                </span>
+              }
+              <div class="share-link-row">
+                <input
+                  type="text"
+                  class="share-link-input"
+                  [value]="url"
+                  readonly
+                  aria-label="Share link"
+                />
+                <button
+                  type="button"
+                  class="btn"
+                  (click)="copyShareLink()"
+                >
+                  {{ shareLinkCopied() ? "Copied" : "Copy link" }}
+                </button>
+              </div>
+              <p class="share-link-note text-secondary">
+                Anyone with this link can read the note. The link's
+                <code>#…</code> part is the decryption key and never reached
+                the server.
+              </p>
+              @if (sharedWithPassword()) {
+                <p class="share-link-note text-secondary">
+                  🔒 Password-protected — send the password to the recipient
+                  <strong>separately</strong> (not in the same message).
+                </p>
+              }
+            </div>
+          }
+          @if (shareError(); as err) {
+            <span class="msg msg-error" role="alert">{{ err }}</span>
+          }
+
+          <!-- Share WITH A PERSON (M5-CLIENT: Murmur↔Murmur, mode B). The
+               email-entry / suggest-link / consent / result steps are all
+               IN-FLOW (a frosted .card is correct); the fingerprint
+               verification SHEET floats OVER the note → it is OPAQUE (trap
+               T3), rendered by <app-share-verify-sheet>. -->
+          @if (personShareOpen()) {
+            <div
+              class="card person-share"
+              role="group"
+              aria-label="Share with a person"
+            >
+              @switch (personStep()) {
+                @case ("email") {
+                  <p class="share-consent-copy">
+                    Share this note directly with another Murmur user. It's
+                    end-to-end encrypted to their account key.
+                  </p>
+                  <div class="person-row">
+                    <input
+                      type="email"
+                      class="person-input"
+                      [value]="personEmail()"
+                      (input)="onPersonEmailInput($event)"
+                      (keydown.enter)="submitPersonEmail()"
+                      placeholder="colleague@example.com"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-label="Recipient email"
+                      [disabled]="personBusy()"
+                    />
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="submitPersonEmail()"
+                      [disabled]="personBusy() || !personEmail().trim()"
+                    >
+                      {{ personBusy() ? "Checking…" : "Continue" }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      (click)="closePersonShare()"
+                      [disabled]="personBusy()"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                }
+                @case ("suggest-link") {
+                  <p class="share-consent-copy">
+                    They don't use Murmur yet — send a protected link
+                    instead?
+                    <span class="pill is-accent">Recommended</span>
+                  </p>
+                  <div class="person-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="sendProtectedLinkInstead()"
+                      [disabled]="personBusy()"
+                    >
+                      Send a protected link
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      (click)="inviteAnyway()"
+                      [disabled]="personBusy()"
+                    >
+                      {{ personBusy() ? "Inviting…" : "Invite them anyway" }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      (click)="closePersonShare()"
+                      [disabled]="personBusy()"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                }
+                @case ("consent") {
+                  <p class="share-consent-copy">
+                    This uploads the encrypted note to your sharing server.
+                    The note is end-to-end encrypted — the server can't read
+                    it — but it does leave this Mac.
+                  </p>
+                  <div class="person-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="confirmPersonShareConsent()"
+                      [disabled]="personBusy()"
+                    >
+                      {{ personBusy() ? "Sharing…" : "Confirm & share" }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost"
+                      (click)="closePersonShare()"
+                      [disabled]="personBusy()"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                }
+                @case ("result") {
+                  <p class="person-result">{{ personResult() }}</p>
+                  <div class="person-row">
+                    <button
+                      type="button"
+                      class="btn"
+                      (click)="closePersonShare()"
+                    >
+                      Done
+                    </button>
+                  </div>
+                }
+              }
+              @if (personError(); as perr) {
+                <span class="msg msg-error" role="alert">{{ perr }}</span>
+              }
+            </div>
+          }
+          @if (verifyMode(); as mode) {
+            <app-share-verify-sheet
+              [email]="personEmail()"
+              [fingerprint]="personPreview()?.fingerprint ?? ''"
+              [mode]="mode"
+              [busy]="personBusy()"
+              [error]="personError()"
+              (confirm)="confirmVerifiedSend()"
+              (cancelled)="closePersonShare()"
+            />
+          }
+
+          <!-- HI-RES MASTERS: retrieve the faithful per-stream float32 WAV
+               archives. Shown only when this install keeps masters AND the
+               meeting has audio; the backend is the source of truth and fails
+               closed (Locked when sealed, "no master for that stream" when a
+               given stream wasn't archived) — both surfaced as friendly inline
+               messages, never a crash. -->
+          @if (keepsMasters() && audioSrc() && !renaming()) {
+            <div
+              class="export"
+              role="group"
+              aria-label="Export hi-res master"
+            >
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                title="Save the faithful float32 mic archive (kept because high-fidelity masters is on)."
+                (click)="exportMaster('mic', d.meeting.id, d.meeting.title)"
+                [disabled]="editing() || exporting()"
+              >
+                {{
+                  exportMsg() === "mic-master-saved"
+                    ? "Saved"
+                    : "Export master (mic)…"
+                }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                title="Save the faithful float32 system-audio archive (when the other side was captured)."
+                (click)="exportMaster('sys', d.meeting.id, d.meeting.title)"
+                [disabled]="editing() || exporting()"
+              >
+                {{
+                  exportMsg() === "sys-master-saved"
+                    ? "Saved"
+                    : "Export master (system)…"
+                }}
+              </button>
+            </div>
+          }
+          @if (canvasMsg(); as path) {
+            <div class="saved-toast canvas-toast" role="status">
+              <span class="saved-toast-check" aria-hidden="true"></span>
+              Canvas saved · {{ path }}
+            </div>
+          }
+          @if (canvasError(); as err) {
+            <span class="msg msg-error" role="alert">{{ err }}</span>
+          }
+
+          <!-- CONNECT TO GRAPH: resolve people + projects into vault stubs.
+             Gated on a parsed note existing; disabled while editing it. -->
+          @if (note() && !renaming()) {
+            <div class="graph-connect" role="group" aria-label="Graph">
+              <button
+                type="button"
+                class="btn btn-ghost export-btn"
+                (click)="linkGraph()"
+                [disabled]="editing() || linking()"
+              >
+                {{ linking() ? "Linking…" : "Link people &amp; projects" }}
+              </button>
+            </div>
+          }
+
+          @if (exportError(); as err) {
+            <span class="msg msg-error" role="alert">{{ err }}</span>
+          }
+          @if (msg()) {
+            <span class="msg">{{ msg() }}</span>
+          }
+        </div>
+      }
+    </header>
+
+    <!-- ============================================================= -->
+    <!-- PHASE 0.5 LOCK GATE — shown when the backend masked this       -->
+    <!-- meeting (sealed, not-session-unlocked folder). Replaces the    -->
+    <!-- note/transcript/audio/timeline/actions with a single frosted   -->
+    <!-- card + a biometric Unlock action. The masked "🔒 Locked" title -->
+    <!-- bar above still shows; the back-to-Meetings nav stays.         -->
+    <!-- ============================================================= -->
+    @if (locked()) {
+      <div
+        class="card empty-state"
+        role="group"
+        aria-labelledby="lock-gate-title"
+        style="animation: rise 420ms var(--transition) both"
+      >
+        <span
+          aria-hidden="true"
+          style="display: inline-flex; align-items: center; justify-content: center; width: 64px; height: 64px; margin-bottom: var(--space-2); border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent-hover)"
+        >
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none">
+            <rect
+              x="4.5"
+              y="10.5"
+              width="15"
+              height="10.5"
+              rx="2.4"
+              stroke="currentColor"
+              stroke-width="1.8"
+            />
+            <path
+              d="M7.75 10.5V7.75a4.25 4.25 0 0 1 8.5 0V10.5"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+            />
+            <circle cx="12" cy="15.4" r="1.6" fill="currentColor" />
+          </svg>
+        </span>
+        <p id="lock-gate-title" class="empty-title">
+          This meeting is locked
+        </p>
+        <p class="empty" style="max-width: 42ch">
+          It lives in a locked folder. Unlock to view the note, transcript
+          and audio.
+        </p>
+        <button
+          #unlockButton
+          type="button"
+          class="btn btn-primary"
+          style="margin-top: var(--space-2)"
+          (click)="unlock()"
+          [disabled]="unlocking()"
+        >
+          {{ unlocking() ? "Unlocking…" : "🔒 Unlock (Touch ID)" }}
+        </button>
+      </div>
+    }
+
+    @if (!locked()) {
+      <!-- Graph link result: resolved people + projects as chips + caption. -->
+      @if (graphError(); as err) {
+        <div class="card graph-card graph-card--error" role="alert">
+          {{ err }}
+        </div>
+      }
+      @if (graph(); as g) {
+        <div class="card graph-card" role="status">
+          @if (g.people.length || g.projects.length) {
+            <div class="graph-groups">
+              @if (g.people.length) {
+                <div class="graph-group">
+                  <span class="graph-group-label">People</span>
+                  <div class="graph-pills">
+                    @for (p of g.people; track p) {
+                      <span class="pill tag">{{ p }}</span>
+                    }
+                  </div>
+                </div>
+              }
+              @if (g.projects.length) {
+                <div class="graph-group">
+                  <span class="graph-group-label">Projects</span>
+                  <div class="graph-pills">
+                    @for (pr of g.projects; track pr) {
+                      <span class="pill tag graph-pill--project">{{
+                        pr
+                      }}</span>
+                    }
+                  </div>
+                </div>
+              }
+            </div>
+            <p class="graph-caption">
+              Added to your Obsidian vault graph (People/ &amp; Projects/)
+            </p>
+          } @else {
+            <p class="graph-caption">No people or projects to link yet.</p>
+          }
+        </div>
+      }
+
+      <!-- In-app delete confirmation (signal-driven; no window.confirm) ----- -->
+      @if (confirmingDelete()) {
+        <div
+          class="card confirm"
+          role="alertdialog"
+          aria-label="Delete meeting"
+        >
+          <div class="confirm-text">
+            <p class="confirm-title">Delete this meeting?</p>
+            <p class="confirm-copy">
+              This permanently removes the recording, transcript, summary
+              and the note in your vault. This can’t be undone.
+            </p>
+            @if (deleteError(); as err) {
+              <p class="confirm-error" role="alert">{{ err }}</p>
+            }
+          </div>
+          <div class="confirm-actions">
+            <button
+              type="button"
+              class="btn btn-ghost"
+              (click)="cancelDelete()"
+              [disabled]="deleting()"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="btn btn-danger"
+              (click)="confirmDelete(d.meeting.id)"
+              [disabled]="deleting()"
+            >
+              {{ deleting() ? "Deleting…" : "Delete" }}
+            </button>
+          </div>
+        </div>
+      }
+
+      <!-- 1) AUDIO PLAYER ------------------------------------------------ -->
+      @if (audioSrc(); as src) {
+        <div class="card player" [style.animation-delay.ms]="40">
+          <audio
+            #player
+            [src]="src"
+            preload="metadata"
+            (loadedmetadata)="onLoaded()"
+            (timeupdate)="onTimeUpdate()"
+            (play)="playing.set(true)"
+            (pause)="playing.set(false)"
+            (ended)="onEnded()"
+          ></audio>
+
+          <button
+            type="button"
+            class="play"
+            (click)="togglePlay()"
+            [attr.aria-label]="playing() ? 'Pause' : 'Play'"
+            [class.is-playing]="playing()"
+          >
+            @if (playing()) {
+              <span class="icon-pause" aria-hidden="true"></span>
+            } @else {
+              <span class="icon-play" aria-hidden="true"></span>
+            }
+          </button>
+
+          <div class="player-body">
+            <div
+              class="track"
+              role="slider"
+              tabindex="0"
+              aria-label="Seek"
+              [attr.aria-valuemin]="0"
+              [attr.aria-valuemax]="Math.round(duration())"
+              [attr.aria-valuenow]="Math.round(currentTime())"
+              (click)="seekFromEvent($event)"
+              (keydown)="onTrackKey($event)"
+            >
+              <div class="track-fill" [style.width.%]="progressPct()">
+                <span class="track-knob"></span>
+              </div>
+            </div>
+            <div class="times">
+              <span class="time">{{ fmt(currentTime()) }}</span>
+              <span class="time time-total">{{ fmt(duration()) }}</span>
+            </div>
+          </div>
+        </div>
+      } @else {
+        <div class="card player player--empty">
+          <span class="audio-off" aria-hidden="true"></span>
+          <span class="audio-off-text">Audio not available</span>
+        </div>
+      }
+
+      <!-- 1b) INTERACTIVE TIMELINE (speakers + topics, shared playhead) -- -->
+      <app-meeting-timeline
+        [timeline]="timeline()"
+        [total]="timelineTotal()"
+        [currentTime]="currentTime()"
+        [loading]="timelineLoading()"
+        [error]="timelineError()"
+        [hasAudio]="!!audioSrc()"
+        [suggestions]="speakerSuggestions()"
+        (seek)="seekTo($event)"
+        (retry)="loadTimeline()"
+        (pin)="onPin($event)"
+        (renameSpeaker)="onRenameSpeaker($event)"
+      />
+
+      <!-- Pin confirmation / error (driven by the timeline's (pin) output). -->
+      @if (pinMsg(); as m) {
+        <div class="saved-toast pin-toast" role="status">
+          <span class="pin-toast-dot" aria-hidden="true"></span>
+          {{ m }}
+        </div>
+      }
+      @if (pinError(); as err) {
+        <div class="saved-toast pin-toast pin-toast--error" role="alert">
+          {{ err }}
+        </div>
+      }
+
+      <!-- 2) RICH ANALYSIS ---------------------------------------------- -->
+      <section class="block print-keep" [class.is-resummarizing]="busy()">
+        <div class="block-head">
+          <h3>Analysis</h3>
+          @if (!editing() && note()?.tags?.length) {
+            <div class="tags">
+              @for (t of note()!.tags; track t) {
+                <span class="pill tag">{{ t }}</span>
+              }
+            </div>
+          }
+          <!-- Phase 5: model-provenance badge — shown only when the backend
+               recorded which model produced this note. Hidden for locked meetings
+               (provenance null) and for legacy meetings without CallMeta. -->
+          @if (provenanceLabel(); as prov) {
+            <span
+              class="provenance-badge"
+              [attr.title]="prov.provider ? 'Provider: ' + prov.provider : null"
+              [attr.aria-label]="'Generated by ' + (prov.model || prov.provider)"
+            >
+              <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+                class="provenance-icon"
+              >
+                <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.4" />
+                <path d="M5.5 8.5 7.2 10.2 10.5 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              @if (prov.model) {
+                <span>{{ prov.model }}</span>
+              }
+              @if (prov.model && prov.provider) {
+                <span class="provenance-sep" aria-hidden="true">·</span>
+              }
+              @if (prov.provider) {
+                <span>{{ prov.provider }}</span>
+              }
+            </span>
+          }
+          @if (note() && !editing()) {
+            <button
+              type="button"
+              class="btn btn-ghost edit-btn"
+              (click)="startEdit()"
+            >
+              Edit
+            </button>
+          }
+        </div>
+
+        @if (note(); as n) {
+          @if (editing()) {
+            <!-- In-app note editor (raw markdown → re-written to the vault) -->
+            <article class="card editor">
+              <textarea
+                class="editor-area"
+                spellcheck="false"
+                autocapitalize="off"
+                autocomplete="off"
+                aria-label="Note markdown"
+                [value]="draft()"
+                [disabled]="saving()"
+                (input)="onDraftInput($event)"
+              ></textarea>
+
+              @if (saveError(); as err) {
+                <p class="editor-error" role="alert">{{ err }}</p>
+              }
+
+              <div class="editor-foot">
+                <span class="editor-hint"
+                  >Markdown · saved to your vault</span
+                >
+                <div class="editor-actions">
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    (click)="cancelEdit()"
+                    [disabled]="saving()"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    (click)="saveNote()"
+                    [disabled]="saving()"
+                  >
+                    {{ saving() ? "Saving…" : "Save" }}
+                  </button>
+                </div>
+              </div>
+            </article>
+          } @else {
+            @if (n.participants.length) {
+              <div class="card meta-card" [style.animation-delay.ms]="80">
+                <span class="meta-card-label">Participants</span>
+                <div class="people">
+                  @for (p of n.participants; track p) {
+                    <span class="person">{{ p }}</span>
+                  }
+                </div>
+              </div>
+            }
+
+            @if (n.sections.length) {
+              @for (sec of n.sections; track sec.heading; let i = $index) {
+                <article
+                  class="card section"
+                  [style.animation-delay.ms]="120 + i * 60"
+                >
+                  <h4 class="section-head">{{ sec.heading }}</h4>
+
+                  @switch (sec.kind) {
+                    @case ("actions") {
+                      <ul class="checklist">
+                        @for (a of sec.actions; track $index) {
+                          <li class="check" [class.is-done]="a.done">
+                            <span
+                              class="check-box"
+                              [class.is-done]="a.done"
+                              aria-hidden="true"
+                            ></span>
+                            <span class="check-text">{{ a.text }}</span>
+                          </li>
+                        }
+                      </ul>
+                    }
+                    @case ("bullets") {
+                      <ul class="bullets">
+                        @for (b of sec.bullets; track $index) {
+                          <li class="bullet">{{ b }}</li>
+                        }
+                      </ul>
+                    }
+                    @default {
+                      <div class="prose">
+                        @for (para of sec.paragraphs; track $index) {
+                          <p>{{ para }}</p>
+                        }
+                      </div>
+                    }
+                  }
+                </article>
+              }
+            } @else if (n.raw) {
+              <article
+                class="card section"
+                [style.animation-delay.ms]="120"
+              >
+                <pre class="note-body">{{ n.raw }}</pre>
+              </article>
+            }
+
+            @if (justSaved()) {
+              <div class="saved-toast" role="status">
+                <span class="saved-toast-check" aria-hidden="true"></span>
+                Saved
+              </div>
+            }
+
+            @if (d.note?.exportedPath; as path) {
+              <div class="card saved" [style.animation-delay.ms]="160">
+                <span class="saved-icon" aria-hidden="true"></span>
+                <div class="saved-body">
+                  <span class="saved-label">Saved to vault</span>
+                  <span class="saved-path">{{ path }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="btn btn-ghost copy-btn"
+                  (click)="copy(path)"
+                >
+                  {{ copied() ? "Copied" : "Copy path" }}
+                </button>
+              </div>
+            }
+          }
+        } @else {
+          <div class="card empty-card empty-state">
+            <span class="empty-mark" aria-hidden="true"></span>
+            <p class="empty-title">No analysis yet</p>
+            <p class="empty">
+              Re-summarize this meeting to generate a structured note.
+            </p>
+          </div>
+        }
+      </section>
+
+      <!-- 2·25) ASSISTANT Q&A (persisted in-meeting voice exchanges) ------- -->
+      @if (interactions().length) {
+        <section class="block print-keep">
+          <div class="block-head">
+            <h3>🎙 Asystent — Q&amp;A</h3>
+            <span class="count">{{ interactions().length }}</span>
+          </div>
+
+          <ul class="qa-list">
+            @for (q of interactions(); track q.id) {
+              <li
+                class="card qa-row"
+                [class.is-pending]="q.status === 'pending'"
+              >
+                <div class="qa-heard">
+                  <span class="qa-ico" aria-hidden="true">🎙</span>
+                  <span class="qa-heard-text">
+                    Pytałeś:
+                    <strong>{{ q.command || "…" }}</strong>
+                  </span>
+                  @if (qaStatusLabel(q.status)) {
+                    <span class="pill" [class]="qaStatusPillClass(q.status)">
+                      <span class="pill-dot"></span>
+                      {{ qaStatusLabel(q.status) }}
+                    </span>
+                  }
+                </div>
+
+                @if (q.answer) {
+                  <app-markdown
+                    class="qa-answer"
+                    [markdown]="q.answer"
+                    compact
+                  />
+                }
+
+                @if (q.citations.length) {
+                  <app-assistant-sources [citations]="q.citations" />
+                }
+
+                @if (q.sourceLabel) {
+                  <span class="qa-source text-muted">{{
+                    q.sourceLabel
+                  }}</span>
+                }
+              </li>
+            }
+          </ul>
+        </section>
+      }
+
+      <!-- 2·5) ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none) - -->
+      <app-meeting-actions [meetingId]="d.meeting.id" />
+
+      <!-- 2a) RECIPES / GENERATE (grounded one-tap generations over text) - -->
+      <section class="block">
+        <div class="block-head">
+          <h3>Recipes</h3>
+        </div>
+        <app-meeting-recipes [meetingId]="d.meeting.id" />
+      </section>
+
+      <!-- 2b) CHAT WITH THIS MEETING (grounded Q&A over the transcript) -- -->
+      <section class="block">
+        <app-meeting-chat [meetingId]="d.meeting.id" />
+      </section>
+
+      <!-- 3) CLICK-TO-SEEK TRANSCRIPT ----------------------------------- -->
+      <section class="block">
+        <div class="block-head">
+          <h3>Transcript</h3>
+          @if (d.segments.length) {
+            <span class="count">{{ d.segments.length }}</span>
+          }
+        </div>
+
+        @if (d.segments.length) {
+          <div
+            class="card transcript-card"
+            [style.animation-delay.ms]="200"
+          >
+            <ul class="segs">
+              @for (s of d.segments; track s.idx) {
+                <li>
+                  <button
+                    type="button"
+                    class="seg"
+                    [class.is-active]="isActiveSegment(s.startS, s.endS)"
+                    [disabled]="!audioSrc()"
+                    (click)="seekTo(s.startS)"
+                  >
+                    <span class="seg-time">{{ fmt(s.startS) }}</span>
+                    @if (speakerChip(s.speaker); as chip) {
+                      <span
+                        class="seg-speaker"
+                        [style.background]="chip.bg"
+                        [style.color]="chip.fg"
+                        >{{ chip.label }}</span
+                      >
+                    }
+                    <span class="seg-text">{{ s.text }}</span>
+                  </button>
+                </li>
+              }
+            </ul>
+          </div>
+        } @else {
+          <div class="card empty-card">
+            <p class="empty">No transcript.</p>
+          </div>
+        }
+      </section>
+
+      <!-- 4) RELATED BY MEANING (semantic neighbors; silent when empty) -- -->
+      <app-related-meetings
+        [meetingId]="d.meeting.id"
+        (open)="openRelated($event)"
+      />
+    }
+  } @else if (loading()) {
+    <div class="card state-card">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else {
+    <div class="card empty-card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Meeting not found</p>
+      <p class="empty">It may have been deleted.</p>
+    </div>
+  }
+</section>
+  

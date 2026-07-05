@@ -1,0 +1,68 @@
+<div
+  class="bar"
+  [class.is-recording]="store.isRecording()"
+  [class.is-processing]="isProcessing()"
+>
+  @if (store.isRecording()) {
+    <span class="orb live" data-tauri-drag-region aria-hidden="true"></span>
+    <span class="timer" data-tauri-drag-region>{{ elapsedLabel() }}</span>
+    @if (caption(); as cc) {
+      <span
+        class="wave is-compact"
+        [style.--level]="store.level()"
+        aria-hidden="true"
+      >
+        @for (b of compactBars; track b) {
+          <span class="wbar" [style.--i]="b"></span>
+        }
+      </span>
+      <span class="cc" aria-live="polite" [title]="cc">{{ cc }}</span>
+    } @else {
+      <div class="wave" [style.--level]="store.level()" aria-hidden="true">
+        @for (b of bars; track b) {
+          <span class="wbar" [style.--i]="b"></span>
+        }
+      </div>
+    }
+    <!-- Mic-mute: icon-only in the slim pill. Silences only the mic;
+         system audio keeps recording. Never starts/stops anything. -->
+    <app-mic-mute-toggle [compact]="true" />
+    <button
+      type="button"
+      class="circle stop"
+      (click)="store.stop()"
+      aria-label="Stop recording"
+    >
+      <span class="sq" aria-hidden="true"></span>
+    </button>
+  } @else if (isProcessing()) {
+    <span class="orb proc" data-tauri-drag-region aria-hidden="true"></span>
+    <span class="label proc-label" data-tauri-drag-region>{{
+      store.message() || store.stage()
+    }}</span>
+    <div class="track" aria-hidden="true"><div class="shim"></div></div>
+  } @else {
+    <span class="grip" data-tauri-drag-region aria-hidden="true">
+      <i></i><i></i>
+    </span>
+    <span
+      class="orb ready"
+      data-tauri-drag-region
+      aria-hidden="true"
+    ></span>
+    <span class="label ready-label" data-tauri-drag-region>
+      Ready to record
+    </span>
+    <span class="kbd" data-tauri-drag-region aria-hidden="true">⌘⇧R</span>
+    <button
+      type="button"
+      class="circle rec"
+      (click)="store.start()"
+      [disabled]="store.isBusy()"
+      aria-label="Start recording"
+    >
+      <span class="dot" aria-hidden="true"></span>
+    </button>
+  }
+</div>
+  

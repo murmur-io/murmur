@@ -1,0 +1,92 @@
+<!-- Floating popover (T3): OPAQUE .menu shell only — never the frosted .card. -->
+<div class="menu" role="menu" aria-label="Move note to folder">
+  <header class="menu-head">
+    <h4 class="menu-title">Move to…</h4>
+    <button
+      type="button"
+      class="menu-close"
+      aria-label="Close move menu"
+      (click)="close.emit()"
+    >
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+        <path
+          d="M4 4l8 8M12 4l-8 8"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+        />
+      </svg>
+    </button>
+  </header>
+
+  @if (pending(); as target) {
+    <!-- Load-bearing confirm for a cross-encryption-boundary move -->
+    <div class="confirm" role="alertdialog" aria-modal="true">
+      <p class="confirm-title">{{ confirmTitle() }}</p>
+      <p class="confirm-body">{{ confirmBody() }}</p>
+      @if (moveError()) {
+        <p class="confirm-error" role="alert">{{ moveError() }}</p>
+      }
+      <div class="confirm-actions">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          [disabled]="moving()"
+          (click)="cancelConfirm()"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="btn btn-primary"
+          [disabled]="moving()"
+          (click)="applyMove(target.id)"
+        >
+          {{ moving() ? "Moving…" : confirmCta() }}
+        </button>
+      </div>
+    </div>
+  } @else {
+    <ul class="opts">
+      <!-- Vault root -->
+      <li>
+        <button
+          type="button"
+          class="opt"
+          role="menuitem"
+          [class.is-current]="currentFolderId() === null"
+          [disabled]="moving() || currentFolderId() === null"
+          (click)="pick(null)"
+        >
+          <span class="opt-name">All notes (vault root)</span>
+          @if (currentFolderId() === null) {
+            <span class="opt-here">Here</span>
+          }
+        </button>
+      </li>
+
+      @for (opt of options(); track opt.node.id) {
+        <li>
+          <button
+            type="button"
+            class="opt"
+            role="menuitem"
+            [style.--depth]="opt.depth"
+            [class.is-current]="currentFolderId() === opt.node.id"
+            [disabled]="moving() || currentFolderId() === opt.node.id"
+            (click)="pick(opt.node.id)"
+          >
+            <span class="opt-name">{{ opt.node.name }}</span>
+            <app-lock-badge [exposure]="folders.exposureOf(opt.node)" />
+            @if (currentFolderId() === opt.node.id) {
+              <span class="opt-here">Here</span>
+            }
+          </button>
+        </li>
+      } @empty {
+        <li><p class="opts-empty">No folders to move into.</p></li>
+      }
+    </ul>
+  }
+</div>
+  

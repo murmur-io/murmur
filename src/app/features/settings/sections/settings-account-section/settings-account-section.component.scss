@@ -1,0 +1,283 @@
+/* Host stays layout-transparent so this section's card is a direct flex
+   item of the shell's .section-body (identical spacing to siblings). */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.account-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.account-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+.account-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  min-width: 48px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
+}
+.account-mark svg {
+  display: block;
+}
+.account-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.account-copy h3 {
+  margin: 0;
+}
+.account-sub {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.account-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.account-section-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.account-note {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+/* Shared text input — mirrors the app's input treatment via tokens. */
+.text-input {
+  height: 38px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.9rem;
+}
+.text-input::placeholder {
+  color: var(--text-muted);
+}
+.text-input:focus-visible {
+  outline: none;
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.server-row {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.server-input {
+  flex: 1 1 18rem;
+  min-width: 0;
+}
+.server-row .btn {
+  flex: none;
+}
+
+.account-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+.account-actions .btn {
+  flex: none;
+}
+
+.signed-in-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.signed-pill {
+  align-self: flex-start;
+}
+
+/* --- Incoming shares (M5-CLIENT inbox) --- */
+.inbox-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.inbox-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+}
+.inbox-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.fp-inline {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  letter-spacing: 0.03em;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.inbox-sub {
+  font-size: 0.8rem;
+}
+.inbox-ok {
+  margin: 0;
+  color: var(--success);
+  font-size: 0.85rem;
+}
+
+/* The accept-into picker floats over the rows below → OPAQUE (trap T3),
+   never the frosted .card. */
+.inbox-actions-wrap {
+  position: relative;
+  align-self: flex-start;
+}
+.folder-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  margin-top: var(--space-1);
+  min-width: 220px;
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-2);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.folder-opt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  padding-left: calc(var(--space-2) + var(--depth, 0) * var(--space-4));
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition);
+}
+.folder-opt:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.folder-opt:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.folder-opt-tag {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.opts-empty {
+  margin: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+/* --- The reusable-flow OPAQUE modal (trap T3) --- */
+.flow-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+  background: rgba(0, 0, 0, 0.5);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  animation: scrim-in 180ms var(--transition) both;
+}
+@keyframes scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.flow-modal {
+  width: 100%;
+  max-width: 460px;
+  max-height: calc(100vh - 2 * var(--space-5));
+  overflow-y: auto;
+  padding: var(--space-6);
+  /* OPAQUE overlay — NOT the frosted .card (trap T3). */
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: modal-in 220ms var(--ease-spring) both;
+}
+.flow-modal:focus-visible {
+  outline: none;
+}
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-scrim,
+  .flow-modal {
+    animation: none !important;
+  }
+}
+    

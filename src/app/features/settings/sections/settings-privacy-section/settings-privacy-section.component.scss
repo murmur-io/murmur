@@ -1,0 +1,237 @@
+/* Stage-1 split: the host stays layout-transparent so this section's
+   cards remain direct flex items of the shell's .section-body (identical
+   spacing to the pre-split monolith); .section-stack reproduces the
+   .section-body column gap between this section's own cards. */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* --- Privacy & integrations card --- */
+.privacy-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.privacy-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+.privacy-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  min-width: 48px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
+}
+.privacy-mark svg {
+  display: block;
+}
+.privacy-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.privacy-copy h3 {
+  margin: 0;
+}
+.privacy-sub {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+/* Each subsection: a small uppercase label over its explanatory note. */
+.privacy-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.privacy-section-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.privacy-note {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+.privacy-inline-url {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+/* Cross-meeting-memory toggle (mirrors the AI-section toggle rows). */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  cursor: pointer;
+}
+.toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.toggle-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.toggle-sub {
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+/* Cloud-processing consent — button + reassurance, or the granted pill. */
+.cloud-consent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+.cloud-consent-row .btn {
+  flex: none;
+}
+.cloud-consent-hint {
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.cloud-consent-pill {
+  align-self: flex-start;
+}
+
+/* Copyable JSON well — a quiet inset block with its own copy button. */
+.mcp-config {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.mcp-config-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.mcp-config-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.mcp-config-block {
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  letter-spacing: -0.01em;
+  /* Exact-as-written JSON; selectable so it can also be copied by hand. */
+  white-space: pre;
+  overflow-x: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.mcp-copy-btn {
+  flex: none;
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+}
+.mcp-copy-btn.is-copied {
+  color: var(--success);
+  border-color: rgba(74, 222, 128, 0.4);
+  background: var(--success-soft);
+}
+.mcp-copy-icon {
+  flex: none;
+}
+.mcp-hint {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* Name-redaction status pill + one-line hint. */
+.ner-pill {
+  align-self: flex-start;
+}
+.ner-hint {
+  display: block;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+/* NER model-download progress bar (mirrors the onboarding wizard). */
+.dl-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: 320px;
+}
+.dl-progress-track {
+  height: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+.dl-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--radius-sm);
+  transition: width var(--transition);
+}
+.dl-progress-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.85rem;
+}
+
+/* Inline spinner on the Download button (matches the onboarding wizard). */
+.spin-ring {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--text-on-accent);
+  animation: spin 0.8s linear infinite;
+  margin-right: var(--space-2);
+  vertical-align: -2px;
+  display: inline-block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin-ring {
+    animation: none;
+  }
+}
+    

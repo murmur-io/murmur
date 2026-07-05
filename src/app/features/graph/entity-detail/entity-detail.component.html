@@ -1,0 +1,94 @@
+<aside class="ed card" aria-label="Entity detail">
+  <button
+    type="button"
+    class="ed-close btn btn-ghost"
+    aria-label="Close detail"
+    (click)="close.emit()"
+  >
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path
+        d="M4 4l8 8M12 4l-8 8"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+      />
+    </svg>
+  </button>
+
+  @if (loading()) {
+    <div class="ed-state">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else if (error()) {
+    <div class="ed-state">
+      <p class="empty-title">Couldn’t load this entity</p>
+      <p class="empty">{{ error() }}</p>
+    </div>
+  } @else if (detail()) {
+    @if (detail(); as d) {
+      <header class="ed-head">
+        <span
+          class="ed-kind-dot"
+          [class.is-project]="d.entity.kind === 'project'"
+          aria-hidden="true"
+        ></span>
+        <div class="ed-head-text">
+          <h3 class="ed-name">{{ d.entity.name }}</h3>
+          <span class="ed-kind">
+            {{ d.entity.kind === "project" ? "Project" : "Person" }}
+            · {{ meetingCountLabel() }}
+          </span>
+        </div>
+      </header>
+
+      <!-- Bounded neighborhood decoration (computed once, no simulation). -->
+      <app-entity-neighborhood
+        class="ed-neighborhood"
+        [neighbors]="d.neighbors"
+        [centerName]="d.entity.name"
+        (select)="select.emit($event)"
+      />
+
+      <!-- Backlinked meetings → reuse the shared sources chip component. -->
+      <section class="ed-section">
+        <h4 class="ed-section-title">Mentioned in</h4>
+        @if (d.meetings.length) {
+          <app-sources [sources]="d.meetings" [limit]="6" />
+        } @else {
+          <p class="empty ed-section-empty">
+            No visible meetings mention this entity right now.
+          </p>
+        }
+      </section>
+
+      <!-- Neighbors: click to pivot the detail panel to that entity. -->
+      @if (d.neighbors.length) {
+        <section class="ed-section">
+          <h4 class="ed-section-title">Connected entities</h4>
+          <ul class="ed-neighbors">
+            @for (nb of d.neighbors; track nb.id) {
+              <li>
+                <button
+                  type="button"
+                  class="ed-neighbor"
+                  [class.is-project]="nb.kind === 'project'"
+                  (click)="select.emit(nb.id)"
+                >
+                  <span class="ed-neighbor-dot" aria-hidden="true"></span>
+                  <span class="ed-neighbor-name">{{ nb.name }}</span>
+                  <span
+                    class="count ed-neighbor-count"
+                    [attr.title]="sharedLabel(nb)"
+                  >
+                    {{ nb.sharedMeetings }}
+                  </span>
+                </button>
+              </li>
+            }
+          </ul>
+        </section>
+      }
+    }
+  }
+</aside>
+  

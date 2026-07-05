@@ -1,0 +1,194 @@
+<section class="ask">
+  <header class="ask-head">
+    <div class="ask-head-text">
+      <h2 class="ask-title">Ask your meetings</h2>
+      <p class="ask-intro">
+        Ask a question and get an answer grounded across every meeting in
+        your vault — with links to the meetings it came from.
+      </p>
+    </div>
+    @if (conversation().length) {
+      <button
+        type="button"
+        class="btn btn-ghost ask-clear"
+        (click)="clear()"
+        [disabled]="pending()"
+      >
+        Clear
+      </button>
+    }
+  </header>
+
+  @if (loading()) {
+    <div class="card state-card">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else if (isEmpty()) {
+    <!-- No meetings in the vault: nothing to ask about yet. -->
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">No meetings to ask about yet</p>
+      <p class="empty">
+        Record your first meeting and you can chat across your whole vault
+        here.
+      </p>
+    </div>
+  } @else {
+    <div class="ask-panel card">
+      <!-- Message list (also the scroll region) -->
+      <div
+        #scroller
+        class="ask-log"
+        role="log"
+        aria-live="polite"
+        aria-label="Conversation"
+      >
+        @if (conversation().length === 0 && !pending()) {
+          <!-- Empty state: a friendly prompt + tappable starter chips. -->
+          <div class="ask-empty">
+            <span class="ask-empty-mark" aria-hidden="true"></span>
+            <p class="ask-empty-title">Chat across all your meetings</p>
+            <p class="ask-empty-copy">
+              Ask about decisions, owners, and follow-ups spanning your
+              entire history — answers cite the meetings they came from.
+            </p>
+            <div
+              class="ask-starters"
+              role="group"
+              aria-label="Suggested questions"
+            >
+              @for (s of starters; track s) {
+                <button
+                  type="button"
+                  class="ask-chip"
+                  [style.--i]="$index"
+                  (click)="ask(s)"
+                >
+                  {{ s }}
+                </button>
+              }
+            </div>
+          </div>
+        } @else {
+          @for (turn of conversation(); track $index) {
+            <div
+              class="ask-row"
+              [class.is-user]="turn.role === 'user'"
+              [class.is-assistant]="turn.role === 'assistant'"
+            >
+              <div
+                class="ask-bubble"
+                [attr.aria-label]="
+                  (turn.role === 'user' ? 'You' : 'Assistant') + ' said'
+                "
+              >
+                @if (turn.role === "assistant") {
+                  <app-markdown [markdown]="turn.content" />
+                } @else {
+                  {{ turn.content }}
+                }
+              </div>
+
+              <!-- Source meetings the answer was grounded in (collapsible). -->
+              @if (turn.role === "assistant" && turn.sources?.length) {
+                <app-sources
+                  class="ask-sources"
+                  [sources]="turn.sources ?? []"
+                />
+              }
+            </div>
+          }
+
+          <!-- In-flight reply: live tool-trace chips once the agentic loop
+               starts calling tools, the "Thinking…" dots until then. -->
+          @if (pending()) {
+            <div class="ask-row is-assistant">
+              @if (trace().length > 0) {
+                <div
+                  class="ask-bubble ask-trace"
+                  role="status"
+                  aria-label="Tool use"
+                >
+                  @for (t of trace(); track t.id) {
+                    <span
+                      class="ask-trace-chip"
+                      [class.is-running]="t.state === 'running'"
+                      [class.is-web]="t.tool === 'web_search'"
+                      [class.is-failed]="!t.ok"
+                    >
+                      <span class="ask-trace-ico" aria-hidden="true">
+                        @if (t.state === "running") {
+                          <span class="ask-trace-spin"></span>
+                        } @else if (!t.ok) {
+                          ⚠
+                        } @else {
+                          ✓
+                        }
+                      </span>
+                      {{ toolLabel(t.tool) }}
+                      @if (t.state === "done" && t.count) {
+                        <span class="ask-trace-count">{{ t.count }}</span>
+                      }
+                    </span>
+                  }
+                </div>
+              } @else {
+                <div class="ask-bubble ask-typing" aria-label="Thinking">
+                  <span class="ask-dot"></span>
+                  <span class="ask-dot"></span>
+                  <span class="ask-dot"></span>
+                </div>
+              }
+            </div>
+          }
+        }
+
+        <!-- Inline error with a retry affordance (keeps the question). -->
+        @if (error(); as err) {
+          <div class="ask-error" role="alert">
+            <span class="ask-error-text">{{ err }}</span>
+            <button
+              type="button"
+              class="btn btn-ghost ask-retry"
+              (click)="retry()"
+              [disabled]="pending()"
+            >
+              Retry
+            </button>
+          </div>
+        }
+      </div>
+
+      <!-- Composer: textarea (Enter sends · Shift+Enter newline) + Send. -->
+      <form class="ask-composer" (submit)="onSubmit($event)">
+        <textarea
+          #input
+          class="ask-input"
+          rows="1"
+          autocapitalize="sentences"
+          autocomplete="off"
+          spellcheck="true"
+          aria-label="Your question"
+          placeholder="Ask anything about your meetings…"
+          [value]="draft()"
+          [disabled]="pending()"
+          (input)="onDraftInput($event)"
+          (keydown)="onKeydown($event)"
+        ></textarea>
+        <button
+          type="submit"
+          class="btn btn-primary ask-send"
+          [disabled]="!canSend()"
+          [attr.aria-label]="pending() ? 'Sending' : 'Send'"
+        >
+          @if (pending()) {
+            <span class="ask-send-spin" aria-hidden="true"></span>
+          } @else {
+            <span class="ask-send-arrow" aria-hidden="true"></span>
+          }
+        </button>
+      </form>
+    </div>
+  }
+</section>
+  

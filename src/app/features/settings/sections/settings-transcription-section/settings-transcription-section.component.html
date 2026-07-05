@@ -1,0 +1,110 @@
+<div class="section-stack" [formGroup]="form">
+          <div class="card model-card">
+            <div class="model-copy">
+              <h3>Transcription model</h3>
+              <p class="text-secondary model-sub">
+                Runs entirely on-device. Pick your language and quality — the
+                matching Whisper model is fetched once and reused for every
+                recording.
+              </p>
+            </div>
+
+            <div class="model-grid">
+              <label class="field">
+                <span class="field-label">Language</span>
+                <select formControlName="language" (change)="onModelChoiceChange()">
+                  <option value="">Auto-detect</option>
+                  <option value="pl">Polski</option>
+                  <option value="en">English</option>
+                  <option value="de">Deutsch</option>
+                  <option value="es">Español</option>
+                  <option value="fr">Français</option>
+                  <option value="it">Italiano</option>
+                  <option value="pt">Português</option>
+                  <option value="uk">Українська</option>
+                  <option value="nl">Nederlands</option>
+                </select>
+                <span class="field-help text-muted">
+                  Force the transcription language. Polish recommended if you record
+                  mostly in Polish (auto-detect can misfire on short clips).
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">Quality</span>
+                <select
+                  formControlName="modelSize"
+                  (change)="onModelChoiceChange()"
+                >
+                  <option value="tiny">Tiny — fastest (~75 MB)</option>
+                  <option value="base">Base (~150 MB)</option>
+                  <option value="small">Small (~470 MB)</option>
+                  <option value="medium">Medium (~1.5 GB)</option>
+                  <option value="large-v3-turbo">
+                    Large v3 Turbo — fast &amp; accurate (~1.6 GB)
+                  </option>
+                  <option value="large-v3">
+                    Large v3 — best accuracy, recommended (~3 GB)
+                  </option>
+                </select>
+                <span class="field-help text-muted">
+                  Large v3 is the most accurate and the default — it’s a one-time ~3
+                  GB download. Turbo is nearly as good and much smaller.
+                </span>
+              </label>
+            </div>
+
+            <div class="model-status-row">
+              @if (modelPresent() === true) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Downloaded ✓
+                </span>
+                <span class="text-muted model-note">
+                  Stored on this Mac — used for every recording.
+                </span>
+              } @else if (modelPresent() === false) {
+                @if (downloadingModel()) {
+                  <div class="brain-progress" role="status">
+                    <div class="brain-progress-track" aria-hidden="true">
+                      <div
+                        class="brain-progress-fill"
+                        [style.width.%]="modelDownloadFrac() * 100"
+                      ></div>
+                    </div>
+                    <span class="brain-progress-label text-muted">
+                      @if (modelDownloadFrac() > 0) {
+                        Downloading… {{ modelPct() }}
+                      } @else {
+                        Downloading…
+                      }
+                    </span>
+                  </div>
+                  <span class="text-muted model-note">
+                    Fetching the model — large models can take a few minutes.
+                  </span>
+                } @else {
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    (click)="downloadModel()"
+                  >
+                    Download ({{ downloadHint() }})
+                  </button>
+                  <span class="text-muted model-note">
+                    {{ downloadHint() }}, one time, on-device.
+                  </span>
+                }
+              } @else {
+                <span class="pill">
+                  <span class="pill-dot"></span>
+                  Checking…
+                </span>
+              }
+            </div>
+            @if (modelDownloadError(); as derr) {
+              <p class="model-error text-danger">{{ derr }}</p>
+            }
+          </div>
+</div>
+  

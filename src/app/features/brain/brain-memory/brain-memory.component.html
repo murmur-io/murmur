@@ -1,0 +1,153 @@
+<section class="mem">
+  <button
+    type="button"
+    class="mem-toggle"
+    [attr.aria-expanded]="open()"
+    (click)="open.set(!open())"
+  >
+    <svg
+      class="mem-chevron"
+      [class.is-open]="open()"
+      viewBox="0 0 16 16"
+      width="14"
+      height="14"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M5.5 4l5 4-5 4"
+        stroke="currentColor"
+        stroke-width="1.7"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+    <span class="mem-title">What the brain knows about you</span>
+    @if (facts().length > 0) {
+      <span class="count mem-count">{{ facts().length }}</span>
+    }
+    <span class="mem-sub">
+      Facts the brain remembers about you and injects into its answers.
+    </span>
+  </button>
+
+  @if (open()) {
+    @if (loading()) {
+      <div class="card state-card">
+        <p class="empty">Loading what the brain remembers…</p>
+      </div>
+    } @else if (error()) {
+      <div class="card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">Couldn’t load your memory</p>
+        <p class="empty">{{ error() }}</p>
+      </div>
+    } @else if (disabled()) {
+      <div class="card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">Cross-meeting memory is off</p>
+        <p class="empty">
+          The brain isn’t learning or remembering durable facts about you, and
+          injects nothing into its answers. Turn it back on in
+          <a routerLink="/settings">Settings → Privacy</a> to let it build
+          context across your meetings — stored locally, gated, and
+          forgettable.
+        </p>
+      </div>
+    } @else if (facts().length === 0) {
+      <div class="card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">The brain hasn’t learned anything yet</p>
+        <p class="empty">
+          As you record meetings, the brain notes durable facts about you —
+          how you like to work, who you work with, what you own — so it can
+          answer with context. They’ll appear here for you to review or
+          forget. Nothing leaves this Mac unredacted.
+        </p>
+      </div>
+    } @else {
+      <div class="card mem-card">
+        <ul class="mem-list">
+          @for (f of facts(); track f.id) {
+            <li class="mem-item">
+              <div class="mem-fact">
+                <span class="mem-fact-text">{{ factLine(f) }}</span>
+                @if (f.sourceMeetingId; as mid) {
+                  <a
+                    class="mem-source"
+                    [routerLink]="['/meeting', mid]"
+                    title="Where the brain learned this"
+                  >
+                    <svg
+                      viewBox="0 0 16 16"
+                      width="11"
+                      height="11"
+                      fill="none"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M4 2.5h5l3 3v8H4z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                      <path
+                        d="M9 2.5v3h3"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                    Source
+                  </a>
+                }
+              </div>
+              <button
+                type="button"
+                class="btn btn-ghost mem-forget"
+                (click)="forget(f.id)"
+                [disabled]="forgettingId() === f.id"
+                [attr.aria-label]="'Forget: ' + factLine(f)"
+              >
+                {{ forgettingId() === f.id ? "Forgetting…" : "Forget" }}
+              </button>
+            </li>
+          }
+        </ul>
+
+        <footer class="mem-footer">
+          @if (confirmingClear()) {
+            <span class="mem-confirm-copy text-secondary">
+              Forget everything the brain has learned about you?
+            </span>
+            <button
+              type="button"
+              class="btn btn-ghost"
+              (click)="confirmingClear.set(false)"
+              [disabled]="clearing()"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="btn btn-danger"
+              (click)="clearAll()"
+              [disabled]="clearing()"
+            >
+              {{ clearing() ? "Clearing…" : "Forget all" }}
+            </button>
+          } @else {
+            <button
+              type="button"
+              class="btn btn-ghost mem-clear"
+              (click)="confirmingClear.set(true)"
+            >
+              Clear all
+            </button>
+          }
+        </footer>
+      </div>
+    }
+  }
+</section>
+  

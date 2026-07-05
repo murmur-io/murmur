@@ -1,0 +1,106 @@
+<div class="gw">
+  <div class="gw-stage">
+    @switch (mode()) {
+      @case ("pick") {
+        <div class="gw-hero">
+          <span class="orb-brand" aria-hidden="true">
+            <span class="orb-core"></span>
+          </span>
+          <h1 class="gw-title">
+            <span class="brand-dot" aria-hidden="true"></span>
+            Share your notes — or keep it all local
+          </h1>
+          <p class="gw-lede text-secondary">
+            Murmur works fully offline. If you want to share a note as a
+            private, end-to-end-encrypted link, you can add a sharing account
+            — otherwise everything stays on this Mac.
+          </p>
+        </div>
+
+        <div class="gw-cards">
+          <button
+            type="button"
+            class="gw-card"
+            (click)="chooseLocal()"
+            [disabled]="busy()"
+          >
+            <span class="gw-card-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none">
+                <rect
+                  x="4"
+                  y="5"
+                  width="16"
+                  height="10"
+                  rx="1.8"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                />
+                <path
+                  d="M8.5 19h7M12 15v4"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+            <span class="gw-card-name">Use Murmur locally — no account</span>
+            <span class="gw-card-sub text-secondary">
+              Everything stays on this Mac. You can add an account later in
+              Settings.
+            </span>
+            <span class="gw-card-cta">
+              {{ busy() ? "Starting…" : "Continue" }}
+              <span class="cta-arrow" aria-hidden="true">→</span>
+            </span>
+          </button>
+
+          <button
+            type="button"
+            class="gw-card is-accent"
+            (click)="openAccount()"
+            [disabled]="busy()"
+          >
+            <span class="gw-card-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none">
+                <path
+                  d="M12 2.5 4.5 5.5v5.2c0 4.6 3.1 8.1 7.5 9.3 4.4-1.2 7.5-4.7 7.5-9.3V5.5L12 2.5Z"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linejoin="round"
+                />
+                <path
+                  d="M9 11.5 11 13.5 15 9"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+            <span class="gw-card-name">
+              Create or sign in to a sharing account
+            </span>
+            <span class="gw-card-sub text-secondary">
+              End-to-end-encrypted note sharing. Only ciphertext leaves this
+              Mac.
+            </span>
+            <span class="gw-card-cta">
+              Set up sharing
+              <span class="cta-arrow" aria-hidden="true">→</span>
+            </span>
+          </button>
+        </div>
+      }
+
+      @case ("account") {
+        <div class="gw-panel card">
+          <app-sharing-auth-flow
+            (completed)="onCompleted()"
+            (dismissed)="onDismissed()"
+          />
+        </div>
+      }
+    }
+  </div>
+</div>
+  

@@ -1,0 +1,293 @@
+/* Surface-agnostic: the host paints NO background of its own — the gateway
+   card / settings modal that hosts this owns the surface (trap T3). */
+:host {
+  display: contents;
+}
+.flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.flow-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.flow-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+.flow-sub {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+.flow-email {
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.flow-note {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.flow-error {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+/* Two big choice doors on the 'choose' step. */
+.doors {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+@media (max-width: 520px) {
+  .doors {
+    grid-template-columns: 1fr;
+  }
+}
+.door {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  text-align: left;
+  padding: var(--space-4);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition),
+    transform var(--transition-fast);
+}
+.door:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.door:active {
+  transform: translateY(1px);
+}
+.door:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.door:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.door-icon {
+  display: inline-flex;
+  color: var(--accent-hover);
+  margin-bottom: var(--space-1);
+}
+.door-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.door-sub {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+/* Fields. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.flow-label {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  font-weight: 550;
+}
+.field-input {
+  height: 38px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.9rem;
+}
+.field-input::placeholder {
+  color: var(--text-muted);
+}
+.field-input:focus-visible {
+  outline: none;
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.code-input {
+  font-family: var(--font-mono);
+  letter-spacing: 0.35em;
+  font-size: 1.05rem;
+}
+
+.row {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.row .field-input {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+.row .btn {
+  flex: none;
+}
+
+/* Advanced disclosure — a quiet inset well, still tokenized. */
+.adv-toggle {
+  align-self: flex-start;
+}
+.adv-well {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.link-btn {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 550;
+  cursor: pointer;
+  text-align: left;
+}
+.link-btn:hover {
+  color: var(--text-secondary);
+}
+.link-btn:focus-visible {
+  outline: none;
+  text-decoration: underline;
+}
+.link-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Recovery-phrase toggle (mirrors the retired section's toggle rows). */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  cursor: pointer;
+}
+.toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.toggle-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.toggle-sub {
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.recovery-block {
+  margin: 0;
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  line-height: 1.8;
+  user-select: text;
+  -webkit-user-select: text;
+  overflow-wrap: anywhere;
+}
+
+/* Footer nav. */
+.flow-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.flow-nav-spacer {
+  flex: 1;
+}
+.resend {
+  font-size: 0.85rem;
+}
+
+/* Done. */
+.flow-done {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-2);
+  padding: var(--space-4) 0;
+}
+.done-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  margin-bottom: var(--space-1);
+  border-radius: 50%;
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+/* Step progress dots. */
+.flow-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding-top: var(--space-1);
+}
+.dots {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--border-strong);
+  transition:
+    width var(--transition),
+    background var(--transition);
+}
+.dot.is-done {
+  background: var(--accent);
+}
+.dot.is-active {
+  width: 22px;
+  background: var(--accent-gradient);
+}
+.step-count {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+    

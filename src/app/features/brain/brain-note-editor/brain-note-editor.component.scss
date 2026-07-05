@@ -1,0 +1,114 @@
+:host {
+  display: block;
+}
+.ne-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+.ne-scrim {
+  position: fixed;
+  inset: 0;
+  border: none;
+  margin: 0;
+  padding: 0;
+  cursor: default;
+  background: rgba(0, 0, 0, 0.55);
+  animation: ne-fade 160ms var(--transition) both;
+}
+.ne-panel {
+  /* Floating modal OVER the page → OPAQUE (T3), never the frosted .card. */
+  position: relative;
+  z-index: 1;
+  width: min(560px, 100%);
+  max-height: 88vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: ne-rise 200ms var(--transition) both;
+}
+.ne-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.ne-title {
+  margin: 0;
+  font-size: 1.0625rem;
+}
+.ne-close {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--text-muted);
+}
+.ne-close:hover {
+  color: var(--text-primary);
+}
+.ne-sub {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+.ne-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.ne-label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.ne-input {
+  width: 100%;
+  height: 40px;
+}
+.ne-textarea {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.55;
+}
+.ne-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+@keyframes ne-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes ne-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ne-scrim,
+  .ne-panel {
+    animation: none;
+  }
+}
+    

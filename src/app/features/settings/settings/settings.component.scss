@@ -1,0 +1,289 @@
+/* Settings is a full drill-down (L2): the primary app rail is hidden
+   (app-shell) and this host fills the whole window as a flush-left
+   [section rail | content] layout. Fixed so it ignores .app-main's
+   centered max-width + padding and hugs the viewport edges; below the
+   toast viewport (z-index 60). */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  display: block;
+  background: var(--surface-base);
+}
+
+/* ── Two-pane shell: floating section rail + scrolling content ── */
+.settings-shell {
+  display: grid;
+  grid-template-columns: 246px minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* Left rail — the shared floating liquid-glass panel (global .drill-rail
+   in styles.css carries the panel look; only layout + the enter glide
+   live here). */
+.settings-sidebar {
+  gap: var(--space-3);
+  animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Enter transition — the rail and the content pane share ONE cohesive,
+   smoothly-eased glide (content lags 40ms for a touch of depth). It is
+   TRANSFORM ONLY, never opacity: the position:fixed :host is opaque and
+   near-black (--surface-base), so any opacity fade shows through as a
+   "black background, then the UI jumps in" flash (the reported bug). Staying
+   opaque means the settings surface is painted from the very first frame and
+   simply settles into place. Disabled under reduced-motion below. */
+@keyframes settings-enter {
+  from {
+    transform: translateY(8px);
+  }
+  to {
+    transform: none;
+  }
+}
+
+/* Top drag strip — mirrors the primary rail so the overlay traffic lights
+   have somewhere to float and the window stays draggable up here. */
+.rail-drag {
+  flex: none;
+  height: 30px;
+}
+
+/* "← Murmur" drill-down up-affordance. */
+.rail-back {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 34px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.rail-back:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.rail-back:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.rail-back-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+.sidebar-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.sidebar-search-icon {
+  position: absolute;
+  left: var(--space-3);
+  width: 15px;
+  height: 15px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+.sidebar-search-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 var(--space-3) 0 calc(var(--space-6) + var(--space-1));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.875rem;
+}
+.sidebar-search-input::placeholder {
+  color: var(--text-muted);
+}
+.sidebar-search-input:focus-visible {
+  outline: none;
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* Hide the native WebKit search clear affordance for a clean rail. */
+.sidebar-search-input::-webkit-search-decoration,
+.sidebar-search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.nav-item:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+/* Active: the shell's neutral glass-on-glass pill — accent only on the
+   glyph/label, never as the fill (matches the primary rail). */
+.nav-item.active {
+  background: var(--shell-active-bg);
+  color: var(--shell-active-text);
+  box-shadow: var(--shell-active-shadow);
+}
+.nav-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  color: currentColor;
+}
+.nav-icon svg {
+  width: 17px;
+  height: 17px;
+}
+.nav-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nav-empty {
+  margin: var(--space-2) var(--space-1);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.sidebar-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.saved-pill {
+  flex: none;
+}
+
+/* Right pane — scrolls independently of the fixed rail. It provides its own
+   padding (the shell no longer sits inside .app-main's padded column). */
+.settings-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-7) var(--space-6) var(--space-8);
+}
+/* Cap the reading width AND center the column — the same centered
+   max-width reading column as the main pages (.app-main). The error
+   banner is a direct .settings-content child too, so it rides the same
+   rule (it otherwise spans the full pane width). */
+.content-header,
+.section-body,
+.settings-content > .banner {
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+}
+.content-header h2 {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.section-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  /* Shares the rail's cohesive transform-only glide (NOT the global 'rise',
+     which fades opacity 0→1 and would flash near-black over the :host — on
+     entry AND on every section switch). 40ms lag for a subtle stagger. */
+  animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) 40ms both;
+}
+
+/* Narrow widths: stack the rail on top of the content (rows), each
+   scrolling within the fixed full-height shell. */
+@media (max-width: 640px) {
+  .settings-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .settings-sidebar {
+    height: auto;
+    margin: 10px 10px 0;
+  }
+  .sidebar-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    overflow-y: visible;
+  }
+  .nav-item {
+    width: auto;
+  }
+  .settings-content {
+    padding: var(--space-5) var(--space-4) var(--space-6);
+  }
+}
+
+/* Honor reduced-motion: no rail slide, no section rise. */
+@media (prefers-reduced-motion: reduce) {
+  .settings-sidebar,
+  .section-body {
+    animation: none;
+  }
+}
+
+/* --- Banner icon (matches the record screen) --- */
+.banner-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  font-weight: 700;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+    

@@ -1,0 +1,9 @@
+/* Compact inline action inside a toast (sits before the ✕ close). */
+.toast-action {
+  flex: none;
+  height: auto;
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+    

@@ -1,0 +1,133 @@
+<div class="card panel">
+  <div class="panel-head">
+    <h3>Egress &amp; Usage</h3>
+    <!-- 7 / 30 / 90 day segmented toggle -->
+    <div class="seg" role="group" aria-label="Window">
+      @for (r of ranges; track r) {
+        <button
+          type="button"
+          class="seg-btn"
+          [class.is-active]="days() === r"
+          [attr.aria-pressed]="days() === r"
+          (click)="days.set(r)"
+        >
+          {{ r }}d
+        </button>
+      }
+    </div>
+  </div>
+
+  @if (loading()) {
+    <p class="empty">Loading…</p>
+  }
+  @if (error(); as err) {
+    <p class="empty eg-error" role="alert">{{ err }}</p>
+  }
+  @if (ledger(); as l) {
+    <!-- Three stat tiles -->
+    <div class="eg-tiles">
+      <div class="eg-tile">
+        <span class="eg-tile-label">Cloud calls</span>
+        <span class="eg-tile-value">{{ l.totalCalls }}</span>
+      </div>
+      <div class="eg-tile">
+        <span class="eg-tile-label">Tokens sent</span>
+        <span class="eg-tile-value">{{ fmtTokens(l.totalTokens) }}</span>
+      </div>
+      <div class="eg-tile">
+        <span class="eg-tile-label">PII scrubbed</span>
+        <span class="eg-tile-value">{{ totalPii() }}</span>
+      </div>
+    </div>
+
+    <!-- Tokens by model -->
+    <div class="eg-section">
+      <h4 class="eg-section-title">Tokens by model</h4>
+      @if (modelBars().length === 0) {
+        <p class="empty-state">
+          No cloud calls in this window — everything stayed on-device.
+        </p>
+      } @else {
+        <ul class="eg-bars" aria-label="Tokens by model">
+          @for (m of modelBars(); track m.model) {
+            <li class="eg-bar-row">
+              <span class="eg-bar-label" [title]="m.model">{{ m.model }}</span>
+              <span class="eg-bar-track" role="presentation">
+                <span class="eg-bar-fill" [style.width.%]="m.pct"></span>
+              </span>
+              <span class="eg-bar-count">{{ fmtTokens(m.tokens) }}</span>
+            </li>
+          }
+        </ul>
+      }
+    </div>
+
+    <!-- Tokens by day -->
+    @if (dayBars().length > 0) {
+      <div class="eg-section">
+        <h4 class="eg-section-title">Tokens by day</h4>
+        <ul class="eg-bars" aria-label="Tokens by day">
+          @for (d of dayBars(); track d.day) {
+            <li class="eg-bar-row">
+              <span class="eg-bar-label eg-bar-label--day" [title]="d.day">{{ d.day }}</span>
+              <span class="eg-bar-track" role="presentation">
+                <span class="eg-bar-fill" [style.width.%]="d.pct"></span>
+              </span>
+              <span class="eg-bar-count">{{ fmtTokens(d.tokens) }}</span>
+            </li>
+          }
+        </ul>
+      </div>
+    }
+
+    <!-- What left this device -->
+    <div class="eg-section">
+      <h4 class="eg-section-title">
+        What left this device
+        <span class="eg-section-note">(scrubbed before sending)</span>
+      </h4>
+      <div class="eg-chips">
+        <span class="eg-chip">
+          <span aria-hidden="true">✉</span>
+          {{ l.totalRedactions.email }} email{{ l.totalRedactions.email === 1 ? '' : 's' }}
+        </span>
+        <span class="eg-chip">
+          <span aria-hidden="true">▦</span>
+          {{ l.totalRedactions.card }} card-like
+        </span>
+        <span class="eg-chip">
+          <span aria-hidden="true">☎</span>
+          {{ l.totalRedactions.phone }} phone{{ l.totalRedactions.phone === 1 ? '' : 's' }}
+        </span>
+        <span class="eg-chip">
+          <span aria-hidden="true">🧑</span>
+          {{ l.totalRedactions.name }} name{{ l.totalRedactions.name === 1 ? '' : 's' }}
+        </span>
+      </div>
+    </div>
+
+    <!-- Recent calls -->
+    @if (l.recent.length > 0) {
+      <div class="eg-section">
+        <h4 class="eg-section-title">Recent calls</h4>
+        <ul class="eg-recent" aria-label="Recent egress calls">
+          <!--
+            track $index is correct here (not a rule violation): l.recent is a
+            read-only snapshot wholesale-replaced by _ledger.set() — rows are
+            never reordered or item-mutated in place. ts is a whole-second Unix
+            timestamp; two calls in the same second (e.g. summarise + timeline in
+            one meeting on a fast gateway) produce duplicate keys = NG0955 crash.
+          -->
+          @for (r of l.recent; track $index) {
+            <li class="eg-recent-row">
+              <span class="eg-recent-dest" [title]="r.destination">{{ r.destination }}</span>
+              <span class="eg-recent-model">{{ r.modelServed ?? '—' }}</span>
+              <span class="eg-recent-tokens">{{ r.totalTokens !== null ? fmtTokens(r.totalTokens) : '—' }}</span>
+            </li>
+          }
+        </ul>
+      </div>
+    }
+  }
+</div>
+  
