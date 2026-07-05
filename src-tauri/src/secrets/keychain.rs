@@ -35,6 +35,11 @@ pub const ACCOUNT_WEB_SEARCH_KEY: &str = "web_search_api_key";
 /// recognizes it as a known fixed account (no per-call string leak in [`leak_account`]).
 pub const ACCOUNT_JIRA_TOKEN: &str = "jira_api_token";
 
+/// Keychain account holding the BYO Slack connector user token (`xoxp-…`). Mirrors
+/// [`crate::connectors::slack::SLACK_TOKEN_ACCOUNT`]. Named here so the data-protection routing
+/// recognizes it as a known fixed account (no per-call string leak in [`leak_account`]).
+pub const ACCOUNT_SLACK_TOKEN: &str = "slack_user_token";
+
 /// Keychain account holding the AI Gateway API key. Mirrors `summarize::GATEWAY_KEY_ACCOUNT` and
 /// `commands::GATEWAY_KEY_ACCOUNT`. Strictly separate from [`ACCOUNT_ANTHROPIC_KEY`] — never a
 /// fallback (R3). Named here so the data-protection routing recognizes it as a known fixed account
@@ -1489,6 +1494,7 @@ fn leak_account(account: &str) -> &'static str {
         ACCOUNT_ANTHROPIC_KEY => ACCOUNT_ANTHROPIC_KEY,
         ACCOUNT_WEB_SEARCH_KEY => ACCOUNT_WEB_SEARCH_KEY,
         ACCOUNT_JIRA_TOKEN => ACCOUNT_JIRA_TOKEN,
+        ACCOUNT_SLACK_TOKEN => ACCOUNT_SLACK_TOKEN,
         ACCOUNT_GATEWAY_KEY => ACCOUNT_GATEWAY_KEY,
         other => Box::leak(other.to_string().into_boxed_str()),
     }
