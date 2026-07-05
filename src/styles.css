@@ -199,67 +199,18 @@ app-shell {
 }
 
 /* Top strip that reserves room for the overlay traffic lights and moves the
-   window (data-tauri-drag-region on the element). */
+   window (data-tauri-drag-region on the element). Sized so the lights
+   (trafficLightPosition 32,30 in tauri.conf.json, inside the floating rail)
+   get their own breathing zone before the rail content starts. */
 .sidebar-drag {
   flex: none;
-  height: 30px;
+  height: 48px;
 }
 
-.app-sidebar .brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: var(--space-1) var(--space-2) var(--space-3);
-  text-decoration: none;
-  border-radius: var(--radius-md);
-  transition: transform var(--transition-fast);
-}
-.app-sidebar .brand:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.brand-mark {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  background: var(--shell-active-bg);
-  border: 1px solid var(--shell-glass-border);
-  box-shadow: var(--glass-highlight);
-}
-.brand-wave {
-  display: block;
-  width: 22px;
-  height: 22px;
-}
-.brand-wave .bar {
-  fill: url(#murmurWave);
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: brand-wave 1.5s ease-in-out infinite;
-}
-.brand-wave .b2 { animation-delay: 0.12s; }
-.brand-wave .b3 { animation-delay: 0.24s; }
-.brand-wave .b4 { animation-delay: 0.36s; }
-.brand-wave .b5 { animation-delay: 0.48s; }
-@keyframes brand-wave {
-  0%, 100% { transform: scaleY(0.5); }
   50% { transform: scaleY(1); }
 }
-.brand-word {
-  font-size: 1.06rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  background: linear-gradient(180deg, var(--text-primary) 0%, var(--accent-hover) 160%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  color: var(--text-primary);
-}
 
-/* --- Quick actions (Search ⌘K / New note ⌘N) — pinned under the brand ------ */
+/* --- Quick actions (Search ⌘K / New note ⌘N) — the top of the rail --------- */
 .sidebar-quick {
   display: flex;
   flex-direction: column;
@@ -533,7 +484,6 @@ app-shell.pill-mode .app-main { padding-top: 84px; }
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 @media (prefers-reduced-motion: reduce) {
-  .brand-wave .bar { animation: none; }
-  .app-sidebar { transition: none; }
+    .app-sidebar { transition: none; }
 }
 
