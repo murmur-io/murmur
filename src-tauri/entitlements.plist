@@ -31,13 +31,12 @@
     <key>com.apple.security.personal-information.calendars</key>
     <true/>
 
-    <!-- NOTE (2026-07-05): do NOT add `keychain-access-groups` here. It is a RESTRICTED macOS
-         entitlement — it requires an embedded provisioning profile that authorizes the group, which a
-         Developer-ID app (signed with just the cert, no profile) does NOT have. Adding it produced a
-         signature the kernel refuses to launch ("Nie można otworzyć aplikacji Murmur" / silent AMFI
-         kill) even though codesign --verify + notarization both pass. The biometric/Touch-ID-gated
-         secrets (folder master KEK + account MK) that need the data-protection keychain must instead be
-         made to work WITHOUT this entitlement (file-based keychain + SecAccessControl, or an embedded
-         Developer-ID provisioning profile) — see the follow-up fix. -->
+    <!-- NOTE (2026-07-05): do NOT add keychain-access-groups here. It is a RESTRICTED macOS
+         entitlement that requires an embedded provisioning profile authorizing the group, which a
+         Developer-ID app (signed with just the cert, no profile) does not have. Adding it produced a
+         signature the kernel refuses to launch (silent AMFI kill) even though codesign verification and
+         Apple notarization both pass. The biometric/Touch-ID-gated secrets (folder master KEK + account
+         MK) that need the data-protection keychain must instead be made to work WITHOUT this entitlement
+         (file-based keychain + SecAccessControl, or an embedded Developer-ID provisioning profile). -->
   </dict>
 </plist>
