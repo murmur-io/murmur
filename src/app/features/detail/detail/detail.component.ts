@@ -98,6 +98,12 @@ export class DetailComponent implements OnInit {
   readonly locked = computed(() => this.detail()?.locked === true);
   /** True while an `unlockMeeting` biometric call is in flight (pending state). */
   readonly unlocking = signal(false);
+  /** Latched true once an unlock attempt has FAILED — reveals the "reset folder" escape hatch. */
+  readonly unlockFailed = signal(false);
+  /** Two-step inline confirm for the destructive reset (no browser dialog). */
+  readonly confirmDiscard = signal(false);
+  /** True while the discard-unrecoverable-lock IPC is in flight. */
+  readonly discarding = signal(false);
   /** Focusable unlock button — focused after the gate renders (afterNextRender). */
   private readonly unlockButton =
     viewChild<ElementRef<HTMLButtonElement>>("unlockButton");
@@ -478,6 +484,7 @@ export class DetailComponent implements OnInit {
     try {
       // Run the biometric unlock_folder path for the meeting's folder.
       await this.ipc.unlockMeeting(id);
+      this.unlockFailed.set(false);
       // Re-fetch the now-unmasked detail and swap it in place. A null detail
       // (deleted out from under us) keeps the not-found state honest.
       const fresh = await this.ipc.getMeetingDetail(id);
@@ -499,8 +506,42 @@ export class DetailComponent implements OnInit {
       // failed" tells the user (and a field screenshot tells us) what actually broke — the old
       // generic apology made signed-build failures undiagnosable.
       this.toast.danger(`Couldn’t unlock — ${String(e)}`);
+      // Reveal the reset escape hatch — the key may be genuinely gone (the backend still re-proves
+      // non-recoverability before it will discard anything).
+      this.unlockFailed.set(true);
     } finally {
       this.unlocking.set(false);
+    }
+  }
+
+  /**
+   * Discard an UNRECOVERABLE folder's lock (the escape hatch). The backend re-proves the key cannot
+   * be recovered and REFUSES if it can (routing back to a normal unlock), so this never destroys
+   * openable content. On success the folder reopens (emptied) and we re-fetch the now-open detail.
+   */
+  async discardLock(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id || this.discarding()) {
+      return;
+    }
+    this.discarding.set(true);
+    try {
+      // The backend resolves the meeting's folder, RE-PROVES the key is unrecoverable, and REFUSES
+      // if it is actually recoverable — so this can never destroy openable content.
+      await this.ipc.discardUnrecoverableMeetingLock(id);
+      this.unlockFailed.set(false);
+      this.confirmDiscard.set(false);
+      const fresh = await this.ipc.getMeetingDetail(id);
+      this.detail.set(fresh);
+      void this.folders.load();
+      this.toast.success(
+        "Folder reset — its locked contents were unrecoverable and have been cleared.",
+      );
+    } catch (e) {
+      // Most importantly: the backend REFUSES when the folder is actually recoverable.
+      this.toast.danger(`Couldn’t reset — ${String(e)}`);
+    } finally {
+      this.discarding.set(false);
     }
   }
 
