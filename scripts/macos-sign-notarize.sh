@@ -25,12 +25,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 ENTITLEMENTS="$ROOT/src-tauri/entitlements.plist"
+ENTITLEMENTS_APP="$ROOT/src-tauri/entitlements-app.plist"
+PROFILE="$ROOT/src-tauri/Murmur_Developer_ID.provisionprofile"
 VERSION="$(grep -m1 '"version"' "$ROOT/src-tauri/tauri.conf.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
 APP="$ROOT/src-tauri/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
 OUT_DMG="$HOME/Desktop/Murmur-$VERSION.dmg"
 
 : "${DEVELOPER_ID:?set DEVELOPER_ID='Developer ID Application: Your Name (TEAMID)' — see security find-identity -v -p codesigning}"
 [ -f "$ENTITLEMENTS" ] || { echo "missing $ENTITLEMENTS" >&2; exit 1; }
+[ -f "$ENTITLEMENTS_APP" ] || { echo "missing $ENTITLEMENTS_APP" >&2; exit 1; }
+[ -f "$PROFILE" ] || { echo "missing provisioning profile $PROFILE" >&2; exit 1; }
 
 # Notarization auth: prefer a stored profile, else require the apple-id trio.
 NOTARY_ARGS=()
@@ -50,6 +54,13 @@ echo "1) Building universal (.app, arm64 + x86_64)…"
 npx tauri build --target universal-apple-darwin --bundles app
 [ -d "$APP" ] || { echo "universal .app not found at $APP" >&2; exit 1; }
 
+# Embed the Developer-ID provisioning profile that AUTHORIZES keychain-access-groups (the
+# data-protection keychain holding the biometric master KEK + account MK). Without it, that restricted
+# entitlement has no authorization and the kernel AMFI-kills launch even though codesign + notarization
+# both pass. Only the main .app carries it — the nested helpers have no keychain entitlement.
+cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+echo "   embedded provisioning profile ($(basename "$PROFILE"))"
+
 echo "2) Codesigning INSIDE-OUT (nested helpers first, app last — NO --deep)…"
 # --deep mis-signs nested Mach-Os and breaks notarization once a helper is bundled
 # (deprecated since macOS 13; reproduces Tauri #11992). Sign each embedded sidecar FIRST
@@ -64,8 +75,11 @@ for HELPER in "$APP/Contents/Resources/"meetnotes-*; do
       --entitlements "$ENTITLEMENTS" --sign "$DEVELOPER_ID" "$HELPER"
   fi
 done
+# The main app gets the app-only entitlements (adds keychain-access-groups + application-identifier,
+# authorized by the embedded profile above); the nested helpers keep the plain entitlements.plist so
+# they carry NO restricted keychain entitlement (they have no profile → would be AMFI-killed).
 codesign --force --options runtime --timestamp \
-  --entitlements "$ENTITLEMENTS" --sign "$DEVELOPER_ID" "$APP"
+  --entitlements "$ENTITLEMENTS_APP" --sign "$DEVELOPER_ID" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "3) Building the DMG (with Applications alias)…"
