@@ -249,6 +249,25 @@ pub struct AppConfigDto {
     /// neither grant nor clear web-search egress consent. `#[serde(default)]` = false (fail-closed).
     #[serde(default)]
     pub web_search_consented: bool,
+    /// brain2 connectors (Phase 2) — the JIRA master toggle. Settable from the DTO (the Settings UI
+    /// owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`), so a
+    /// partial/older save can never silently enable it. Even ON, the connector is exposed only once
+    /// `jira_consented` is granted AND a base URL + email + token are configured.
+    #[serde(default)]
+    pub jira_enabled: bool,
+    /// brain2 connectors — one-time JIRA egress consent. PRESERVE-ONLY on this DTO, exactly like
+    /// `web_search_consented`: `get_config` carries the current value OUT (so the FE can show consent
+    /// status), but `dto_to_config` IGNORES the incoming value and PRESERVES the stored one. The ONLY
+    /// mutator is the dedicated `consent_to_jira` command. `#[serde(default)]` = false (fail-closed).
+    #[serde(default)]
+    pub jira_consented: bool,
+    /// The Jira Cloud site base URL (non-secret). Settable from the DTO. Default `""` (unset).
+    #[serde(default)]
+    pub jira_base_url: String,
+    /// The Atlassian account email paired with the token for Basic auth (non-secret). Settable from
+    /// the DTO. Default `""` (unset).
+    #[serde(default)]
+    pub jira_email: String,
     /// Opt-in: inherit the shell environment into the `claude` CLI subprocess (restores the older
     /// behavior where an env `ANTHROPIC_API_KEY` reached the CLI). Settable from the DTO (the Settings
     /// UI owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`) = the
@@ -3803,6 +3822,39 @@ pub fn consent_to_web_search(state: State<'_, AppState>) -> Result<(), AppError>
     Ok(())
 }
 
+/// One-time Jira egress consent — the ONLY way `jira_consented` flips true. Persists the flag AND
+/// updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the jira tool
+/// (provided Jira is also enabled + configured + a token is stored). Idempotent.
+#[tauri::command]
+pub fn consent_to_jira(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_jira_consent(&state.db)?;
+    Ok(())
+}
+
+/// Store/replace the BYO Jira API token in the Keychain (account "jira_api_token"). An empty input
+/// clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
+#[tauri::command]
+pub fn set_jira_token(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return secrets::delete_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT);
+    }
+    secrets::set_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT, key.trim())
+}
+
+/// Whether a Jira token is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_jira_token() -> Result<bool, AppError> {
+    Ok(
+        secrets::get_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT)?
+            .filter(|k| !k.trim().is_empty())
+            .is_some(),
+    )
+}
+
 fn config_to_dto(c: &AppConfig) -> AppConfigDto {
     AppConfigDto {
         provider_id: c.provider_id.clone(),
@@ -3851,6 +3903,12 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
         // in `dto_to_config`).
         web_search_consented: c.web_search_consented,
+        jira_enabled: c.jira_enabled,
+        // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
+        // in `dto_to_config`).
+        jira_consented: c.jira_consented,
+        jira_base_url: c.jira_base_url.clone(),
+        jira_email: c.jira_email.clone(),
         claude_code_inherit_env: c.claude_code_inherit_env,
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
@@ -3997,6 +4055,16 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // live value (BLK-4 mirror). Only `consent_to_web_search` may flip it, so a settings save can
         // neither grant nor clear web-search egress consent.
         web_search_consented: current.web_search_consented,
+        // brain2 connectors (Phase 2): the Jira master toggle + non-secret base URL/email ARE settable
+        // from the DTO (Settings owns them). An omitted toggle already defaulted to OFF on the DTO, so
+        // a partial save can't enable it.
+        jira_enabled: d.jira_enabled,
+        // brain2 connectors (NEW EGRESS CLASS): consent is NEVER set from the DTO — preserved from the
+        // live value (BLK-4 mirror). Only `consent_to_jira` may flip it, so a settings save can
+        // neither grant nor clear Jira egress consent.
+        jira_consented: current.jira_consented,
+        jira_base_url: d.jira_base_url,
+        jira_email: d.jira_email,
         // Opt-in env inheritance for the `claude` CLI IS settable from the DTO (the Settings UI owns
         // the toggle). Default OFF on the DTO (`#[serde(default)]`), so a partial/older save can never
         // silently enable it. Even ON, the DB keys are never inherited (claude_code.rs `harden_env`).
