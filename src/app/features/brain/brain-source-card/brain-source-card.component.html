@@ -35,6 +35,8 @@
 
   @if (linkTo(); as href) {
     <!-- Read-only source: just a link to its own page. -->
+    <!-- Link-shaped button: stays on the legacy .btn classes until
+         <mur-button> grows href/routerLink support (follow-up wave). -->
     <a class="btn btn-ghost sc-link" [routerLink]="href">
       {{ linkLabel() }}
       <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
@@ -50,9 +52,10 @@
   } @else {
     <!-- Editable source: add affordance + expandable item list. -->
     <div class="sc-actions">
-      <button
-        type="button"
-        class="btn btn-primary sc-add"
+      <mur-button
+        variant="primary"
+        class="sc-add"
+        [busy]="busy()"
         [disabled]="busy() || blocked()"
         (click)="add.emit()"
       >
@@ -69,16 +72,16 @@
           </svg>
           {{ addLabel() }}
         }
-      </button>
+      </mur-button>
       @if (items().length > 0) {
-        <button
-          type="button"
-          class="btn btn-ghost sc-toggle"
-          [attr.aria-expanded]="expanded()"
+        <mur-button
+          variant="ghost"
+          class="sc-toggle"
+          [ariaExpanded]="expanded()"
           (click)="toggleList.emit()"
         >
           {{ expanded() ? "Hide" : "Show" }} list
-        </button>
+        </mur-button>
       }
     </div>
 

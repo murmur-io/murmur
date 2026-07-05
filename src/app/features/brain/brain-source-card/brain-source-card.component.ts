@@ -5,6 +5,7 @@ import {
   output,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
+import { MurButtonComponent } from "../../../design-system/button/button.component";
 import type { DocumentInfo } from "../../../core/models";
 
 /**
@@ -24,7 +25,7 @@ import type { DocumentInfo } from "../../../core/models";
 @Component({
   selector: "app-brain-source-card",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, MurButtonComponent],
   templateUrl: "./brain-source-card.component.html",
   styleUrl: "./brain-source-card.component.scss",
 })
