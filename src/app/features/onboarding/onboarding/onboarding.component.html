@@ -429,6 +429,21 @@
           }
         }
 
+        <!-- ──────────────────────── ENABLE THE BRAIN ─────────────────── -->
+        @case ("brain") {
+          <div class="ob-head">
+            <span class="ob-eyebrow">On-device intelligence</span>
+            <h2 class="ob-title">Enable the brain</h2>
+            <p class="ob-sub text-secondary">
+              Two small models make Murmur remember facts about you and search
+              your notes by meaning — all on this Mac. Optional, and you can do
+              it later from the Brain page.
+            </p>
+          </div>
+
+          <app-brain-enable-card (enabled)="next()" />
+        }
+
         <!-- ──────────────────────── VAULT (OPTIONAL) ────────────────── -->
         @case ("vault") {
           <div class="ob-head">
@@ -559,6 +574,15 @@
             (click)="skipProvider()"
           >
             I’ll set this up later
+          </button>
+        }
+        @if (currentStep() === "brain") {
+          <button
+            type="button"
+            class="btn btn-ghost ob-skip"
+            (click)="next()"
+          >
+            Skip for now
           </button>
         }
         @if (currentStep() === "vault") {
