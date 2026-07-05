@@ -13,13 +13,15 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import { hostIsLoopback } from "../../../core/loopback";
 import type { AppConfigDto, ProviderStatus } from "../../../core/models";
+import { BrainEnableCardComponent } from "../../brain/brain-enable-card/brain-enable-card.component";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
-type Step = "welcome" | "model" | "provider" | "vault" | "done";
+type Step = "welcome" | "model" | "provider" | "brain" | "vault" | "done";
 const STEPS: readonly Step[] = [
   "welcome",
   "model",
   "provider",
+  "brain",
   "vault",
   "done",
 ];
@@ -79,6 +81,7 @@ const SIZE_HINTS: Record<string, string> = {
   selector: "app-onboarding",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [BrainEnableCardComponent],
   templateUrl: "./onboarding.component.html",
   styleUrl: "./onboarding.component.scss",
 })
