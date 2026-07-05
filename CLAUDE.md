@@ -11,7 +11,7 @@ The four rule files below are **imported into context automatically** via the `@
 @.claude/rules/lock-model.md
 @.claude/rules/agentic-workflow.md
 
-*(Orientation: `rust-tauri` = errors/commands/SQLCipher/additive-migrations/verify-before-destroy/gate-every-read/crash-safe-FFI/`cargo test --lib` only; `angular-zoneless` = signals-first/standalone/`@if`-`@for`/IPC→signals/the three traps; `lock-model` = gate every read + verify-before-destroy every seal + the `convertFileSrc` leak trap; `agentic-workflow` = Workflow tool + adversarial-verify discipline.)*
+*(Orientation: `rust-tauri` = errors/commands/SQLCipher/additive-migrations/verify-before-destroy/gate-every-read/crash-safe-FFI/`cargo test --lib` only; `angular-zoneless` = signals-first/standalone/`@if`-`@for`/IPC→signals/dir-per-component (ts+html+scss)/Liquid-Glass views/design-tokens-only/mur-* design-system/the traps; `lock-model` = gate every read + verify-before-destroy every seal + the `convertFileSrc` leak trap; `agentic-workflow` = Workflow tool + adversarial-verify discipline.)*
 
 ## What Murmur is
 
