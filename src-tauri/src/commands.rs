@@ -34,6 +34,24 @@ pub struct StartResult {
     pub meeting_id: String,
 }
 
+/// Live recording state, so a freshly-loaded webview can resync to a capture that is STILL running
+/// in the (long-lived) Rust process. In `tauri dev` a frontend hot-reload swaps the webview without
+/// restarting the backend, so the FE store resets to `idle` while `AppState.recorder` is still
+/// `Some(..)` — the desync that made the next Start fail with "already recording". This exposes only
+/// the ACTIVELY-recording meeting (which cannot be sealed — it's a fresh in-progress draft), so it
+/// leaks no locked content.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStatus {
+    /// True while the backend recorder is actively capturing.
+    pub recording: bool,
+    /// The in-progress meeting id, or `None` when idle.
+    pub meeting_id: Option<String>,
+    /// The in-progress meeting's `started_at` (RFC3339), so the FE anchors its elapsed timer to the
+    /// real start instead of an epoch-sized value. `None` when idle or the row can't be read.
+    pub started_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopResult {
@@ -719,6 +737,66 @@ pub fn recording_level(app: AppHandle, state: State<'_, AppState>) -> Result<f32
         }
     }
     Ok(level)
+}
+
+/// Report whether the backend is CURRENTLY capturing, plus the in-progress meeting id and its start
+/// time. A freshly-loaded webview calls this ONCE on init to resync: a `tauri dev` frontend hot-reload
+/// (or any webview reload / Cmd-R / webview crash) swaps the FE without restarting the long-lived Rust
+/// process, so `AppState.recorder` can still be `Some(..)` (genuinely recording to disk) while the FE
+/// `RecorderStore` has reset to `idle`. Without this resync the next Start hits `start_recording`'s
+/// `already recording` guard, and the Record screen disagrees with the still-`RECORDING` meeting row.
+/// Read-only + leak-safe: the actively-recording meeting is a fresh in-progress draft that cannot be
+/// sealed, so no `meeting_is_unlocked` gate is needed (it returns no note/transcript/audio content).
+#[tauri::command]
+pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, AppError> {
+    // The live recorder — NOT the lingering `current_meeting` — is the source of truth for "am I
+    // recording". After a full process restart the recorder is `None` again, so idle is reported even
+    // if a ghost row somehow survived reconcile.
+    let recording = {
+        let recorder = state
+            .recorder
+            .lock()
+            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+        recorder.is_some()
+    };
+    let meeting_id = if recording {
+        let current = state
+            .current_meeting
+            .lock()
+            .map_err(|_| AppError::Audio("current_meeting mutex poisoned".into()))?;
+        current.map(|u| u.to_string())
+    } else {
+        None
+    };
+    Ok(recording_status_dto(&state.db, recording, meeting_id))
+}
+
+/// Assemble the [`RecordingStatus`] DTO from the recorder-presence flag + the in-progress meeting id,
+/// resolving the start time from the persisted row. Split out of the command so both branches are
+/// unit-testable WITHOUT a live [`Recorder`] (which needs mic hardware and can't be built headless).
+/// The `started_at` lookup is best-effort: a missing/unreadable row just drops the anchor (the FE
+/// falls back to "now") — it never fails the status read.
+fn recording_status_dto(
+    db: &crate::storage::Db,
+    recording: bool,
+    meeting_id: Option<String>,
+) -> RecordingStatus {
+    if !recording {
+        return RecordingStatus {
+            recording: false,
+            meeting_id: None,
+            started_at: None,
+        };
+    }
+    let started_at = meeting_id
+        .as_deref()
+        .and_then(|id| db.get_meeting(id).ok().flatten())
+        .map(|m| m.started_at);
+    RecordingStatus {
+        recording: true,
+        meeting_id,
+        started_at,
+    }
 }
 
 /// Live-toggle the microphone mute mid-recording (no stream teardown). While muted, the cpal
@@ -4500,10 +4578,50 @@ pub async fn resummarize(
     })
 }
 
-/// Recent meetings for the Library list (newest first, capped).
+/// Recent meetings for the Library list (newest first, capped). Sealed-and-not-session-unlocked
+/// meetings are MASKED at the backend before the DTO crosses IPC (see [`mask_locked_meetings`]) —
+/// the Library lock gate is enforced in code here, never trusted to the FE.
 #[tauri::command]
 pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppError> {
-    state.db.list_meetings(200)
+    let meetings = state.db.list_meetings(200)?;
+    mask_locked_meetings(state.inner(), meetings)
+}
+
+/// Backend-mask sealed-not-session-unlocked meetings in a Library list, mirroring [`masked_detail`]:
+/// a meeting whose folder is locked (`folders.locked = 1`) AND NOT in the current session unlock set
+/// gets its real AI title replaced by the "🔒 Locked" placeholder and its `.enc` `audio_path` nulled
+/// (so nothing can feed `convertFileSrc` / the `asset:` protocol for a locked recording). The row +
+/// its `folder_id` are PRESERVED so the FE still renders the inline lock badge (it keys the badge off
+/// `folder_id` + the folder's exposure). The lock decision routes through the session unlock set +
+/// `locked_folder_ids` (the same source the `*_visible` reads use) — NOT the FE.
+fn mask_locked_meetings(
+    state: &AppState,
+    meetings: Vec<Meeting>,
+) -> Result<Vec<Meeting>, AppError> {
+    let locked: std::collections::HashSet<String> =
+        state.db.locked_folder_ids()?.into_iter().collect();
+    if locked.is_empty() {
+        return Ok(meetings); // no sealed folders at all → nothing to mask (fast path).
+    }
+    let unlocked = unlocked_snapshot(state)?;
+    Ok(meetings
+        .into_iter()
+        .map(|m| {
+            let sealed = match m.folder_id.as_deref() {
+                Some(f) => locked.contains(f) && !unlocked.contains(f),
+                None => false, // vault root / no folder → never sealed.
+            };
+            if sealed {
+                Meeting {
+                    title: Some("🔒 Locked".to_string()),
+                    audio_path: None,
+                    ..m
+                }
+            } else {
+                m
+            }
+        })
+        .collect())
 }
 
 /// Aggregate analytics for the dashboard + Analytics tab.
@@ -7770,6 +7888,109 @@ fn share_base_url(state: &AppState) -> Result<String, AppError> {
         .clone())
 }
 
+/// Return a VALID (unexpired) access token for a bearer share op, PROACTIVELY redeeming the refresh
+/// token via `/v1/auth/refresh` when the cached token is at/near its 30-min server-side expiry.
+///
+/// THIS is the fix for the "authentication error: … not authenticated" 401s: the in-RAM session (and
+/// the biometric-restored session) keeps a bearer token that the server expires after 30 min, but
+/// nothing ever refreshed it — so every share op past that window 401'd while the UI still showed the
+/// user as logged in. Every bearer share op now obtains its token here instead of reading the cached
+/// one directly. Fails closed `Unavailable` when logged out.
+async fn valid_access_token(state: &AppState) -> Result<String, AppError> {
+    // Snapshot the cached token + expiry; do NOT hold the std mutex across an await.
+    let (token, expires_at) = {
+        let g = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        let s = crate::share::require_login(&g)?;
+        (s.access_token.clone(), s.access_expires_at.clone())
+    };
+    if !crate::share::access_token_needs_refresh(expires_at.as_deref(), chrono::Utc::now()) {
+        return Ok(token);
+    }
+    refresh_session(state, &token).await
+}
+
+/// Redeem the persisted (single-use) refresh token for a fresh session pair, SINGLE-FLIGHTED so two
+/// concurrent share ops can never double-spend the same refresh token (which would trip the server's
+/// reuse detection and revoke the whole family, logging the user out mid-share). `stale_token` is the
+/// access token the caller saw as expiring; if a racing op already refreshed while we waited for the
+/// guard, we return THAT fresh token rather than spending our now-stale refresh token again.
+async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, AppError> {
+    // Serialize refreshes; this async guard is deliberately held ACROSS the network call below (unlike
+    // the std mutexes here, which are never held across an `await`).
+    let _guard = state.share_refresh_lock.lock().await;
+
+    // Double-check under the guard: a racing op may have refreshed already. If the session's token
+    // changed AND is now fresh, use it — do not spend our (now-stale) refresh token a second time.
+    {
+        let g = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        let s = crate::share::require_login(&g)?;
+        if s.access_token != stale_token
+            && !crate::share::access_token_needs_refresh(
+                s.access_expires_at.as_deref(),
+                chrono::Utc::now(),
+            )
+        {
+            return Ok(s.access_token.clone());
+        }
+    }
+
+    // The Keychain is the source of truth for the single-use refresh token.
+    let tokens = crate::share::load_tokens()?
+        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let base = share_base_url(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    let rotated = match client.refresh(&tokens.refresh_token).await {
+        Ok(r) => r,
+        Err(AppError::Auth(_)) => {
+            // The refresh token itself is expired/revoked/reused ⇒ the session is unrecoverable. Clear
+            // the in-RAM session FIRST (drops + zeroizes MK), then the Keychain tokens + biometric MK
+            // cache, so `account_status` reports logged-out and the FE routes to a fresh sign-in.
+            if let Ok(mut sess) = state.account_session.lock() {
+                *sess = None;
+            }
+            let _ = crate::share::clear_tokens();
+            let _ = crate::secrets::keychain::clear_account_mk();
+            return Err(AppError::Auth(
+                "your sharing session expired — sign in again".into(),
+            ));
+        }
+        // A network/5xx failure is NOT an auth problem — propagate as-is and keep the session so a
+        // later op can still refresh (never clear tokens on a transient error).
+        Err(e) => return Err(e),
+    };
+
+    // Persist the ROTATED pair (+ new expiry) immediately — re-presenting the OLD refresh token would
+    // revoke the family, so the new one must land before it is used again.
+    crate::share::store_tokens(&crate::share::PersistedTokens {
+        access_token: rotated.access_token.clone(),
+        refresh_token: rotated.refresh_token,
+        device_id: tokens.device_id,
+        email: tokens.email,
+        account_id: tokens.account_id,
+        generation: tokens.generation,
+        access_expires_at: Some(rotated.access_expires_at.clone()),
+    })?;
+
+    // Update the in-RAM session's cached token + expiry in place (MK + generation untouched).
+    if let Ok(mut sess) = state.account_session.lock() {
+        if let Some(s) = sess.as_mut() {
+            s.access_token = rotated.access_token.clone();
+            s.access_expires_at = Some(rotated.access_expires_at.clone());
+        }
+    }
+
+    // Content-free egress-ledger row (host + 0 bytes), consistent with `account_login`.
+    crate::share::ledger_row(&state.db, &client.host(), "session_refresh", 0);
+    Ok(rotated.access_token)
+}
+
 /// `account_status` — is there a logged-in sharing account this session, and can it share?
 #[tauri::command]
 pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppError> {
@@ -7996,6 +8217,7 @@ pub async fn account_login(
             "this account has two-factor auth enabled — not yet supported in the app".into(),
         ));
     }
+    let access_expires_at = finish.access_expires_at.clone();
     let (Some(access_token), Some(refresh_token), Some(device_id), Some(key_material)) = (
         finish.access_token,
         finish.refresh_token,
@@ -8019,6 +8241,7 @@ pub async fn account_login(
         email: acct_id.clone(),
         account_id: acct_id.clone(),
         generation,
+        access_expires_at: access_expires_at.clone(),
     })?;
 
     // Cache the session (MK in RAM, zeroized on drop).
@@ -8034,6 +8257,7 @@ pub async fn account_login(
             mk: Zeroizing::new(*mk),
             generation,
             access_token,
+            access_expires_at,
         });
     }
 
@@ -8111,6 +8335,9 @@ pub async fn unlock_sharing_with_biometric(
             mk,
             generation: tokens.generation,
             access_token: tokens.access_token,
+            // Carry the persisted expiry so the first share op refreshes proactively when the restored
+            // token is already past its 30-min TTL (the common case after any real restart).
+            access_expires_at: tokens.access_expires_at,
         });
     }
 
@@ -8151,7 +8378,7 @@ pub(crate) async fn share_note_to_link_inner(
     // (8) Logged out ⇒ fail closed Unavailable. A mode-A link share needs a live session (the bearer
     //     token) but NOT the account MK — `L`/`NK` are per-share random (MK binds only mode-B grants),
     //     so we require login + hold the access token; MK stays untouched in the session.
-    let (access_token, base) = {
+    let base = {
         let cfg = state
             .config
             .lock()
@@ -8161,15 +8388,12 @@ pub(crate) async fn share_note_to_link_inner(
                 "sharing not consented — confirm the one-time upload notice first".into(),
             ));
         }
-        let base = cfg.share_base_url.clone();
-        drop(cfg);
-        let session_guard = state
-            .account_session
-            .lock()
-            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
-        let session = crate::share::require_login(&session_guard)?;
-        (session.access_token.clone(), base)
+        cfg.share_base_url.clone()
     };
+    // Proactively refresh the bearer if it is at/near its 30-min expiry — otherwise a long-lived or
+    // biometric-restored session 401s here ("not authenticated") while still looking logged in. Fails
+    // closed `Unavailable` when logged out (mirrors the old `require_login`).
+    let access_token = valid_access_token(state).await?;
 
     let client = crate::share::client::ShareClient::new(&base)?;
 
@@ -8263,8 +8487,7 @@ pub(crate) async fn share_note_to_link_inner(
 #[tauri::command]
 pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEntry>, AppError> {
     let base = share_base_url(state.inner())?;
-    let access = crate::share::access_token()?
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     let resp = client.list_shares(&access).await?;
 
@@ -8305,8 +8528,7 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
 #[tauri::command]
 pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
     let base = share_base_url(state.inner())?;
-    let access = crate::share::access_token()?
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     client.revoke_share(&access, &share_id).await?;
     state.db.set_outbound_share_state(&share_id, "revoked")?;
@@ -8408,8 +8630,12 @@ fn tofu_check(
 type SessionMk = (String, u32, zeroize::Zeroizing<[u8; 32]>, String);
 
 /// The logged-in sharing session's `(account_id, generation, MK, access_token)`, or a fail-closed
-/// `Unavailable` when logged out (mode-B needs MK to DERIVE the identity keypair for sign/open).
-fn require_session_mk(state: &AppState) -> Result<SessionMk, AppError> {
+/// `Unavailable` when logged out (mode-B needs MK to DERIVE the identity keypair for sign/open). The
+/// returned access token is proactively refreshed via [`valid_access_token`] so a long-idle mode-B
+/// share never 401s on a lapsed bearer.
+async fn require_session_mk(state: &AppState) -> Result<SessionMk, AppError> {
+    // Refresh-if-needed FIRST (updates the session's cached token), then read the fresh token + MK.
+    let access_token = valid_access_token(state).await?;
     let g = state
         .account_session
         .lock()
@@ -8419,7 +8645,7 @@ fn require_session_mk(state: &AppState) -> Result<SessionMk, AppError> {
         s.account_id.clone(),
         s.generation,
         zeroize::Zeroizing::new(*s.mk),
-        s.access_token.clone(),
+        access_token,
     ))
 }
 
@@ -8441,8 +8667,7 @@ pub async fn preview_share_recipient(
     email: String,
 ) -> Result<RecipientPreview, AppError> {
     let base = share_base_url(state.inner())?;
-    let access = crate::share::access_token()?
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     let resp = client.lookup_key(&access, email.trim()).await?;
     let Some(key) = resp.key.filter(|_| resp.registered) else {
@@ -8507,7 +8732,7 @@ pub(crate) async fn share_note_to_user_inner(
         }
         cfg.share_base_url.clone()
     };
-    let (account_id, generation, mk, access_token) = require_session_mk(state)?;
+    let (account_id, generation, mk, access_token) = require_session_mk(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
     // (3) Fetch + CLEAN the note (gated read), build the inner envelope, seal a fresh NK.
@@ -8535,6 +8760,14 @@ pub(crate) async fn share_note_to_user_inner(
         use sha2::{Digest, Sha256};
         Sha256::digest(&content_cell).to_vec()
     };
+    // (3b) Wrap the RETAINED NK under the account MK (share-scoped AAD) BEFORE it is persisted — so a
+    // re-locked session (no MK) can no longer decrypt an already-shared envelope from the retained
+    // blob. Only `share_rewrap_pending`, which holds the MK session, unwraps it. NK stays Zeroizing.
+    let nk_wrapped = crate::e2ee::wrap_key32(
+        &mk,
+        &nk,
+        crate::e2ee::outbound_nk_at_rest_aad(&share_id).as_bytes(),
+    )?;
 
     // (4) Look up the recipient → TOFU pin/verify; wrap-now (registered) or invite (unregistered).
     let recipient_email = recipient_email.trim().to_string();
@@ -8587,21 +8820,23 @@ pub(crate) async fn share_note_to_user_inner(
                 key_generation: Some(generation),
                 grant_sig: Some(grant.signature),
             }];
-            // Retain NK + content_hash locally so an "Update share" / re-wrap can reuse them; state 'sent'.
+            // Retain the MK-wrapped NK + content_hash locally so an "Update share" / re-wrap can reuse
+            // them; state 'sent'.
             state.db.insert_outbound_user_share(
                 &share_id,
                 &meeting_id,
                 rev,
                 &chrono::Utc::now().to_rfc3339(),
                 "sent",
-                &*nk,
+                &nk_wrapped,
                 &recipient_acct,
                 &recipient_email,
                 &content_hash,
             )?;
             (recipients, "sent".to_string(), Some(fp))
         } else {
-            // Unregistered → an invite; retain NK + content_hash for the on-launch re-wrap ('awaiting_key').
+            // Unregistered → an invite; retain the MK-wrapped NK + content_hash for the on-launch
+            // re-wrap ('awaiting_key').
             let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
                 email: recipient_email.clone(),
                 wrapped_key: None,
@@ -8614,7 +8849,7 @@ pub(crate) async fn share_note_to_user_inner(
                 rev,
                 &chrono::Utc::now().to_rfc3339(),
                 "awaiting_key",
-                &*nk,
+                &nk_wrapped,
                 &recipient_acct,
                 &recipient_email,
                 &content_hash,
@@ -8686,7 +8921,7 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
         return Ok(0);
     }
     // Logged out ⇒ nothing to do (not an error — this is a best-effort launch sweep).
-    let Ok((account_id, generation, mk, access_token)) = require_session_mk(state) else {
+    let Ok((account_id, generation, mk, access_token)) = require_session_mk(state).await else {
         return Ok(0);
     };
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -8694,7 +8929,7 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
     let sender_fp = crate::e2ee::key_fingerprint(&sender.pk_enc, &sender.pk_sig);
 
     let mut advanced = 0u32;
-    for (share_id, rev, nk_bytes, recipient_email, content_hash) in
+    for (share_id, rev, nk_bytes, nk_is_wrapped, recipient_email, content_hash) in
         state.db.list_awaiting_rewrap()?
     {
         // Re-look-up the recipient. Not registered yet / lookup error ⇒ leave it pending.
@@ -8717,10 +8952,23 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
                 &chrono::Utc::now().to_rfc3339(),
             )?,
         }
-        let Ok(nk_arr) = crate::e2ee::to_arr32(&nk_bytes) else {
-            continue;
+        // Unwrap the retained NK: MK-wrapped (0.7+ rows, needs the live MK session) or legacy raw
+        // (pre-0.7 rows, unwrap = identity). A wrong-MK / tampered / malformed blob ⇒ leave pending.
+        let nk = if nk_is_wrapped {
+            match crate::e2ee::unwrap_key32(
+                &mk,
+                &nk_bytes,
+                crate::e2ee::outbound_nk_at_rest_aad(&share_id).as_bytes(),
+            ) {
+                Ok(k) => k,
+                Err(_) => continue,
+            }
+        } else {
+            let Ok(nk_arr) = crate::e2ee::to_arr32(&nk_bytes) else {
+                continue;
+            };
+            zeroize::Zeroizing::new(nk_arr)
         };
-        let nk = zeroize::Zeroizing::new(nk_arr);
         let grant = crate::e2ee::wrap::seal_to_recipient_with_hash(
             &nk,
             &content_hash,
@@ -8763,8 +9011,7 @@ pub(crate) async fn share_rewrap_pending_inner(state: &AppState) -> Result<u32, 
 #[tauri::command]
 pub async fn list_share_inbox(state: State<'_, AppState>) -> Result<Vec<ShareInboxItem>, AppError> {
     let base = share_base_url(state.inner())?;
-    let access = crate::share::access_token()?
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     let resp = client.list_inbox(&access).await?;
     let mut out = Vec::with_capacity(resp.items.len());
@@ -8810,12 +9057,20 @@ pub(crate) async fn accept_share_inner(
         });
     }
 
+    // (1b) RESUME a stranded accept: a prior attempt flipped the server row to `accepted` but failed
+    //      before the local ingest committed. The server no longer lists an accepted share in the
+    //      inbox and a re-accept 404s, so without the durable resume record the share would be lost.
+    //      Re-fetch (the blob stays fetchable while `accepted`) + re-verify + ingest from the record.
+    if let Some(pending) = state.db.get_pending_share_accept(&share_id)? {
+        return resume_pending_accept(state, pending).await;
+    }
+
     // (2) WRITE-GATE the target folder FIRST (mirror `ingest_into_folder`). Default = an auto-created
     //     UNSEALED "Shared" folder; a sealed-not-session-unlocked target is REFUSED (write nothing).
     let target = resolve_accept_folder(state, folder_id.as_deref())?;
 
     // (3) Need a session (MK derives the recipient identity for HPKE-open) + server.
-    let (account_id, generation, mk, access) = require_session_mk(state)?;
+    let (account_id, generation, mk, access) = require_session_mk(state).await?;
     let base = share_base_url(state)?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
@@ -8855,41 +9110,152 @@ pub(crate) async fn accept_share_inner(
         )));
     }
 
-    // (6) Flip the server row to accepted (authorizes the blob fetch), then (7) fetch the content cell.
+    // (6) Flip the server row to accepted (authorizes the blob fetch). This is the point of no return
+    //     server-side: a re-accept 404s and the inbox drops the item.
     let accepted = client.accept_share_server(&access, &share_id).await?;
-    let content_cell = client.get_blob(&access, &accepted.blob_id).await?;
 
-    // (8) Derive OUR identity from MK; VERIFY (§4.8) + decrypt + ingest — writes NOTHING on failure.
+    // (6b) DURABLY record the resume state BEFORE the fetch/verify/ingest below — so ANY failure in
+    //      (7)/(8) is recoverable from the CLIENT via the resume path (step 1b), never a stranded
+    //      share. Carries only the opaque server-relayed key material the inbox already held.
+    state
+        .db
+        .insert_pending_share_accept(&crate::storage::PendingShareAccept {
+            share_id: share_id.clone(),
+            blob_id: accepted.blob_id.clone(),
+            target_folder_id: target.id.clone(),
+            sender_user_id: item.sender_user_id.clone(),
+            sender_fingerprint: sender_fp.clone(),
+            wrapped_key: item.wrapped_key.clone(),
+            grant_sig: item.grant_sig.clone(),
+            rev: item.rev,
+            key_generation: item.key_generation,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })?;
+
+    // (7)+(8)+(9) fetch + VERIFY (§4.8) + decrypt + ingest + pin + drop the resume record.
     let recipient = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
-    let result = accept_ingest_verified(
+    finalize_accepted_share(
         state,
+        &client,
+        &access,
         &target,
         &recipient,
         &sender_fp,
         &item.sender_user_id,
         &up,
-        &content_cell,
+        &accepted.blob_id,
         &share_id,
         item.rev,
         item.key_generation,
-    )?;
+    )
+    .await
+}
 
-    // (9) Pin the sender's key ONLY NOW — after the grant verified (§4.8) and the note actually landed
-    //     in the vault, so a failed/forged first-contact item never leaves a poisoned pin behind.
+/// The shared TAIL of an accept: fetch the (recipiency-authorized) content blob, VERIFY §4.8 +
+/// decrypt + ingest into the write-gated folder, pin the sender AFTER a verified ingest, drop the
+/// durable resume record, and ledger. Used by both the normal path (right after the server flip) and
+/// the RESUME path (after a strand). Writes NOTHING on any verification/fetch failure — and leaves the
+/// resume record in place on failure so a retry can finish.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_accepted_share(
+    state: &AppState,
+    client: &crate::share::client::ShareClient,
+    access: &str,
+    target: &Folder,
+    recipient: &crate::e2ee::keys::IdentityKeypair,
+    sender_fp: &str,
+    sender_user_id: &str,
+    up: &crate::e2ee::wrap::UnpackedGrant,
+    blob_id: &str,
+    share_id: &str,
+    rev: u32,
+    key_generation: u32,
+) -> Result<AcceptedShare, AppError> {
+    let content_cell = client.get_blob(access, blob_id).await?;
+    let result = accept_ingest_verified(
+        state,
+        target,
+        recipient,
+        sender_fp,
+        sender_user_id,
+        up,
+        &content_cell,
+        share_id,
+        rev,
+        key_generation,
+    )?;
+    // Pin ONLY NOW — after the grant verified (§4.8) and the note landed — so a forged/failed item
+    // never leaves a poisoned pin. Then drop the resume record (the strand window is closed).
     state.db.pin_contact(
-        &item.sender_user_id,
+        sender_user_id,
         None,
-        &sender_fp,
+        sender_fp,
         &chrono::Utc::now().to_rfc3339(),
     )?;
-
-    crate::share::ledger_row(
-        &state.db,
-        &client.host(),
-        "share_accept",
-        content_cell.len(),
-    );
+    state.db.delete_pending_share_accept(share_id)?;
+    crate::share::ledger_row(&state.db, &client.host(), "share_accept", content_cell.len());
     Ok(result)
+}
+
+/// RESUME a stranded accept from its durable [`PendingShareAccept`] record: the server row was flipped
+/// to `accepted` on a prior attempt but the local verify+ingest failed after the flip. Re-runs the
+/// write-gate + fingerprint-attest + TOFU-block (never trust the saved state blindly), then finishes
+/// via [`finalize_accepted_share`]. This makes the server flip effectively idempotent from the client.
+async fn resume_pending_accept(
+    state: &AppState,
+    pending: crate::storage::PendingShareAccept,
+) -> Result<AcceptedShare, AppError> {
+    // (2) WRITE-GATE the saved target folder FIRST — refuse if it was sealed since the flip.
+    let target = state
+        .db
+        .folder_by_id(&pending.target_folder_id)?
+        .ok_or_else(|| AppError::InvalidArg("the share's target folder no longer exists".into()))?;
+    if target.locked && !folder_is_unlocked(state, &target.id)? {
+        return Err(AppError::Locked(
+            "the target folder is locked — unlock it first to finish accepting the share".into(),
+        ));
+    }
+    // (3) Session (MK derives our identity for HPKE-open) + server.
+    let (account_id, generation, mk, access) = require_session_mk(state).await?;
+    let base = share_base_url(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (5) Re-unpack + ATTEST the saved sender identity, then TOFU-BLOCK on a changed key — before any
+    //     write, exactly like the normal path.
+    let up = crate::e2ee::wrap::unpack_wrapped_key(&pending.wrapped_key, &pending.grant_sig)?;
+    let sender_fp = crate::e2ee::key_fingerprint(&up.sender_pk_enc, &up.sender_pk_sig);
+    if sender_fp != pending.sender_fingerprint {
+        return Err(AppError::InvalidArg(
+            "share sender identity does not match the retained fingerprint — refusing".into(),
+        ));
+    }
+    if matches!(
+        tofu_check(&state.db, &pending.sender_user_id, &sender_fp)?,
+        TofuState::Changed
+    ) {
+        return Err(AppError::Other(anyhow::anyhow!(
+            "this sender's key changed since you last accepted from them — re-verify the safety \
+             words out of band before accepting"
+        )));
+    }
+
+    // (8)+(9) fetch (the blob stays fetchable while `accepted`) + verify + ingest + pin + drop record.
+    let recipient = crate::e2ee::keys::derive_identity(&mk, &account_id, generation)?;
+    finalize_accepted_share(
+        state,
+        &client,
+        &access,
+        &target,
+        &recipient,
+        &sender_fp,
+        &pending.sender_user_id,
+        &up,
+        &pending.blob_id,
+        &pending.share_id,
+        pending.rev,
+        pending.key_generation,
+    )
+    .await
 }
 
 /// Resolve + WRITE-GATE the folder an accepted share lands in. `Some(id)` uses that folder (refusing a
@@ -9084,8 +9450,7 @@ fn ingest_shared_note(
 #[tauri::command]
 pub async fn decline_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
     let base = share_base_url(state.inner())?;
-    let access = crate::share::access_token()?
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))?;
+    let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     client.decline_share_server(&access, &share_id).await?;
     crate::share::ledger_row(&state.db, &client.host(), "share_decline", 0);
@@ -10000,6 +10365,88 @@ mod lifecycle_tests {
             created_at: "2026-06-27T08:00:00Z".to_string(),
         })
         .unwrap();
+    }
+
+    /// Seed a meeting with an explicit title + audio path into a folder (association lives on the
+    /// note's `folder_id`, resolved back by `list_meetings`).
+    fn seed_titled_meeting(db: &Db, mid: &str, title: &str, audio: &str, folder_id: &str) {
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-07-04T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some(title.to_string()),
+            duration_s: 600,
+            audio_path: Some(audio.to_string()),
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "# note".to_string(),
+            created_at: "2026-07-04T09:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_meeting_folder(mid, Some(folder_id)).unwrap();
+    }
+
+    /// #2 (0.7 security fast-follow): `list_meetings` MUST mask a sealed-and-NOT-session-unlocked
+    /// meeting at the BACKEND — the real AI title + `.enc` `audio_path` may not cross IPC (the Library
+    /// lock gate is enforced in code, not trusted to the FE). This is the RED-before-GREEN regression:
+    /// on the unpatched command a sealed row still carried "Board strategy" + its `.enc` path. The
+    /// `folder_id` stays (the FE keys the lock badge off it), an OPEN-folder meeting is untouched, and
+    /// a session-unlock reveals the real fields again (masking is reversible, never lossy).
+    #[test]
+    fn list_meetings_masks_a_sealed_meeting_at_the_backend() {
+        let state = build_state("list-mask");
+        let db = &state.db;
+        make_open_folder(db, "f-sealed", "Secret");
+        make_open_folder(db, "f-open", "Standups");
+        seed_titled_meeting(db, "m-sealed", "Board strategy", "/data/m-sealed.wav.enc", "f-sealed");
+        seed_titled_meeting(db, "m-open", "Open standup", "/data/m-open.wav", "f-open");
+        db.set_folder_locked("f-sealed", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let masked =
+            mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let sealed = masked.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(
+            sealed.title.as_deref(),
+            Some("🔒 Locked"),
+            "the real AI title must be masked at the backend for a sealed meeting"
+        );
+        assert_eq!(
+            sealed.audio_path, None,
+            "the .enc audio_path must be nulled so nothing can feed convertFileSrc"
+        );
+        assert_eq!(
+            sealed.folder_id.as_deref(),
+            Some("f-sealed"),
+            "folder_id is preserved so the FE still renders the lock badge"
+        );
+
+        // The open-folder meeting is untouched.
+        let open = masked.iter().find(|m| m.id == "m-open").unwrap();
+        assert_eq!(open.title.as_deref(), Some("Open standup"));
+        assert_eq!(open.audio_path.as_deref(), Some("/data/m-open.wav"));
+
+        // Session-unlock the sealed folder → the real title + audio path come back (reversible).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unmasked =
+            mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let now = unmasked.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(now.title.as_deref(), Some("Board strategy"));
+        assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));
     }
 
     /// WS6 (Tier 4b) — the NEW structured, egress-free `get_person_dossier` command inherits the
@@ -13020,6 +13467,71 @@ mod lifecycle_tests {
                 "expected InvalidArg for '{conn}', got: {err:?}"
             );
         }
+    }
+
+    // ── recording_status (webview-reload resync) ─────────────────────────────────────────────────
+    // A `tauri dev` FE hot-reload swaps the webview WITHOUT restarting the Rust process, so the store
+    // resets to `idle` while the backend recorder is still `Some(..)`. `recording_status` lets the
+    // freshly-loaded FE resync instead of pressing Start and hitting the "already recording" guard.
+    // `Recorder` needs mic hardware (can't be built headless), so we test the pure DTO builder that
+    // the command delegates to.
+
+    #[test]
+    fn recording_status_reports_idle_when_not_recording() {
+        let state = build_state("recstatus-idle");
+        // Even a lingering meeting row + a set `current_meeting` must NOT read as recording: the live
+        // recorder is the source of truth, and here it is `None`.
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "ghost".to_string(),
+                started_at: "2026-07-05T10:00:00Z".to_string(),
+                ended_at: None,
+                title: None,
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let st = recording_status_dto(&state.db, false, Some("ghost".to_string()));
+        assert!(!st.recording);
+        assert_eq!(st.meeting_id, None);
+        assert_eq!(st.started_at, None);
+    }
+
+    #[test]
+    fn recording_status_anchors_started_at_from_the_persisted_row() {
+        let state = build_state("recstatus-live");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "live-1".to_string(),
+                started_at: "2026-07-05T11:22:33Z".to_string(),
+                ended_at: None,
+                title: None,
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let st = recording_status_dto(&state.db, true, Some("live-1".to_string()));
+        assert!(st.recording);
+        assert_eq!(st.meeting_id.as_deref(), Some("live-1"));
+        // The FE anchors its elapsed timer to THIS, not an epoch-sized value.
+        assert_eq!(st.started_at.as_deref(), Some("2026-07-05T11:22:33Z"));
+    }
+
+    #[test]
+    fn recording_status_degrades_when_the_row_is_missing() {
+        // Recording is true but the row can't be read → still report recording, just drop the anchor
+        // (the FE falls back to "now"); the status read must never fail on a best-effort lookup.
+        let state = build_state("recstatus-norow");
+        let st = recording_status_dto(&state.db, true, Some("no-such-meeting".to_string()));
+        assert!(st.recording);
+        assert_eq!(st.meeting_id.as_deref(), Some("no-such-meeting"));
+        assert_eq!(st.started_at, None);
     }
 }
 

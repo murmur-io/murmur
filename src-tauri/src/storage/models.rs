@@ -173,6 +173,34 @@ pub struct NoteRecord {
     pub gateway_host: Option<String>,
 }
 
+/// A DURABLE resume record for a mode-B share whose server row was flipped to `accepted` but whose
+/// local verify+ingest has NOT yet committed (spec §7 accept invariant). Persisted between the server
+/// flip and the vault write so a post-flip failure (network / crash) is RECOVERABLE: the server no
+/// longer lists an accepted share in the inbox and a re-accept 404s, so without this the share would
+/// be stranded (gone from the inbox, un-re-acceptable). Carries only what `finalize_accepted_share`
+/// needs to re-fetch (the blob stays fetchable while `accepted`) + re-verify + ingest. Dropped the
+/// instant the ingest commits. `wrapped_key`/`grant_sig` are the same opaque server-relayed bytes the
+/// inbox already carried (no new secret at rest); the whole row is SQLCipher-encrypted like the rest.
+#[derive(Debug, Clone)]
+pub struct PendingShareAccept {
+    pub share_id: String,
+    /// The content-cell blob id returned by the server `accept` (fetch is authorized while `accepted`).
+    pub blob_id: String,
+    /// The write-gated target folder the note lands in (re-gated on resume in case it was sealed since).
+    pub target_folder_id: String,
+    /// The sender's STABLE server account id (TOFU namespace).
+    pub sender_user_id: String,
+    /// The sender's attested safety-word fingerprint (re-attested on resume).
+    pub sender_fingerprint: String,
+    /// HPKE-wrapped NK to us + packed sender identity (opaque; re-unpacked + §4.8-verified on resume).
+    pub wrapped_key: Vec<u8>,
+    /// The sender's detached Ed25519 grant signature (verified CLIENT-side on ingest).
+    pub grant_sig: Vec<u8>,
+    pub rev: u32,
+    pub key_generation: u32,
+    pub created_at: String,
+}
+
 /// One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken command, the
 /// assistant's answer, the grounding citations, and the dispatch status. PERSISTED so the meeting
 /// note can surface the assistant exchange that was previously ephemeral (only the live card). It is
