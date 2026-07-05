@@ -561,6 +561,10 @@ export class OnboardingComponent implements OnInit {
       jiraConsented: base?.jiraConsented ?? false,
       jiraBaseUrl: base?.jiraBaseUrl ?? "",
       jiraEmail: base?.jiraEmail ?? "",
+      // brain2 connectors (Phase 3) — Slack toggle + preserve-only consent; round-trip
+      // the snapshot so onboarding never resets them (default off, no egress).
+      slackEnabled: base?.slackEnabled ?? false,
+      slackConsented: base?.slackConsented ?? false,
       // Opt-in claude-CLI env inheritance — round-trip the snapshot so onboarding never resets it.
       claudeCodeInheritEnv: base?.claudeCodeInheritEnv ?? false,
       // AI Gateway — the base URL is now wizard-editable (the gateway tile);

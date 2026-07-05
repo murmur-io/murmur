@@ -518,6 +518,31 @@ export class IpcService {
     return invoke<boolean>("has_jira_token");
   }
 
+  /**
+   * brain2 connectors (Phase 3) — grant the one-time consent for SLACK egress. The ONLY
+   * supported way to flip `slackConsented` true: the backend persists the flag AND updates
+   * its in-memory config cache, so the next brain/Ask answer may expose the Slack connector
+   * (provided Slack is enabled AND a user token is stored). Idempotent. Mirrors
+   * {@link consentToJira}.
+   */
+  consentToSlack(): Promise<void> {
+    return invoke<void>("consent_to_slack");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Slack user token in the Keychain. An empty
+   * string clears it. NEVER logged / NEVER returned to the FE — only {@link hasSlackToken}
+   * reports presence. Mirrors {@link setJiraToken}.
+   */
+  setSlackToken(key: string): Promise<void> {
+    return invoke<void>("set_slack_token", { key });
+  }
+
+  /** Whether a Slack user token is currently stored. Never the value. */
+  hasSlackToken(): Promise<boolean> {
+    return invoke<boolean>("has_slack_token");
+  }
+
   providerStatuses(): Promise<ProviderStatus[]> {
     return invoke<ProviderStatus[]>("provider_statuses");
   }
