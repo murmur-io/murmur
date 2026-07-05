@@ -26,6 +26,14 @@
 - **Side effects:** `afterNextRender(fn, { injector })` for focus/scroll/measure — never
   `setTimeout`/`rAF` in a component. Observers live in a directive with `DestroyRef.onDestroy`.
 - **No new npm packages** without explicit user approval.
+- **Directory per component** (2026-07-04, user-approved): `name/name.component.{ts,html,scss}`
+  with `templateUrl`/`styleUrl` — never inline template/styles. Exemplars in
+  `src/app/design-system/`.
+- **Liquid Glass + tokens + catalog** (rule §6b): new views model on the macOS glass chrome;
+  every design value from `src/design-tokens/*.css` (missing value → ADD a token there with its
+  light override, never a raw hex/px in scss); reusable/atomic components go in
+  `src/app/design-system/` under the `mur-` prefix (form controls as CVAs — check the 14-strong
+  catalog + `primitives.css` before rolling a one-off).
 - **Verify live**, not just by build: drive `:1420` with a mocked
   `window.__TAURI_INTERNALS__.invoke`; Playwright defaults colorScheme LIGHT — eyeball the PNG,
   don't trust a shallow shell screenshot.
@@ -33,6 +41,31 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-04] Settings auto-save — a type="number" input killed the save stream
+- **Pattern 1:** an `<input type="number">` bound to a STRING-typed form control commits a
+  NUMBER (or null when cleared) via NumberValueAccessor — any `.trim()`/string method on
+  `getRawValue()` then throws. Normalize (`raw == null ? "" : String(raw)`) before string ops.
+- **Pattern 2:** a synchronous throw inside a `.subscribe()` callback KILLS the subscription —
+  an auto-save wired as `valueChanges → debounce → subscribe(save)` dies silently for the whole
+  session on the first bad value. Wrap the callback body in try/catch and surface the error.
+- **Pattern 3:** replacing a Save button with debounced auto-save needs a destroy-flush: a
+  change made <debounce before navigation is otherwise dropped (`DestroyRef.onDestroy` +
+  pending flag). And legacy direct `save()` calls (select `(change)` handlers) double-save —
+  retire them.
+- **Caught by:** adversarial-verifier live pass (payload-capturing mock invoke); build+lint
+  green throughout.
+- **Status:** journaled
+
+### [2026-07-04] Apple TV shell prototype — 2 findings the build/lint missed
+- **Pattern 1:** an `(keydown.escape)` bound on an overlay's scrim/panel only fires while focus
+  sits INSIDE that subtree — click any non-focusable text and focus falls to `<body>`, Esc goes
+  dead. A modal's Esc-to-close belongs on the shell's `(document:keydown)` host listener.
+- **Pattern 2:** a host class derived from a persisted mode (`[class.pill-mode]="pillMode()"`)
+  leaks its layout side-effects onto routes that hide the chrome — gate the binding on the same
+  route condition that hides the chrome (`pillMode() && !inDrilldown()`), not on the raw pref.
+- **Caught by:** adversarial-verifier live Playwright pass (RED observed pre-fix, GREEN post-fix);
+  `ng build`/`ng lint` were green the whole time.
+- **Status:** journaled
 ### [2026-07-05 detail redesign — #194] a botched multi-agent component split
 - **Pattern:** Splitting a 4600-line `detail.component` into panels across workflow phases left it
   NON-BUILDING: the Split-phase agent DIED mid-response ("API Error: Connection closed") so the panel

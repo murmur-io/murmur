@@ -1,0 +1,150 @@
+:host {
+  display: block;
+}
+.menu {
+  padding: var(--space-3);
+  min-width: 260px;
+  max-width: 320px;
+  /* Floating popover OVER the meeting list → must be OPAQUE. The global .card is a
+     frosted/translucent surface, which bled the list through (broken-looking modal). */
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.menu-title {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.menu-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition);
+}
+.menu-close:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.menu-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.opts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.opt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-2);
+  padding-left: calc(var(--space-2) + var(--depth, 0) * var(--space-4));
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition);
+}
+.opt:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.opt:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.opt:disabled {
+  cursor: default;
+}
+.opt.is-current {
+  color: var(--text-muted);
+}
+.opt-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-here {
+  flex: none;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.opts-empty {
+  margin: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+/* --- Load-bearing confirm (names the exact destructive consequence) --- */
+.confirm {
+  padding: var(--space-3);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+  /* Opaque so nothing behind shows through; the warning border + halo carry the caution. */
+  background: var(--surface-overlay);
+  box-shadow: 0 0 0 4px var(--warning-soft);
+}
+.confirm-title {
+  margin: 0 0 var(--space-1);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.confirm-body {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.confirm-error {
+  margin: var(--space-2) 0 0;
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+    

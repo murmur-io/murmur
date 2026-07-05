@@ -1,0 +1,50 @@
+:host {
+  display: contents;
+}
+.brain-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+.brain-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.brain-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.brain-name {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+/* "In use now" — accent (not the green Ready) so availability vs active read apart. */
+.brain-inuse {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.brain-privacy {
+  font-size: 0.8125rem;
+}
+.brain-chevron {
+  margin-left: var(--space-1);
+  transition: transform var(--transition);
+}
+.brain-chevron.is-open {
+  transform: rotate(180deg);
+}
+.brain-config {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+    

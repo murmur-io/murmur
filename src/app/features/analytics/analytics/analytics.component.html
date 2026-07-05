@@ -1,0 +1,130 @@
+<section class="analytics">
+  <header class="head">
+    <h2>Analytics</h2>
+    @if (!loading() && !isEmpty()) {
+      <span class="count">{{ data()!.totalMeetings }}</span>
+    }
+  </header>
+
+  @if (loading()) {
+    <div class="card state-card">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else if (isEmpty()) {
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Nothing to measure yet</p>
+      <p class="empty">
+        Record your first meeting and your stats will appear here.
+      </p>
+    </div>
+  } @else {
+    <!-- Hero stat cards -->
+    <div class="hero">
+      @for (s of heroStats(); track s.label; let i = $index) {
+        <div class="card stat" [style.animation-delay.ms]="i * 60">
+          <span class="stat-label">{{ s.label }}</span>
+          <span class="stat-value">{{ s.value }}</span>
+          @if (s.sub) {
+            <span class="stat-sub">{{ s.sub }}</span>
+          }
+        </div>
+      }
+    </div>
+
+    <!-- 30-day activity chart -->
+    <div class="card panel chart-panel" [style.animation-delay.ms]="260">
+      <div class="panel-head">
+        <h3>Activity</h3>
+        <span class="panel-note">Last 30 days</span>
+      </div>
+      <div
+        class="chart"
+        role="img"
+        aria-label="Meetings per day, last 30 days"
+      >
+        @for (b of chartBars(); track b.date) {
+          <div class="chart-col">
+            <div class="chart-track">
+              <div
+                class="chart-bar"
+                [class.is-zero]="b.count === 0"
+                [style.height.%]="b.count === 0 ? 0 : b.pct"
+              >
+                <span class="chart-tip">
+                  {{ chartTip(b) }}
+                </span>
+              </div>
+            </div>
+          </div>
+        }
+      </div>
+      <div class="chart-axis">
+        @for (b of chartBars(); track b.date) {
+          <span class="chart-axis-cell">
+            @if (b.tick) {
+              <span class="chart-tick">{{ b.tick }}</span>
+            }
+          </span>
+        }
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Status breakdown -->
+      <div class="card panel" [style.animation-delay.ms]="320">
+        <div class="panel-head">
+          <h3>By status</h3>
+        </div>
+        <ul class="status-list">
+          @for (row of statusRows(); track row.status) {
+            <li class="status-row">
+              <span class="pill" [class]="row.pillClass">
+                <span class="pill-dot"></span>
+                {{ row.label }}
+              </span>
+              <span class="status-track">
+                <span
+                  class="status-fill"
+                  [class]="row.pillClass"
+                  [style.width.%]="row.pct"
+                ></span>
+              </span>
+              <span class="status-count">{{ row.count }}</span>
+            </li>
+          }
+        </ul>
+      </div>
+
+      <!-- Small tiles -->
+      <div class="tiles">
+        <div class="card tile" [style.animation-delay.ms]="360">
+          <span class="tile-label">Longest session</span>
+          <span class="tile-value">
+            {{ formatDuration(data()!.longestDurationS) }}
+          </span>
+        </div>
+        <div class="card tile" [style.animation-delay.ms]="400">
+          <span class="tile-label">Notes created</span>
+          <span class="tile-value">{{ data()!.notesCount }}</span>
+        </div>
+        <div class="card tile" [style.animation-delay.ms]="440">
+          <span class="tile-label">Recording since</span>
+          <span class="tile-value tile-value--text">
+            {{ recordingSince() }}
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Topic threads (cross-meeting clusters from cached timelines) -->
+    <app-topic-threads />
+
+    <!-- Weekly digest (on-demand synthesis of recent meetings) -->
+    <app-weekly-digest />
+
+    <!-- Egress & Usage (content-free local egress ledger, Phase 6) -->
+    <app-egress-ledger />
+  }
+</section>
+  

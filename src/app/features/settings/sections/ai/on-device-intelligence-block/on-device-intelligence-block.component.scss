@@ -1,0 +1,135 @@
+:host {
+  display: contents;
+}
+
+.ondevice-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* Light regrouping heading. */
+.use-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.use-group-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+
+.btn-sm {
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+}
+
+/* --- brain2 RAG — semantic-search subsection --- */
+.semantic {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.semantic-model-row,
+.semantic-reindex {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  min-height: 36px;
+}
+.semantic-reindex .btn,
+.semantic-model-row .btn {
+  flex: none;
+}
+.semantic-note {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.semantic-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 180px;
+  flex: 1 1 auto;
+}
+.semantic-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+.semantic-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--transition);
+}
+.semantic-progress-label {
+  font-size: 0.75rem;
+}
+.semantic-nudge {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.semantic-done-pill {
+  align-self: flex-start;
+}
+.brain-error {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* Toggle row (for semantic-search checkbox). */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  cursor: pointer;
+}
+.toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.toggle-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+}
+.toggle-sub {
+  font-size: 0.85rem;
+}
+
+/* Inline spinner on the Re-indexing button. */
+.spin-ring {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--text-on-accent);
+  animation: spin 0.8s linear infinite;
+  margin-right: var(--space-2);
+  vertical-align: -2px;
+  display: inline-block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin-ring {
+    animation: none;
+  }
+}
+    

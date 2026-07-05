@@ -1,0 +1,166 @@
+<section class="graph">
+  <header class="g-head">
+    <div class="g-head-text">
+      <h2 class="g-title">Graph</h2>
+      <p class="g-intro">
+        The people and projects across your meetings — your graph builds
+        itself as you record.
+      </p>
+    </div>
+    @if (!loading() && total() > 0) {
+      <span class="count g-total" [attr.title]="total() + ' entities'">
+        {{ total() }}
+      </span>
+    }
+  </header>
+
+  @if (loading()) {
+    <div class="card state-card">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else if (error()) {
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Couldn’t load your graph</p>
+      <p class="empty">{{ error() }}</p>
+    </div>
+  } @else if (total() === 0) {
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">
+        Your graph builds itself as you record meetings
+      </p>
+      <p class="empty">
+        As Murmur recognises the people and projects you talk about, they’ll
+        appear here — connected by the meetings they share.
+      </p>
+    </div>
+  } @else {
+    <!-- One honest disclosure: sealed folders are withheld from the graph. -->
+    @if (hasHidden()) {
+      <div class="banner is-accent g-banner" role="status">
+        <span class="g-banner-glyph" aria-hidden="true"></span>
+        <span>
+          Some entities are hidden — unlock a folder to include them.
+        </span>
+      </div>
+    }
+
+    <div class="g-layout" [class.has-detail]="selectedId() !== null">
+      <!-- Directory (spine) -->
+      <div class="g-directory">
+        <div class="g-controls">
+          <div class="g-search">
+            <svg
+              class="g-search-icon"
+              viewBox="0 0 16 16"
+              width="15"
+              height="15"
+              aria-hidden="true"
+            >
+              <circle
+                cx="7"
+                cy="7"
+                r="4.5"
+                stroke="currentColor"
+                stroke-width="1.5"
+                fill="none"
+              />
+              <path
+                d="M10.5 10.5L14 14"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+            <input
+              type="search"
+              class="g-search-input"
+              placeholder="Search people and projects…"
+              aria-label="Search entities"
+              [value]="query()"
+              (input)="onQuery($event)"
+            />
+          </div>
+
+          <div class="g-filter" role="group" aria-label="Filter by kind">
+            @for (f of kindFilters; track f.key) {
+              <button
+                type="button"
+                class="g-seg"
+                [class.is-active]="kindFilter() === f.key"
+                [attr.aria-pressed]="kindFilter() === f.key"
+                (click)="kindFilter.set(f.key)"
+              >
+                {{ f.label }}
+              </button>
+            }
+          </div>
+
+          <label class="g-sort">
+            <span class="g-sort-label">Sort</span>
+            <select
+              class="g-sort-select"
+              aria-label="Sort entities"
+              [value]="sort()"
+              (change)="onSort($event)"
+            >
+              <option value="mentions">Most mentioned</option>
+              <option value="name">Name</option>
+            </select>
+          </label>
+        </div>
+
+        @if (visibleTotal() === 0) {
+          <div class="card g-no-results">
+            <p class="empty-title">No matches</p>
+            <p class="empty">
+              Nothing matches your search and filters. Try clearing them.
+            </p>
+          </div>
+        } @else {
+          @for (section of sections(); track section.kind) {
+            @if (section.entities.length) {
+              <div class="g-section">
+                <div class="g-section-head">
+                  <span
+                    class="g-section-dot"
+                    [class.is-project]="section.kind === 'project'"
+                    aria-hidden="true"
+                  ></span>
+                  <h3 class="g-section-title">{{ section.label }}</h3>
+                  <span class="count g-section-count">
+                    {{ section.entities.length }}
+                  </span>
+                </div>
+                <div class="g-cards" role="list">
+                  @for (e of section.entities; track e.id) {
+                    <app-entity-card
+                      role="listitem"
+                      [style.--i]="$index"
+                      class="g-card"
+                      [entity]="e"
+                      [selected]="selectedId() === e.id"
+                      (select)="onSelect($event)"
+                    />
+                  }
+                </div>
+              </div>
+            }
+          }
+        }
+      </div>
+
+      <!-- Detail panel (sticky on wide viewports) -->
+      @if (selectedId(); as id) {
+        <app-entity-detail
+          class="g-detail"
+          [entityId]="id"
+          (select)="onSelect($event)"
+          (close)="clearSelection()"
+        />
+      }
+    </div>
+  }
+</section>
+  

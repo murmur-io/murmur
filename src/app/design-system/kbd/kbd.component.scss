@@ -1,0 +1,15 @@
+:host {
+  display: inline-flex;
+  flex: none;
+}
+kbd {
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  line-height: 1.5;
+  white-space: nowrap;
+}

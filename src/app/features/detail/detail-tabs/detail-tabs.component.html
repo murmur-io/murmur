@@ -1,0 +1,15 @@
+<div class="tabbar seg" role="tablist" aria-label="Meeting sections">
+  @for (t of tabs(); track t.id) {
+    <button
+      type="button"
+      class="seg-btn"
+      role="tab"
+      [class.is-active]="active() === t.id"
+      [attr.aria-selected]="active() === t.id"
+      (click)="tabChange.emit(t.id)"
+    >
+      {{ t.label }}
+    </button>
+  }
+</div>
+  

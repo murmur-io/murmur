@@ -1,0 +1,52 @@
+:host {
+  display: contents;
+}
+
+.conn-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.conn-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.conn-head h3 {
+  margin: 0;
+}
+.conn-sub {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+.conn-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.conn-group-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+/* Quiet text button that reveals the engines outside the posture's lane. */
+.conn-showall {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: var(--space-1) 0;
+  cursor: pointer;
+  color: var(--accent-hover);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 550;
+  transition: color var(--transition);
+}
+.conn-showall:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+    

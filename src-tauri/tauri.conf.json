@@ -19,7 +19,11 @@
         "height": 680,
         "visible": false,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 32,
+          "y": 30
+        }
       }
     ],
     "security": {

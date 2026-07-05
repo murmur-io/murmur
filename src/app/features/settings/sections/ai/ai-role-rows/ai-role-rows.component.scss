@@ -1,0 +1,115 @@
+:host {
+  display: contents;
+}
+
+.role-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Progressive-disclosure trigger — a quiet inline text button. */
+.role-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+  transition: color var(--transition);
+}
+.role-toggle:hover {
+  color: var(--text-primary);
+}
+.role-chevron {
+  transition: transform var(--transition);
+}
+.role-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.role-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.role-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+/* Flash when the map's "Change" scrolls to this row (accent ring pulse). */
+.role-row.hl {
+  animation: role-hl 1.6s ease;
+  border-color: var(--accent);
+}
+@keyframes role-hl {
+  0%,
+  100% {
+    box-shadow: none;
+  }
+  25% {
+    box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .role-row.hl {
+    animation: none;
+  }
+}
+.role-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.role-title {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+.role-what {
+  font-size: 0.8125rem;
+}
+
+.role-model-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.role-model-select,
+.role-model-input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.role-model-refresh {
+  flex: none;
+  white-space: nowrap;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.field-label {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 550;
+}
+.field-help {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+    

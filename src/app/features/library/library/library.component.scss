@@ -1,0 +1,793 @@
+/* Meetings is a full drill-down (L2): app-shell hides the primary rail and
+   this fixed host fills the window as a flush-left [folders rail | content]
+   layout, below the toast viewport (z 60). Mirrors settings.component. */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  display: block;
+  background: var(--surface-base);
+}
+
+/* Two-pane shell: full-height folders rail + scrolling meetings content.
+   Collapses to stacked rows on narrow widths so the list never squeezes. */
+.library {
+  display: grid;
+  /* Same shared .drill-rail panel; a touch wider than the other rails so
+     nested folder names + count/lock badges don't truncate. */
+  grid-template-columns: 268px minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* --- Left pane: folder tree (lock-aware) ---
+   The shared floating liquid-glass panel (global .drill-rail in
+   styles.css carries the panel look; only layout + the enter glide live
+   here). Mirrors .settings-sidebar. */
+.folders-pane {
+  gap: var(--space-2);
+  animation: library-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Enter transition — rail + meetings pane share ONE eased glide (content
+   lags 40ms). TRANSFORM ONLY, never opacity: the fixed :host is opaque
+   near-black (--surface-base), so an opacity fade would flash black then
+   jump the UI in (the bug fixed for settings). Painted opaque from frame 1,
+   it just settles into place. Disabled under reduced-motion below. */
+@keyframes library-enter {
+  from {
+    transform: translateY(8px);
+  }
+  to {
+    transform: none;
+  }
+}
+
+/* Top drag strip — mirrors the primary rail so the overlay traffic lights
+   have somewhere to float and the window stays draggable up here. */
+.rail-drag {
+  flex: none;
+  height: 30px;
+}
+
+/* "← Murmur" drill-down up-affordance. */
+.rail-back {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 34px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.rail-back:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.rail-back:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.rail-back-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+/* Folder tree scrolls independently within the fixed full-height rail. */
+.folders-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.folders-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  min-height: 24px;
+}
+.folders-title {
+  margin: 0;
+  padding: 0 var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+/* "Lock all" — quiet accent pill, only present when a folder is exposed. */
+.relock-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 24px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-family: inherit;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition:
+    filter var(--transition),
+    transform var(--transition-fast);
+}
+.relock-pill:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+.relock-pill:active:not(:disabled) {
+  transform: scale(0.95);
+}
+.relock-pill:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.relock-pill:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.folders-state {
+  margin: var(--space-2);
+  font-size: 0.8125rem;
+}
+
+/* --- Right pane: stacks search, filters and the list ---
+   Scrolls independently, with its own padding (no longer inside .app-main's
+   padded column). Shares the rail's transform-only glide (40ms lag). */
+.meetings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+  height: 100%;
+  overflow-y: auto;
+  padding: var(--space-6) var(--space-6) var(--space-8);
+  animation: library-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) 40ms both;
+}
+
+/* Masked title for a locked-folder note (hidden until session-unlock). */
+.title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* --- Drag grip (signals a row is draggable; reveals on row hover) ----- */
+.grip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 18px;
+  margin-left: calc(var(--space-2) * -1);
+  color: var(--text-muted);
+  cursor: grab;
+  opacity: 0;
+  transition:
+    opacity var(--transition),
+    color var(--transition);
+}
+.row:hover .grip,
+.row:focus-visible .grip {
+  opacity: 0.65;
+}
+.row:hover .grip:hover {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+.row[draggable="true"]:active .grip {
+  cursor: grabbing;
+}
+
+/* --- Folder chip — the primary filing affordance on every row -------- */
+.folder-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 168px;
+  height: 26px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    background var(--transition),
+    border-color var(--transition),
+    transform var(--transition-fast);
+}
+.folder-chip:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+.folder-chip:active {
+  transform: scale(0.96);
+}
+.folder-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* A note that IS filed reads in the accent voice — its folder is "real". */
+.folder-chip.is-filed {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+}
+.folder-chip.is-filed:hover {
+  background: var(--accent-soft);
+  filter: brightness(1.12);
+}
+.row-item.is-menu-open .folder-chip {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+.folder-chip-icon {
+  flex: none;
+}
+.folder-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.folder-chip-plus {
+  font-size: 0.95rem;
+  line-height: 0;
+  margin-left: 1px;
+  opacity: 0.8;
+}
+
+/* --- "Move to…" popover anchor (right edge of the row) --------------- */
+.move-anchor {
+  position: absolute;
+  top: calc(100% - var(--space-2));
+  right: var(--space-3);
+  z-index: 40;
+  animation: rise 160ms var(--transition) both;
+}
+
+/* --- Drag source: dim the row being dragged for a tidy affordance ---- */
+.row-item.is-dragging {
+  opacity: 0.45;
+}
+.row-item.is-dragging .row {
+  background: var(--surface-hover);
+}
+
+/* --- Actionable empty-folder illustration --------------------------- */
+.empty-illo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: var(--space-3);
+  filter: drop-shadow(0 8px 24px rgba(110, 118, 255, 0.25));
+  animation: rise 420ms var(--transition) both;
+}
+.empty-chip-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px var(--space-2);
+  margin: 0 2px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-weight: 600;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+.title--masked {
+  color: var(--text-muted);
+  letter-spacing: 0.12em;
+  user-select: none;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* --- Frosted search field (pinned, sticky to the scroll top) ---
+   Sticks flush to the top of the meetings pane's scroll area; the negative
+   top pulls it over the pane's own top padding so it hugs the edge as the
+   list scrolls beneath it. */
+.search {
+  position: sticky;
+  top: calc(var(--space-6) * -1);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  height: 48px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  -webkit-backdrop-filter: blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  box-shadow: var(--shadow-sm), var(--glass-highlight);
+  transition:
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+.search:focus-within {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 3px var(--accent-ring),
+    var(--glass-highlight);
+}
+.search-icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-muted);
+  transition: color var(--transition);
+}
+.search:focus-within .search-icon,
+.search.is-active .search-icon {
+  color: var(--accent-hover);
+}
+/* Reset the global input chrome — the wrapper carries the frosting. */
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 0.9375rem;
+  letter-spacing: -0.01em;
+}
+.search-input:hover,
+.search-input:focus {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
+.search-input::placeholder {
+  color: var(--text-muted);
+}
+/* Hide the native WebKit search affordances — we draw our own ✕. */
+.search-input::-webkit-search-decoration,
+.search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+.search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition),
+    transform var(--transition-fast);
+}
+.search-clear:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.search-clear:active {
+  transform: scale(0.92);
+}
+.search-clear:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* --- Tag filter chips (pill language; accent for the active tag) ----- */
+.tagbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    color var(--transition),
+    transform var(--transition-fast);
+}
+.chip:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+.chip:active {
+  transform: scale(0.96);
+}
+.chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.chip.is-active {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+
+.library-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.library-head h2 {
+  margin: 0;
+}
+
+/* --- Recording-storage usage chip (header, only with a cap set) --- */
+.storage-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  margin-left: auto;
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  text-decoration: none;
+  min-width: 8rem;
+}
+.storage-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent-soft);
+  border-radius: inherit;
+}
+.storage-chip[data-state="amber"] .storage-fill {
+  background: color-mix(in srgb, var(--warning) 30%, transparent);
+}
+.storage-chip[data-state="red"] .storage-fill {
+  background: color-mix(in srgb, var(--live) 30%, transparent);
+}
+.storage-label {
+  position: relative;
+}
+
+/* Muted "audio freed" chip on a pruned meeting row. */
+.audio-freed {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+/* --- Meeting / results list --- */
+.list {
+  list-style: none;
+  padding: var(--space-2);
+  margin: 0;
+}
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  color: inherit;
+  animation: rise 360ms var(--transition) both;
+  transition:
+    background var(--transition),
+    transform var(--transition-fast);
+}
+.list li + li {
+  border-top: 1px solid var(--border-subtle);
+}
+.row:hover {
+  background: var(--surface-hover);
+}
+.row:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.row:active {
+  transform: translateY(1px);
+}
+
+/* --- Per-row delete affordance (hidden until hover / focus) --------- */
+.row-item {
+  position: relative;
+}
+/* Keep the link clear of the delete button's hover footprint. */
+.row-item .row {
+  padding-right: var(--space-7);
+}
+.row-delete {
+  position: absolute;
+  top: 50%;
+  right: var(--space-3);
+  transform: translateY(-50%) scale(0.9);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--transition),
+    transform var(--transition-fast),
+    background var(--transition),
+    border-color var(--transition),
+    color var(--transition);
+}
+.row-item:hover .row-delete,
+.row-item:focus-within .row-delete,
+.row-item.is-confirming .row-delete {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(-50%) scale(1);
+}
+.row-delete:hover {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.row-delete:active {
+  transform: translateY(-50%) scale(0.92);
+}
+.row-delete:focus-visible {
+  outline: none;
+  opacity: 1;
+  pointer-events: auto;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* Fade the decorative chevron out so the ✕ owns the right edge. */
+.row-item:hover .chevron,
+.row-item:focus-within .chevron,
+.row-item.is-confirming .chevron {
+  opacity: 0;
+}
+
+/* --- In-app delete confirm (signal-driven; not window.confirm) ------ */
+.confirm {
+  margin: 0 var(--space-2) var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  animation: rise 200ms var(--transition) both;
+}
+.confirm-title {
+  margin: 0 0 var(--space-1);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.confirm-body {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.confirm-error {
+  margin: var(--space-3) 0 0;
+  color: var(--danger);
+  font-size: 0.8125rem;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.row-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.title {
+  color: var(--text-primary);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.meta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+.meta .dot {
+  color: var(--text-muted);
+}
+.date {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.duration {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.row-aside {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+}
+.chevron {
+  color: var(--text-muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  transition:
+    color var(--transition),
+    opacity var(--transition),
+    transform var(--transition);
+}
+.row:hover .chevron {
+  color: var(--text-secondary);
+  transform: translateX(2px);
+}
+
+/* --- Search result extras: matched-in badge + snippet --- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  line-height: 1;
+  flex: none;
+}
+.badge.is-accent {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+}
+.badge.is-success {
+  background: var(--success-soft);
+  border-color: transparent;
+  color: var(--success);
+}
+.snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.snippet-hit {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+/* --- Loading states (.count/.state-card/.empty* are global) --- */
+.searching {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.spinner {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent-hover);
+  animation: spin 700ms linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Narrow widths: stack the folders rail on top of the meetings content
+   (rows), each scrolling within the fixed full-height shell. Mirrors the
+   settings drill-down's narrow layout. */
+@media (max-width: 720px) {
+  .library {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .folders-pane {
+    height: auto;
+    margin: 10px 10px 0;
+  }
+  .meetings-pane {
+    padding: var(--space-5) var(--space-4) var(--space-6);
+  }
+  .search {
+    top: calc(var(--space-5) * -1);
+  }
+}
+
+/* Honor reduced-motion everywhere: no rail slide / content stagger (the
+   surface is opaque from frame 1, so entry is instant with no flash), and
+   no in-flow rise on the popover / empty illustration. */
+@media (prefers-reduced-motion: reduce) {
+  .folders-pane,
+  .meetings-pane,
+  .move-anchor,
+  .empty-illo {
+    animation: none;
+  }
+}
+    
