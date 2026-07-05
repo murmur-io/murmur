@@ -226,6 +226,8 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::ListRecentMeetings { .. } => "Recent meetings",
         ToolCall::WebSearch { .. } => "Web search",
         ToolCall::CalendarLookup { .. } => "Calendar",
+        ToolCall::JiraSearch { .. } => "Jira",
+        ToolCall::SlackSearch { .. } => "Slack",
     }
 }
 

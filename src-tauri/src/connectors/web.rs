@@ -104,7 +104,7 @@ impl WebSearchProvider for BraveSearch {
     }
 
     async fn search(&self, redacted_query: &str, api_key: &str) -> ConnectorResult {
-        let client = reqwest::Client::new();
+        let client = super::http_client();
         let resp = client
             .get(&self.base_url)
             .query(&[("q", redacted_query)])
@@ -202,6 +202,10 @@ impl Connector for WebConnector {
 
     fn egress_class(&self) -> EgressClass {
         EgressClass::External
+    }
+
+    fn egress_attribution(&self) -> (&'static str, &'static str) {
+        ("web_search", "web search (connector)")
     }
 
     async fn search(&self, redacted_query: &str) -> ConnectorResult {

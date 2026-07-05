@@ -1,0 +1,38 @@
+<div class="verify-panel">
+  <div class="verify-head">
+    <button type="button" class="btn btn-ghost" (click)="verify()" [disabled]="running()">
+      @if (running()) { Checking Jira… } @else { Verify with Jira }
+    </button>
+    @if (findings(); as f) {
+      @if (f.length > 0 && !applied()) {
+        <button type="button" class="btn btn-primary" (click)="apply()" [disabled]="running()">
+          Add markers to note
+        </button>
+      }
+    }
+  </div>
+
+  @if (findings(); as f) {
+    @if (f.length === 0) {
+      <p class="text-secondary">No ticket references found in this note.</p>
+    } @else {
+      <ul class="verify-list">
+        @for (item of f; track item.key) {
+          <li class="verify-item" [class]="'is-' + item.verdict">
+            <span class="verify-glyph">{{ glyph(item.verdict) }}</span>
+            <span class="verify-detail">{{ item.detail }}</span>
+            @if (item.url) {
+              <a [href]="item.url" target="_blank" rel="noopener">{{ item.key }}</a>
+            }
+          </li>
+        }
+      </ul>
+    }
+  }
+  @if (applied()) {
+    <p class="text-secondary">Markers added — the note now carries the verification inline.</p>
+  }
+  @if (error(); as e) {
+    <p class="banner is-warning" role="alert">{{ e }}</p>
+  }
+</div>
