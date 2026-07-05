@@ -12,6 +12,7 @@ import {
 import { toObservable, toSignal } from "@angular/core/rxjs-interop";
 import { Router } from "@angular/router";
 import { catchError, debounceTime, from, of, switchMap } from "rxjs";
+import { MurKbdComponent } from "../kbd/kbd.component";
 import { IpcService } from "../../core/ipc.service";
 import type { SearchHit } from "../../core/models";
 
@@ -36,13 +37,14 @@ interface HitRow {
  * → debounce → `switchMap` (stale results dropped for free) → `toSignal`.
  */
 @Component({
-  selector: "app-quick-search",
+  selector: "mur-quick-search",
   standalone: true,
+  imports: [MurKbdComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./quick-search.component.html",
   styleUrl: "./quick-search.component.scss",
 })
-export class QuickSearchComponent {
+export class MurQuickSearchComponent {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
 
