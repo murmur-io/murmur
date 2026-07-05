@@ -6214,7 +6214,30 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         return Ok(()); // already sealed — idempotent.
     }
 
-    let kek = Zeroizing::new(crate::secrets::get_or_create_master_kek()?);
+    // Prefer the SESSION-CACHED KEK (set by a successful unlock — possibly a RECOVERED key): it
+    // keeps every folder sealed this session convergent on the key that demonstrably unwraps the
+    // existing ones, and skips a redundant Touch ID prompt. Only fall through to the keychain when
+    // nothing is cached. Minting a fresh KEK is then allowed ONLY when nothing is sealed yet: with
+    // sealed folders present, a missing keychain item must be an ERROR (a fresh KEK would fork the
+    // key the folders depend on — the 2026-07-05 field incident sealed folders under divergent
+    // mints).
+    let cached: Option<Zeroizing<[u8; 32]>> = {
+        let g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        g.clone()
+    };
+    let kek = match cached {
+        Some(k) => k,
+        None => {
+            let any_sealed = state.db.any_locked_folder()?;
+            Zeroizing::new(crate::secrets::master_kek_with_policy(
+                "Lock this folder",
+                !any_sealed,
+            )?)
+        }
+    };
     let ck = Zeroizing::new(crate::crypto::random_key()?);
     // Wrapped CK is AAD-bound to the folder id (B7): the wrapped key cannot be lifted onto a
     // different folder row and unwrapped there.
@@ -6349,38 +6372,99 @@ pub async fn unlock_folder(
             None => {
                 // The biometric-gated keychain read BLOCKS while the Touch ID sheet is up, so run it
                 // on the blocking pool — never on an async-runtime worker thread. This is the single
-                // Touch ID prompt.
-                let bytes = tokio::task::spawn_blocking(|| {
-                    crate::secrets::get_or_create_master_kek_with_reason("Unlock this folder")
+                // Touch ID prompt. `allow_mint = false`: a locked folder EXISTS (we are unlocking
+                // it), so a missing keychain item must NEVER be papered over with a fresh KEK — that
+                // orphans every sealed folder (2026-07-05 field incident).
+                let resolved = tokio::task::spawn_blocking(|| {
+                    crate::secrets::master_kek_with_policy("Unlock this folder", false)
                 })
                 .await
-                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))?
-                .inspect_err(|e| {
-                    tracing::warn!(
-                        target: "lock",
-                        folder = %folder_id,
-                        error = %e,
-                        "unlock_folder: master-KEK release failed (keychain/biometric)"
-                    );
-                })?;
-                Zeroizing::new(bytes)
+                .map_err(|e| AppError::Auth(format!("master-kek task join failed: {e}")))?;
+                match resolved {
+                    Ok(bytes) => Zeroizing::new(bytes),
+                    Err(resolve_err) => {
+                        // LAST RESORT: even the primary release failed (e.g. an authoritatively
+                        // missing item — or a read shape that lies on this macOS). Enumerate every
+                        // candidate the stores hold and try each against THIS folder's wrapped CK;
+                        // a winner proceeds exactly like a released KEK. Read-only.
+                        tracing::warn!(
+                            target: "lock",
+                            folder = %folder_id,
+                            error = %resolve_err,
+                            "unlock_folder: master-KEK release failed — trying candidate recovery"
+                        );
+                        let candidates = tokio::task::spawn_blocking(|| {
+                            crate::secrets::list_master_kek_candidates("Recover the folder key")
+                        })
+                        .await
+                        .map_err(|e| {
+                            AppError::Auth(format!("kek-recovery task join failed: {e}"))
+                        })?
+                        .unwrap_or_else(|_| Zeroizing::new(Vec::new()));
+                        match try_unwrap_ck_with_candidates(&candidates, &wrapped, &folder_id, None)
+                        {
+                            Some((_bytes, winner, idx)) => {
+                                tracing::warn!(
+                                    target: "lock",
+                                    folder = %folder_id,
+                                    candidates = candidates.len(),
+                                    winner_index = idx,
+                                    "unlock_folder: RECOVERED the master KEK from the candidate set (primary release had failed)"
+                                );
+                                winner
+                            }
+                            None => return Err(resolve_err),
+                        }
+                    }
+                }
             }
         }
     };
     // Wrapped CK is bound to the folder id (legacy folders fall back to empty AAD transparently).
     // A failure HERE with a successfully-released KEK means the CK was wrapped under a DIFFERENT
-    // KEK than the one just read (store divergence / replaced item) — the exact signature worth
-    // distinguishing in the field from a biometric refusal, so trace it separately.
-    let ck_bytes = Zeroizing::new(
-        crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id)).inspect_err(|e| {
+    // KEK than the one just read (store divergence / replaced item). RECOVERY: on machines where
+    // the no-UI keychain probe lied, several KEK generations can coexist — enumerate every
+    // candidate in the stores and try each against the wrapped CK before giving up. Read-only;
+    // the winning KEK is adopted for the session (cached below) but nothing is rewritten.
+    let (ck_bytes, kek) = match crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id))
+    {
+        Ok(b) => (Zeroizing::new(b), kek),
+        Err(primary_err) => {
             tracing::warn!(
                 target: "lock",
                 folder = %folder_id,
-                error = %e,
-                "unlock_folder: content-key unwrap failed — the folder was sealed under a different master KEK than the one released"
+                error = %primary_err,
+                "unlock_folder: content-key unwrap failed with the primary master KEK — trying every keychain candidate"
             );
-        })?,
-    );
+            let candidates = tokio::task::spawn_blocking(|| {
+                crate::secrets::list_master_kek_candidates("Recover the folder key")
+            })
+            .await
+            .map_err(|e| AppError::Auth(format!("kek-recovery task join failed: {e}")))?
+            .unwrap_or_else(|_| Zeroizing::new(Vec::new()));
+            match try_unwrap_ck_with_candidates(&candidates, &wrapped, &folder_id, Some(&*kek)) {
+                Some((bytes, winner, idx)) => {
+                    tracing::warn!(
+                        target: "lock",
+                        folder = %folder_id,
+                        candidates = candidates.len(),
+                        winner_index = idx,
+                        "unlock_folder: RECOVERED the content key with a non-primary master-KEK candidate"
+                    );
+                    (Zeroizing::new(bytes), winner)
+                }
+                None => {
+                    tracing::error!(
+                        target: "lock",
+                        folder = %folder_id,
+                        candidates = candidates.len(),
+                        "unlock_folder: NO keychain candidate unwraps this folder's content key"
+                    );
+                    return Err(primary_err);
+                }
+            }
+        }
+    };
     let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
         ck_bytes
             .as_slice()
@@ -6563,12 +6647,62 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
         .db
         .folder_wrapped_key(&folder_id)?
         .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
-    let kek = Zeroizing::new(crate::secrets::get_or_create_master_kek()?);
-    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
-        &kek,
-        &wrapped,
-        &aad_wrapped_ck(&folder_id),
-    )?);
+    // Prefer the session-cached KEK (possibly a RECOVERED key), then the keychain with the strict
+    // no-mint policy (this folder IS sealed — a fresh mint can never unwrap it). On an unwrap
+    // failure, run the same candidate RECOVERY as `unlock_folder` before giving up.
+    let cached: Option<Zeroizing<[u8; 32]>> = {
+        let g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        g.clone()
+    };
+    let kek = match cached {
+        Some(k) => k,
+        None => Zeroizing::new(crate::secrets::master_kek_with_policy(
+            "Remove this folder's lock",
+            false,
+        )?),
+    };
+    let ck_bytes = match crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id)) {
+        Ok(b) => Zeroizing::new(b),
+        Err(primary_err) => {
+            tracing::warn!(
+                target: "lock",
+                folder = %folder_id,
+                error = %primary_err,
+                "remove_lock: content-key unwrap failed with the primary master KEK — trying every keychain candidate"
+            );
+            let candidates = crate::secrets::list_master_kek_candidates("Recover the folder key")
+                .unwrap_or_else(|_| Zeroizing::new(Vec::new()));
+            match try_unwrap_ck_with_candidates(&candidates, &wrapped, &folder_id, Some(&*kek)) {
+                Some((bytes, winner, idx)) => {
+                    tracing::warn!(
+                        target: "lock",
+                        folder = %folder_id,
+                        candidates = candidates.len(),
+                        winner_index = idx,
+                        "remove_lock: RECOVERED the content key with a non-primary master-KEK candidate"
+                    );
+                    // Cache the winner so subsequent lock ops this session converge on the key
+                    // that demonstrably unwraps existing folders (and skip re-enumeration).
+                    if let Ok(mut g) = state.master_kek.lock() {
+                        *g = Some(winner);
+                    }
+                    Zeroizing::new(bytes)
+                }
+                None => {
+                    tracing::error!(
+                        target: "lock",
+                        folder = %folder_id,
+                        candidates = candidates.len(),
+                        "remove_lock: NO keychain candidate unwraps this folder's content key"
+                    );
+                    return Err(primary_err);
+                }
+            }
+        }
+    };
     let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
         ck_bytes
             .as_slice()
@@ -7036,6 +7170,30 @@ const AAD_SCHEMA_VERSION: &str = "1";
 /// the folder row; nothing else identifies it).
 fn aad_wrapped_ck(folder_id: &str) -> Vec<u8> {
     format!("murmur:wrapck:v{AAD_SCHEMA_VERSION}|folder={folder_id}").into_bytes()
+}
+
+/// KEK-RECOVERY: try every master-KEK candidate the keychain stores hold against a folder's
+/// wrapped content key, skipping the already-tried primary. Returns the unwrapped CK bytes, the
+/// WINNING KEK (adopted for the session by the caller) and the candidate index (for the forensic
+/// log — count/index only, never key bytes). Read-only and pure over its inputs, so it is unit-
+/// testable without a keychain. Rationale: on machines where the no-UI keychain probe lies,
+/// several KEK generations coexist under the same account and only ONE of them sealed this folder
+/// (2026-07-05 field incident).
+fn try_unwrap_ck_with_candidates(
+    candidates: &[[u8; 32]],
+    wrapped: &[u8],
+    folder_id: &str,
+    already_tried: Option<&[u8; 32]>,
+) -> Option<(Vec<u8>, Zeroizing<[u8; 32]>, usize)> {
+    for (i, cand) in candidates.iter().enumerate() {
+        if already_tried == Some(cand) {
+            continue;
+        }
+        if let Ok(bytes) = crate::crypto::decrypt(cand, wrapped, &aad_wrapped_ck(folder_id)) {
+            return Some((bytes, Zeroizing::new(*cand), i));
+        }
+    }
+    None
 }
 
 /// AAD for a content blob (note / transcript segment / timeline). Bound to
@@ -8127,7 +8285,15 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
         },
     };
     // Existence-only probe (NO Touch ID prompt): can a locked session be restored biometrically?
-    let biometric_unlock_available = logged_in && crate::secrets::keychain::account_mk_cached()?;
+    // The no-prompt existence probe LIES for ACL'd data-protection items on current macOS
+    // (2026-07-05 field incident: it reported not-found for items that a prompting read returns),
+    // so a probe "false" must not HIDE the Touch ID button — on a macOS release build, offer it
+    // whenever a logged-in-but-locked session exists; a tap with no real cached MK fails closed
+    // ("no cached account key") and the FE falls back to the password CTA. The probe result still
+    // short-circuits `true` when it does find the item.
+    let probe_says_cached = crate::secrets::keychain::account_mk_cached().unwrap_or(false);
+    let biometric_unlock_available = logged_in
+        && (probe_says_cached || cfg!(all(target_os = "macos", not(debug_assertions))));
     let cfg = state
         .config
         .lock()
@@ -10012,6 +10178,61 @@ mod lifecycle_tests {
             matches!(err2, AppError::Unavailable(_)),
             "past the lock gate, an unconsented/logged-out share fails Unavailable, got: {err2:?}"
         );
+    }
+
+    // ── KEK candidate-recovery (0.7.4) tests ────────────────────────────────────────────────────
+
+    /// The recovery loop finds the ONE candidate that sealed the folder (AAD-bound), returns its
+    /// bytes + index, and yields None when no candidate (or the wrong folder id) matches.
+    #[test]
+    fn kek_recovery_tries_candidates_and_finds_the_sealing_key() {
+        let kek_old: [u8; 32] = [3u8; 32];
+        let kek_new: [u8; 32] = [9u8; 32];
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek_old, &ck, &aad_wrapped_ck("f-rec")).unwrap();
+
+        // Primary (kek_new) failed upstream; candidates hold [wrong, old] → winner at index 1.
+        let candidates = [[7u8; 32], kek_old];
+        let (bytes, winner, idx) =
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", Some(&kek_new))
+                .expect("recovery must find the sealing KEK among the candidates");
+        assert_eq!(bytes.as_slice(), ck.as_slice(), "recovered CK must be the original");
+        assert_eq!(*winner, kek_old, "the winner is the KEK that sealed the folder");
+        assert_eq!(idx, 1);
+
+        // No matching candidate → None (the caller surfaces the primary error).
+        assert!(
+            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new))
+                .is_none()
+        );
+        // AAD binding holds: the right KEK under the WRONG folder id must not unwrap.
+        assert!(
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new))
+                .is_none()
+        );
+        // The already-tried primary is skipped even if listed as a candidate.
+        assert!(
+            try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none()
+        );
+        // With NO already-tried key (the primary release itself failed), all candidates are tried.
+        let (_, winner2, _) = try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", None)
+            .expect("recovery with no primary must still find the sealing KEK");
+        assert_eq!(*winner2, kek_old);
+    }
+
+    /// `any_locked_folder` (the mint-guard input) flips with seal state.
+    #[test]
+    fn any_locked_folder_reflects_seal_state() {
+        let state = build_state("any-locked");
+        make_open_folder(&state.db, "f-guard", "Guard");
+        assert!(!state.db.any_locked_folder().unwrap());
+        state
+            .db
+            .set_folder_locked("f-guard", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(state.db.any_locked_folder().unwrap());
+        state.db.set_folder_locked("f-guard", false, None).unwrap();
+        assert!(!state.db.any_locked_folder().unwrap());
     }
 
     // ── session-refresh (0.7.3 re-enable) tests ─────────────────────────────────────────────────
