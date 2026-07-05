@@ -17,6 +17,8 @@ export interface ConnectionCardVm {
   readonly status: ProviderStatus | null;
   readonly expanded: boolean;
   readonly cloud: boolean;
+  /** True when the current posture actively routes work to this engine now. */
+  readonly inUse: boolean;
 }
 
 /**
@@ -52,6 +54,12 @@ export interface ConnectionCardVm {
             <span class="pill">
               <span class="pill-dot"></span>
               Not set up
+            </span>
+          }
+          @if (card().inUse) {
+            <span class="pill conn-inuse">
+              <span class="pill-dot"></span>
+              In use now
             </span>
           }
         </div>
@@ -99,7 +107,7 @@ export interface ConnectionCardVm {
       </span>
       @if (card().id === "ollama") {
         <span class="conn-reason text-muted">
-          Your own local model server — separate from the built-in Murmur Brain.
+          Your own local model server — separate from the built-in models.
         </span>
       }
       @if (unavailableReason(); as reason) {
@@ -400,6 +408,12 @@ export interface ConnectionCardVm {
         color: var(--text-primary);
         font-weight: 550;
         font-size: 0.95rem;
+      }
+      /* "In use now" — accent (not the green Ready) so availability vs active read apart. */
+      .conn-inuse {
+        color: var(--accent-hover);
+        background: var(--accent-soft);
+        border-color: transparent;
       }
       .conn-actions {
         display: inline-flex;

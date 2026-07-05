@@ -39,6 +39,13 @@ const PROVIDER_CONNECTION_IDS: readonly string[] = [
 ];
 
 /**
+ * Synthetic id for the built-in on-device engine (the brain-engine-card) in the
+ * `inUseConnections` set — it is not a provider CONNECTION, so it needs its own
+ * token to be markable "In use now" alongside the real connection ids.
+ */
+export const BRAIN_ENGINE_ID = "__brain__";
+
+/**
  * Heuristic: does this string look like a filesystem PATH to a `.gguf` file
  * (vs a bare registry id like `qwen3-14b`)? True when it contains a path
  * separator, ends `.gguf` (case-insensitive), or starts with `~`. Drives which
@@ -507,6 +514,30 @@ export class SettingsStore {
     const id = this._providerIdValue();
     if (id === "ollama") return this.ollamaIsRemote();
     return true; // claude_code | anthropic | gateway | any future id
+  });
+
+  /**
+   * Which engines the CURRENT posture actively routes work to right now — the
+   * source for the "In use now" badge in Advanced → Engines. Derived from the
+   * posture-preset semantics (NOT re-implementing the resolver row-by-row):
+   * cloud/hybrid clear the role overrides so the DEFAULT engine writes
+   * Notes/Ask/Live; hybrid/fully_local run the built-in on-device brain
+   * (reactions / all local roles). It is a usage HINT, not a locality label —
+   * the card's own group heading and the "What runs where" map carry the
+   * cloud-vs-Mac truth. It never marks an engine a preset does not use; on the
+   * derived `custom` posture it best-effort marks the default engine (which
+   * always writes Notes) plus the built-in brain when `brain_backend=local`.
+   */
+  readonly inUseConnections = computed<ReadonlySet<string>>(() => {
+    const p = this.posture();
+    const provider = this._providerIdValue();
+    const s = new Set<string>();
+    if (provider && (p === "cloud" || p === "hybrid" || p === "custom"))
+      s.add(provider);
+    if (p === "hybrid" || p === "fully_local") s.add(BRAIN_ENGINE_ID);
+    if (p === "custom" && this._brainBackendValue() === "local")
+      s.add(BRAIN_ENGINE_ID);
+    return s;
   });
 
   /**

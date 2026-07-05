@@ -5,7 +5,7 @@ import {
   inject,
   signal,
 } from "@angular/core";
-import { SettingsStore } from "../../settings.store";
+import { BRAIN_ENGINE_ID, SettingsStore } from "../../settings.store";
 import {
   AiConnectionCardComponent,
   type ConnectionCardVm,
@@ -50,38 +50,53 @@ const CONNECTIONS: readonly ConnectionDef[] = [
       <div class="conn-head">
         <h3>Engines</h3>
         <p class="text-secondary conn-sub">
-          Where models can run. Set each engine up once.
+          Every engine a model can run on. Your posture above already picks which
+          one runs — “Ready” just means an engine is set up and available, not
+          that it’s running. Open this only to route a feature by hand or connect
+          your own engine.
         </p>
       </div>
 
-      <div class="conn-group">
-        <span class="conn-group-label text-muted">On this Mac</span>
-        <app-brain-engine-card />
-        @for (c of localCards(); track c.id) {
-          <app-ai-connection-card
-            [card]="c"
-            [testing]="testing()"
-            (toggleConfigure)="toggleConfigure(c.id)"
-            (probe)="test(c.id)"
-          />
-        } @empty {
-          <p class="conn-empty text-muted">
-            Ollama appears here only while its base URL points at this Mac.
-          </p>
-        }
-      </div>
+      @if (brainShown() || macCardsShown().length > 0) {
+        <div class="conn-group">
+          <span class="conn-group-label text-muted">On this Mac</span>
+          @if (brainShown()) {
+            <app-brain-engine-card [inUse]="brainInUse()" />
+          }
+          @for (c of macCardsShown(); track c.id) {
+            <app-ai-connection-card
+              [card]="c"
+              [testing]="testing()"
+              (toggleConfigure)="toggleConfigure(c.id)"
+              (probe)="test(c.id)"
+            />
+          }
+        </div>
+      }
 
-      <div class="conn-group">
-        <span class="conn-group-label text-muted">Cloud (redacted first)</span>
-        @for (c of cloudCards(); track c.id) {
-          <app-ai-connection-card
-            [card]="c"
-            [testing]="testing()"
-            (toggleConfigure)="toggleConfigure(c.id)"
-            (probe)="test(c.id)"
-          />
-        }
-      </div>
+      @if (cloudCardsShown().length > 0) {
+        <div class="conn-group">
+          <span class="conn-group-label text-muted">Cloud (redacted first)</span>
+          @for (c of cloudCardsShown(); track c.id) {
+            <app-ai-connection-card
+              [card]="c"
+              [testing]="testing()"
+              (toggleConfigure)="toggleConfigure(c.id)"
+              (probe)="test(c.id)"
+            />
+          }
+        </div>
+      }
+
+      @if (hiddenCount() > 0) {
+        <button type="button" class="conn-showall" (click)="toggleShowAll()">
+          {{
+            showAll()
+              ? "Show fewer engines"
+              : "Show all engines (" + hiddenCount() + " more)"
+          }}
+        </button>
+      }
     </div>
   `,
   styles: [
@@ -120,10 +135,22 @@ const CONNECTIONS: readonly ConnectionDef[] = [
         letter-spacing: 0.01em;
         text-transform: uppercase;
       }
-      .conn-empty {
-        margin: 0;
+      /* Quiet text button that reveals the engines outside the posture's lane. */
+      .conn-showall {
+        align-self: flex-start;
+        background: none;
+        border: none;
+        padding: var(--space-1) 0;
+        cursor: pointer;
+        color: var(--accent-hover);
+        font: inherit;
         font-size: 0.85rem;
-        line-height: 1.5;
+        font-weight: 550;
+        transition: color var(--transition);
+      }
+      .conn-showall:hover {
+        color: var(--accent);
+        text-decoration: underline;
       }
     `,
   ],
@@ -137,24 +164,79 @@ export class AiConnectionCardsComponent {
   /** True while a Test probe is in flight — disables every Test button. */
   readonly testing = signal(false);
 
-  /** Cards for the "On this Mac" group — Ollama, while its URL is loopback. */
-  readonly localCards = computed(() => this.buildCards(false));
+  /** Reveal the engines outside the current posture's lane (default: collapsed). */
+  readonly showAll = signal(false);
 
-  /** Cards for the "Cloud (redacted first)" group — everything else. */
-  readonly cloudCards = computed(() => this.buildCards(true));
+  readonly posture = this.store.posture;
+  private readonly inUse = this.store.inUseConnections;
 
-  private buildCards(cloud: boolean): ConnectionCardVm[] {
+  /** The built-in on-device engine is "in use now" when the posture routes to it. */
+  readonly brainInUse = computed(() => this.inUse().has(BRAIN_ENGINE_ID));
+
+  /** The built-in engine belongs to every posture's lane except pure Cloud. */
+  readonly brainShown = computed(
+    () =>
+      this.posture() !== "cloud" ||
+      this.brainInUse() ||
+      this.showAll(),
+  );
+
+  /** Every connection card VM, with its live group + "in use now" flag. */
+  private readonly allCards = computed<ConnectionCardVm[]>(() => {
     const statuses = this.store.providers();
     const expanded = this._expanded();
     const ollamaRemote = this.store.ollamaIsRemote();
-    return CONNECTIONS.filter((c) =>
-      c.id === "ollama" ? ollamaRemote === cloud : cloud,
-    ).map((c) => ({
-      ...c,
-      status: statuses.find((p) => p.id === c.id) ?? null,
-      expanded: expanded.has(c.id),
-      cloud,
-    }));
+    const inUse = this.inUse();
+    return CONNECTIONS.map((c) => {
+      const cloud = c.id === "ollama" ? ollamaRemote : true;
+      return {
+        ...c,
+        status: statuses.find((p) => p.id === c.id) ?? null,
+        expanded: expanded.has(c.id),
+        cloud,
+        inUse: inUse.has(c.id),
+      };
+    });
+  });
+
+  /**
+   * Is this connection part of the current posture's default lane? Cloud
+   * providers belong to every posture except Fully local; Ollama (a BYO local
+   * server) only to Fully local / Custom. An engine actually IN USE is always
+   * shown, so the active engine can never be hidden behind "Show all".
+   */
+  private relevant(id: string): boolean {
+    if (this.inUse().has(id)) return true;
+    const p = this.posture();
+    if (id === "ollama") return p === "fully_local" || p === "custom";
+    return p !== "fully_local";
+  }
+
+  /** On-this-Mac cards (loopback Ollama) inside the posture's lane, or all when expanded. */
+  readonly macCardsShown = computed(() =>
+    this.allCards().filter(
+      (c) => !c.cloud && (this.relevant(c.id) || this.showAll()),
+    ),
+  );
+
+  /** Cloud cards inside the posture's lane, or all when expanded. */
+  readonly cloudCardsShown = computed(() =>
+    this.allCards().filter(
+      (c) => c.cloud && (this.relevant(c.id) || this.showAll()),
+    ),
+  );
+
+  /** How many engines sit OUTSIDE the current posture's lane (0 → no toggle). */
+  readonly hiddenCount = computed(() => {
+    const hiddenConns = this.allCards().filter(
+      (c) => !this.relevant(c.id),
+    ).length;
+    const brainHidden = this.posture() === "cloud" && !this.brainInUse() ? 1 : 0;
+    return hiddenConns + brainHidden;
+  });
+
+  toggleShowAll(): void {
+    this.showAll.update((v) => !v);
   }
 
   toggleConfigure(id: string): void {
