@@ -31,18 +31,13 @@
     <key>com.apple.security.personal-information.calendars</key>
     <true/>
 
-    <!-- Keychain-access-groups — REQUIRED for the data-protection keychain (kSecUseDataProtectionKeychain
-         = true) that stores the biometric/Touch-ID-gated secrets (the per-folder master KEK + the
-         account MK cache). Without an access group, a Developer-ID app (no provisioning profile) has no
-         default DP-keychain group, so SecItemAdd/CopyMatching on those items fail with
-         errSecMissingEntitlement (-34018) — which broke folder lock ("Couldn't change this folder's
-         lock") and sharing ("Sharing is locked this session") on the notarized build. The value MUST
-         carry the Team-ID prefix; com.apple.application-identifier is NOT needed (that's App Store).
-         Does NOT affect the FILE-BASED keychain (the DB DEK via `keyring`) — a separate store that
-         never sees -34018. -->
-    <key>keychain-access-groups</key>
-    <array>
-      <string>BVF778E5QD.com.meetnotes.app</string>
-    </array>
+    <!-- NOTE (2026-07-05): do NOT add `keychain-access-groups` here. It is a RESTRICTED macOS
+         entitlement — it requires an embedded provisioning profile that authorizes the group, which a
+         Developer-ID app (signed with just the cert, no profile) does NOT have. Adding it produced a
+         signature the kernel refuses to launch ("Nie można otworzyć aplikacji Murmur" / silent AMFI
+         kill) even though codesign --verify + notarization both pass. The biometric/Touch-ID-gated
+         secrets (folder master KEK + account MK) that need the data-protection keychain must instead be
+         made to work WITHOUT this entitlement (file-based keychain + SecAccessControl, or an embedded
+         Developer-ID provisioning profile) — see the follow-up fix. -->
   </dict>
 </plist>
