@@ -31,12 +31,12 @@
     <key>com.apple.security.personal-information.calendars</key>
     <true/>
 
-    <!-- NOTE (2026-07-05): do NOT add keychain-access-groups here. It is a RESTRICTED macOS
-         entitlement that requires an embedded provisioning profile authorizing the group, which a
-         Developer-ID app (signed with just the cert, no profile) does not have. Adding it produced a
-         signature the kernel refuses to launch (silent AMFI kill) even though codesign verification and
-         Apple notarization both pass. The biometric/Touch-ID-gated secrets (folder master KEK + account
-         MK) that need the data-protection keychain must instead be made to work WITHOUT this entitlement
-         (file-based keychain + SecAccessControl, or an embedded Developer-ID provisioning profile). -->
+    <!-- NOTE (2026-07-05): this file is for the NESTED Resources/ helpers (meetnotes-*) — it must NOT
+         carry keychain-access-groups. That is a RESTRICTED entitlement: it needs an embedded
+         provisioning profile to authorize it, and the helpers have no profile, so signing them with it
+         would AMFI-kill them on launch. The MAIN Murmur.app gets keychain-access-groups (for the
+         data-protection keychain that holds the biometric master KEK + account MK) via the separate
+         entitlements-app.plist, paired with the embedded Developer-ID provisioning profile
+         (src-tauri/Murmur_Developer_ID.provisionprofile, embedded by scripts/macos-sign-notarize.sh). -->
   </dict>
 </plist>
