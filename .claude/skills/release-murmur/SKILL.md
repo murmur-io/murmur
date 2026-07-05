@@ -66,6 +66,12 @@ bash scripts/ci.sh                        # the full gate — must end "✅ CI: 
 
 Do not proceed unless CI is green.
 
+> **Also refresh the public copy before you ship.** Run **`/sync-release-copy`** now —
+> it checks the landing page (`landing/index.html`) and the GitHub repo description
+> against what the app actually does as of this release, and lands any needed edits
+> (landing via a PR that auto-deploys, description via `gh repo edit`). Skipping it
+> ships a release whose marketing describes an older app.
+
 ## Stage 1 — Pick the version
 
 ```bash

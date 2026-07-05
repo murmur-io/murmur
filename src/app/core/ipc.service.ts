@@ -52,6 +52,8 @@ import type {
   PinResult,
   PruneSummary,
   StorageReport,
+  SupersessionDto,
+  ApplyResult,
   UserMemory,
   VerifyFindingDto,
   ProviderStatus,
@@ -192,6 +194,27 @@ export class IpcService {
     findings: VerifyFindingDto[],
   ): Promise<NoteDto> {
     return invoke<NoteDto>("apply_note_verify_markers", { meetingId, findings });
+  }
+
+  /**
+   * Re-Truth — preview the facts a just-finished meeting SUPERSEDES from earlier
+   * notes (pending only; `applied` always false). Returns `[]` when nothing moved on.
+   */
+  previewSupersessions(meetingId: string): Promise<SupersessionDto[]> {
+    return invoke<SupersessionDto[]>("preview_supersessions", { meetingId });
+  }
+
+  /**
+   * Heal the vault: APPEND an Obsidian `[!superseded]` callout to each selected
+   * supersession's source note (append-only, reversible). Sealed sources are skipped.
+   */
+  applySupersessions(ids: string[]): Promise<ApplyResult> {
+    return invoke<ApplyResult>("apply_supersessions", { ids });
+  }
+
+  /** Undo a heal — remove the appended callouts, restoring the originals. */
+  undoSupersessions(ids: string[]): Promise<void> {
+    return invoke<void>("undo_supersessions", { ids });
   }
 
   getConfig(): Promise<AppConfigDto> {
@@ -1309,6 +1332,28 @@ export class IpcService {
   /** Permanently remove a folder's lock: decrypt to plaintext + re-export to the vault. */
   removeLock(folderId: string): Promise<void> {
     return invoke<void>("remove_lock", { folderId });
+  }
+
+  /**
+   * ESCAPE HATCH for a folder whose master key is genuinely unrecoverable: the backend FIRST
+   * proves no key can unwrap it (else it refuses with a "key was found — unlock normally" error),
+   * then discards ONLY that folder's UNRECOVERABLE sealed contents (never-sealed readable content is
+   * preserved) and reopens it. Destructive —
+   * the FE must confirm first. Returns the reopened FolderNode.
+   */
+  discardUnrecoverableFolderLock(folderId: string): Promise<FolderNode> {
+    return invoke<FolderNode>("discard_unrecoverable_folder_lock", { folderId });
+  }
+
+  /**
+   * Meeting-aware escape hatch (mirrors {@link unlockMeeting}): resolves the meeting's owning folder
+   * and discards its lock IF the key is unrecoverable. `null` when the meeting is at the vault root
+   * or its folder is already open. Refuses (rejects) if the folder is actually recoverable.
+   */
+  discardUnrecoverableMeetingLock(meetingId: string): Promise<FolderNode | null> {
+    return invoke<FolderNode | null>("discard_unrecoverable_meeting_lock", {
+      meetingId,
+    });
   }
 
   // ── Update check + product info (GitHub-release update flow) ────────────

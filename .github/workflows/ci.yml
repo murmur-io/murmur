@@ -12,8 +12,8 @@ name: CI
 #                  audio E2E (downloads the whisper model, brew-installs ffmpeg).
 #
 # To change WHAT CI enforces, edit `scripts/ci.sh` — never duplicate its command
-# list here (that is how the two drift). See .claude/skills/add-ci-gate.
-# Owned by the ci-cd-engineer agent (.claude/agents/ci-cd-engineer.md).
+# list here (that is how the two drift). See .agents/skills/add-ci-gate.
+# Owned by the ci-cd-engineer agent (.codex/agents/ci-cd-engineer.toml).
 #
 # NOTE ON HONESTY: real mic capture, live ScreenCaptureKit, Touch ID, lock-at-rest,
 # and notarization CANNOT run headless in CI — they need a signed build on a real

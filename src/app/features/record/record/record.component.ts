@@ -16,6 +16,7 @@ import type { Analytics, AppConfigDto } from "../../../core/models";
 import { MicMuteToggleComponent } from "../mic-mute-toggle/mic-mute-toggle.component";
 import { MeetingConversationComponent } from "../meeting-conversation/meeting-conversation.component";
 import { BrainRevealCardComponent } from "../brain-reveal-card/brain-reveal-card.component";
+import { ReTruthCardComponent } from "../re-truth-card/re-truth-card.component";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 
 @Component({
@@ -27,6 +28,7 @@ import { MeetingConversationStore } from "../../../core/meeting-conversation.sto
     MicMuteToggleComponent,
     MeetingConversationComponent,
     BrainRevealCardComponent,
+    ReTruthCardComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
   templateUrl: "./record.component.html",

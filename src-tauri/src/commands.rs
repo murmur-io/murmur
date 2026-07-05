@@ -2450,7 +2450,93 @@ fn persist_facts_for_meeting(
     // 4) Stamp the source meeting (gating + purge anchor) and apply atomically.
     crate::facts::set_meeting_id(&mut ops, meeting_id);
     state.db.apply_fact_ops(&ops)?;
+    // Re-Truth (the vault heals itself): capture SUPERSESSIONS — every Invalidate that closed a fact
+    // sourced in an OLDER meeting is recorded for one-tap review + stamping. BEST-EFFORT and NEVER
+    // fails the note: a hiccup is logged (non-PII: counts only) and swallowed, exactly like the facts
+    // hook that wraps this whole fn.
+    if let Err(e) = record_supersessions_for_meeting(state, meeting_id, &existing, &ops) {
+        tracing::warn!(target: "retruth", error = %e, "supersession capture failed (facts unaffected)");
+    }
     Ok(())
+}
+
+/// Re-Truth: derive + persist the supersessions for one reconcile batch (called after
+/// `apply_fact_ops`). Best-effort; returns `Ok` with nothing recorded when there are no cross-note
+/// supersessions. Non-PII log line (a count only).
+fn record_supersessions_for_meeting(
+    state: &AppState,
+    superseding_meeting_id: &str,
+    existing: &[crate::facts::Fact],
+    ops: &[crate::facts::FactOp],
+) -> Result<(), AppError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = build_supersession_rows(superseding_meeting_id, existing, ops, &now);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let recorded = state.db.record_supersessions(&rows)?;
+    if recorded > 0 {
+        tracing::info!(target: "retruth", recorded, "supersessions captured for review");
+    }
+    Ok(())
+}
+
+/// PURE (no DB, no clock — `now` injected): build the SUPERSESSION rows for one reconcile batch. For
+/// each `FactOp::Invalidate` (which closed an OLD fact), resolve that old fact in `existing`
+/// (entity/predicate/old_value + its source meeting) and the matching `FactOp::Add` (the new value
+/// that superseded it, same entity+subject+predicate key reconcile used). SKIPS: an Invalidate whose
+/// old fact is absent or has no source meeting, a self-supersession (the older fact came from the SAME
+/// meeting), or a change with no matching Add. Deterministic + headless-testable.
+fn build_supersession_rows(
+    superseding_meeting_id: &str,
+    existing: &[crate::facts::Fact],
+    ops: &[crate::facts::FactOp],
+    now: &str,
+) -> Vec<crate::storage::models::SupersessionRow> {
+    use crate::facts::FactOp;
+    let norm = |s: &str| s.trim().to_lowercase();
+    let mut out = Vec::new();
+    for op in ops {
+        let FactOp::Invalidate { id, .. } = op else {
+            continue;
+        };
+        let Some(old) = existing.iter().find(|f| &f.id == id) else {
+            continue;
+        };
+        let Some(source) = old.meeting_id.as_deref().filter(|m| !m.is_empty()) else {
+            continue; // legacy/unattributed old fact — no source note to stamp.
+        };
+        if source == superseding_meeting_id {
+            continue; // a meeting refining its own earlier fact is not a cross-note supersession.
+        }
+        // The new value is the Add op sharing the old fact's (entity_id, subject, predicate) key.
+        let Some(new_value) = ops.iter().find_map(|o| match o {
+            FactOp::Add(nf)
+                if nf.entity_id == old.entity_id
+                    && norm(&nf.subject) == norm(&old.subject)
+                    && norm(&nf.predicate) == norm(&old.predicate) =>
+            {
+                Some(nf.object.clone())
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        out.push(crate::storage::models::SupersessionRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            superseding_meeting_id: superseding_meeting_id.to_string(),
+            source_meeting_id: source.to_string(),
+            entity: old.subject.clone(),
+            predicate: old.predicate.clone(),
+            old_value: old.object.clone(),
+            new_value,
+            created_at: now.to_string(),
+            applied_at: None,
+            source_pre_image: None,
+            superseding_pre_image: None,
+        });
+    }
+    out
 }
 
 /// Phase 3 CROSS-MEETING USER MEMORY — extract → reconcile → apply USER-SCOPED facts for one
@@ -2522,6 +2608,414 @@ fn user_memory_enabled(state: &AppState) -> bool {
         .lock()
         .map(|c| c.user_memory_enabled)
         .unwrap_or(true)
+}
+
+// ── Re-Truth (the vault heals itself) — supersession review + one-tap stamp ──────────────────────
+
+/// One supersession surfaced for review (camelCase for the FE). `sourceNotePath` is the absolute
+/// on-disk `.md` the FE never shows (it shows `sourceNoteTitle`); `applied` reflects whether the
+/// row has already been stamped (always `false` from `preview_supersessions`, which returns the
+/// pending set).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupersessionDto {
+    pub id: String,
+    pub entity: String,
+    pub predicate: String,
+    pub old_value: String,
+    pub new_value: String,
+    pub source_note_title: String,
+    pub source_note_path: String,
+    pub source_meeting_id: String,
+    pub superseding_meeting_id: String,
+    /// The superseding note's title — `None` when that note is sealed (never leak a locked title).
+    pub superseding_note_title: Option<String>,
+    pub applied: bool,
+}
+
+/// Result of `apply_supersessions`: how many were stamped vs skipped because their source note sealed
+/// (or lost its vault file) between preview and apply (the prune↔seal TOCTOU discipline).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyResult {
+    pub applied: usize,
+    pub skipped_sealed: usize,
+}
+
+/// A source note is STAMPABLE iff it is BOTH session-unlocked (content-read gate) AND its folder is
+/// NOT locked-on-disk (write-safety gate). A sealed source's `.md` was deleted on seal and its facts
+/// must surface nothing, so the intersection excludes any locked-or-not-unlocked source — Re-Truth v1
+/// only ever touches OPEN-folder notes.
+fn source_is_stampable(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
+    Ok(meeting_is_unlocked(state, meeting_id)? && !folder_locked_on_disk(state, meeting_id)?)
+}
+
+/// Whether a meeting's folder is sealed ON DISK (disk-truth `locked`, NOT session unlock). Mirrors the
+/// `build_and_persist_entities` write gate: a meeting at the vault root (no folder) is never locked.
+fn folder_locked_on_disk(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
+    match state.db.folder_for_meeting(meeting_id)? {
+        Some(fid) => Ok(state
+            .db
+            .folder_by_id(&fid)?
+            .map(|f| f.locked)
+            .unwrap_or(false)),
+        None => Ok(false),
+    }
+}
+
+/// Resolve a meeting's on-disk note file: `(absolute .md path, file-stem title)` from the latest note
+/// row's `exported_path`. `None` when the meeting has no note or was never exported to the vault (so
+/// there is nothing to stamp). RAW read — callers gate on the meeting BEFORE exposing the result.
+fn note_file_for(state: &AppState, meeting_id: &str) -> Result<Option<(String, String)>, AppError> {
+    let note = match state.db.get_latest_note_for_meeting(meeting_id)? {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let path = match note.exported_path {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return Ok(None),
+    };
+    let stem = std::path::Path::new(&path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(Some((path, stem)))
+}
+
+/// Preview the PENDING supersessions whose superseding meeting is `meeting_id`. GATED: a row is
+/// included ONLY when its SOURCE meeting is stampable (open-on-disk + unlocked) AND has a vault `.md`;
+/// a sealed-or-unexported source contributes NOTHING. The superseding note's title is surfaced only
+/// when that note is itself unlocked. Returns `[]` when there are none.
+#[tauri::command]
+pub fn preview_supersessions(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<SupersessionDto>, AppError> {
+    preview_supersessions_inner(state.inner(), &meeting_id)
+}
+
+pub(crate) fn preview_supersessions_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<Vec<SupersessionDto>, AppError> {
+    let rows = state.db.unapplied_supersessions_for(meeting_id)?;
+    let mut out = Vec::new();
+    for r in rows {
+        // GATE the SOURCE note (content-read + write-safety). A sealed/not-unlocked source is dropped.
+        if !source_is_stampable(state, &r.source_meeting_id)? {
+            continue;
+        }
+        // GATE the SUPERSEDING side TOO — defense-in-depth. `new_value` is derived from the superseding
+        // meeting's fact, so a sealed-and-not-session-unlocked superseding meeting must surface NOTHING,
+        // even in the brief race window where `lock_folder` has flipped `locked=1` but not yet purged
+        // this row. Purge-on-seal normally removes it; this second-side gate closes the race regardless.
+        if !meeting_is_unlocked(state, &r.superseding_meeting_id)? {
+            continue;
+        }
+        let Some((path, stem)) = note_file_for(state, &r.source_meeting_id)? else {
+            continue; // no vault file → nothing to stamp/show.
+        };
+        // The superseding meeting is now known-unlocked, so its title is safe to surface (`None` only
+        // when it was never exported to the vault).
+        let superseding_note_title = note_file_for(state, &r.superseding_meeting_id)?.map(|(_, s)| s);
+        out.push(SupersessionDto {
+            id: r.id,
+            entity: r.entity,
+            predicate: r.predicate,
+            old_value: r.old_value,
+            new_value: r.new_value,
+            source_note_title: stem,
+            source_note_path: path,
+            source_meeting_id: r.source_meeting_id,
+            superseding_meeting_id: r.superseding_meeting_id,
+            superseding_note_title,
+            applied: r.applied_at.is_some(),
+        });
+    }
+    Ok(out)
+}
+
+/// APPLY the given supersessions: append a `[!superseded]` callout to each SOURCE note (and a mirror
+/// backlink to the superseding note, when it too is open). RE-GATES each row at apply time — a source
+/// that sealed since preview is SKIPPED (never stamped), the prune↔seal TOCTOU discipline. Snapshots
+/// each note's exact bytes into the row's pre-image BEFORE the (append-only) write, so `undo` restores
+/// them byte-identical. Idempotent: an already-applied row is a no-op, and the callout carries a
+/// stable marker so re-stamping never duplicates.
+#[tauri::command]
+pub fn apply_supersessions(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<ApplyResult, AppError> {
+    apply_supersessions_inner(state.inner(), &ids)
+}
+
+pub(crate) fn apply_supersessions_inner(
+    state: &AppState,
+    ids: &[String],
+) -> Result<ApplyResult, AppError> {
+    let mut applied = 0usize;
+    let mut skipped_sealed = 0usize;
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    // PER-BATCH PRISTINE CACHE, keyed by note FILE path. Multiple rows in ONE heal touch the SAME
+    // note — every row shares the superseding meeting's note, and two facts from one old note share a
+    // SOURCE note too. The undo pre-image for a file MUST be its PRE-BATCH ("pristine") content,
+    // captured the FIRST time this call touches that path — never the mid-batch, already-stamped
+    // bytes a later row would otherwise read. So all rows sharing a note carry IDENTICAL pristine
+    // pre-images and undo (restore-each-file-once) is order-independent + byte-identical for N≥2.
+    let mut pristine: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+
+    // PRE-PASS: seed the cache from any pre-images ALREADY durably stored by an earlier (crashed)
+    // attempt, keyed by note path — so a row that still has to capture its pre-image finds the
+    // pristine bytes here instead of re-reading a sibling-stamped file, regardless of the id order a
+    // retry arrives in (retry-safe AND order-independent).
+    for id in ids {
+        let Some(row) = state.db.get_supersession(id)? else {
+            continue;
+        };
+        if let Some(pre) = &row.source_pre_image {
+            if let Some((path, _)) = note_file_for(state, &row.source_meeting_id)? {
+                pristine.entry(path).or_insert_with(|| pre.clone());
+            }
+        }
+        if let Some(pre) = &row.superseding_pre_image {
+            if let Some((path, _)) = note_file_for(state, &row.superseding_meeting_id)? {
+                pristine.entry(path).or_insert_with(|| pre.clone());
+            }
+        }
+    }
+
+    for id in ids {
+        let Some(row) = state.db.get_supersession(id)? else {
+            continue; // unknown id — nothing to do.
+        };
+        if row.applied_at.is_some() {
+            continue; // already stamped — idempotent no-op.
+        }
+        // TOCTOU re-gate: the source folder may have sealed since preview. A now-sealed/not-unlocked
+        // (or unexported) source is SKIPPED, never stamped.
+        if !source_is_stampable(state, &row.source_meeting_id)? {
+            skipped_sealed += 1;
+            continue;
+        }
+        let Some((source_path, source_stem)) = note_file_for(state, &row.source_meeting_id)? else {
+            skipped_sealed += 1;
+            continue;
+        };
+
+        // The superseding note gets a backlink ONLY when it is itself open-on-disk + unlocked (never
+        // write into or reference a sealed note). Its stem feeds the source callout's `[[…]]` link.
+        let superseding_open = meeting_is_unlocked(state, &row.superseding_meeting_id)?
+            && !folder_locked_on_disk(state, &row.superseding_meeting_id)?;
+        let superseding_file = if superseding_open {
+            note_file_for(state, &row.superseding_meeting_id)?
+        } else {
+            None
+        };
+
+        // Resolve PRISTINE pre-images from the per-path cache (reads + UTF-8-validates each file on its
+        // first batch-touch; every later row sharing the path reuses the SAME pristine bytes).
+        let source_pre = pristine_note_bytes(&mut pristine, &source_path)?;
+        let superseding_pre = match &superseding_file {
+            Some((p, _)) => Some(pristine_note_bytes(&mut pristine, p)?),
+            None => None,
+        };
+
+        // DURABLE-BEFORE-WRITE: persist the pristine pre-images BEFORE any `.md` write, so a crash
+        // between write and mark-applied still leaves a recoverable un-stamped pre-image. `COALESCE`
+        // never clobbers an already-stored pristine backup and, combined with the pristine cache, the
+        // stored bytes are NEVER a re-snapshot of a stamped file.
+        state
+            .db
+            .store_supersession_pre_images(id, Some(&source_pre), superseding_pre.as_deref())?;
+
+        // Stamp the SOURCE note: append the callout to the CURRENT on-disk content (idempotent — a
+        // retry over an already-stamped file is a no-op). The undo pre-image is the pristine cache
+        // copy, never these current bytes.
+        let current_source = std::fs::read_to_string(&source_path)
+            .map_err(|e| AppError::Export(format!("read source note failed: {e}")))?;
+        let new_source = crate::export::obsidian::append_supersession_callout(
+            &current_source,
+            &date,
+            &row.predicate,
+            &row.old_value,
+            &row.new_value,
+            superseding_file.as_ref().map(|(_, s)| s.as_str()),
+        );
+        crate::export::obsidian::overwrite_note(std::path::Path::new(&source_path), &new_source)?;
+
+        // Stamp the SUPERSEDING backlink (its pristine pre-image is now durably stored). Append to its
+        // CURRENT content (idempotent).
+        if let Some((sup_path, _)) = &superseding_file {
+            let current_sup = std::fs::read_to_string(sup_path)
+                .map_err(|e| AppError::Export(format!("read superseding note failed: {e}")))?;
+            let new_sup = crate::export::obsidian::append_supersedes_callout(
+                &current_sup,
+                &date,
+                &row.predicate,
+                &row.old_value,
+                &row.new_value,
+                &source_stem,
+            );
+            crate::export::obsidian::overwrite_note(std::path::Path::new(sup_path), &new_sup)?;
+        }
+
+        // APPLIED is the LAST write — flipped only after the note(s) are safely stamped.
+        state
+            .db
+            .mark_supersession_applied(id, &chrono::Utc::now().to_rfc3339())?;
+        applied += 1;
+    }
+    tracing::info!(target: "retruth", applied, skipped_sealed, "supersessions applied");
+    Ok(ApplyResult {
+        applied,
+        skipped_sealed,
+    })
+}
+
+/// Resolve the PRISTINE (pre-batch) bytes of a note file from the per-apply-call cache: on the first
+/// touch of a path this batch, read + UTF-8-validate the file and cache it; every later touch reuses
+/// the cached bytes. This is what makes all rows sharing a note carry identical pristine pre-images
+/// (so a multi-row undo restores each file once, byte-identical). Refusing a non-UTF-8 file here —
+/// before any write — keeps the stamp all-or-nothing.
+fn pristine_note_bytes(
+    cache: &mut std::collections::HashMap<String, Vec<u8>>,
+    path: &str,
+) -> Result<Vec<u8>, AppError> {
+    if let Some(b) = cache.get(path) {
+        return Ok(b.clone());
+    }
+    let bytes =
+        std::fs::read(path).map_err(|e| AppError::Export(format!("read note failed: {e}")))?;
+    String::from_utf8(bytes.clone())
+        .map_err(|_| AppError::Export("note is not valid UTF-8".into()))?;
+    cache.insert(path.to_string(), bytes.clone());
+    Ok(bytes)
+}
+
+/// UNDO the given applied supersessions: restore each stamped note's byte-exact pre-image (atomic
+/// overwrite) and clear the row's applied state + pre-images. A row that isn't applied is a no-op. A
+/// note whose folder sealed since apply is SKIPPED (never re-materialize plaintext into a locked
+/// folder) — the sealed content will return WITH the stamp on unlock.
+#[tauri::command]
+pub fn undo_supersessions(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), AppError> {
+    undo_supersessions_inner(state.inner(), &ids)
+}
+
+pub(crate) fn undo_supersessions_inner(state: &AppState, ids: &[String]) -> Result<(), AppError> {
+    let undo_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+
+    // Collect the DISTINCT affected note files touched by the UNDO SET (`path -> (meeting_id,
+    // pristine pre-image)`). All rows in one heal sharing a note carry IDENTICAL pristine pre-images
+    // (see apply's per-path cache), and `path ↔ meeting` is 1:1. Only files whose folder is still
+    // OPEN are collected/rewritten (never re-materialize plaintext into a sealed folder — a sealed
+    // note's stamp rides inside its sealed content already; and purge-on-seal has already dropped any
+    // supersession referencing a sealed meeting).
+    let mut affected: std::collections::HashMap<String, (String, Vec<u8>)> =
+        std::collections::HashMap::new();
+    let mut to_clear: Vec<&String> = Vec::new();
+    for id in ids {
+        let Some(row) = state.db.get_supersession(id)? else {
+            continue;
+        };
+        if row.applied_at.is_none() {
+            continue; // nothing applied to undo.
+        }
+        if let Some(pre) = &row.source_pre_image {
+            if !folder_locked_on_disk(state, &row.source_meeting_id)? {
+                if let Some((path, _)) = note_file_for(state, &row.source_meeting_id)? {
+                    affected
+                        .entry(path)
+                        .or_insert_with(|| (row.source_meeting_id.clone(), pre.clone()));
+                }
+            }
+        }
+        if let Some(pre) = &row.superseding_pre_image {
+            if !folder_locked_on_disk(state, &row.superseding_meeting_id)? {
+                if let Some((path, _)) = note_file_for(state, &row.superseding_meeting_id)? {
+                    affected
+                        .entry(path)
+                        .or_insert_with(|| (row.superseding_meeting_id.clone(), pre.clone()));
+                }
+            }
+        }
+        to_clear.push(id);
+    }
+
+    // For each affected file: rebuild it as pristine + the stamps of every SURVIVOR — a supersession
+    // that touches THIS note's meeting, is NOT in the undo set, and remains applied. Because the
+    // callout appends are idempotent + order-independent across distinct supersessions, replaying the
+    // survivors reconstructs the exact on-disk state that matches the DB. A FULL undo (no survivors)
+    // collapses to a plain pristine restore. This closes the partial-undo desync where restoring a
+    // shared file to pristine silently stripped a still-applied sibling's on-disk stamp.
+    for (path, (meeting_id, pristine)) in &affected {
+        let mut text = String::from_utf8(pristine.clone())
+            .map_err(|_| AppError::Export("stored pre-image is not valid UTF-8".into()))?;
+        for s in state.db.supersessions_touching_meeting(meeting_id)? {
+            if undo_set.contains(s.id.as_str()) || s.applied_at.is_none() {
+                continue; // being undone, or not currently applied → no stamp to replay.
+            }
+            // Reproduce this survivor's stamp with its ORIGINAL date (the day it was applied) so the
+            // replay byte-matches the original append.
+            let date = s
+                .applied_at
+                .as_deref()
+                .and_then(|a| a.split('T').next())
+                .unwrap_or("")
+                .to_string();
+            if &s.source_meeting_id == meeting_id {
+                // This file is the SURVIVOR's SOURCE note → re-append its `[!superseded]` callout,
+                // reproducing the `· see [[…]]` link exactly as apply did (open superseding only).
+                let sup_stem = superseding_link_stem(state, &s)?;
+                text = crate::export::obsidian::append_supersession_callout(
+                    &text,
+                    &date,
+                    &s.predicate,
+                    &s.old_value,
+                    &s.new_value,
+                    sup_stem.as_deref(),
+                );
+            }
+            if &s.superseding_meeting_id == meeting_id {
+                // This file is the SURVIVOR's SUPERSEDING note → re-append its `[!supersedes]`
+                // backlink referencing the survivor's SOURCE stem.
+                if let Some((_, src_stem)) = note_file_for(state, &s.source_meeting_id)? {
+                    text = crate::export::obsidian::append_supersedes_callout(
+                        &text,
+                        &date,
+                        &s.predicate,
+                        &s.old_value,
+                        &s.new_value,
+                        &src_stem,
+                    );
+                }
+            }
+        }
+        crate::export::obsidian::overwrite_note(std::path::Path::new(path), &text)?;
+    }
+
+    // Clear the applied state on the undone rows ONLY (pre-images dropped); survivors stay applied.
+    for id in to_clear {
+        state.db.clear_supersession_applied(id)?;
+    }
+    Ok(())
+}
+
+/// The `· see [[stem]]` link stem for a supersession's SOURCE-side callout: the superseding note's
+/// file-stem when that note is open-on-disk + unlocked (exactly the apply-time condition), else
+/// `None` (never leak a sealed meeting's title). Mirrors the apply path so a survivor replay
+/// reproduces the original callout.
+fn superseding_link_stem(
+    state: &AppState,
+    s: &crate::storage::models::SupersessionRow,
+) -> Result<Option<String>, AppError> {
+    let open = meeting_is_unlocked(state, &s.superseding_meeting_id)?
+        && !folder_locked_on_disk(state, &s.superseding_meeting_id)?;
+    if !open {
+        return Ok(None);
+    }
+    Ok(note_file_for(state, &s.superseding_meeting_id)?.map(|(_, stem)| stem))
 }
 
 /// Read the meeting's OWN @brain THREAD TURNS for user-fact extraction (design spec D5), GATED by the
@@ -7033,6 +7527,120 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     Ok(())
 }
 
+/// `discard_unrecoverable_folder_lock(folder_id) -> FolderNode` — the ESCAPE HATCH for a folder whose
+/// master KEK is GENUINELY gone (keychain wiped, Mac migrated without the login keychain, or the KEK
+/// item truly deleted — e.g. the 2026-07-05 pre-0.7.4 delete-and-replace destroyed the original).
+/// Such a folder is otherwise permanently bricked: it cannot be unlocked, its lock cannot be removed,
+/// and its content is undecryptable.
+///
+/// SAFETY (the whole point): this PROVES non-recoverability before destroying anything, via a STRICT
+/// candidate enumeration (session-cached KEK, then every keychain candidate) against this folder's
+/// wrapped content key. If ANY candidate unwraps it, the folder is RECOVERABLE and this command
+/// REFUSES (routing the user to a normal unlock). A biometric cancel / transient keychain error /
+/// any failure to COMPLETE the enumeration also aborts — an absence that could not be authoritatively
+/// established is never treated as proof. ONLY a completed enumeration that unwraps nothing lets it
+/// discard — and even then it discards ONLY the UNRECOVERABLE SEALED payload: a never-sealed buffer
+/// (readable plaintext with a NULL blob) is PRESERVED (`Db::discard_folder_seal`).
+#[tauri::command]
+pub async fn discard_unrecoverable_folder_lock(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<FolderNode, AppError> {
+    discard_unrecoverable_folder_lock_inner(state.inner(), folder_id).await
+}
+
+pub(crate) async fn discard_unrecoverable_folder_lock_inner(
+    state: &AppState,
+    folder_id: String,
+) -> Result<FolderNode, AppError> {
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if !folder.locked {
+        return Err(AppError::InvalidArg("folder is not locked".into()));
+    }
+    let wrapped = state
+        .db
+        .folder_wrapped_key(&folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+
+    let aad = aad_wrapped_ck(&folder_id);
+    let recoverable = "this folder's key was found — unlock it normally instead of discarding (its content is intact)";
+
+    // ── SAFETY GATE: prove UNRECOVERABLE before destroying anything ──────────────────────────────
+    // The discard may proceed ONLY when we have AFFIRMATIVELY established that no key can unwrap this
+    // folder. Any inability to COMPLETE that proof — a cancelled/failed Touch ID, a transient
+    // keychain fault — MUST abort (never wipe a folder whose key we simply could not read).
+    //
+    // 1. session-cached KEK (possibly a key recovered earlier this session).
+    let cached: Option<Zeroizing<[u8; 32]>> = {
+        let g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        g.clone()
+    };
+    if let Some(k) = &cached {
+        if crate::crypto::decrypt(k, &wrapped, &aad).is_ok() {
+            return Err(AppError::InvalidArg(recoverable.into()));
+        }
+    }
+    // 2. STRICT enumeration of EVERY keychain candidate (`kSecMatchLimitAll`, one Touch ID —
+    //    a superset of the single primary read). Unlike the lenient recovery enumeration, this
+    //    PROPAGATES a read/enumeration failure via `??`: a cancelled Touch ID or a transient fault
+    //    aborts the discard here, and is NEVER mistaken for "the keychain holds no key". Only a
+    //    successfully-completed enumeration that returns NO unwrapping candidate proves the folder
+    //    unrecoverable (2026-07-05 lock-security finding — the previous lenient enumeration could
+    //    swallow a cancelled second Touch ID and wrongly wipe a recoverable folder).
+    let enumeration = tokio::task::spawn_blocking(|| {
+        crate::secrets::list_master_kek_candidates_strict(
+            "Confirm this folder's key is unrecoverable",
+        )
+    })
+    .await
+    .map_err(|e| AppError::Auth(format!("kek-enumeration task join failed: {e}")))?;
+    if !discard_proof_complete(enumeration, &wrapped, &folder_id)? {
+        return Err(AppError::InvalidArg(recoverable.into()));
+    }
+
+    // ── PROVEN unrecoverable → discard THIS folder's sealed payload ──────────────────────────────
+    // Serialize with the rest of the lock state machine (acquired AFTER the awaits above so the guard
+    // never crosses a suspend point).
+    let _lifecycle = lifecycle_guard(state);
+    // `discard_folder_seal` returns ONLY the SEALED `.enc` audio paths (a never-sealed plaintext WAV
+    // is readable content and is preserved, both on disk and in the DB). Best-effort unlink each.
+    let enc_paths = state.db.discard_folder_seal(&folder_id)?;
+    let enc_count = enc_paths.len();
+    for p in &enc_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    {
+        let mut g = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+        g.remove(&folder_id);
+    }
+    tracing::warn!(
+        target: "lock",
+        folder = %folder_id,
+        sealed_audio = enc_count,
+        "discard_unrecoverable_folder_lock: key proven unrecoverable — discarded the sealed payload and reopened the folder (never-sealed plaintext preserved)"
+    );
+
+    let counts = state.db.count_notes_per_folder()?;
+    Ok(FolderNode {
+        id: folder.id.clone(),
+        name: folder.name.clone(),
+        parent_id: folder.parent_id.clone(),
+        note_count: counts.get(&folder.id).copied().unwrap_or(0),
+        locked: false,
+        unlocked: false,
+        children: Vec::new(),
+    })
+}
+
 /// Rename a folder: change its display `name` (and the matching vault subdirectory + every governed
 /// `path`) without ever touching sealed content.
 ///
@@ -7378,6 +7986,31 @@ pub async fn unlock_meeting(
     unlock_folder(state, folder_id).await.map(Some)
 }
 
+/// `discard_unrecoverable_meeting_lock(meeting_id) -> Option<FolderNode>` — the meeting-aware entry to
+/// the escape hatch (mirrors `unlock_meeting`): resolves the meeting's owning folder and, if it is
+/// locked, runs `discard_unrecoverable_folder_lock` on it (which PROVES non-recoverability and
+/// REFUSES if the folder is actually recoverable). `None` when the meeting is at the vault root or the
+/// folder is already open.
+#[tauri::command]
+pub async fn discard_unrecoverable_meeting_lock(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Option<FolderNode>, AppError> {
+    let Some(folder_id) = state.db.folder_for_meeting(&meeting_id)? else {
+        return Ok(None);
+    };
+    let folder = state
+        .db
+        .folder_by_id(&folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if !folder.locked {
+        return Ok(None);
+    }
+    discard_unrecoverable_folder_lock_inner(state.inner(), folder_id)
+        .await
+        .map(Some)
+}
+
 // ── Phase 0.5 full per-folder lock: transcript + timeline + audio seal helpers ──
 //
 // The note markdown was already sealed (encrypt→content_blob, blank plaintext). These helpers
@@ -7418,6 +8051,21 @@ fn aad_wrapped_ck(folder_id: &str) -> Vec<u8> {
 /// testable without a keychain. Rationale: on machines where the no-UI keychain probe lies,
 /// several KEK generations coexist under the same account and only ONE of them sealed this folder
 /// (2026-07-05 field incident).
+/// The discard SAFETY DECISION, factored out PURE so the "an enumeration failure must ABORT — never
+/// be read as proof of absence" invariant is unit-testable WITHOUT a keychain. Returns:
+/// - `Err(e)` — the candidate enumeration itself FAILED (`enumeration` was `Err`): the discard cannot
+///   prove the folder unrecoverable, so it must abort (never wipe on an unproven absence).
+/// - `Ok(false)` — a candidate DOES unwrap the folder's wrapped CK ⇒ RECOVERABLE ⇒ refuse to discard.
+/// - `Ok(true)` — the enumeration completed and NO candidate unwraps ⇒ provably unrecoverable ⇒ safe.
+fn discard_proof_complete(
+    enumeration: Result<Zeroizing<Vec<[u8; 32]>>, AppError>,
+    wrapped: &[u8],
+    folder_id: &str,
+) -> Result<bool, AppError> {
+    let candidates = enumeration?;
+    Ok(try_unwrap_ck_with_candidates(&candidates, wrapped, folder_id, None).is_none())
+}
+
 fn try_unwrap_ck_with_candidates(
     candidates: &[[u8; 32]],
     wrapped: &[u8],
@@ -10527,6 +11175,49 @@ mod lifecycle_tests {
         assert_eq!(*winner2, kek_old);
     }
 
+    /// THE 2026-07-05 lock-security regression: a discard must ABORT (not wipe) when the candidate
+    /// enumeration itself FAILED — a cancelled/failed Touch ID or a transient keychain fault must
+    /// never be read as "no key exists". `discard_proof_complete` is the pure decision seam; here we
+    /// drive it directly (the real enumeration can't fail on the dev keychain path).
+    #[test]
+    fn discard_aborts_when_candidate_enumeration_fails() {
+        let kek = [0x11u8; 32];
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, &aad_wrapped_ck("f-x")).unwrap();
+
+        // Enumeration FAILED (e.g. cancelled Touch ID) → MUST propagate as Err (abort the discard),
+        // NEVER conclude unrecoverable — even though, with an empty set, `try_unwrap` would say "none".
+        let failed: Result<Zeroizing<Vec<[u8; 32]>>, AppError> =
+            Err(AppError::BiometricFailed("Touch ID was cancelled".into()));
+        assert!(
+            discard_proof_complete(failed, &wrapped, "f-x").is_err(),
+            "a failed enumeration must ABORT the discard, never prove absence"
+        );
+
+        // Enumeration COMPLETED with a candidate that unwraps → recoverable → refuse (Ok(false)).
+        let recoverable: Result<Zeroizing<Vec<[u8; 32]>>, AppError> =
+            Ok(Zeroizing::new(vec![kek]));
+        assert!(
+            !discard_proof_complete(recoverable, &wrapped, "f-x").unwrap(),
+            "a completed enumeration with a matching candidate is RECOVERABLE (refuse)"
+        );
+
+        // Enumeration COMPLETED with only a wrong key → provably unrecoverable → safe (Ok(true)).
+        let unrecoverable: Result<Zeroizing<Vec<[u8; 32]>>, AppError> =
+            Ok(Zeroizing::new(vec![[0x99u8; 32]]));
+        assert!(
+            discard_proof_complete(unrecoverable, &wrapped, "f-x").unwrap(),
+            "a completed enumeration with no matching candidate is provably unrecoverable"
+        );
+
+        // Enumeration COMPLETED empty (keychain genuinely wiped) → provably unrecoverable → safe.
+        let empty: Result<Zeroizing<Vec<[u8; 32]>>, AppError> = Ok(Zeroizing::new(vec![]));
+        assert!(
+            discard_proof_complete(empty, &wrapped, "f-x").unwrap(),
+            "an authoritatively-empty enumeration is provably unrecoverable"
+        );
+    }
+
     /// `any_locked_folder` (the mint-guard input) flips with seal state.
     #[test]
     fn any_locked_folder_reflects_seal_state() {
@@ -12020,6 +12711,133 @@ mod lifecycle_tests {
     /// cycle — SEALED under the folder CK (plaintext blanked, blob present) on lock, RESTORED
     /// byte-identical on unlock. Drives the PRODUCTION seal (`lock_folder_inner` →
     /// `seal_meeting_extras`) and unseal (`unseal_folder_extras`), so the typed notes are never
+    /// ESCAPE-HATCH SAFETY GATE (0.7.5): `discard_unrecoverable_folder_lock` MUST REFUSE a folder
+    /// whose key is still available — discarding a RECOVERABLE folder would be gratuitous data loss.
+    /// This is the RED-before-GREEN guard: delete the safety gate and this test fails (the folder
+    /// gets wiped). Here the folder is sealed under the (dev) master KEK, so the recovery ladder
+    /// finds it → discard must refuse and leave the sealed content intact.
+    #[test]
+    fn discard_refuses_a_recoverable_folder() {
+        let state = build_state("discard-refuses-recoverable");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# recoverable note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        // Sealed: the note carries a content_blob.
+        assert!(
+            state.db.notes_in_folder("f-lock").unwrap()[0]
+                .content_blob
+                .is_some(),
+            "precondition: folder is sealed"
+        );
+
+        let err = block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a RECOVERABLE folder must be refused (route to normal unlock), got: {err:?}"
+        );
+        // Nothing destroyed: still locked, blob intact.
+        assert!(
+            state.db.folder_by_id("f-lock").unwrap().unwrap().locked,
+            "the folder must STAY locked when discard is refused"
+        );
+        assert!(
+            state.db.notes_in_folder("f-lock").unwrap()[0]
+                .content_blob
+                .is_some(),
+            "the sealed content must be untouched when discard is refused"
+        );
+    }
+
+    /// The escape hatch itself: a folder whose key is GENUINELY unrecoverable (sealed under a foreign
+    /// KEK no candidate holds) is discarded — blobs cleared, folder reopened — so the user is no
+    /// longer permanently bricked out of it.
+    #[test]
+    fn discard_clears_an_unrecoverable_folder() {
+        let state = build_state("discard-clears-unrecoverable");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# lost note", Some("f-lock"));
+        // Seal normally (real content_blob under the dev KEK's CK)…
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        // …then REPLACE the wrapped key with one wrapped under a FOREIGN KEK the recovery ladder can
+        // never hold — simulating a keychain wipe / Mac migration where the real KEK is gone.
+        let foreign_kek = [0x42u8; 32];
+        let foreign_ck = [0x24u8; 32];
+        let foreign_wrapped =
+            crate::crypto::encrypt(&foreign_kek, &foreign_ck, &aad_wrapped_ck("f-lock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
+            .unwrap();
+
+        let node = block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .expect("an unrecoverable folder must be discardable");
+        assert!(!node.locked, "the folder reopens (locked=false)");
+        // The folder is open on disk and its sealed payload is gone.
+        assert!(
+            !state.db.folder_by_id("f-lock").unwrap().unwrap().locked,
+            "folder flipped open in the DB"
+        );
+        assert!(
+            state.db.folder_wrapped_key("f-lock").unwrap().is_none(),
+            "the (useless) wrapped key is cleared"
+        );
+        let notes = state.db.notes_in_folder("f-lock").unwrap();
+        assert!(
+            notes.iter().all(|n| n.content_blob.is_none()),
+            "the undecryptable sealed blobs are discarded"
+        );
+    }
+
+    /// PRESERVE-NEVER-SEALED (2026-07-05 lock-security finding): discard must destroy only the
+    /// UNRECOVERABLE SEALED payload — a never-sealed buffer (plaintext with a NULL blob, e.g. typed
+    /// during a session-unlock) is the ONLY copy and readable once the folder reopens, so it MUST
+    /// survive. RED-before-GREEN: the prior unconditional `markdown=''` blanked it.
+    #[test]
+    fn discard_preserves_never_sealed_content() {
+        let state = build_state("discard-preserve-never-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# sealed note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap(); // seals m1 (blob set, plaintext '')
+
+        // A buffer added into the folder AFTER the seal (as if typed during a later session-unlock):
+        // its note plaintext is the ONLY copy, content_blob stays NULL (never sealed).
+        seed_meeting(&state.db, "m2", "NEVER SEALED — the only copy", Some("f-lock"));
+
+        // Make the folder unrecoverable (foreign wrapped key no candidate holds).
+        let foreign_wrapped =
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
+            .unwrap();
+
+        block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .unwrap();
+
+        let notes = state.db.notes_in_folder("f-lock").unwrap();
+        let m1 = notes.iter().find(|n| n.meeting_id == "m1").unwrap();
+        let m2 = notes.iter().find(|n| n.meeting_id == "m2").unwrap();
+        assert_eq!(
+            m1.markdown, "",
+            "the SEALED note's plaintext is gone (its key was lost) and its blob dropped"
+        );
+        assert!(m1.content_blob.is_none(), "sealed blob dropped");
+        assert_eq!(
+            m2.markdown, "NEVER SEALED — the only copy",
+            "the NEVER-SEALED note's only readable copy MUST be preserved, not wiped"
+        );
+    }
+
     /// blanked-and-lost. RED on the prior blank-on-seal code (no blob → nothing to restore).
     #[test]
     fn manual_notes_survive_lock_unlock_cycle_sealed_and_restored() {
@@ -14352,6 +15170,659 @@ mod lifecycle_tests {
         assert!(st.recording);
         assert_eq!(st.meeting_id.as_deref(), Some("no-such-meeting"));
         assert_eq!(st.started_at, None);
+    }
+
+    // ── Re-Truth (the vault heals itself): supersession capture + preview gate + apply/undo ──────
+
+    use crate::facts::{Fact, FactOp, NewFact};
+    use crate::storage::models::SupersessionRow;
+
+    fn a_fact(id: &str, subject: &str, predicate: &str, object: &str, meeting: &str) -> Fact {
+        Fact {
+            id: id.to_string(),
+            entity_id: "atlas".to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: "2026-06-01T00:00:00Z".to_string(),
+            valid_to: None,
+            recorded_at: "2026-06-01T00:00:00Z".to_string(),
+            meeting_id: Some(meeting.to_string()),
+            confidence: 1.0,
+        }
+    }
+
+    fn an_add(subject: &str, predicate: &str, object: &str, meeting: &str) -> FactOp {
+        FactOp::Add(NewFact {
+            entity_id: "atlas".to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: "2026-06-20T00:00:00Z".to_string(),
+            recorded_at: "2026-06-20T00:00:00Z".to_string(),
+            confidence: 1.0,
+            meeting_id: Some(meeting.to_string()),
+        })
+    }
+
+    /// PURE: an Invalidate closing an M1-sourced fact + the matching Add produces EXACTLY one
+    /// supersession citing M1, with the old/new values. A NoOp/Add-only batch (nothing invalidated)
+    /// produces none; a self-supersession (older fact from the SAME meeting) produces none.
+    #[test]
+    fn build_supersession_rows_captures_cross_note_change_only() {
+        let existing = vec![a_fact("f1", "Atlas", "status", "in-progress", "m1")];
+        let ops = vec![
+            FactOp::Invalidate {
+                id: "f1".to_string(),
+                valid_to: "2026-06-20T00:00:00Z".to_string(),
+            },
+            an_add("Atlas", "status", "shipped", "m2"),
+        ];
+        let rows = build_supersession_rows("m2", &existing, &ops, "2026-06-20T00:00:00Z");
+        assert_eq!(rows.len(), 1, "one cross-note supersession");
+        assert_eq!(rows[0].source_meeting_id, "m1");
+        assert_eq!(rows[0].superseding_meeting_id, "m2");
+        assert_eq!(rows[0].entity, "Atlas");
+        assert_eq!(rows[0].predicate, "status");
+        assert_eq!(rows[0].old_value, "in-progress");
+        assert_eq!(rows[0].new_value, "shipped");
+        assert!(rows[0].applied_at.is_none());
+
+        // A NoOp/Add-only batch invalidates nothing → no supersession.
+        let none = build_supersession_rows(
+            "m2",
+            &existing,
+            &[FactOp::NoOp, an_add("Atlas", "owner", "Anna", "m2")],
+            "2026-06-20T00:00:00Z",
+        );
+        assert!(none.is_empty(), "nothing invalidated → no supersession");
+
+        // A self-supersession (the old fact came from the SAME meeting) is skipped.
+        let self_only = vec![a_fact("f1", "Atlas", "status", "in-progress", "m2")];
+        let self_rows = build_supersession_rows(
+            "m2",
+            &self_only,
+            &[
+                FactOp::Invalidate {
+                    id: "f1".to_string(),
+                    valid_to: "2026-06-20T00:00:00Z".to_string(),
+                },
+                an_add("Atlas", "status", "shipped", "m2"),
+            ],
+            "2026-06-20T00:00:00Z",
+        );
+        assert!(self_rows.is_empty(), "same-meeting refinement is not a cross-note supersession");
+    }
+
+    /// Seed a summarized meeting in a folder, its note pointing at an on-disk `.md` (or a DB-only path
+    /// when `md_bytes` is `None`). Returns the on-disk path.
+    fn seed_note_on_disk(
+        state: &AppState,
+        vault: &std::path::Path,
+        mid: &str,
+        folder_id: &str,
+        folder_name: &str,
+        filename: &str,
+        md_bytes: Option<&str>,
+    ) -> std::path::PathBuf {
+        seed_meeting(&state.db, mid, md_bytes.unwrap_or("# note"), Some(folder_id));
+        state.db.set_note_folder(mid, Some(folder_id)).unwrap();
+        let dir = vault.join(folder_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(filename);
+        if let Some(bytes) = md_bytes {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        state
+            .db
+            .set_note_exported_path(mid, "claude_code", &path.to_string_lossy())
+            .unwrap();
+        path
+    }
+
+    /// GATE: `preview_supersessions` EXCLUDES a supersession whose SOURCE meeting is sealed — and a
+    /// mere SESSION-unlock does not re-open it for stamping (its `.md` was deleted on seal; v1 only
+    /// touches open-on-disk notes).
+    #[test]
+    fn preview_supersessions_excludes_sealed_source() {
+        let vault = tmp_vault("retruth-gate");
+        let state = build_state_with_vault("retruth-gate", &vault);
+        make_open_folder(&state.db, "f-src", "Work");
+        seed_note_on_disk(&state, &vault, "m1", "f-src", "Work", "kickoff.md", Some("# Kickoff\n"));
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_note_on_disk(&state, &vault, "m2", "f-new", "Reviews", "review.md", Some("# Review\n"));
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Both folders open → surfaced.
+        assert_eq!(preview_supersessions_inner(&state, "m2").unwrap().len(), 1);
+
+        // Seal the SOURCE folder → excluded.
+        state
+            .db
+            .set_folder_locked("f-src", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            preview_supersessions_inner(&state, "m2").unwrap().is_empty(),
+            "a sealed source contributes nothing"
+        );
+
+        // Session-unlock the source folder → STILL excluded (no .md on disk after seal; v1 is
+        // open-on-disk only).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-src".to_string());
+        assert!(
+            preview_supersessions_inner(&state, "m2").unwrap().is_empty(),
+            "session-unlock does not re-open a sealed source for stamping"
+        );
+    }
+
+    /// APPLY appends the callout to both notes; UNDO restores both BYTE-IDENTICAL (the append-only
+    /// verify-before-destroy analogue). Also asserts APPEND-ONLY (original bytes are an untouched
+    /// prefix) and IDEMPOTENCE (a second apply is a no-op — no double stamp).
+    #[test]
+    fn apply_then_undo_round_trips_notes_byte_identical() {
+        let vault = tmp_vault("retruth-apply");
+        let state = build_state_with_vault("retruth-apply", &vault);
+
+        let src_original = "---\ntitle: Kickoff\n---\n# Kickoff\n\nAtlas is in progress.\n";
+        let sup_original = "---\ntitle: Launch review\n---\n# Launch review\n";
+        make_open_folder(&state.db, "f-src", "Work");
+        let src_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "2026-06-01 0900 - Kickoff.md",
+            Some(src_original),
+        );
+        make_open_folder(&state.db, "f-new", "Reviews");
+        let sup_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "2026-06-20 1000 - Launch review.md",
+            Some(sup_original),
+        );
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Preview surfaces titles.
+        let preview = preview_supersessions_inner(&state, "m2").unwrap();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].source_note_title, "2026-06-01 0900 - Kickoff");
+        assert_eq!(
+            preview[0].superseding_note_title.as_deref(),
+            Some("2026-06-20 1000 - Launch review")
+        );
+
+        let src_before = std::fs::read(&src_md).unwrap();
+        let sup_before = std::fs::read(&sup_md).unwrap();
+
+        // APPLY.
+        let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res.applied, 1);
+        assert_eq!(res.skipped_sealed, 0);
+
+        let src_after = std::fs::read_to_string(&src_md).unwrap();
+        assert!(src_after.contains("## Re-Truth updates"), "section: {src_after}");
+        assert!(
+            src_after.contains(
+                "> **status** — in-progress → shipped · see [[2026-06-20 1000 - Launch review]]"
+            ),
+            "source callout: {src_after}"
+        );
+        assert!(
+            src_after.as_bytes().starts_with(&src_before),
+            "append-only: original bytes are an untouched prefix"
+        );
+        let sup_after = std::fs::read_to_string(&sup_md).unwrap();
+        assert!(
+            sup_after.contains("supersedes in-progress → shipped in [[2026-06-01 0900 - Kickoff]]"),
+            "superseding backlink: {sup_after}"
+        );
+
+        // IDEMPOTENT: a second apply is a no-op (row already applied), no double stamp.
+        let res2 = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res2.applied, 0, "already-applied row is not re-stamped");
+        assert_eq!(
+            std::fs::read_to_string(&src_md).unwrap().matches("> **status** — in-progress → shipped").count(),
+            1,
+            "no duplicate callout body"
+        );
+
+        // UNDO restores BOTH notes byte-identical.
+        undo_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read(&src_md).unwrap(),
+            src_before,
+            "source note restored byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(&sup_md).unwrap(),
+            sup_before,
+            "superseding note restored byte-identical"
+        );
+        assert!(
+            state
+                .db
+                .get_supersession("s1")
+                .unwrap()
+                .unwrap()
+                .applied_at
+                .is_none(),
+            "undo returns the row to pending"
+        );
+    }
+
+    /// TOCTOU: a source folder that seals BETWEEN preview and apply is SKIPPED (never stamped) —
+    /// proving the prune↔seal re-gate AND the "never write `.md` into a locked folder" invariant.
+    #[test]
+    fn apply_skips_source_sealed_after_preview() {
+        let vault = tmp_vault("retruth-toctou");
+        let state = build_state_with_vault("retruth-toctou", &vault);
+        let src_original = "# Kickoff\n\nAtlas is in progress.\n";
+        make_open_folder(&state.db, "f-src", "Work");
+        let src_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some(src_original),
+        );
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_note_on_disk(&state, &vault, "m2", "f-new", "Reviews", "review.md", Some("# Review\n"));
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Preview saw it open — now SEAL the source folder before apply (TOCTOU).
+        assert_eq!(preview_supersessions_inner(&state, "m2").unwrap().len(), 1);
+        state
+            .db
+            .set_folder_locked("f-src", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res.applied, 0);
+        assert_eq!(res.skipped_sealed, 1, "a source sealed after preview is skipped");
+        // The `.md` was NOT touched (no callout written into a locked folder).
+        assert_eq!(
+            std::fs::read_to_string(&src_md).unwrap(),
+            src_original,
+            "never write into a locked folder"
+        );
+        // Still pending (not marked applied).
+        assert!(
+            state
+                .db
+                .get_supersession("s1")
+                .unwrap()
+                .unwrap()
+                .applied_at
+                .is_none()
+        );
+    }
+
+    /// GATE BOTH SIDES: `preview_supersessions` must EXCLUDE a row whose SUPERSEDING meeting is sealed
+    /// (its `new_value` is derived from that just-sealed note). Uses `set_folder_locked` directly so the
+    /// row SURVIVES at rest — proving the READ GATE on the superseding side, independent of
+    /// purge-on-seal (closing the `lock_folder` flip-before-purge race). RED-before-GREEN: without the
+    /// superseding-side gate the source stays open, so the row (with `new_value`) leaks.
+    #[test]
+    fn preview_supersessions_excludes_sealed_superseding() {
+        let vault = tmp_vault("retruth-supgate");
+        let state = build_state_with_vault("retruth-supgate", &vault);
+        make_open_folder(&state.db, "f-src", "Work");
+        seed_note_on_disk(&state, &vault, "m1", "f-src", "Work", "kickoff.md", Some("# Kickoff\n"));
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_note_on_disk(&state, &vault, "m2", "f-new", "Reviews", "review.md", Some("# Review\n"));
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Both open → surfaced.
+        assert_eq!(preview_supersessions_inner(&state, "m2").unwrap().len(), 1);
+
+        // Seal the SUPERSEDING folder (row survives — the race window) → excluded (no new_value leak).
+        state
+            .db
+            .set_folder_locked("f-new", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            preview_supersessions_inner(&state, "m2").unwrap().is_empty(),
+            "a sealed superseding meeting must surface no new_value (gate BOTH sides)"
+        );
+    }
+
+    /// RETRY AFTER PARTIAL APPLY must not corrupt undo. Reproduces the crash window the durable-
+    /// before-write ordering produces (pre-image stored + file stamped, but `applied_at` not yet
+    /// committed), then a retry: it must REUSE the stored un-stamped pre-image, NOT re-snapshot the
+    /// stamped file — so a later undo still restores byte-identical. RED-before-GREEN: the old
+    /// order (write → mark-with-fresh-file-read) re-captures the stamped bytes here, so undo can no
+    /// longer remove the stamp.
+    #[test]
+    fn apply_retry_after_partial_does_not_corrupt_undo() {
+        let vault = tmp_vault("retruth-retry");
+        let state = build_state_with_vault("retruth-retry", &vault);
+        let original = "# Kickoff\n\nAtlas is in progress.\n";
+        make_open_folder(&state.db, "f-src", "Work");
+        let src_md =
+            seed_note_on_disk(&state, &vault, "m1", "f-src", "Work", "kickoff.md", Some(original));
+        // Superseding meeting stays open but WITHOUT a vault file we care about — the backlink is
+        // irrelevant to this source-undo test (no superseding stem link ⇒ simpler assertions).
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_meeting(&state.db, "m2", "# Review", Some("f-new"));
+        state.db.set_note_folder("m2", Some("f-new")).unwrap();
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Simulate the intermediate crash state produced by the durable-before-write ordering: the
+        // un-stamped pre-image is already persisted AND the file is already stamped, but `applied_at`
+        // never committed. (This is exactly what a crash between the write and mark-applied leaves.)
+        let un_stamped = std::fs::read(&src_md).unwrap();
+        state
+            .db
+            .store_supersession_pre_images("s1", Some(&un_stamped), None)
+            .unwrap();
+        let stamped = crate::export::obsidian::append_supersession_callout(
+            original,
+            "2026-06-20",
+            "status",
+            "in-progress",
+            "shipped",
+            None,
+        );
+        std::fs::write(&src_md, &stamped).unwrap();
+
+        // RETRY the apply: it MUST reuse the stored (un-stamped) pre-image, never re-snapshot the
+        // stamped file.
+        let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res.applied, 1);
+        let after = state.db.get_supersession("s1").unwrap().unwrap();
+        assert_eq!(
+            after.source_pre_image.as_deref(),
+            Some(un_stamped.as_slice()),
+            "retry must NOT re-snapshot the stamped file into the pre-image"
+        );
+        // The file is stamped exactly once (idempotent — retry over an already-stamped file is a no-op).
+        assert_eq!(
+            std::fs::read_to_string(&src_md)
+                .unwrap()
+                .matches("> **status** — in-progress → shipped")
+                .count(),
+            1,
+            "no duplicate stamp on retry"
+        );
+
+        // UNDO restores byte-identical to the ORIGINAL (un-stamped) — the corruption is gone.
+        undo_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read(&src_md).unwrap(),
+            un_stamped,
+            "undo removes the stamp — byte-identical to the un-stamped original"
+        );
+    }
+
+    /// MULTI-ROW heal: several supersessions in ONE preview share a note FILE — every row shares the
+    /// superseding meeting's note, and two facts from the same old meeting share a SOURCE note. Apply
+    /// ALL then undo ALL must restore EVERY affected file byte-identical. RED-before-GREEN: the old
+    /// per-row snapshot captured mid-batch (already-stamped) bytes for the 2nd+ row on a shared file,
+    /// and forward-order undo then left N-1 orphan stamps → NOT byte-identical.
+    #[test]
+    fn apply_then_undo_multi_row_shared_note_round_trips_byte_identical() {
+        let vault = tmp_vault("retruth-multi");
+        let state = build_state_with_vault("retruth-multi", &vault);
+        // One open folder holding the superseding note + two old source notes.
+        make_open_folder(&state.db, "f", "Work");
+        let new_md =
+            seed_note_on_disk(&state, &vault, "m-new", "f", "Work", "new.md", Some("# New\n"));
+        let old1_md =
+            seed_note_on_disk(&state, &vault, "m-old1", "f", "Work", "old1.md", Some("# Old one\n"));
+        let old2_md =
+            seed_note_on_disk(&state, &vault, "m-old2", "f", "Work", "old2.md", Some("# Old two\n"));
+
+        // Three rows, ALL superseded by m-new:
+        //   r1, r2 → SOURCE m-old1 (two facts from one old note ⇒ shared SOURCE note)
+        //   r3     → SOURCE m-old2
+        // All three ⇒ shared SUPERSEDING note (new.md gets 3 backlinks).
+        let mk = |id: &str, source: &str, predicate: &str, old: &str, new: &str| SupersessionRow {
+            id: id.into(),
+            superseding_meeting_id: "m-new".into(),
+            source_meeting_id: source.into(),
+            entity: "Atlas".into(),
+            predicate: predicate.into(),
+            old_value: old.into(),
+            new_value: new.into(),
+            created_at: "2026-06-20T00:00:00Z".into(),
+            applied_at: None,
+            source_pre_image: None,
+            superseding_pre_image: None,
+        };
+        state
+            .db
+            .record_supersessions(&[
+                mk("r1", "m-old1", "status", "in-progress", "shipped"),
+                mk("r2", "m-old1", "owner", "Anna", "Bob"),
+                mk("r3", "m-old2", "stage", "alpha", "beta"),
+            ])
+            .unwrap();
+
+        // Pre-heal content of every affected file.
+        let new_pre = std::fs::read(&new_md).unwrap();
+        let old1_pre = std::fs::read(&old1_md).unwrap();
+        let old2_pre = std::fs::read(&old2_md).unwrap();
+
+        // APPLY ALL.
+        let ids: Vec<String> = ["r1", "r2", "r3"].iter().map(|s| s.to_string()).collect();
+        let res = apply_supersessions_inner(&state, &ids).unwrap();
+        assert_eq!(res.applied, 3);
+        assert_eq!(res.skipped_sealed, 0);
+        // The shared superseding note carries all THREE backlinks; each source its own callout(s).
+        assert_eq!(
+            std::fs::read_to_string(&new_md).unwrap().matches("> [!supersedes]").count(),
+            3,
+            "shared superseding note accumulates all backlinks"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old1_md).unwrap().matches("> [!superseded]").count(),
+            2,
+            "shared source note accumulates both callouts"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old2_md).unwrap().matches("> [!superseded]").count(),
+            1
+        );
+
+        // UNDO ALL → EVERY affected file byte-identical to its pre-heal content.
+        undo_supersessions_inner(&state, &ids).unwrap();
+        assert_eq!(
+            std::fs::read(&new_md).unwrap(),
+            new_pre,
+            "shared SUPERSEDING note restored byte-identical (no orphan backlinks)"
+        );
+        assert_eq!(
+            std::fs::read(&old1_md).unwrap(),
+            old1_pre,
+            "shared SOURCE note restored byte-identical (no orphan callout)"
+        );
+        assert_eq!(std::fs::read(&old2_md).unwrap(), old2_pre);
+        // Every row back to unapplied.
+        for id in ["r1", "r2", "r3"] {
+            assert!(
+                state
+                    .db
+                    .get_supersession(id)
+                    .unwrap()
+                    .unwrap()
+                    .applied_at
+                    .is_none(),
+                "row {id} returned to pending"
+            );
+        }
+    }
+
+    /// PARTIAL undo of a SUBSET that shares a note file must preserve the still-applied siblings'
+    /// on-disk stamps (no silent DB↔disk desync). `apply [r1,r2,r3]` (r1,r2 → source old1.md; r3 →
+    /// source old2.md; all three → superseding new.md), then `undo [r1]` only: r2/r3 stay applied and
+    /// their stamps must survive on old1.md/new.md while r1's are removed. Then `undo [r2,r3]` →
+    /// every file byte-identical to pristine. RED-before-GREEN: the restore-pristine-once logic wipes
+    /// old1.md/new.md fully pristine with r2/r3 still applied (their callouts vanish).
+    #[test]
+    fn partial_undo_preserves_still_applied_siblings_on_shared_file() {
+        let vault = tmp_vault("retruth-partial");
+        let state = build_state_with_vault("retruth-partial", &vault);
+        make_open_folder(&state.db, "f", "Work");
+        let new_md =
+            seed_note_on_disk(&state, &vault, "m-new", "f", "Work", "new.md", Some("# New\n"));
+        let old1_md =
+            seed_note_on_disk(&state, &vault, "m-old1", "f", "Work", "old1.md", Some("# Old one\n"));
+        let old2_md =
+            seed_note_on_disk(&state, &vault, "m-old2", "f", "Work", "old2.md", Some("# Old two\n"));
+        let mk = |id: &str, source: &str, predicate: &str, old: &str, new: &str| SupersessionRow {
+            id: id.into(),
+            superseding_meeting_id: "m-new".into(),
+            source_meeting_id: source.into(),
+            entity: "Atlas".into(),
+            predicate: predicate.into(),
+            old_value: old.into(),
+            new_value: new.into(),
+            created_at: "2026-06-20T00:00:00Z".into(),
+            applied_at: None,
+            source_pre_image: None,
+            superseding_pre_image: None,
+        };
+        state
+            .db
+            .record_supersessions(&[
+                mk("r1", "m-old1", "status", "in-progress", "shipped"),
+                mk("r2", "m-old1", "owner", "Anna", "Bob"),
+                mk("r3", "m-old2", "stage", "alpha", "beta"),
+            ])
+            .unwrap();
+
+        let new_pre = std::fs::read(&new_md).unwrap();
+        let old1_pre = std::fs::read(&old1_md).unwrap();
+        let old2_pre = std::fs::read(&old2_md).unwrap();
+
+        // APPLY ALL.
+        let all: Vec<String> = ["r1", "r2", "r3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(apply_supersessions_inner(&state, &all).unwrap().applied, 3);
+        let old2_after_apply = std::fs::read(&old2_md).unwrap();
+
+        // UNDO ONLY r1.
+        undo_supersessions_inner(&state, &["r1".to_string()]).unwrap();
+
+        // r2, r3 stay applied; r1 cleared.
+        assert!(state.db.get_supersession("r1").unwrap().unwrap().applied_at.is_none());
+        assert!(state.db.get_supersession("r2").unwrap().unwrap().applied_at.is_some());
+        assert!(state.db.get_supersession("r3").unwrap().unwrap().applied_at.is_some());
+
+        // old1.md: r2's callout SURVIVES, r1's is GONE.
+        let old1 = std::fs::read_to_string(&old1_md).unwrap();
+        assert!(old1.contains("> **owner** — Anna → Bob"), "r2 (survivor) callout kept: {old1}");
+        assert!(
+            !old1.contains("> **status** — in-progress → shipped"),
+            "r1 (undone) callout removed: {old1}"
+        );
+        // new.md: r2 + r3 backlinks SURVIVE, r1's is GONE.
+        let new = std::fs::read_to_string(&new_md).unwrap();
+        assert!(new.contains("> **owner** — supersedes Anna → Bob in [[old1]]"), "r2 backlink kept: {new}");
+        assert!(new.contains("> **stage** — supersedes alpha → beta in [[old2]]"), "r3 backlink kept: {new}");
+        assert!(
+            !new.contains("> **status** — supersedes in-progress → shipped in [[old1]]"),
+            "r1 backlink removed: {new}"
+        );
+        // old2.md: r3 untouched (never in an undo set).
+        assert_eq!(std::fs::read(&old2_md).unwrap(), old2_after_apply, "r3's source note unchanged");
+
+        // Now UNDO r2, r3 → every file byte-identical to pristine, all rows unapplied.
+        undo_supersessions_inner(&state, &["r2".to_string(), "r3".to_string()]).unwrap();
+        assert_eq!(std::fs::read(&new_md).unwrap(), new_pre, "superseding note back to pristine");
+        assert_eq!(std::fs::read(&old1_md).unwrap(), old1_pre, "shared source note back to pristine");
+        assert_eq!(std::fs::read(&old2_md).unwrap(), old2_pre, "other source note back to pristine");
+        for id in ["r1", "r2", "r3"] {
+            assert!(
+                state.db.get_supersession(id).unwrap().unwrap().applied_at.is_none(),
+                "row {id} unapplied after full undo"
+            );
+        }
     }
 }
 

@@ -391,6 +391,73 @@ pub fn append_pin(markdown: &str, mmss: &str, label: &str, block_id: &str) -> St
     md
 }
 
+// ── Re-Truth: append-only supersession stamps ───────────────────────────────
+
+/// The managed heading Re-Truth stamps live under. Created once per note (idempotent) so repeated
+/// stamps stay contiguous and never duplicate the heading.
+pub const RETRUTH_SECTION: &str = "## Re-Truth updates";
+
+/// APPEND a `[!superseded]` callout to a SOURCE note under the managed [`RETRUTH_SECTION`]. Pure +
+/// APPEND-ONLY: no existing byte is touched (the safe verify-before-destroy shape — the caller
+/// snapshots the pre-image, and undo restores it byte-identical). Idempotent: if the exact callout
+/// BODY (predicate/old/new/link — everything but the date) is already present, the markdown is
+/// returned UNCHANGED, so applying twice never double-stamps. `superseding_stem`, when present, adds
+/// a `· see [[stem]]` wikilink to the note that superseded this fact (omitted when the superseding
+/// note is sealed — never leak a locked meeting's title into an open note).
+pub fn append_supersession_callout(
+    markdown: &str,
+    date: &str,
+    predicate: &str,
+    old_value: &str,
+    new_value: &str,
+    superseding_stem: Option<&str>,
+) -> String {
+    let link = superseding_stem
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" · see [[{s}]]"))
+        .unwrap_or_default();
+    let body = format!("> **{predicate}** — {old_value} → {new_value}{link}");
+    let block = format!("> [!superseded] {date}\n{body}\n");
+    append_under_section(markdown, &body, &block)
+}
+
+/// APPEND a `[!supersedes]` backlink callout to the SUPERSEDING note under the managed
+/// [`RETRUTH_SECTION`] — the mirror of [`append_supersession_callout`], recording that THIS note's
+/// fact supersedes an older one in `source_stem`. Pure, append-only, idempotent on the body line.
+pub fn append_supersedes_callout(
+    markdown: &str,
+    date: &str,
+    predicate: &str,
+    old_value: &str,
+    new_value: &str,
+    source_stem: &str,
+) -> String {
+    let body = format!("> **{predicate}** — supersedes {old_value} → {new_value} in [[{source_stem}]]");
+    let block = format!("> [!supersedes] {date}\n{body}\n");
+    append_under_section(markdown, &body, &block)
+}
+
+/// Shared append-under-managed-section core. `marker` is the stable idempotence guard (the callout
+/// body without its date); `block` is the full multi-line callout to append. Append-only: the input
+/// markdown is never rewritten, only extended. Creates [`RETRUTH_SECTION`] once if absent.
+fn append_under_section(markdown: &str, marker: &str, block: &str) -> String {
+    // Idempotent: the exact body line already present → nothing to do (applying twice is a no-op).
+    if markdown.contains(marker) {
+        return markdown.to_string();
+    }
+    let mut out = markdown.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.contains(RETRUTH_SECTION) {
+        out.push_str(&format!("\n{RETRUTH_SECTION}\n"));
+    }
+    out.push('\n');
+    out.push_str(block);
+    out
+}
+
 // ── Vault detection (from ~/Library/Application Support/obsidian/obsidian.json) ──
 
 /// A detected Obsidian vault.
@@ -1092,6 +1159,84 @@ mod tests {
         assert_eq!(
             out, md,
             "cloud with no host/count → nothing to honestly stamp"
+        );
+    }
+
+    // ── Re-Truth: append-only supersession callouts ─────────────────────────
+
+    /// A supersession stamp APPENDS a `[!superseded]` callout under a freshly-created
+    /// `## Re-Truth updates` section, referencing the superseding note — and touches NO existing byte
+    /// (the input is a strict prefix of the output: append-only).
+    #[test]
+    fn supersession_callout_appends_under_managed_section() {
+        let md = "---\ntitle: Kickoff\n---\n# Kickoff\n\nAtlas is in progress.\n";
+        let out = append_supersession_callout(
+            md,
+            "2026-07-05",
+            "status",
+            "in-progress",
+            "shipped",
+            Some("2026-07-04 1000 - Launch review"),
+        );
+        assert!(out.starts_with(md), "append-only: input is a prefix of output");
+        assert!(out.contains("## Re-Truth updates"), "section created: {out}");
+        assert!(out.contains("> [!superseded] 2026-07-05"), "callout: {out}");
+        assert!(
+            out.contains("> **status** — in-progress → shipped · see [[2026-07-04 1000 - Launch review]]"),
+            "body + wikilink: {out}"
+        );
+    }
+
+    /// Applying the SAME supersession twice is a no-op — the callout body (predicate/old/new/link) is
+    /// the stable idempotence marker, so a re-apply returns byte-identical markdown (no double-stamp).
+    #[test]
+    fn supersession_callout_is_idempotent() {
+        let md = "---\ntitle: T\n---\n# T\n";
+        let once = append_supersession_callout(md, "2026-07-05", "status", "a", "b", Some("Later"));
+        let twice =
+            append_supersession_callout(&once, "2026-07-05", "status", "a", "b", Some("Later"));
+        assert_eq!(once, twice, "second apply is a no-op");
+        assert_eq!(
+            once.matches("> **status** — a → b").count(),
+            1,
+            "no duplicate callout body"
+        );
+    }
+
+    /// A second, DIFFERENT supersession reuses the existing section (created once) and appends below.
+    #[test]
+    fn supersession_callout_reuses_section_for_second_stamp() {
+        let md = "# T\n";
+        let one = append_supersession_callout(md, "2026-07-05", "status", "a", "b", None);
+        let two = append_supersession_callout(&one, "2026-07-06", "owner", "X", "Y", None);
+        assert_eq!(
+            two.matches("## Re-Truth updates").count(),
+            1,
+            "section heading created exactly once"
+        );
+        assert!(two.contains("> **status** — a → b"), "first stamp kept");
+        assert!(two.contains("> **owner** — X → Y"), "second stamp appended");
+    }
+
+    /// With no superseding stem, the callout omits the `· see [[…]]` wikilink entirely (never an empty
+    /// `[[]]` link) — the leak-safe path when the superseding note is sealed.
+    #[test]
+    fn supersession_callout_omits_link_when_no_stem() {
+        let out = append_supersession_callout("# T\n", "2026-07-05", "status", "a", "b", None);
+        assert!(out.contains("> **status** — a → b\n"), "body without link: {out}");
+        assert!(!out.contains("see [["), "no dangling wikilink: {out}");
+    }
+
+    /// The superseding-note backlink is the mirror callout, referencing the SOURCE note, append-only.
+    #[test]
+    fn supersedes_backlink_appends_and_references_source() {
+        let md = "# Launch review\n";
+        let out = append_supersedes_callout(md, "2026-07-05", "status", "in-progress", "shipped", "Kickoff");
+        assert!(out.starts_with(md), "append-only");
+        assert!(out.contains("> [!supersedes] 2026-07-05"), "callout: {out}");
+        assert!(
+            out.contains("> **status** — supersedes in-progress → shipped in [[Kickoff]]"),
+            "backlink body: {out}"
         );
     }
 }

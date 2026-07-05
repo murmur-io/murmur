@@ -1438,3 +1438,45 @@ export interface PruneSummary {
   prunedCount: number;
   mastersDeleted: number;
 }
+
+/**
+ * Re-Truth — one fact that a just-finished meeting SUPERSEDES from an earlier
+ * note (mirrors the Rust `SupersessionDto`, camelCase). The vault "moved on":
+ * an `entity`'s `predicate` changed from `oldValue` to `newValue`, and the note
+ * that first recorded it (`sourceNoteTitle`) is now stale. `preview_supersessions`
+ * returns pending-only rows (`applied` always false); `apply_supersessions`
+ * APPENDS an Obsidian `[!superseded]` callout to the source note (append-only,
+ * reversible) — it never edits the user's own prose line.
+ *
+ * PRIVACY (lock-model): `sourceNotePath` is an ABSOLUTE on-disk path used only
+ * by the backend to locate the file — never display it; render `sourceNoteTitle`.
+ * `supersedingNoteTitle` is `null` when the superseding note lives in a sealed
+ * folder (masked) — the row still renders, just without that title.
+ */
+export interface SupersessionDto {
+  id: string;
+  entity: string;
+  predicate: string;
+  oldValue: string;
+  newValue: string;
+  /** Human title of the now-stale note (render this). */
+  sourceNoteTitle: string;
+  /** Absolute on-disk path — backend-only, NEVER displayed. */
+  sourceNotePath: string;
+  sourceMeetingId: string;
+  supersedingMeetingId: string;
+  /** `null` when the superseding note is sealed — handle gracefully. */
+  supersedingNoteTitle: string | null;
+  /** Preview rows are always pending (`false`); an applied row round-trips true. */
+  applied: boolean;
+}
+
+/**
+ * Result of applying (healing) a batch of supersessions (mirrors the Rust
+ * `ApplyResult`). `applied` = callouts stamped; `skippedSealed` = rows whose
+ * source note was sealed and could not be stamped this session.
+ */
+export interface ApplyResult {
+  applied: number;
+  skippedSealed: number;
+}
