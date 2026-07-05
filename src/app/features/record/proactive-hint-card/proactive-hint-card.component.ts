@@ -25,7 +25,6 @@ import type { ProactiveHintPayload } from "../../../core/models";
  */
 @Component({
   selector: "app-proactive-hint-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./proactive-hint-card.component.html",

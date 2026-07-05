@@ -3,7 +3,7 @@
     type="button"
     class="ed-close btn btn-ghost"
     aria-label="Close detail"
-    (click)="close.emit()"
+    (click)="closed.emit()"
   >
     <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
       <path
@@ -46,7 +46,7 @@
         class="ed-neighborhood"
         [neighbors]="d.neighbors"
         [centerName]="d.entity.name"
-        (select)="select.emit($event)"
+        (selected)="selected.emit($event)"
       />
 
       <!-- Backlinked meetings → reuse the shared sources chip component. -->
@@ -72,7 +72,7 @@
                   type="button"
                   class="ed-neighbor"
                   [class.is-project]="nb.kind === 'project'"
-                  (click)="select.emit(nb.id)"
+                  (click)="selected.emit(nb.id)"
                 >
                   <span class="ed-neighbor-dot" aria-hidden="true"></span>
                   <span class="ed-neighbor-name">{{ nb.name }}</span>

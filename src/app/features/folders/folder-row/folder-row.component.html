@@ -70,7 +70,7 @@
       class="folder"
       [class.is-selected]="selectedId() === node().id"
       [attr.aria-pressed]="selectedId() === node().id"
-      (click)="select.emit(node().id)"
+      (click)="selected.emit(node().id)"
     >
       <span class="folder-icon" aria-hidden="true">
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
@@ -356,7 +356,7 @@
     [nodes]="children()"
     [selectedId]="selectedId()"
     [depth]="depth() + 1"
-    (select)="select.emit($event)"
+    (selected)="selected.emit($event)"
     (dropNote)="dropNote.emit($event)"
   />
 }

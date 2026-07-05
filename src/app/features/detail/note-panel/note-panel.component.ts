@@ -73,7 +73,6 @@ export interface AssistantQa {
  */
 @Component({
   selector: "app-note-panel",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MarkdownComponent,

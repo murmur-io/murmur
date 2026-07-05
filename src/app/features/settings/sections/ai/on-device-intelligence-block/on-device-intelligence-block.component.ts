@@ -15,7 +15,6 @@ import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.c
  */
 @Component({
   selector: "app-on-device-intelligence-block",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MurToggleComponent,ReactiveFormsModule],

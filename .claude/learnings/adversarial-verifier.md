@@ -14,7 +14,8 @@
   2. **Sealed-content leak** — a read/asset path returning sealed data un-gated, especially
      `audio_path` reaching `convertFileSrc`/the `asset:` protocol (bypasses every backend command).
   3. **macOS FFI abort** — an unrecognized-selector `NSException` crossing FFI → abort at launch.
-  4. **NG0600** — a signal written in an `effect()` without `{ allowSignalWrites: true }`.
+  4. **Unguarded IPC effect** — an effect-orchestrated fetch without a stale-result guard
+     (NG0600/`allowSignalWrites` is gone since Angular 19 — flag any attempt to reintroduce it).
   5. **Import-cycle `ɵcmp`** — mutually-recursive standalone components missing `forwardRef`.
   6. **Opacity bleed** — a popover/modal using the frosted `.card` instead of `--surface-overlay`.
   7. **Prod-only CSP style break** — reproduce in WebKit + the real `style-src` CSP, not Chromium;

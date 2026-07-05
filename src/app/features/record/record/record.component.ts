@@ -21,7 +21,6 @@ import { MeetingConversationStore } from "../../../core/meeting-conversation.sto
 
 @Component({
   selector: "app-record",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
@@ -46,8 +45,8 @@ export class RecordComponent implements OnInit {
    * Shadow-mode calibration (deliverable #5): once a recording finishes, read the
    * per-recording contradiction SHADOW count so the reactions rail can offer "the
    * brain would have flagged N — show them live?". The effect only CALLS an async
-   * store method (the signal write happens inside the store, outside this effect),
-   * so no `allowSignalWrites` is needed. Event-driven, no FE timer.
+   * store method (the signal write happens inside the store, outside this effect).
+   * Event-driven, no FE timer.
    */
   private readonly _shadowOnStop = effect(() => {
     if (this.store.stage() === "done") void this.assistant.refreshShadowCount();

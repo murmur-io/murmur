@@ -24,7 +24,8 @@ A change is not done because it compiles. It is done when an independent agent *
   1. **Seal content-loss** — keyed dedup destroying non-first rows on encrypt.
   2. **Sealed-content leak** — a read/asset path returning sealed data un-gated (incl. `audio_path` reaching `convertFileSrc`/the `asset:` protocol, which bypasses every backend command).
   3. **macOS FFI abort** — an unrecognized-selector `NSException` crossing FFI ("Rust cannot catch foreign exceptions") and aborting at launch.
-  4. **NG0600** — a signal written in an `effect()` without `{ allowSignalWrites: true }`.
+  4. **Unguarded IPC effect** — an effect-orchestrated fetch without a stale-result guard
+     (late response overwrites newer state; NG0600/`allowSignalWrites` itself is gone since v19).
   5. **Import-cycle `ɵcmp`** — mutually-recursive standalone components each in the other's `imports` (needs `forwardRef`).
   6. **Opacity bleed** — a popover/modal using the frosted `.card` instead of an opaque `--surface-overlay`.
 - The **adversarial-verifier** agent owns PASS/FAIL. For anything touching the lock model or crypto, the **lock-security-reviewer** is a required second gate. The implementing agent self-checks but **must not self-certify**.

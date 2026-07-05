@@ -10,7 +10,6 @@ import { SettingsStore } from "../../settings.store";
  */
 @Component({
   selector: "app-settings-about-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./settings-about-section.component.html",
   styleUrl: "./settings-about-section.component.scss",

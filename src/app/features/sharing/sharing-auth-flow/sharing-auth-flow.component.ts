@@ -52,7 +52,6 @@ type Step =
  */
 @Component({
   selector: "app-sharing-auth-flow",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   templateUrl: "./sharing-auth-flow.component.html",

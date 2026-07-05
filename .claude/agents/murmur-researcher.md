@@ -13,7 +13,7 @@ You are usually dispatched by the `/research` skill with a single research angle
 
 A **local-first macOS desktop app** that records meetings, transcribes on-device, turns the transcript into a clean note via a **pluggable LLM provider**, and lives inside the user's **Obsidian vault**.
 
-- **Stack:** Tauri 2 (Rust core) + Angular 18 (zoneless, standalone, signals). IPC = Tauri commands + events.
+- **Stack:** Tauri 2 (Rust core) + Angular 22 (zoneless, standalone, signals). IPC = Tauri commands + events.
 - **Pipeline:** capture (mic via `cpal` + system audio via a Swift **ScreenCaptureKit** sidecar) → mix to 16 kHz mono WAV → **whisper.cpp** (`whisper-rs`, Metal) → segments → **SQLite (canonical source of truth)** → `SummarizerProvider` → note markdown in DB → **Obsidian `.md` export** (atomic write, front-matter + `[[wikilinks]]` + `obsidian://` block-refs).
 - **Providers (one trait, swappable):** `claude_code` (spawns `claude -p`, default), `anthropic` (REST, BYO key in macOS Keychain), `ollama` (local). A **HostedProvider** is designed-for-later.
 - **Shipped feature set** (the "meeting memory system"): Recipes/Generate, Action-items → Obsidian Tasks **and** Apple Reminders, Timeline scrubber + pin-moment, self-assembling **`[[Person]]/[[Project]]` graph**, **Ask-My-Vault** (cited cross-meeting chat), Weekly Digest, Topic Threads, Obsidian Canvas export, Pre-Meeting Brief (calendar-aware), speaker rename, **redaction firewall** (scrub PII → cloud LLM → restore), **local MCP server** (`127.0.0.1:8765`, read-only meeting tools for Claude Desktop/Code), auto thematic foldering.

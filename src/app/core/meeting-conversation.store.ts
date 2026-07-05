@@ -376,8 +376,8 @@ export class MeetingConversationStore {
    *
    * The trigger is a DROP in the number of folders whose content is currently
    * visible (`!locked || unlocked`), mirroring the graph's `_refetchOnLock`
-   * folder-tree effect. `{ allowSignalWrites: true }` — the effect writes the rail
-   * signals via {@link clearRail} (trap T1 / NG0600).
+   * folder-tree effect. The effect writes the rail signals via
+   * {@link clearRail} (allowed by default since Angular 19).
    */
   private prevVisibleFolderCount: number | null = null;
   private readonly _purgeRailOnLock = effect(
@@ -387,7 +387,6 @@ export class MeetingConversationStore {
       this.prevVisibleFolderCount = visible;
       if (prev !== null && visible < prev) this.clearRail();
     },
-    { allowSignalWrites: true },
   );
 
   /** Count folders whose content is currently visible to this session (`!locked || unlocked`). */

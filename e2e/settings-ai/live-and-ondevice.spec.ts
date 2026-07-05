@@ -37,14 +37,16 @@ test.describe("during-meetings-block + on-device-intelligence-block", () => {
   });
 
   // ── (c) — assistant + proactive-hints toggles render ────────────────────
-  test("(c) in-meeting assistant and proactive-hints checkboxes render", async ({
+  // The checkboxes became design-system <mur-toggle> controls (CVA), so the
+  // formControlName sits on the mur-toggle element, not a native input.
+  test("(c) in-meeting assistant and proactive-hints toggles render", async ({
     page,
   }) => {
     await expect(
-      page.locator('input[formcontrolname="realtimeReactions"]'),
+      page.locator('mur-toggle[formcontrolname="realtimeReactions"]'),
     ).toBeAttached();
     await expect(
-      page.locator('input[formcontrolname="proactiveHintsEnabled"]'),
+      page.locator('mur-toggle[formcontrolname="proactiveHintsEnabled"]'),
     ).toBeAttached();
   });
 
@@ -53,7 +55,7 @@ test.describe("during-meetings-block + on-device-intelligence-block", () => {
     page,
   }) => {
     await expect(
-      page.locator('input[formcontrolname="semanticSearchEnabled"]'),
+      page.locator('mur-toggle[formcontrolname="semanticSearchEnabled"]'),
     ).toBeAttached();
     await expect(
       page.getByRole("button", { name: "Re-index notes" }),
@@ -65,63 +67,19 @@ test.describe("during-meetings-block + on-device-intelligence-block", () => {
 test("(e) cloud-consent warning appears when realtime on + live target is cloud + not consented", async ({
   page,
 }) => {
-  // cloudEgressConsented:false forces liveTargetIsCloud=true
-  // (claude_code provider → cloud) and cloudConsented=false → banner visible.
-  await mockTauri(page, {
-    get_config: () =>
-      Object.assign(
-        {},
-        {
-          providerId: "claude_code",
-          vaultPath: "/demo",
-          vaultSubfolder: "Meetings",
-          whisperModelPath: null,
-          language: null,
-          anthropicModel: "claude-opus-4-8",
-          providerModel: "",
-          providerEffort: "",
-          ollamaBaseUrl: "http://localhost:11434",
-          ollamaModel: "llama3.1:8b",
-          claudeBinary: "claude",
-          inputDevice: null,
-          captureSystemAudio: true,
-          vadEnabled: true,
-          keepHiresMasters: false,
-          diarizeOthers: true,
-          aecEnabled: false,
-          postAecEnabled: false,
-          modelSize: "large-v3",
-          voiceTrigger: true,
-          onboarded: true,
-          noteStyle: "structured",
-          autoOrganize: true,
-          noteLanguage: "en",
-          mcpRequireToken: true,
-          lockRequireBiometric: true,
-          relockOnScreenshare: true,
-          cloudEgressConsented: false,
-          brainBackend: "cloud",
-          realtimeReactions: true,
-          brainModelId: "bielik-11b",
-          brainModelPath: null,
-          semanticSearchEnabled: true,
-          webSearchEnabled: false,
-          webSearchConsented: false,
-          claudeCodeInheritEnv: false,
-          gatewayBaseUrl: "",
-          gatewayModel: "",
-          proactiveHintsEnabled: true,
-          roleNotesConnection: "",
-          roleNotesModel: "",
-          roleNotesEffort: "",
-          roleAskConnection: "",
-          roleAskModel: "",
-          roleAskEffort: "",
-          roleLiveConnection: "",
-          roleLiveModel: "",
-          roleLiveEffort: "",
-        },
-      ),
+  // The banner requires: posture ≠ cloud (mock default is "hybrid"), realtime
+  // reactions ON (mock default), an explicitly cloud-routed live target
+  // (roleLiveConnection: claude_code — explicit override wins the resolver),
+  // and cloud egress NOT yet consented. `__demoConfig` merges over the base
+  // mock's DEFAULT_CONFIG, so only the deltas are pinned here.
+  await mockTauri(page);
+  await page.addInitScript(() => {
+    (window as unknown as { __demoConfig: Record<string, unknown> }).__demoConfig =
+      {
+        realtimeReactions: true,
+        roleLiveConnection: "claude_code",
+        cloudEgressConsented: false,
+      };
   });
   await page.goto("/settings");
   await page.getByText("AI & Models").first().click();

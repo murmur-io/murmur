@@ -27,7 +27,6 @@ import type { TopicThread } from "../../../core/models";
  */
 @Component({
   selector: "app-topic-threads",
-  standalone: true,
   imports: [RouterLink],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./topic-threads.component.html",

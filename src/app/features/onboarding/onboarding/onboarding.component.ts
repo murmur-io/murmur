@@ -79,7 +79,6 @@ const SIZE_HINTS: Record<string, string> = {
  */
 @Component({
   selector: "app-onboarding",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [BrainEnableCardComponent],
   templateUrl: "./onboarding.component.html",

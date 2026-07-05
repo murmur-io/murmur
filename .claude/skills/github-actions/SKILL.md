@@ -1,6 +1,6 @@
 ---
 name: github-actions
-description: Author and maintain GitHub Actions workflows for THIS repo (Murmur — Tauri 2 Rust + Angular 18, macOS-first, heavy always-compiled ML build). The best-practice patterns tuned to Murmur — macos-14 runner, Swatinem/rust-cache + npm cache + whisper-model cache, SHA-pinned actions resolved live, least-privilege permissions, concurrency cancel, secrets by name, and the ci.sh-wraps-not-duplicates rule. Includes the release-workflow blueprint (CD) that stays a design, since notarization belongs to release-engineer. Use whenever the user wants to write/change a GitHub Actions workflow, tune CI runtime/caching, pin actions, or design a cloud release pipeline for Murmur.
+description: Author and maintain GitHub Actions workflows for THIS repo (Murmur — Tauri 2 Rust + Angular 22, macOS-first, heavy always-compiled ML build). The best-practice patterns tuned to Murmur — macos-14 runner, Swatinem/rust-cache + npm cache + whisper-model cache, SHA-pinned actions resolved live, least-privilege permissions, concurrency cancel, secrets by name, and the ci.sh-wraps-not-duplicates rule. Includes the release-workflow blueprint (CD) that stays a design, since notarization belongs to release-engineer. Use whenever the user wants to write/change a GitHub Actions workflow, tune CI runtime/caching, pin actions, or design a cloud release pipeline for Murmur.
 ---
 
 # /github-actions — workflow best-practices for Murmur

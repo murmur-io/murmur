@@ -26,7 +26,6 @@ import { EntityNeighborhoodComponent } from "../entity-neighborhood/entity-neigh
  */
 @Component({
   selector: "app-entity-detail",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [SourcesComponent, EntityNeighborhoodComponent],
   templateUrl: "./entity-detail.component.html",
@@ -38,9 +37,9 @@ export class EntityDetailComponent {
   /** The entity to show detail for; changing it re-loads the panel. */
   readonly entityId = input.required<string>();
   /** Emits when the user picks a neighbor — the container re-selects it. */
-  readonly select = output<string>();
+  readonly selected = output<string>();
   /** Emits when the user dismisses the panel. */
-  readonly close = output<void>();
+  readonly closed = output<void>();
 
   readonly detail = signal<EntityDetail | null>(null);
   readonly loading = signal(false);
@@ -66,7 +65,6 @@ export class EntityDetailComponent {
     },
     // Sets loading/error synchronously inside the tracked effect, so writes
     // must be permitted here.
-    { allowSignalWrites: true },
   );
 
   private async fetch(id: string): Promise<void> {
