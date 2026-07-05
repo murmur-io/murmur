@@ -263,8 +263,15 @@ pub struct BrainModelDto {
     /// `min_ram_gb` fits the machine. When total RAM is unknown this is `true` (never HIDE a model
     /// behind a failed probe — the user can still try it).
     pub fits_ram: bool,
-    /// This id is the persisted `brain_model_id` selection.
+    /// This id is the persisted `brain_model_id` selection (the single last-selected model, any class).
     pub selected: bool,
+    /// This id is the EFFECTIVE light-class model (persisted `brain_light_model_id`, else the registry
+    /// default) — realtime reactions run on it. Lets the FE reflect the true per-class choice, not just
+    /// the single `brain_model_id`.
+    pub selected_light: bool,
+    /// This id is the EFFECTIVE heavy-class model (persisted `brain_heavy_model_id`, else the registry
+    /// default) — local Notes/Ask run on it.
+    pub selected_heavy: bool,
 }
 
 /// Build the picker DTOs from the registry against a given models dir + (optional) total RAM in GB +
@@ -274,7 +281,14 @@ pub fn brain_model_dtos(
     models_dir: &Path,
     total_ram_gb: Option<u64>,
     selected_id: Option<&str>,
+    light_id: Option<&str>,
+    heavy_id: Option<&str>,
 ) -> Vec<BrainModelDto> {
+    // EFFECTIVE per-class selection = the explicit slot, else the registry default (exactly what the
+    // role resolver runs). So the FE reflects the true model per class, not just the single
+    // last-selected `brain_model_id` (which is whichever class was picked LAST).
+    let eff_light = light_id.or_else(|| default_model_for_class(ModelClass::Light).map(|m| m.id));
+    let eff_heavy = heavy_id.or_else(|| default_model_for_class(ModelClass::Heavy).map(|m| m.id));
     BRAIN_MODELS
         .iter()
         .map(|m| BrainModelDto {
@@ -292,6 +306,8 @@ pub fn brain_model_dtos(
                 .map(|g| u64::from(m.min_ram_gb) <= g)
                 .unwrap_or(true),
             selected: selected_id == Some(m.id),
+            selected_light: eff_light == Some(m.id),
+            selected_heavy: eff_heavy == Some(m.id),
         })
         .collect()
 }
@@ -1327,7 +1343,15 @@ mod tests {
         std::fs::write(dir.join(small.filename), b"GGUF").unwrap();
 
         // RAM threshold of 10 GB: bielik-11b(10) fits, qwen3-14b(14) does NOT, qwen3-1.7b(4) fits.
-        let dtos = brain_model_dtos(&dir, Some(10), Some("qwen3-1.7b"));
+        // Per-class slots are INDEPENDENT of the single `brain_model_id` (`selected`): here the last
+        // selected is a light, but the effective heavy is an explicit Bielik 11B.
+        let dtos = brain_model_dtos(
+            &dir,
+            Some(10),
+            Some("qwen3-1.7b"),
+            Some("bielik-1.5b-v3"),
+            Some("bielik-11b-v3"),
+        );
         let by = |id: &str| dtos.iter().find(|d| d.id == id).unwrap();
         assert!(by("qwen3-1.7b").downloaded);
         assert!(!by("bielik-11b-v3").downloaded);
@@ -1337,14 +1361,26 @@ mod tests {
         // class tag surfaces to the picker.
         assert_eq!(by("qwen3-1.7b").class, ModelClass::Light);
         assert_eq!(by("qwen3-14b").class, ModelClass::Heavy);
-        // selection mirrors the passed id.
+        // `selected` mirrors the single passed id (any class).
         assert!(by("qwen3-1.7b").selected);
         assert!(!by("bielik-11b-v3").selected);
+        // per-class selection reflects the explicit slots, NOT the single `selected` — the fix that
+        // lets the effort slider show the true heavy even when a light was selected last.
+        assert!(by("bielik-1.5b-v3").selected_light);
+        assert!(by("bielik-11b-v3").selected_heavy);
+        assert!(!by("qwen3-1.7b").selected_light); // the single `selected`, but NOT the light slot
+        assert!(!by("qwen3-1.7b").selected_heavy);
 
-        // Unknown RAM ⇒ everything fits (never hide behind a probe failure).
-        let unknown = brain_model_dtos(&dir, None, None);
+        // Unknown RAM ⇒ everything fits (never hide behind a probe failure). No explicit selection ⇒
+        // per-class falls back to the registry DEFAULT (first light / first heavy = what the resolver runs).
+        let unknown = brain_model_dtos(&dir, None, None, None, None);
         assert!(unknown.iter().all(|d| d.fits_ram));
         assert!(unknown.iter().all(|d| !d.selected));
+        let uby = |id: &str| unknown.iter().find(|d| d.id == id).unwrap();
+        assert!(uby("qwen3-1.7b").selected_light); // default light
+        assert!(uby("qwen3-4b-instruct-2507").selected_heavy); // default heavy
+        assert_eq!(unknown.iter().filter(|d| d.selected_light).count(), 1);
+        assert_eq!(unknown.iter().filter(|d| d.selected_heavy).count(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

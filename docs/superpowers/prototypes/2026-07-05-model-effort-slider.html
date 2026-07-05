@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur · on-device model — Claude-style effort slider (prototype)</title>
+<style>
+  :root {
+    --surface-base:#07070b; --surface-raised:rgba(255,255,255,0.045);
+    --surface-overlay:#1b1b24; --surface-input:rgba(255,255,255,0.035);
+    --surface-hover:rgba(255,255,255,0.06);
+    --glass-border:rgba(255,255,255,0.10);
+    --text-primary:#f6f6fa; --text-secondary:#a6a6b6; --text-muted:#6c6c7d; --text-on-accent:#fff;
+    --accent:#6e76ff; --accent-hover:#8a90ff; --accent-active:#5b63f0;
+    --accent-soft:rgba(110,118,255,0.16); --accent-ring:rgba(110,118,255,0.5);
+    --accent-gradient:linear-gradient(135deg,#6e76ff 0%,#9d7bff 100%);
+    --border:rgba(255,255,255,0.09); --border-strong:rgba(255,255,255,0.16); --border-subtle:rgba(255,255,255,0.055);
+    --success:#4ade80; --success-soft:rgba(74,222,128,0.15);
+    --warning:#f5b14c; --warning-soft:rgba(245,177,76,0.14);
+    --radius-sm:9px; --radius-md:13px; --radius-lg:18px; --radius-pill:999px;
+    --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px;
+    --transition:200ms cubic-bezier(0.32,0.72,0,1);
+    --font-sans:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:
+      radial-gradient(1200px 700px at 80% -10%, rgba(110,118,255,0.10), transparent 60%),
+      radial-gradient(900px 600px at -10% 20%, rgba(157,123,255,0.08), transparent 55%),
+      var(--surface-base);
+    color:var(--text-primary); font-family:var(--font-sans); line-height:1.5; padding:40px 20px 80px;
+    -webkit-font-smoothing:antialiased; }
+  .shell { max-width:640px; margin:0 auto; }
+  .proto-note { max-width:640px; margin:0 auto 24px; font-size:0.8rem; color:var(--text-muted);
+    border:1px dashed var(--border-strong); border-radius:var(--radius-md); padding:10px 14px; }
+  .proto-note b { color:var(--text-secondary); }
+  h3 { margin:0; font-size:1.05rem; font-weight:650; }
+  .card { background:var(--surface-raised); border:1px solid var(--glass-border); border-radius:var(--radius-lg);
+    padding:var(--space-5); margin-bottom:var(--space-4); backdrop-filter:blur(30px) saturate(135%); }
+  .head { display:flex; flex-direction:column; gap:4px; margin-bottom:var(--space-5); }
+  .sub { margin:0; font-size:0.85rem; color:var(--text-secondary); }
+  .label { font-size:0.8rem; font-weight:600; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.02em; }
+
+  /* segmented family toggle */
+  .seg { display:inline-flex; gap:4px; padding:4px; background:var(--surface-input); border:1px solid var(--border-subtle);
+    border-radius:var(--radius-md); }
+  .seg button { border:none; background:none; color:var(--text-secondary); font:inherit; font-size:0.9rem; font-weight:600;
+    padding:8px 18px; border-radius:var(--radius-sm); cursor:pointer; transition:all var(--transition); }
+  .seg button.on { background:var(--accent-soft); color:var(--text-primary); box-shadow:0 0 0 1px var(--accent); }
+
+  .block { margin-top:var(--space-5); }
+  .row-between { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:var(--space-2); }
+
+  /* the effort slider */
+  .slider-wrap { position:relative; padding:var(--space-3) 0 var(--space-2); }
+  input[type=range] { -webkit-appearance:none; width:100%; height:6px; border-radius:3px; outline:none; margin:0;
+    background:linear-gradient(90deg,var(--accent) 0%,var(--accent) var(--fill,50%),var(--surface-hover) var(--fill,50%),var(--surface-hover) 100%); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:22px; height:22px; border-radius:50%;
+    background:#fff; box-shadow:0 2px 8px rgba(0,0,0,0.5), 0 0 0 1px var(--accent); cursor:pointer; transition:transform var(--transition); }
+  input[type=range]::-webkit-slider-thumb:hover { transform:scale(1.1); }
+  .ticks { display:flex; justify-content:space-between; margin-top:10px; }
+  .tick { font-size:0.78rem; color:var(--text-muted); flex:1; text-align:center; }
+  .tick:first-child { text-align:left; } .tick:last-child { text-align:right; }
+  .tick.on { color:var(--accent-hover); font-weight:600; }
+  .ends { display:flex; justify-content:space-between; font-size:0.78rem; color:var(--text-muted); margin-top:2px; }
+
+  /* resolved model card */
+  .resolved { margin-top:var(--space-4); display:flex; align-items:center; justify-content:space-between; gap:var(--space-3);
+    padding:var(--space-4); border:1px solid var(--accent); background:var(--accent-soft); border-radius:var(--radius-md); }
+  .resolved.notready { border-color:var(--border-subtle); background:var(--surface-input); }
+  .r-name { font-size:1rem; font-weight:650; }
+  .r-meta { font-size:0.82rem; color:var(--text-muted); margin-top:3px; }
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:0.8rem; font-weight:600; padding:4px 12px;
+    border-radius:var(--radius-pill); }
+  .pill.ok { color:var(--success); background:var(--success-soft); }
+  .pill-dot { width:7px; height:7px; border-radius:50%; background:currentColor; }
+  .btn { border:none; border-radius:var(--radius-sm); font:inherit; font-size:0.85rem; font-weight:600; padding:9px 18px;
+    cursor:pointer; background:var(--accent-gradient); color:#fff; box-shadow:0 8px 24px rgba(110,118,255,0.35); white-space:nowrap; }
+  .ram-warn { margin-top:var(--space-3); font-size:0.82rem; color:var(--warning); }
+  .auto-note { margin-top:var(--space-4); font-size:0.82rem; color:var(--text-muted); line-height:1.5;
+    padding-top:var(--space-3); border-top:1px solid var(--border-subtle); }
+  .auto-note b { color:var(--text-secondary); }
+  .adv-link { margin-top:var(--space-3); display:inline-block; font-size:0.82rem; color:var(--accent-hover); cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="proto-note"><b>Prototyp.</b> Przeciągaj <b>slider effort</b> i przełączaj rodzinę (Multilingual / Polish). To zastąpi listę 6 modeli i dropdowny — jeden slider „im więcej, tym cięższy/mądrzejszy model", pod spodem konkretny rozwiązany model. W stylu Claude.</div>
+
+<div class="shell">
+  <div class="card">
+    <div class="head">
+      <h3>On-device model</h3>
+      <p class="sub">Runs your notes &amp; answers fully on this Mac. More effort = a heavier, smarter model — slower and needs more RAM.</p>
+    </div>
+
+    <!-- family -->
+    <div class="block">
+      <div class="row-between"><span class="label">Language</span></div>
+      <div class="seg" id="fam">
+        <button data-fam="multi" class="on">🌍 Multilingual</button>
+        <button data-fam="pl">🇵🇱 Polish-native</button>
+      </div>
+    </div>
+
+    <!-- effort slider -->
+    <div class="block">
+      <div class="row-between"><span class="label">Effort</span><span class="r-meta" id="effortLabel"></span></div>
+      <div class="slider-wrap">
+        <input type="range" id="slider" min="0" max="2" step="1" value="1" />
+        <div class="ends"><span>⚡ Faster</span><span>Smarter 🧠</span></div>
+        <div class="ticks" id="ticks"></div>
+      </div>
+
+      <!-- resolved -->
+      <div class="resolved" id="resolved"></div>
+      <div id="ramWarn"></div>
+
+      <div class="auto-note">
+        <b>Live reactions</b> during the meeting always use the smallest model of your family (<span id="liteName"></span>) — fast, low-RAM, automatic.
+      </div>
+      <span class="adv-link">＋ Use a custom GGUF file instead</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const FAM = {
+  multi: { name:"Multilingual", lite:"Qwen3 1.7B", models:[
+    { id:"qwen3-1.7b", name:"Qwen3 1.7B", size:"1.0 GB", ram:10, ramLabel:"≥4 GB RAM", downloaded:true, effort:"Faster · lighter" },
+    { id:"qwen3-4b",   name:"Qwen3 4B Instruct 2507", size:"2.3 GB", ram:6, ramLabel:"≥6 GB RAM", downloaded:true, effort:"Balanced" },
+    { id:"qwen3-14b",  name:"Qwen3 14B", size:"9.0 GB", ram:14, ramLabel:"≥14 GB RAM", downloaded:false, effort:"Smarter · heavier" },
+  ]},
+  pl: { name:"Polish-native", lite:"Bielik 1.5B v3", models:[
+    { id:"bielik-1.5b", name:"Bielik 1.5B v3", size:"1.5 GB", ram:4, ramLabel:"≥4 GB RAM", downloaded:false, effort:"Faster · lighter" },
+    { id:"bielik-4.5b", name:"Bielik 4.5B v3", size:"4.6 GB", ram:10, ramLabel:"≥10 GB RAM", downloaded:false, effort:"Balanced" },
+    { id:"bielik-11b",  name:"Bielik 11B v3", size:"6.7 GB", ram:10, ramLabel:"≥10 GB RAM", downloaded:true, effort:"Smarter · heavier" },
+  ]},
+};
+const MAC_RAM = 8; // pretend this Mac has 8 GB, to show the RAM warning on the heaviest
+let fam = "multi", pos = 1;
+
+function render(){
+  const f = FAM[fam], m = f.models[pos];
+  document.getElementById("effortLabel").textContent = m.effort;
+  document.getElementById("liteName").textContent = f.lite;
+
+  const slider = document.getElementById("slider");
+  slider.style.setProperty("--fill", (pos/2*100)+"%");
+
+  document.getElementById("ticks").innerHTML = f.models.map((mm,i)=>
+    `<span class="tick ${i===pos?"on":""}">${mm.size}</span>`).join("");
+
+  const ready = m.downloaded;
+  document.getElementById("resolved").className = "resolved" + (ready?"":" notready");
+  document.getElementById("resolved").innerHTML = `
+    <div>
+      <div class="r-name">${m.name}</div>
+      <div class="r-meta">${f.name} · ${m.size} · needs ${m.ramLabel}</div>
+    </div>
+    ${ready ? `<span class="pill ok"><span class="pill-dot"></span>Ready</span>`
+            : `<button class="btn">Download ${m.size}</button>`}`;
+
+  document.getElementById("ramWarn").innerHTML = (m.ram > MAC_RAM)
+    ? `<div class="ram-warn">⚠ ${m.name} needs ${m.ramLabel} — may be slow alongside recording on this Mac (${MAC_RAM} GB).</div>` : "";
+}
+document.getElementById("fam").addEventListener("click", e=>{
+  const b = e.target.closest("[data-fam]"); if(!b) return;
+  fam = b.dataset.fam;
+  document.querySelectorAll("#fam button").forEach(x=>x.classList.toggle("on", x===b));
+  render();
+});
+document.getElementById("slider").addEventListener("input", e=>{ pos = +e.target.value; render(); });
+render();
+</script>
+</body>
+</html>
