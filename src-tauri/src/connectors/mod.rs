@@ -27,6 +27,7 @@
 //! result snippets, or the API key.
 
 pub mod calendar;
+pub mod jira;
 pub mod web;
 
 use std::sync::Arc;
@@ -159,6 +160,9 @@ impl ConnectorRegistry {
     pub fn build(config: &AppConfig) -> Self {
         let mut connectors: Vec<Box<dyn Connector>> = Vec::new();
         if let Some(c) = web::WebConnector::from_config_if_available(config) {
+            connectors.push(Box::new(c));
+        }
+        if let Some(c) = jira::JiraConnector::from_config_if_available(config) {
             connectors.push(Box::new(c));
         }
         Self {
