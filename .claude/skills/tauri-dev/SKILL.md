@@ -1,12 +1,12 @@
 ---
 name: tauri-dev
-description: Run and iterate Murmur locally (Tauri 2.11 + Angular 18 zoneless). The exact dev-run recipe — MURMUR_DEV_DEK to avoid keychain re-prompts, source ~/.cargo/env, ng on :1420 + MCP on :8765, the dev biometric degradation, the `cargo test --lib`-not-`clippy --all-targets` inner loop, clean-relaunch (pkill + free ports), and reading the boot/abort log. Use whenever the user wants to start/run/serve Murmur in dev, debug a launch/abort, relaunch cleanly, or run the Rust test loop.
+description: Run and iterate Murmur locally (Tauri 2.11 + Angular 22 zoneless). The exact dev-run recipe — MURMUR_DEV_DEK to avoid keychain re-prompts, source ~/.cargo/env, ng on :1420 + MCP on :8765, the dev biometric degradation, the `cargo test --lib`-not-`clippy --all-targets` inner loop, clean-relaunch (pkill + free ports), and reading the boot/abort log. Use whenever the user wants to start/run/serve Murmur in dev, debug a launch/abort, relaunch cleanly, or run the Rust test loop.
 ---
 
 # /tauri-dev — run & iterate Murmur in dev
 
 Murmur is a Tauri 2.11 desktop app: a Rust core (crate `murmur`, bin `Murmur`, lib
-`meetnotes_lib`) hosting an Angular 18 **zoneless** webview. `npm run dev` (= `tauri dev`)
+`meetnotes_lib`) hosting an Angular 22 **zoneless** webview. `npm run dev` (= `tauri dev`)
 builds the Rust binary, serves Angular on **http://localhost:1420**, and the app boots the
 read-only MCP server on **127.0.0.1:8765**.
 

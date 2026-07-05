@@ -24,7 +24,6 @@ type Range = (typeof RANGES)[number];
  */
 @Component({
   selector: "app-egress-ledger",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./egress-ledger.component.html",
   styleUrl: "./egress-ledger.component.scss",
@@ -88,8 +87,8 @@ export class EgressLedgerComponent {
     return r.email + r.card + r.phone + r.name;
   });
 
-  // T1 — this effect writes `loading` / `error` / `_ledger` (all signals) before
-  // and after the async IPC call, so `allowSignalWrites` is REQUIRED in Angular 18.
+  // This effect writes `loading` / `error` / `_ledger` (all signals) before and
+  // after the async IPC call — signal writes in effects are allowed since Angular 19.
   private readonly _load = effect(
     () => {
       const d = this.days();
@@ -100,7 +99,6 @@ export class EgressLedgerComponent {
       this._ledger.set(null);
       void this.fetch(d);
     },
-    { allowSignalWrites: true },
   );
 
   /** Compact token formatter: ≥1 000 → "1.2k", ≥1 000 000 → "1.2M". */

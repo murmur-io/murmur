@@ -11,7 +11,6 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import { RouterLink } from "@angular/router";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import type {
@@ -72,9 +71,8 @@ const STARTERS: readonly string[] = [
  */
 @Component({
   selector: "app-ask",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, MarkdownComponent, SourcesComponent],
+  imports: [MarkdownComponent, SourcesComponent],
   templateUrl: "./ask.component.html",
   styleUrl: "./ask.component.scss",
 })

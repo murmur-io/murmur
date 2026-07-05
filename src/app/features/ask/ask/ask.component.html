@@ -93,7 +93,7 @@
               @if (turn.role === "assistant" && turn.sources?.length) {
                 <app-sources
                   class="ask-sources"
-                  [sources]="turn.sources ?? []"
+                  [sources]="turn.sources"
                 />
               }
             </div>

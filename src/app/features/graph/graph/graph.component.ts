@@ -38,7 +38,6 @@ interface DirectorySection {
  */
 @Component({
   selector: "app-graph",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [EntityCardComponent, EntityDetailComponent],
   templateUrl: "./graph.component.html",
@@ -138,7 +137,6 @@ export class GraphComponent {
     },
     // fetchGraph() writes the loading/error/data signals (synchronously before
     // its first await), so this tracked effect must be allowed to write.
-    { allowSignalWrites: true },
   );
 
   private async fetchGraph(): Promise<void> {

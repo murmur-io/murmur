@@ -44,7 +44,6 @@ type Family = "multi" | "pl";
  */
 @Component({
   selector: "app-model-effort-picker",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [],
   templateUrl: "./model-effort-picker.component.html",

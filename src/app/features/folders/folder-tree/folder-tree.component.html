@@ -10,7 +10,7 @@
       appFolderDrop
       [dropFolderId]="null"
       (dropNote)="dropNote.emit({ meetingId: $event, folderId: null })"
-      (click)="select.emit(null)"
+      (click)="selected.emit(null)"
     >
       <span class="root-icon" aria-hidden="true">
         <!-- Same CLOSED folder outline as the per-folder rows (the old
@@ -41,7 +41,7 @@
       [node]="node"
       [selectedId]="selectedId()"
       [depth]="depth()"
-      (select)="select.emit($event)"
+      (selected)="selected.emit($event)"
       (dropNote)="dropNote.emit($event)"
     />
   } @empty {

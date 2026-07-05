@@ -23,7 +23,6 @@ export type ShellIcon =
  */
 @Component({
   selector: "mur-icon",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./icon.component.html",
   styleUrl: "./icon.component.scss",

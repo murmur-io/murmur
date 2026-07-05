@@ -17,7 +17,6 @@ import { SettingsStore } from "../../../settings.store";
  */
 @Component({
   selector: "app-ai-privacy-strip",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./ai-privacy-strip.component.html",
   styleUrl: "./ai-privacy-strip.component.scss",

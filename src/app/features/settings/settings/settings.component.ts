@@ -62,7 +62,6 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
  */
 @Component({
   selector: "app-settings",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   // Esc in settings backs out ("← Murmur") — but NOT while you're typing: in the
   // search box Esc clears/blurs it first, and it never hijacks another form field.

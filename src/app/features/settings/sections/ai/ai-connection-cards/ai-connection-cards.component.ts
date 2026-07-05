@@ -42,7 +42,6 @@ const CONNECTIONS: readonly ConnectionDef[] = [
  */
 @Component({
   selector: "app-ai-connection-cards",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [AiConnectionCardComponent, BrainEngineCardComponent],
   templateUrl: "./ai-connection-cards.component.html",

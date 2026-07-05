@@ -34,13 +34,12 @@ import type {
  *
  * The IPC call is a one-shot awaited promise (not a data stream), loaded imperatively
  * inside an `effect()` that tracks the input signal — a stale-result guard drops a
- * response that resolves after the id moved on (fast neighbour-to-neighbour pivots),
- * and `allowSignalWrites` is required because loading/error are written synchronously
- * inside that tracked effect (NG0600 guard). Mirrors `entity-detail.component.ts`.
+ * response that resolves after the id moved on (fast neighbour-to-neighbour pivots);
+ * loading/error are written synchronously inside that tracked effect (allowed since
+ * Angular 19). Mirrors `entity-detail.component.ts`.
  */
 @Component({
   selector: "app-person-dossier",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./person-dossier.component.html",
@@ -52,9 +51,9 @@ export class PersonDossierComponent {
   /** The person/entity to build the dossier for; changing it re-loads the pane. */
   readonly entityId = input.required<string>();
   /** Emits when the user picks a neighbour — the container re-selects it. */
-  readonly select = output<string>();
+  readonly selected = output<string>();
   /** Emits when the user dismisses the pane. */
-  readonly close = output<void>();
+  readonly closed = output<void>();
 
   readonly dossier = signal<DossierData | null>(null);
   readonly loading = signal(false);
@@ -93,7 +92,7 @@ export class PersonDossierComponent {
    * promise, so we await it inside an effect that tracks the input signal — a
    * stale-result guard drops responses that resolve after the id moved on (fast
    * neighbour-to-neighbour pivots), so the pane never shows mismatched data.
-   * `allowSignalWrites` because loading/error are set synchronously here (NG0600).
+   * loading/error are set synchronously here (fine since Angular 19).
    */
   private readonly _load = effect(
     () => {
@@ -102,7 +101,6 @@ export class PersonDossierComponent {
       this.error.set(null);
       void this.fetch(id);
     },
-    { allowSignalWrites: true },
   );
 
   private async fetch(id: string): Promise<void> {

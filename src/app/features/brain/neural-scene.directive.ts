@@ -234,7 +234,6 @@ function parseColor(raw: string, fallback: Rgb): Rgb {
  */
 @Directive({
   selector: "canvas[appNeuralScene]",
-  standalone: true,
   host: {
     "[style.cursor]": "cursor()",
     "(pointerdown)": "onPointerDown($event)",
@@ -411,8 +410,8 @@ export class NeuralSceneDirective {
     this.ro.observe(this.hostRef.nativeElement);
 
     // Rebuild render caches when the graph inputs change; clears a stale hover
-    // (a signal WRITE inside a tracked effect → allowSignalWrites, the Angular
-    // 18 NG0600 guard). The hover read is untracked so hovering doesn't rebuild.
+    // (a signal write inside a tracked effect — allowed since Angular 19).
+    // The hover read is untracked so hovering doesn't rebuild.
     effect(
       () => {
         const nodes = this.sceneNodes();
@@ -428,7 +427,6 @@ export class NeuralSceneDirective {
         }
         this.invalidate();
       },
-      { allowSignalWrites: true },
     );
 
     // Ease the 3d↔2d morph on mode change (snapped under reduced motion).

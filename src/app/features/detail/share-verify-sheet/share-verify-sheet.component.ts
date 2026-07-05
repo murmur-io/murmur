@@ -32,7 +32,6 @@ export type ShareVerifyMode = "first-contact" | "key-changed";
  */
 @Component({
   selector: "app-share-verify-sheet",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./share-verify-sheet.component.html",
   styleUrl: "./share-verify-sheet.component.scss",

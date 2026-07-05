@@ -26,7 +26,6 @@ import { NoteDragService } from "./note-drag.service";
  */
 @Directive({
   selector: "[appFolderDrop]",
-  standalone: true,
   host: {
     "[class.is-drop-target]": "over()",
     "[class.is-drop-armed]": "armed()",

@@ -71,7 +71,6 @@ interface FolderOption {
  */
 @Component({
   selector: "app-brain",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
@@ -311,7 +310,6 @@ export class BrainComponent {
           this.selectedFolderId.set(ALL_FOLDERS_ID);
         }
       },
-      { allowSignalWrites: true },
     );
 
     // (Re)load the OVERVIEW whenever the folder lock-state changes — a session
@@ -323,7 +321,6 @@ export class BrainComponent {
         this.folders.tree();
         void this.fetchOverview();
       },
-      { allowSignalWrites: true },
     );
 
     // (Re)load the document/note LIST whenever the selected folder OR the lock
@@ -346,7 +343,6 @@ export class BrainComponent {
           void this.fetchItems(id);
         }
       },
-      { allowSignalWrites: true },
     );
 
     // (Re)load the GRAPH whenever the folder lock-state changes (mirrors the old
@@ -356,7 +352,6 @@ export class BrainComponent {
         this.folders.tree();
         void this.fetchGraph();
       },
-      { allowSignalWrites: true },
     );
   }
 

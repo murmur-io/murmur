@@ -54,10 +54,10 @@ test.describe("brain-posture-block", () => {
     page,
   }) => {
     // Use subtitle text for Cloud — its title text "Cloud" also appears inside the
-    // Hybrid button's subtitle ("Cloud notes + on-device reactions"), so a bare /Cloud/
-    // would hit two buttons and trigger a strict-mode violation.
+    // Hybrid button's subtitle ("Cloud notes + realtime reactions on this Mac"), so a
+    // bare /Cloud/ would hit two buttons and trigger a strict-mode violation.
     await expect(
-      page.getByRole("button", { name: /Your Default AI does everything/ }),
+      page.getByRole("button", { name: /Your Default engine does everything/ }),
     ).toBeVisible();
     await expect(
       page.getByRole("button", { name: /Hybrid/ }),
@@ -88,12 +88,13 @@ test.describe("brain-posture-block", () => {
     ).toBeVisible({ timeout: 10_000 });
   });
 
-  test("(d) cloud right-now line renders postureStateLine copy", async ({
+  test("(d) cloud meaning line renders postureMeaning copy", async ({
     page,
   }) => {
-    // postureStateLine() for "cloud" = "Claude Code writes everything — ..."
+    // postureMeaning() for "cloud" leads "Cloud." and explains what the
+    // default engine does — the plain-language line under the posture picker.
     await expect(
-      page.getByText(/Claude Code writes everything/),
+      page.getByText(/writes your notes, answers and briefs/),
     ).toBeVisible();
   });
 });

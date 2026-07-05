@@ -17,7 +17,6 @@ import type { VerifyFindingDto } from "../../../core/models";
  */
 @Component({
   selector: "app-verify-panel",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./verify-panel.component.html",
   styleUrl: "./verify-panel.component.scss",

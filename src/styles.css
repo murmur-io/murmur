@@ -207,9 +207,6 @@ app-shell {
   height: 48px;
 }
 
-  50% { transform: scaleY(1); }
-}
-
 /* --- Quick actions (Search ⌘K / New note ⌘N) — the top of the rail --------- */
 .sidebar-quick {
   display: flex;

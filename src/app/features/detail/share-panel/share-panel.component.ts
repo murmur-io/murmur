@@ -67,7 +67,6 @@ export interface LinkShareRow {
  */
 @Component({
   selector: "app-share-panel",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ShareVerifySheetComponent],
   templateUrl: "./share-panel.component.html",
@@ -290,7 +289,7 @@ export class SharePanelComponent {
         }
         void this.refresh();
       },
-      { injector: this.injector, allowSignalWrites: true },
+      { injector: this.injector },
     );
 
     // A meeting change clears the transient created-link + per-session URLs — a
@@ -300,7 +299,7 @@ export class SharePanelComponent {
         this.meetingId();
         this.resetTransient();
       },
-      { injector: this.injector, allowSignalWrites: true },
+      { injector: this.injector },
     );
   }
 

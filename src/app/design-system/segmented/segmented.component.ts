@@ -22,7 +22,6 @@ export interface SegmentOption {
  */
 @Component({
   selector: "mur-segmented",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MurIconComponent],
   templateUrl: "./segmented.component.html",

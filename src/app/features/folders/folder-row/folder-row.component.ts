@@ -49,7 +49,6 @@ import { FolderDropDirective } from "../folder-drop.directive";
  */
 @Component({
   selector: "app-folder-row",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   // `folder-row` ↔ `folder-tree` are mutually recursive standalone components
   // (a row renders its children through another tree). Their ES modules form a
@@ -74,7 +73,7 @@ export class FolderRowComponent {
   readonly depth = input<number>(0);
 
   /** Emits the folder id when this row (or a descendant) is chosen. */
-  readonly select = output<string | null>();
+  readonly selected = output<string | null>();
 
   /** Emits when a dragged meeting is dropped onto this row (or a descendant). */
   readonly dropNote = output<{ meetingId: string; folderId: string | null }>();
@@ -303,7 +302,7 @@ export class FolderRowComponent {
       this.toast.success("Folder deleted. Its notes are in All notes.");
       // If this folder was selected, fall back to the vault root.
       if (this.selectedId() === this.node().id) {
-        this.select.emit(null);
+        this.selected.emit(null);
       }
     } catch {
       this.actionError.set("Couldn’t delete this folder. Please try again.");

@@ -26,7 +26,6 @@ import { OnDeviceIntelligenceBlockComponent } from "../ai/on-device-intelligence
  */
 @Component({
   selector: "app-settings-ai-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     BrainPostureBlockComponent,

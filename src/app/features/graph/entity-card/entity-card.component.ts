@@ -15,7 +15,6 @@ import type { GraphNode } from "../../../core/models";
  */
 @Component({
   selector: "app-entity-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./entity-card.component.html",
   styleUrl: "./entity-card.component.scss",
@@ -26,7 +25,7 @@ export class EntityCardComponent {
   /** Whether this row is the currently-open entity in the detail panel. */
   readonly selected = input(false);
   /** Emits the entity id when the row is chosen. */
-  readonly select = output<string>();
+  readonly entitySelected = output<string>();
 
   protected readonly isProject = computed(
     () => this.entity().kind === "project",
