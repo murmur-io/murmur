@@ -493,6 +493,31 @@ export class IpcService {
     return invoke<boolean>("has_web_search_key");
   }
 
+  /**
+   * brain2 connectors (Phase 2) — grant the one-time consent for JIRA egress. The ONLY
+   * supported way to flip `jiraConsented` true: the backend persists the flag AND updates
+   * its in-memory config cache, so the next brain/Ask answer may expose the Jira connector
+   * (provided Jira is enabled AND configured AND a token is stored). Idempotent. Mirrors
+   * {@link consentToWebSearch}.
+   */
+  consentToJira(): Promise<void> {
+    return invoke<void>("consent_to_jira");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Jira API token in the Keychain. An empty
+   * string clears it. NEVER logged / NEVER returned to the FE — only {@link hasJiraToken}
+   * reports presence. Mirrors {@link setWebSearchApiKey}.
+   */
+  setJiraToken(key: string): Promise<void> {
+    return invoke<void>("set_jira_token", { key });
+  }
+
+  /** Whether a Jira API token is currently stored. Never the value. */
+  hasJiraToken(): Promise<boolean> {
+    return invoke<boolean>("has_jira_token");
+  }
+
   providerStatuses(): Promise<ProviderStatus[]> {
     return invoke<ProviderStatus[]>("provider_statuses");
   }
