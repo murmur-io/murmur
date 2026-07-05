@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      Entitlements for the MAIN Murmur.app bundle ONLY (not the nested Resources/ helpers).
+      It is the hardened-runtime set from entitlements.plist PLUS keychain-access-groups +
+      application-identifier, which the data-protection keychain needs to store the Touch-ID-gated
+      secrets (the per-folder master KEK + the account MK cache — see secrets/keychain.rs).
+
+      keychain-access-groups is a RESTRICTED entitlement: it is authorized by the embedded
+      Developer-ID provisioning profile (Contents/embedded.provisionprofile, generated in the Apple
+      portal for App ID com.meetnotes.app, copied into the bundle by scripts/macos-sign-notarize.sh).
+      Without the profile the kernel AMFI-kills launch even though codesign + notarization pass — so
+      this file MUST only ever be paired with the embedded profile. The nested helpers (meetnotes-*)
+      have NO profile, so they keep signing with the plain entitlements.plist (no keychain group) or
+      they would be AMFI-killed too.
+    -->
+
+    <!-- WKWebView / JS engine under hardened runtime -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- ScreenCaptureKit sidecar + whisper.cpp / Metal dylibs are not Team-signed -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Microphone capture (mic TCC) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Local Calendar read via the bundled meetnotes-calendar EventKit helper -->
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+
+    <!-- Data-protection keychain access group for the biometric KEK + account MK. Authorized by the
+         embedded Developer-ID provisioning profile (which grants keychain-access-groups BVF778E5QD.*). -->
+    <key>com.apple.application-identifier</key>
+    <string>BVF778E5QD.com.meetnotes.app</string>
+    <key>keychain-access-groups</key>
+    <array>
+      <string>BVF778E5QD.com.meetnotes.app</string>
+    </array>
+  </dict>
+</plist>
