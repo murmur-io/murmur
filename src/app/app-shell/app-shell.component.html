@@ -7,25 +7,6 @@
            lets the user move the window. -->
       <div class="sidebar-drag" data-tauri-drag-region></div>
 
-      <a class="brand" routerLink="/record" aria-label="Murmur — home">
-        <span class="brand-mark" aria-hidden="true">
-          <svg class="brand-wave" viewBox="0 0 28 28" fill="none">
-            <defs>
-              <linearGradient id="murmurWave" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#6e76ff" />
-                <stop offset="1" stop-color="#9d7bff" />
-              </linearGradient>
-            </defs>
-            <rect class="bar b1" x="4.4" y="10" width="2.4" height="8" rx="1.2" />
-            <rect class="bar b2" x="8.4" y="7" width="2.4" height="14" rx="1.2" />
-            <rect class="bar b3" x="12.4" y="4" width="2.4" height="20" rx="1.2" />
-            <rect class="bar b4" x="16.4" y="7" width="2.4" height="14" rx="1.2" />
-            <rect class="bar b5" x="20.4" y="10" width="2.4" height="8" rx="1.2" />
-          </svg>
-        </span>
-        <span class="brand-word">murmur</span>
-      </a>
-
       <!-- Quick actions (Apple TV puts Search first in the rail). -->
       <div class="sidebar-quick">
         <button type="button" class="quick-row" (click)="openSearch()">
