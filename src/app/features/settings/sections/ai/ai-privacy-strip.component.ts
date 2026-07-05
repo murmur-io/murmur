@@ -43,6 +43,21 @@ import { SettingsStore } from "../../settings.store";
               {{ dest.connection }} → {{ dest.destination }}
             </span>
           </div>
+          <!--
+            Honest caveat (fast-follow #3): personal-NAME masking is best-effort
+            and only active once the optional on-device NER model is downloaded.
+            Emails / phones / cards are always regex-scrubbed regardless. Shown
+            only when text actually leaves the Mac AND the model is absent — a
+            calm nudge, not an alarm. Enable it in the Privacy section.
+          -->
+          @if (nerModelPresent() === false) {
+            <p class="strip-subnote text-muted">
+              Personal names aren't masked before this leaves your Mac yet —
+              on-device name masking needs the optional model, and names are only
+              masked once it's downloaded (in Privacy &amp; integrations). Emails,
+              phone numbers and card numbers are always scrubbed.
+            </p>
+          }
         }
       </div>
 
@@ -151,6 +166,13 @@ import { SettingsStore } from "../../settings.store";
         color: var(--text-primary);
         font-weight: 550;
       }
+      /* Honest name-masking caveat — aligned under the cloud line, calm. */
+      .strip-subnote {
+        margin: 0;
+        padding-left: calc(8px + var(--space-2));
+        font-size: 0.82rem;
+        line-height: 1.5;
+      }
       .strip-dot {
         width: 8px;
         height: 8px;
@@ -230,6 +252,12 @@ export class AiPrivacyStripComponent {
   readonly revoking = this.store.revoking;
   readonly revokeError = this.store.revokeError;
   readonly defaultEgressDestination = this.store.defaultEgressDestination;
+  /**
+   * Whether the on-device PERSON-name NER model is present. `false` (not `null`)
+   * gates the honest name-masking caveat, so it never flashes during the
+   * initial "not yet checked" window.
+   */
+  readonly nerModelPresent = this.store.nerModelPresent;
 
   /** True while the inline "Really revoke?" confirm step is showing. */
   readonly confirmingRevoke = signal(false);
