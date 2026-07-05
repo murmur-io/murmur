@@ -29,7 +29,8 @@ interface RoleRowVm {
   readonly connCtrl: string;
   readonly modelCtrl: string;
   readonly effortCtrl: string;
-  /** Ask/Live only — the Notes row must NOT offer Local/Off (see template comment). */
+  /** Whether to offer the "Off — retrieval only" target (Ask/Live only). Notes can't:
+   *  "off" builds no SummarizerProvider so provider_for refuses it. All roles offer "local". */
   readonly offersReasonerTargets: boolean;
   readonly conn: string;
   readonly isProviderConn: boolean;
@@ -94,24 +95,27 @@ interface RoleRowVm {
               </div>
 
               <!--
-                The Notes row deliberately offers NO Local/Off: notes, digests,
-                briefs, recipes and the graph are SummarizerProvider surfaces,
-                and the backend's provider_for REFUSES reasoner-only targets
-                for them (every summary would hard-error) — the lock-security
-                carry-over from the stage-3 review. "Local notes" already has
-                a first-class answer: Ollama.
+                EVERY role may run on the built-in on-device model ("local" =
+                LocalSummarizerProvider — exactly what the Fully-local posture
+                sets for Notes/Ask/Live, so the Notes select MUST offer it or its
+                value shows blank on Fully local). Only Ask/Live additionally
+                offer "off" (retrieval-only stub): "off" builds NO
+                SummarizerProvider, so provider_for REFUSES it for Notes (every
+                summary would hard-error) — hence it stays gated behind
+                offersReasonerTargets. (roles.rs: local builds a summarizer,
+                off/apple do not.)
               -->
               <select
                 [formControlName]="row.connCtrl"
                 (change)="onConnectionChange(row.role, $event)"
               >
                 <option value="">Inherit default</option>
-                @if (row.offersReasonerTargets) {
-                  <optgroup label="Built-in (on this Mac)">
-                    <option value="local">Murmur Brain — on-device</option>
+                <optgroup label="Built-in (on this Mac)">
+                  <option value="local">Murmur Brain — on-device</option>
+                  @if (row.offersReasonerTargets) {
                     <option value="off">Off — retrieval only</option>
-                  </optgroup>
-                }
+                  }
+                </optgroup>
                 <optgroup label="Your engines">
                   <option value="claude_code">Claude Code</option>
                   <option value="anthropic">Anthropic API</option>
@@ -207,7 +211,7 @@ interface RoleRowVm {
                 } @else {
                   <span class="field-help text-muted">
                     Runs on-device with the shared local model — pick or
-                    download it under Local models below.
+                    download it under Engines → On this Mac → Configure.
                   </span>
                 }
               }
@@ -221,7 +225,7 @@ interface RoleRowVm {
           -->
           @if (anyLocal()) {
             <p class="field-help text-muted">
-              On-device models are managed under Engines above (Murmur Brain →
+              On-device models are managed under Engines above (On this Mac →
               Configure).
             </p>
           }
