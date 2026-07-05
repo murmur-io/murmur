@@ -165,10 +165,50 @@
           type="button"
           class="btn btn-primary lock-gate-btn"
           (click)="unlock()"
-          [disabled]="unlocking()"
+          [disabled]="unlocking() || discarding()"
         >
           {{ unlocking() ? "Unlocking…" : "🔒 Unlock (Touch ID)" }}
         </button>
+
+        <!-- Escape hatch: only after an unlock attempt FAILED (the key may be gone). The backend
+             re-proves non-recoverability and REFUSES if the folder is actually recoverable, so
+             this can never destroy openable content. Two-step inline confirm (no browser dialog). -->
+        @if (unlockFailed()) {
+          @if (!confirmDiscard()) {
+            <button
+              type="button"
+              class="btn btn-ghost lock-gate-reset"
+              (click)="confirmDiscard.set(true)"
+              [disabled]="discarding()"
+            >
+              Can’t unlock? Reset this folder…
+            </button>
+          } @else {
+            <p class="empty lock-gate-copy lock-gate-reset-warn">
+              If the key is truly lost, this permanently deletes this folder’s
+              locked notes, transcripts and audio. It only proceeds if the key
+              really can’t be recovered.
+            </p>
+            <div class="lock-gate-reset-actions">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="confirmDiscard.set(false)"
+                [disabled]="discarding()"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-danger"
+                (click)="discardLock()"
+                [disabled]="discarding()"
+              >
+                {{ discarding() ? "Resetting…" : "Reset folder (delete contents)" }}
+              </button>
+            </div>
+          }
+        }
       </div>
     } @else {
       <!-- TAB BAR (Note · Audio · Share) — page-scale segmented control. -->

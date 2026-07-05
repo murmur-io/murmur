@@ -173,6 +173,38 @@ pub struct NoteRecord {
     pub gateway_host: Option<String>,
 }
 
+/// Re-Truth (the vault heals itself) — one SUPERSESSION row: a fact asserted in `superseding_meeting_id`
+/// INVALIDATED an older fact sourced in `source_meeting_id`. Surfaced for REVIEW; the user one-taps to
+/// APPEND an Obsidian callout to the source note (never mangling prose). Append-only is the safe
+/// verify-before-destroy shape: no existing bytes are touched, and the exact pre-image bytes of each
+/// stamped note are captured (`*_pre_image`) so `undo_supersessions` restores them BYTE-IDENTICAL —
+/// the owned-files promise. `applied_at` NULL ⇒ pending; `Some` ⇒ stamped. This is DERIVED,
+/// meeting-anchored state: `delete_meeting` purges every row referencing either meeting
+/// (`purge_supersessions_tx`), and the read command is folder-lock + `meeting_is_unlocked` gated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupersessionRow {
+    pub id: String,
+    /// The NEWER meeting whose fact superseded the older one (the review anchor).
+    pub superseding_meeting_id: String,
+    /// The OLDER meeting whose note sourced the now-invalidated fact (the note we stamp).
+    pub source_meeting_id: String,
+    /// The fact's subject (entity name), e.g. "Project Atlas".
+    pub entity: String,
+    pub predicate: String,
+    /// The value that WAS true (now closed).
+    pub old_value: String,
+    /// The value that IS true (the superseding assertion).
+    pub new_value: String,
+    pub created_at: String,
+    /// `None` while pending; the stamp instant once applied.
+    pub applied_at: Option<String>,
+    /// Exact source-note bytes captured at apply, for byte-identical undo. `None` until applied.
+    pub source_pre_image: Option<Vec<u8>>,
+    /// Exact superseding-note bytes captured at apply (when its backlink was stamped). `None`
+    /// until applied, or when the superseding note's folder was locked at apply (skipped).
+    pub superseding_pre_image: Option<Vec<u8>>,
+}
+
 /// A DURABLE resume record for a mode-B share whose server row was flipped to `accepted` but whose
 /// local verify+ingest has NOT yet committed (spec §7 accept invariant). Persisted between the server
 /// flip and the vault write so a post-flip failure (network / crash) is RECOVERABLE: the server no

@@ -52,6 +52,23 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-05 landing/API deploy] GitHub Pages + Railway custom-domain flow
+- **Pattern:** The public launch path split across two hosts and two repos: landing lives in
+  `murmur-io/murmur` GitHub Pages on `murmurnotes.io`, while the zero-knowledge relay lives in
+  `murmur-io/murmur-server` Railway on `api.murmurnotes.io`. Both can look "configured" before their
+  certificates are actually live: Railway needed the `_railway-verify.api` TXT plus CNAME, and GitHub
+  Pages needed `landing/CNAME` in the workflow artifact plus a remove/re-add of the custom domain
+  before certificate issuance moved from "does not exist yet" to issued.
+- **Caught by:** operator (public DNS, Railway domain status, GitHub Pages API, `curl -I`, and
+  `openssl s_client`).
+- **Lesson:** Treat DNS, provider-domain status, and browser HTTPS as separate gates. For API, require
+  `api CNAME -> k9sfnbwk.up.railway.app`, `_railway-verify.api` TXT, Railway `verified=true`, cert
+  `VALID`, and `https://api.murmurnotes.io/healthz` 200. For landing, require apex GitHub A records,
+  `www CNAME -> murmur-io.github.io`, `landing/CNAME`, Pages deploy green, Pages `https_enforced=true`,
+  and cert SAN covering both `murmurnotes.io` and `www.murmurnotes.io`. Full runbook:
+  `.claude/learnings/landing-api-deploy.md`.
+- **Status:** success-pattern
+
 ### [2026-07-05 sharing session — #194/#195/#196 + murmur-server #4/#5] password links + Touch ID + detail redesign
 - **Pattern:** (a) A `build-detail-redesign` workflow's Split phase agent DIED mid-response → the tree
   was left with panel components created-but-unwired + a hard syntax error in `share-panel` (backticks
@@ -79,4 +96,5 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 - **Lesson:** A branded domain is polish; if the cert won't validate, DEFER (the `*.up.railway.app`
   URL works), delete the stuck domain so it's not "pending", and document Plan B (Cloudflare proxy +
   SSL Full, but disable Rocket-Loader/Email-Obfuscation or they break the strict-CSP viewer).
-- **Status:** journal
+- **Status:** superseded by `2026-07-05 landing/API deploy` (final fix was CNAME + TXT +
+  wait/poll; cert became `CERTIFICATE_STATUS_TYPE_VALID`)

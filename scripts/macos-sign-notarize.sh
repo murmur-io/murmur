@@ -36,6 +36,22 @@ OUT_DMG="$HOME/Desktop/Murmur-$VERSION.dmg"
 [ -f "$ENTITLEMENTS_APP" ] || { echo "missing $ENTITLEMENTS_APP" >&2; exit 1; }
 [ -f "$PROFILE" ] || { echo "missing provisioning profile $PROFILE" >&2; exit 1; }
 
+# PREFLIGHT: the DP-keychain ACL items (biometric master KEK + account MK) need the RESTRICTED
+# keychain-access-groups entitlement, authorized ONLY by this embedded provisioning profile. A
+# missing/EXPIRED/mismatched profile AMFI-kills launch even though codesign + notarization pass
+# (the 0.7.1 incident). Fail the build NOW rather than ship a bundle that dies on the user's Mac.
+PROFILE_EXP="$(security cms -D -i "$PROFILE" 2>/dev/null | plutil -extract ExpirationDate raw - 2>/dev/null || true)"
+if [ -n "$PROFILE_EXP" ]; then
+  # ExpirationDate is ISO-8601 (e.g. 2027-01-01T00:00:00Z). Compare epoch seconds.
+  EXP_EPOCH="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$PROFILE_EXP" +%s 2>/dev/null || echo 0)"
+  NOW_EPOCH="$(date +%s)"
+  if [ "$EXP_EPOCH" != "0" ] && [ "$EXP_EPOCH" -le "$NOW_EPOCH" ]; then
+    echo "provisioning profile EXPIRED ($PROFILE_EXP) — regenerate the Developer-ID profile before releasing" >&2
+    exit 1
+  fi
+  echo "   provisioning profile valid until $PROFILE_EXP"
+fi
+
 # Notarization auth: prefer a stored profile, else require the apple-id trio.
 NOTARY_ARGS=()
 if [ -n "${NOTARY_PROFILE:-}" ]; then
@@ -81,6 +97,17 @@ done
 codesign --force --options runtime --timestamp \
   --entitlements "$ENTITLEMENTS_APP" --sign "$DEVELOPER_ID" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
+
+# POST-SIGN ASSERTION: prove the shipped bundle actually carries the keychain-access-groups
+# entitlement AND the embedded profile — the two things whose absence silently AMFI-kills launch
+# despite a passing codesign/notarization. Fail loudly here instead of on the user's Mac.
+[ -f "$APP/Contents/embedded.provisionprofile" ] || {
+  echo "signed app is MISSING Contents/embedded.provisionprofile — launch would be AMFI-killed" >&2; exit 1; }
+if ! codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "keychain-access-groups"; then
+  echo "signed app is MISSING the keychain-access-groups entitlement — biometric lock/sharing would fail (and launch may be AMFI-killed)" >&2
+  exit 1
+fi
+echo "   verified: embedded profile present + keychain-access-groups entitlement signed in"
 
 echo "3) Building the DMG (with Applications alias)…"
 STAGE="$(mktemp -d)/Murmur"
