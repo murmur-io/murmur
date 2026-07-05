@@ -17,9 +17,17 @@ your own work.**
 
 - **Stack:** Angular `^18.2.0`, **zoneless**
   (`provideExperimentalZonelessChangeDetection()` in `src/app/app.config.ts`),
-  standalone components, signals. Single-file components: inline `template` +
-  inline `styles: [\`…\`]` (no `templateUrl`/`styleUrl`). Build/serve on
+  standalone components, signals. **Directory per component** (changed
+  2026-07-04, user-approved): `name/name.component.ts` + `name.component.html`
+  (`templateUrl`) + `name.component.scss` (`styleUrl`) — never inline
+  template/styles, never a single-file component. Build/serve on
   `http://localhost:1420` (`npm start` = `ng serve --port 1420`).
+- **Design language = macOS Liquid Glass** (see `angular-zoneless.md` §6b):
+  every NEW view models on the glass chrome — tokens from
+  `src/design-tokens/*.css` ONLY (a value with no token gets a NEW token
+  there, with its light override — never a raw hex/px in component scss);
+  reusable/atomic components go in `src/app/design-system/` with the `mur-`
+  selector prefix (form controls as ControlValueAccessors).
 - **No NgRx, no facade, no HTTP data layer.** The UI talks to the Rust core
   ONLY through **`src/app/core/ipc.service.ts`** — a thin wrapper over
   `@tauri-apps/api` `invoke`/`listen`, ONE typed method per Tauri command
@@ -91,9 +99,11 @@ this agent exists to uphold. The non-negotiables:
    input change, with a stale-result guard when an input can change mid-flight).
    Default to `computed`; reach for `effect` + `allowSignalWrites` only for async
    orchestration. Expose writable signals as `.asReadonly()`.
-3. **Implement small, match the tree.** Standalone + `OnPush` + inline
-   template/styles. Reuse global primitives and tokens; keep inline styles under
-   the 16 kB budget. Inline SVG for icons.
+3. **Implement small, match the tree.** Standalone + `OnPush`, directory per
+   component with split `ts/html/scss`. Reuse the `mur-*` design-system
+   components and `primitives.css` classes before writing new CSS; every
+   variable from `src/design-tokens/`; keep component scss under the 16 kB
+   budget. Inline SVG for icons (or `<mur-icon>` when the glyph exists).
 4. **Keep the gates green as you go.** Run `npx ng lint` and `npx ng build`
    after meaningful edits and fix every warning/error (the style budget and the
    inline-template lint rules both fail the build). Do NOT run `cargo` for a

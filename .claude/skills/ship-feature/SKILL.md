@@ -70,9 +70,15 @@ the conventions explicitly). Iterate with `/tauri-dev` (`MURMUR_DEV_DEK` recipe,
 **Angular (zoneless) rules:** standalone + `OnPush` + signals/`computed`/`effect` +
 `inject()` + `input()`/`output()`/`viewChild()`; `@if`/`@for`/`@switch` ONLY (no
 `*ngIf`/`*ngFor`); `toSignal()` for IPC streams (NEVER subscribe-for-state);
-`afterNextRender()`/`afterRenderEffect()` (NEVER `setTimeout` in components); inline
-template + styles; `var(--token)` CSS (no hardcoded hex/px); ≤16 kB per-component style
-budget; inline SVG icons; **no new npm packages without explicit user approval.** Banned:
+`afterNextRender()`/`afterRenderEffect()` (NEVER `setTimeout` in components); **directory
+per component with split `ts` + `html` + `scss` files** (`templateUrl`/`styleUrl` — no inline
+template/styles); **Liquid Glass design language** for every new view (glass tokens, aurora
+ambient, neutral chrome — see `angular-zoneless.md` §6b); `var(--token)` CSS with every
+variable living in `src/design-tokens/` (a missing value = add a token there, incl. its light
+override — never a raw hex/px in component scss); reusable/atomic components belong in
+`src/app/design-system/` under the `mur-` prefix (form controls as CVAs); ≤16 kB
+per-component style budget; inline SVG icons or `<mur-icon>`; **no new npm packages without
+explicit user approval.** Banned:
 `markForCheck`, `@Input`/`@Output`/`EventEmitter`, `@ViewChild`, `BehaviorSubject`-as-state,
 constructor injection.
 

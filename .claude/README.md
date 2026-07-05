@@ -46,7 +46,7 @@ until the ship-feature gates emit `.claude/tmp/<task>/*.json`; flip with `MURMUR
   runs. Deferred to avoid a noisy Stop hook layered on the existing user-global one; revisit for long
   autonomy sessions.
 - **PostToolUse TS/Angular auto-format** — intentionally NOT added; a blind prettier pass fights the
-  zoneless rules (inline templates, per-component style budget). `npx ng lint` stays the FE formatter.
+  zoneless rules (dir-per-component ts/html/scss, per-component style budget). `npx ng lint` stays the FE formatter.
 - **`.mcp.json` (checked-in MCP servers)** — none needed yet; MCP tools reach the session already.
 - **GitHub Action SAST** (`anthropics/claude-code-security-review`) — cloud-bound + needs an API-key
   secret; out of step with local-first + solo. One YAML file away if desired.

@@ -26,6 +26,14 @@
 - **Side effects:** `afterNextRender(fn, { injector })` for focus/scroll/measure — never
   `setTimeout`/`rAF` in a component. Observers live in a directive with `DestroyRef.onDestroy`.
 - **No new npm packages** without explicit user approval.
+- **Directory per component** (2026-07-04, user-approved): `name/name.component.{ts,html,scss}`
+  with `templateUrl`/`styleUrl` — never inline template/styles. Exemplars in
+  `src/app/design-system/`.
+- **Liquid Glass + tokens + catalog** (rule §6b): new views model on the macOS glass chrome;
+  every design value from `src/design-tokens/*.css` (missing value → ADD a token there with its
+  light override, never a raw hex/px in scss); reusable/atomic components go in
+  `src/app/design-system/` under the `mur-` prefix (form controls as CVAs — check the 14-strong
+  catalog + `primitives.css` before rolling a one-off).
 - **Verify live**, not just by build: drive `:1420` with a mocked
   `window.__TAURI_INTERNALS__.invoke`; Playwright defaults colorScheme LIGHT — eyeball the PNG,
   don't trust a shallow shell screenshot.
