@@ -237,6 +237,12 @@
             (copyPath)="copy(d.note?.exportedPath ?? '')"
             (openRelated)="openRelated($event)"
           />
+          @if (config()?.jiraEnabled && config()?.jiraConsented && !locked()) {
+            <app-verify-panel
+              [meetingId]="d.meeting.id"
+              (noteChanged)="reloadDetail()"
+            />
+          }
         }
         @case ("audio") {
           <app-audio-panel

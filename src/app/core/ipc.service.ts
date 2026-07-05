@@ -53,6 +53,7 @@ import type {
   PruneSummary,
   StorageReport,
   UserMemory,
+  VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
   SearchHit,
@@ -174,6 +175,23 @@ export class IpcService {
   /** Replace a meeting's note markdown (in-app edit) + re-write the vault file in place. */
   updateNote(meetingId: string, markdown: string): Promise<NoteDto> {
     return invoke<NoteDto>("update_note", { meetingId, markdown });
+  }
+
+  /**
+   * VERIFY PASS: check the note's Jira ticket claims against LIVE Jira (deterministic — the LLM is
+   * never the judge). On-demand only; rides the Jira connector's enable+consent gate and refuses a
+   * locked meeting. Returns one finding per referenced ticket.
+   */
+  verifyNoteSources(meetingId: string): Promise<VerifyFindingDto[]> {
+    return invoke<VerifyFindingDto[]>("verify_note_sources", { meetingId });
+  }
+
+  /** Persist the reviewed verify findings as non-destructive inline `> ` markers in the note. */
+  applyNoteVerifyMarkers(
+    meetingId: string,
+    findings: VerifyFindingDto[],
+  ): Promise<NoteDto> {
+    return invoke<NoteDto>("apply_note_verify_markers", { meetingId, findings });
   }
 
   getConfig(): Promise<AppConfigDto> {

@@ -16,6 +16,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../../core/ipc.service";
 import type {
+  AppConfigDto,
   AssistantInteraction,
   FolderNode,
   GraphPayload,
@@ -43,6 +44,7 @@ import {
   type ParsedNote,
 } from "../note-panel/note-panel.component";
 import { SharePanelComponent } from "../share-panel/share-panel.component";
+import { VerifyPanelComponent } from "../verify-panel/verify-panel.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
@@ -61,6 +63,7 @@ interface ActionItem {
     NotePanelComponent,
     AudioPanelComponent,
     SharePanelComponent,
+    VerifyPanelComponent,
   ],
   templateUrl: "./detail.component.html",
   styleUrl: "./detail.component.scss",
@@ -78,6 +81,13 @@ export class DetailComponent implements OnInit {
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly msg = signal("");
+
+  /**
+   * Install config snapshot — gates the "Verify with Jira" panel (shown only when
+   * `jiraEnabled && jiraConsented`, and never for a locked meeting). Loaded per
+   * meeting alongside `keepsMasters`; null until the first load resolves.
+   */
+  readonly config = signal<AppConfigDto | null>(null);
 
   // --- Phase 0.5 lock gate -------------------------------------------------
   /**
@@ -375,8 +385,11 @@ export class DetailComponent implements OnInit {
     // actions. Install-global, so load it regardless of lock state (best-effort;
     // a failure simply hides the actions). The backend remains the real gate.
     try {
-      this.keepsMasters.set((await this.ipc.getConfig()).keepHiresMasters);
+      const cfg = await this.ipc.getConfig();
+      this.config.set(cfg);
+      this.keepsMasters.set(cfg.keepHiresMasters);
     } catch {
+      this.config.set(null);
       this.keepsMasters.set(false);
     }
     // Locked (masked) meetings render the lock gate only — skip priming the
@@ -777,6 +790,17 @@ export class DetailComponent implements OnInit {
       this.saveError.set("Couldn’t save: " + String(e));
     } finally {
       this.saving.set(false);
+    }
+  }
+
+  /**
+   * Re-fetch the current meeting into the view — used after the Verify panel writes inline
+   * markers so the rendered note reflects the newly-applied `> ` blockquotes.
+   */
+  async reloadDetail(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (id) {
+      await this.loadMeeting(id);
     }
   }
 
