@@ -99,6 +99,59 @@ impl JiraConnector {
             .collect();
         Ok(hits)
     }
+
+    /// Fetch ONE issue's current state (verify pass). `Ok(None)` on 404 (not found / no access —
+    /// Jira Cloud returns 404 for both). The KEY is validated by the caller (strict issue-key
+    /// shape) — it is an identifier, not free text, so it needs no PII redaction.
+    pub async fn get_issue(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/rest/api/3/issue/{key}?fields=summary,status,duedate",
+                self.base_url
+            ))
+            .basic_auth(&self.email, Some(&self.api_token))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Failed(format!("jira issue request: {}", e.without_url())))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(target: "connector", provider = "jira", status = status.as_u16(), "jira issue HTTP error");
+            return Err(ConnectorError::Failed(format!("jira HTTP {status}")));
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ConnectorError::Failed(format!("jira body: {}", e.without_url())))?;
+        Self::parse_issue(&text, &self.base_url)
+    }
+
+    /// Parse a single-issue body into a snapshot (fixture-testable, no network).
+    pub(crate) fn parse_issue(
+        body: &str,
+        base_url: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        let issue: JiraIssue = serde_json::from_str(body)
+            .map_err(|e| ConnectorError::Failed(format!("jira issue parse: {e}")))?;
+        if issue.key.trim().is_empty() {
+            return Ok(None);
+        }
+        let f = issue.fields;
+        Ok(Some(crate::verify::IssueSnapshot {
+            key: issue.key.clone(),
+            summary: f.summary.unwrap_or_default(),
+            status: f.status.and_then(|s| s.name).unwrap_or_default(),
+            due: f.duedate,
+            url: format!("{base_url}/browse/{}", issue.key),
+        }))
+    }
 }
 
 #[async_trait]
@@ -147,6 +200,13 @@ impl Connector for JiraConnector {
         let hits = Self::parse_results(&text, &self.base_url)?;
         tracing::info!(target: "connector", provider = "jira", hits = hits.len(), "jira search returned");
         Ok(hits)
+    }
+
+    async fn lookup(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        self.get_issue(id).await
     }
 }
 
@@ -228,6 +288,16 @@ mod tests {
             JiraConnector::parse_results("not json", "https://x"),
             Err(ConnectorError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn jira_issue_parser_maps_snapshot() {
+        let body = r#"{"key":"PROJ-1","fields":{"summary":"Fix login","status":{"name":"In Progress"},"duedate":"2026-07-10"}}"#;
+        let s = JiraConnector::parse_issue(body, "https://acme.atlassian.net").unwrap().unwrap();
+        assert_eq!(s.key, "PROJ-1");
+        assert_eq!(s.status, "In Progress");
+        assert_eq!(s.due.as_deref(), Some("2026-07-10"));
+        assert_eq!(s.url, "https://acme.atlassian.net/browse/PROJ-1");
     }
 
     #[test]
