@@ -296,10 +296,12 @@ fn is_any_screen_captured() -> bool {
         let title = dict_string(dict, unsafe { kCGWindowName });
 
         if is_active_share_window(owner.as_deref(), title.as_deref()) {
+            // Log ONLY the owning app name + a boolean hint — NEVER the raw window title (a browser
+            // tab / doc title is mild PII, and logs must not become the leak — rules §8).
             tracing::info!(
                 target: "screenshare",
                 owner = owner.as_deref().unwrap_or("<unknown>"),
-                window = title.as_deref().unwrap_or("<unnamed>"),
+                has_share_hint = true,
                 "active screen-share indicator window detected (heuristic) — will relock"
             );
             return true;
