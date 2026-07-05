@@ -11,7 +11,7 @@ pub const ACCOUNT_DB_DEK: &str = "murmur_db_dek";
 ///
 /// v0.3.2: this account now names the BIOMETRIC-GATED item (stored via the macOS Security framework
 /// with a `kSecAttrAccessControl` requiring user presence). The legacy PLAIN keyring item lived
-/// under the SAME account name; the one-time migration (see [`migrate_or_create_kek`]) reads that
+/// under the SAME account name; the one-time migration (see [`resolve_kek`]) reads that
 /// plain item, re-stores the identical bytes as the biometric-gated item, then deletes the plain one
 /// — so the account string is stable across the migration and the KEK value is preserved byte-for-
 /// byte (existing locked folders still unwrap).
@@ -94,12 +94,16 @@ pub fn get_or_create_db_dek() -> Result<String> {
 /// folder").
 ///
 /// On first use this also runs a one-time, idempotent, value-preserving migration from the legacy
-/// PLAIN item (see [`migrate_or_create_kek`]). This KEK never touches SQLCipher; it only
+/// PLAIN item (see [`resolve_kek`]). This KEK never touches SQLCipher; it only
 /// wraps/unwraps content keys via [`crate::crypto`].
 ///
 /// Uses [`KEK_DEFAULT_REASON`] on the Touch ID sheet. Call
-/// [`get_or_create_master_kek_with_reason`] to override the prompt text per call-site. This zero-arg
-/// form is kept so existing call-sites (e.g. `remove_lock`) compile unchanged.
+/// [`get_or_create_master_kek_with_reason`] to override the prompt text per call-site.
+///
+/// ⚠️ ALLOW-MINT semantics: this back-compat form may CREATE a fresh KEK when none exists. Every
+/// production lock/unseal path must use [`master_kek_with_policy`] with `allow_mint` derived from
+/// `Db::any_locked_folder()` instead (minting over sealed folders orphans them — the 2026-07-05
+/// field incident). Kept for the test suite, which runs entirely on the `MURMUR_DEV_KEK` hatch.
 pub fn get_or_create_master_kek() -> Result<[u8; 32]> {
     get_or_create_master_kek_with_reason(KEK_DEFAULT_REASON)
 }
@@ -108,6 +112,15 @@ pub fn get_or_create_master_kek() -> Result<[u8; 32]> {
 /// passcode sheet that the biometric-gated keychain read presents (e.g. "Unlock this folder").
 /// THAT sheet is the unlock auth — do NOT also run a separate biometric prompt.
 pub fn get_or_create_master_kek_with_reason(reason: &str) -> Result<[u8; 32]> {
+    master_kek_with_policy(reason, true)
+}
+
+/// As [`get_or_create_master_kek_with_reason`] but with an explicit MINT POLICY. `allow_mint`
+/// MUST be `false` whenever ANY sealed folder exists (the caller checks the DB): a freshly-minted
+/// KEK cannot unwrap existing folders' content keys, so minting over sealed content silently
+/// orphans it (the 2026-07-05 field incident). Unseal paths (`unlock_folder` / `remove_lock`)
+/// always pass `false`; `lock_folder` passes `false` unless NOTHING is sealed yet.
+pub fn master_kek_with_policy(reason: &str, allow_mint: bool) -> Result<[u8; 32]> {
     // Dev-only escape hatch mirroring MURMUR_DEV_DEK, but a SEPARATE env var so the at-rest DEK
     // and the lock KEK can be fixed independently in tests/dev. Returns FIRST so dev needs no Touch
     // ID and no Keychain access at all. NEVER compiled into release.
@@ -120,7 +133,7 @@ pub fn get_or_create_master_kek_with_reason(reason: &str) -> Result<[u8; 32]> {
 
     #[cfg(target_os = "macos")]
     {
-        migrate_or_create_kek(&MacKekStore, reason)
+        resolve_kek(&MacKekStore, reason, allow_mint)
     }
 
     // Non-macOS hosts have no Security-framework access control. Fall back to a PLAIN keyring item
@@ -135,11 +148,68 @@ pub fn get_or_create_master_kek_with_reason(reason: &str) -> Result<[u8; 32]> {
             }
             return Err(AppError::Secrets("stored master KEK is malformed".into()));
         }
+        if !allow_mint {
+            return Err(AppError::Secrets(
+                "the folder master key was not found in the keychain — Murmur will NOT create a new one because locked folders exist (their data stays intact); try unlocking again to run key recovery"
+                    .into(),
+            ));
+        }
         let bytes = crate::crypto::random_key()?;
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         set_secret(ACCOUNT_MASTER_KEK, &hex)?;
         Ok(bytes)
     }
+}
+
+/// EVERY master-KEK candidate the keychain stores currently hold, for the unlock RECOVERY path:
+/// when the primary KEK fails to unwrap a folder's content key, the folder was sealed under a
+/// DIFFERENT KEK — and on machines where the no-UI existence probe lies (see [`KekStore`]), several
+/// generations of KEK items can coexist in the data-protection keychain (each "fresh mint" that
+/// couldn't see its predecessors added another). This enumerates ALL of them (`kSecMatchLimitAll` +
+/// data, ONE user-presence prompt) plus the legacy plain item, so the unlock can try each candidate
+/// against the wrapped content key. Read-only — never writes or deletes anything. Candidate COUNT
+/// may be logged by callers; the bytes never are, and the list zeroizes on drop.
+pub fn list_master_kek_candidates(reason: &str) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
+    let mut out: zeroize::Zeroizing<Vec<[u8; 32]>> = zeroize::Zeroizing::new(Vec::new());
+
+    // Dev hatch first (mirrors the resolution order).
+    #[cfg(debug_assertions)]
+    if let Ok(dev) = std::env::var("MURMUR_DEV_KEK") {
+        if let Some(k) = hex_to_key32(&dev) {
+            out.push(k);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match MacKekStore.read_biometric_all(reason) {
+            Ok(items) => out.extend(items),
+            Err(e) => {
+                // Enumeration failing must not mask the legacy candidate below — log and continue.
+                tracing::warn!(
+                    target: "secrets",
+                    error = %e,
+                    "master-KEK candidate enumeration failed (continuing with the legacy store only)"
+                );
+            }
+        }
+        if let Ok(Some(plain)) = MacKekStore.read_plain() {
+            out.push(plain);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = reason;
+        if let Ok(Some(hex)) = get_secret(ACCOUNT_MASTER_KEK) {
+            if let Some(k) = hex_to_key32(&hex) {
+                out.push(k);
+            }
+        }
+    }
+
+    out.dedup();
+    Ok(out)
 }
 
 // ─────────────────────── biometric-gated sharing-account MK cache (public API) ───────────────────────
@@ -439,51 +509,58 @@ fn dp_biometric_delete(account: &str) -> Result<()> {
 // ───────────────────────────── biometric-gated KEK: storage seam ─────────────────────────────
 
 /// A thin storage seam over the master-KEK keychain operations, so the value-preserving migration
-/// ([`migrate_or_create_kek`]) can be unit-tested against an in-memory fake WITHOUT a live keychain
+/// ([`resolve_kek`]) can be unit-tested against an in-memory fake WITHOUT a live keychain
 /// or a Touch ID prompt (a biometric read can't run headlessly — there is no Touch ID in CI).
 ///
-/// The four operations are exactly what the migration needs:
-/// - [`KekStore::biometric_exists`] — does the biometric-gated item exist? MUST NOT prompt (uses
-///   `kSecUseAuthenticationUISkip` in the real impl) so it is a cheap, side-effect-free probe.
+/// The operations the resolution needs:
 /// - [`KekStore::read_plain`] — read the legacy PLAIN item's raw value (never prompts).
 /// - [`KekStore::write_biometric`] — create/replace the biometric-gated item with the given bytes.
 /// - [`KekStore::read_biometric`] — read the biometric-gated item's value (prompts Touch ID on real
-///   macOS; the reason string is shown on the sheet). This is the actual unlock auth.
+///   macOS; the reason string is shown on the sheet). This is the actual unlock auth. Returns
+///   `Ok(None)` for an AUTHORITATIVE not-found (`errSecItemNotFound` from the prompting read) —
+///   the ONLY existence signal [`resolve_kek`] trusts. A cancelled/failed/denied auth is an `Err`,
+///   NEVER `None`, so an auth hiccup can never be mistaken for "no key exists".
 /// - [`KekStore::delete_plain`] — delete the legacy plain item (idempotent).
+///
+/// NOTE (2026-07-05 field incident): the trait previously had a no-prompt `biometric_exists` probe
+/// (`kSecUseAuthenticationUISkip` + `kSecReturnAttributes`) and the resolution trusted it. On
+/// current macOS that probe returns `errSecItemNotFound` for ACL-protected data-protection items
+/// EVEN WHEN THE ITEM EXISTS (observed: a write reported success and the probe missed it 37 s later
+/// in the same process), so the resolution repeatedly minted fresh KEKs "over" folders sealed under
+/// the real one. The probe is GONE from the resolution path — existence is only ever decided by the
+/// prompting read.
 trait KekStore {
-    fn biometric_exists(&self) -> Result<bool>;
     fn read_plain(&self) -> Result<Option<[u8; 32]>>;
     fn write_biometric(&self, key: &[u8; 32]) -> Result<()>;
-    fn read_biometric(&self, reason: &str) -> Result<[u8; 32]>;
+    fn read_biometric(&self, reason: &str) -> Result<Option<[u8; 32]>>;
     fn delete_plain(&self) -> Result<()>;
 }
 
-/// One-time, idempotent, value-preserving master-KEK resolution + migration.
+/// One-time, idempotent, value-preserving master-KEK resolution + migration — READ-FIRST.
 ///
-/// Steady state (biometric item already present): a SINGLE biometric read → the lone Touch ID sheet.
+/// Steady state (biometric item present): a SINGLE prompting biometric read → the lone Touch ID
+/// sheet — and that read's result is the ONLY existence evidence used (see the [`KekStore`] note:
+/// the old no-prompt probe lies for ACL'd items on current macOS and minted fresh KEKs over sealed
+/// folders).
 ///
-/// First run with a legacy PLAIN item (existing locked folders): read the plain 32 bytes, re-store
-/// the SAME bytes as the biometric-gated item, then **confirm by VALUE** (read the biometric item
-/// back and assert the bytes are byte-for-byte identical) BEFORE deleting the plain item. The
-/// confirm-read is itself a biometric read — on the migrating unlock it IS the unlock's Touch ID
-/// sheet, so the user still sees exactly one prompt. If the confirm fails for ANY reason we return
-/// the error and DO NOT delete the plain item, so access to existing folders is never lost.
+/// Legacy PLAIN item present (biometric read authoritatively not-found): read the plain 32 bytes,
+/// re-store the SAME bytes as the biometric-gated item, then **confirm by VALUE** (read the
+/// biometric item back and assert byte-identical) BEFORE deleting the plain item. If the confirm
+/// fails for ANY reason we return the error and DO NOT delete the plain item, so access to existing
+/// folders is never lost.
 ///
-/// Fresh install (neither item exists): generate a random 32-byte KEK, store it biometric-gated, and
-/// return the in-memory bytes — no read-back, no prompt (first `lock_folder` needs no Touch ID).
-///
-/// Idempotency / crash-safety: the biometric write is create-or-replace and the plain delete is the
-/// LAST step gated on a successful value-confirm, so a crash mid-migration leaves either (a) the
-/// plain item still present (re-runs cleanly) or (b) both present (next run sees the biometric item,
-/// confirms value-equality, then deletes the plain one). The plain item is NEVER deleted before a
-/// confirmed, value-equal biometric copy exists.
-fn migrate_or_create_kek<S: KekStore>(store: &S, reason: &str) -> Result<[u8; 32]> {
-    // Fast path / steady state: the biometric item already exists → one biometric read.
-    if store.biometric_exists()? {
+/// Neither item exists: `allow_mint` decides. `true` (nothing is sealed anywhere) → generate a
+/// random 32-byte KEK, store it biometric-gated, return the in-memory bytes. `false` (sealed
+/// folders EXIST — the caller checked the DB) → REFUSE with a loud error: a fresh KEK cannot
+/// unwrap any existing folder's content key, so minting here silently orphans every sealed folder
+/// (the 2026-07-05 field incident). The sealed data stays intact and recoverable; the error is the
+/// correct outcome.
+fn resolve_kek<S: KekStore>(store: &S, reason: &str, allow_mint: bool) -> Result<[u8; 32]> {
+    // READ FIRST: the prompting read is the authoritative existence check.
+    if let Some(kek) = store.read_biometric(reason)? {
         // A stray leftover plain item (e.g. a crash AFTER the biometric write but BEFORE the plain
         // delete on a previous run) is cleaned up opportunistically here, but ONLY after we have
         // confirmed the biometric value equals it — never a blind delete.
-        let kek = store.read_biometric(reason)?;
         if let Some(plain) = store.read_plain()? {
             if ct_eq(&plain, &kek) {
                 // Confirmed identical → safe to remove the redundant plain copy.
@@ -500,12 +577,17 @@ fn migrate_or_create_kek<S: KekStore>(store: &S, reason: &str) -> Result<[u8; 32
         return Ok(kek);
     }
 
-    // No biometric item yet. Is there a legacy plain item to migrate?
+    // Authoritatively no biometric item. Is there a legacy plain item to migrate?
     match store.read_plain()? {
         Some(plain) => {
             // Migrate: write the SAME bytes biometric-gated, then CONFIRM BY VALUE before deleting.
             store.write_biometric(&plain)?;
-            let confirm = store.read_biometric(reason)?;
+            let confirm = store.read_biometric(reason)?.ok_or_else(|| {
+                AppError::Secrets(
+                    "master-KEK migration read-back found no item — keeping the plain item, retry next launch"
+                        .into(),
+                )
+            })?;
             if !ct_eq(&plain, &confirm) {
                 // The biometric copy does not match the plain bytes → ABORT the migration. Leave the
                 // plain item untouched so the next launch retries and existing folders still unwrap.
@@ -522,9 +604,9 @@ fn migrate_or_create_kek<S: KekStore>(store: &S, reason: &str) -> Result<[u8; 32
             );
             Ok(confirm)
         }
-        None => {
-            // Fresh install: mint a random KEK, store it biometric-gated, return the in-memory bytes
-            // (no read-back, no Touch ID prompt for the first lock).
+        None if allow_mint => {
+            // Genuinely fresh (nothing sealed anywhere): mint a random KEK, store it biometric-gated,
+            // return the in-memory bytes (no read-back, no Touch ID prompt for the first lock).
             let fresh = crate::crypto::random_key()?;
             store.write_biometric(&fresh)?;
             tracing::info!(
@@ -532,6 +614,16 @@ fn migrate_or_create_kek<S: KekStore>(store: &S, reason: &str) -> Result<[u8; 32
                 "created a fresh biometric-gated master KEK"
             );
             Ok(fresh)
+        }
+        None => {
+            tracing::error!(
+                target: "secrets",
+                "master KEK not found in ANY keychain store while sealed folders exist — REFUSING to mint a replacement (the sealed data would be orphaned); see the recovery path"
+            );
+            Err(AppError::Secrets(
+                "the folder master key was not found in the keychain — Murmur will NOT create a new one because locked folders exist (their data stays intact); try unlocking again to run key recovery"
+                    .into(),
+            ))
         }
     }
 }
@@ -570,6 +662,7 @@ mod sec_consts {
     #[link(name = "Security", kind = "framework")]
     extern "C" {
         pub static kSecMatchLimitOne: CFStringRef;
+        pub static kSecMatchLimitAll: CFStringRef;
         pub static kSecUseOperationPrompt: CFStringRef;
         // The `kSecAttrAccessible` DICTIONARY KEY is not re-exported by security-framework-sys
         // (only the value constants live in its `access_control` module). It is a stable Apple
@@ -641,45 +734,6 @@ impl MacKekStore {
 
 #[cfg(target_os = "macos")]
 impl KekStore for MacKekStore {
-    /// Existence probe that NEVER prompts: query with `kSecUseAuthenticationUI = Skip` and
-    /// `kSecReturnAttributes = true` (no data ⇒ no biometric needed). `errSecSuccess` ⇒ exists;
-    /// `errSecItemNotFound` ⇒ absent; `errSecInteractionNotAllowed` ⇒ exists but gated (still
-    /// "exists"). Any other status is a real error.
-    fn biometric_exists(&self) -> Result<bool> {
-        use crate::secrets::keychain::sec_consts::ERR_SEC_INTERACTION_NOT_ALLOWED;
-        use core_foundation::base::{CFType, TCFType};
-        use core_foundation::boolean::CFBoolean;
-        use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
-        use security_framework_sys::item::kSecUseAuthenticationUISkip;
-        use security_framework_sys::item::{kSecReturnAttributes, kSecUseAuthenticationUI};
-        use security_framework_sys::keychain_item::SecItemCopyMatching;
-
-        let mut q = self.base_query();
-        unsafe {
-            q.add(
-                &(kSecReturnAttributes as *const _),
-                &CFBoolean::true_value().as_CFTypeRef(),
-            );
-            q.add(
-                &(kSecUseAuthenticationUI as *const _),
-                &(kSecUseAuthenticationUISkip as *const _),
-            );
-        }
-        let dict = q.to_immutable();
-        let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
-        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out) };
-        // Release anything returned (we only care about the status code).
-        if !out.is_null() {
-            unsafe { drop(CFType::wrap_under_create_rule(out)) };
-        }
-        match status {
-            s if s == errSecSuccess => Ok(true),
-            s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Ok(true),
-            s if s == errSecItemNotFound => Ok(false),
-            other => Err(map_osstatus("probe biometric KEK item", other)),
-        }
-    }
-
     /// Read the legacy PLAIN item via the `keyring` crate (the exact account+store the old code
     /// wrote — the FILE-BASED keychain). MUST bypass the new data-protection routing in `get_secret`
     /// (the legacy KEK lives in the file-based store, and the gated KEK is read via `read_biometric`,
@@ -696,10 +750,16 @@ impl KekStore for MacKekStore {
         }
     }
 
-    /// Create-or-replace the biometric-gated item: build a `SecAccessControl` requiring user
-    /// presence (`kSecAccessControlUserPresence` = Touch ID OR device passcode) with accessibility
+    /// Create the biometric-gated item: build a `SecAccessControl` requiring user presence
+    /// (`kSecAccessControlUserPresence` = Touch ID OR device passcode) with accessibility
     /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, then `SecItemAdd` the 32 raw bytes under it.
-    /// On `errSecDuplicateItem` we delete the existing item and retry once (idempotent replace).
+    ///
+    /// `errSecDuplicateItem` is a CONTRADICTION and REFUSES (2026-07-05 hardening): this method is
+    /// only ever reached after the prompting read said not-found, so a duplicate means the read and
+    /// the add disagree about the store's contents — exactly the query-shape divergence behind the
+    /// field incident. The old delete-and-re-add "idempotent replace" would `SecItemDelete` EVERY
+    /// hidden generation under the account, destroying the very keys the recovery path needs.
+    /// Never delete what the read cannot see.
     fn write_biometric(&self, key: &[u8; 32]) -> Result<()> {
         use core_foundation::base::TCFType;
         use core_foundation::data::CFData;
@@ -719,35 +779,28 @@ impl KekStore for MacKekStore {
 
         let data = CFData::from_buffer(key);
 
-        let add = |access: &SecAccessControl| -> i32 {
-            let mut q = self.base_query();
-            unsafe {
-                q.add(&(kSecAttrAccessControl as *const _), &access.as_CFTypeRef());
-                q.add(&(kSecValueData as *const _), &data.as_CFTypeRef());
-            }
-            let dict = q.to_immutable();
-            let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
-            let s = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), &mut out) };
-            if !out.is_null() {
-                unsafe { drop(core_foundation::base::CFType::wrap_under_create_rule(out)) };
-            }
-            s
-        };
+        let mut q = self.base_query();
+        unsafe {
+            q.add(&(kSecAttrAccessControl as *const _), &access.as_CFTypeRef());
+            q.add(&(kSecValueData as *const _), &data.as_CFTypeRef());
+        }
+        let dict = q.to_immutable();
+        let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), &mut out) };
+        if !out.is_null() {
+            unsafe { drop(core_foundation::base::CFType::wrap_under_create_rule(out)) };
+        }
 
-        let status = add(&access);
         if status == errSecSuccess {
             return Ok(());
         }
         if status == errSecDuplicateItem {
-            // Replace: delete the existing item (by identity, no value read ⇒ no prompt) then re-add.
-            self.delete_biometric()?;
-            let status2 = add(&access);
-            if status2 == errSecSuccess {
-                return Ok(());
-            }
-            return Err(map_osstatus(
-                "add biometric KEK item (after replace)",
-                status2,
+            tracing::error!(
+                target: "secrets",
+                "master-KEK add hit errSecDuplicateItem though the prompting read found no item — keychain query shapes disagree; REFUSING to delete-and-replace (hidden key generations stay intact)"
+            );
+            return Err(AppError::Secrets(
+                "a master-key item already exists in the keychain even though it could not be read — refusing to replace it; existing locked folders stay recoverable".into(),
             ));
         }
         Err(map_osstatus("add biometric KEK item", status))
@@ -755,8 +808,10 @@ impl KekStore for MacKekStore {
 
     /// Read the biometric-gated item's value. On real macOS this triggers the Touch ID / passcode
     /// sheet with `reason` shown via `kSecUseOperationPrompt`, and returns the 32 raw bytes on a
-    /// successful presence check. A user cancel / auth failure maps to [`AppError::BiometricFailed`].
-    fn read_biometric(&self, reason: &str) -> Result<[u8; 32]> {
+    /// successful presence check. `Ok(None)` ONLY for `errSecItemNotFound` from this prompting read
+    /// — the authoritative "no item exists" signal (the no-UI probe lies for ACL'd items on current
+    /// macOS). A user cancel / auth failure maps to [`AppError::BiometricFailed`], never `None`.
+    fn read_biometric(&self, reason: &str) -> Result<Option<[u8; 32]>> {
         use crate::secrets::keychain::sec_consts::{
             ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_USER_CANCELED,
         };
@@ -764,7 +819,7 @@ impl KekStore for MacKekStore {
         use core_foundation::boolean::CFBoolean;
         use core_foundation::data::CFData;
         use core_foundation::string::CFString;
-        use security_framework_sys::base::{errSecAuthFailed, errSecSuccess};
+        use security_framework_sys::base::{errSecAuthFailed, errSecItemNotFound, errSecSuccess};
         use security_framework_sys::item::{kSecMatchLimit, kSecReturnData};
         use security_framework_sys::keychain_item::SecItemCopyMatching;
 
@@ -794,6 +849,7 @@ impl KekStore for MacKekStore {
                 unsafe { drop(CFType::wrap_under_create_rule(out)) };
             }
             return match status {
+                s if s == errSecItemNotFound => Ok(None),
                 s if s == ERR_SEC_USER_CANCELED => {
                     Err(AppError::BiometricFailed("Touch ID was cancelled".into()))
                 }
@@ -819,7 +875,7 @@ impl KekStore for MacKekStore {
         let k: [u8; 32] = bytes
             .try_into()
             .map_err(|_| AppError::Secrets("biometric KEK has wrong length".into()))?;
-        Ok(k)
+        Ok(Some(k))
     }
 
     /// Delete the legacy PLAIN item via the `keyring` crate (FILE-BASED store; idempotent; absence
@@ -831,21 +887,101 @@ impl KekStore for MacKekStore {
 
 #[cfg(target_os = "macos")]
 impl MacKekStore {
-    /// Delete the biometric-gated item by IDENTITY (class + service + account only — no value read,
-    /// so NO Touch ID prompt). Used to replace a duplicate before a fresh add. Idempotent.
-    fn delete_biometric(&self) -> Result<()> {
-        use core_foundation::base::TCFType;
-        use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
-        use security_framework_sys::keychain_item::SecItemDelete;
+    /// EVERY biometric-gated master-KEK item's bytes (`kSecMatchLimitAll` + `kSecReturnData`, one
+    /// user-presence prompt for the batch). On machines where the no-UI probe lies, several KEK
+    /// generations can coexist (each blind "fresh mint" added one) — the RECOVERY path tries each
+    /// against a folder's wrapped content key. `errSecItemNotFound` ⇒ empty vec. Read-only.
+    fn read_biometric_all(&self, reason: &str) -> Result<Vec<[u8; 32]>> {
+        use crate::secrets::keychain::sec_consts::{
+            ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_USER_CANCELED,
+        };
+        use core_foundation::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex};
+        use core_foundation::base::{CFGetTypeID, CFType, TCFType};
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::data::CFData;
+        use core_foundation::string::CFString;
+        use security_framework_sys::base::{errSecAuthFailed, errSecItemNotFound, errSecSuccess};
+        use security_framework_sys::item::{kSecMatchLimit, kSecReturnData};
+        use security_framework_sys::keychain_item::SecItemCopyMatching;
 
-        let dict = self.base_query().to_immutable();
-        let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
-        if status == errSecSuccess || status == errSecItemNotFound {
-            Ok(())
-        } else {
-            Err(map_osstatus("delete biometric KEK item", status))
+        let prompt = CFString::new(reason);
+        let mut q = self.base_query();
+        unsafe {
+            q.add(
+                &(kSecReturnData as *const _),
+                &CFBoolean::true_value().as_CFTypeRef(),
+            );
+            q.add(
+                &(kSecMatchLimit as *const _),
+                &(sec_consts::kSecMatchLimitAll as *const _),
+            );
+            q.add(
+                &(sec_consts::kSecUseOperationPrompt as *const _),
+                &prompt.as_CFTypeRef(),
+            );
         }
+        let dict = q.to_immutable();
+        let mut out: core_foundation::base::CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut out) };
+
+        if status != errSecSuccess {
+            if !out.is_null() {
+                unsafe { drop(CFType::wrap_under_create_rule(out)) };
+            }
+            return match status {
+                s if s == errSecItemNotFound => Ok(Vec::new()),
+                s if s == ERR_SEC_USER_CANCELED => {
+                    Err(AppError::BiometricFailed("Touch ID was cancelled".into()))
+                }
+                s if s == errSecAuthFailed => {
+                    Err(AppError::BiometricFailed("authentication failed".into()))
+                }
+                s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Err(AppError::BiometricFailed(
+                    "interaction not allowed (no UI context to present Touch ID)".into(),
+                )),
+                other => Err(map_osstatus("enumerate biometric KEK items", other)),
+            };
+        }
+        if out.is_null() {
+            return Ok(Vec::new());
+        }
+
+        // SAFETY: success + non-null ⇒ a CF object we own under the create rule. With MatchLimitAll
+        // it is a CFArray of CFData; be defensive and also accept a bare CFData (single item).
+        let owned = unsafe { CFType::wrap_under_create_rule(out) };
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        let push_data = |keys: &mut Vec<[u8; 32]>, data: &CFData| {
+            if let Ok(k) = <&[u8] as TryInto<[u8; 32]>>::try_into(data.bytes()) {
+                keys.push(k);
+            }
+            // Wrong-length values are skipped silently — a foreign item under our account name is
+            // not a KEK candidate; never log its bytes.
+        };
+        unsafe {
+            let type_id = CFGetTypeID(out);
+            if type_id == CFArrayGetTypeID() {
+                let arr = out as core_foundation::array::CFArrayRef;
+                let n = CFArrayGetCount(arr);
+                for i in 0..n {
+                    let item = CFArrayGetValueAtIndex(arr, i);
+                    if !item.is_null() && CFGetTypeID(item as _) == CFData::type_id() {
+                        let data = CFData::wrap_under_get_rule(item as *const _);
+                        push_data(&mut keys, &data);
+                    }
+                }
+            } else if type_id == CFData::type_id() {
+                let data = CFData::wrap_under_get_rule(out as *const _);
+                push_data(&mut keys, &data);
+            }
+        }
+        drop(owned);
+        Ok(keys)
     }
+
+    // NOTE: there is deliberately NO `delete_biometric` here anymore (2026-07-05 hardening). The
+    // only caller was `write_biometric`'s duplicate-replace arm, and a blind
+    // `SecItemDelete(base_query)` destroys EVERY generation under the account — including hidden
+    // ones the recovery path depends on. No production path may delete a master-KEK item.
 }
 
 /// Map a non-success Security `OSStatus` to a typed [`AppError`]. The message carries only the
@@ -1562,7 +1698,6 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq)]
     enum Op {
-        ProbeExists,
         ReadPlain,
         WriteBiometric([u8; 32]),
         ReadBiometric,
@@ -1594,10 +1729,6 @@ mod tests {
     }
 
     impl KekStore for FakeStore {
-        fn biometric_exists(&self) -> Result<bool> {
-            self.log.borrow_mut().push(Op::ProbeExists);
-            Ok(self.biometric.borrow().is_some())
-        }
         fn read_plain(&self) -> Result<Option<[u8; 32]>> {
             self.log.borrow_mut().push(Op::ReadPlain);
             Ok(*self.plain.borrow())
@@ -1607,19 +1738,18 @@ mod tests {
             *self.biometric.borrow_mut() = Some(*key);
             Ok(())
         }
-        fn read_biometric(&self, _reason: &str) -> Result<[u8; 32]> {
+        fn read_biometric(&self, _reason: &str) -> Result<Option<[u8; 32]>> {
             self.log.borrow_mut().push(Op::ReadBiometric);
-            let stored = self
-                .biometric
-                .borrow()
-                .ok_or_else(|| AppError::Secrets("fake: no biometric item".into()))?;
+            let Some(stored) = *self.biometric.borrow() else {
+                return Ok(None); // authoritative not-found (mirrors errSecItemNotFound)
+            };
             if self.corrupt_biometric_read {
                 // Simulate a copy that read back DIFFERENT bytes than were written.
                 let mut bad = stored;
                 bad[0] ^= 0xFF;
-                return Ok(bad);
+                return Ok(Some(bad));
             }
-            Ok(stored)
+            Ok(Some(stored))
         }
         fn delete_plain(&self) -> Result<()> {
             self.log.borrow_mut().push(Op::DeletePlain);
@@ -1637,7 +1767,7 @@ mod tests {
     #[test]
     fn migration_preserves_value_and_deletes_plain_only_after_confirm() {
         let store = FakeStore::new(Some(KEK), None);
-        let out = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
+        let out = resolve_kek(&store, "Unlock this folder", false).unwrap();
 
         // The returned KEK is byte-for-byte the original plain value.
         assert_eq!(out, KEK, "migrated KEK must equal the original plain KEK");
@@ -1675,7 +1805,7 @@ mod tests {
     fn migration_mismatch_aborts_and_keeps_plain_item() {
         let mut store = FakeStore::new(Some(KEK), None);
         store.corrupt_biometric_read = true;
-        let res = migrate_or_create_kek(&store, "Unlock this folder");
+        let res = resolve_kek(&store, "Unlock this folder", false);
 
         assert!(res.is_err(), "a confirm mismatch must abort the migration");
         // CRITICAL: the plain item must STILL exist (never delete-before-confirm) so existing
@@ -1695,23 +1825,65 @@ mod tests {
     #[test]
     fn fresh_install_creates_biometric_without_readback_or_delete() {
         let store = FakeStore::new(None, None);
-        let out = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
+        let out = resolve_kek(&store, "Unlock this folder", true).unwrap();
 
         // A biometric item now exists holding exactly the returned bytes.
         assert_eq!(*store.biometric.borrow(), Some(out));
-        // Fresh path: no biometric read-back (no Touch ID for the first lock) and no plain delete.
+        // Fresh path: the read-first existence check runs BEFORE the mint (a missing item returns
+        // not-found without presenting any UI), the mint itself does no read-back after the write,
+        // and there is no plain delete.
         let log = store.log();
+        let wrote = log
+            .iter()
+            .position(|o| matches!(o, Op::WriteBiometric(_)))
+            .expect("fresh create must write the biometric item");
         assert!(
-            !log.contains(&Op::ReadBiometric),
-            "fresh create must not read back (no Touch ID prompt for the first lock)"
+            !log.iter().skip(wrote + 1).any(|o| *o == Op::ReadBiometric),
+            "fresh create must not read back after the write (no Touch ID prompt for the first lock)"
         );
         assert!(
             !log.contains(&Op::DeletePlain),
             "fresh create has no plain item to delete"
         );
+    }
+
+    /// THE 2026-07-05 FIELD REGRESSION: the master KEK is missing from every store while sealed
+    /// folders exist (`allow_mint = false`). The resolution MUST refuse — the old code minted a
+    /// fresh KEK here, silently orphaning every folder sealed under the real one. Nothing may be
+    /// written to any store on the refusal path.
+    #[test]
+    fn missing_kek_with_sealed_content_refuses_to_mint() {
+        let store = FakeStore::new(None, None);
+        let res = resolve_kek(&store, "Unlock this folder", false);
         assert!(
-            log.iter().any(|o| matches!(o, Op::WriteBiometric(_))),
-            "fresh create must write the biometric item"
+            res.is_err(),
+            "a missing KEK with sealed content must be an ERROR, never a fresh mint"
+        );
+        assert!(
+            !store
+                .log()
+                .iter()
+                .any(|o| matches!(o, Op::WriteBiometric(_))),
+            "the refusal path must not write anything (no replacement KEK may be created)"
+        );
+        assert_eq!(*store.biometric.borrow(), None, "store left untouched");
+    }
+
+    /// Read-first makes the probe-lie structurally impossible: when the biometric item EXISTS, the
+    /// prompting read returns it and the resolution never consults any existence probe — so a
+    /// lying no-UI probe (the 2026-07-05 incident's trigger) can no longer route to the mint arm.
+    /// Also holds under the strict no-mint policy.
+    #[test]
+    fn existing_item_is_returned_read_first_even_under_no_mint_policy() {
+        let store = FakeStore::new(None, Some(KEK));
+        let out = resolve_kek(&store, "Unlock this folder", false).unwrap();
+        assert_eq!(out, KEK);
+        assert!(
+            !store
+                .log()
+                .iter()
+                .any(|o| matches!(o, Op::WriteBiometric(_))),
+            "steady state must not write"
         );
     }
 
@@ -1719,7 +1891,7 @@ mod tests {
     fn steady_state_is_single_biometric_read() {
         // Biometric item already present, no plain leftover → exactly one biometric read.
         let store = FakeStore::new(None, Some(KEK));
-        let out = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
+        let out = resolve_kek(&store, "Unlock this folder", false).unwrap();
         assert_eq!(out, KEK);
         let reads = store
             .log()
@@ -1741,7 +1913,7 @@ mod tests {
         // Crash recovery: a previous run wrote the biometric item but crashed BEFORE deleting the
         // plain one. Both present + value-equal → the next run confirms equality then removes plain.
         let store = FakeStore::new(Some(KEK), Some(KEK));
-        let out = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
+        let out = resolve_kek(&store, "Unlock this folder", false).unwrap();
         assert_eq!(out, KEK);
         assert_eq!(
             *store.plain.borrow(),
@@ -1753,7 +1925,7 @@ mod tests {
         // destroy). Use a distinct biometric value so the confirm read returns it (not the plain).
         let other: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_add(7));
         let store2 = FakeStore::new(Some(KEK), Some(other));
-        let out2 = migrate_or_create_kek(&store2, "Unlock this folder").unwrap();
+        let out2 = resolve_kek(&store2, "Unlock this folder", false).unwrap();
         assert_eq!(
             out2, other,
             "steady-state read returns the biometric item value"
@@ -1775,7 +1947,7 @@ mod tests {
 
         // 2. Migrate the plain KEK to the biometric item (value preserved).
         let store = FakeStore::new(Some(KEK), None);
-        let migrated_kek = migrate_or_create_kek(&store, "Unlock this folder").unwrap();
+        let migrated_kek = resolve_kek(&store, "Unlock this folder", false).unwrap();
 
         // 3. Post-migration: unwrap the SAME wrapped key with the migrated KEK → original CK back.
         let unwrapped = crate::crypto::decrypt(&migrated_kek, &wrapped, b"folder-123").unwrap();
