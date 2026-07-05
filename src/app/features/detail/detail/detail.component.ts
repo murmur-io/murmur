@@ -480,11 +480,12 @@ export class DetailComponent implements OnInit {
           this.tags.set([]);
         }
       }
-    } catch {
-      // Biometric denied / cancelled, or the unlock errored — stay gated.
-      this.toast.danger(
-        "Couldn’t unlock — authentication failed or cancelled.",
-      );
+    } catch (e) {
+      // Biometric denied / cancelled, or the unlock errored — stay gated. Surface the REAL backend
+      // error (AppError crosses the IPC as a string): a keychain OSStatus or a "content-key unwrap
+      // failed" tells the user (and a field screenshot tells us) what actually broke — the old
+      // generic apology made signed-build failures undiagnosable.
+      this.toast.danger(`Couldn’t unlock — ${String(e)}`);
     } finally {
       this.unlocking.set(false);
     }
