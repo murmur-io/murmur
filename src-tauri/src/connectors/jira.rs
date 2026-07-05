@@ -111,6 +111,10 @@ impl Connector for JiraConnector {
         EgressClass::External
     }
 
+    fn egress_attribution(&self) -> (&'static str, &'static str) {
+        ("jira_search", "Jira (connector)")
+    }
+
     async fn search(&self, redacted_query: &str) -> ConnectorResult {
         let q = redacted_query.trim();
         if q.is_empty() {
