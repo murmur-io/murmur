@@ -1217,6 +1217,121 @@ pub fn update_note(
     })
 }
 
+/// VERIFY PASS (read-only): extract Jira issue keys from the meeting's note and check each against
+/// LIVE Jira. GATED: sealed-not-unlocked meetings refuse (a verify against a blanked note would be
+/// nonsense AND a read-gate bypass). Consent-gated: rides the Jira connector's enable+consent+key
+/// gate (fail-closed `NeedsConsent` maps to `AppError::Unavailable`). NEVER called proactively —
+/// FE-invoked only. Findings are computed against the note WITH OLD MARKERS STRIPPED so line
+/// numbers line up with `apply_verify_markers`' post-strip numbering.
+#[tauri::command]
+pub async fn verify_note_sources(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::verify::VerifyFinding>, AppError> {
+    verify_note_sources_inner(state.inner(), meeting_id).await
+}
+
+pub(crate) async fn verify_note_sources_inner(
+    state: &AppState,
+    meeting_id: String,
+) -> Result<Vec<crate::verify::VerifyFinding>, AppError> {
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to verify the note".into(),
+        ));
+    }
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    // Strip our own old markers so extraction/judgment sees the canonical note lines.
+    let stripped = crate::verify::apply_verify_markers(&note.markdown, &[]);
+    let keys = crate::verify::extract_issue_keys(&stripped);
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Other(anyhow::anyhow!("config lock")))?
+        .clone();
+    let registry = crate::connectors::ConnectorRegistry::build(&config);
+    let lines: Vec<&str> = stripped.lines().collect();
+    let mut findings = Vec::with_capacity(keys.len());
+    for (line_no, key) in keys {
+        let snap = registry.jira_lookup(&key).await.map_err(AppError::from)?;
+        let line_text = lines.get(line_no - 1).copied().unwrap_or("");
+        let (verdict, detail) = crate::verify::judge(line_text, &key, snap.as_ref());
+        let url = snap.map(|s| s.url).unwrap_or_default();
+        findings.push(crate::verify::VerifyFinding {
+            line_no,
+            key,
+            verdict,
+            detail,
+            url,
+        });
+    }
+    Ok(findings)
+}
+
+/// Apply verify markers to the note (WRITE — same gate + save/re-export tail as `update_note`).
+/// Takes the findings the user just reviewed in the panel; validates every key's strict shape.
+#[tauri::command]
+pub fn apply_note_verify_markers(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    findings: Vec<crate::verify::VerifyFinding>,
+) -> Result<NoteDto, AppError> {
+    apply_note_verify_markers_inner(state.inner(), meeting_id, findings)
+}
+
+pub(crate) fn apply_note_verify_markers_inner(
+    state: &AppState,
+    meeting_id: String,
+    findings: Vec<crate::verify::VerifyFinding>,
+) -> Result<NoteDto, AppError> {
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to edit the note".into(),
+        ));
+    }
+    for f in &findings {
+        let ok = crate::verify::extract_issue_keys(&f.key)
+            .first()
+            .map(|(_, k)| k == &f.key)
+            .unwrap_or(false);
+        if !ok {
+            return Err(AppError::InvalidArg("invalid issue key in findings".into()));
+        }
+    }
+    let existing = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let marked = crate::verify::apply_verify_markers(&existing.markdown, &findings);
+    // Save + re-export — the exact `update_note` tail, with `marked`.
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: existing.provider_id.clone(),
+        markdown: marked.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
+    })?;
+    if let Some(path) = existing.exported_path.as_deref() {
+        crate::export::overwrite_note(std::path::Path::new(path), &marked)?;
+    }
+    Ok(NoteDto {
+        meeting_id,
+        provider_id: existing.provider_id,
+        markdown: marked,
+        exported_path: existing.exported_path,
+    })
+}
+
 /// brain2 realtime typed @brain notes — persist the user's free-text notes typed DURING a meeting
 /// (the FE autosaves the whole buffer here). The buffer (a) feeds the in-meeting brain's system
 /// prompt while recording and (b) is folded into the finalized note at summarize time.
@@ -10219,6 +10334,74 @@ mod lifecycle_tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// PHASE-4 lock gate (RED-before-GREEN): `verify_note_sources` + `apply_note_verify_markers` on a
+    /// SEALED-and-not-session-unlocked meeting MUST refuse with `AppError::Locked` BEFORE any note
+    /// read / connector egress — a locked note can neither be verified nor marker-written. Runs with
+    /// NO Jira configured, so once session-unlocked the verify falls through to the fail-closed
+    /// connector gate (`Unavailable`), proving `Locked` was the FIRST gate, not a downstream error.
+    #[test]
+    fn verify_commands_refuse_a_sealed_meeting() {
+        let state = build_state("verify-lockgate");
+        make_open_folder(&state.db, "f-vlock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vlock".to_string(),
+                started_at: "2026-07-05T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-vlock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vlock".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-05T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-vlock", Some("f-vlock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-vlock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: both commands fail closed with Locked.
+        let e1 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
+        assert!(matches!(e1, AppError::Locked(_)), "verify must fail Locked, got: {e1:?}");
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::NotFound,
+            detail: "PROJ-1 not found in Jira".into(),
+            url: String::new(),
+        };
+        let e2 =
+            apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding]).unwrap_err();
+        assert!(matches!(e2, AppError::Locked(_)), "apply must fail Locked, got: {e2:?}");
+
+        // Session-unlock → the lock gate passes; verify now falls to the fail-closed connector gate
+        // (no Jira configured ⇒ jira_lookup NeedsConsent ⇒ Unavailable), proving Locked was the gate.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-vlock".to_string());
+        let e3 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
+        assert!(
+            matches!(e3, AppError::Unavailable(_)),
+            "past the lock gate, an unconfigured Jira verify fails Unavailable, got: {e3:?}"
+        );
     }
 
     /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked

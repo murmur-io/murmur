@@ -120,6 +120,8 @@ pub fn run() {
             commands::output_is_builtin_speakers,
             commands::get_last_note,
             commands::update_note,
+            commands::verify_note_sources,
+            commands::apply_note_verify_markers,
             commands::save_manual_notes,
             commands::get_manual_notes,
             commands::import_document,
