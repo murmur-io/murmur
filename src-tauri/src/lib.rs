@@ -28,6 +28,7 @@ pub mod tools;
 pub mod transcribe;
 pub mod update;
 pub mod user_memory;
+pub mod verify;
 pub mod voice_action;
 
 use tauri::window::{Effect, EffectsBuilder};
@@ -119,6 +120,8 @@ pub fn run() {
             commands::output_is_builtin_speakers,
             commands::get_last_note,
             commands::update_note,
+            commands::verify_note_sources,
+            commands::apply_note_verify_markers,
             commands::save_manual_notes,
             commands::get_manual_notes,
             commands::import_document,
@@ -138,6 +141,8 @@ pub fn run() {
             commands::consent_to_cloud_egress,
             commands::revoke_cloud_egress,
             commands::consent_to_web_search,
+            commands::consent_to_jira,
+            commands::consent_to_slack,
             // M3-CLIENT — sharing account + zero-knowledge link shares (mode A).
             commands::account_status,
             commands::account_signup,
@@ -169,6 +174,10 @@ pub fn run() {
             commands::get_egress_ledger,
             commands::set_web_search_api_key,
             commands::has_web_search_key,
+            commands::set_jira_token,
+            commands::has_jira_token,
+            commands::set_slack_token,
+            commands::has_slack_token,
             commands::provider_statuses,
             commands::resummarize,
             commands::list_meetings,

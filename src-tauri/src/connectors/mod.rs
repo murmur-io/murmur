@@ -27,6 +27,8 @@
 //! result snippets, or the API key.
 
 pub mod calendar;
+pub mod jira;
+pub mod slack;
 pub mod web;
 
 use std::sync::Arc;
@@ -35,6 +37,17 @@ use crate::settings::AppConfig;
 use crate::summarize::egress_log::{active_sink, EgressEntry, EgressSink};
 use crate::summarize::meta::CallMeta;
 use crate::summarize::redact::{active_name_redactor, redact_connector_query, NameRedactor};
+
+/// Shared HTTP client for connector calls — bounded so a stalled external service can never hang
+/// the scoped tool worker or the Ask loop indefinitely. 20s overall per request.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        // Builder only fails on TLS-backend misconfig; fall back to the default client rather
+        // than panicking (default has no timeout, but a request still goes out).
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// Whether a connector reaches OFF the device. The framework gates every [`External`] connector
 /// behind enable + consent; a [`Local`] connector (none yet) would be exempt, exactly as `ollama` is
@@ -122,9 +135,29 @@ pub trait Connector: Send + Sync {
     /// The egress class — `External` connectors are consent-gated by the framework.
     fn egress_class(&self) -> EgressClass;
 
+    /// The TRUTHFUL egress-ledger attribution for THIS connector: the `(call_kind, destination)`
+    /// pair the framework records in the content-free ledger row so the Analytics "receipt of what
+    /// left your Mac" names the RIGHT external service — a Jira egress is labeled Jira, a web search
+    /// is labeled web, never one masquerading as the other. Each field is a non-PII `&'static str`
+    /// (a fixed label, never query content). The default is a GENERIC fallback so a connector that
+    /// forgets to declare its own is still audited (never mis-attributed to web); every real
+    /// `External` connector OVERRIDES it with its own truthful pair.
+    fn egress_attribution(&self) -> (&'static str, &'static str) {
+        ("connector_search", "external connector")
+    }
+
     /// Run the search for an ALREADY-REDACTED query (the registry redacts before calling this — see
     /// [`ConnectorRegistry::search`]). Returns the hits, each carrying a loud `source_label`.
     async fn search(&self, redacted_query: &str) -> ConnectorResult;
+
+    /// OPTIONAL identifier lookup (verify pass). Default: unsupported. `id` is a strict,
+    /// caller-validated identifier (e.g. a Jira issue key), never free text.
+    async fn lookup(
+        &self,
+        _id: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        Err(ConnectorError::Unconfigured("lookup not supported".into()))
+    }
 }
 
 /// The registry of connectors AVAILABLE to the brain for the current config. It exposes ONLY the
@@ -161,6 +194,12 @@ impl ConnectorRegistry {
         if let Some(c) = web::WebConnector::from_config_if_available(config) {
             connectors.push(Box::new(c));
         }
+        if let Some(c) = jira::JiraConnector::from_config_if_available(config) {
+            connectors.push(Box::new(c));
+        }
+        if let Some(c) = slack::SlackConnector::from_config_if_available(config) {
+            connectors.push(Box::new(c));
+        }
         Self {
             connectors,
             names: active_name_redactor(),
@@ -194,9 +233,10 @@ impl ConnectorRegistry {
     /// into vault content.
     ///
     /// LEDGER: for an EXTERNAL connector we record ONE content-free [`EgressEntry`] on the attempt
-    /// (a failed HTTP call is still attempted egress), carrying provider/destination, a
-    /// `"web_search"` call_kind, the scrubbed-query BYTE SIZE, and the redaction COUNTS — never the
-    /// query text (the ledger is content-free by design).
+    /// (a failed HTTP call is still attempted egress), carrying provider/destination, a per-connector
+    /// `call_kind`/`destination` (from [`Connector::egress_attribution`] — so a Jira egress is
+    /// labeled Jira, not a web search), the scrubbed-query BYTE SIZE, and the redaction COUNTS —
+    /// never the query text (the ledger is content-free by design).
     pub async fn search(&self, id: &str, query: &str) -> ConnectorResult {
         let Some(connector) = self.connectors.iter().find(|c| c.id() == id) else {
             // Not exposed → fail closed. NOTHING egresses, so nothing is recorded.
@@ -211,11 +251,14 @@ impl ConnectorRegistry {
         // of the scrubbed query (never its text); `system_bytes` is 0 (a connector has no system
         // prompt). `meta` is default (a search backend reports no token usage).
         if connector.egress_class() == EgressClass::External {
+            // Per-connector truthful attribution (both are non-PII fixed labels) so the ledger row
+            // names the RIGHT external service — a Jira egress is never recorded as a web search.
+            let (call_kind, destination) = connector.egress_attribution();
             self.sink.record(EgressEntry {
                 provider_id: connector.id().to_string(),
-                destination: "web search (connector)".to_string(),
+                destination: destination.to_string(),
                 model_requested: String::new(),
-                call_kind: "web_search",
+                call_kind,
                 meta: CallMeta::default(),
                 redactions: counts,
                 system_bytes: 0,
@@ -225,6 +268,46 @@ impl ConnectorRegistry {
         }
 
         connector.search(&redacted).await
+    }
+
+    /// VERIFY-PASS lookup: fetch one Jira issue's live state through the SAME fail-closed +
+    /// ledgered discipline as [`ConnectorRegistry::search`]. The key is a strict issue identifier
+    /// (validated here via [`crate::verify::extract_issue_keys`] round-trip), not free text — no PII
+    /// redaction applies, but the attempt IS recorded content-free. A malformed key is refused
+    /// BEFORE any exposure/egress; an unexposed jira connector fails closed WITHOUT a ledger row.
+    pub async fn jira_lookup(
+        &self,
+        key: &str,
+    ) -> std::result::Result<Option<crate::verify::IssueSnapshot>, ConnectorError> {
+        // Strict shape guard BEFORE anything else (defense-in-depth against URL injection): the key
+        // must round-trip through the issue-key scanner as EXACTLY itself.
+        let valid = crate::verify::extract_issue_keys(key)
+            .first()
+            .map(|(_, k)| k == key)
+            .unwrap_or(false);
+        if !valid {
+            return Err(ConnectorError::Failed("invalid issue key".into()));
+        }
+        let Some(connector) = self.connectors.iter().find(|c| c.id() == "jira") else {
+            // Not exposed → fail closed. NOTHING egresses, so nothing is recorded.
+            return Err(ConnectorError::NeedsConsent);
+        };
+        // Record ONE content-free ledger row for this external egress ATTEMPT, BEFORE the network
+        // call. A lookup is a DISTINCT call_kind from a search — attribute it truthfully as such.
+        if connector.egress_class() == EgressClass::External {
+            self.sink.record(EgressEntry {
+                provider_id: "jira".to_string(),
+                destination: "Jira issue lookup (connector)".to_string(),
+                model_requested: String::new(),
+                call_kind: "connector_lookup",
+                meta: CallMeta::default(),
+                redactions: Default::default(),
+                system_bytes: 0,
+                user_bytes: key.len(),
+                meeting_id: None,
+            });
+        }
+        connector.lookup(key).await
     }
 
     /// TEST-ONLY: build a registry around injected connectors + an explicit name redactor + sink, so
@@ -412,6 +495,33 @@ mod tests {
     }
 
     #[test]
+    fn jira_lookup_fails_closed_without_ledger_when_not_exposed() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(captured.clone())),
+        );
+        let res = block_on(registry.jira_lookup("PROJ-1"));
+        assert!(matches!(res, Err(ConnectorError::NeedsConsent)));
+        assert!(captured.lock().unwrap().is_empty(), "no egress ⇒ no ledger row");
+    }
+
+    #[test]
+    fn jira_lookup_rejects_malformed_keys_without_egress() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(captured.clone())),
+        );
+        // Even before exposure is checked, a key that isn't a strict issue key is refused.
+        let res = block_on(registry.jira_lookup("not a key; DROP TABLE"));
+        assert!(res.is_err());
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn connector_error_maps_to_unavailable_or_summarize() {
         assert!(matches!(
             crate::error::AppError::from(ConnectorError::NeedsConsent),
@@ -458,7 +568,9 @@ mod tests {
     }
 
     /// (b) LEDGER — a connector search records EXACTLY ONE content-free egress row: provider "capture"
-    /// (the connector id), call_kind "web_search", the SCRUBBED-query byte size, and the redaction
+    /// (the connector id), the GENERIC-FALLBACK attribution (`"capture"` declares no
+    /// `egress_attribution` override → `call_kind "connector_search"` / destination
+    /// "external connector"), the SCRUBBED-query byte size, and the redaction
     /// COUNTS (1 email + 1 name here). Copies the content-free invariant from redact.rs's
     /// `egress_entry_is_content_free_and_captures_meta_and_counts`: NO query text / NO PII appears in
     /// ANY field of the recorded entry (asserted over the full Debug output).
@@ -481,10 +593,11 @@ mod tests {
         assert_eq!(rows.len(), 1, "exactly one content-free ledger row per connector search");
         let row = &rows[0];
 
-        // Shape: connector-attributed, web_search kind, sizes + counts only.
+        // Shape: connector-attributed via the GENERIC FALLBACK (the fake "capture" connector does
+        // not override egress_attribution), sizes + counts only.
         assert_eq!(row.provider_id, "capture");
-        assert_eq!(row.call_kind, "web_search");
-        assert_eq!(row.destination, "web search (connector)");
+        assert_eq!(row.call_kind, "connector_search");
+        assert_eq!(row.destination, "external connector");
         assert_eq!(row.model_requested, "");
         assert_eq!(row.system_bytes, 0);
         assert!(row.user_bytes > 0, "the scrubbed-query byte SIZE is recorded");
@@ -528,9 +641,124 @@ mod tests {
         assert!(matches!(res, Err(ConnectorError::Failed(_))), "the failure surfaces");
         let rows = recorded.lock().unwrap();
         assert_eq!(rows.len(), 1, "a failed attempt is still audited as attempted egress");
-        assert_eq!(rows[0].call_kind, "web_search");
+        // "capture" declares no override → generic fallback attribution.
+        assert_eq!(rows[0].call_kind, "connector_search");
         assert_eq!(rows[0].redactions.email, 1);
         let debug = format!("{:?}", rows[0]);
         assert!(!debug.contains("bob@acme.com"), "email must NOT appear in ledger row: {debug}");
+    }
+
+    /// (c) PER-CONNECTOR ATTRIBUTION — RED-before-GREEN: a `"jira"`-id connector must record its OWN
+    /// truthful ledger attribution, NOT the web-search label. On the pre-fix code (the framework
+    /// hardcoded `call_kind: "web_search"` / destination "web search (connector)" for EVERY External
+    /// connector) a Jira egress was recorded as a web search — this test asserts RED there. GREEN once
+    /// the framework reads `Connector::egress_attribution` (jira → "jira_search" / "Jira (connector)").
+    #[test]
+    fn jira_connector_search_is_attributed_to_jira_not_web() {
+        struct JiraLikeConnector;
+        #[async_trait::async_trait]
+        impl Connector for JiraLikeConnector {
+            fn id(&self) -> &str {
+                "jira"
+            }
+            fn egress_class(&self) -> EgressClass {
+                EgressClass::External
+            }
+            fn egress_attribution(&self) -> (&'static str, &'static str) {
+                ("jira_search", "Jira (connector)")
+            }
+            async fn search(&self, _redacted_query: &str) -> ConnectorResult {
+                Ok(vec![ConnectorHit {
+                    title: "t".into(),
+                    snippet: "s".into(),
+                    url: "https://example.atlassian.net/browse/ABC-1".into(),
+                    source_label: "jira · fake".into(),
+                }])
+            }
+        }
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(JiraLikeConnector)],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
+        );
+        block_on(registry.search("jira", "sprint status for ABC")).unwrap();
+
+        let rows = recorded.lock().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one ledger row for the jira search");
+        let row = &rows[0];
+        assert_eq!(row.provider_id, "jira");
+        assert!(
+            row.call_kind.contains("jira"),
+            "a jira egress must be attributed to jira, not web: call_kind={}",
+            row.call_kind
+        );
+        assert_eq!(row.call_kind, "jira_search");
+        assert_eq!(row.destination, "Jira (connector)");
+        assert_ne!(
+            row.call_kind, "web_search",
+            "a jira egress must NOT be mislabeled as a web search"
+        );
+        assert!(
+            !row.destination.to_lowercase().contains("web search"),
+            "a jira destination must not read as a web search: {}",
+            row.destination
+        );
+    }
+
+    /// (c, cont.) PER-CONNECTOR ATTRIBUTION for Slack — a `"slack"`-id connector must record its OWN
+    /// truthful ledger attribution ("slack_search" / "Slack (connector)"), NOT the web-search label.
+    /// Mirrors `jira_connector_search_is_attributed_to_jira_not_web`.
+    #[test]
+    fn slack_connector_search_is_attributed_to_slack_not_web() {
+        struct SlackLikeConnector;
+        #[async_trait::async_trait]
+        impl Connector for SlackLikeConnector {
+            fn id(&self) -> &str {
+                "slack"
+            }
+            fn egress_class(&self) -> EgressClass {
+                EgressClass::External
+            }
+            fn egress_attribution(&self) -> (&'static str, &'static str) {
+                ("slack_search", "Slack (connector)")
+            }
+            async fn search(&self, _redacted_query: &str) -> ConnectorResult {
+                Ok(vec![ConnectorHit {
+                    title: "t".into(),
+                    snippet: "s".into(),
+                    url: "https://acme.slack.com/archives/C1/p1".into(),
+                    source_label: "slack · fake".into(),
+                }])
+            }
+        }
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(SlackLikeConnector)],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
+        );
+        block_on(registry.search("slack", "what did we decide about launch")).unwrap();
+
+        let rows = recorded.lock().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one ledger row for the slack search");
+        let row = &rows[0];
+        assert_eq!(row.provider_id, "slack");
+        assert!(
+            row.call_kind.contains("slack"),
+            "a slack egress must be attributed to slack, not web: call_kind={}",
+            row.call_kind
+        );
+        assert_eq!(row.call_kind, "slack_search");
+        assert_eq!(row.destination, "Slack (connector)");
+        assert_ne!(
+            row.call_kind, "web_search",
+            "a slack egress must NOT be mislabeled as a web search"
+        );
+        assert!(
+            !row.destination.to_lowercase().contains("web search"),
+            "a slack destination must not read as a web search: {}",
+            row.destination
+        );
     }
 }

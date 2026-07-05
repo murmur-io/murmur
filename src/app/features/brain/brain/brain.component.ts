@@ -17,6 +17,7 @@ import type {
 } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
+import { BrainEnableCardComponent } from "../brain-enable-card/brain-enable-card.component";
 import { BrainMapComponent } from "../brain-map/brain-map.component";
 import { BrainMemoryComponent } from "../brain-memory/brain-memory.component";
 import { BrainNoteEditorComponent } from "../brain-note-editor/brain-note-editor.component";
@@ -74,6 +75,7 @@ interface FolderOption {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
+    BrainEnableCardComponent,
     BrainSourceCardComponent,
     BrainNoteEditorComponent,
     BrainMapComponent,
@@ -86,6 +88,16 @@ export class BrainComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+
+  // ── "Enable the brain" nudge — shown only when an on-device model is missing ─
+  /**
+   * Both on-device models present? null = unknown (probe in flight / failed).
+   * The nudge card renders ONLY when this is confirmed `false` (never flashes on
+   * an already-set-up brain, never shows behind a failed probe). Hoisted here
+   * rather than read off the child (a template-ref can't gate its own creation);
+   * the card re-probes and emits `enabled` when the download lands.
+   */
+  readonly brainReady = signal<boolean | null>(null);
 
   // ── status header ──────────────────────────────────────────────────────
   readonly overview = signal<BrainOverview | null>(null);
@@ -278,6 +290,9 @@ export class BrainComponent {
     // Ensure the folder tree is loaded so the selector has options.
     void this.folders.load();
 
+    // Probe whether the two on-device models are present (drives the nudge).
+    void this.probeBrainReady();
+
     // Default the selection to "All folders" once options resolve, and keep it
     // valid if the tree changes (a removed folder falls back to "All"). Tracked
     // effect that writes the selection (NG0600 guard). ALL_FOLDERS_ID is always
@@ -343,6 +358,25 @@ export class BrainComponent {
       },
       { allowSignalWrites: true },
     );
+  }
+
+  /** Probe both on-device models; null on any failure (nudge stays hidden). */
+  private async probeBrainReady(): Promise<void> {
+    try {
+      const [brain, embed] = await Promise.all([
+        this.ipc.brainModelPresent(),
+        this.ipc.embedModelPresent(),
+      ]);
+      this.brainReady.set(brain && embed);
+    } catch {
+      this.brainReady.set(null);
+    }
+  }
+
+  /** The card landed both models — hide the nudge + refresh the header counts. */
+  protected onBrainEnabled(): void {
+    this.brainReady.set(true);
+    void this.fetchOverview();
   }
 
   private async fetchOverview(): Promise<void> {

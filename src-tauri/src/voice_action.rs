@@ -219,11 +219,34 @@ pub fn handle_voice_action(
             }
             note_aside(text, db, unlocked, meeting_id)
         }
-        VoiceIntent::SlackSearch { .. } => VoiceActionResult::new(
-            "slack_search",
-            "unavailable",
-            "Slack search isn't available yet.",
-        ),
+        VoiceIntent::SlackSearch { query } => {
+            // Ride the REAL connector: dispatch through `execute_slack_search` (fail-closed,
+            // redacted, egress-ledgered inside the connector framework). When the Slack connector is
+            // not exposed (default: disabled + unconsented) the tool returns its own graceful
+            // "not available" sentinel — a non-answer that EGRESSES NOTHING, exactly like before,
+            // but now a consented + configured user gets live Slack results. A real external failure
+            // degrades to the same "not available" notice (non-PII), never a panic.
+            let q = query.trim();
+            let query_for_retrieval = if q.is_empty() {
+                literal_command.trim()
+            } else {
+                q
+            };
+            match slack_search_blocking(query_for_retrieval, config) {
+                Ok(text) => {
+                    let text = text.trim();
+                    if text.is_empty() || is_empty_tool_result(text) {
+                        // Not exposed / no results → non-answer notice, still zero egress.
+                        VoiceActionResult::new("slack_search", "unavailable", text.to_string())
+                    } else {
+                        VoiceActionResult::new("slack_search", "ok", text.to_string())
+                    }
+                }
+                Err(e) => {
+                    VoiceActionResult::new("slack_search", "unavailable", non_pii_error(&e))
+                }
+            }
+        }
         VoiceIntent::Unknown { .. } => VoiceActionResult::new(
             "unknown",
             "unrecognized",
@@ -670,6 +693,26 @@ fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<
     })
 }
 
+/// Run the async SLACK-search connector to completion from this SYNCHRONOUS dispatch. Mirrors
+/// [`web_search_blocking`]: a dedicated scoped OS thread with its own current-thread runtime, so we
+/// never "start a runtime within a runtime" and the future never crosses a thread boundary (only the
+/// `Result<String>` does). The egress/consent/redaction discipline all lives inside
+/// `execute_slack_search` → the connector registry (fail-closed when the Slack connector is absent).
+fn slack_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Summarize(format!("slack search runtime build: {e}")))?;
+                rt.block_on(crate::tools::execute_slack_search(query, config))
+            })
+            .join()
+            .map_err(|_| AppError::Summarize("slack search worker thread panicked".into()))?
+    })
+}
+
 /// INTENT GATE for the calendar leg: does this request read like a calendar/meeting question? We
 /// fire the local calendar lookup ONLY for these — so a plain "what's the weather" research never
 /// drags in calendar noise, while "who's in my next meeting" / "what's on my agenda" / "kto jest na
@@ -790,6 +833,8 @@ fn is_empty_tool_result(text: &str) -> bool {
         || t.starts_with("Semantic search is disabled")
         || t.starts_with("No web results")
         || t.starts_with("Web search is not available")
+        || t.starts_with("No Slack results")
+        || t.starts_with("Slack search is not available")
         || t.starts_with("No calendar events")
 }
 
@@ -1330,7 +1375,15 @@ mod tests {
             None,
         );
         assert_eq!(res.intent_kind, "slack_search");
+        // The SlackSearch intent now rides the REAL connector: with a default (unconsented) config it
+        // returns the tool's OWN fail-closed sentinel — a non-answer under the "unavailable" status,
+        // still zero egress (no token, no network).
         assert_eq!(res.status, "unavailable");
+        assert!(
+            res.summary.contains("not available"),
+            "fail-closed connector sentinel flows through (zero egress): {}",
+            res.summary
+        );
     }
 
     #[test]

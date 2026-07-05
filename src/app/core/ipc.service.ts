@@ -53,6 +53,7 @@ import type {
   PruneSummary,
   StorageReport,
   UserMemory,
+  VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
   SearchHit,
@@ -174,6 +175,23 @@ export class IpcService {
   /** Replace a meeting's note markdown (in-app edit) + re-write the vault file in place. */
   updateNote(meetingId: string, markdown: string): Promise<NoteDto> {
     return invoke<NoteDto>("update_note", { meetingId, markdown });
+  }
+
+  /**
+   * VERIFY PASS: check the note's Jira ticket claims against LIVE Jira (deterministic — the LLM is
+   * never the judge). On-demand only; rides the Jira connector's enable+consent gate and refuses a
+   * locked meeting. Returns one finding per referenced ticket.
+   */
+  verifyNoteSources(meetingId: string): Promise<VerifyFindingDto[]> {
+    return invoke<VerifyFindingDto[]>("verify_note_sources", { meetingId });
+  }
+
+  /** Persist the reviewed verify findings as non-destructive inline `> ` markers in the note. */
+  applyNoteVerifyMarkers(
+    meetingId: string,
+    findings: VerifyFindingDto[],
+  ): Promise<NoteDto> {
+    return invoke<NoteDto>("apply_note_verify_markers", { meetingId, findings });
   }
 
   getConfig(): Promise<AppConfigDto> {
@@ -491,6 +509,56 @@ export class IpcService {
   /** Whether a web-search (Brave) API key is currently stored. Never the value. */
   hasWebSearchKey(): Promise<boolean> {
     return invoke<boolean>("has_web_search_key");
+  }
+
+  /**
+   * brain2 connectors (Phase 2) — grant the one-time consent for JIRA egress. The ONLY
+   * supported way to flip `jiraConsented` true: the backend persists the flag AND updates
+   * its in-memory config cache, so the next brain/Ask answer may expose the Jira connector
+   * (provided Jira is enabled AND configured AND a token is stored). Idempotent. Mirrors
+   * {@link consentToWebSearch}.
+   */
+  consentToJira(): Promise<void> {
+    return invoke<void>("consent_to_jira");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Jira API token in the Keychain. An empty
+   * string clears it. NEVER logged / NEVER returned to the FE — only {@link hasJiraToken}
+   * reports presence. Mirrors {@link setWebSearchApiKey}.
+   */
+  setJiraToken(key: string): Promise<void> {
+    return invoke<void>("set_jira_token", { key });
+  }
+
+  /** Whether a Jira API token is currently stored. Never the value. */
+  hasJiraToken(): Promise<boolean> {
+    return invoke<boolean>("has_jira_token");
+  }
+
+  /**
+   * brain2 connectors (Phase 3) — grant the one-time consent for SLACK egress. The ONLY
+   * supported way to flip `slackConsented` true: the backend persists the flag AND updates
+   * its in-memory config cache, so the next brain/Ask answer may expose the Slack connector
+   * (provided Slack is enabled AND a user token is stored). Idempotent. Mirrors
+   * {@link consentToJira}.
+   */
+  consentToSlack(): Promise<void> {
+    return invoke<void>("consent_to_slack");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Slack user token in the Keychain. An empty
+   * string clears it. NEVER logged / NEVER returned to the FE — only {@link hasSlackToken}
+   * reports presence. Mirrors {@link setJiraToken}.
+   */
+  setSlackToken(key: string): Promise<void> {
+    return invoke<void>("set_slack_token", { key });
+  }
+
+  /** Whether a Slack user token is currently stored. Never the value. */
+  hasSlackToken(): Promise<boolean> {
+    return invoke<boolean>("has_slack_token");
   }
 
   providerStatuses(): Promise<ProviderStatus[]> {
