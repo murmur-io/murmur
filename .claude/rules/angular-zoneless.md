@@ -184,7 +184,11 @@ prototype is the reference implementation). The concrete contract:
   `mur-toggle`); number inputs stay native (`NumberValueAccessor` commits
   numbers — the storage-limit lesson). Before writing ANY new control, check
   the catalog: icon, sidebar, quick-search, toggle, input, select, slider,
-  segmented, kbd, spinner, banner, pill, card, empty-state — and
+  segmented, kbd, spinner, banner, pill, card, empty-state, **button**
+  (`<mur-button variant="…" [busy]="…" [disabled]="…">` — wraps a native
+  `<button>`; variants ride the `.btn` primitives; link-shaped `<a routerLink>`
+  and bespoke icon-square buttons stay on legacy `.btn` classes until it grows
+  href/iconOnly support) — and
   `primitives.css` for class-based primitives (`.btn`, `.seg`, `.menu`,
   `.panel-card`, `.tabbar`…). Extending the catalog beats re-rolling a one-off.
 
@@ -219,6 +223,7 @@ prototype is the reference implementation). The concrete contract:
 | New npm package (FE) | ask the user; reuse `@angular/*` / `rxjs` / `@tauri-apps/api` |
 | `NgModule`, NgRx, a new facade/store abstraction | standalone component + `IpcService` + signals |
 | `standalone: true` in a decorator | omit it — standalone is the v19+ default |
+| raw `class="btn btn-*"` in NEW templates | `<mur-button variant="…">` (legacy call sites migrate in waves; links/icon-squares exempt until covered) |
 | `{ allowSignalWrites: true }` on `effect()` | delete it — writes are allowed since v19 (deprecated no-op) |
 | `provideExperimentalZonelessChangeDetection` | `provideZonelessChangeDetection` (stable) |
 | `@angular-devkit/build-angular` builders | `@angular/build:application` / `@angular/build:dev-server` |

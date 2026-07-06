@@ -1,0 +1,30 @@
+/* Visuals live in the .btn primitives (primitives.css) — the component adds
+   ONLY what classes can't express: the typed sm size and the busy state.
+   The HOST is a transparent flex wrapper: width/margins/alignment applied to
+   <mur-button> flow through; the inner native button is the visual box. */
+:host {
+  display: inline-flex;
+}
+:host button {
+  flex: 1 1 auto;
+}
+
+/* A disabled/busy control must not emit host (click)s from its padding. */
+:host(.is-blocked) {
+  pointer-events: none;
+}
+
+/* Compact control — replaces the ten per-feature `.btn-sm` re-declarations
+   (absorbed wave by wave). The 30px height is structural, like .btn's 40px. */
+:host button.mur-btn-sm {
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  border-radius: var(--radius-sm);
+}
+
+/* In-flight: the spinner announces progress; the muted look rides
+   .btn:disabled (busy also disables the inner button). */
+:host button.is-busy {
+  opacity: 0.7;
+}

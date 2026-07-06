@@ -1,0 +1,18 @@
+<button
+  class="btn"
+  [class.btn-primary]="variant() === 'primary'"
+  [class.btn-ghost]="variant() === 'ghost'"
+  [class.btn-danger]="variant() === 'danger'"
+  [class.mur-btn-sm]="size() === 'sm'"
+  [class.is-busy]="busy()"
+  [type]="type()"
+  [disabled]="disabled() || busy()"
+  [attr.aria-label]="ariaLabel()"
+  [attr.aria-expanded]="ariaExpanded()"
+  [attr.aria-busy]="busy() || null"
+>
+  @if (busy()) {
+    <mur-spinner [size]="14" />
+  }
+  <ng-content />
+</button>
