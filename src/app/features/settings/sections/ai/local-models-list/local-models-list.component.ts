@@ -14,7 +14,6 @@ import { SettingsStore } from "../../../settings.store";
  */
 @Component({
   selector: "app-local-models-list",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [],
   templateUrl: "./local-models-list.component.html",

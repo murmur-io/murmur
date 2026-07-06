@@ -19,7 +19,6 @@ import { ModelEffortPickerComponent } from "../model-effort-picker/model-effort-
  */
 @Component({
   selector: "app-brain-engine-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ModelEffortPickerComponent],
   templateUrl: "./brain-engine-card.component.html",

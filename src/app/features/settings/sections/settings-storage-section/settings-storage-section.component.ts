@@ -13,7 +13,6 @@ import { SettingsStore } from "../../settings.store";
  *  manual "Free up space". Notes/transcripts are never deleted — only audio. */
 @Component({
   selector: "app-settings-storage-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MurToggleComponent,ReactiveFormsModule],

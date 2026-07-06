@@ -20,7 +20,6 @@ import type { FolderExposure } from "../../../services/folders.service";
  */
 @Component({
   selector: "app-lock-badge",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     class: "lock-badge",

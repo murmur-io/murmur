@@ -29,7 +29,6 @@ import type { ActionItem } from "../../../core/models";
  */
 @Component({
   selector: "app-meeting-actions",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   // Hide the host entirely when there are no items (no empty panel).
   host: { "[hidden]": "items().length === 0" },

@@ -15,7 +15,6 @@ import { NG_VALUE_ACCESSOR, type ControlValueAccessor } from "@angular/forms";
  */
 @Component({
   selector: "mur-input",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./input.component.html",
   styleUrl: "./input.component.scss",

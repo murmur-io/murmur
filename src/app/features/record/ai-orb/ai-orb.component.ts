@@ -36,7 +36,6 @@ import type { OrbState } from "../../../core/meeting-conversation.store";
  */
 @Component({
   selector: "app-ai-orb",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./ai-orb.component.html",
   styleUrl: "./ai-orb.component.scss",

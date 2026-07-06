@@ -231,7 +231,7 @@ are still just Markdown you own. (The encrypted SQLite DB — not the vault — 
 ## 🏗️ Architecture
 
 Murmur is a **Tauri 2.11** desktop app: a **Rust** core (crate `murmur`, lib `meetnotes_lib`, bin `Murmur`)
-talks to an **Angular 18 zoneless** frontend over Tauri IPC. There's no NgRx — every screen is a standalone
+talks to an **Angular 22 zoneless** frontend over Tauri IPC. There's no NgRx — every screen is a standalone
 *signals* component calling a single `IpcService`. The Rust side captures, transcribes, summarizes, and
 persists everything to **one SQLCipher-encrypted SQLite database** — the canonical store. Over it sit the
 **brain** (a grounded RAG + reasoning layer powering the in-meeting assistant and Ask — full model-driven
@@ -402,7 +402,7 @@ bash scripts/ci.sh                      # full gate: clippy -D warnings + tests 
 | Layer | Tech |
 | --- | --- |
 | **Shell** | Tauri 2.11 · Rust (edition 2021, toolchain 1.96) · macOS-first, universal (arm64 + x86_64), min macOS 13.4 |
-| **Frontend** | Angular 18.2 **zoneless** · standalone + signals · TypeScript 5.5 · `marked` + `DOMPurify` · **no NgRx** |
+| **Frontend** | Angular 22 **zoneless** · standalone + signals · TypeScript 6.0 · `marked` + `DOMPurify` · **no NgRx** |
 | **Audio** | `cpal` · `whisper-rs` (Metal) · ScreenCaptureKit / Core Audio tap · `sherpa-onnx` diarization · offline AEC |
 | **On-device brain** | `mistralrs` (GGUF reasoner) · `candle` (e5 embeddings + DeBERTa NER) · `sqlite-vec` |
 | **Storage / crypto** | `rusqlite` + **SQLCipher** · `aes-gcm` + `zeroize` · macOS Keychain · Touch ID (`LAContext`) |
@@ -411,7 +411,7 @@ bash scripts/ci.sh                      # full gate: clippy -D warnings + tests 
 
 ```
 murmur/
-├─ src/             Angular 18 frontend (standalone, zoneless, signals)
+├─ src/             Angular 22 frontend (standalone, zoneless, signals)
 │  └─ app/
 │     ├─ core/        ipc.service.ts · models.ts · recorder.store.ts · meeting-conversation.store.ts
 │     └─ features/    record · library · detail · folders · graph · ask · brain · analytics · settings · onboarding · bar

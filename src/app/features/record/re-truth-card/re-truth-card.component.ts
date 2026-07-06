@@ -37,7 +37,6 @@ import type { ApplyResult, SupersessionDto } from "../../../core/models";
  */
 @Component({
   selector: "app-re-truth-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./re-truth-card.component.html",
   styleUrl: "./re-truth-card.component.scss",
@@ -127,7 +126,6 @@ export class ReTruthCardComponent {
       this.folders.tree();
       void this.fetch(id);
     },
-    { allowSignalWrites: true },
   );
 
   private async fetch(id: string): Promise<void> {

@@ -28,7 +28,6 @@ import { ToastService } from "../../../services/toast.service";
  */
 @Component({
   selector: "app-brain-memory",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./brain-memory.component.html",
@@ -75,7 +74,6 @@ export class BrainMemoryComponent {
         this.folders.tree();
         void this.fetch();
       },
-      { allowSignalWrites: true },
     );
   }
 

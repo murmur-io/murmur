@@ -46,7 +46,6 @@ import { AssistantSourcesComponent } from "../../../shared/assistant-sources/ass
  */
 @Component({
   selector: "app-note-item",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MarkdownComponent, AssistantSourcesComponent],
   templateUrl: "./note-item.component.html",

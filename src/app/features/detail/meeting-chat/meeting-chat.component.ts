@@ -37,7 +37,6 @@ const STARTERS: readonly string[] = [
  */
 @Component({
   selector: "app-meeting-chat",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MarkdownComponent],
   templateUrl: "./meeting-chat.component.html",

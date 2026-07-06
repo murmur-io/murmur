@@ -43,7 +43,6 @@ interface FolderOption {
  */
 @Component({
   selector: "app-settings-account-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [SharingAuthFlowComponent],
   templateUrl: "./settings-account-section.component.html",

@@ -56,7 +56,6 @@ interface NavItem {
  */
 @Component({
   selector: "app-shell",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterOutlet,

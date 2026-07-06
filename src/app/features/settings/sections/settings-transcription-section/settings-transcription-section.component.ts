@@ -9,7 +9,6 @@ import { SettingsStore } from "../../settings.store";
  */
 @Component({
   selector: "app-settings-transcription-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   templateUrl: "./settings-transcription-section.component.html",

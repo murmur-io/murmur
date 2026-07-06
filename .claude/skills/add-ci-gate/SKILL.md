@@ -53,14 +53,14 @@ If the step needs something the CI runner lacks, add the minimal step to `.githu
 - a system tool → `brew list <t> >/dev/null 2>&1 || brew install <t>`
 - a big download the step needs → an `actions/cache` step (like the whisper model)
 
-If the check runs in BOTH the per-PR `gate` and the `full-gate`, it belongs before the `MURMUR_CI_SKIP_E2E` guard in ci.sh. If it's E2E-heavy, put it inside the guarded `else` branch so the per-PR gate stays fast.
+CI runs the COMPLETE ci.sh on every PR (release parity, 2026-07-05), so placement no longer changes CI coverage — but it still changes the LOCAL iterating subset: a check before the `MURMUR_CI_SKIP_E2E` guard runs even in the fast local subset; an E2E-heavy check belongs inside the guarded `else` branch so `MURMUR_CI_SKIP_E2E=1` stays quick.
 
 ## Step 6 — verify (RED-before-GREEN for the gate too)
 
 ```bash
 # 1) The new step FAILS when it should (introduce a temporary violation, confirm red), then remove it.
 # 2) The gate is green with the real tree, via the exact CI command:
-MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh     # PR-gate subset
+MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh     # fast local subset (CI itself runs the full gate)
 bash scripts/ci.sh                          # full, if your step is in the E2E path
 # 3) Guardrail added? prove it:
 bash .claude/hooks/selftest.sh              # PASS

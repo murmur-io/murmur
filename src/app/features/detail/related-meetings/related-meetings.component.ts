@@ -27,7 +27,6 @@ import type { SearchHit } from "../../../core/models";
  */
 @Component({
   selector: "app-related-meetings",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./related-meetings.component.html",
   styleUrl: "./related-meetings.component.scss",
@@ -55,7 +54,6 @@ export class RelatedMeetingsComponent {
       this.loading.set(true);
       void this.fetch(id);
     },
-    { allowSignalWrites: true },
   );
 
   private async fetch(id: string | null): Promise<void> {

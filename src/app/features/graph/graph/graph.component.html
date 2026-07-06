@@ -141,7 +141,7 @@
                       class="g-card"
                       [entity]="e"
                       [selected]="selectedId() === e.id"
-                      (select)="onSelect($event)"
+                      (entitySelected)="onSelect($event)"
                     />
                   }
                 </div>
@@ -156,8 +156,8 @@
         <app-entity-detail
           class="g-detail"
           [entityId]="id"
-          (select)="onSelect($event)"
-          (close)="clearSelection()"
+          (selected)="onSelect($event)"
+          (closed)="clearSelection()"
         />
       }
     </div>

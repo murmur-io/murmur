@@ -26,7 +26,6 @@ import { AiRoleRowsComponent } from "../ai-role-rows/ai-role-rows.component";
  */
 @Component({
   selector: "app-ai-advanced-block",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [AiConnectionCardsComponent, AiRoleRowsComponent],
   templateUrl: "./ai-advanced-block.component.html",
@@ -55,7 +54,6 @@ export class AiAdvancedBlockComponent {
         this.store.advancedExpanded.set(true);
       }
     },
-    { allowSignalWrites: true },
   );
 
   toggle(): void {

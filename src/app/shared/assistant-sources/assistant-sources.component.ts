@@ -47,7 +47,6 @@ interface RichSource extends AssistantSource {
  */
 @Component({
   selector: "app-assistant-sources",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./assistant-sources.component.html",
   styleUrl: "./assistant-sources.component.scss",

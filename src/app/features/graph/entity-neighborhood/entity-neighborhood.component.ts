@@ -46,7 +46,6 @@ const SAT_R = 5.5;
  */
 @Component({
   selector: "app-entity-neighborhood",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./entity-neighborhood.component.html",
   styleUrl: "./entity-neighborhood.component.scss",
@@ -57,7 +56,7 @@ export class EntityNeighborhoodComponent {
   /** Display name of the centred entity (for the SVG aria-label). */
   readonly centerName = input<string>("");
   /** Emits a neighbor's id when its satellite is activated. */
-  readonly select = output<string>();
+  readonly selected = output<string>();
 
   protected readonly size = SIZE;
   protected readonly center = CENTER;
@@ -135,6 +134,6 @@ export class EntityNeighborhoodComponent {
   /** Space activates the satellite without scrolling the page. */
   protected onSpace(event: Event, id: string): void {
     event.preventDefault();
-    this.select.emit(id);
+    this.selected.emit(id);
   }
 }

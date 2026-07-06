@@ -13090,17 +13090,23 @@ mod lifecycle_tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].kind, "note", "import_text stores kind='note'");
         assert_eq!(listed[0].name, "Decisions");
-        // Model-presence-gated chunk count (deterministic on a no-model CI machine).
+        // CHUNKING is unconditional (keyword/FTS retrieval must work on a default install);
+        // only the VECTORS stay model-presence-gated (never write stub vectors — mirrors
+        // `import_document`'s assertions and `should_auto_index`'s no-stub contract).
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "the note must be chunked regardless of model presence (always-chunk)"
+        );
         if crate::embed::embed_model_present() {
             assert!(
-                state.db.doc_chunk_count(&id).unwrap() >= 1,
-                "note chunked+embedded when model present"
+                state.db.doc_vec_count(&id).unwrap() >= 1,
+                "with the e5 model present, the chunks must carry real vectors"
             );
         } else {
             assert_eq!(
-                state.db.doc_chunk_count(&id).unwrap(),
+                state.db.doc_vec_count(&id).unwrap(),
                 0,
-                "no stub vectors when model absent"
+                "with no e5 model, NO stub vectors are written (no-stub contract)"
             );
         }
         // Empty / whitespace-only text is refused.
