@@ -29,7 +29,6 @@ import { PersonDossierComponent } from "../person-dossier/person-dossier.compone
  */
 @Component({
   selector: "app-people",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [PersonDossierComponent],
   templateUrl: "./people.component.html",
@@ -62,7 +61,6 @@ export class PeopleComponent {
       this.folders.tree();
       void this.fetch();
     },
-    { allowSignalWrites: true },
   );
 
   private async fetch(): Promise<void> {

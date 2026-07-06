@@ -33,7 +33,6 @@ interface FolderOption {
  */
 @Component({
   selector: "app-move-to-menu",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [LockBadgeComponent],
   templateUrl: "./move-to-menu.component.html",
@@ -51,7 +50,7 @@ export class MoveToMenuComponent {
   /** Fired after a successful move, with the new folder id (null = root). */
   readonly moved = output<string | null>();
   /** Fired when the menu should be dismissed. */
-  readonly close = output<void>();
+  readonly closed = output<void>();
 
   /** True while a move IPC is in flight. */
   readonly moving = signal(false);
@@ -167,7 +166,7 @@ export class MoveToMenuComponent {
       const targetName = this.nodeById(targetId)?.name ?? "All notes";
       this.toast.success(`Moved to ${targetName}`);
       this.moved.emit(targetId);
-      this.close.emit();
+      this.closed.emit();
     } catch {
       this.moveError.set("Couldn’t move this note. Please try again.");
     } finally {

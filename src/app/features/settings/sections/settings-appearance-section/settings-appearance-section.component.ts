@@ -14,7 +14,6 @@ import { ThemeService, type ThemeMode } from "../../../../services/theme.service
  */
 @Component({
   selector: "app-settings-appearance-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MurSegmentedComponent, MurSliderComponent],
   templateUrl: "./settings-appearance-section.component.html",

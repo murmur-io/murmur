@@ -25,7 +25,6 @@ import { IpcService } from "../../../core/ipc.service";
  */
 @Component({
   selector: "app-mic-mute-toggle",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./mic-mute-toggle.component.html",
   styleUrl: "./mic-mute-toggle.component.scss",

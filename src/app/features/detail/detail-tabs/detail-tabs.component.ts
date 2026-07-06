@@ -22,7 +22,6 @@ export interface DetailTabDef {
  */
 @Component({
   selector: "app-detail-tabs",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./detail-tabs.component.html",
   styleUrl: "./detail-tabs.component.scss",

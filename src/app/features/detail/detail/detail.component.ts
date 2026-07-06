@@ -54,7 +54,6 @@ interface ActionItem {
 
 @Component({
   selector: "app-detail",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,

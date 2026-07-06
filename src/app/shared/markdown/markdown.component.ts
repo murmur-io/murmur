@@ -29,7 +29,6 @@ import DOMPurify from "dompurify";
  */
 @Component({
   selector: "app-markdown",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   encapsulation: ViewEncapsulation.None,
   templateUrl: "./markdown.component.html",

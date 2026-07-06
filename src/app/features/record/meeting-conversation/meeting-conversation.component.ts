@@ -74,7 +74,6 @@ export function parseBrainLine(text: string): string | null {
  */
 @Component({
   selector: "app-meeting-conversation",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     AiOrbComponent,
@@ -153,14 +152,12 @@ export class MeetingConversationComponent implements OnInit {
   constructor() {
     // Keep the store pointed at the active meeting so a note line appends to the
     // right `manual_notes` buffer. The effect reads the `meetingId` input and the
-    // store method WRITES the store's `_meetingId` signal → allowSignalWrites is
-    // REQUIRED in Angular 18 (trap T1 / NG0600), even though it's a different
-    // signal than the one read.
+    // store method writes the store's `_meetingId` signal (signal writes in
+    // effects are allowed since Angular 19).
     effect(
       () => {
         this.store.setMeetingId(this.meetingId());
       },
-      { allowSignalWrites: true },
     );
 
     // Auto-scroll the flow to the newest line whenever the notes change. Tracks

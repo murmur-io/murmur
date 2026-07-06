@@ -98,8 +98,8 @@
           tabindex="0"
           [attr.aria-label]="satLabel(s)"
           [style.--i]="$index"
-          (click)="select.emit(s.id)"
-          (keydown.enter)="select.emit(s.id)"
+          (click)="selected.emit(s.id)"
+          (keydown.enter)="selected.emit(s.id)"
           (keydown.space)="onSpace($event, s.id)"
         >
           <circle

@@ -11,32 +11,29 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@angular/animations": "^18.2.0",
-    "@angular/common": "^18.2.0",
-    "@angular/compiler": "^18.2.0",
-    "@angular/core": "^18.2.0",
-    "@angular/forms": "^18.2.0",
-    "@angular/platform-browser": "^18.2.0",
-    "@angular/platform-browser-dynamic": "^18.2.0",
-    "@angular/router": "^18.2.0",
-    "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@angular/common": "^22.0.5",
+    "@angular/compiler": "^22.0.5",
+    "@angular/core": "^22.0.5",
+    "@angular/forms": "^22.0.5",
+    "@angular/platform-browser": "^22.0.5",
+    "@angular/router": "^22.0.5",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "dompurify": "^3.4.11",
-    "marked": "^14.1.4",
-    "rxjs": "^7.8.0",
-    "tslib": "^2.6.0",
-    "zone.js": "~0.14.10"
+    "marked": "^18.0.5",
+    "rxjs": "^7.8.2",
+    "tslib": "^2.8.1"
   },
   "devDependencies": {
-    "@angular-devkit/build-angular": "^18.2.0",
-    "@angular/cli": "^18.2.0",
-    "@angular/compiler-cli": "^18.2.0",
+    "@angular/build": "^22.0.5",
+    "@angular/cli": "^22.0.5",
+    "@angular/compiler-cli": "^22.0.5",
+    "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.61.1",
-    "@tauri-apps/cli": "^2.0.0",
-    "@types/dompurify": "^3.2.0",
-    "angular-eslint": "18.4.3",
-    "eslint": "^9.15.0",
-    "typescript": "~5.5.0",
-    "typescript-eslint": "8.16.0"
+    "@tauri-apps/cli": "^2.11.4",
+    "angular-eslint": "22.0.0",
+    "eslint": "^10.6.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "8.62.1"
   }
 }

@@ -8,7 +8,6 @@ export type BannerKind = "info" | "success" | "warning" | "danger";
  */
 @Component({
   selector: "mur-banner",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     class: "banner",

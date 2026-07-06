@@ -29,7 +29,6 @@ import { SharingAuthFlowComponent } from "../sharing-auth-flow/sharing-auth-flow
  */
 @Component({
   selector: "app-sharing-gateway",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [SharingAuthFlowComponent],
   templateUrl: "./sharing-gateway.component.html",

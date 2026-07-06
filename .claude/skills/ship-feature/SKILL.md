@@ -1,12 +1,12 @@
 ---
 name: ship-feature
-description: The agentic feature-shipping discipline for Murmur (Tauri 2.11 Rust core + Angular 18 zoneless). Scope → (Workflow) plan → build backend and/or FE under the project conventions → ADVERSARIAL verify (an adversarial-verifier pass, plus a lock-security review when the change touches the lock/crypto/visibility path) → gates green (cargo test --lib, ng lint, ng build, scripts/ci.sh) → QueaT commit → PR to the `murmur` trunk. Use whenever the user wants to build, implement, add, or ship a feature/fix in Murmur end-to-end. Encodes the verify-before-trust discipline that caught 7 bugs.
+description: The agentic feature-shipping discipline for Murmur (Tauri 2.11 Rust core + Angular 22 zoneless). Scope → (Workflow) plan → build backend and/or FE under the project conventions → ADVERSARIAL verify (an adversarial-verifier pass, plus a lock-security review when the change touches the lock/crypto/visibility path) → gates green (cargo test --lib, ng lint, ng build, scripts/ci.sh) → QueaT commit → PR to the `murmur` trunk. Use whenever the user wants to build, implement, add, or ship a feature/fix in Murmur end-to-end. Encodes the verify-before-trust discipline that caught 7 bugs.
 ---
 
 # /ship-feature — ship a Murmur feature end-to-end
 
 You are shipping a change into **Murmur** (Rust crate `murmur` / bin `Murmur` / lib
-`meetnotes_lib` + Angular 18 zoneless). The job is not "write code" — it is "land a
+`meetnotes_lib` + Angular 22 zoneless). The job is not "write code" — it is "land a
 **verified** change behind the project's gates and identity rules." The non-obvious value
 here is **adversarial verification**: the team distrusts AI-written, self-certified code, and
 this loop's adversarial pass is what previously **caught 7 bugs** that the implementing agent

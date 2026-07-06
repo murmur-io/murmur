@@ -49,7 +49,6 @@ const MAX_CLOUD_R = 470;
  */
 @Component({
   selector: "app-brain-map",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [NeuralSceneDirective],
   templateUrl: "./brain-map.component.html",

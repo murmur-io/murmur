@@ -23,7 +23,6 @@ import type { DocumentInfo } from "../../../core/models";
  */
 @Component({
   selector: "app-brain-source-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./brain-source-card.component.html",

@@ -56,7 +56,6 @@ interface Turn {
  */
 @Component({
   selector: "app-audio-panel",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MeetingTimelineComponent],
   templateUrl: "./audio-panel.component.html",
@@ -294,7 +293,7 @@ export class AudioPanelComponent {
     if (!el || dur <= 0) {
       return;
     }
-    let next: number | null = null;
+    let next: number;
     switch (event.key) {
       case "ArrowLeft":
         next = Math.max(0, el.currentTime - 5);

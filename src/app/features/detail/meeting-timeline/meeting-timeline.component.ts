@@ -77,7 +77,6 @@ interface AxisTick {
  */
 @Component({
   selector: "app-meeting-timeline",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./meeting-timeline.component.html",
   styleUrl: "./meeting-timeline.component.scss",
@@ -489,7 +488,7 @@ export class MeetingTimelineComponent {
       return;
     }
     const cur = clamp(this.currentTime(), 0, total);
-    let next: number | null = null;
+    let next: number;
     switch (event.key) {
       case "ArrowLeft":
         next = Math.max(0, cur - 5);

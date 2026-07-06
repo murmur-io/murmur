@@ -10,7 +10,6 @@ import { ChangeDetectionStrategy, Component } from "@angular/core";
  */
 @Component({
   selector: "mur-sidebar",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: { class: "drill-rail" },
   templateUrl: "./sidebar.component.html",

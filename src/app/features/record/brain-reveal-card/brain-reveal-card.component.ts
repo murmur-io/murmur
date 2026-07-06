@@ -35,7 +35,6 @@ const SEEN_KEY = "murmur-brain-reveal-seen";
  */
 @Component({
   selector: "app-brain-reveal-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterLink],
   templateUrl: "./brain-reveal-card.component.html",
@@ -99,7 +98,6 @@ export class BrainRevealCardComponent {
       this.folders.tree();
       void this.fetch();
     },
-    { allowSignalWrites: true },
   );
 
   private async fetch(): Promise<void> {

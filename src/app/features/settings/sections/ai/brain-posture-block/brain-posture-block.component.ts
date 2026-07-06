@@ -20,7 +20,6 @@ import { SettingsStore } from "../../../settings.store";
  */
 @Component({
   selector: "app-brain-posture-block",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [],
   templateUrl: "./brain-posture-block.component.html",

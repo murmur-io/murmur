@@ -20,7 +20,6 @@ import { UpdateService } from "../services/update.service";
 
 @Component({
   selector: "app-root",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [RouterOutlet],
   // AppComponent is the bootstrap root, hosted by the STATIC <app-root> in

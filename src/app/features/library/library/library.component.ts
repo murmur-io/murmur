@@ -41,7 +41,6 @@ interface SnippetPart {
 
 @Component({
   selector: "app-library",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   // Esc in Meetings backs out ("← Murmur") — but NOT while you're typing: in the
   // search box Esc clears/blurs it first, and it never hijacks another form field.
