@@ -14,7 +14,6 @@ import { NG_VALUE_ACCESSOR, type ControlValueAccessor } from "@angular/forms";
  */
 @Component({
   selector: "mur-select",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./select.component.html",
   styleUrl: "./select.component.scss",

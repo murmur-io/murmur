@@ -32,7 +32,6 @@ import { SettingsStore } from "../../../settings.store";
  */
 @Component({
   selector: "app-ai-setup-block",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   templateUrl: "./ai-setup-block.component.html",

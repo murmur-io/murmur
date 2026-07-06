@@ -23,7 +23,6 @@ import { SettingsStore } from "../../../settings.store";
  */
 @Component({
   selector: "app-ai-resolved-map",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./ai-resolved-map.component.html",
   styleUrl: "./ai-resolved-map.component.scss",

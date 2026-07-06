@@ -54,7 +54,6 @@ interface RoleRowVm {
  */
 @Component({
   selector: "app-ai-role-rows",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   templateUrl: "./ai-role-rows.component.html",
@@ -80,9 +79,9 @@ export class AiRoleRowsComponent {
   /**
    * When the map's "Change" asks for a role (store.highlightRole()), open the
    * disclosure and, after the row renders, scroll it into view + flash it, then
-   * clear the request. `allowSignalWrites` covers the synchronous `expanded`
-   * write (the store clear runs later, inside afterNextRender, so it's outside
-   * this effect's reactive context — no NG0600 either way). The store's
+   * clear the request. The synchronous `expanded` write is fine (signal writes
+   * in effects are allowed since Angular 19; the store clear runs later, inside
+   * afterNextRender, outside this effect's reactive context). The store's
    * null-then-set makes a repeat Change on the same row re-fire this effect.
    */
   private readonly _highlight = effect(
@@ -107,7 +106,6 @@ export class AiRoleRowsComponent {
         { injector: this.injector },
       );
     },
-    { allowSignalWrites: true },
   );
 
   /**
@@ -125,7 +123,6 @@ export class AiRoleRowsComponent {
         this.expanded.set(true);
       }
     },
-    { allowSignalWrites: true },
   );
 
   /**

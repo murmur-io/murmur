@@ -9,7 +9,6 @@ import { SettingsStore } from "../../settings.store";
  */
 @Component({
   selector: "app-settings-general-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [ReactiveFormsModule],
   templateUrl: "./settings-general-section.component.html",

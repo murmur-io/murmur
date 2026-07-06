@@ -34,7 +34,6 @@ import { SettingsStore } from "../../settings/settings.store";
  */
 @Component({
   selector: "app-brain-enable-card",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   providers: [SettingsStore],
   templateUrl: "./brain-enable-card.component.html",
@@ -75,7 +74,6 @@ export class BrainEnableCardComponent {
     () => {
       void this.refresh();
     },
-    { allowSignalWrites: true },
   );
 
   constructor() {

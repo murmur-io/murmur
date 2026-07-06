@@ -118,8 +118,8 @@
         <app-person-dossier
           class="p-detail"
           [entityId]="id"
-          (select)="onSelect($event)"
-          (close)="clearSelection()"
+          (selected)="onSelect($event)"
+          (closed)="clearSelection()"
         />
       }
     </div>

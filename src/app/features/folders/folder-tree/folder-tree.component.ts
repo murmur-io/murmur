@@ -34,7 +34,6 @@ import { FolderDropDirective } from "../folder-drop.directive";
  */
 @Component({
   selector: "app-folder-tree",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   // `folder-tree` ↔ `folder-row` are mutually recursive standalone components,
   // so their ES modules form an import cycle. Referencing `FolderRowComponent`
@@ -60,7 +59,7 @@ export class FolderTreeComponent {
   readonly depth = input<number>(0);
 
   /** Bubbles the chosen folder id (or null for the vault root) to the screen. */
-  readonly select = output<string | null>();
+  readonly selected = output<string | null>();
 
   /** Bubbles a note dropped onto a folder (or the root) up to the screen. */
   readonly dropNote = output<{ meetingId: string; folderId: string | null }>();
@@ -122,7 +121,7 @@ export class FolderTreeComponent {
       this.draftName.set("");
       // Surface the new folder: select + highlight it (its row now exists in the
       // reloaded tree). The parent screen filters the meeting list to it.
-      this.select.emit(folder.id);
+      this.selected.emit(folder.id);
     } catch {
       this.toast.danger("Couldn’t create that folder. Try another name.");
     } finally {

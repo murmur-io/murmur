@@ -5,7 +5,6 @@ export type PillKind = "neutral" | "success" | "warning" | "danger" | "accent";
 /** Design System — <mur-pill kind="success">…</mur-pill>: the status pill. */
 @Component({
   selector: "mur-pill",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     class: "pill",

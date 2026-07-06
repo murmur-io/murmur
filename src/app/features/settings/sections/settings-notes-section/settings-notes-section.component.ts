@@ -10,7 +10,6 @@ import { SettingsStore } from "../../settings.store";
  */
 @Component({
   selector: "app-settings-notes-section",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MurToggleComponent,ReactiveFormsModule],

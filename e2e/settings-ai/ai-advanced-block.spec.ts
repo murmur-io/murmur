@@ -2,48 +2,47 @@ import { test, expect } from "@playwright/test";
 import { mockTauri } from "./mock-invoke";
 
 /**
- * Integration spec for AiAdvancedBlockComponent (Task 4).
+ * Integration spec for AiAdvancedBlockComponent.
  *
- * RED contract:
- *   (a) Before the component exists the Default-AI select is always visible
- *       (inside the old ai-defaults-block). After, it lives behind the toggle
- *       → `not.toBeVisible()` FAILS before Task 4 and PASSES after.
- *   (b) The "⚙ Advanced" toggle button does not exist before Task 4 — the
- *       `.click()` times out / throws before implementation.
- *   (c) Same — the Advanced button does not exist before Task 4.
+ * Since the posture-first redesign the Default-engine select lives in the
+ * ALWAYS-VISIBLE AiSetupBlockComponent — what the "⚙ Advanced" disclosure
+ * hides is the Engines catalog (<app-ai-connection-cards />, heading
+ * "Engines") and the per-feature overrides (<app-ai-role-rows />, the
+ * "Customize per feature" button).
  */
-test.describe("ai-advanced-block — cloud posture (default)", () => {
+test.describe("ai-advanced-block — cloud posture", () => {
   test.beforeEach(async ({ page }) => {
-    await mockTauri(page);
+    await mockTauri(page, { brain_posture: () => "cloud" });
     await page.goto("/settings");
     await page.getByText("AI & Models").first().click();
   });
 
   // ── (a) — collapsed by default ───────────────────────────────────────────
-  test("(a) Advanced is collapsed by default — Default-AI select is not visible", async ({
+  test("(a) Advanced is collapsed by default — Engines catalog and per-feature overrides are hidden", async ({
     page,
   }) => {
-    // The Default-AI select lives inside the @if (expanded()) region.
-    // Before Task 4 the select was always visible → this assertion FAILS = RED.
+    // The Engines heading (ai-connection-cards) and the per-feature button
+    // (ai-role-rows) live inside the @if (expanded()) region — absent at load.
     await expect(
-      page.locator('select[formcontrolname="providerId"]'),
+      page.getByRole("heading", { name: "Engines" }),
     ).not.toBeVisible();
-  });
-
-  // ── (b) — toggle reveals everything ─────────────────────────────────────
-  test("(b) clicking ⚙ Advanced reveals the Providers section, Default-AI select, and Customize-per-feature button", async ({
-    page,
-  }) => {
-    // Before Task 4 this button does not exist → click times out = RED.
-    await page.getByRole("button", { name: /Advanced/ }).click();
-
-    // Default-AI select is now in the DOM and visible.
+    await expect(
+      page.getByRole("button", { name: /Customize per feature/ }),
+    ).not.toBeVisible();
+    // The Default-engine select is NOT behind Advanced — it stays visible.
     await expect(
       page.locator('select[formcontrolname="providerId"]'),
     ).toBeVisible();
+  });
 
-    // The Providers heading comes from <app-ai-connection-cards /> rendered inside.
-    await expect(page.getByRole("heading", { name: "Providers" })).toBeVisible();
+  // ── (b) — toggle reveals everything ─────────────────────────────────────
+  test("(b) clicking ⚙ Advanced reveals the Engines catalog and the Customize-per-feature button", async ({
+    page,
+  }) => {
+    await page.getByRole("button", { name: /Advanced/ }).click();
+
+    // The Engines heading comes from <app-ai-connection-cards /> rendered inside.
+    await expect(page.getByRole("heading", { name: "Engines" })).toBeVisible();
 
     // The per-feature toggle button comes from <app-ai-role-rows />.
     await expect(
@@ -52,24 +51,24 @@ test.describe("ai-advanced-block — cloud posture (default)", () => {
   });
 });
 
-// ── (c) — fully_local posture disables the Default-AI select ────────────
+// ── (c) — fully_local posture replaces the Default-engine card ────────────
 test.describe("ai-advanced-block — fully_local posture", () => {
   test.beforeEach(async ({ page }) => {
     await mockTauri(page, { brain_posture: () => "fully_local" });
     await page.goto("/settings");
     await page.getByText("AI & Models").first().click();
-    // Before Task 4 this button does not exist → click times out = RED.
-    await page.getByRole("button", { name: /Advanced/ }).click();
   });
 
-  test("(c) Default-AI select is disabled and the fully-local note is visible", async ({
+  test("(c) Default-engine select is not rendered — the on-device setup card shows instead", async ({
     page,
   }) => {
+    // setupCards() for "fully_local" is ["local"] — no "engine" card, so the
+    // providerId select is gone and the on-device card copy renders.
+    await expect(
+      page.getByText("Everything runs on this Mac — nothing leaves."),
+    ).toBeVisible();
     await expect(
       page.locator('select[formcontrolname="providerId"]'),
-    ).toBeDisabled();
-    await expect(
-      page.getByText(/Not used.*Fully local/),
-    ).toBeVisible();
+    ).toHaveCount(0);
   });
 });

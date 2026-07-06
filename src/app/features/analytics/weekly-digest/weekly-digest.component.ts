@@ -30,7 +30,6 @@ type Range = (typeof RANGES)[number];
  */
 @Component({
   selector: "app-weekly-digest",
-  standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MarkdownComponent],
   templateUrl: "./weekly-digest.component.html",
