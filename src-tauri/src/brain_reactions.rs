@@ -161,6 +161,14 @@ pub fn reactions_scan(app: &tauri::AppHandle, now: &str) -> ReactionScan {
         emit: false,
     };
     let st = app.state::<crate::state::AppState>();
+    // Brain v2 P0.3 — USER-TURN PRIORITY: a user-initiated assistant turn is in flight → defer this
+    // background scan entirely (before any config/model/DB work), so the background light-model
+    // extraction never competes with a user-facing answer for the on-device engine. The next
+    // scheduled scan (~21 s later) picks up naturally once the turn's RAII guard clears the flag.
+    if should_defer_scan(&st.user_turn_in_progress) {
+        tracing::debug!(target: "reactions", "user turn in flight; deferring scan");
+        return empty;
+    }
     let (brain_live, emit) = match st.config.lock() {
         Ok(c) => (c.brain_live, c.brain_contradiction_cards),
         Err(_) => return empty,
@@ -210,6 +218,14 @@ pub fn reactions_scan(app: &tauri::AppHandle, now: &str) -> ReactionScan {
             .collect()
     };
     ReactionScan { cards, emit }
+}
+
+/// Brain v2 P0.3 — the PURE deferral decision for [`reactions_scan`]: defer while a user-initiated
+/// assistant turn is in flight (`AppState::user_turn_in_progress`). Factored off `AppHandle` so the
+/// contract is headless-testable; `Relaxed` suffices — this is an advisory scheduling hint, not a
+/// synchronization edge.
+fn should_defer_scan(user_turn_in_progress: &std::sync::atomic::AtomicBool) -> bool {
+    user_turn_in_progress.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The last `n` chars of `s` on a char boundary.
@@ -307,6 +323,19 @@ mod tests {
     fn no_candidates_no_cards() {
         let existing = vec![fact("f1", "Project Atlas", "deadline", "May 30 firm", "m-kickoff")];
         assert!(cards_from_reconcile(&existing, &[], "2026-07-04T00:00:00Z").is_empty());
+    }
+
+    /// Brain v2 P0.3 — the deferral decision: the scan defers exactly while the user-turn priority
+    /// flag is set, and resumes once the turn's RAII guard clears it. (The `reactions_scan` wiring
+    /// itself needs an `AppHandle` and is exercised on a real Mac; this pins the pure decision.)
+    #[test]
+    fn scan_defers_only_while_a_user_turn_is_in_flight() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!should_defer_scan(&flag), "idle: the scan runs");
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(should_defer_scan(&flag), "user turn in flight: defer");
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!should_defer_scan(&flag), "turn ended: the scan resumes");
     }
 
     #[test]

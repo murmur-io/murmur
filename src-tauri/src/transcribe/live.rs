@@ -435,15 +435,113 @@ pub(crate) fn resolve_scope_meeting(
 /// The brain + tools can take seconds, so it MUST run off-thread; the whole body is best-effort +
 /// panic-free and runs on its own thread, so even an unexpected panic is contained and can never
 /// disrupt recording or the caption.
+///
+/// Brain v2 P0.3 — IN-FLIGHT DEDUP + USER-TURN PRIORITY:
+/// - At most ONE turn per scope key (the FE-sent `meeting_id`, "" for the voice/wake path) runs at a
+///   time. A second spawn while one is in flight is DROPPED ([`try_begin_turn`]) — the overlapping-
+///   wake / double-click pile-up guard, so duplicate turns never stack generations on Metal. The
+///   already-running turn still resolves the FE's pending card via `EVENT_VOICE_ACTION_RESULT`.
+/// - While the turn runs, `AppState::user_turn_in_progress` is `true` so the background
+///   Realtime-Reactions scan defers. Both the per-key decrement and the flag reset are guaranteed on
+///   EVERY exit path (including a panic inside the turn, and a failed thread spawn) by the RAII
+///   [`TurnGuard`] moved into the worker closure.
 pub fn spawn_assistant_turn(
     app: AppHandle,
     command: String,
     thread_id: Option<String>,
     meeting_id: Option<String>,
 ) {
+    // Scope key = the FE-sent meeting id (matching how the turn scopes itself); the voice/wake twin
+    // sends none → the shared "" key. Opaque id only — no PII.
+    let key = meeting_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    {
+        let state = app.state::<AppState>();
+        if !try_begin_turn(&state.in_flight_turns, &key) {
+            // NO PII: no command text, no id content — just the dedup decision.
+            tracing::debug!(target: "voice", "turn dedup: turn already in flight; dropping");
+            return;
+        }
+    }
+    // The guard is created NOW and moved into the closure: if the spawn itself fails, the closure
+    // (and the guard inside it) is dropped → the counter is decremented and the flag cleared, so a
+    // failed spawn can never wedge the dedup registry.
+    let guard = TurnGuard {
+        app: app.clone(),
+        key,
+    };
     let _ = std::thread::Builder::new()
         .name("murmur-assistant-turn".into())
-        .spawn(move || run_assistant_turn(&app, command, thread_id, meeting_id));
+        .spawn(move || {
+            let _guard = guard; // held for the WHOLE turn; Drop runs on every exit incl. panic.
+            _guard
+                .app
+                .state::<AppState>()
+                .user_turn_in_progress
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            run_assistant_turn(&app, command, thread_id, meeting_id)
+        });
+}
+
+/// Brain v2 P0.3 — the PURE in-flight registry decision: begin a turn for `key` unless one is
+/// already in flight. Returns `true` (and increments the counter) when the caller may proceed;
+/// `false` when a turn for the same key is already running (the caller drops the duplicate). A
+/// poisoned lock is recovered via `into_inner` — the map is a plain counter registry, always valid.
+/// Factored off `AppHandle` so the dedup contract is headless-testable.
+pub(crate) fn try_begin_turn(
+    registry: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    key: &str,
+) -> bool {
+    let mut map = match registry.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let count = map.entry(key.to_string()).or_insert(0);
+    if *count > 0 {
+        return false;
+    }
+    *count += 1;
+    true
+}
+
+/// Brain v2 P0.3 — end a turn for `key`: decrement its in-flight count (saturating) and drop the
+/// entry at zero so the registry never grows unboundedly across meetings. Counterpart of
+/// [`try_begin_turn`]; called from [`TurnGuard::drop`] (and directly by tests).
+pub(crate) fn end_turn(
+    registry: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    key: &str,
+) {
+    let mut map = match registry.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(count) = map.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            map.remove(key);
+        }
+    }
+}
+
+/// RAII guard for ONE assistant turn (Brain v2 P0.3): on drop — normal return, early return, panic
+/// inside the turn, or a failed thread spawn — it clears the user-turn priority flag and decrements
+/// the per-key in-flight counter. Mirrors the panic-safe `BusyReset` pattern of the reactions worker
+/// (see `run`), so a wedged flag/counter can never silently kill all further turns or scans.
+struct TurnGuard {
+    app: AppHandle,
+    key: String,
+}
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        let state = self.app.state::<AppState>();
+        state
+            .user_turn_in_progress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        end_turn(&state.in_flight_turns, &self.key);
+    }
 }
 
 /// The CARD path (wake / manual button / single-shot text composer): run the shared query core, then
@@ -929,6 +1027,9 @@ fn run_cascade(
             &executor,
             max_steps,
             Some(&sink as &dyn crate::agent::DeltaSink),
+            // P0.3: the LIVE preset — a 1024-token cap (+ the GGUF 30 s wall-clock timeout) so a
+            // runaway on-device decode can't saturate Metal mid-recording. No-op on stub/cloud.
+            crate::reason::GenOptions::live_answer(),
         ) {
             Ok(Some(outcome)) => {
                 // ESCALATION vs a REAL answer. `is_escalation` matches the WHOLE answer (never a
@@ -1670,6 +1771,54 @@ fn assistant_system_prompt(
 mod tests {
     use super::*;
     use crate::audio::wake::VoiceIntent;
+
+    // ── Brain v2 P0.3: in-flight assistant-turn dedup registry ────────────────────────────────────
+
+    /// The dedup contract of `spawn_assistant_turn` (headless — the registry helpers off `AppHandle`):
+    /// the FIRST begin for a key wins; a SECOND begin for the SAME key while in flight is refused;
+    /// after the turn ends (the guard's decrement) the key begins again. RED before P0.3:
+    /// `try_begin_turn` did not exist — overlapping wakes stacked concurrent generations.
+    #[test]
+    fn turn_dedup_refuses_second_in_flight_then_allows_after_end() {
+        let registry = std::sync::Mutex::new(std::collections::HashMap::new());
+        assert!(try_begin_turn(&registry, "m1"), "first begin must proceed");
+        assert!(
+            !try_begin_turn(&registry, "m1"),
+            "a second turn for the same key while one is in flight must be dropped"
+        );
+        end_turn(&registry, "m1");
+        assert!(
+            try_begin_turn(&registry, "m1"),
+            "after the in-flight turn ends the key must begin again"
+        );
+        end_turn(&registry, "m1");
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "a fully-ended key is removed — the registry never grows across meetings"
+        );
+    }
+
+    /// Dedup is PER KEY: a turn scoped to a different meeting (or the unscoped "" voice key) is NOT
+    /// blocked by another meeting's in-flight turn. And ending a never-begun / already-ended key is a
+    /// harmless no-op (never an underflow/panic).
+    #[test]
+    fn turn_dedup_is_per_key_and_end_is_saturating() {
+        let registry = std::sync::Mutex::new(std::collections::HashMap::new());
+        assert!(try_begin_turn(&registry, "m1"));
+        assert!(
+            try_begin_turn(&registry, "m2"),
+            "a different meeting's turn must not be blocked"
+        );
+        assert!(
+            try_begin_turn(&registry, ""),
+            "the unscoped voice/wake key is independent too"
+        );
+        // Ending an unknown key / double-ending never panics or underflows.
+        end_turn(&registry, "never-began");
+        end_turn(&registry, "m1");
+        end_turn(&registry, "m1"); // double end — saturating no-op
+        assert!(try_begin_turn(&registry, "m1"), "m1 is free again");
+    }
 
     // ── PR D thread identity: backend UUID fallback + thread-stamped trace payloads ───────────────
 

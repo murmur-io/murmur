@@ -249,6 +249,16 @@ pub trait NameRedactor: Send + Sync {
     /// Scrub personal names out of `text`. Returns `(scrubbed_text, token→name pairs)`, where each
     /// token is a placeholder to be restored verbatim in the provider's reply.
     fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>);
+
+    /// `true` ONLY for the dependency-free no-op fallback ([`NoopNameRedactor`]) — i.e. NO real NER
+    /// model is active and names pass through UNCHANGED. The vault-title filter in
+    /// [`RedactingProvider::summarize_with_meta`] keys its conservative SYNTACTIC person-name
+    /// fallback ([`title_looks_like_person_name`]) on this, so person-page titles are still dropped
+    /// on installs without the NER model (Brain v2 P0.1). Default `false`: every REAL redactor
+    /// (DeBERTa NER, test fixtures) keeps the unchanged NER-detector path.
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// Default name redactor: a NO-OP. Returns the text unchanged and an empty map, so names egress
@@ -262,6 +272,109 @@ impl NameRedactor for NoopNameRedactor {
     fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
         (text.to_string(), Vec::new())
     }
+
+    /// The one redactor that detects NOTHING — the vault-title filter compensates with the
+    /// syntactic person-name fallback (see [`NameRedactor::is_noop`]).
+    fn is_noop(&self) -> bool {
+        true
+    }
+}
+
+// ── P0.1 (Brain v2) — the NO-NER person-name title fallback ─────────────────────────────────────
+
+/// Words (case-insensitive) that mark a vault title as a MEETING-SHAPED title, not a person page.
+/// Any title containing one of these is NEVER treated as a person name by
+/// [`title_looks_like_person_name`] — the false-positive guard for the syntactic fallback.
+/// EN + PL, matching the languages Murmur serves. Extend from observed dev false-positives
+/// (conservative-ship decision, spec §P0.1).
+const COMMON_TITLE_WORDS: &[&str] = &[
+    // EN
+    "meeting",
+    "notes",
+    "call",
+    "sync",
+    "review",
+    "planning",
+    "standup",
+    "retrospective",
+    "sprint",
+    "kickoff",
+    "workshop",
+    "demo",
+    "interview",
+    "briefing",
+    "agenda",
+    "project",
+    "roadmap",
+    "update",
+    "weekly",
+    "daily",
+    "monthly",
+    // PL
+    "spotkanie",
+    "notatki",
+    "raport",
+    "przegląd",
+    "planowanie",
+    "synchronizacja",
+    "projekt",
+    "tygodniowy",
+    "aktualizacja",
+];
+
+/// Conservative SYNTACTIC detector for a vault title that is (very likely) a bare PERSON NAME —
+/// the shape of an auto-created `[[Anna Kowalska]].md` person page. Active ONLY as the vault-title
+/// egress fallback when the real NER model is absent ([`NameRedactor::is_noop`]); with the model
+/// present the NER detector governs, unchanged.
+///
+/// A title "looks like a person name" iff ALL hold:
+/// - 2–4 whitespace-separated words (a single word or a long phrase is not a name shape);
+/// - every word is name-like: starts uppercase, contains NO digits, uses only alphabetic chars
+///   plus internal hyphens/apostrophes ("Anne-Marie", "O'Brien"), and is NOT an all-uppercase
+///   acronym ("OKR", "CI");
+/// - NO word (case-insensitive) is on the [`COMMON_TITLE_WORDS`] blocklist ("Meeting Notes",
+///   "Atlas Project", "Spotkanie Zarządu" are titles, not people).
+///
+/// Deliberately conservative: a false POSITIVE only drops a `[[wikilink]]` target from the prompt
+/// (never content); a false NEGATIVE leaks a name — so the blocklist errs toward dropping.
+/// Unicode-aware (`char::is_uppercase` / `is_alphabetic`), so Polish diacritics work.
+pub(crate) fn title_looks_like_person_name(title: &str) -> bool {
+    let words: Vec<&str> = title.split_whitespace().collect();
+    if words.len() < 2 || words.len() > 4 {
+        return false;
+    }
+    for word in &words {
+        if COMMON_TITLE_WORDS.contains(&word.to_lowercase().as_str()) {
+            return false; // a known title word ⇒ this is a meeting-shaped title, not a person.
+        }
+        if !word_is_name_like(word) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One word of a person-name shape: uppercase-first, digit-free, alphabetic (with internal
+/// hyphen/apostrophe), and not an all-caps acronym. See [`title_looks_like_person_name`].
+fn word_is_name_like(word: &str) -> bool {
+    let Some(first) = word.chars().next() else {
+        return false;
+    };
+    if !first.is_uppercase() {
+        return false;
+    }
+    if !word
+        .chars()
+        .all(|c| c.is_alphabetic() || c == '-' || c == '\'' || c == '\u{2019}')
+    {
+        return false; // digits or punctuation ("Q3", "Offer:", "R&D") ⇒ not a name word.
+    }
+    // Reject an ALL-CAPS acronym ("OKR", "CI") — every alphabetic char uppercase, len ≥ 2.
+    let alpha: Vec<char> = word.chars().filter(|c| c.is_alphabetic()).collect();
+    if alpha.len() >= 2 && alpha.iter().all(|c| c.is_uppercase()) {
+        return false;
+    }
+    true
 }
 
 /// Restore name placeholders produced by a [`NameRedactor`] back to the original names. Disjoint
@@ -443,7 +556,9 @@ impl SummarizerProvider for RedactingProvider {
     ///   instruction/label strings).
     /// - `vault_titles` (the `[[wikilink]]` target list embedded in `render_user_content`, incl.
     ///   auto-created `[[Person Name]].md` pages) — FILTERED: any title the firewall would alter
-    ///   is DROPPED before egress (design B — see the inline rationale below).
+    ///   is DROPPED before egress (design B — see the inline rationale below). With NO NER model
+    ///   installed the conservative syntactic fallback [`title_looks_like_person_name`] drops
+    ///   bare person-name titles too (Brain v2 P0.1).
     /// - `meta.date_iso`, `meta.language`, `meta.duration_s` — deliberately UN-scrubbed non-PII
     ///   format flags (an ISO date / language code / integer; scrubbing a date would false-positive
     ///   as a PHONE and garble the note). Any NEW string field MUST be classified here and is
@@ -513,6 +628,13 @@ impl SummarizerProvider for RedactingProvider {
         // The predicate uses standalone `redact` + the active name layer purely as DETECTORS (their
         // scrubbed output is discarded — no title tokens enter the shared restore map). A clean vault
         // (no PII in any title) is byte-identical: every title survives the filter unchanged.
+        //
+        // P0.1 (Brain v2) — the NO-NER fallback: when the active name layer is the no-op (no NER
+        // model on this install), the NER detector below flags NOTHING, so an auto-created
+        // `[[Anna Kowalska]].md` person page would egress verbatim. The conservative SYNTACTIC
+        // detector `title_looks_like_person_name` covers that gap — active ONLY under the no-op, so
+        // model-present installs keep the unchanged NER behavior.
+        let noop_ner = self.names.is_noop();
         let red_titles: Vec<String> = req
             .vault_titles
             .iter()
@@ -521,6 +643,9 @@ impl SummarizerProvider for RedactingProvider {
                 let (regex_scrubbed, _) = redact(title);
                 if regex_scrubbed.as_str() != title {
                     return false; // an email/card/phone in the title → drop it
+                }
+                if noop_ner && title_looks_like_person_name(title) {
+                    return false; // no NER model → syntactic person-name fallback drops it
                 }
                 let (name_scrubbed, name_hits) = self.names.redact_names(title);
                 // a PERSON detected in the title → drop it (only fires when a NER model is present)
@@ -1478,6 +1603,80 @@ mod tests {
         );
     }
 
+    /// P0.1 (Brain v2) — the NO-NER person-name fallback. On an install WITHOUT the NER model the
+    /// active name layer is the [`NoopNameRedactor`] (`name_hits` always empty), so an auto-created
+    /// `[[Anna Kowalska]].md` person page rode `vault_titles` to the cloud VERBATIM — the exact
+    /// side-channel the NER title filter closes on model-present installs. The fix is a conservative
+    /// SYNTACTIC fallback ([`title_looks_like_person_name`]) active ONLY when the name layer is the
+    /// no-op: a Title-Case 2–4-word, digit-free, non-blocklisted title is dropped before egress.
+    ///
+    /// RED-before-GREEN: on the unpatched code this test FAILED — "Anna Kowalska" reached the inner
+    /// provider (the no-op detector flags nothing). Confirmed failing before the fix.
+    #[test]
+    fn person_name_title_is_dropped_when_no_ner_model_present() {
+        let mut req = sample_req("no PII in transcript");
+        req.vault_titles = vec![
+            "Anna Kowalska".to_string(), // person-page stem → MUST be dropped under the no-op NER
+            "Meeting Notes".to_string(), // blocklisted common title words → survives
+            "Q3 OKRs".to_string(),       // digits/acronym → survives
+        ];
+        let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
+        // The PRODUCTION no-model shape: the explicit NoopNameRedactor (what `active_name_redactor`
+        // returns when the NER model is absent).
+        let provider =
+            RedactingProvider::with_name_redactor(inner.clone(), Arc::new(NoopNameRedactor));
+        block_on(provider.summarize(&req)).unwrap();
+        let egressed = inner.0.lock().unwrap().clone().expect("inner was called");
+        assert!(
+            !egressed.vault_titles.iter().any(|t| t == "Anna Kowalska"),
+            "a person-name title must NOT egress when no NER model is present: {:?}",
+            egressed.vault_titles
+        );
+        assert!(
+            egressed.vault_titles.iter().any(|t| t == "Meeting Notes"),
+            "a common-words title must survive as a link target: {:?}",
+            egressed.vault_titles
+        );
+        assert!(
+            egressed.vault_titles.iter().any(|t| t == "Q3 OKRs"),
+            "a digit/acronym title must survive as a link target: {:?}",
+            egressed.vault_titles
+        );
+        // The rendered egress surface carries no trace of the person name either.
+        let egress = rendered_egress(&egressed);
+        assert!(
+            !egress.contains("Anna Kowalska"),
+            "the person name must not appear anywhere in the egressed content: {egress}"
+        );
+    }
+
+    /// P0.1 — the conservative syntactic person-name predicate, tested directly. Positives are the
+    /// bare person-page shapes; negatives cover blocklisted title words, digits, acronyms, single
+    /// words, lowercase words, and long phrases.
+    #[test]
+    fn title_looks_like_person_name_predicate() {
+        // POSITIVE — person-page shapes (2–4 Title-Case, digit-free, non-blocklisted words).
+        assert!(title_looks_like_person_name("Anna Kowalska"));
+        assert!(title_looks_like_person_name("Jan Maria Rokita"));
+        assert!(title_looks_like_person_name("Anne-Marie O'Brien")); // internal hyphen/apostrophe
+        assert!(title_looks_like_person_name("Łukasz Gawroński")); // Unicode uppercase + diacritics
+
+        // NEGATIVE — meeting-shaped / non-name titles must survive the filter.
+        assert!(!title_looks_like_person_name("Meeting Notes")); // EN blocklist
+        assert!(!title_looks_like_person_name("Spotkanie Zarządu")); // PL blocklist
+        assert!(!title_looks_like_person_name("Przegląd Kwartalny")); // PL blocklist (diacritics)
+        assert!(!title_looks_like_person_name("Q3 OKRs")); // digit word
+        assert!(!title_looks_like_person_name("Atlas Project")); // blocklisted "project"
+        assert!(!title_looks_like_person_name("Budget 2026")); // digits
+        assert!(!title_looks_like_person_name("Anna")); // single word
+        assert!(!title_looks_like_person_name("CI CD Pipeline")); // all-caps acronyms
+        assert!(!title_looks_like_person_name("Clean retained title")); // lowercase words
+        assert!(!title_looks_like_person_name(
+            "Five Word Long Phrase Here"
+        )); // > 4 words
+        assert!(!title_looks_like_person_name("")); // empty
+    }
+
     /// DEFENSE-IN-DEPTH: a user-authored custom `template` (rides the SYSTEM prompt) and
     /// `meta.title_hint` (rides `render_user_content`) previously carried any email/card/phone the
     /// user typed straight past the firewall inside `req.clone()`. Both are now scrubbed through the
@@ -1536,7 +1735,11 @@ mod tests {
             template: "recipe s-template@leak.example".to_string(), // SCRUBBED (regex, system prompt)
             vault_titles: vec![
                 "Offer - s-title@leak.example".to_string(), // SCRUBBED (design B filter → dropped)
-                "Clean Retained Title".to_string(),         // control: a clean title must survive
+                // Control: a clean title must survive. NOT Title-Case-throughout on purpose — a
+                // 2–4-word all-Title-Case title now trips the P0.1 no-NER person-name fallback
+                // (this test runs the production no-op name layer), which would be CORRECT
+                // filtering, not a leak; the control pins that ordinary titles still pass.
+                "Clean retained title".to_string(),
             ],
             related_context: Some("s-related@leak.example".to_string()), // SCRUBBED (regex + NER)
             user_notes: Some("s-notes@leak.example".to_string()),        // SCRUBBED (regex + NER)
@@ -1570,7 +1773,7 @@ mod tests {
         );
         // A clean vault title must NOT be over-filtered.
         assert!(
-            egress.contains("Clean Retained Title"),
+            egress.contains("Clean retained title"),
             "clean titles must survive the filter as valid link targets"
         );
     }
