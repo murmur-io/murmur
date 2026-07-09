@@ -28,6 +28,7 @@
 //! lock-touching: it adds no seal, no new read path, no new export.
 
 pub mod bakeoff;
+pub mod corpus;
 pub mod diarization;
 pub mod notes_bakeoff;
 
@@ -80,6 +81,11 @@ pub enum RetrievalMode {
     Semantic,
     /// RRF fusion of FTS ∪ semantic (`embed::rrf_fuse`).
     Hybrid,
+    /// Hybrid + a reranker pass over the fused candidates (brain2 PR 3 — the SCAFFOLD exists so
+    /// reports/tables can carry the fourth row; no reranker implementation ships yet, so this mode
+    /// only appears in a report when a future runner adds it. Rendering is presence-driven: a report
+    /// without a `Reranked` row prints three rows exactly as before.
+    Reranked,
 }
 
 impl RetrievalMode {
@@ -89,6 +95,7 @@ impl RetrievalMode {
             RetrievalMode::Fts => "fts",
             RetrievalMode::Semantic => "semantic",
             RetrievalMode::Hybrid => "hybrid",
+            RetrievalMode::Reranked => "hybrid+rerank",
         }
     }
 }
@@ -240,6 +247,79 @@ pub fn format_report_table(report: &BakeoffReport) -> String {
     for m in &report.modes {
         out.push_str(&format!(
             "{:<10} {:>10.4} {:>10.4} {:>10.4}\n",
+            m.mode.label(),
+            m.recall_at_k,
+            m.ndcg_at_k,
+            m.mrr
+        ));
+    }
+    out
+}
+
+/// Provenance context for the COMMITTED markdown artifact (`eval/results/*.md`): everything a
+/// future reader needs to interpret the numbers — when, at which commit, over which corpus and
+/// labeled set, with which config knobs, and — critically — whether the semantic vectors came from
+/// the REAL embedding model or the deterministic stub. Plain strings, no PII (ids/labels only —
+/// never note text, never a user home path).
+#[derive(Debug, Clone)]
+pub struct ReportContext {
+    /// Run date, ISO `YYYY-MM-DD`.
+    pub date: String,
+    /// Short git commit sha (or `"unknown"` outside a checkout).
+    pub commit: String,
+    /// Human corpus label, e.g. `"synthetic (eval::corpus, 16 seeded meetings)"`.
+    pub corpus: String,
+    /// Labeled-set label, e.g. the fixture filename.
+    pub labeled_set: String,
+    /// Config consts that shape the run, e.g. `"RRF_K=60"`.
+    pub config: String,
+    /// The embedder id the run used (e.g. `"multilingual-e5-small"`).
+    pub embedder_id: String,
+    /// `true` iff the REAL model produced the vectors. `false` = StubEmbedder — the semantic and
+    /// hybrid rows are then NOT a quality signal, and the artifact says so loudly.
+    pub embedder_real: bool,
+}
+
+/// Render a [`BakeoffReport`] + [`ReportContext`] as the COMMITTED markdown artifact (spec §L1.6):
+/// provenance lines, an HONEST embedder line (real model id vs a loud STUB warning), and one table
+/// row per mode present in the report — so the `hybrid+rerank` row appears exactly when a runner
+/// added a [`RetrievalMode::Reranked`] entry, and a 3-mode report renders 3 rows. Pure string
+/// formatting: deterministic for a fixed input, no I/O, no clock.
+pub fn format_report_markdown(report: &BakeoffReport, ctx: &ReportContext) -> String {
+    let mut out = String::new();
+    out.push_str("# RAG bake-off\n\n");
+    out.push_str(&format!("- date: {}\n", ctx.date));
+    out.push_str(&format!("- commit: {}\n", ctx.commit));
+    out.push_str(&format!("- corpus: {}\n", ctx.corpus));
+    out.push_str(&format!(
+        "- labeled set: {} ({} queries, k={})\n",
+        ctx.labeled_set, report.queries, report.k
+    ));
+    out.push_str(&format!("- config: {}\n", ctx.config));
+    if ctx.embedder_real {
+        out.push_str(&format!(
+            "- embedder: {} (REAL model — semantic/hybrid rows are a genuine quality signal)\n",
+            ctx.embedder_id
+        ));
+    } else {
+        out.push_str(&format!(
+            "- embedder: STUB (hash-bag; selected model `{}` NOT on disk)\n",
+            ctx.embedder_id
+        ));
+        out.push_str(
+            "\n> **WARNING — STUB EMBEDDER.** The `semantic` and `hybrid` rows below were produced \
+             by the deterministic hash-bag stub, NOT a real embedding model. They are NOT a \
+             retrieval-quality signal — only the `fts` row is real. Download the embed model and \
+             re-run before reading anything into those numbers.\n",
+        );
+    }
+    out.push_str(&format!(
+        "\n| mode | recall@{k} | ndcg@{k} | mrr |\n|---|---:|---:|---:|\n",
+        k = report.k
+    ));
+    for m in &report.modes {
+        out.push_str(&format!(
+            "| {} | {:.4} | {:.4} | {:.4} |\n",
             m.mode.label(),
             m.recall_at_k,
             m.ndcg_at_k,
@@ -434,5 +514,97 @@ mod tests {
         assert!(table.contains("mrr"));
         // The hybrid recall value is rendered to 4dp.
         assert!(table.contains("0.8000"));
+    }
+
+    fn sample_report(with_rerank: bool) -> BakeoffReport {
+        let row = |mode: RetrievalMode, r: f64| ModeMetrics {
+            mode,
+            recall_at_k: r,
+            ndcg_at_k: r - 0.05,
+            mrr: r + 0.01,
+            k: 5,
+            queries: 20,
+        };
+        let mut modes = vec![
+            row(RetrievalMode::Fts, 0.5),
+            row(RetrievalMode::Semantic, 0.7),
+            row(RetrievalMode::Hybrid, 0.8),
+        ];
+        if with_rerank {
+            modes.push(row(RetrievalMode::Reranked, 0.85));
+        }
+        BakeoffReport {
+            k: 5,
+            queries: 20,
+            modes,
+        }
+    }
+
+    fn sample_ctx(real: bool) -> ReportContext {
+        ReportContext {
+            date: "2026-07-10".to_string(),
+            commit: "abc1234".to_string(),
+            corpus: "synthetic (eval::corpus, 16 seeded meetings)".to_string(),
+            labeled_set: "rag-bakeoff-synthetic.json".to_string(),
+            config: "RRF_K=60".to_string(),
+            embedder_id: "multilingual-e5-small".to_string(),
+            embedder_real: real,
+        }
+    }
+
+    /// The markdown artifact carries provenance lines, the honest embedder line, and one table row
+    /// per mode — with NO `hybrid+rerank` row for a 3-mode report (presence-driven rendering).
+    #[test]
+    fn format_report_markdown_real_embedder_three_rows() {
+        let md = format_report_markdown(&sample_report(false), &sample_ctx(true));
+        assert!(md.contains("- date: 2026-07-10"));
+        assert!(md.contains("- commit: abc1234"));
+        assert!(md.contains("- corpus: synthetic (eval::corpus, 16 seeded meetings)"));
+        assert!(md.contains("- labeled set: rag-bakeoff-synthetic.json (20 queries, k=5)"));
+        assert!(md.contains("- config: RRF_K=60"));
+        assert!(md.contains("- embedder: multilingual-e5-small (REAL model"));
+        assert!(!md.contains("STUB"), "real run must NOT carry the stub warning");
+        assert!(md.contains("| mode | recall@5 | ndcg@5 | mrr |"));
+        assert!(md.contains("| fts | 0.5000 | 0.4500 | 0.5100 |"));
+        assert!(md.contains("| semantic | 0.7000 | 0.6500 | 0.7100 |"));
+        assert!(md.contains("| hybrid | 0.8000 | 0.7500 | 0.8100 |"));
+        assert!(
+            !md.contains("hybrid+rerank"),
+            "3-mode report must not render a rerank row"
+        );
+    }
+
+    /// STUB honesty: a stub-embedder run must shout that the semantic/hybrid numbers are not a
+    /// quality signal. And the optional fourth row renders when (and only when) a `Reranked` mode
+    /// row is present in the report.
+    #[test]
+    fn format_report_markdown_stub_warning_and_rerank_row() {
+        let md = format_report_markdown(&sample_report(true), &sample_ctx(false));
+        assert!(md.contains("- embedder: STUB (hash-bag"));
+        assert!(
+            md.contains("WARNING — STUB EMBEDDER"),
+            "stub run must carry the loud warning: {md}"
+        );
+        assert!(md.contains("NOT a retrieval-quality signal"));
+        assert!(md.contains("| hybrid+rerank | 0.8500 | 0.8000 | 0.8600 |"));
+    }
+
+    /// `RetrievalMode::Reranked` has a stable table label distinct from the other three.
+    #[test]
+    fn reranked_mode_label_is_stable() {
+        assert_eq!(RetrievalMode::Reranked.label(), "hybrid+rerank");
+        let labels: Vec<&str> = [
+            RetrievalMode::Fts,
+            RetrievalMode::Semantic,
+            RetrievalMode::Hybrid,
+            RetrievalMode::Reranked,
+        ]
+        .iter()
+        .map(|m| m.label())
+        .collect();
+        let mut dedup = labels.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), labels.len(), "mode labels must be unique");
     }
 }
