@@ -161,7 +161,7 @@
     @if (visibleTurns().length) {
       <div #scroller class="transcript-card panel-card">
         <ul class="turns">
-          @for (t of visibleTurns(); track t.key) {
+          @for (t of renderedTurns(); track t.key) {
             <li
               #turnRow
               class="turn"
@@ -191,7 +191,7 @@
                   <button
                     type="button"
                     class="frag"
-                    [class.is-active]="isActiveSegment(s.startS, s.endS)"
+                    [class.is-active]="activeSegKeys().has(s.idx)"
                     [disabled]="!audioSrc()"
                     (click)="seekTo(s.startS)"
                   >{{ s.text }} </button>
@@ -204,6 +204,16 @@
             </li>
           }
         </ul>
+        @if (hiddenTurnCount() > 0) {
+          <button
+            type="button"
+            class="btn btn-ghost show-all"
+            (click)="showAllTurns()"
+          >
+            Show all {{ visibleTurns().length }} turns
+            <span class="count">+{{ hiddenTurnCount() }}</span>
+          </button>
+        }
       </div>
     } @else if (segments().length) {
       <div class="empty-card panel-card">

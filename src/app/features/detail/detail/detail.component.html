@@ -276,6 +276,7 @@
             (draftInput)="draft.set($event)"
             (copyPath)="copy(d.note?.exportedPath ?? '')"
             (openRelated)="openRelated($event)"
+            (noteChanged)="reloadDetail()"
           />
           @if (config()?.jiraEnabled && config()?.jiraConsented && !locked()) {
             <app-verify-panel

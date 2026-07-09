@@ -190,7 +190,30 @@ tags do not support."
 /// use this. Providers with a separate system/user channel (Anthropic) use
 /// [`default_template`] (or `req.template`) as the system prompt and
 /// [`render_user_content`] as the user message.
+/// On-device note prompts are bounded to this many transcript chars to protect the local engine's
+/// prefill KV cache from an unbounded 1h transcript (P0.2 / mem-2 — the note-generation twin of the
+/// `timeline.rs` guard). Matches the `MAX_TRANSCRIPT_CHARS` cap `chat.rs`/`recipes.rs` already apply.
+/// Cloud providers call [`render_user_content`] directly and are NOT capped (they handle the full
+/// transcript; the RAM-refuse guard in `reason/mistral.rs` is the true OOM backstop).
+const LOCAL_NOTE_MAX_CHARS: usize = 40_000;
+
 pub fn render_prompt(req: &SummarizeRequest) -> String {
+    // `render_prompt` serves ONLY the on-device combined-prompt providers (local mistralrs +
+    // Ollama); cloud providers (Anthropic, Claude Code) render via `render_user_content` directly.
+    // So cap the transcript HERE — it bounds the local prefill KV for a long meeting without
+    // touching cloud note quality. `..req.clone()` keeps every other field byte-identical; a
+    // within-budget transcript borrows the original req unchanged (no clone, byte-identical output).
+    let capped;
+    let req = if req.transcript.chars().count() > LOCAL_NOTE_MAX_CHARS {
+        let head: String = req.transcript.chars().take(LOCAL_NOTE_MAX_CHARS).collect();
+        capped = SummarizeRequest {
+            transcript: format!("{head}\n[transcript truncated]"),
+            ..req.clone()
+        };
+        &capped
+    } else {
+        req
+    };
     format!(
         "{instructions}\n\n{user}",
         instructions = req.template,
@@ -228,20 +251,13 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
         }
     }
 
-    // brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION. When `related_context` is present
-    // (the flag is ON and the gated retrieval found visible prior notes), prepend it as a clearly
-    // labelled, read-only block BEFORE the transcript so the model can reference prior decisions /
-    // owed items and cite them as `[[Title]]`. When `None` (the default + flag-OFF case) this whole
-    // block is skipped, so the output is BYTE-IDENTICAL to before this field existed — no regression.
-    if let Some(ctx) = &req.related_context {
-        if !ctx.trim().is_empty() {
-            out.push_str(
-                "\n## Related prior notes (context only — do not copy, cite as [[Title]])\n",
-            );
-            out.push_str(ctx);
-            out.push('\n');
-        }
-    }
+    // STAGE 1 (two-stage note redesign — Phase 1): the Stage-1 generation prompt carries ONLY this
+    // meeting's transcript + the user's typed notes. Cross-meeting `related_context` is NOT rendered
+    // here — the pipeline sets it `None` (see `pipeline::summarize_and_export`), and even if a caller
+    // sets it, this renderer never folds it into the prompt, so a related note's `## Action items`
+    // can never bleed into the Stage-1 note by construction. The `related_context` field is retained
+    // on `SummarizeRequest` for Phase 2 (a deferred additive link/context post-pass on the finished
+    // note). See docs/research/2026-07-06-note-and-brain-architecture.md (§3 Stage 1, §8 Phase 1).
 
     // ENHANCE-MY-NOTES: the user's typed notes become the SKELETON of the note. The block is
     // instruction + verbatim notes; absent/blank ⇒ byte-identical output (mirrors
@@ -312,29 +328,81 @@ mod tests {
         assert_eq!(out, expected);
     }
 
-    /// Flag ON: a `Some(context)` prepends the labelled, read-only block BEFORE the transcript.
+    /// mem-2 (P0.2): the ON-DEVICE note prompt (`render_prompt`, used only by local mistralrs +
+    /// Ollama) caps the transcript so a 1h meeting cannot blow the local engine's prefill KV, while
+    /// the CLOUD path (`render_user_content`) stays uncapped. RED before the cap (the full ~100k-char
+    /// transcript rendered verbatim, no marker, unbounded length); GREEN after.
     #[test]
-    fn render_user_content_some_prepends_block() {
-        let ctx = "\n\n### [[Q2 Planning]] · 2026-04-01 · id:m-prev\nWe decided to delay launch.";
-        let out = render_user_content(&req(Some(ctx.to_string())));
-        let block_at = out
-            .find("## Related prior notes (context only — do not copy, cite as [[Title]])")
-            .expect("related block present");
-        let transcript_at = out.find("\nTRANSCRIPT\n").expect("transcript present");
+    fn on_device_note_prompt_caps_long_transcript() {
+        let mut r = req(None);
+        r.transcript = "word ".repeat(20_000); // ~100k chars ≈ a full 1h transcript
+
+        let on_device = render_prompt(&r);
         assert!(
-            block_at < transcript_at,
-            "related block must precede the transcript"
+            on_device.contains("[transcript truncated]"),
+            "render_prompt must truncate a long transcript for the on-device path",
         );
-        assert!(out.contains("Q2 Planning"));
-        assert!(out.contains("We decided to delay launch."));
+        assert!(
+            on_device.chars().count() < LOCAL_NOTE_MAX_CHARS + 2_000,
+            "render_prompt output must be bounded near LOCAL_NOTE_MAX_CHARS; got {}",
+            on_device.chars().count(),
+        );
+
+        // The cloud path is deliberately NOT capped (it handles the full transcript).
+        let cloud = render_user_content(&r);
+        assert!(
+            !cloud.contains("[transcript truncated]"),
+            "render_user_content (cloud) must NOT truncate",
+        );
+        assert!(
+            cloud.chars().count() >= LOCAL_NOTE_MAX_CHARS,
+            "the cloud path must carry the full transcript",
+        );
     }
 
-    /// An empty/whitespace context is treated as None (no block, byte-identical to the None path).
+    /// A within-budget transcript is byte-identical through `render_prompt` (no clone, no marker) —
+    /// the cap is inert for normal meetings.
     #[test]
-    fn render_user_content_empty_context_is_skipped() {
+    fn on_device_note_prompt_short_transcript_unchanged() {
+        let r = req(None);
+        let p = render_prompt(&r);
+        assert!(!p.contains("[transcript truncated]"));
+        assert!(p.contains("TRANSCRIPT\nWe shipped v2 and agreed Anna owns the rollout."));
+    }
+
+    /// STAGE 1 BLEED REGRESSION (Phase 1): a POISONED `related_context` — another meeting's
+    /// `## Action items` — is STRUCTURALLY ABSENT from the Stage-1 generation prompt. The renderer no
+    /// longer folds `related_context` into the prompt at all, so cross-meeting tasks can never reach
+    /// the weak model's one prompt (the confirmed source of the `## Action items` bleed). RED before
+    /// Phase 1 (the old code prepended a "## Related prior notes" block, so `Weronika`/`Alcon` and the
+    /// heading WOULD appear); GREEN after. The transcript still renders, and `related_context: None`
+    /// (what the pipeline actually sets) trivially satisfies this too.
+    #[test]
+    fn poisoned_related_note_is_absent_from_stage1_prompt() {
+        // A hostile prior note whose action items must NEVER bleed into this meeting's note.
+        let poison = "\n\n### [[Other Meeting]] · 2026-04-01 · id:m-other\n\
+                      ## Action items\n- [ ] Weronika — weryfikować rampę Alcon\n";
+        let out = render_user_content(&req(Some(poison.to_string())));
+
+        // The Stage-1 prompt still carries THIS meeting's transcript.
+        assert!(
+            out.contains("\nTRANSCRIPT\nWe shipped v2"),
+            "the transcript must be present in the Stage-1 prompt; got:\n{out}"
+        );
+        // …and ZERO cross-meeting content: no related-notes block, no foreign task text.
+        assert!(
+            !out.contains("Related prior notes"),
+            "no '## Related prior notes' block may appear in the Stage-1 prompt; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Weronika") && !out.contains("Alcon"),
+            "a poisoned related note's action items must be structurally absent; got:\n{out}"
+        );
+        // Because the field is now inert, ANY related_context renders identically to `None`.
         assert_eq!(
-            render_user_content(&req(Some("   \n".to_string()))),
-            render_user_content(&req(None))
+            out,
+            render_user_content(&req(None)),
+            "related_context must not affect the rendered Stage-1 prompt"
         );
     }
 
@@ -356,22 +424,21 @@ mod tests {
         );
     }
 
-    /// The skeleton block lands AFTER the related-notes block and BEFORE the transcript,
-    /// carries the notes verbatim, and instructs the `## Also discussed` / no-`My notes` contract.
+    /// The skeleton block lands BEFORE the transcript, carries the notes verbatim, and instructs the
+    /// `## Also discussed` / no-`My notes` contract. (Stage 1, Phase 1: there is no longer a
+    /// related-notes block — the user notes are the only pre-transcript content besides metadata.)
     #[test]
-    fn user_notes_block_renders_between_related_and_transcript() {
-        let mut r = req(Some(
-            "### [[Prior]] · 2026-06-01 · id:x\nprior body".to_string(),
-        ));
+    fn user_notes_block_renders_before_transcript() {
+        let mut r = req(None);
         r.user_notes = Some("ship Friday\nAnna owns QA".to_string());
         let s = render_user_content(&r);
-        let related_at = s
-            .find("## Related prior notes")
-            .expect("related block present");
         let notes_at = s.find("ship Friday\nAnna owns QA").expect("notes verbatim");
         let transcript_at = s.find("\nTRANSCRIPT\n").expect("transcript section");
-        assert!(related_at < notes_at, "skeleton after related notes");
         assert!(notes_at < transcript_at, "skeleton before transcript");
+        assert!(
+            !s.contains("Related prior notes"),
+            "no related-notes block in the Stage-1 prompt"
+        );
         assert!(
             s.contains("## Also discussed"),
             "instructs the Also discussed section"

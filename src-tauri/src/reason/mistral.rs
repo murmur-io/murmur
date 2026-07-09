@@ -53,6 +53,93 @@ use crate::reason::{parse_first_json, GenOptions, LocalReasoner};
 /// §3.3). REFUSE-don't-evict at the cap (see the module header).
 const MODEL_CACHE_CAP: usize = 2;
 
+/// KV / activation / runtime headroom factor applied to a GGUF's on-disk (weights) size to estimate
+/// its true peak resident footprint (P0.3, perf-memory-audit §2). The GGUF weights stay quantized in
+/// RAM (~on-disk size — audit §1 BF16 note), but the prefill KV cache + Metal buffers + activations
+/// add substantially on top for a long prompt. `1.5×` is DELIBERATELY CONSERVATIVE (low, so we do not
+/// false-refuse a healthy machine): the goal is to catch "load a multi-GB model when free RAM is
+/// already nearly exhausted", not to reject a normal load. Integer-scaled as `× 3 / 2` to stay in
+/// `u64` without a float.
+const MODEL_RAM_HEADROOM_NUM: u64 = 3;
+const MODEL_RAM_HEADROOM_DEN: u64 = 2;
+
+/// Only guard loads for models at least this large on disk. Tiny GGUFs (e.g. an embedding-sized
+/// model) never move the needle on a memory-pressure kill, and probing/estimating for them just
+/// risks a false refuse — so a small model always loads (fail-open by size).
+const MODEL_RAM_GUARD_MIN_DISK_BYTES: u64 = 1_500_000_000; // ~1.5 GB
+
+/// Decide whether there is enough FREE system RAM to load a model of `model_disk_bytes` on top of
+/// what is ALREADY resident. PURE + injectable (no OS probe here) so it is unit-testable.
+///
+/// - `free_bytes = None` ⇒ the OS probe FAILED — FAIL OPEN (return `true`). We never block a working
+///   setup because the RAM probe broke; we only refuse when we AFFIRMATIVELY measure that a load
+///   would not fit. (The never-evict `model_cache` means an already-resident model stays put; this
+///   check is purely about the headroom for the NEXT load.)
+/// - a small model (`< MODEL_RAM_GUARD_MIN_DISK_BYTES`) ⇒ always `true` (never worth guarding).
+/// - otherwise ⇒ `true` iff `free_bytes >= model_disk_bytes × headroom`.
+fn ram_permits_load(free_bytes: Option<u64>, model_disk_bytes: u64) -> bool {
+    if model_disk_bytes < MODEL_RAM_GUARD_MIN_DISK_BYTES {
+        return true; // tiny model — never the OOM driver; don't risk a false refuse.
+    }
+    let Some(free) = free_bytes else {
+        return true; // probe failed → fail OPEN (never break a working machine on a broken probe).
+    };
+    let needed = model_disk_bytes
+        .saturating_mul(MODEL_RAM_HEADROOM_NUM)
+        / MODEL_RAM_HEADROOM_DEN;
+    free >= needed
+}
+
+/// Best-effort AVAILABLE (free + reclaimable) system RAM in bytes, macOS, via `vm_stat` (no new
+/// crate/FFI — mirrors the `sysctl` pattern in `commands.rs::total_ram_gb`). Sums the page classes
+/// macOS can hand to a new allocation WITHOUT swapping — free + inactive + speculative + purgeable
+/// (NOT wired/active/compressed, which are in use) — times the page size. Returns `None` on ANY
+/// parse/exec failure so the caller FAILS OPEN (never refuses a load because the probe broke). This
+/// is a coarse estimate, deliberately so: the guard is a swap-death backstop, not an accountant.
+fn available_ram_bytes() -> Option<u64> {
+    let out = std::process::Command::new("vm_stat").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    // Header line: "Mach Virtual Memory Statistics: (page size of 16384 bytes)".
+    let page_size = text
+        .lines()
+        .next()
+        .and_then(|l| l.split("page size of ").nth(1))
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4096);
+    // Parse "Pages free: 12345." style lines into a page count.
+    let pages = |label: &str| -> u64 {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .and_then(|l| l.rsplit(':').next())
+            .map(|v| v.trim().trim_end_matches('.').replace(',', ""))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let free = pages("Pages free");
+    let inactive = pages("Pages inactive");
+    let speculative = pages("Pages speculative");
+    let purgeable = pages("Pages purgeable");
+    let avail_pages = free
+        .saturating_add(inactive)
+        .saturating_add(speculative)
+        .saturating_add(purgeable);
+    // A zero result means we couldn't read any of the classes → treat as probe failure (fail open).
+    if avail_pages == 0 {
+        return None;
+    }
+    Some(avail_pages.saturating_mul(page_size))
+}
+
+/// The on-disk size (bytes) of the GGUF at `path`, or `None` if it can't be stat'd — the estimate
+/// input for [`ram_permits_load`]. A stat failure yields `None` ⇒ the guard fails OPEN.
+fn model_disk_bytes(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
 /// The resident-model list: (canonical GGUF path → loaded engine), capped at [`MODEL_CACHE_CAP`].
 type ResidentModels = Vec<(PathBuf, Arc<Model>)>;
 
@@ -132,6 +219,30 @@ impl MistralReasoner {
             return Err(AppError::Summarize(format!(
                 "Murmur Brain holds at most {MODEL_CACHE_CAP} models at once; restart to switch models"
             )));
+        }
+        // P0.3 — REFUSE-don't-OOM: gate the NEXT load on measured free RAM (the model is NOT yet
+        // resident here — the early `find` returned an already-loaded engine). We refuse ONLY when we
+        // AFFIRMATIVELY measure that this GGUF + KV headroom won't fit the currently-available RAM;
+        // a failed probe or an unreadable file size fails OPEN (never blocks a working machine). This
+        // catches the "load a 6.3 GB model on a 16 GB Mac already under pressure" swap-death without
+        // false-refusing a healthy one (headroom is a conservative 1.5× of the on-disk size). Returns
+        // `Unavailable` so the caller degrades to the deterministic floor / Cloud instead of OOM-ing.
+        let disk = model_disk_bytes(&self.model_path);
+        if let Some(bytes) = disk {
+            if !ram_permits_load(available_ram_bytes(), bytes) {
+                let gb = bytes as f64 / 1_073_741_824.0;
+                tracing::warn!(
+                    target: "reason",
+                    model = %self.model_file,
+                    model_gb = format_args!("{gb:.1}"),
+                    "refusing on-device model load: insufficient free memory"
+                );
+                return Err(AppError::Unavailable(format!(
+                    "not enough free memory to load this on-device model ({}, {gb:.1} GB) — \
+                     switch the brain to Cloud in Settings or pick a smaller model",
+                    self.model_file
+                )));
+            }
         }
         let builder = GgufModelBuilder::new(
             self.model_dir.to_string_lossy().to_string(),
@@ -226,4 +337,72 @@ where
 {
     std::thread::scope(|scope| scope.spawn(|| rt.block_on(fut)).join())
         .map_err(|_| AppError::Summarize("brain inference worker thread panicked".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1_073_741_824;
+
+    /// P0.3 — the pure RAM decision. A HEALTHY machine (plenty of free RAM) permits loading a big
+    /// model; a machine already under pressure (tiny free RAM vs a big model) REFUSES it.
+    #[test]
+    fn ram_permits_load_ok_when_free_and_refuses_under_pressure() {
+        let big_model = 6 * GB + GB / 2; // ~6.3 GB heavy model (Bielik-class)
+
+        // Plenty free (24 GB free): 6.3 GB × 1.5 = ~9.5 GB needed ≤ 24 GB → OK.
+        assert!(
+            ram_permits_load(Some(24 * GB), big_model),
+            "a healthy machine with 24 GB free must permit a 6.3 GB model"
+        );
+
+        // Under pressure (only 4 GB free): 9.5 GB needed > 4 GB → REFUSE (the OOM case).
+        assert!(
+            !ram_permits_load(Some(4 * GB), big_model),
+            "4 GB free must REFUSE a 6.3 GB model (would swap-death the machine)"
+        );
+
+        // Borderline: free exactly equals the headroom estimate → OK (>=, conservative-but-permits).
+        let needed = big_model * MODEL_RAM_HEADROOM_NUM / MODEL_RAM_HEADROOM_DEN;
+        assert!(ram_permits_load(Some(needed), big_model));
+        assert!(!ram_permits_load(Some(needed - 1), big_model));
+    }
+
+    /// FAIL OPEN: a failed RAM probe (`None`) must NEVER block a load — we only refuse on an
+    /// affirmative measurement of insufficient memory, never because the probe broke.
+    #[test]
+    fn ram_permits_load_fails_open_on_broken_probe() {
+        let big_model = 9 * GB;
+        assert!(
+            ram_permits_load(None, big_model),
+            "a broken RAM probe must fail OPEN (never break a working setup)"
+        );
+    }
+
+    /// A SMALL model is never guarded (never the OOM driver) — it loads even with almost no free RAM,
+    /// so the guard can't false-refuse a tiny model / embedder-sized GGUF.
+    #[test]
+    fn ram_permits_load_small_model_always_ok() {
+        let tiny = MODEL_RAM_GUARD_MIN_DISK_BYTES - 1;
+        assert!(
+            ram_permits_load(Some(100 * 1024 * 1024), tiny),
+            "a sub-1.5 GB model must always load regardless of pressure"
+        );
+        // ...but a model at/above the threshold IS guarded.
+        assert!(!ram_permits_load(
+            Some(1024 * 1024 * 1024),
+            MODEL_RAM_GUARD_MIN_DISK_BYTES + GB
+        ));
+    }
+
+    /// The best-effort `available_ram_bytes` probe is crash-safe: it returns EITHER `Some(>0)` on a
+    /// real macOS `vm_stat`, OR `None` if the tool/parse fails — never a panic, never `Some(0)`.
+    #[test]
+    fn available_ram_probe_is_crash_safe() {
+        // `None` (probe unavailable in this environment) is the fail-open path — fine, nothing to assert.
+        if let Some(b) = available_ram_bytes() {
+            assert!(b > 0, "a Some result must be a positive byte count");
+        }
+    }
 }

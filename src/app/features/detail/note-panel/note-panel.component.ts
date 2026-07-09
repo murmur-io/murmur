@@ -16,6 +16,7 @@ import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.comp
 import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
 import { MeetingRecipesComponent } from "../meeting-recipes/meeting-recipes.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
+import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 export interface ActionItemLine {
@@ -83,6 +84,7 @@ export interface AssistantQa {
     MeetingChatComponent,
     MeetingRecipesComponent,
     RelatedMeetingsComponent,
+    Stage2PanelComponent,
   ],
   templateUrl: "./note-panel.component.html",
   styleUrl: "./note-panel.component.scss",
@@ -146,6 +148,8 @@ export class NotePanelComponent {
   readonly saveAudio = output<void>();
   readonly exportMaster = output<"mic" | "sys">();
   readonly linkGraph = output<void>();
+  /** Bubbles the live-context panel's apply/clear up so the parent reloads the note. */
+  readonly noteChanged = output<void>();
   readonly edit = output<void>();
   readonly cancelEdit = output<void>();
   readonly saveNote = output<void>();
