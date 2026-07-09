@@ -200,6 +200,7 @@
                     type="button"
                     class="btn mcp-copy-btn"
                     [class.is-copied]="configCopied()"
+                    [disabled]="!mcpConfig()"
                     (click)="copyMcpConfig()"
                     [attr.aria-label]="
                       configCopied() ? 'Copied' : 'Copy config to clipboard'
@@ -254,12 +255,24 @@
                     }
                   </button>
                 </div>
-                <pre class="mcp-config-block" role="text">{{ mcpConfig }}</pre>
+                @if (mcpConfig()) {
+                  <pre class="mcp-config-block" role="text">{{ mcpConfig() }}</pre>
+                } @else {
+                  <p class="mcp-config-error text-secondary" role="alert">
+                    Couldn't read the local server token. Reopen Settings, or
+                    restart Murmur — the config appears here once the token is
+                    available.
+                  </p>
+                }
               </div>
 
-              <span class="mcp-hint text-muted">
-                Add this to your Claude Desktop config, then restart Claude Desktop.
-              </span>
+              @if (mcpConfig()) {
+                <span class="mcp-hint text-muted">
+                  Add this to your Claude config, then restart Claude. This block
+                  includes a private access token for your local server — keep it
+                  to yourself.
+                </span>
+              }
             </div>
           </div>
 </div>

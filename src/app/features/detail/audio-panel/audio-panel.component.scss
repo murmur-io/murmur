@@ -378,4 +378,10 @@
     animation: none;
   }
 }
+
+// "Show all N turns" — the transcript-cap expander (renders below the windowed turn list).
+.show-all {
+  display: block;
+  margin: var(--space-3) auto 0;
+}
     

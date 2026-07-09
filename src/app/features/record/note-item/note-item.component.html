@@ -130,6 +130,16 @@
                 @if (turn.citations.length > 0) {
                   <app-assistant-sources [citations]="turn.citations" />
                 }
+                <!-- Phase 5: the visible tier chip — WHICH cascade tier answered
+                     (current meeting / vault / connectors), set deterministically
+                     by the backend ladder. Hidden when the turn didn't run through
+                     the cascade (answeredFrom null) or is still pending. -->
+                @if (tierLabel(turn); as tier) {
+                  <div class="tier-chip" role="note">
+                    <span class="tier-chip-dot" aria-hidden="true"></span>
+                    answered from: {{ tier }}
+                  </div>
+                }
 
                 <!-- Propose → accept: shown ONLY when the agent proposed a
                      NOTE (proposedNote != null). The DRAFT CONTENT is the

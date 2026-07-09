@@ -107,6 +107,14 @@ export class AudioPanelComponent {
   // --- Transcript find + karaoke ------------------------------------------
   /** Live text filter for the transcript turns (case-insensitive substring). */
   readonly query = signal("");
+  /**
+   * Cap on how many turns render at once. A 1h meeting folds to hundreds of turns / thousands of
+   * `<button>` fragments, so materializing them all is tens of MB of DOM + layout. We render the
+   * first `RENDER_CAP` (always extended to include the turn the playhead is inside, so karaoke
+   * auto-scroll never targets an un-rendered row) until the user asks for the whole transcript.
+   */
+  private readonly RENDER_CAP = 80;
+  readonly transcriptExpanded = signal(false);
   /** The scrolling transcript container + one element per rendered turn. */
   private readonly scroller = viewChild<ElementRef<HTMLElement>>("scroller");
   private readonly turnRows =
@@ -160,6 +168,53 @@ export class AudioPanelComponent {
       }
     }
     return null;
+  });
+
+  /**
+   * The turns actually rendered — the first `RENDER_CAP`, always extended to include the turn the
+   * playhead is inside (so karaoke auto-scroll never targets an un-rendered row), or ALL turns once
+   * the user expands or when the (possibly filtered) list is already within the cap. This bounds the
+   * DOM node count for a long meeting without breaking the play/seek/highlight surfaces.
+   */
+  readonly renderedTurns = computed<Turn[]>(() => {
+    const all = this.visibleTurns();
+    if (this.transcriptExpanded() || all.length <= this.RENDER_CAP) {
+      return all;
+    }
+    let cap = this.RENDER_CAP;
+    const activeKey = this.activeTurnKey();
+    if (activeKey) {
+      const activeIdx = all.findIndex((t) => t.key === activeKey);
+      if (activeIdx >= 0) {
+        cap = Math.max(cap, activeIdx + 1);
+      }
+    }
+    return all.slice(0, cap);
+  });
+
+  /** How many turns sit behind the "Show all" affordance (0 when the whole transcript is rendered). */
+  readonly hiddenTurnCount = computed(
+    () => this.visibleTurns().length - this.renderedTurns().length,
+  );
+
+  /**
+   * The set of segment `idx`es whose [startS, endS) currently contains the playhead — the karaoke
+   * highlight targets. A single `computed`, scanned ONCE per `currentTime` tick (O(n)); the template
+   * then does an O(1) `.has(s.idx)` per fragment. Replaces the former `isActiveSegment()` METHOD
+   * binding, which Angular re-ran O(n) per fragment on EVERY change-detection pass (~4×/s during
+   * playback → an ~8k-eval/s storm for a 1h transcript). A Set (not a single key) preserves the
+   * original behavior of highlighting EVERY active fragment when me/others segments overlap in
+   * wall-clock time.
+   */
+  readonly activeSegKeys = computed<Set<number>>(() => {
+    const t = this.currentTime();
+    const out = new Set<number>();
+    for (const s of this.segments()) {
+      if (t >= s.startS && t < s.endS) {
+        out.add(s.idx);
+      }
+    }
+    return out;
   });
 
   /** Progress as a 0–100 percentage for the seek-bar fill. */
@@ -338,12 +393,6 @@ export class AudioPanelComponent {
     void el.play();
   }
 
-  /** True when playback is inside [startS, endS) — highlights the live fragment. */
-  isActiveSegment(startS: number, endS: number): boolean {
-    const t = this.currentTime();
-    return t >= startS && t < endS;
-  }
-
   /** Find-box input handler → the `query` signal. */
   onQuery(event: Event): void {
     this.query.set((event.target as HTMLInputElement).value);
@@ -352,6 +401,11 @@ export class AudioPanelComponent {
   /** Clear the Find box. */
   clearQuery(): void {
     this.query.set("");
+  }
+
+  /** Reveal the full transcript (drops the `RENDER_CAP` window). */
+  showAllTurns(): void {
+    this.transcriptExpanded.set(true);
   }
 
   /**

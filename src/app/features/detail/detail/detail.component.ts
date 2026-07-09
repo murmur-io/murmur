@@ -7,6 +7,7 @@ import {
   OnInit,
   afterNextRender,
   computed,
+  effect,
   inject,
   signal,
   viewChild,
@@ -273,6 +274,34 @@ export class DetailComponent implements OnInit {
   // --- Interactive timeline (speaker + topic viz) -------------------------
   readonly timeline = signal<MeetingTimeline | null>(null);
   readonly timelineLoading = signal(false);
+
+  /**
+   * PERF/OOM (P0.1): generate the timeline LAZILY — only when the Audio tab (the only surface that
+   * renders it) is first opened for an unlocked meeting and it isn't already loaded / in flight.
+   * `loadMeeting`/`unlock` no longer kick it off on open, so a plain Note-tab open never triggers the
+   * multi-GB on-device LLM pass that OOM-killed the Mac. `allowSignalWrites` because `loadTimeline`
+   * writes `timelineLoading` (which this effect reads) — the `!timelineLoading()` guard makes the
+   * re-run a no-op, so there is no loop. See docs/research/2026-07-07-perf-memory-audit.md.
+   */
+  private readonly _timelineOnAudioTab = effect(
+    () => {
+      if (
+        this.activeTab() === "audio" &&
+        this.detail() &&
+        !this.locked() &&
+        !this.timeline() &&
+        !this.timelineLoading() &&
+        // Do NOT auto-retry after a failure: a persistent `get_timeline` error would otherwise
+        // re-fire this effect every time `timelineLoading` flips back to false → an infinite retry
+        // loop (and repeated multi-GB model loads). A failed load surfaces the Retry button, which
+        // clears `timelineError` and re-calls `loadTimeline` explicitly.
+        !this.timelineError()
+      ) {
+        void this.loadTimeline();
+      }
+    },
+    { allowSignalWrites: true },
+  );
   readonly timelineError = signal(false);
   /**
    * Speaker voiceprint suggestions (opt-in) — one per diarized `others-{n}` lane
@@ -405,10 +434,12 @@ export class DetailComponent implements OnInit {
       });
       return;
     }
-    // Kick the timeline off after the detail load; never blocks the page and
-    // tolerates the first-call LLM latency (backend caches the result).
+    // PERF/OOM (P0.1): do NOT generate the timeline on open. It only renders on the Audio tab
+    // (default is Note), and `get_timeline` on a fresh meeting runs an on-device LLM over the WHOLE
+    // transcript — with a local heavy model (Bielik-11B, 6.3 GB, never-evict) that multi-GB load
+    // on every open OOM-killed the Mac. It is now generated LAZILY when the Audio tab first opens
+    // (`_timelineOnAudioTab` effect below). See docs/research/2026-07-07-perf-memory-audit.md.
     if (this.detail()) {
-      void this.loadTimeline();
       // Prime the folder tree so the read-only folder/lock badge + the move
       // picker have state on a direct navigation (idempotent; the root component
       // also loads it). Non-blocking — a failure just hides the badge.
@@ -490,9 +521,9 @@ export class DetailComponent implements OnInit {
       this.detail.set(fresh);
       if (fresh && !fresh.locked) {
         // Refresh the folder tree so the header lock badge reflects the unlock,
-        // then prime the timeline + tags the masked load skipped. Non-blocking.
+        // then prime the tags the masked load skipped. Non-blocking. The timeline is
+        // NOT generated here (P0.1) — it loads lazily when the Audio tab opens.
         void this.folders.load();
-        void this.loadTimeline();
         try {
           this.tags.set(await this.ipc.getMeetingTags(id));
         } catch {
@@ -547,16 +578,27 @@ export class DetailComponent implements OnInit {
   /** Fetch (or re-fetch, via Retry) the AI-derived speaker + topic timeline. */
   async loadTimeline(): Promise<void> {
     const id = this.detail()?.meeting.id;
-    if (!id) {
+    // In-flight guard: never start a second generation while one is running (the Audio-tab effect
+    // could otherwise re-fire). P0.4.
+    if (!id || this.timelineLoading()) {
       return;
     }
     this.timelineError.set(false);
     this.timelineLoading.set(true);
     try {
-      this.timeline.set(await this.ipc.getTimeline(id));
+      const tl = await this.ipc.getTimeline(id);
+      // STALE-RESULT guard: `get_timeline` can take many seconds (on-device LLM). If the user
+      // switched meetings mid-flight, drop this result so we never paint meeting A's timeline over
+      // meeting B (mirrors `resummarize`). P0.4.
+      if (this.detail()?.meeting.id !== id) {
+        return;
+      }
+      this.timeline.set(tl);
     } catch {
-      this.timeline.set(null);
-      this.timelineError.set(true);
+      if (this.detail()?.meeting.id === id) {
+        this.timeline.set(null);
+        this.timelineError.set(true);
+      }
     } finally {
       this.timelineLoading.set(false);
     }

@@ -7,6 +7,7 @@ import type {
   AiMapRow,
   Analytics,
   AppConfigDto,
+  ContextHit,
   MyShareEntry,
   RecipientPreview,
   ShareToUserResult,
@@ -197,6 +198,36 @@ export class IpcService {
   }
 
   /**
+   * ENRICH: preview live context to fold into the note, from EVERY consented connector (Jira via
+   * precise issue-key lookup; other connectors via a title search). This is the egress moment
+   * (explicit, like verify); refuses a locked meeting; returns `[]` when there is nothing to add.
+   */
+  enrichNoteContext(meetingId: string): Promise<ContextHit[]> {
+    return invoke<ContextHit[]>("enrich_note_context", { meetingId });
+  }
+
+  /**
+   * Persist the reviewed context hits as ONE consolidated, dated `> [!context]-` callout appended to
+   * the note (byte-exact undo: pass `[]` to strip it). No egress — the hits were already fetched.
+   */
+  applyNoteEnrichment(meetingId: string, hits: ContextHit[]): Promise<NoteDto> {
+    return invoke<NoteDto>("apply_note_enrichment", { meetingId, hits });
+  }
+
+  /**
+   * STAGE 2 / LANE A — MANUAL re-link / backfill of cross-meeting `[[links]]` over a FINISHED note.
+   * ZERO egress: the pass retrieves over the user's OWN visible notes (double visibility-gated,
+   * self-excluding) and appends an additive, idempotent, byte-exact-undo `> [!related]-` block —
+   * nothing leaves the device. The AUTO pipeline runs the same pass as a deferred post-`Exported`
+   * step; this is the on-demand refresh so the panel can re-link after later meetings land. Lock-
+   * gated + seal-safe (a sealed meeting is a silent no-op). Re-fetch the note (getMeetingDetail)
+   * after it resolves to render the refreshed links.
+   */
+  linkRelatedNotes(meetingId: string): Promise<void> {
+    return invoke<void>("link_related_notes", { meetingId });
+  }
+
+  /**
    * Re-Truth — preview the facts a just-finished meeting SUPERSEDES from earlier
    * notes (pending only; `applied` always false). Returns `[]` when nothing moved on.
    */
@@ -219,6 +250,16 @@ export class IpcService {
 
   getConfig(): Promise<AppConfigDto> {
     return invoke<AppConfigDto>("get_config");
+  }
+
+  /**
+   * The ready-to-paste Claude Code MCP config block (pretty JSON, `type: "http"`),
+   * carrying the localhost URL and — when `mcp_require_token` is on (default) — the
+   * `Authorization: Bearer <token>` header so the handshake authenticates. When the
+   * token flag is off the config has no headers block.
+   */
+  getMcpConfig(): Promise<string> {
+    return invoke<string>("get_mcp_config");
   }
 
   saveConfig(config: AppConfigDto): Promise<void> {
@@ -1199,6 +1240,22 @@ export class IpcService {
   }
 
   /**
+   * Phase 6 — tell the backend which meeting the user is currently VIEWING /
+   * anchored to (the FOCUS pointer), distinct from the recording pointer. Call
+   * with the meeting id when a meeting-detail / conversation view opens, and with
+   * `null` when it closes. This is a backend SAFETY-NET: the brain resolves its
+   * "this meeting" scope as `explicit meetingId > focus > recording`, so any
+   * assistant path that falls back off an explicit id (the voice/wake twin) still
+   * scopes to the meeting on screen — even when nothing is recording, and even
+   * when a DIFFERENT meeting is recording. Focus is only an id (never content);
+   * the sealed-content gate is unchanged (a relocked meeting stays masked).
+   * Best-effort — a failure never blocks opening the view.
+   */
+  setFocusMeeting(meetingId: string | null): Promise<void> {
+    return invoke<void>("set_focus_meeting", { meetingId });
+  }
+
+  /**
    * Ask the in-meeting assistant a TYPED question (the text composer — the twin of
    * the voice trigger). Routes the typed command through the SAME gated agentic
    * brain as voice: the model decides which gated tools to call, the live tool
@@ -1208,9 +1265,19 @@ export class IpcService {
    *
    * Pass `threadId` to persist the exchange under that thread (the result +
    * tool-trace events come back stamped with it); omit it for an anchorless ask.
+   *
+   * Pass `meetingId` (Phase 4) to bind the turn to a SPECIFIC meeting: the backend
+   * resolves `meetingId ?? state.current_meeting`, so an explicit id wins (a
+   * past/anchored @brain thread scopes to ITS meeting) while omitting it keeps the
+   * live-recording scope. Omitting it preserves the pre-Phase-4 behavior for the
+   * voice/wake twin.
    */
-  askAssistantText(text: string, threadId?: string): Promise<void> {
-    return invoke<void>("ask_assistant_text", { text, threadId });
+  askAssistantText(
+    text: string,
+    threadId?: string,
+    meetingId?: string,
+  ): Promise<void> {
+    return invoke<void>("ask_assistant_text", { text, threadId, meetingId });
   }
 
   /**
@@ -1227,16 +1294,25 @@ export class IpcService {
    * a UUID itself and the exchange STILL persists (it then rehydrates as a
    * standalone anchorless thread). Always pass the thread's own id so its
    * exchanges stay grouped.
+   *
+   * Pass `meetingId` (Phase 4) to bind the thread to a SPECIFIC meeting so the
+   * brain scopes "this meeting" correctly: the backend resolves
+   * `meetingId ?? state.current_meeting`, so an explicit id wins (a past/anchored
+   * thread answers about ITS meeting even while a different meeting records) and
+   * omitting it keeps the live-recording scope. This is what kills the
+   * wrong-meeting bug — always pass the thread's bound meeting id.
    */
   askAssistantChat(
     messages: ChatMsg[],
     threadId?: string,
     anchorText?: string,
+    meetingId?: string,
   ): Promise<VoiceActionResultPayload> {
     return invoke<VoiceActionResultPayload>("ask_assistant_chat", {
       messages,
       threadId,
       anchorText,
+      meetingId,
     });
   }
 
