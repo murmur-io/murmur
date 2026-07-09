@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::audio::wake::VoiceIntent;
 use crate::error::AppError;
-use crate::reason::LocalReasoner;
+use crate::reason::{GenOptions, LocalReasoner};
 use crate::settings::AppConfig;
 use crate::storage::Db;
 use crate::tools::{execute_tool, ToolCall};
@@ -670,7 +670,9 @@ pub(crate) fn answer_current_meeting_isolated(
             "User's request (their own words): {}\n\nSentence to translate: {english}",
             literal_command.trim()
         );
-        let summary = match reasoner.reason(system, &user) {
+        // P0.3: a LIVE user-facing answer rides the live preset (capped decode; the GGUF path also
+        // gets the 30 s wall-clock timeout). Best-effort no-op on stub/cloud reasoners.
+        let summary = match reasoner.reason_with(system, &user, GenOptions::live_answer()) {
             Ok(a) if !a.trim().is_empty() => a.trim().to_string(),
             // Any failure (incl. no-consent Unavailable) ⇒ the honest English notice, never a
             // fan-out. The user still gets a truthful, non-leaking answer.
@@ -716,7 +718,8 @@ pub(crate) fn answer_current_meeting_isolated(
         "User's request (their own words): {}\n\nThe meeting's transcript and the user's notes:\n{content}",
         literal_command.trim()
     );
-    match reasoner.reason(system, &user) {
+    // P0.3: LIVE answer preset — bounded decode so the isolated Tier-1 synthesis can't run away.
+    match reasoner.reason_with(system, &user, GenOptions::live_answer()) {
         Ok(answer) if !answer.trim().is_empty() => VoiceActionResult {
             intent_kind: intent_kind.to_string(),
             status: "ok".to_string(),
@@ -1103,7 +1106,8 @@ fn rag_answer(
 
     // EGRESS SEAM: a Cloud reasoner routes through make_provider (consent gate + RedactingProvider).
     // A no-consent refusal comes back as AppError::Unavailable → graceful "needs consent", no leak.
-    match reasoner.reason(&system, &user) {
+    // P0.3: the floor's user-facing synthesis is a LIVE answer — ride the live (capped) preset.
+    match reasoner.reason_with(&system, &user, GenOptions::live_answer()) {
         Ok(answer) => {
             let answer = answer.trim();
             let summary = if answer.is_empty() {
@@ -1630,9 +1634,17 @@ mod tests {
                 .into(),
             ),
         };
-        let outcome = run_agentic_loop(&brain, "sys", "what are the secret terms?", &exec, 5, None)
-            .unwrap()
-            .expect("the brain answered");
+        let outcome = run_agentic_loop(
+            &brain,
+            "sys",
+            "what are the secret terms?",
+            &exec,
+            5,
+            None,
+            crate::reason::GenOptions::default(),
+        )
+        .unwrap()
+        .expect("the brain answered");
         assert!(
             !outcome
                 .citations
@@ -1752,6 +1764,68 @@ mod tests {
             !res.citations.iter().any(|c| c.contains("Secret")),
             "SEALED meeting must NOT be cited on the stub floor: {:?}",
             res.citations
+        );
+    }
+
+    /// P0.2 (Brain v2) — the stub-echo guard, pinned END-TO-END on both deterministic-floor answer
+    /// paths `run_informational` dispatches to (the fan-out floor via `handle_voice_action` and the
+    /// Tier-1 isolated current-meeting answer). With the StubReasoner (brain Off / no GGUF), the
+    /// user-facing summary must (a) NEVER carry the `[stub-reason]` diagnostic echo and (b) point
+    /// the user at Settings so they know how to enable a real brain.
+    ///
+    /// HONEST RED/GREEN NOTE: this test was run BEFORE any P0 change and already PASSED — the
+    /// per-call-site guards shipped in #172 ("don't surface StubReasoner echo") and the 0.8.0
+    /// cascade work already cover every `reason()` call on the floor. It is kept as the regression
+    /// pin for the P0.2 invariant rather than a RED-first bug capture.
+    #[test]
+    fn stub_floor_hints_settings_and_never_echoes_stub() {
+        // 1) The fan-out floor over a seeded vault (non-empty grounding → the synthesis point).
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let stub = crate::reason::StubReasoner;
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &stub,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            "",
+            false,
+            None,
+        );
+        assert!(
+            !res.summary.contains("[stub-reason]"),
+            "the stub echo must never surface on the fan-out floor: {}",
+            res.summary
+        );
+        assert!(
+            res.summary.contains("Settings"),
+            "the no-model notice must point at Settings: {}",
+            res.summary
+        );
+
+        // 2) The Tier-1 isolated current-meeting answer with content present.
+        let res2 = answer_current_meeting_isolated(
+            "research",
+            "o czym to spotkanie",
+            "Transcript:\n[0s] Budget approved.",
+            true,
+            Some("Budget Review"),
+            &stub,
+        );
+        assert!(
+            !res2.summary.contains("[stub-reason]"),
+            "the stub echo must never surface on the Tier-1 isolated answer: {}",
+            res2.summary
+        );
+        assert!(
+            res2.summary.contains("Settings"),
+            "the Tier-1 no-model notice must point at Settings: {}",
+            res2.summary
         );
     }
 

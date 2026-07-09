@@ -3686,8 +3686,17 @@ fn ask_vault_loop(
 ) -> Result<Option<AskVaultResult>, AppError> {
     let system = crate::summarize::vault_chat::agentic_system(memory_brief);
     let user = crate::summarize::vault_chat::render_conversation(history, question);
-    let Some(outcome) =
-        crate::agent::run_agentic_loop(reasoner, &system, &user, executor, ASK_MAX_STEPS, sink)?
+    let Some(outcome) = crate::agent::run_agentic_loop(
+        reasoner,
+        &system,
+        &user,
+        executor,
+        ASK_MAX_STEPS,
+        sink,
+        // P0.3: the ASK preset — a 2048-token cap (roomier than live, still bounded; the GGUF path
+        // additionally rides the 30 s wall-clock generation timeout). No-op on stub/cloud.
+        crate::reason::GenOptions::ask_answer(),
+    )?
     else {
         return Ok(None);
     };
@@ -11422,6 +11431,8 @@ mod lifecycle_tests {
             capped_notified: std::sync::atomic::AtomicBool::new(false),
             reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
             reactions_emitted: Mutex::new(HashSet::new()),
+            in_flight_turns: Mutex::new(std::collections::HashMap::new()),
+            user_turn_in_progress: std::sync::atomic::AtomicBool::new(false),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),

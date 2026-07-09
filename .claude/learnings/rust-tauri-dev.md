@@ -128,3 +128,9 @@
 - **Caught by:** operator (seeding the loop).
 - **Lesson:** the bullets above; full detail in `.claude/rules/rust-tauri.md` + `lock-model.md`.
 - **Status:** distilled (2026-07-02)
+
+### [2026-07-09 brain-p0-hotfixes] Scope resource bounds to the surface that needs them
+- **Pattern:** a wall-clock timeout added to `MistralReasoner` for the LIVE path was wired at the lowest seam (`reason_with_opts`) and silently applied to EVERY local generation — FullyLocal note-gen (legit 30–90s) and the Ask floor (200k-char prefill) would have started failing `Unavailable`, and first-gen Metal shader compile (CLT-only Macs, `MISTRALRS_METAL_PRECOMPILE=0`) could always eat the first call.
+- **Caught by:** adversarial-verifier (`.claude/tmp/brain-p0-hotfixes/adversarial-verify.json`, MAJOR) — builder's tests were green; the regression was on paths the new tests didn't cover.
+- **Lesson:** carry per-call bounds IN the options struct (`GenOptions.timeout: Option<Duration>`, default None = old behavior; presets opt in), never as a blanket const at the lowest layer. Before bounding a shared seam, enumerate every caller class (live / notes / floor / background extraction) and ask which of them legitimately exceeds the bound.
+- **Status:** journal
