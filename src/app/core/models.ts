@@ -521,6 +521,16 @@ export type VoiceActionStatus =
   | "error";
 
 /**
+ * Phase 5 — which BRAIN CASCADE tier answered an in-meeting @brain turn. Set
+ * DETERMINISTICALLY by the backend ladder (never string-sniffed): the current
+ * meeting in isolation, the user's vault, or the connectors/web. Mirrors the
+ * backend `AnsweredFrom` enum (`voice_action.rs`, serialized `snake_case`).
+ * Absent/null when the turn didn't run through the cascade (the deterministic
+ * floor, an error, or the vault-wide Ask page).
+ */
+export type AnsweredFrom = "current_meeting" | "vault" | "connectors";
+
+/**
  * Phase H — the result of a voice action (`EVENT_VOICE_ACTION_RESULT`): the
  * HEARD command (the user's own dictated words, so the card can show
  * "usłyszano: {command}"; empty when nothing was heard), a short summary +
@@ -549,6 +559,12 @@ export interface VoiceActionResultPayload {
    * routing. Lets the FE resolve the RIGHT thread when several are in flight.
    */
   threadId?: string | null;
+  /**
+   * Phase 5 — which BRAIN CASCADE tier answered (current meeting / vault /
+   * connectors), set deterministically by the backend ladder. Absent/null when
+   * the turn did not run through the cascade. Drives the visible tier chip.
+   */
+  answeredFrom?: AnsweredFrom | null;
 }
 
 /**
@@ -683,6 +699,16 @@ export interface VerifyFindingDto {
   verdict: "confirmed" | "notfound" | "conflict";
   detail: string;
   url: string;
+}
+
+/**
+ * One piece of live connector context to fold into a note (connector-agnostic — `source` is the
+ * truthful connector label, e.g. "Jira" / "Slack"). Mirrors the Rust `enrich::ContextHit`.
+ */
+export interface ContextHit {
+  source: string;
+  detail: string;
+  url: string | null;
 }
 
 export interface StartResult {

@@ -321,14 +321,14 @@ export class SettingsStore {
   /** The localhost MCP server address — shown inline and embedded in the config. */
   readonly mcpUrl = "http://127.0.0.1:8765";
 
-  /** Exact JSON to drop into the Claude Desktop config — copied verbatim. */
-  readonly mcpConfig = `{
-  "mcpServers": {
-    "murmur": {
-      "url": "${this.mcpUrl}"
-    }
-  }
-}`;
+  /**
+   * Exact JSON to drop into the Claude Code config — fetched from the backend
+   * (`get_mcp_config`) because it carries the private bearer token needed for the
+   * MCP handshake when `mcp_require_token` is on (the default). Populated by
+   * `load()`; empty until then. `copyMcpConfig()` copies whatever is in the signal.
+   */
+  private readonly _mcpConfig = signal<string>("");
+  readonly mcpConfig = this._mcpConfig.asReadonly();
 
   /** Flips true for ~1.6s after copying the MCP config — drives the button's confirmed state. */
   private readonly _configCopied = signal(false);
@@ -1343,6 +1343,11 @@ export class SettingsStore {
       this._appInfo.set(await this.ipc.appInfo().catch(() => null));
       // Recording-storage usage report (best-effort; drives the Storage section + Library bar).
       await this.loadStorageReport();
+      // MCP config block for Claude Code — carries the private bearer token so the copied
+      // snippet authenticates (fixes the `-32001 unauthorized` handshake). Best-effort: on a
+      // keychain read failure it stays empty and the copy button no-ops rather than pasting a
+      // tokenless config that would fail.
+      await this.refreshMcpConfig();
       // Only a SUCCESSFUL load arms auto-save — arming after a failed load
       // would let the pristine defaults overwrite the user's stored config.
       this.autoSaveReady = true;
@@ -2026,9 +2031,17 @@ export class SettingsStore {
       // re-check presence so the download hint stays honest (was previously done
       // by onModelChoiceChange's direct save, now retired).
       this._modelPresent.set(await this.ipc.modelPresent().catch(() => false));
+      // A save may have flipped `mcp_require_token` (or minted the token on first use) — re-fetch
+      // the MCP config so the copy block never shows a stale token-bearing / tokenless snippet.
+      await this.refreshMcpConfig();
     } catch (e) {
       this._loadError.set("Save failed: " + String(e));
     }
+  }
+
+  /** Re-fetch the token-bearing MCP config into its signal (after load / config save). */
+  private async refreshMcpConfig(): Promise<void> {
+    this._mcpConfig.set(await this.ipc.getMcpConfig().catch(() => ""));
   }
 
   async saveKey(): Promise<void> {
@@ -2365,8 +2378,17 @@ export class SettingsStore {
    * The <pre> block stays selectable as a fallback if the clipboard is blocked.
    */
   async copyMcpConfig(): Promise<void> {
+    // Guard the silent-empty-copy: if the config never loaded (keychain read failed → ""), do NOT
+    // copy an empty string and flash a misleading "Copied". Re-fetch once; if still empty, surface
+    // the error line and no-op so the user isn't handed a blank config that "does nothing".
+    if (!this.mcpConfig().trim()) {
+      await this.refreshMcpConfig();
+      if (!this.mcpConfig().trim()) {
+        return;
+      }
+    }
     try {
-      await navigator.clipboard.writeText(this.mcpConfig);
+      await navigator.clipboard.writeText(this.mcpConfig());
       this._configCopied.set(true);
       if (this.mcpCopyResetTimer) clearTimeout(this.mcpCopyResetTimer);
       this.mcpCopyResetTimer = setTimeout(

@@ -225,15 +225,32 @@ fn is_wikilink_only(content: &str) -> bool {
     !remainder.chars().any(|c| c.is_alphanumeric())
 }
 
-/// Whether a heading opens a section that legitimately carries content NOT in the transcript (the
-/// user's typed `## My notes`, the `## Related prior notes` grounding corpus) — those must never be
-/// flagged as unverified. Case-insensitive, tolerant of a title suffix.
-fn is_skipped_heading(trimmed_heading: &str) -> bool {
-    let title = trimmed_heading
+/// The lowercased, `#`-stripped title of a heading line (`"## My Notes"` → `"my notes"`). One
+/// source of truth for the EN+PL heading matchers.
+fn section_title(trimmed_heading: &str) -> String {
+    trimmed_heading
         .trim_start_matches('#')
         .trim()
-        .to_lowercase();
-    title.starts_with("my notes") || title.starts_with("related prior notes")
+        .to_lowercase()
+}
+
+/// Whether a heading opens a PROTECTED section that legitimately carries content NOT in THIS
+/// transcript (the user's typed `## My notes`, the `## Related prior notes` grounding corpus, an
+/// `## Also discussed` recap) — those must NEVER be flagged unverified NOR have a unit removed by
+/// the anti-bleed pass. EN + PL, case-insensitive, suffix-tolerant.
+fn is_skipped_heading(trimmed_heading: &str) -> bool {
+    let title = section_title(trimmed_heading);
+    const KEYS: &[&str] = &[
+        // English
+        "my notes",
+        "related prior notes",
+        "also discussed",
+        // Polish
+        "moje notatki",
+        "powiązane notatki",
+        "pozostałe",
+    ];
+    KEYS.iter().any(|k| title.starts_with(k))
 }
 
 /// Whether the first non-empty line at/after `start` is already a `> unverified` marker (either

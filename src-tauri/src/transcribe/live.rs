@@ -272,7 +272,8 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                                 crate::events::VoiceCommandProcessingPayload { active: true },
                             );
                             // No FE thread here (spoken turn) → the turn generates its own id.
-                            spawn_assistant_turn(app.clone(), command, None);
+                            // No FE meeting_id (voice twin) → scope falls back to the live recording.
+                            spawn_assistant_turn(app.clone(), command, None, None);
                         }
                         ManualCaptureDecision::NothingHeard => {
                             // Budget expired with nothing heard → graceful, NOT a confusing
@@ -340,7 +341,8 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                         );
                         if dispatch {
                             // No FE thread here (wake-word turn) → the turn generates its own id.
-                            spawn_assistant_turn(app.clone(), payload.command.clone(), None);
+                            // No FE meeting_id (wake twin) → scope falls back to the live recording.
+                            spawn_assistant_turn(app.clone(), payload.command.clone(), None, None);
                         }
                         let _ = app.emit(crate::events::EVENT_WAKE_DETECTED, payload);
                     }
@@ -360,8 +362,35 @@ fn should_dispatch(config: &crate::settings::AppConfig) -> bool {
     config.realtime_reactions
 }
 
-/// Max agentic rounds on the cloud brain (decide → tool → … → answer). Bounded for live latency.
-const CLOUD_MAX_STEPS: usize = 4;
+// ── Phase 5 tier system-prompt SUFFIXES ─────────────────────────────────────────────────────────
+// Each is appended to the shared `assistant_system_prompt` (which injects the current-meeting live
+// buffer / typed notes / memory brief). They give the tier its SCOPE contract + the `__ESCALATE__`
+// escalation instruction. The suffix is prose only — the actual tool boundary is STRUCTURAL
+// (`AssistantScope` in the executor), so a model that ignores the prose still cannot reach a higher
+// tier's tools. `__ESCALATE__` must exactly match `crate::agent::ESCALATE_SENTINEL`.
+
+/// Tier 1 — answer ONLY from THIS meeting's own content (the injected live transcript / typed notes),
+/// never the vault. If it is not answerable from this meeting, escalate.
+const TIER1_SUFFIX: &str = "SCOPE — CURRENT MEETING ONLY: Answer STRICTLY from THIS meeting's own \
+    content shown above (its live transcript and the user's typed notes). Do NOT use any outside \
+    knowledge or other saved meetings. You have NO search tools at this step — that is intentional. \
+    If — and only if — the question CANNOT be answered from THIS meeting's content, reply with \
+    EXACTLY this JSON and nothing else: {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
+
+/// Tier 2 — answer from the user's OWN VAULT (their saved meetings/notes) via the gated search tools;
+/// if the vault doesn't cover it, escalate.
+const TIER2_SUFFIX: &str = "SCOPE — YOUR VAULT: Answer from the user's OWN saved meetings and notes, \
+    using the gated vault search tools to ground your answer. Cite meetings by their [[Title]] \
+    wikilink. If — and only if — the answer is NOT in the user's vault (it needs the web, Jira, \
+    Slack, or the calendar), reply with EXACTLY this JSON and nothing else: \
+    {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
+
+/// Tier 3 — TERMINAL: reach the consent-gated connectors/web. If it still can't be answered, say so
+/// honestly — there is NO further tier, so NEVER emit the escalation sentinel here.
+const TIER3_SUFFIX: &str = "SCOPE — CONNECTORS & WEB (last resort): Use the consent-gated connector \
+    and web tools (and the vault tools for grounding) to answer. Loud-attribute external facts \
+    (\"(via web)\", \"(via Jira)\", \"(via Slack)\"). This is the LAST step — if you still cannot \
+    find the answer, say so plainly; do NOT emit any escalation marker.";
 
 /// Resolve the turn's THREAD id: the FE-supplied id when present (an @brain thread), else a fresh
 /// UUID v4 (the voice/wake path and the single-shot text composer send none), so EVERY persisted
@@ -374,22 +403,61 @@ pub(crate) fn ensure_thread_id(explicit: Option<String>) -> String {
     }
 }
 
+/// Resolve the SCOPE meeting for an assistant turn — the id the brain grounds "this meeting" in
+/// (both `GatedToolExecutor.meeting_id` and `gated_live_context`). Precedence (Phase 6 generalizes
+/// the Phase-4 fix): an EXPLICIT FE-sent `meeting_id` (a bound past/anchored @brain thread) WINS
+/// over the FOCUS pointer (`state.focus_meeting` — the meeting the user is looking at), which in
+/// turn WINS over `state.current_meeting` (the recording pointer, `Some` only while recording). So:
+/// a bound thread scopes to ITS meeting even while a different one records; an idle user viewing a
+/// past meeting scopes to THAT meeting (the exact idle wrong-meeting root); and a voice/wake twin
+/// that sends none AND has no focus still falls back to the live recording — so recording keeps
+/// working. A blank/whitespace id at ANY level counts as ABSENT. The empty string means "no scope"
+/// (no FE id, no focus, not recording) — the fail-closed default `gated_live_context` treats as
+/// not-visible. PURE + headless-testable; no PII (opaque ids only).
+pub(crate) fn resolve_scope_meeting(
+    fe_meeting_id: Option<&str>,
+    focus_meeting: Option<&str>,
+    current_meeting: Option<&str>,
+) -> String {
+    let norm = |s: Option<&str>| -> Option<String> {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    norm(fe_meeting_id)
+        .or_else(|| norm(focus_meeting))
+        .or_else(|| norm(current_meeting))
+        .unwrap_or_default()
+}
+
 /// Spawn ONE assistant turn on a DETACHED OS thread — the SINGLE entry to the in-meeting brain for the
 /// wake path, the manual button, AND the text composer (all three funnel here with a `command` string).
 /// The brain + tools can take seconds, so it MUST run off-thread; the whole body is best-effort +
 /// panic-free and runs on its own thread, so even an unexpected panic is contained and can never
 /// disrupt recording or the caption.
-pub fn spawn_assistant_turn(app: AppHandle, command: String, thread_id: Option<String>) {
+pub fn spawn_assistant_turn(
+    app: AppHandle,
+    command: String,
+    thread_id: Option<String>,
+    meeting_id: Option<String>,
+) {
     let _ = std::thread::Builder::new()
         .name("murmur-assistant-turn".into())
-        .spawn(move || run_assistant_turn(&app, command, thread_id));
+        .spawn(move || run_assistant_turn(&app, command, thread_id, meeting_id));
 }
 
 /// The CARD path (wake / manual button / single-shot text composer): run the shared query core, then
 /// EMIT `EVENT_VOICE_ACTION_RESULT` so the assistant card resolves the pending row. The per-tool trace
 /// streams via `EVENT_ASSISTANT_TOOL`. A missing `thread_id` (voice/wake) is backend-generated here,
 /// so the persisted row + every emitted payload of this turn carry the SAME thread identity.
-fn run_assistant_turn(app: &AppHandle, command: String, thread_id: Option<String>) {
+/// `meeting_id` is the OPTIONAL FE-supplied scope meeting (Phase 4): when present it wins over
+/// `state.current_meeting`; the voice/wake twin sends none, so the live recording still scopes.
+fn run_assistant_turn(
+    app: &AppHandle,
+    command: String,
+    thread_id: Option<String>,
+    meeting_id: Option<String>,
+) {
     let thread_id = ensure_thread_id(thread_id);
     let result = run_assistant_query(
         app,
@@ -398,6 +466,7 @@ fn run_assistant_turn(app: &AppHandle, command: String, thread_id: Option<String
         crate::events::EVENT_ASSISTANT_TOOL,
         &thread_id,
         None,
+        meeting_id.as_deref(),
     );
     let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
 }
@@ -421,6 +490,16 @@ fn run_assistant_turn(app: &AppHandle, command: String, thread_id: Option<String
 /// — it is threaded onto every trace payload, the returned result, and the persisted row, so
 /// simultaneous threads never cross-attribute. `anchor_text` is the note text an @brain thread was
 /// anchored to (persisted with the row; `None` for voice/unanchored turns).
+///
+/// `fe_meeting_id` (Phase 4) is the EXPLICIT scope meeting the FE binds this thread to. It is
+/// resolved as `fe_meeting_id.or(state.focus_meeting).or(state.current_meeting)` via
+/// [`resolve_scope_meeting`] (Phase 6): an explicit FE id WINS (so a past/anchored @brain thread
+/// scopes to ITS meeting even while a DIFFERENT meeting records, and "o czym to spotkanie" on an
+/// idle thread no longer defaults to a vault-wide arbitrary meeting); when the FE sends none, the
+/// FOCUS pointer (the meeting the user is viewing) applies — the backend safety-net for the
+/// voice/wake fallback path; and only when there is neither does the live-recording pointer apply.
+/// The RESOLVED id is used for the executor scope, `gated_live_context`, AND the persisted
+/// thread binding — so a thread durably answers about its OWN meeting.
 pub fn run_assistant_query(
     app: &AppHandle,
     command: &str,
@@ -428,6 +507,7 @@ pub fn run_assistant_query(
     tool_event: &'static str,
     thread_id: &str,
     anchor_text: Option<&str>,
+    fe_meeting_id: Option<&str>,
 ) -> crate::voice_action::VoiceActionResult {
     let state = app.state::<AppState>();
     let config = match state.config.lock() {
@@ -447,12 +527,27 @@ pub fn run_assistant_query(
                 .with_thread_id(thread_id)
         }
     };
-    let meeting_id = state
+    // Phase 6 precedence (generalizes Phase 4): FE-sent `fe_meeting_id` (a bound thread) WINS over
+    // the FOCUS pointer (the meeting the user is viewing — the backend safety-net for any fallback
+    // path, e.g. the voice/wake twin), which WINS over the recording pointer (`current_meeting`,
+    // Some only while recording). Resolved ONCE here and used for the executor scope,
+    // `gated_live_context`, AND the persisted thread binding. A poisoned focus mutex fails safe (as
+    // if unset) — the resolver just falls through to the recording pointer.
+    let focus_meeting = state
+        .focus_meeting
+        .lock()
+        .ok()
+        .and_then(|f| f.clone());
+    let current_meeting = state
         .current_meeting
         .lock()
         .ok()
-        .and_then(|m| m.map(|id| id.to_string()))
-        .unwrap_or_default();
+        .and_then(|m| m.map(|id| id.to_string()));
+    let meeting_id = resolve_scope_meeting(
+        fe_meeting_id,
+        focus_meeting.as_deref(),
+        current_meeting.as_deref(),
+    );
 
     // Resolve an intent for the FLOOR only (its read fan-out + surfaced kind) — it NO LONGER routes
     // writes. The agentic loop (with writes) is the single executive path; the agent DECIDES.
@@ -536,86 +631,72 @@ fn run_informational(
     if !crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config)
         .is_reasoner_only()
     {
-        let executor = crate::tools::GatedToolExecutor {
-            db: &state.db,
-            // The LIVE set behind its Mutex — re-read per tool call (C6), so a mid-loop relock is gated
-            // out immediately. (The deterministic floor below still uses the per-turn `unlocked` snapshot.)
-            unlocked: &state.unlocked_folders,
-            config,
-            meeting_id,
-            app: Some(app),
-            // PROPOSE-then-ACCEPT model (Rev 2): the in-meeting agent is READ-ONLY — it GENERATES
-            // content (incl. note drafts enriched with the live context) but NEVER auto-writes. The
-            // user commits a draft via the FE's "Add to notes" (→ `save_manual_notes`). The
-            // `save_note`/`create_reminder` write tools stay DORMANT (not advertised while read-only)
-            // for a future structured "agent acts" iteration. The dispatch still routes EVERY request
-            // through this loop (no hardcoded write classifier), so the model decides answer-vs-draft.
-            allow_writes: false,
-            // In-meeting surfaces HAVE the notes flow + "Add to notes" Accept affordance, so the
-            // draft tool is advertised here (the vault-wide Ask page sets this false).
-            note_drafts: true,
-            // The `propose_note` tool records its draft HERE (no DB write). We read it after
-            // the loop to mark the reply as a NOTE PROPOSAL vs a plain ANSWER. The model decides which.
-            proposed_note: std::sync::Mutex::new(None),
-        };
-        let sink = ToolEventSink {
-            app: app.clone(),
-            event: tool_event,
-            thread_id: thread_id.to_string(),
-        };
-        // Inject the LIVE transcript of the recording IN PROGRESS + the user's OWN typed notes for
-        // the CURRENT meeting (segments aren't persisted until Stop, and typed notes carry the
-        // user's emphasis). Both are read through `gated_live_context` — gated by
-        // `meeting_is_visible` on the LIVE per-turn `unlocked` set (fail-closed) — and egress
-        // through the SAME redaction firewall as every prompt (`RedactingProvider::complete`
-        // scrubs `system` + `user`), only when cloud egress is consented (this branch is
-        // Cloud-only). NO new egress class.
-        let (live, typed_notes) =
-            gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
-        // Phase 3 CROSS-MEETING USER MEMORY: synthesize the memory brief from the currently-VISIBLE
-        // user facts only (sealed-source facts are excluded by `list_user_facts_visible`), and inject
-        // it next to the live-transcript section. It rides the SAME redaction firewall + cloud-consent
-        // gate as every other prompt segment — NO new egress class (design spec C3). Suppressed
-        // entirely when memory is turned off (`user_memory_enabled == false`).
-        let memory_brief = gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled);
-        // Is a recording LIVE right now? (recorder present ⇒ capture in progress.) This lets the
-        // prompt scope "this meeting/conversation" to the recording in progress even before any
-        // caption lands — so an empty live buffer no longer sends the agent off to describe OTHER
-        // saved meetings. Best-effort: a poisoned lock degrades to `false` (the vault-grounding
-        // branch), never a failure.
-        let recording_in_progress = state.recorder.lock().map(|g| g.is_some()).unwrap_or(false);
-        let system =
-            assistant_system_prompt(&live, &typed_notes, &memory_brief, recording_in_progress);
-        match crate::agent::run_agentic_loop(
+        // Phase 5 — the CURRENT-FIRST BRAIN CASCADE. Try each tier in order (current meeting →
+        // vault → connectors), each with a STRUCTURALLY-scoped executor (`AssistantScope`) that
+        // advertises only that tier's tools. The tier's prompt instructs the model to reply with the
+        // `__ESCALATE__` sentinel when the question is not answerable at that tier; the ladder detects
+        // it and steps up. This is "deterministic escalation, model-driven retrieval": which tools are
+        // reachable is code-enforced, retrieval within a tier stays model-driven.
+        if let Some(result) = run_cascade(
+            app, state, config, unlocked, meeting_id, loop_user, intent, tool_event, thread_id,
             &*reasoner,
-            &system,
-            loop_user,
-            &executor,
-            CLOUD_MAX_STEPS,
-            Some(&sink as &dyn crate::agent::DeltaSink),
         ) {
-            Ok(Some(outcome)) => {
-                // Read the model's NOTE PROPOSAL (if it called `propose_note` this turn) off the
-                // executor scratch and thread it onto the result — `Some` ⇒ a note draft, `None` ⇒ a
-                // plain answer. No DB write happened; the FE commits the draft on Accept.
-                let proposed = executor.proposed_note.lock().ok().and_then(|g| g.clone());
-                return crate::voice_action::VoiceActionResult::from_agent(intent, outcome)
-                    .with_proposed_note(proposed);
-            }
-            Ok(None) => tracing::debug!(
-                target: "voice",
-                "agentic loop did not converge; flooring to deterministic retrieval"
-            ),
-            Err(e) => tracing::debug!(
-                target: "voice",
-                error = %e,
-                "agentic loop unavailable/failed; flooring to deterministic retrieval"
-            ),
+            return result;
         }
+        // No tier converged (out of steps / no answer at any tier) → fall through to the floor.
     }
     // FLOOR — deterministic, gated, cited, needs_consent-aware, INFORMATIONAL ONLY. `floor_intent_for`
     // demotes a write intent to a Research so the floor NEVER performs a hardcoded write (a write
     // happens only when the AGENT chooses it; the floor is the read safety net).
+    //
+    // RECORDING AWARENESS on the FLOOR (back-ported from the cascade): the SAME recorder-lock flag the
+    // cascade computes (`run_cascade`) — a bool, NOT a content read — so the floor knows a meeting is
+    // being recorded RIGHT NOW even when the live buffer is still empty (meeting just started).
+    let recording_in_progress = state.recorder.lock().map(|g| g.is_some()).unwrap_or(false);
+
+    // ── TIER 1 — DETERMINISTIC CURRENT-FIRST (the structural fix) ────────────────────────────────
+    // When the user is CLEARLY asking about THIS meeting ("o czym jest to spotkanie", "summarize this
+    // recording", "co tu ustaliliśmy"), answer from the CURRENT meeting IN ISOLATION — NO vault
+    // fan-out, NO web leg, NO calendar. This is what stops "o czym to spotkanie" (topic ≈ "spotkanie")
+    // from web-searching the WORD "meeting" and drowning the weak local model in generic definition
+    // pages. Deterministic, NOT model-driven: the weak floor model can't be trusted to route.
+    //
+    // The current content comes from `tier1_current_content` — the SAME visibility gate as the
+    // fan-out floor, but ALSO reading a VIEWED PAST meeting's own gated transcript+note (the gap:
+    // `floor_current_context` reads only the live buffer, so a viewed saved meeting was empty →
+    // wrongly fell through to fan-out). A sealed-not-unlocked meeting yields "" (fail-closed) → the
+    // honest "no content" branch, NEVER a leak and NEVER a fan-out.
+    if crate::voice_action::is_about_current_meeting(command) {
+        let current_content =
+            tier1_current_content(&state.db, &state.live_transcript, meeting_id, unlocked);
+        let title = current_meeting_title(&state.db, meeting_id, unlocked);
+        // `intent_kind` for the card: keep the demoted read discriminant (research/recall stay as-is;
+        // a write intent is surfaced as research so the card style matches the informational floor).
+        let floor_intent = floor_intent_for(intent, command);
+        let kind = crate::voice_action::intent_kind_str(&floor_intent);
+        return crate::voice_action::answer_current_meeting_isolated(
+            kind,
+            command,
+            &current_content,
+            recording_in_progress,
+            title.as_deref(),
+            &*reasoner,
+        );
+    }
+
+    // ── TIER 2/3 — the EXISTING fan-out floor (UNCHANGED) ────────────────────────────────────────
+    // NOT a current-meeting question → the vault + web + calendar fan-out, exactly as before, so
+    // cross-note ("co ustaliliśmy z Weroniką" → vault) and world ("jaka pogoda" → web) questions still
+    // work. Because the current-first branch returned early above, the web leg now ONLY ever fires for
+    // genuinely non-current questions — precisely the fix.
+    //
+    // Fetch THIS meeting's context through the SAME GATED reader the cascade uses
+    // (`gated_live_context` → fail-closed on `meeting_is_visible`: a sealed-not-visible meeting yields
+    // empty), and hand it to the floor as the PRIMARY, clearly-labeled grounding. No new read path, no
+    // new egress class (it rides the same RedactingProvider + consent gate inside `handle_voice_action`).
+    let (live, typed_notes) =
+        gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
+    let current_meeting_context = floor_current_context(&live, &typed_notes);
     let floor_intent = floor_intent_for(intent, command);
     crate::voice_action::handle_voice_action(
         &floor_intent,
@@ -625,8 +706,297 @@ fn run_informational(
         config,
         meeting_id,
         command,
+        &current_meeting_context,
+        recording_in_progress,
         Some(app),
     )
+}
+
+/// Assemble the CURRENT meeting's gated context (its live-transcript tail + the user's typed notes)
+/// into one compact, labeled block for the deterministic floor's PRIMARY grounding. Inputs come from
+/// [`gated_live_context`] (already visibility-gated — a sealed-not-visible meeting yields two empty
+/// strings), so this only ever formats VISIBLE content. Both parts are truncated to the same recent
+/// tail the live system prompt uses ([`LIVE_TRANSCRIPT_INJECT_CHARS`]) to keep the local reasoner's
+/// window bounded. Returns "" when there is nothing to inject (idle / not-yet-captured / not visible),
+/// so the floor stays byte-identical to before for a no-context turn.
+fn floor_current_context(live: &str, typed_notes: &str) -> String {
+    let mut out = String::new();
+    let live = live.trim();
+    if !live.is_empty() {
+        out.push_str("Live transcript (so far):\n");
+        out.push_str(&tail_chars(live, LIVE_TRANSCRIPT_INJECT_CHARS));
+    }
+    let typed = typed_notes.trim();
+    if !typed.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("Your typed notes:\n");
+        out.push_str(&tail_chars(typed, LIVE_TRANSCRIPT_INJECT_CHARS));
+    }
+    out
+}
+
+/// TIER-1 CURRENT-MEETING CONTENT for the DETERMINISTIC FLOOR (reasoner-only / local backend). Unlike
+/// [`floor_current_context`] (which reads ONLY the live RAM buffer), this ALSO reads a VIEWED PAST
+/// meeting's own gated content — the gap that made "o czym to spotkanie" on a viewed saved meeting
+/// fall through to the vault+web fan-out (its live buffer is empty for a non-recording meeting).
+///
+/// Two GATED sources, in order:
+///   1. LIVE (recording in progress OR the live buffer/typed-notes are non-empty for a VISIBLE
+///      meeting): the `floor_current_context` block (live tail + typed notes), already
+///      visibility-gated by `gated_live_context` (a sealed-not-visible meeting yields "").
+///   2. PAST (a viewed saved meeting): the meeting's OWN transcript (`get_segments`) + note
+///      (`get_note_if_visible`), read ONLY when `meeting_is_visible` — a sealed-not-unlocked meeting
+///      is INVISIBLE, so BOTH the visibility check and `get_note_if_visible` fail closed and this
+///      returns "". This mirrors the `chat_meeting` gated read shape but stays inside `live.rs` over
+///      `db` (no call into `commands.rs`).
+///
+/// Returns the assembled current-meeting content (possibly ""). NEVER reads ungated content: the
+/// visibility gate is checked before ANY segment/note read.
+fn tier1_current_content(
+    db: &crate::storage::Db,
+    live_transcript: &std::sync::Mutex<String>,
+    meeting_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> String {
+    // 1) LIVE buffer + typed notes (gated). Non-empty for a visible in-progress / focused meeting.
+    let (live, typed_notes) = gated_live_context(db, live_transcript, meeting_id, unlocked);
+    let live_block = floor_current_context(&live, &typed_notes);
+    if !live_block.trim().is_empty() {
+        return live_block;
+    }
+
+    // 2) PAST viewed meeting — read its OWN gated content. GATE FIRST: a sealed-not-unlocked meeting
+    // is invisible → return "" (no read). This is the same fail-closed gate `chat_meeting` uses,
+    // implemented here over `db` so we never touch `commands.rs`.
+    if meeting_id.is_empty() || !db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false) {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    // Transcript (gated by the visibility check above; a sealed meeting's segments are blanked at
+    // rest anyway). Rendered like `chat_meeting`'s transcript, bounded to the recent tail.
+    if let Ok(segments) = db.get_segments(meeting_id) {
+        let transcript = segments
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| format!("[{:.0}s] {}", s.start_s, s.text.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transcript = transcript.trim();
+        if !transcript.is_empty() {
+            out.push_str("Transcript:\n");
+            out.push_str(&tail_chars(transcript, LIVE_TRANSCRIPT_INJECT_CHARS));
+        }
+    }
+    // Note (VISIBILITY-GATED read: a sealed-not-unlocked meeting yields None).
+    if let Ok(Some(note)) = db.get_note_if_visible(meeting_id, unlocked) {
+        let md = note.markdown.trim();
+        if !md.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("Note:\n");
+            out.push_str(&tail_chars(md, LIVE_TRANSCRIPT_INJECT_CHARS));
+        }
+    }
+    out
+}
+
+/// The current meeting's OWN gated title (for the Tier-1 isolated answer's `[[Title]]` citation).
+/// GATE (fail-closed): resolved ONLY for a VISIBLE meeting — a sealed-not-unlocked meeting is
+/// invisible and yields `None` (no title leak). Mirrors [`tier_extra_citations`]'s gated resolution.
+fn current_meeting_title(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if meeting_id.is_empty() || !db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false) {
+        return None;
+    }
+    match db.get_meeting(meeting_id) {
+        Ok(Some(m)) => m
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Per-tier step budgets (Phase 5) — kept SMALL so the cascade stays live-safe (a live turn can run
+/// up to all three tiers back-to-back). Tier 1 answers from injected content (no retrieval tool), so
+/// it converges in one model turn — a budget of 2 leaves room for a `propose_note` + answer. Tier 2
+/// (vault retrieval) gets 4; Tier 3 (connectors) gets 3.
+const TIER1_MAX_STEPS: usize = 2;
+const TIER2_MAX_STEPS: usize = 4;
+const TIER3_MAX_STEPS: usize = 3;
+
+/// Run the CURRENT-FIRST BRAIN CASCADE (Phase 5): Tier 1 (current meeting in isolation) → Tier 2
+/// (vault) → Tier 3 (connectors), each with a STRUCTURALLY-scoped executor. Returns
+/// `Some(VoiceActionResult)` when a tier CONVERGED to a real (non-escalation) answer — the tier badge
+/// is set DETERMINISTICALLY to that tier. Returns `None` when no tier answered (each either escalated
+/// to the next, or ran out of steps / errored) → the caller floors to the deterministic path.
+///
+/// ESCALATION is deterministic: the tier prompt asks the model to reply EXACTLY the
+/// [`crate::agent::ESCALATE_SENTINEL`] when it cannot answer at that tier; [`crate::agent::is_escalation`]
+/// detects it (whole-answer match, never a substring) and the ladder steps up. A NON-convergence
+/// (`Ok(None)`) or an `Err` at a tier is handled WITHIN the ladder (try the next tier if there is one,
+/// else `None`) — it is NOT conflated with escalation.
+#[allow(clippy::too_many_arguments)]
+fn run_cascade(
+    app: &AppHandle,
+    state: &AppState,
+    config: &crate::settings::AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+    meeting_id: &str,
+    loop_user: &str,
+    intent: &crate::audio::wake::VoiceIntent,
+    tool_event: &'static str,
+    thread_id: &str,
+    reasoner: &dyn crate::reason::LocalReasoner,
+) -> Option<crate::voice_action::VoiceActionResult> {
+    // Shared per-turn injected context (gated). Tier 1 leans on the live buffer + typed notes for the
+    // CURRENT meeting (read through `gated_live_context`, fail-closed on the LIVE unlocked set); the
+    // memory brief + recording flag ride along exactly as before. NO new egress class — every segment
+    // goes through the same RedactingProvider + cloud-consent gate.
+    let (live, typed_notes) =
+        gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
+    let memory_brief = gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled);
+    let recording_in_progress = state.recorder.lock().map(|g| g.is_some()).unwrap_or(false);
+    let base_system =
+        assistant_system_prompt(&live, &typed_notes, &memory_brief, recording_in_progress);
+
+    // The ladder, in order. Each entry: (scope, per-tier prompt suffix, step budget, badge, whether
+    // it may escalate). Tier 3 is TERMINAL — it never escalates (there is no higher tier).
+    use crate::tools::AssistantScope;
+    use crate::voice_action::AnsweredFrom;
+    let tiers: [(AssistantScope, &str, usize, AnsweredFrom, bool); 3] = [
+        (
+            AssistantScope::CurrentMeeting,
+            TIER1_SUFFIX,
+            TIER1_MAX_STEPS,
+            AnsweredFrom::CurrentMeeting,
+            true,
+        ),
+        (
+            AssistantScope::Vault,
+            TIER2_SUFFIX,
+            TIER2_MAX_STEPS,
+            AnsweredFrom::Vault,
+            true,
+        ),
+        (
+            AssistantScope::Connectors,
+            TIER3_SUFFIX,
+            TIER3_MAX_STEPS,
+            AnsweredFrom::Connectors,
+            false,
+        ),
+    ];
+
+    for (scope, suffix, max_steps, badge, may_escalate) in tiers {
+        let executor = crate::tools::GatedToolExecutor {
+            db: &state.db,
+            // The LIVE set behind its Mutex — re-read per tool call (C6), so a mid-loop relock is gated
+            // out immediately at every tier.
+            unlocked: &state.unlocked_folders,
+            config,
+            meeting_id,
+            app: Some(app),
+            // PROPOSE-then-ACCEPT model (Rev 2): the in-meeting agent is READ-ONLY at every tier — it
+            // GENERATES content (incl. note drafts) but NEVER auto-writes; the user commits via "Add to
+            // notes". The dispatch still routes EVERY request through the loop (no hardcoded classifier).
+            allow_writes: false,
+            note_drafts: true,
+            // Phase 5: the STRUCTURAL escalation boundary — this tier's executor advertises only its
+            // tools; `run()` refuses any other. A weak model CANNOT reach a higher tier's tools.
+            scope,
+            proposed_note: std::sync::Mutex::new(None),
+        };
+        let sink = ToolEventSink {
+            app: app.clone(),
+            event: tool_event,
+            thread_id: thread_id.to_string(),
+        };
+        let system = format!("{base_system}\n\n{suffix}");
+        match crate::agent::run_agentic_loop(
+            reasoner,
+            &system,
+            loop_user,
+            &executor,
+            max_steps,
+            Some(&sink as &dyn crate::agent::DeltaSink),
+        ) {
+            Ok(Some(outcome)) => {
+                // ESCALATION vs a REAL answer. `is_escalation` matches the WHOLE answer (never a
+                // substring) so a genuine answer that mentions the token does not mis-escalate.
+                if crate::agent::is_escalation(&outcome.answer) {
+                    if may_escalate {
+                        tracing::debug!(target: "voice", "tier escalating to the next tier");
+                        continue; // try the next tier
+                    }
+                    // Terminal tier said escalate but there is no higher tier → treat as "no answer
+                    // here" and fall to the deterministic floor (never surface the sentinel).
+                    tracing::debug!(target: "voice", "terminal tier requested escalation; flooring");
+                    return None;
+                }
+                // REAL answer at this tier — set the badge DETERMINISTICALLY from the tier that
+                // converged (never string-sniffed). Add the tier-appropriate extra citations.
+                let extra = tier_extra_citations(&state.db, meeting_id, badge, unlocked);
+                let proposed = executor.proposed_note.lock().ok().and_then(|g| g.clone());
+                return Some(
+                    crate::voice_action::VoiceActionResult::from_agent(intent, outcome, badge, extra)
+                        .with_proposed_note(proposed),
+                );
+            }
+            // Non-convergence at a tier is NOT escalation — try the next tier if there is one, else
+            // let the caller floor. This distinguishes "out of steps here" from "escalate".
+            Ok(None) => {
+                tracing::debug!(target: "voice", "tier did not converge; trying the next tier / floor");
+                continue;
+            }
+            // An error (e.g. Unavailable = no cloud consent) is fatal to the whole cascade — the same
+            // provider is used at every tier, so a re-attempt would fail identically. Floor.
+            Err(e) => {
+                tracing::debug!(target: "voice", error = %e, "cascade tier unavailable/failed; flooring");
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// The tier-specific extra citations the loop's `gathered`-scraped citations miss. Tier 1's answer is
+/// grounded in PROMPT-INJECTED current-meeting content (which produces no `[[Title]]` in `gathered`),
+/// so we resolve the CURRENT meeting's OWN title to a `[[Title]]` and prepend it — GATED: only when
+/// the meeting is VISIBLE to the live `unlocked` set (never a title for a sealed-not-unlocked
+/// meeting), and only when it has a non-empty title. Tier 2/3 rely on the loop's own gated citations
+/// + (Tier 3) the connector loud-lines the agent's answer already carries, so they add nothing here.
+fn tier_extra_citations(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    badge: crate::voice_action::AnsweredFrom,
+    unlocked: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    if badge != crate::voice_action::AnsweredFrom::CurrentMeeting || meeting_id.is_empty() {
+        return Vec::new();
+    }
+    // GATE (fail-closed): resolve the title ONLY for a VISIBLE meeting — a sealed-not-unlocked meeting
+    // is invisible and contributes no citation (its live buffer was already masked to "" by
+    // `gated_live_context`, so Tier 1 could only have answered "just started" anyway).
+    if !db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false) {
+        return Vec::new();
+    }
+    match db.get_meeting(meeting_id) {
+        Ok(Some(m)) => match m.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(title) => vec![format!("[[{title}]]")],
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// The intent the INFORMATIONAL FLOOR runs with. Read intents (Research / Recall / SlackSearch /
@@ -1223,6 +1593,14 @@ fn assistant_system_prompt(
                 note about the decisions\", \"save that we ship Friday\"), call the propose_note tool \
                 with the note content enriched from the meeting context — that drafts a note for the \
                 user to review and accept; do NOT call propose_note for ordinary questions.";
+    // NOTE (shared recording-awareness wording): the three load-bearing phrases below —
+    // "recorded RIGHT NOW", "meeting just started", and the "do NOT search the vault for other saved
+    // meetings" substitution ban — are ALSO the deterministic FLOOR's phrases, defined ONCE as
+    // `voice_action::{RECORDING_NOW_PHRASE, MEETING_JUST_STARTED_PHRASE,
+    // NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE}` and consumed by `voice_action::rag_answer` so the
+    // local-model floor frames a live recording IDENTICALLY to this cascade prompt. This prose is kept
+    // LITERAL here (not wired to the consts) because the cascade prompt tests pin these exact
+    // substrings verbatim — the duplication is deliberate and cross-referenced; keep the two in sync.
     let t = live_transcript.trim();
     let mut prompt = if t.is_empty() {
         if recording_in_progress {
@@ -2019,6 +2397,70 @@ mod tests {
         assert_eq!(*live.lock().unwrap(), "sealed meeting tail still in RAM");
     }
 
+    /// (B/gate) RED-before-GREEN (2026-07-08): the deterministic floor's CURRENT-meeting grounding is
+    /// built from `gated_live_context` → `floor_current_context`. A sealed-not-visible meeting yields
+    /// EMPTY gated context, so the floor's current-meeting block is empty (nothing sealed leaks into
+    /// the local-brain floor prompt). A VISIBLE meeting produces a labeled, non-empty block.
+    #[test]
+    fn floor_current_context_is_empty_for_sealed_meeting_and_labeled_for_visible() {
+        let db = tmp_db("floor-ctx");
+        // Sealed-not-unlocked meeting → gated context is empty → floor current block is empty.
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "sealed", Some("f1"));
+        db.set_manual_notes("sealed", "SECRET typed note").unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let live = std::sync::Mutex::new("SECRET live tail".to_string());
+        let unlocked = std::collections::HashSet::new();
+        let (l, n) = gated_live_context(&db, &live, "sealed", &unlocked);
+        let ctx = floor_current_context(&l, &n);
+        assert!(
+            ctx.is_empty(),
+            "a sealed-not-visible meeting must contribute NO floor current-meeting grounding: {ctx}"
+        );
+        assert!(
+            !ctx.contains("SECRET"),
+            "sealed content must NOT leak into the floor grounding"
+        );
+
+        // A visible in-progress recording → non-empty, labeled block containing tail + typed notes.
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-rec".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: None,
+            duration_s: 0,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        db.set_manual_notes("m-rec", "ship Friday").unwrap();
+        let live2 = std::sync::Mutex::new("we agreed to ship friday".to_string());
+        let (l2, n2) = gated_live_context(&db, &live2, "m-rec", &unlocked);
+        let ctx2 = floor_current_context(&l2, &n2);
+        assert!(
+            ctx2.contains("Live transcript"),
+            "the visible meeting's live tail must be labeled in the floor grounding: {ctx2}"
+        );
+        assert!(
+            ctx2.contains("we agreed to ship friday"),
+            "the visible live tail must be present: {ctx2}"
+        );
+        assert!(
+            ctx2.contains("ship Friday"),
+            "the visible typed notes must be present: {ctx2}"
+        );
+    }
+
     #[test]
     fn gated_live_context_injects_for_visible_meeting_and_masks_without_one() {
         let db = tmp_db("visible");
@@ -2083,6 +2525,277 @@ mod tests {
         assert!(gated_live_context(&db, &live, "m1", &unlocked).0.is_empty());
         unlocked.insert("f1".to_string());
         assert_eq!(gated_live_context(&db, &live, "m1", &unlocked).0, "tail");
+    }
+
+    // ── Phase 4: explicit-meeting_id scope resolution (kills the wrong-meeting bug) ────────────────
+
+    #[test]
+    fn resolve_scope_meeting_fe_id_wins_over_current_meeting() {
+        // The precedence rule: an EXPLICIT FE-sent meeting_id (a bound past/anchored @brain thread)
+        // WINS over state.current_meeting (the recording pointer). This is the exact case the
+        // wrong-meeting bug lived in — viewing a PAST meeting while a DIFFERENT meeting records must
+        // scope to the viewed meeting, not the recording. RED on the pre-phase code, which read ONLY
+        // current_meeting and ignored any FE id. (Phase 6: focus is None here.)
+        assert_eq!(
+            resolve_scope_meeting(Some("past-thread-meeting"), None, Some("recording-meeting")),
+            "past-thread-meeting",
+            "an explicit FE meeting_id must win over the recording pointer"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_meeting_falls_back_to_recording_when_fe_none() {
+        // The voice/wake twin (and a live thread that omits it) sends None → with no focus either,
+        // the live recording pointer still scopes, so recording keeps working exactly as before.
+        assert_eq!(
+            resolve_scope_meeting(None, None, Some("recording-meeting")),
+            "recording-meeting",
+            "a None FE id + no focus falls back to the current recording meeting"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_meeting_past_thread_when_idle_no_recording() {
+        // The headline fix: idle (nothing recording ⇒ current_meeting None, no focus) + a bound
+        // past-meeting thread ⇒ scope is THAT meeting, NOT empty. Empty was the whole bug: it fell
+        // through to gated_live_context → ("","") → the "ground answers in the vault" branch → an
+        // arbitrary saved meeting. With a bound id the scope is concrete.
+        assert_eq!(
+            resolve_scope_meeting(Some("m-past"), None, None),
+            "m-past",
+            "an idle bound past-meeting thread scopes to its own meeting, not empty"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_meeting_blank_counts_as_absent_both_sides() {
+        // Blank/whitespace at ANY level is ABSENT. A blank FE id falls to focus/recording; a blank
+        // FE id + blank focus + blank recording yields "" (no scope — the fail-closed default,
+        // which gated_live_context treats as not-visible).
+        assert_eq!(resolve_scope_meeting(Some("  "), None, Some("m-rec")), "m-rec");
+        assert_eq!(resolve_scope_meeting(Some(""), None, None), "");
+        assert_eq!(resolve_scope_meeting(None, None, Some("   ")), "");
+        assert_eq!(resolve_scope_meeting(Some(" m-x "), None, None), "m-x");
+    }
+
+    #[test]
+    fn resolve_scope_meeting_focus_wins_over_recording_when_fe_none() {
+        // PHASE 6: the FOCUS pointer (the meeting the user is VIEWING) wins over the recording
+        // pointer when the FE sends no explicit id — the idle wrong-meeting root. Viewing a past
+        // meeting while a DIFFERENT meeting records must scope to the VIEWED (focus) meeting, not
+        // the recording. RED on the Phase-4 two-arg resolver (no focus arg existed).
+        assert_eq!(
+            resolve_scope_meeting(None, Some("m-focused-past"), Some("m-recording")),
+            "m-focused-past",
+            "the focus pointer must win over the recording pointer when the FE sends none"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_meeting_fe_id_wins_over_focus() {
+        // PHASE 6: an explicit FE-bound thread id is the TOP of the precedence — it wins even over
+        // the focus pointer (a thread durably answers about its OWN bound meeting regardless of what
+        // the user happens to be looking at).
+        assert_eq!(
+            resolve_scope_meeting(Some("m-bound"), Some("m-focused"), Some("m-recording")),
+            "m-bound",
+            "an explicit FE meeting_id must win over both focus and recording"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_meeting_focus_used_when_idle_no_recording() {
+        // PHASE 6: focus makes the cascade Tier-1 scope deterministic even when NOTHING records
+        // (current_meeting None) and the FE sent no id — the user is just viewing a meeting.
+        assert_eq!(
+            resolve_scope_meeting(None, Some("m-focused"), None),
+            "m-focused",
+            "focus scopes an idle view when there is no FE id and no recording"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_meeting_blank_focus_falls_through() {
+        // A blank/whitespace focus is ABSENT and falls through to the recording pointer.
+        assert_eq!(resolve_scope_meeting(None, Some("   "), Some("m-rec")), "m-rec");
+        // A blank focus + no recording yields "".
+        assert_eq!(resolve_scope_meeting(None, Some("  "), None), "");
+        // A blank FE id + a real focus uses the focus.
+        assert_eq!(resolve_scope_meeting(Some(" "), Some("m-focus"), Some("m-rec")), "m-focus");
+    }
+
+    #[test]
+    fn resolved_past_meeting_scope_grounds_gated_context_in_that_meeting() {
+        // End-to-end for the resolution seam: a bound PAST (not-recording) meeting id, resolved with
+        // NO recording pointer, drives gated_live_context to read THAT meeting's own gated context
+        // (its typed notes) — not empty/arbitrary. Proves the FE id reaches the gate as the scope.
+        let db = tmp_db("phase4-scope");
+        // A visible past meeting (no folder → trivially visible) with its OWN typed notes.
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-past".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: Some("2026-07-01T10:00:00Z".to_string()),
+            title: Some("Budget review".to_string()),
+            duration_s: 3600,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.set_manual_notes("m-past", "cut the Q3 travel line").unwrap();
+
+        // Idle: no recording pointer, no focus. The FE binds the thread to m-past.
+        let scope = resolve_scope_meeting(Some("m-past"), None, None);
+        assert_eq!(scope, "m-past");
+
+        let live = std::sync::Mutex::new(String::new()); // not recording → no live tail
+        let unlocked = std::collections::HashSet::new();
+        let (_tail, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert_eq!(
+            notes, "cut the Q3 travel line",
+            "the resolved past-meeting scope must read THAT meeting's gated context, not empty/arbitrary"
+        );
+
+        // Contrast: the pre-phase behavior (ignore FE id + focus, use only the empty recording
+        // pointer) would have scoped to "" → no context read → the vault-wide-arbitrary fallback.
+        let empty_scope = resolve_scope_meeting(None, None, None);
+        assert_eq!(empty_scope, "");
+        let (_t, n) = gated_live_context(&db, &live, &empty_scope, &unlocked);
+        assert!(
+            n.is_empty(),
+            "the pre-phase empty scope reads NO meeting context (the fallback that caused the bug)"
+        );
+    }
+
+    #[test]
+    fn resolved_scope_still_masks_a_sealed_not_visible_bound_meeting() {
+        // The visibility gate must still hold for the RESOLVED scope: binding a thread to a
+        // sealed-and-not-session-unlocked meeting must inject NOTHING (fail-closed) — Phase 4 threads
+        // the id but never bypasses meeting_is_visible.
+        let db = tmp_db("phase4-sealed");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "m1", Some("f1"));
+        db.set_manual_notes("m1", "secret budget cuts").unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // The FE binds the thread to the sealed meeting; the scope resolves to it — but the gate masks.
+        let scope = resolve_scope_meeting(Some("m1"), None, None);
+        assert_eq!(scope, "m1");
+        let live = std::sync::Mutex::new("sealed tail in RAM".to_string());
+        let unlocked = std::collections::HashSet::new();
+        let (tail, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert!(
+            tail.is_empty() && notes.is_empty(),
+            "a bound-but-sealed meeting must inject nothing (the visibility gate still holds)"
+        );
+
+        // A session unlock re-exposes it (the gate is reversible, not a wipe).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f1".to_string());
+        let (_t, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert_eq!(
+            notes, "secret budget cuts",
+            "a session-unlocked bound meeting injects its own context"
+        );
+    }
+
+    #[test]
+    fn focused_past_meeting_scopes_to_itself_even_while_a_different_meeting_records() {
+        // PHASE 6 — the exact idle/cross-meeting wrong-meeting root: the FE sends NO explicit id
+        // (the voice/wake fallback path), a DIFFERENT meeting is recording, and the user is viewing
+        // (focus) a PAST meeting. The scope must resolve to the FOCUSED past meeting and read ITS
+        // gated context — NOT the recording, NOT an arbitrary vault meeting.
+        let db = tmp_db("phase6-focus-scope");
+        // A past, saved meeting the user is looking at, with its own typed notes.
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-focused-past".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: Some("2026-07-01T10:00:00Z".to_string()),
+            title: Some("Roadmap review".to_string()),
+            duration_s: 3600,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.set_manual_notes("m-focused-past", "ship the connector in Q3")
+            .unwrap();
+
+        // Resolution: no FE id, focus = the past meeting, recording = a DIFFERENT live meeting.
+        let scope = resolve_scope_meeting(None, Some("m-focused-past"), Some("m-recording-now"));
+        assert_eq!(
+            scope, "m-focused-past",
+            "focus must win over the recording pointer for the fallback path"
+        );
+
+        let live = std::sync::Mutex::new("live tail of the OTHER meeting".to_string());
+        let unlocked = std::collections::HashSet::new();
+        let (_tail, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert_eq!(
+            notes, "ship the connector in Q3",
+            "the focused past meeting grounds context in ITSELF, not the recording"
+        );
+    }
+
+    #[test]
+    fn relock_re_masks_the_focused_meeting_content() {
+        // PHASE 6 clear-on-relock discipline: focus is only an ID (no content), so a relock does not
+        // need to clear the focus pointer — but any CONTENT read against the focused meeting MUST
+        // re-mask when its folder relocks (the same visibility gate live_transcript rides). This
+        // proves the focused meeting's content is masked after relock and reversible on re-unlock.
+        let db = tmp_db("phase6-relock-mask");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f-focus".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "m-focus", Some("f-focus"));
+        db.set_manual_notes("m-focus", "secret roadmap").unwrap();
+
+        // The user is viewing (focus) this meeting; the folder is session-UNLOCKED → content shows.
+        let scope = resolve_scope_meeting(None, Some("m-focus"), None);
+        assert_eq!(scope, "m-focus");
+        let live = std::sync::Mutex::new(String::new());
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-focus".to_string());
+        // Seal the folder (locked=1) but keep it in the session-unlocked set → visible.
+        db.set_folder_locked("f-focus", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let (_t, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert_eq!(
+            notes, "secret roadmap",
+            "a session-unlocked focused meeting shows its content"
+        );
+
+        // RELOCK: the folder leaves the session-unlocked set (as relock_all_inner/relock_folder do).
+        // The focus id may stay — but the CONTENT read must now re-mask (fail-closed).
+        unlocked.remove("f-focus");
+        let (tail, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert!(
+            tail.is_empty() && notes.is_empty(),
+            "after relock, the focused meeting's content must be re-masked"
+        );
+
+        // Reversible: a fresh session unlock re-exposes it.
+        unlocked.insert("f-focus".to_string());
+        let (_t, notes) = gated_live_context(&db, &live, &scope, &unlocked);
+        assert_eq!(
+            notes, "secret roadmap",
+            "unlock re-exposes the focused meeting's content (the gate is reversible)"
+        );
     }
 
     // ── PR-A #1/#3: clearing the buffer at Stop + lock-surface hygiene ─────────────────────────────
@@ -2361,5 +3074,295 @@ mod tests {
             gated_user_memory_brief(&db, &unlocked, false).is_empty(),
             "memory disabled must suppress the brief even for a visible fact"
         );
+    }
+
+    // ── Phase 5: the cascade tier suffixes + badge determinism + Tier-1 citation gate ───────────────
+
+    /// The tier prompt suffixes carry the EXACT escalation sentinel (must match
+    /// `crate::agent::ESCALATE_SENTINEL`) at Tiers 1/2, and the TERMINAL Tier 3 must NOT instruct the
+    /// sentinel (there is no higher tier to escalate to). Prompt-drift guard.
+    #[test]
+    fn tier_suffixes_carry_the_sentinel_except_terminal_tier() {
+        assert!(
+            TIER1_SUFFIX.contains(crate::agent::ESCALATE_SENTINEL),
+            "Tier 1 must instruct the escalation sentinel"
+        );
+        assert!(
+            TIER2_SUFFIX.contains(crate::agent::ESCALATE_SENTINEL),
+            "Tier 2 must instruct the escalation sentinel"
+        );
+        assert!(
+            !TIER3_SUFFIX.contains(crate::agent::ESCALATE_SENTINEL),
+            "the TERMINAL Tier 3 must NEVER instruct the escalation sentinel"
+        );
+        // Tier 1's scope contract really is "this meeting only".
+        assert!(
+            TIER1_SUFFIX.contains("CURRENT MEETING ONLY"),
+            "Tier 1 must scope to the current meeting only"
+        );
+    }
+
+    /// DETERMINISTIC BADGE: `from_agent` stamps the tier the ladder passes — never string-sniffed —
+    /// and Tier 1 PREPENDS its `extra_citations` (the current meeting's own [[Title]]) ahead of the
+    /// loop's gated citations, de-duplicated in first-seen order.
+    #[test]
+    fn from_agent_sets_the_tier_badge_and_prepends_extra_citations() {
+        let outcome = crate::agent::AgentOutcome {
+            answer: "We decided to ship Friday.".to_string(),
+            steps: Vec::new(),
+            citations: vec!["[[Other Meeting]]".to_string()],
+        };
+        let res = crate::voice_action::VoiceActionResult::from_agent(
+            &VoiceIntent::Research { topic: "ship".into() },
+            outcome,
+            crate::voice_action::AnsweredFrom::CurrentMeeting,
+            vec!["[[This Meeting]]".to_string()],
+        );
+        assert_eq!(
+            res.answered_from,
+            Some(crate::voice_action::AnsweredFrom::CurrentMeeting),
+            "the badge is the tier the ladder passed, deterministically"
+        );
+        assert_eq!(
+            res.citations,
+            vec!["[[This Meeting]]".to_string(), "[[Other Meeting]]".to_string()],
+            "Tier 1's own [[Title]] is prepended ahead of the loop's gated citations"
+        );
+    }
+
+    /// TIER-1 CITATION GATE: for a VISIBLE current meeting, Tier 1 resolves its own [[Title]]; for a
+    /// SEALED-not-unlocked meeting it resolves NOTHING (fail-closed — no title leaks behind a lock).
+    #[test]
+    fn tier_extra_citations_gates_the_current_meeting_title() {
+        use crate::voice_action::AnsweredFrom;
+        let db = tmp_db("tier1-cite");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "m1", Some("f1")); // title "Sync", foldered into f1
+
+        // OPEN folder → visible → Tier 1 cites its own [[Sync]].
+        let open = std::collections::HashSet::new();
+        assert_eq!(
+            tier_extra_citations(&db, "m1", AnsweredFrom::CurrentMeeting, &open),
+            vec!["[[Sync]]".to_string()],
+            "a visible current meeting contributes its own [[Title]] citation"
+        );
+
+        // A non-Tier-1 badge adds nothing here (Tier 2/3 use the loop's own gated citations).
+        assert!(
+            tier_extra_citations(&db, "m1", AnsweredFrom::Vault, &open).is_empty(),
+            "Tier 2 adds no extra citation from here"
+        );
+        assert!(
+            tier_extra_citations(&db, "m1", AnsweredFrom::Connectors, &open).is_empty(),
+            "Tier 3 adds no extra citation from here"
+        );
+
+        // SEAL the folder + nothing unlocked → invisible → NO title citation (fail-closed).
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        let sealed = std::collections::HashSet::new();
+        assert!(
+            !db.meeting_is_visible("m1", &sealed).unwrap(),
+            "seed self-check: the sealed meeting is invisible"
+        );
+        assert!(
+            tier_extra_citations(&db, "m1", AnsweredFrom::CurrentMeeting, &sealed).is_empty(),
+            "a sealed-not-unlocked current meeting must contribute NO [[Title]] (no leak behind a lock)"
+        );
+
+        // An empty meeting_id (idle, no scope) contributes nothing.
+        assert!(
+            tier_extra_citations(&db, "", AnsweredFrom::CurrentMeeting, &open).is_empty(),
+            "no scope meeting ⇒ no citation"
+        );
+    }
+
+    // ── Tier-1 current-meeting reader: live + PAST, both gated (2026-07-09 structural fix) ─────────
+
+    fn seg(idx: i64, start_s: f64, text: &str) -> crate::transcribe::types::Segment {
+        crate::transcribe::types::Segment {
+            idx,
+            start_s,
+            end_s: start_s + 1.0,
+            text: text.to_string(),
+            speaker: None,
+            confidence: None,
+        }
+    }
+
+    /// RED-TODAY GAP: a VIEWED PAST (not-recording) meeting has an EMPTY live buffer, so the old
+    /// `floor_current_context` yielded "" → the floor wrongly fanned out. `tier1_current_content`
+    /// ALSO reads the past meeting's OWN gated transcript + note, so a viewed meeting is answerable
+    /// from itself. (On the pre-fix code this content path did not exist.)
+    #[test]
+    fn tier1_current_content_reads_a_viewed_past_meetings_gated_transcript_and_note() {
+        let db = tmp_db("tier1-past");
+        // A visible past meeting (no folder → trivially visible) with its OWN transcript + note.
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-past".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: Some("2026-07-01T10:00:00Z".to_string()),
+            title: Some("Roadmap Sync".to_string()),
+            duration_s: 3600,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.insert_segments(
+            "m-past",
+            &[
+                seg(0, 0.0, "We decided to cut the Q3 travel budget."),
+                seg(1, 5.0, "Alice will own the migration."),
+            ],
+        )
+        .unwrap();
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: "m-past".to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "## Decisions\n- Cut Q3 travel\n- Alice owns migration".to_string(),
+            created_at: "2026-07-01T10:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+
+        // NOT recording → empty live buffer. The reader must still surface the past meeting's content.
+        let live = std::sync::Mutex::new(String::new());
+        let unlocked = std::collections::HashSet::new();
+
+        // RED-documenting the gap: the OLD floor reader (gated_live_context → floor_current_context)
+        // reads ONLY the live buffer + manual notes, so for a viewed past meeting it is EMPTY — which
+        // is exactly why the floor wrongly fanned out. `tier1_current_content` closes that gap.
+        let (old_live, old_typed) = gated_live_context(&db, &live, "m-past", &unlocked);
+        assert!(
+            floor_current_context(&old_live, &old_typed).is_empty(),
+            "the OLD reader was empty for a viewed past meeting (the fan-out cause this fix closes)"
+        );
+
+        let ctx = tier1_current_content(&db, &live, "m-past", &unlocked);
+        assert!(
+            ctx.contains("cut the Q3 travel budget"),
+            "the viewed past meeting's OWN transcript must be read (RED today): {ctx}"
+        );
+        assert!(
+            ctx.contains("Alice owns migration"),
+            "the viewed past meeting's OWN note must be read: {ctx}"
+        );
+        // The title is resolvable (gated) for the [[Title]] citation.
+        assert_eq!(
+            current_meeting_title(&db, "m-past", &unlocked),
+            Some("Roadmap Sync".to_string())
+        );
+    }
+
+    /// GATE (fail-closed): a SEALED-not-unlocked viewed past meeting yields NOTHING from the Tier-1
+    /// reader — its transcript/note are never read, its title never resolved. No leak behind a lock.
+    #[test]
+    fn tier1_current_content_yields_nothing_for_a_sealed_not_unlocked_meeting() {
+        let db = tmp_db("tier1-sealed");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-sealed".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: Some("2026-07-01T10:00:00Z".to_string()),
+            title: Some("Confidential Terms".to_string()),
+            duration_s: 3600,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.insert_segments("m-sealed", &[seg(0, 0.0, "SECRET acquisition price is 40M.")])
+            .unwrap();
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: "m-sealed".to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "SECRET terms".to_string(),
+            created_at: "2026-07-01T10:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_meeting_folder("m-sealed", Some("f1")).unwrap();
+        db.set_note_folder("m-sealed", Some("f1")).unwrap();
+        // Seal the folder → sealed-not-session-unlocked.
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+
+        let live = std::sync::Mutex::new(String::new());
+        let sealed = std::collections::HashSet::new(); // folder NOT in the session unlock set
+        // Self-check: the meeting is invisible to the sealed session.
+        assert!(!db.meeting_is_visible("m-sealed", &sealed).unwrap());
+
+        let ctx = tier1_current_content(&db, &live, "m-sealed", &sealed);
+        assert!(
+            ctx.is_empty(),
+            "a sealed-not-unlocked viewed meeting must yield NO Tier-1 content: {ctx}"
+        );
+        assert!(
+            !ctx.contains("SECRET") && !ctx.contains("40M"),
+            "sealed content must NEVER leak into the Tier-1 reader"
+        );
+        // The title must not resolve either (no title leak behind a lock).
+        assert_eq!(
+            current_meeting_title(&db, "m-sealed", &sealed),
+            None,
+            "no [[Title]] for a sealed-not-unlocked meeting"
+        );
+
+        // A SESSION UNLOCK makes it readable again (reversible, not a wipe).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f1".to_string());
+        let ctx2 = tier1_current_content(&db, &live, "m-sealed", &unlocked);
+        assert!(
+            ctx2.contains("SECRET acquisition price") || ctx2.contains("SECRET terms"),
+            "after session unlock the Tier-1 reader surfaces the content again: {ctx2}"
+        );
+    }
+
+    /// The LIVE buffer still wins for an in-progress recording (unchanged): `tier1_current_content`
+    /// returns the live block without touching the past-meeting read path.
+    #[test]
+    fn tier1_current_content_prefers_the_live_buffer_for_a_recording() {
+        let db = tmp_db("tier1-live");
+        db.insert_meeting(&crate::storage::Meeting {
+            id: "m-rec".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: None,
+            duration_s: 0,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        db.set_manual_notes("m-rec", "ship Friday").unwrap();
+        let live = std::sync::Mutex::new("we agreed to ship friday".to_string());
+        let unlocked = std::collections::HashSet::new();
+        let ctx = tier1_current_content(&db, &live, "m-rec", &unlocked);
+        assert!(
+            ctx.contains("Live transcript") && ctx.contains("we agreed to ship friday"),
+            "the live buffer is the Tier-1 source for a recording: {ctx}"
+        );
+        assert!(ctx.contains("ship Friday"), "typed notes come along: {ctx}");
     }
 }
