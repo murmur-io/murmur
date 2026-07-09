@@ -177,6 +177,18 @@ pub struct AppState {
     /// Prevents the same contradiction re-emitting every ~21 s scan (and re-inflating the shadow count)
     /// — the "does not resurface this session" contract (deep-review). Cleared at each `start_recording`.
     pub reactions_emitted: Mutex<std::collections::HashSet<String>>,
+    /// Brain v2 P0.3 — per-meeting IN-FLIGHT assistant-turn counter: how many assistant turns are
+    /// currently running for each scope meeting (key = the FE-sent meeting id, "" for the unscoped
+    /// voice/wake path). `spawn_assistant_turn` DEDUPS on it: a second turn for the same key while one
+    /// is in flight is dropped (the overlapping-wake / double-click pile-up guard), so at most one
+    /// generation per scope contends for Metal at a time. Keys are OPAQUE meeting ids — no PII.
+    /// Incremented via `try_begin_turn`, decremented by the turn's panic-safe RAII guard.
+    pub in_flight_turns: Mutex<std::collections::HashMap<String, u32>>,
+    /// Brain v2 P0.3 — USER-TURN PRIORITY flag: `true` while ANY user-initiated assistant turn is in
+    /// flight (set at turn start, cleared by the same RAII guard on every exit path incl. panic). The
+    /// background Realtime-Reactions scan checks it and DEFERS its light-model extraction, so a
+    /// user-facing answer never competes with a background scan for the on-device engine. No PII.
+    pub user_turn_in_progress: std::sync::atomic::AtomicBool,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
     /// thread shares the SAME set as the command surface.
@@ -283,6 +295,8 @@ impl AppState {
             capped_notified: AtomicBool::new(false),
             reactions_shadow_count: AtomicU64::new(0),
             reactions_emitted: Mutex::new(std::collections::HashSet::new()),
+            in_flight_turns: Mutex::new(std::collections::HashMap::new()),
+            user_turn_in_progress: AtomicBool::new(false),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),
