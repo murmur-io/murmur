@@ -1,0 +1,122 @@
+[
+  {
+    "_comment": "entity-anchored: gather every meeting Anna Nowak features in (entity-string search — FTS home turf; note the app FTS is implicit-AND over all tokens)",
+    "query": "Anna Nowak",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-001", "syn-002", "syn-004", "syn-005"]
+  },
+  {
+    "_comment": "entity-anchored: Projekt Atlas status is spread across kickoff/status/budget",
+    "query": "Projekt Atlas",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-001", "syn-002", "syn-005"]
+  },
+  {
+    "_comment": "entity-anchored: meetings where Marek Wiśniewski (full name) has commitments — syn-001 qualifies (full name twice + an explicit architecture commitment); syn-009 mentions only 'Marek' and is deliberately excluded from the gold set",
+    "query": "Marek Wiśniewski",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-001", "syn-002", "syn-003", "syn-004"]
+  },
+  {
+    "_comment": "entity-anchored: Orion Migration across planning + checkpoint",
+    "query": "Orion Migration",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-003", "syn-004"]
+  },
+  {
+    "_comment": "entity-anchored (natural-language variant): database migration ownership inside Orion — implicit-AND FTS whiffs on the extra question words; the semantic leg should not",
+    "query": "Kto odpowiada za migrację bazy danych w Orion Migration?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-003", "syn-004"]
+  },
+  {
+    "_comment": "paraphrase: note says 'umówiliśmy się na piątek' + 'bramka płatnicza' — query asks 'deadline'/'integracja płatności' (no shared token)",
+    "query": "Kiedy jest deadline na integrację płatności?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-006"]
+  },
+  {
+    "_comment": "paraphrase: note says 'lecimy z tym' + 'ścieżka powitalna' — query asks 'decyzja'/'onboarding' (no shared token)",
+    "query": "Jaka zapadła decyzja w sprawie onboardingu nowych użytkowników?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-007"]
+  },
+  {
+    "_comment": "paraphrase: note says 'ship it' / 'goes live' — query asks 'agreement'/'launch'/'reworked purchase flow' (no shared token)",
+    "query": "Was there agreement to launch the reworked purchase flow?",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-008"]
+  },
+  {
+    "_comment": "paraphrase: note says 'nie jestem przekonany' + 'twórcy internetowi' — query asks 'zastrzeżenia'/'influencerzy' (no shared token)",
+    "query": "Jakie były zastrzeżenia do kampanii z influencerami?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-009"]
+  },
+  {
+    "_comment": "paraphrase: note says 'oddajemy wyszukiwarkę' / 'nic nowego nie bierzemy' — query asks 'zobowiązał się dostarczyć' (no shared token)",
+    "query": "Co zespół zobowiązał się dostarczyć w tym sprincie?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-010"]
+  },
+  {
+    "_comment": "cross-lingual: PL note (kwartalne planowanie budżetu) targeted by an EN query",
+    "query": "What did we decide about the quarterly budget?",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-011"]
+  },
+  {
+    "_comment": "cross-lingual: PL note (roadmapa na drugie półrocze) targeted by an EN query",
+    "query": "What are the product roadmap priorities for the second half of the year?",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-012"]
+  },
+  {
+    "_comment": "cross-lingual: EN note (security incident retrospective) targeted by a PL query",
+    "query": "Co ustaliliśmy po incydencie bezpieczeństwa z phishingiem?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-013"]
+  },
+  {
+    "_comment": "cross-lingual: EN note (customer feedback session) targeted by a PL query",
+    "query": "Na co skarżyli się klienci podczas sesji z opiniami?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-014"]
+  },
+  {
+    "_comment": "cross-lingual: EN note (hiring pipeline, offer to Kasia Zielińska) targeted by a PL query with no shared token",
+    "query": "Komu zdecydowaliśmy się złożyć ofertę pracy?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-015"]
+  },
+  {
+    "_comment": "temporal: 'last week' relative to CORPUS_ANCHOR_DATE 2026-06-29 = 2026-06-22..28, unique answer. Pre-L1 baseline: temporal expansion not implemented yet — fts leg expected ~0 (semantic may partially hit via incidental tokens)",
+    "query": "What did we discuss last week?",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-016"]
+  },
+  {
+    "_comment": "temporal: PL 'zeszły tydzień' relative to the fixed anchor — same unique answer. Pre-L1 baseline: fts leg expected ~0 (semantic may partially hit)",
+    "query": "Jakie wnioski z zeszłego tygodnia?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-016"]
+  },
+  {
+    "_comment": "temporal: the week of June 15 holds exactly the budget review + sprint planning. Pre-L1 baseline: fts leg expected ~0 (semantic may partially hit)",
+    "query": "Which decisions were made in the week of June 15?",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-005", "syn-010"]
+  },
+  {
+    "_comment": "temporal: the first week of June holds exactly roadmap/onboarding/feedback. Pre-L1 baseline: fts leg expected ~0 (semantic may partially hit)",
+    "query": "Co działo się w pierwszym tygodniu czerwca?",
+    "lang": "pl",
+    "expected_meeting_ids": ["syn-012", "syn-007", "syn-014"]
+  },
+  {
+    "_comment": "temporal: 'two weeks ago' relative to the fixed anchor = the week of 2026-06-15. Pre-L1 baseline: fts leg expected ~0 (semantic may partially hit)",
+    "query": "What did we agree on two weeks ago?",
+    "lang": "en",
+    "expected_meeting_ids": ["syn-005", "syn-010"]
+  }
+]

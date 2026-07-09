@@ -234,6 +234,164 @@ mod tests {
         // app and copy the WAL'd DB, or extend this to accept a folder-id list.
         let report = run_bakeoff(&db, embedder.as_ref(), &set, k, &HashSet::new()).unwrap();
         println!("\n{}", crate::eval::format_report_table(&report));
+
+        // Spec §L1.6: honor MURMUR_BAKEOFF_OUT — write the committed markdown artifact. The corpus
+        // line deliberately does NOT echo the DB path (it may embed a user home dir — no PII).
+        let ctx = crate::eval::ReportContext {
+            date: today_utc(),
+            commit: git_short_sha(),
+            corpus: "real vault DB (env MURMUR_BAKEOFF_DB)".to_string(),
+            labeled_set: set_file_name(&set_path),
+            config: format!("RRF_K={}", crate::embed::RRF_K),
+            embedder_id: crate::embed::selected_embed_model().id.to_string(),
+            embedder_real: crate::embed::embed_model_present(),
+        };
+        write_artifact_if_requested(&crate::eval::format_report_markdown(&report, &ctx));
+    }
+
+    /// SYNTHETIC baseline run (brain2 PR 2) — seeds the deterministic `eval::corpus` fixture
+    /// meetings into a throwaway SQLCipher DB, runs the bake-off over the committed
+    /// `rag-bakeoff-synthetic.json` labeled set (k=5), prints the markdown artifact, and honors
+    /// `MURMUR_BAKEOFF_OUT` to write it to a file. `#[ignore]`d because a MEANINGFUL run wants the
+    /// real embed model on a Mac (without it the semantic/hybrid rows come from the stub and the
+    /// artifact says so loudly — the fts row is real either way):
+    ///   MURMUR_BAKEOFF_OUT=eval/results/rag-bakeoff-baseline-synthetic.md \
+    ///   cargo test --lib run_bakeoff_over_synthetic_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "synthetic baseline: run manually on a Mac (real embed model preferred); writes MURMUR_BAKEOFF_OUT"]
+    fn run_bakeoff_over_synthetic_corpus() {
+        let db = throwaway_db("synthetic");
+        let real = crate::embed::embed_model_present();
+        if !real {
+            eprintln!(
+                "WARNING: no embedding model on disk — the semantic/hybrid legs use the STUB \
+                 embedder; only the fts row is a quality signal. Download the model and re-run."
+            );
+        }
+        let embedder = crate::embed::active_embedder();
+        let ids = crate::eval::corpus::seed_synthetic_corpus(&db, embedder.as_ref())
+            .expect("seed synthetic corpus");
+        assert_eq!(ids.len(), 16, "synthetic corpus is 16 meetings");
+
+        let set = LabeledSet::from_json(include_str!("fixtures/rag-bakeoff-synthetic.json"))
+            .expect("parse synthetic labeled set");
+        let report = run_bakeoff(&db, embedder.as_ref(), &set, 5, &HashSet::new()).unwrap();
+
+        let ctx = crate::eval::ReportContext {
+            date: today_utc(),
+            commit: git_short_sha(),
+            corpus: format!(
+                "synthetic (eval::corpus, {} seeded meetings, anchor {})",
+                ids.len(),
+                crate::eval::corpus::CORPUS_ANCHOR_DATE
+            ),
+            labeled_set: "src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json".to_string(),
+            config: format!("RRF_K={}", crate::embed::RRF_K),
+            embedder_id: crate::embed::selected_embed_model().id.to_string(),
+            embedder_real: real,
+        };
+        let markdown = crate::eval::format_report_markdown(&report, &ctx);
+        println!("\n{markdown}");
+        write_artifact_if_requested(&markdown);
+    }
+
+    /// HEADLESS wiring proof (runs in the normal loop): seed the synthetic corpus with the stub
+    /// embedder, run the full bake-off over the committed fixture, and assert the FTS leg — the
+    /// only leg that is REAL without a model — actually retrieves (the entity-anchored queries
+    /// carry exact names, so BM25 must land hits). Deterministic: fixed corpus, fixed set, stub
+    /// vectors. Semantic numbers are NOT asserted (stub ≠ quality signal).
+    #[test]
+    fn synthetic_corpus_bakeoff_wires_headless() {
+        let db = throwaway_db("synthetic-headless");
+        let stub = crate::embed::StubEmbedder;
+        let ids = crate::eval::corpus::seed_synthetic_corpus(&db, &stub).unwrap();
+        assert_eq!(ids.len(), 16);
+        let set =
+            LabeledSet::from_json(include_str!("fixtures/rag-bakeoff-synthetic.json")).unwrap();
+        assert_eq!(set.len(), 20);
+        let report = run_bakeoff(&db, &stub, &set, 5, &HashSet::new()).unwrap();
+        assert_eq!(report.modes.len(), 3, "no reranker yet — exactly 3 rows");
+        let fts = report
+            .modes
+            .iter()
+            .find(|m| m.mode == RetrievalMode::Fts)
+            .expect("fts row present");
+        assert!(
+            fts.recall_at_k > 0.0,
+            "FTS must retrieve at least the entity-anchored queries over the seeded corpus, got {}",
+            fts.recall_at_k
+        );
+        // The markdown renders over the real report without panicking and carries all three rows.
+        let ctx = crate::eval::ReportContext {
+            date: "2026-07-10".to_string(),
+            commit: "test".to_string(),
+            corpus: "synthetic".to_string(),
+            labeled_set: "rag-bakeoff-synthetic.json".to_string(),
+            config: "RRF_K=60".to_string(),
+            embedder_id: crate::embed::DEFAULT_EMBED_MODEL_ID.to_string(),
+            embedder_real: false,
+        };
+        let md = crate::eval::format_report_markdown(&report, &ctx);
+        assert!(md.contains("| fts |") && md.contains("| semantic |") && md.contains("| hybrid |"));
+        assert!(md.contains("WARNING — STUB EMBEDDER"));
+    }
+
+    /// Write the artifact to `$MURMUR_BAKEOFF_OUT` when set (creating parent dirs). Test-only
+    /// helper shared by both `#[ignore]` runners.
+    fn write_artifact_if_requested(markdown: &str) {
+        let Ok(path) = std::env::var("MURMUR_BAKEOFF_OUT") else {
+            return;
+        };
+        if path.trim().is_empty() {
+            return;
+        }
+        let p = std::path::Path::new(&path);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(p, markdown).expect("write MURMUR_BAKEOFF_OUT artifact");
+        println!("bake-off artifact written to MURMUR_BAKEOFF_OUT");
+    }
+
+    /// Today as ISO `YYYY-MM-DD` (UTC) for the artifact provenance line.
+    fn today_utc() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    /// Short git sha of the working tree, `-dirty`-suffixed when uncommitted changes exist
+    /// (an artifact produced from a dirty tree must say so — HEAD alone misattributes it),
+    /// or `"unknown"` outside a checkout (never panics).
+    fn git_short_sha() -> String {
+        let sha = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(sha) = sha else {
+            return "unknown".to_string();
+        };
+        let dirty = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if dirty {
+            format!("{sha}-dirty")
+        } else {
+            sha
+        }
+    }
+
+    /// The labeled-set FILE NAME only (never the full path — it may embed a user home dir).
+    fn set_file_name(path: &str) -> String {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "labeled-set.json".to_string())
     }
 
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

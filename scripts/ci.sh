@@ -34,6 +34,9 @@ echo "── cargo clippy (deny warnings) ──"
 ( cd src-tauri && cargo clippy --all-targets -- -D warnings )
 
 echo "── cargo test ──"
+# NOTE: the RAG eval gate (eval::bakeoff #[ignore] runners + eval/results/ artifact) is MANUAL —
+# it needs the embed model (and, for the real-vault run, a copied DB) so it is NOT run in CI;
+# see docs/RAG-BAKEOFF.md "Synthetic baseline" for the re-run command + merge rule.
 ( cd src-tauri && cargo test --quiet )
 
 # ── Supply-chain gates (D11/F5): advisories + license/ban/source policy, BEFORE the build. ──

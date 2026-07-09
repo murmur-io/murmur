@@ -157,6 +157,29 @@ The recall@k / nDCG@k / MRR implementations are pure and covered by deterministi
 
 ---
 
+## Stage 2c — SYNTHETIC baseline (brain2 PR 2: zero labeling, fully reproducible)
+
+A committed synthetic corpus removes the labeling bottleneck for the **eval gate**: `eval::corpus::seed_synthetic_corpus` seeds **16 fixed fixture meetings** (fixed ids `syn-001`…`syn-016`, fixed dates spread over ~8 weeks before the fixed anchor `CORPUS_ANCHOR_DATE = 2026-06-29`, realistic PL/EN notes + speaker turns) covering the four query categories — entity-anchored / paraphrase / cross-lingual PL↔EN / temporal — and the committed labeled set `src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json` (20 queries, 5 per category) has its `expected_meeting_ids` **correct by construction**. No real vault, no manual labeling, byte-deterministic across machines.
+
+Re-run the baseline (writes the markdown artifact when `MURMUR_BAKEOFF_OUT` is set — the real-DB runner honors the same variable):
+
+```bash
+source ~/.cargo/env
+cd src-tauri
+MURMUR_BAKEOFF_OUT=../eval/results/rag-bakeoff-baseline-synthetic.md \
+cargo test --lib run_bakeoff_over_synthetic_corpus -- --ignored --nocapture
+```
+
+The committed baseline lives at `eval/results/rag-bakeoff-baseline-synthetic.md`. **Merge rule (manual, per spec §L1.6):** a retrieval-touching PR re-runs this and must keep hybrid recall@5 ≥ the committed baseline; CI cannot run it (needs the embed model on disk), so the check is human/adversarial-verifier-driven.
+
+Reading the baseline honestly:
+- The **fts** row is low **by construction of the app's FTS**: `search_visible` builds an implicit-AND match over every query token, so full natural-language questions whiff while the entity-string queries hit — that IS the shipped keyword behavior, not a harness bug.
+- The **temporal** queries ("last week", "two weeks ago") are labeled correctly and pin the pre-L1 floor **on the fts leg** (~0 there). The semantic leg partially answers them anyway (small 16-doc corpus + incidental shared tokens — measured ~0.77 recall@5 on the temporal slice), so the realistic AGGREGATE headroom from temporal expansion (spec L1.5) is ~+0.06 recall@5, not the full temporal-category gap. Judge L1.5 by the fts temporal slice and the aggregate delta together.
+- If the artifact says `embedder: STUB`, the semantic/hybrid rows are **not** a quality signal (the runner and the artifact both shout this); download the embed model first.
+- The synthetic corpus is a REGRESSION baseline, not a quality ceiling: **real-vault labeling (Stage 2b above) remains the higher-signal upgrade path** — real spoken, code-switched, ASR-errorful Polish is exactly what the fixture cannot fake.
+
+---
+
 ## Honesty notes
 - Stage 1 is fully doable **today** (FTS5 is live) and is the cheaper, decision-first gate — do it first.
 - Stage 2 needs the real embedder + your signed/dev build on a real Mac; headless tests can't measure retrieval *quality* or Polish recall.
