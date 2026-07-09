@@ -843,16 +843,52 @@ pub struct GenOptions {
     /// Whether to allow qwen3 "thinking" traces. Default `false` (the derived bool default) — we never
     /// want thinking in structured extraction; on non-thinking models this is a no-op.
     pub enable_thinking: bool,
+    /// Wall-clock bound on ONE on-device generation (honored only by the local GGUF path —
+    /// [`mistral::MistralReasoner`]; a no-op elsewhere). `None` (the default) = UNBOUNDED, exactly the
+    /// pre-P0 behavior — load-bearing for FullyLocal note generation (30–90 s on Qwen3-4B), the
+    /// FullyLocal Ask floor (a huge prefill), and the FIRST local generation on a CLT-only Mac
+    /// (`MISTRALRS_METAL_PRECOMPILE=0` defers Metal shader compile into the first request). The LIVE
+    /// presets set `Some(30 s)` — the P0.3 live-path discipline (spec §P0.3).
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl GenOptions {
     /// The LIGHT realtime-extraction preset: a hard 128-token cap, low temperature, no thinking
-    /// (spec §4.3 — triples are short; the cap is the contention lever).
+    /// (spec §4.3 — triples are short; the cap is the contention lever). Carries the 30 s wall-clock
+    /// timeout too: reactions are a live BACKGROUND scan, so a hung 128-token extraction must not
+    /// wedge the worker — degrading one scan beats blocking the loop.
     pub fn light_extraction() -> Self {
         Self {
             max_tokens: Some(128),
             temperature: Some(0.2),
             enable_thinking: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        }
+    }
+
+    /// Brain v2 P0.3 — the LIVE in-meeting answer preset: a hard 1024-token cap so a runaway
+    /// on-device decode can't saturate Metal mid-recording (effective on the local GGUF path — the
+    /// only truly unbounded one; a best-effort no-op elsewhere), plus a 30 s wall-clock timeout —
+    /// the live path must answer promptly or degrade to the floor. Model-default temperature; never
+    /// thinking traces in a live answer.
+    pub fn live_answer() -> Self {
+        Self {
+            max_tokens: Some(1024),
+            temperature: None,
+            enable_thinking: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        }
+    }
+
+    /// Brain v2 P0.3 — the ASK (vault Q&A) answer preset: a 2048-token cap — roomier than the live
+    /// path (Ask answers can run longer) but still bounded, with the same 30 s wall-clock timeout
+    /// (an interactive Ask that hasn't started answering in 30 s should degrade, not hang the UI).
+    pub fn ask_answer() -> Self {
+        Self {
+            max_tokens: Some(2048),
+            temperature: None,
+            enable_thinking: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
         }
     }
 }
@@ -866,6 +902,14 @@ pub trait LocalReasoner: Send + Sync {
 
     /// Free-form reasoning: run `system` + `user` and return the model's text.
     fn reason(&self, system: &str, user: &str) -> Result<String>;
+
+    /// Free-form reasoning WITH generation options (a token cap etc. — Brain v2 P0.3). Default:
+    /// IGNORE the options and delegate to [`reason`](Self::reason) — the Stub / Cloud / AFM
+    /// reasoners have no local sampler to bound, so this is non-breaking for every implementor.
+    /// [`mistral::MistralReasoner`] OVERRIDES it to honor the cap on the on-device GGUF path.
+    fn reason_with(&self, system: &str, user: &str, _opts: GenOptions) -> Result<String> {
+        self.reason(system, user)
+    }
 
     /// Structured reasoning: run `system` + `user` and return a JSON value. `json_schema` is the
     /// shape the output must conform to. NONE of the shipped impls hard-constrain the decode: the
@@ -1130,6 +1174,38 @@ impl LocalReasoner for CloudReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Brain v2 P0.3 — the answer presets carry the intended hard caps + the 30 s live-path
+    /// wall-clock timeout and never enable thinking; the DEFAULT options carry NO timeout (note-gen
+    /// / the FullyLocal floor legitimately run past 30 s — the pre-P0 unbounded behavior); the
+    /// trait's default `reason_with` ignores the options (non-breaking for stub/cloud).
+    #[test]
+    fn gen_option_presets_cap_tokens_and_default_reason_with_delegates() {
+        let live = GenOptions::live_answer();
+        assert_eq!(live.max_tokens, Some(1024));
+        assert!(live.temperature.is_none());
+        assert!(!live.enable_thinking);
+        assert_eq!(live.timeout, Some(std::time::Duration::from_secs(30)));
+
+        let ask = GenOptions::ask_answer();
+        assert_eq!(ask.max_tokens, Some(2048));
+        assert!(ask.temperature.is_none());
+        assert!(!ask.enable_thinking);
+        assert_eq!(ask.timeout, Some(std::time::Duration::from_secs(30)));
+
+        let light = GenOptions::light_extraction();
+        assert_eq!(light.timeout, Some(std::time::Duration::from_secs(30)));
+
+        // The DEFAULT (note generation, the Ask floor, agent default steps) is UNBOUNDED in time —
+        // scoping the timeout to the live presets is the whole point of the fix.
+        assert!(GenOptions::default().timeout.is_none());
+
+        // The default trait method delegates to `reason` — the stub answers identically with or
+        // without options, proving implementors without a sampler are untouched.
+        let with = StubReasoner.reason_with("s", "u", GenOptions::live_answer()).unwrap();
+        let without = StubReasoner.reason("s", "u").unwrap();
+        assert_eq!(with, without);
+    }
 
     #[test]
     fn extracts_object_from_surrounding_prose() {
