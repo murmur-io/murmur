@@ -191,6 +191,15 @@ export class RecorderStore {
   }
 
   async stop(): Promise<void> {
+    // OPTIMISTIC flip BEFORE the await: `stopRecording` runs the WHOLE pipeline inline (transcribe
+    // the entire recording + generate the note), which for a long meeting takes minutes. Without
+    // this, `_stage` stays "recording" for that whole time — the Stop button keeps rendering
+    // (`isRecording()` true) and stays clickable, so the UI looks frozen and a double-Stop is
+    // possible. Moving to "transcribing" now (mirrors `resummarize`'s optimistic set) instantly
+    // swaps the recording strip for the processing view; the backend's status events + the resolved
+    // StopResult then reconcile the exact stage.
+    this._error.set(null);
+    this._stage.set("transcribing");
     try {
       const res = await this.ipc.stopRecording();
       // Optimistic preview from the StopResult; then reconcile with the

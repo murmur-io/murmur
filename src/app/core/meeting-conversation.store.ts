@@ -3,6 +3,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import { FoldersService } from "../services/folders.service";
 import type {
+  AnsweredFrom,
   AssistantThreadRow,
   AssistantToolPayload,
   ChatMsg,
@@ -100,6 +101,13 @@ export interface ThreadTurn {
    * draft (not the whole reply) is appended to the notes.
    */
   proposedNote: string | null;
+  /**
+   * Agent only (Phase 5): which BRAIN CASCADE tier answered — current meeting /
+   * vault / connectors — set deterministically by the backend ladder. `null`
+   * while pending, on an error, or on an older backend that omits it. Drives the
+   * visible tier chip ("answered from: this meeting / your vault / connectors").
+   */
+  answeredFrom: AnsweredFrom | null;
   /** Agent only: true once the user has ACCEPTED this turn's draft into the main notes. */
   accepted: boolean;
   /**
@@ -480,6 +488,10 @@ export class MeetingConversationStore {
   setMeetingId(id: string | null): void {
     if (id === this._meetingId()) return;
     this._meetingId.set(id);
+    // Phase 6 — mirror the viewed meeting into the backend FOCUS pointer (safety-net for any
+    // assistant path that falls back off an explicit id, e.g. the voice/wake twin). Best-effort;
+    // a failure never blocks the view. Cleared (null) when the store points at no meeting.
+    void this.ipc.setFocusMeeting(id);
     const token = ++this.notesLoadToken;
     if (!id) {
       // No meeting to load → nothing to wait on; the composer stays enabled.
@@ -615,6 +627,7 @@ export class MeetingConversationStore {
             trace: [],
             citations: [],
             proposedNote: null,
+            answeredFrom: null,
             accepted: false,
             dismissed: false,
           });
@@ -626,6 +639,7 @@ export class MeetingConversationStore {
             trace: [],
             citations: parseCitations(row.citations),
             proposedNote: null,
+            answeredFrom: null,
             accepted: false,
             dismissed: false,
           });
@@ -727,6 +741,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -738,6 +753,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -787,6 +803,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -798,6 +815,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -842,6 +860,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -853,6 +872,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -875,9 +895,11 @@ export class MeetingConversationStore {
   /**
    * Ship a thread's OWN turns (its history) to `ask_assistant_chat` (multi-turn
    * memory scoped to THIS thread) and resolve the given pending agent turn with
-   * the reply. Ships the note's `threadId` + its anchor text (the note line) so
-   * the backend PERSISTS the exchange under the thread — a reopened meeting
-   * rebuilds it via `list_assistant_threads`. The live tool-trace lands via
+   * the reply. Ships the note's `threadId` + its anchor text (the note line) +
+   * the store's anchored `meetingId` (Phase 4 — so the brain scopes "this meeting"
+   * to the bound meeting, not whatever is recording), so the backend PERSISTS the
+   * exchange under the thread — a reopened meeting rebuilds it via
+   * `list_assistant_threads`. The live tool-trace lands via
    * {@link onTool} (routed by the payload's threadId when stamped, else the most
    * recent pending agent turn). Always clears the thread's `threadPending` flag.
    */
@@ -906,12 +928,19 @@ export class MeetingConversationStore {
         payload,
         note?.threadId ?? undefined,
         note?.text.trim() || undefined,
+        // Phase 4: bind this thread to the store's anchored meeting so the brain
+        // scopes "this meeting" to it (a past/anchored thread answers about ITS
+        // meeting; omitting it would fall back to state.current_meeting → the
+        // wrong-meeting bug). Null → undefined so the backend uses the recording.
+        this._meetingId() ?? undefined,
       );
       this.resolveTurn(noteId, agentTurnId, {
         status: reply.status,
         text: reply.summary || "(no answer)",
         citations: parseCitations(reply.citations),
         proposedNote: reply.proposedNote,
+        // Phase 5: the deterministic tier badge from the ladder (or null).
+        answeredFrom: reply.answeredFrom ?? null,
       });
     } catch {
       this.resolveTurn(noteId, agentTurnId, {
@@ -919,6 +948,7 @@ export class MeetingConversationStore {
         text: "Couldn't reach the assistant.",
         citations: [],
         proposedNote: null,
+        answeredFrom: null,
       });
     }
   }
@@ -936,6 +966,7 @@ export class MeetingConversationStore {
       text: string;
       citations: AssistantCitation[];
       proposedNote: string | null;
+      answeredFrom: AnsweredFrom | null;
     },
   ): void {
     this._notes.update((ns) =>
@@ -952,6 +983,7 @@ export class MeetingConversationStore {
                   text: patch.text,
                   citations: patch.citations,
                   proposedNote: patch.proposedNote,
+                  answeredFrom: patch.answeredFrom,
                 }
               : turn,
           ),
@@ -1053,6 +1085,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -1064,6 +1097,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -1093,6 +1127,7 @@ export class MeetingConversationStore {
         text: "Couldn't start the listener.",
         citations: [],
         proposedNote: null,
+        answeredFrom: null,
       });
       throw e;
     }
@@ -1130,6 +1165,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -1141,6 +1177,7 @@ export class MeetingConversationStore {
       trace: [],
       citations: [],
       proposedNote: null,
+      answeredFrom: null,
       accepted: false,
       dismissed: false,
     };
@@ -1439,6 +1476,7 @@ export class MeetingConversationStore {
         trace: [],
         citations: [],
         proposedNote: null,
+        answeredFrom: null,
         accepted: false,
         dismissed: false,
       };
@@ -1450,6 +1488,8 @@ export class MeetingConversationStore {
         trace: [],
         citations: parseCitations(p.citations),
         proposedNote: p.proposedNote,
+        // Phase 5: the deterministic tier badge (current meeting / vault / connectors), or null.
+        answeredFrom: p.answeredFrom ?? null,
         accepted: false,
         dismissed: false,
       };
@@ -1486,6 +1526,8 @@ export class MeetingConversationStore {
               text: p.summary,
               citations: parseCitations(p.citations),
               proposedNote: p.proposedNote,
+              // Phase 5: the deterministic tier badge from the ladder (or null).
+              answeredFrom: p.answeredFrom ?? null,
             };
             // Backfill the heard command onto the preceding empty user turn.
             const prev = thread[i - 1];
