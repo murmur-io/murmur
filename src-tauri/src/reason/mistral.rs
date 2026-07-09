@@ -258,26 +258,34 @@ impl MistralReasoner {
         Ok(arc)
     }
 
-    /// Free-form generation with explicit [`GenOptions`] — the load-bearing path. The token cap
-    /// (`set_sampler_max_len`) bounds a runaway decode; `enable_thinking(false)` keeps qwen3 thinking
-    /// traces out (a no-op on non-thinking models). An in-flight generation is NOT cancellable once
-    /// submitted — the cap is the only per-call bound (spec §4.3).
-    fn reason_with(&self, system: &str, user: &str, opts: GenOptions) -> Result<String> {
+    /// Free-form generation with explicit [`GenOptions`] — the load-bearing path. Two OPTIONAL
+    /// bounds compose (Brain v2 P0.3, SCOPED per-call via the options — spec §P0.3 is LIVE-path
+    /// discipline, not a blanket bound):
+    /// - the token cap (`set_sampler_max_len`) bounds a runaway decode LENGTH;
+    /// - `opts.timeout` (`Some` on the live/ask/extraction presets) bounds runaway decode TIME: the
+    ///   blocking generation runs on a spawned worker thread ([`run_with_timeout`]) and a reply that
+    ///   misses the deadline yields `AppError::Unavailable` while the worker is deliberately LEAKED
+    ///   (an in-flight mistralrs generation is NOT cancellable; the model lives in the
+    ///   process-global cache and is never dropped).
+    ///
+    /// `opts.timeout = None` (the `GenOptions::default()` path — note generation, the FullyLocal
+    /// Ask floor, default agent steps) runs `generate_blocking` DIRECTLY on the current thread,
+    /// UNBOUNDED — exactly the pre-P0 behavior. This is deliberate: FullyLocal note generation
+    /// legitimately takes 30–90 s on Qwen3-4B, a huge Ask-floor prefill can too, and the FIRST
+    /// generation on a CLT-only Mac pays the deferred Metal shader compile
+    /// (`MISTRALRS_METAL_PRECOMPILE=0`) inside `send_chat_request` — a blanket 30 s timeout would
+    /// kill all three.
+    ///
+    /// The MODEL LOAD (`self.model()`) deliberately stays OUTSIDE any timeout: a first-call
+    /// multi-GB load is not a runaway generation, is already gated by the RAM guard, and may
+    /// legitimately exceed 30 s on a cold disk.
+    fn reason_with_opts(&self, system: &str, user: &str, opts: GenOptions) -> Result<String> {
         let model = self.model()?;
-        let mut req = RequestBuilder::new()
-            .add_message(TextMessageRole::System, system)
-            .add_message(TextMessageRole::User, user)
-            .enable_thinking(opts.enable_thinking);
-        if let Some(t) = opts.temperature {
-            req = req.set_sampler_temperature(t);
-        }
-        if let Some(n) = opts.max_tokens {
-            req = req.set_sampler_max_len(n);
-        }
-        let rt = brain_rt().ok_or_else(|| AppError::Summarize("brain runtime unavailable".into()))?;
-        let resp = block_on(rt, model.send_chat_request(req))?
-            .map_err(|e| AppError::Summarize(format!("brain generation failed: {e}")))?;
-        Self::first_content(resp)
+        let system = system.to_string();
+        let user = user.to_string();
+        run_bounded(opts.timeout, move || {
+            generate_blocking(&model, &system, &user, opts)
+        })
     }
 
     /// Structured generation with explicit [`GenOptions`]: instruct the JSON schema in the prompt
@@ -289,7 +297,7 @@ impl MistralReasoner {
             "{system}\n\nRespond with ONLY a single JSON object conforming to this schema: \
              {json_schema}. No prose, no markdown fences."
         );
-        let content = self.reason_with(&sys, user, opts)?;
+        let content = self.reason_with_opts(&sys, user, opts)?;
         parse_first_json(&content)
     }
 
@@ -309,7 +317,11 @@ impl LocalReasoner for MistralReasoner {
     }
 
     fn reason(&self, system: &str, user: &str) -> Result<String> {
-        self.reason_with(system, user, GenOptions::default())
+        self.reason_with_opts(system, user, GenOptions::default())
+    }
+
+    fn reason_with(&self, system: &str, user: &str, opts: GenOptions) -> Result<String> {
+        self.reason_with_opts(system, user, opts)
     }
 
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value> {
@@ -324,6 +336,97 @@ impl LocalReasoner for MistralReasoner {
         opts: GenOptions,
     ) -> Result<Value> {
         self.structured_with_opts(system, user, json_schema, opts)
+    }
+}
+
+/// The BLOCKING generation core: build one chat request over an already-resolved engine and drive
+/// it to completion. Runs on the [`run_with_timeout`] worker thread — that thread has no ambient
+/// runtime, so the inner scoped `block_on` is safe regardless of caller context. `enable_thinking`
+/// / temperature / token cap come from the [`GenOptions`].
+fn generate_blocking(
+    model: &Arc<Model>,
+    system: &str,
+    user: &str,
+    opts: GenOptions,
+) -> Result<String> {
+    let mut req = RequestBuilder::new()
+        .add_message(TextMessageRole::System, system)
+        .add_message(TextMessageRole::User, user)
+        .enable_thinking(opts.enable_thinking);
+    if let Some(t) = opts.temperature {
+        req = req.set_sampler_temperature(t);
+    }
+    if let Some(n) = opts.max_tokens {
+        req = req.set_sampler_max_len(n);
+    }
+    let rt = brain_rt().ok_or_else(|| AppError::Summarize("brain runtime unavailable".into()))?;
+    let resp = block_on(rt, model.send_chat_request(req))?
+        .map_err(|e| AppError::Summarize(format!("brain generation failed: {e}")))?;
+    MistralReasoner::first_content(resp)
+}
+
+/// Brain v2 P0.3 (revised) — the SCOPED bound seam: apply the wall-clock timeout ONLY when the
+/// caller's [`GenOptions`] asked for one.
+///
+/// - `Some(timeout)` (the live / ask / light-extraction presets) ⇒ [`run_with_timeout`] on a
+///   spawned worker thread — the live-path discipline.
+/// - `None` (`GenOptions::default()` — note generation, the FullyLocal Ask floor, default agent
+///   steps) ⇒ run `work` DIRECTLY on the current thread, UNBOUNDED — the pre-P0 behavior. Those
+///   paths legitimately exceed 30 s (Qwen3-4B note-gen runs 30–90 s; the first generation on a
+///   CLT-only Mac pays the deferred Metal shader compile), so they must never be timeout-killed.
+///
+/// Factored as a seam (not inlined in `reason_with_opts`) so the branch decision is unit-testable
+/// headless, without a model.
+fn run_bounded<T: Send + 'static>(
+    timeout: Option<std::time::Duration>,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match timeout {
+        Some(t) => run_with_timeout(t, work),
+        None => work(),
+    }
+}
+
+/// Brain v2 P0.3 — the testable WAIT MECHANIC of the generation timeout: run `work` on a spawned
+/// (detached) OS thread and wait at most `timeout` for its result over an mpsc channel.
+///
+/// - In time ⇒ the worker's own `Result` is returned verbatim.
+/// - TIMEOUT ⇒ `AppError::Unavailable` and the worker thread is deliberately LEAKED — the caller
+///   must never block on (or cancel) an uncancellable mistralrs generation, and the model itself
+///   is never dropped (it lives in the process-global [`model_cache`]). The eventual send into the
+///   dropped channel is a no-op.
+/// - Worker PANIC ⇒ the sender is dropped without a message ⇒ `Disconnected` ⇒ a graceful `Err`
+///   (never a hang, never a propagated panic).
+///
+/// Factored generic over `work` precisely so the mechanics are unit-testable headless, without a
+/// real model (`cargo test --lib` never runs a forward pass here — see the module header).
+fn run_with_timeout<T: Send + 'static>(
+    timeout: std::time::Duration,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<T>>();
+    std::thread::Builder::new()
+        .name("murmur-brain-gen".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|e| AppError::Summarize(format!("brain generation worker spawn failed: {e}")))?;
+    match rx.recv_timeout(timeout) {
+        Ok(res) => res,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // NO PII: duration only. The worker keeps running detached (leaked by design).
+            tracing::warn!(
+                target: "reason",
+                timeout_s = timeout.as_secs(),
+                "on-device brain generation timed out; leaking the worker (generations are uncancellable)"
+            );
+            Err(AppError::Unavailable(
+                "on-device brain generation timed out".into(),
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(AppError::Summarize(
+            "brain generation worker exited without a result".into(),
+        )),
     }
 }
 
@@ -394,6 +497,96 @@ mod tests {
             Some(1024 * 1024 * 1024),
             MODEL_RAM_GUARD_MIN_DISK_BYTES + GB
         ));
+    }
+
+    /// Brain v2 P0.3 — the timeout wait mechanic, fast path: a worker that finishes within the
+    /// deadline returns its own result verbatim (Ok and Err alike).
+    #[test]
+    fn run_with_timeout_returns_fast_result() {
+        let ok = run_with_timeout(std::time::Duration::from_secs(5), || Ok(42u32));
+        assert!(matches!(ok, Ok(42)));
+
+        let err: Result<u32> = run_with_timeout(std::time::Duration::from_secs(5), || {
+            Err(AppError::Summarize("inner failure".into()))
+        });
+        assert!(
+            matches!(err, Err(AppError::Summarize(_))),
+            "a worker's own error must pass through verbatim"
+        );
+    }
+
+    /// Brain v2 P0.3 — the timeout path: a worker that outlives the deadline yields
+    /// `AppError::Unavailable` (the caller degrades to the floor / a lower tier) and is LEAKED,
+    /// never joined — the call returns promptly instead of hanging on the slow worker.
+    #[test]
+    fn run_with_timeout_times_out_gracefully_and_leaks_the_worker() {
+        let started = std::time::Instant::now();
+        let res: Result<u32> = run_with_timeout(std::time::Duration::from_millis(50), || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(1)
+        });
+        match res {
+            Err(AppError::Unavailable(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "the timeout error must say so: {msg}"
+                );
+            }
+            other => panic!("timeout must be Unavailable, got {other:?}"),
+        }
+        // Prompt return: we did NOT wait for the 500 ms worker (leaked by design).
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "the caller must not block on the leaked worker"
+        );
+    }
+
+    /// Brain v2 P0.3 (revised) — DEFAULT options carry NO timeout, and the `None` branch of
+    /// [`run_bounded`] runs the work INLINE on the CURRENT thread, unbounded — the pre-P0 behavior
+    /// note generation / the FullyLocal Ask floor / first-gen shader compile depend on. A slow
+    /// worker (well past what a live-preset deadline would allow) still completes.
+    #[test]
+    fn default_gen_options_do_not_timeout() {
+        // The default preset requests no wall-clock bound...
+        assert!(GenOptions::default().timeout.is_none());
+
+        // ...and the None branch executes inline on the caller's thread (no worker, no deadline):
+        // a 200 ms "generation" — 4× the 50 ms deadline the timeout test uses — returns Ok.
+        let caller = std::thread::current().id();
+        let res = run_bounded(None, move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(std::thread::current().id())
+        });
+        match res {
+            Ok(id) => assert_eq!(
+                id, caller,
+                "the unbounded path must run on the current thread (no timeout worker)"
+            ),
+            Err(e) => panic!("the unbounded path must never time out, got {e:?}"),
+        }
+
+        // The Some branch still delegates to the timeout wrapper: a deadline miss is Unavailable.
+        let bounded: Result<u32> = run_bounded(Some(std::time::Duration::from_millis(50)), || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Ok(1)
+        });
+        assert!(
+            matches!(bounded, Err(AppError::Unavailable(_))),
+            "a Some(timeout) must still bound the work, got {bounded:?}"
+        );
+    }
+
+    /// Brain v2 P0.3 — worker-panic safety: a panicking worker drops the channel sender, which
+    /// surfaces as a graceful `Err` (never a hang until the deadline, never a propagated panic).
+    #[test]
+    fn run_with_timeout_surfaces_worker_panic_as_err() {
+        let res: Result<u32> = run_with_timeout(std::time::Duration::from_secs(5), || {
+            panic!("worker exploded")
+        });
+        assert!(
+            matches!(res, Err(AppError::Summarize(_))),
+            "a worker panic must become a graceful Err, got {res:?}"
+        );
     }
 
     /// The best-effort `available_ram_bytes` probe is crash-safe: it returns EITHER `Some(>0)` on a
