@@ -160,27 +160,58 @@ fn transcribe_stream(
         None => vec![(0, samples_16k.len())],
     };
 
+    // Bound each whisper decode to a fixed window so the mel-spectrogram + decoder working set stay
+    // O(window), not O(recording length). Without this, the VAD-less fallback region (the WHOLE
+    // buffer) or a very long continuous speech region hands an hour of audio to whisper.cpp in ONE
+    // decode — a full-length mel + a 16384-max-text-ctx allocation (P1 whisper-batch-cap). Each
+    // window re-offsets its timestamps exactly like the per-region loop already does; boundaries fall
+    // at most every MAX_WINDOW_S (a rare, minor continuity cost only inside a >2-min unbroken region).
+    const MAX_WINDOW_S: usize = 120;
+    let window_len = MAX_WINDOW_S * crate::audio::TARGET_RATE_HZ as usize;
+
     let mut out: Vec<crate::transcribe::types::Segment> = Vec::new();
     let mut idx: i64 = 0;
     for (start, end) in regions {
-        if end <= start {
-            continue;
-        }
-        let offset_s = start as f64 / crate::audio::TARGET_RATE_HZ as f64;
-        let tx = transcriber.transcribe_with(
-            &samples_16k[start..end],
-            lang,
-            TranscribeQuality::Accurate,
-        )?;
-        for mut seg in tx.segments {
-            seg.idx = idx;
-            seg.start_s += offset_s;
-            seg.end_s += offset_s;
-            idx += 1;
-            out.push(seg);
+        for (win_start, win_end) in decode_windows(start, end, window_len) {
+            let offset_s = win_start as f64 / crate::audio::TARGET_RATE_HZ as f64;
+            let tx = transcriber.transcribe_with(
+                &samples_16k[win_start..win_end],
+                lang,
+                TranscribeQuality::Accurate,
+            )?;
+            for mut seg in tx.segments {
+                seg.idx = idx;
+                seg.start_s += offset_s;
+                seg.end_s += offset_s;
+                idx += 1;
+                out.push(seg);
+            }
         }
     }
     Ok(out)
+}
+
+/// Split a `[start, end)` sample range into fixed-length decode windows of at most `window_len`
+/// samples, so a single whisper decode never spans more than one window (bounds whisper's mel +
+/// decoder working memory to O(window), not O(recording length)). Windows tile the range with no
+/// gaps or overlaps; the final window is whatever remains. An empty/degenerate range yields no
+/// windows. Pure + deterministic, so the windowing contract is unit-tested without a whisper model.
+fn decode_windows(start: usize, end: usize, window_len: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if end <= start {
+        return out;
+    }
+    if window_len == 0 {
+        out.push((start, end));
+        return out;
+    }
+    let mut s = start;
+    while s < end {
+        let e = (s + window_len).min(end);
+        out.push((s, e));
+        s = e;
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,6 +255,18 @@ async fn run_inner(
     let system_scratch = ScratchWav::new(system_wav);
 
     let mut mic_16k = audio::resample_to_16k(&samples, src_rate)?;
+    // P1 Stop-time peak: in the common case (no hi-res masters — the default) the source-rate mic
+    // buffer (~0.7 GB/hr at 48 kHz) is never needed again, so free it NOW — before the 16k AEC / mix /
+    // transcription buffers allocate — instead of holding it to the end of `run_inner`. This roughly
+    // halves the pre-whisper Stop-time peak (source + mic_16k + sys_16k + archive_16k → just the 16k
+    // set). When masters ARE kept we must retain it for the faithful PRE-resample `.mic.wav` written
+    // after finalize (below), so keep it only in that case.
+    let samples: Option<Vec<f32>> = if config.keep_hires_masters {
+        Some(samples)
+    } else {
+        drop(samples);
+        None
+    };
     // AEC'd mic for the ASR feed (rec #5): when the VPIO helper produced a WAV, transcribe THAT and
     // keep the RAW cpal mic for the archive (`mic_16k_archive`); otherwise archive == ASR (today).
     // `mem::replace` avoids cloning the (large) mic buffer in the common no-AEC path.
@@ -367,16 +410,21 @@ async fn run_inner(
     // rest by the lock lifecycle exactly like audio_path. Best-effort: a write failure never fails
     // the recording. NOT exposed to the FE — reachable only via the gated export commands.
     if config.keep_hires_masters {
-        let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
-        if let Err(e) = audio::write_wav_f32(&mic_master, &samples, src_rate, 1) {
-            tracing::warn!(target: "audio", error = %e, "mic master write failed");
-        } else if let Err(e) = state
-            .db
-            .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))
-        {
-            // Best-effort: a stranded, untracked master plaintext is unreferenced + ungated-out;
-            // never fail the recording over it.
-            tracing::warn!(target: "audio", error = %e, "persisting mic master path failed");
+        // `samples` is retained as `Some` exactly when keep_hires_masters is on (see the resample
+        // site, where it is dropped early otherwise). Written from the PRE-resample buffer so it
+        // stays faithful; path persistence + error handling are byte-identical to before.
+        if let Some(samples) = &samples {
+            let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
+            if let Err(e) = audio::write_wav_f32(&mic_master, samples, src_rate, 1) {
+                tracing::warn!(target: "audio", error = %e, "mic master write failed");
+            } else if let Err(e) = state
+                .db
+                .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))
+            {
+                // Best-effort: a stranded, untracked master plaintext is unreferenced + ungated-out;
+                // never fail the recording over it.
+                tracing::warn!(target: "audio", error = %e, "persisting mic master path failed");
+            }
         }
         if let Some((sys, sys_rate)) = &sys_native {
             let sys_master = wav_dir.join(format!("{meeting_id}.sys.wav"));
@@ -677,6 +725,12 @@ async fn run_inner(
 /// as the rest of the transcript before any cloud egress — it rides no side channel.
 pub(crate) struct TranscriptFeed {
     /// Flat text (assistant-directed segments dropped) for retrieval — byte-identical to the legacy join.
+    /// `#[allow(dead_code)]`: Phase 1 (two-stage notes) removed the pre-generation cross-meeting
+    /// grounding injection (`orchestrate_context`) that was this field's only PRODUCTION consumer, so
+    /// the note is now generated from `summary_text` alone. The flat-join field is retained as the
+    /// canonical retrieval text (its no-regression properties are still pinned by the feed tests, and
+    /// it is the seam any future/optional grounding re-wire keys off) — not dead history.
+    #[allow(dead_code)]
     pub retrieval_text: String,
     /// What the model summarizes: speaker-labeled when `labeled`, else identical to `retrieval_text`.
     pub summary_text: String,
@@ -899,47 +953,18 @@ async fn summarize_and_export(
         _ => Vec::new(),
     };
 
-    // brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION (ALWAYS ON). Ground the new note in
-    // related PRIOR notes so notes compound ("last time you decided X"). GATED by the LIVE session
-    // unlock set: the retrieval routes through `search_visible` + `get_note_if_visible` (inside
-    // `build_grounding_context` → `build_related_context`), so a sealed-and-not-session-unlocked
-    // prior note contributes NOTHING. This matters because the corpus EGRESSES to the provider in
-    // the prompt — but it is the SAME provider call (`make_provider` → RedactingProvider +
-    // fail-closed `cloud_egress_consented` gate) the summary already makes, so always-on adds NO
-    // new egress class and does NOT bypass consent (local provider stays local; no consent → the
-    // summary already fails closed). Best-effort: a retrieval error logs (target rag, no PII) and
-    // proceeds with NO context, and an empty corpus yields `None` (byte-identical to no-context) —
-    // it NEVER fails the pipeline.
-    let unlocked = state
-        .unlocked_folders
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    let related_title = state
-        .db
-        .get_meeting(meeting_id)
-        .ok()
-        .flatten()
-        .and_then(|m| m.title);
-    // Phase B step 3 (Flow A) — the local brain DECIDES what context to fetch. With no real model
-    // (the StubReasoner, the default build) `orchestrate_context` falls through to the EXACT
-    // deterministic `build_grounding_context` path below (byte-identical, zero behavior change). With
-    // a real reasoner it runs a gated pre-analysis → retrieval plan, but the deterministic
-    // salient-query path stays the FALLBACK FLOOR. The reasoner call is synchronous, so this keeps
-    // the existing inline shape (no extra await). Best-effort + GATED: same egress/consent envelope.
-    let related_context = crate::orchestrate::orchestrate_context(
-        // Brain Live ON ⇒ the LOCAL light engine for retrieval planning (no egress); a missing light
-        // model degrades to the stub ⇒ the deterministic `build_grounding_context` floor below — never
-        // silently to cloud (spec §3.4). OFF ⇒ today's Notes reasoner.
-        &*state.reasoner.extraction_reasoner(),
-        &state.db,
-        meeting_id,
-        related_title.as_deref(),
-        // Retrieval query planning reads the FLAT text — unperturbed by `(speaker)` tag tokens.
-        &feed.retrieval_text,
-        &unlocked,
-        config,
-    );
+    // STAGE 1 (two-stage note redesign — Phase 1). The note is generated PROVABLY from ONLY this
+    // meeting's transcript + the user's typed notes: NO cross-meeting context is injected into the
+    // generation prompt (`related_context: None` below). This eliminates the cross-meeting `## Action
+    // items` bleed class BY CONSTRUCTION — the weak on-device model can no longer be handed another
+    // meeting's tasks in its one prompt. The retrieval machinery stays in the tree UNTOUCHED for
+    // Phase 2 (a deferred, additive, link-only post-pass on the FINISHED note):
+    // `orchestrate::orchestrate_context`, `build_grounding_context`, and everything in
+    // `related_context.rs` are retained, just not called here. `render_user_content` for
+    // `related_context: None` is byte-identical to the pre-injection prompt (test
+    // `render_user_content_none_is_unchanged`), so Stage 1's prompt carries only transcript +
+    // user_notes + vault_titles. See docs/research/2026-07-06-note-and-brain-architecture.md
+    // (§3 Stage 1, §8 Phase 1).
 
     // ENHANCE-MY-NOTES: fetch the typed-notes buffer BEFORE building the request — in
     // "enhance" mode the notes ride INSIDE the prompt as the skeleton (a NEW, deliberate,
@@ -961,7 +986,9 @@ async fn summarize_and_export(
         },
         template: template::build_template(&config.note_style, &config.note_language, feed.labeled),
         vault_titles,
-        related_context,
+        // STAGE 1 — no cross-meeting context in the generation prompt (Phase 1). Phase 2 will add
+        // links additively on the finished note, not via this field.
+        related_context: None,
         user_notes: if config.notes_mode == "enhance" && !manual_notes.trim().is_empty() {
             Some(manual_notes.clone())
         } else {
@@ -977,18 +1004,24 @@ async fn summarize_and_export(
     // every (re)summarize re-reads it fresh in EITHER mode; empty buffer ⇒ byte-identical.
     let markdown = finalize_note_markdown(&generated, &manual_notes, &config.notes_mode);
 
+    // GROUNDING reads THIS meeting's OWN segments (the SAME plaintext the pipeline just summarized) —
+    // NO new read path, NO cross-meeting read, NO egress (pure local string ops). A `get_segments`
+    // failure degrades to no segments ⇒ the opt-in grounding pass below returns the note
+    // byte-identical; it NEVER fails the pipeline. Runs BEFORE `upsert_note` + the vault write so the
+    // DB copy and the exported `.md` carry the same grounded body.
+    //
+    // NOTE (Phase 1): the always-on lexical anti-bleed pass (`strip_ungrounded_action_items`, gated by
+    // `strip_applies_for_language`) that used to run here has been DELETED. It existed ONLY to clean up
+    // the cross-meeting injection removed above (Stage 1); with the note now transcript-only, the bleed
+    // class is gone by construction and the lexical deletion (which risked removing real generated
+    // content) is dead weight.
     // Tier 3b (B) — DETERMINISTIC GROUNDING (anti-hallucination). Annotate summary units this
     // meeting's OWN transcript does not support with a non-destructive `> unverified` line (or
     // `(low audio confidence)` when the overlap was acoustically shaky). Gated by `ground_summary`
     // (default OFF / opt-in until the overlap thresholds are calibrated on real data — an over-flag
     // would `> unverified` a legitimately-abstractive sentence in the note 100% of users read).
-    // GATE/EGRESS posture: reads ONLY `get_segments(meeting_id)` — this meeting's own
-    // segments, the SAME plaintext the pipeline just summarized — so it adds NO new read path, NO
-    // cross-meeting read, and NO egress (pure local string ops). The markers become part of the note
-    // markdown and are sealed WITH it. Best-effort: a `get_segments` failure degrades to no segments
-    // ⇒ `annotate_unverified` returns the note byte-identical; it NEVER fails the pipeline. Runs
-    // BEFORE `upsert_note` + the vault write so the DB copy and the exported `.md` carry the same
-    // grounded body.
+    // The markers become part of the note markdown and are sealed WITH it. The meeting's own
+    // segments are fetched ONLY on this opt-in path (the default OFF path does no wasted DB read).
     let markdown = if config.ground_summary {
         let segments = state.db.get_segments(meeting_id).unwrap_or_default();
         crate::summarize::grounding::annotate_unverified(&markdown, &segments)
@@ -1193,6 +1226,29 @@ async fn summarize_and_export(
         crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
     {
         tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note export unaffected)");
+    }
+
+    // Stage 2 / Lane A — DEFERRED, best-effort cross-meeting LINKING. Runs AFTER the note reaches
+    // `Exported` so the first `.md` is written promptly; the `[[links]]` + Related block land seconds
+    // later on a DB-canonical re-persist + re-export. Fully LOCAL (ZERO egress) + lock/seal-safe (see
+    // `link_related_notes_inner`), so it is auto-eligible on finalize. It must NEVER fail or delay the
+    // pipeline: a detached worker (the same `std::thread::spawn` + `app.state::<AppState>()` shape the
+    // proactive/reactions workers use), any error swallowed with an IDs-only log (no PII).
+    {
+        let app_bg = app.clone();
+        let mid = meeting_id.to_string();
+        std::thread::spawn(move || {
+            use tauri::Manager;
+            let state = app_bg.state::<AppState>();
+            if let Err(e) = crate::commands::link_related_notes_inner(state.inner(), &mid) {
+                tracing::warn!(
+                    target: "stage2",
+                    meeting_id = %mid,
+                    error = %e,
+                    "deferred cross-meeting linking failed (note unaffected)"
+                );
+            }
+        });
     }
 
     Ok(PipelineResult {
@@ -1492,6 +1548,48 @@ fn should_auto_index(semantic_enabled: bool, embed_model_present: bool) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── whisper decode windowing (P1 whisper-batch-cap) ────────────────────────────────────────
+    /// A long region is tiled into ≤window_len windows that fully cover it with no gaps/overlaps, so
+    /// whisper never decodes more than one window at a time. Pre-cap the whole region was one decode
+    /// (this helper + tiling contract did not exist).
+    #[test]
+    fn decode_windows_tiles_long_region() {
+        let hz = crate::audio::TARGET_RATE_HZ as usize;
+        let w = 120 * hz;
+        let wins = decode_windows(0, 300 * hz, w);
+        assert_eq!(
+            wins,
+            vec![(0, 120 * hz), (120 * hz, 240 * hz), (240 * hz, 300 * hz)]
+        );
+        assert_eq!(wins.first().unwrap().0, 0);
+        assert_eq!(wins.last().unwrap().1, 300 * hz);
+        for pair in wins.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "windows must be contiguous");
+        }
+        for (s, e) in &wins {
+            assert!(e - s <= w, "no window exceeds the cap");
+        }
+    }
+
+    /// A region already within budget is a single window (byte-identical to the pre-cap behavior);
+    /// a non-zero start offset is preserved.
+    #[test]
+    fn decode_windows_short_region_is_one_window() {
+        let hz = crate::audio::TARGET_RATE_HZ as usize;
+        assert_eq!(decode_windows(0, 30 * hz, 120 * hz), vec![(0, 30 * hz)]);
+        assert_eq!(
+            decode_windows(5 * hz, 20 * hz, 120 * hz),
+            vec![(5 * hz, 20 * hz)]
+        );
+    }
+
+    /// Degenerate ranges yield nothing (subsumes the old `if end <= start { continue }`).
+    #[test]
+    fn decode_windows_empty_on_degenerate_range() {
+        assert!(decode_windows(100, 100, 16_000).is_empty());
+        assert!(decode_windows(200, 100, 16_000).is_empty());
+    }
 
     // ── Tier 4c: privacy_receipt_facts (per-note egress self-report wiring) ────────────────────
     //

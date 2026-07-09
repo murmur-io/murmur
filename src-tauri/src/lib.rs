@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod crypto;
 pub mod e2ee;
 pub mod embed;
+pub mod enrich;
 pub mod error;
 pub mod eval;
 pub mod events;
@@ -111,6 +112,7 @@ pub fn run() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            commands::set_focus_meeting,
             commands::start_recording,
             commands::stop_recording,
             commands::recording_level,
@@ -127,6 +129,9 @@ pub fn run() {
             commands::update_note,
             commands::verify_note_sources,
             commands::apply_note_verify_markers,
+            commands::enrich_note_context,
+            commands::apply_note_enrichment,
+            commands::link_related_notes,
             commands::save_manual_notes,
             commands::get_manual_notes,
             commands::import_document,
@@ -143,6 +148,7 @@ pub fn run() {
             commands::apply_supersessions,
             commands::undo_supersessions,
             commands::get_config,
+            commands::get_mcp_config,
             commands::save_config,
             commands::get_storage_report,
             commands::free_up_space,

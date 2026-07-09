@@ -445,6 +445,24 @@
   }
 }
 
+// Phase 5 — the "answered from: <tier>" chip. A quiet, muted inline note under the
+// answer/citations that names WHICH cascade tier answered (deterministic backend badge).
+.tier-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.tier-chip-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .turn-bubble,
   .dots span,

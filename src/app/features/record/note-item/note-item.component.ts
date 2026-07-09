@@ -185,4 +185,22 @@ export class NoteItemComponent {
         return "(no answer)";
     }
   }
+
+  /**
+   * Phase 5 — the human label for the BRAIN CASCADE tier that answered
+   * (`answeredFrom`), e.g. "this meeting" / "your vault" / "connectors". Empty
+   * for a turn that didn't run through the cascade (`null`) so the chip hides.
+   */
+  protected tierLabel(turn: ThreadTurn): string {
+    switch (turn.answeredFrom) {
+      case "current_meeting":
+        return "this meeting";
+      case "vault":
+        return "your vault";
+      case "connectors":
+        return "connectors";
+      default:
+        return "";
+    }
+  }
 }

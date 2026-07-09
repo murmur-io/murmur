@@ -27,29 +27,122 @@ with its start/end span; sequential spans covering the discussion.\n\
 - Use only timestamps from the transcript; the final endS should be near the meeting end.\n\
 - Output ONLY the JSON object, nothing before or after it.";
 
+/// OOM guard (P0.2, perf-memory-audit §2): the max joined-transcript size fed to an ON-DEVICE
+/// model when deriving the timeline. A 1h meeting joins to ~15–25k tokens; the local mistralrs
+/// engine plans for `max_seq_len = 4096`, so a whole-hour prompt blows past it and the prefill KV
+/// cache balloons several GB on top of the resident weights → the machine OOMs. The timeline is a
+/// COARSE speaker/topic map — it does not need every word — so we cap the joined transcript that
+/// reaches a local model. ~14k chars ≈ a few thousand tokens, comfortably inside the 4096 window
+/// with headroom for the system prompt + the JSON reply. Cloud providers are NOT capped (big
+/// context windows, and they are not the OOM path — see `generate`). Bytes, not tokens: cheap,
+/// deterministic, pure-testable.
+const LOCAL_TIMELINE_MAX_CHARS: usize = 14_000;
+
+/// True when `provider_id` names an ON-DEVICE model (the on-device brain, Ollama, or Apple
+/// Foundation Models) — the residency-bound engines the transcript cap protects. Mirrors
+/// `related_context::is_weak_provider` (same three connection ids) so the two OOM-relevant
+/// classifications never drift; kept local + private to timeline.rs so this file owns its guard.
+fn is_on_device_provider(provider_id: &str) -> bool {
+    provider_id == crate::summarize::roles::CONN_LOCAL
+        || provider_id == crate::summarize::roles::CONN_AFM
+        || provider_id == crate::summarize::PROVIDER_OLLAMA
+}
+
+/// Render ONE transcript line for a segment, preserving its real `[start-end]` timestamps + the
+/// canonical diarization tag (me / others / others-N) so the LLM-derived timeline AGREES with the
+/// segment speaker labels (and its time-spans stay anchored to real meeting time) instead of
+/// inventing its own.
+fn render_segment_line(s: &Segment) -> String {
+    let who = s.speaker.as_deref().unwrap_or("?");
+    format!("[{:.1}-{:.1}] ({}) {}", s.start_s, s.end_s, who, s.text.trim())
+}
+
+/// Build the timestamped transcript fed to the provider.
+///
+/// For an ON-DEVICE model we bound the prompt to `LOCAL_TIMELINE_MAX_CHARS` (the KV/OOM lever, P0.2)
+/// via UNIFORM DECIMATION — NOT head-truncation. A naive head-cut would derive the whole timeline
+/// from only the first minutes of a 1h meeting (a correctness bug); instead we keep an EVENLY-SPACED
+/// stride of segments across the FULL duration, so the coarse timeline still spans the entire
+/// meeting, just at lower resolution. We always keep the FIRST and LAST segment (the timeline's real
+/// start/end anchors). Deterministic + pure over `segments` (unit-tested). Cloud providers pass every
+/// segment (`on_device == false` ⇒ no cap, no decimation — byte-identical to the pre-guard prompt).
+fn build_transcript(segments: &[Segment], on_device: bool) -> String {
+    let full = |segs: &[Segment]| {
+        segs.iter()
+            .map(render_segment_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if !on_device {
+        return full(segments);
+    }
+    let joined = full(segments);
+    if joined.chars().count() <= LOCAL_TIMELINE_MAX_CHARS || segments.len() <= 2 {
+        // Already within budget (short meeting), or too few segments to decimate meaningfully.
+        return joined;
+    }
+    // Pick an EVENLY-SPACED subset that fits the char budget by its ACTUAL rendered cost — NOT a
+    // mean-line estimate + a trailing `take()`. The estimate approach was wrong on non-uniform
+    // transcripts: a few long monologue turns make the mean under-count the strided subset's real
+    // size, the estimate overshoots the budget, and a tail trim then silently DROPS the last kept
+    // segments — re-introducing the very head-only coverage this guards against (adversarial finding
+    // 2026-07-08). Instead we START from an even-stride subset and SHRINK `keep` until the real joined
+    // cost is within budget, so the FIRST + LAST segment (the timeline's end anchors) always survive
+    // and the tail is never chopped.
+    let n = segments.len();
+    // Cost of a strided subset of `keep` segments (rendered line chars + '\n' joins), without
+    // allocating the whole string each time — sum the picked lines' lengths.
+    let stride_indices = |keep: usize| -> Vec<usize> {
+        let mut idxs: Vec<usize> = Vec::with_capacity(keep);
+        for k in 0..keep {
+            // k ∈ [0, keep-1] → index in [0, n-1]; k=0 → first, k=keep-1 → last.
+            let idx = (k * (n - 1)) / (keep - 1);
+            if idxs.last() != Some(&idx) {
+                idxs.push(idx);
+            }
+        }
+        idxs
+    };
+    let cost = |idxs: &[usize]| -> usize {
+        let chars: usize = idxs
+            .iter()
+            .map(|&i| render_segment_line(&segments[i]).chars().count())
+            .sum();
+        chars + idxs.len().saturating_sub(1) // '\n' joins
+    };
+    // Start from a generous even-stride guess, then shrink proportionally until within budget. Each
+    // step strictly decreases `keep` (min(scaled, keep-1)) so it terminates; the floor is 2 (just the
+    // first + last anchors), which we accept even if two pathological giant anchor segments exceed the
+    // budget — keeping BOTH ends beats dropping the last.
+    let mut keep = segments.len();
+    loop {
+        let idxs = stride_indices(keep);
+        let c = cost(&idxs);
+        if c <= LOCAL_TIMELINE_MAX_CHARS || keep <= 2 {
+            return idxs
+                .iter()
+                .map(|&i| render_segment_line(&segments[i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        // Proportional shrink, but force progress (at least -1) so we can't stall on a slight overage.
+        let scaled = (keep.saturating_mul(LOCAL_TIMELINE_MAX_CHARS)) / c.max(1);
+        keep = scaled.min(keep - 1).max(2);
+    }
+}
+
 /// Ask the provider to derive the timeline from `segments`, then parse strict JSON out of
 /// the (possibly noisy) reply.
+///
+/// OOM guard (P0.2): for an ON-DEVICE provider the transcript is decimated to
+/// `LOCAL_TIMELINE_MAX_CHARS` (uniform-stride, full-coverage) so a 1h prompt cannot balloon the
+/// local engine's prefill KV cache and OOM the machine. Cloud providers pass the full transcript.
 pub async fn generate(
     provider: &dyn SummarizerProvider,
     segments: &[Segment],
     _duration_s: i64,
 ) -> Result<MeetingTimeline> {
-    let transcript: String = segments
-        .iter()
-        .map(|s| {
-            // Feed the canonical diarization tag (me / others / others-N) so the LLM-derived
-            // timeline AGREES with the segment speaker labels instead of inventing its own.
-            let who = s.speaker.as_deref().unwrap_or("?");
-            format!(
-                "[{:.1}-{:.1}] ({}) {}",
-                s.start_s,
-                s.end_s,
-                who,
-                s.text.trim()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let transcript = build_transcript(segments, is_on_device_provider(provider.id()));
 
     // Minimal JSON schema for the timeline — passed to the gateway for native constrained decoding;
     // the DEFAULT `complete_json` impl only stringifies it into the system prompt (same parse path
@@ -378,5 +471,185 @@ mod tests {
         repair_coverage(&mut tl, &[]);
         assert_eq!(tl.speakers[0].end_s, 5.0);
         assert_eq!(tl.topics[0].end_s, 5.0);
+    }
+
+    // ── P0.2: bound the transcript fed to a LOCAL model (the KV/OOM lever) ─────────────────────────
+
+    /// Build a synthetic ~1h transcript: many segments, each with realistic text, spread evenly
+    /// across `dur_s` seconds. Returns segments whose joined form vastly exceeds
+    /// `LOCAL_TIMELINE_MAX_CHARS` so the cap is exercised.
+    fn hour_of_segments(n: usize, dur_s: f64) -> Vec<Segment> {
+        (0..n)
+            .map(|i| {
+                let start = (i as f64) * dur_s / (n as f64);
+                let end = start + (dur_s / (n as f64));
+                Segment {
+                    idx: i as i64,
+                    start_s: start,
+                    end_s: end,
+                    // ~60-char line of real-ish content so the join is big.
+                    text: format!(
+                        "segment {i} discussing the quarterly roadmap and budget details here"
+                    ),
+                    speaker: Some(if i % 2 == 0 { "me" } else { "others" }.into()),
+                    confidence: None,
+                }
+            })
+            .collect()
+    }
+
+    /// RED-before-GREEN (OOM guard): an ON-DEVICE provider ("local") gets a transcript BOUNDED to
+    /// `LOCAL_TIMELINE_MAX_CHARS`, while a CLOUD provider ("anthropic") gets the FULL transcript
+    /// (no regression — cloud has a big context window and is not the OOM path).
+    #[test]
+    fn local_transcript_is_capped_cloud_is_not() {
+        // ~1h of dense conversation: 1200 segments × ~75 chars ≈ 90k chars — well past the 14k cap.
+        let segments = hour_of_segments(1200, 3600.0);
+
+        let full = build_transcript(&segments, false); // cloud provider
+        let capped = build_transcript(&segments, true); // on-device provider
+
+        // Cloud: every segment present, uncapped.
+        assert_eq!(
+            full.lines().count(),
+            segments.len(),
+            "cloud provider must receive the FULL transcript (no cap)"
+        );
+        assert!(
+            full.chars().count() > LOCAL_TIMELINE_MAX_CHARS,
+            "the synthetic 1h transcript must exceed the cap so the test is meaningful"
+        );
+
+        // On-device: bounded to the cap.
+        assert!(
+            capped.chars().count() <= LOCAL_TIMELINE_MAX_CHARS,
+            "on-device transcript must be capped at {LOCAL_TIMELINE_MAX_CHARS}, got {}",
+            capped.chars().count()
+        );
+        assert!(
+            capped.chars().count() < full.chars().count(),
+            "the on-device transcript must be strictly smaller than the full one"
+        );
+    }
+
+    /// COVERAGE (not head-truncation): the decimated on-device transcript must still SPAN the whole
+    /// meeting — the LAST kept segment's start time must be in the LATTER portion of the recording,
+    /// and the FIRST kept line must be near the start. A naive head-cut would fail this (its last
+    /// line would be in the first minutes). Parses the `[start-end]` prefix of the kept lines.
+    #[test]
+    fn local_transcript_preserves_full_coverage() {
+        let dur_s = 3600.0;
+        let segments = hour_of_segments(1200, dur_s);
+        let capped = build_transcript(&segments, true);
+
+        // Parse the leading `[start-` float off each kept line.
+        let starts: Vec<f64> = capped
+            .lines()
+            .filter_map(|l| {
+                let inner = l.strip_prefix('[')?;
+                let dash = inner.find('-')?;
+                inner[..dash].parse::<f64>().ok()
+            })
+            .collect();
+        assert!(starts.len() >= 2, "expected multiple kept lines, got {starts:?}");
+
+        let first = *starts.first().unwrap();
+        let last = *starts.last().unwrap();
+        assert!(
+            first < dur_s * 0.05,
+            "first kept segment must be near the start (< 3 min of a 1h meeting), got {first}s"
+        );
+        assert!(
+            last > dur_s * 0.9,
+            "COVERAGE: last kept segment must be in the final tenth of the meeting (not head-only), got {last}s"
+        );
+        // Kept lines are in time order (evenly-spaced stride), so the span is monotonic.
+        assert!(
+            starts.windows(2).all(|w| w[0] <= w[1]),
+            "kept segments must stay in time order"
+        );
+    }
+
+    /// COVERAGE under NON-UNIFORM line lengths — the adversarial regression (2026-07-08). A minority
+    /// of long monologue turns (~2000 chars) among short turns made the OLD `mean_line` estimate
+    /// under-count the strided subset, overshoot the budget, and then a trailing `take()` silently
+    /// DROPPED the last kept lines — re-introducing head-only coverage (repro: last kept ≈ 3160s of
+    /// 3600s; extreme: 0s). This asserts the fix: the LAST segment always survives and the prompt is
+    /// still bounded, regardless of length skew. RED on the old mean-estimate + tail-`take()` code.
+    #[test]
+    fn local_transcript_coverage_survives_length_skew() {
+        let dur_s = 3600.0;
+        let n = 600usize;
+        // 10% long monologues (~2000 chars), 90% short (~200 chars), spread across the hour.
+        let segments: Vec<Segment> = (0..n)
+            .map(|i| {
+                let start = (i as f64) * dur_s / (n as f64);
+                let end = start + dur_s / (n as f64);
+                let text = if i % 10 == 0 {
+                    format!("monologue {i} ").repeat(140) // ~2000 chars
+                } else {
+                    format!("turn {i} ").repeat(25) // ~200 chars
+                };
+                Segment {
+                    idx: i as i64,
+                    start_s: start,
+                    end_s: end,
+                    text,
+                    speaker: Some(if i % 2 == 0 { "me" } else { "others" }.into()),
+                    confidence: None,
+                }
+            })
+            .collect();
+
+        let capped = build_transcript(&segments, true);
+        // Bounded (the OOM guarantee): the on-device prompt stays within budget despite the skew.
+        assert!(
+            capped.chars().count() <= LOCAL_TIMELINE_MAX_CHARS,
+            "skewed on-device transcript must stay within the cap, got {}",
+            capped.chars().count()
+        );
+        // COVERAGE: the LAST kept line's start must be in the final tenth — the last segment (≈3600s)
+        // is never dropped. This is the exact assertion the old tail-`take()` failed (last ≈ 3160s).
+        let starts: Vec<f64> = capped
+            .lines()
+            .filter_map(|l| {
+                let inner = l.strip_prefix('[')?;
+                let dash = inner.find('-')?;
+                inner[..dash].parse::<f64>().ok()
+            })
+            .collect();
+        let last = *starts.last().expect("kept lines");
+        assert!(
+            last > dur_s * 0.9,
+            "COVERAGE under skew: last kept segment must reach the final tenth (not head-only), got {last}s"
+        );
+    }
+
+    /// A SHORT meeting (already within budget) is fed verbatim to an on-device model — no decimation,
+    /// no lost segments — so small meetings are byte-identical for local + cloud.
+    #[test]
+    fn local_transcript_short_meeting_is_unchanged() {
+        let segments = hour_of_segments(6, 30.0); // ~6 short lines, well under 14k chars
+        let capped = build_transcript(&segments, true);
+        let full = build_transcript(&segments, false);
+        assert_eq!(
+            capped, full,
+            "a short meeting under the cap must be identical for local + cloud"
+        );
+        assert_eq!(capped.lines().count(), segments.len());
+    }
+
+    /// `is_on_device_provider` classifies exactly the three residency-bound connection ids (mirrors
+    /// `related_context::is_weak_provider`); cloud providers are NOT on-device.
+    #[test]
+    fn on_device_provider_classification() {
+        assert!(is_on_device_provider(crate::summarize::roles::CONN_LOCAL));
+        assert!(is_on_device_provider(crate::summarize::roles::CONN_AFM));
+        assert!(is_on_device_provider(crate::summarize::PROVIDER_OLLAMA));
+        assert!(!is_on_device_provider(crate::summarize::PROVIDER_ANTHROPIC));
+        assert!(!is_on_device_provider(
+            crate::summarize::PROVIDER_CLAUDE_CODE
+        ));
+        assert!(!is_on_device_provider(crate::summarize::PROVIDER_GATEWAY));
     }
 }

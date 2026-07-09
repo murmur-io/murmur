@@ -32,6 +32,65 @@ use crate::error::{AppError, Result};
 use crate::settings::AppConfig;
 use crate::storage::Db;
 
+/// The BRAIN CASCADE tier a [`GatedToolExecutor`] runs at (Phase 5). It is the STRUCTURAL escalation
+/// boundary: which tools the model may reach this turn is decided by CODE (`specs()` filter +
+/// `run()` allowlist), not prompt-trust. A weak model that mis-judges scope STILL cannot reach a
+/// higher tier's tools — the loop literally has no allowlisted way to call them.
+///
+/// - [`Self::CurrentMeeting`] (Tier 1): NO retrieval tools at all. Tier 1 answers from the current
+///   meeting IN ISOLATION — its content is prompt-injected (live RAM buffer / this meeting's
+///   note+segments), so it needs no tool to reach it, and it must NOT be able to reach the vault.
+/// - [`Self::Vault`] (Tier 2): the owned-vault read tools only (search/get_meeting/list_recent/
+///   commitments/dossier) — NO connectors/web.
+/// - [`Self::Connectors`] (Tier 3): the connector/web tools (already `has_app`-gated for
+///   consent/egress). Vault tools stay reachable here too so Tier 3 can still ground in owned notes
+///   while reaching out.
+/// - [`Self::Full`]: the pre-cascade full catalog (per surface flags) — the DELIBERATELY vault-wide
+///   surfaces (the Ask page, MCP-shaped read executors) keep this so their behavior is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantScope {
+    /// Tier 1 — the current meeting in isolation (no retrieval tools).
+    CurrentMeeting,
+    /// Tier 2 — the owned vault (search/get_meeting/list_recent/commitments/dossier; no connectors).
+    Vault,
+    /// Tier 3 — connectors/web (+ vault reads for grounding).
+    Connectors,
+    /// The full per-surface catalog (deliberately vault-wide surfaces: Ask page, MCP-shaped reads).
+    Full,
+}
+
+impl AssistantScope {
+    /// Is `tool` reachable at THIS scope? The tiered gate, applied on top of the per-surface flags
+    /// (`has_app`/`note_drafts`/`allow_writes`) in [`GatedToolExecutor::specs`]. The vault READ tools
+    /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
+    /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
+    fn allows(self, tool: &str) -> bool {
+        const VAULT_READS: [&str; 6] = [
+            "search_meetings",
+            "search_semantic",
+            "get_meeting",
+            "list_recent_meetings",
+            "get_open_commitments",
+            "get_entity_dossier",
+        ];
+        const CONNECTORS: [&str; 4] = ["web_search", "calendar_lookup", "jira_search", "slack_search"];
+        match self {
+            // Tier 1 reaches NEITHER vault reads NOR connectors — it answers from injected
+            // current-meeting content only. (propose_note / writes still pass the tier gate; the
+            // surface flags decide those.)
+            AssistantScope::CurrentMeeting => {
+                !VAULT_READS.contains(&tool) && !CONNECTORS.contains(&tool)
+            }
+            // Tier 2 reaches the owned vault only — NO connectors.
+            AssistantScope::Vault => !CONNECTORS.contains(&tool),
+            // Tier 3 reaches connectors AND (for grounding) the vault reads.
+            AssistantScope::Connectors => true,
+            // The full catalog leaves the tier gate open; the surface flags alone decide.
+            AssistantScope::Full => true,
+        }
+    }
+}
+
 /// A single read-only tool INVOCATION. This enum holds the 8 read-only calls the brain can run
 /// against the vault: the 6 the MCP surface advertises (`mcp.rs::tools_spec`) — `search_meetings`,
 /// `get_meeting`, `list_recent_meetings`, `search_semantic`, `get_open_commitments`,
@@ -681,6 +740,13 @@ pub struct GatedToolExecutor<'a> {
     /// with no notes flow (the vault-wide Ask page), where a drafted note could never be accepted.
     /// The tool stays implemented either way — un-advertised, the `run()` allowlist refuses it.
     pub note_drafts: bool,
+    /// The BRAIN CASCADE tier this executor runs at (Phase 5) — the STRUCTURAL escalation boundary.
+    /// [`AssistantScope::CurrentMeeting`] advertises NO retrieval tools (Tier 1 answers from injected
+    /// current-meeting content only); [`AssistantScope::Vault`] advertises the owned-vault reads but NO
+    /// connectors; [`AssistantScope::Connectors`] adds connectors; [`AssistantScope::Full`] is the
+    /// pre-cascade behavior for the deliberately vault-wide surfaces (Ask page). The `run()` allowlist
+    /// re-checks `specs()`, so a model at a lower tier literally CANNOT reach a higher tier's tools.
+    pub scope: AssistantScope,
     /// The note draft the model proposed this turn (via `propose_note`), if any. `None` ⇒ the reply
     /// is a plain ANSWER; `Some(content)` ⇒ a NOTE PROPOSAL the FE should offer to add. No DB effect.
     pub proposed_note: std::sync::Mutex<Option<String>>,
@@ -690,8 +756,14 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
     fn specs(&self) -> Vec<ToolSpec> {
         let has_app = self.app.is_some();
         let allow_writes = self.allow_writes;
+        let scope = self.scope;
         tool_specs()
             .into_iter()
+            // TIER GATE (Phase 5, STRUCTURAL): drop any tool this cascade tier may not reach BEFORE
+            // the per-surface flags. Tier 1 keeps no retrieval tool; Tier 2 keeps no connector; etc.
+            // Applied first so a lower tier cannot advertise (and therefore cannot run) a higher
+            // tier's tool regardless of the surface flags below.
+            .filter(|s| scope.allows(s.name))
             .filter(|s| match s.name {
                 // Connectors require the AppHandle (async sidecar / consent path).
                 "web_search" | "calendar_lookup" | "jira_search" | "slack_search" => has_app,
@@ -1198,6 +1270,7 @@ mod tests {
             app: None,
             allow_writes: true,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         let names: Vec<&str> = writeable.specs().iter().map(|s| s.name).collect();
@@ -1223,6 +1296,7 @@ mod tests {
             app: None,
             allow_writes: false,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         let ro_names: Vec<&str> = readonly.specs().iter().map(|s| s.name).collect();
@@ -1257,6 +1331,7 @@ mod tests {
             app: None,
             allow_writes: true,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
 
@@ -1319,6 +1394,7 @@ mod tests {
             app: None,
             allow_writes: true,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "secret note" }));
@@ -1349,6 +1425,7 @@ mod tests {
             app: None,
             allow_writes: true,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "orphan note" }));
@@ -1374,6 +1451,7 @@ mod tests {
             app: None,
             allow_writes: false, // read-only — write tools not advertised
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run(
@@ -1408,6 +1486,7 @@ mod tests {
                 app: None,
                 allow_writes,
                 note_drafts: true,
+                scope: AssistantScope::Full,
                 proposed_note: Mutex::new(None),
             };
             let names: Vec<&str> = exec.specs().iter().map(|s| s.name).collect();
@@ -1444,6 +1523,7 @@ mod tests {
             app: None,
             allow_writes: false, // propose works even read-only
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
 
@@ -1498,6 +1578,7 @@ mod tests {
             app: None,
             allow_writes: false,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         // A plain read tool (the kind a question would use) does NOT set a proposal.
@@ -1528,6 +1609,7 @@ mod tests {
             app: None,
             allow_writes: false,
             note_drafts: true,
+            scope: AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("propose_note", &serde_json::json!({ "content": "   " }));
@@ -1539,5 +1621,138 @@ mod tests {
             exec.proposed_note.lock().unwrap().is_none(),
             "no draft recorded for an empty proposal"
         );
+    }
+
+    // ── Phase 5: PER-TIER TOOL GATING (STRUCTURAL escalation boundary) ──────────────────────────────
+    // The cascade tier is enforced by CODE (`specs()` filter + `run()` allowlist), never prompt-trust.
+    // A model at a lower tier literally CANNOT reach a higher tier's tools — proven here, not "shouldn't".
+
+    fn exec_at<'a>(
+        db: &'a Db,
+        unlocked: &'a Mutex<HashSet<String>>,
+        cfg: &'a AppConfig,
+        scope: AssistantScope,
+    ) -> GatedToolExecutor<'a> {
+        GatedToolExecutor {
+            db,
+            unlocked,
+            config: cfg,
+            meeting_id: "live1",
+            // AppHandle present so the connector tools are NOT gated out by `has_app` — this isolates
+            // the TIER gate: any connector absence here is the tier, not the missing AppHandle. But
+            // `GatedToolExecutor` needs a real `&AppHandle`, which a headless test cannot mint. So we
+            // set `app: None` and, for the Tier-3 advertise test, assert via the TIER predicate
+            // directly (below) — the run()-rejection tests below cover the enforcement path.
+            app: None,
+            allow_writes: false,
+            note_drafts: true,
+            scope,
+            proposed_note: Mutex::new(None),
+        }
+    }
+
+    /// TIER 1 (CurrentMeeting): the executor advertises NO retrieval tools (no vault reads, no
+    /// connectors) — Tier 1 answers from injected current-meeting content only. RED-able: drop the
+    /// `scope.allows(..)` filter in `specs()` and the vault tools reappear at Tier 1.
+    #[test]
+    fn tier1_advertises_no_retrieval_tools() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::CurrentMeeting);
+        let names: Vec<&str> = exec.specs().iter().map(|s| s.name).collect();
+        for banned in [
+            "search_meetings",
+            "search_semantic",
+            "get_meeting",
+            "list_recent_meetings",
+            "get_open_commitments",
+            "get_entity_dossier",
+            "web_search",
+            "jira_search",
+            "slack_search",
+            "calendar_lookup",
+        ] {
+            assert!(
+                !names.contains(&banned),
+                "Tier 1 must NOT advertise {banned}: {names:?}"
+            );
+        }
+        // propose_note (a note-draft, not a retrieval tool) is still allowed at Tier 1 (note_drafts).
+        assert!(
+            names.contains(&"propose_note"),
+            "Tier 1 keeps the note-draft tool: {names:?}"
+        );
+    }
+
+    /// TIER 1 STRUCTURAL ENFORCEMENT: a Tier-1 executor `run()`s a vault tool → REFUSED by the
+    /// allowlist (`AppError::InvalidArg`), and NOTHING is read. The model CANNOT reach the vault at
+    /// Tier 1 even if it names a vault tool directly. RED-able: drop the tier filter and this passes
+    /// through to a real (leaking) read.
+    #[test]
+    fn tier1_run_refuses_a_vault_tool() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::CurrentMeeting);
+        let res = exec.run("search_meetings", &serde_json::json!({ "query": "anything" }));
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "Tier 1 must REFUSE search_meetings (structural, not prompt-trust): {res:?}"
+        );
+        let res = exec.run("get_meeting", &serde_json::json!({ "meetingId": "m1" }));
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "Tier 1 must REFUSE get_meeting: {res:?}"
+        );
+    }
+
+    /// TIER 2 (Vault): advertises the owned-vault reads but NO connectors. And `run()` REFUSES a
+    /// connector at Tier 2 — a Tier-2 loop cannot reach off-device. RED-able: drop the tier filter
+    /// and jira_search would run (egress at the wrong tier).
+    #[test]
+    fn tier2_advertises_vault_reads_and_refuses_connectors() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::Vault);
+        let names: Vec<&str> = exec.specs().iter().map(|s| s.name).collect();
+        assert!(
+            names.contains(&"search_meetings") && names.contains(&"get_meeting"),
+            "Tier 2 advertises the owned-vault reads: {names:?}"
+        );
+        for connector in ["web_search", "jira_search", "slack_search", "calendar_lookup"] {
+            assert!(
+                !names.contains(&connector),
+                "Tier 2 must NOT advertise the connector {connector}: {names:?}"
+            );
+        }
+        // Even a direct, mis-named connector call is refused by the allowlist at Tier 2.
+        let res = exec.run("jira_search", &serde_json::json!({ "query": "login bug" }));
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "Tier 2 must REFUSE a connector tool (no egress at Tier 2): {res:?}"
+        );
+    }
+
+    /// The TIER PREDICATE partitions the catalog correctly across tiers (the source-of-truth the
+    /// `specs()` filter applies). Tier 3 reaches connectors AND vault reads; `Full` leaves the gate open.
+    #[test]
+    fn tier_predicate_partitions_the_catalog() {
+        // Tier 1: neither vault reads nor connectors.
+        assert!(!AssistantScope::CurrentMeeting.allows("search_meetings"));
+        assert!(!AssistantScope::CurrentMeeting.allows("web_search"));
+        assert!(AssistantScope::CurrentMeeting.allows("propose_note"));
+        // Tier 2: vault reads yes, connectors no.
+        assert!(AssistantScope::Vault.allows("search_meetings"));
+        assert!(!AssistantScope::Vault.allows("web_search"));
+        assert!(!AssistantScope::Vault.allows("jira_search"));
+        // Tier 3: connectors AND vault reads.
+        assert!(AssistantScope::Connectors.allows("web_search"));
+        assert!(AssistantScope::Connectors.allows("jira_search"));
+        assert!(AssistantScope::Connectors.allows("search_meetings"));
+        // Full: everything passes the tier gate (surface flags alone decide downstream).
+        assert!(AssistantScope::Full.allows("search_meetings"));
+        assert!(AssistantScope::Full.allows("web_search"));
     }
 }

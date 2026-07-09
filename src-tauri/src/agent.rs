@@ -24,6 +24,21 @@
 use crate::error::Result;
 use crate::reason::LocalReasoner;
 
+/// The BRAIN CASCADE escalation sentinel (Phase 5). A tier's system prompt instructs the model to
+/// reply EXACTLY `{"answer":"__ESCALATE__"}` when the question is NOT answerable at that tier. The
+/// ladder caller ([`crate::transcribe::live`]) detects this in `outcome.answer` and re-runs at the
+/// next tier. It is a DISTINCT signal from `Ok(None)` (the loop ran out of steps → floor WITHIN the
+/// tier): "escalate" means "this tier has no answer, go up"; non-convergence means "I couldn't
+/// converge here". Kept as a shared const so the prompt text and the detector never drift.
+pub const ESCALATE_SENTINEL: &str = "__ESCALATE__";
+
+/// Does this converged answer request escalation to the next cascade tier? True ONLY when the whole
+/// (trimmed) answer IS the sentinel — a substring match would let a real answer that merely mentions
+/// the token escalate by accident. So a genuine Tier-1 answer NEVER escalates.
+pub fn is_escalation(answer: &str) -> bool {
+    answer.trim() == ESCALATE_SENTINEL
+}
+
 /// The outcome of one agentic turn: the brain's final answer, the gated tool-call trace, and the
 /// `[[Title]]` / `(web)` / `(calendar)` citations extracted from GATED tool output only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +363,20 @@ mod tests {
             !out.steps[0].ok,
             "a failed tool is recorded ok=false, never panics"
         );
+    }
+
+    /// Phase 5: the escalation detector fires ONLY on the exact sentinel (trimmed), never on a real
+    /// answer that merely mentions the token — so a genuine Tier-1 answer does NOT escalate.
+    #[test]
+    fn is_escalation_fires_only_on_the_exact_sentinel() {
+        assert!(is_escalation(ESCALATE_SENTINEL));
+        assert!(is_escalation("  __ESCALATE__  "), "trims surrounding whitespace");
+        assert!(
+            !is_escalation("The meeting is about the __ESCALATE__ feature."),
+            "a real answer that MENTIONS the token must NOT escalate"
+        );
+        assert!(!is_escalation("This is answerable here."), "a real answer never escalates");
+        assert!(!is_escalation(""), "an empty answer is not an escalation");
     }
 
     #[test]

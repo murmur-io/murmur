@@ -5115,6 +5115,12 @@ impl Db {
     pub fn graph_edges_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<GraphEdge>> {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
+        // F5: bound the quadratic co-occurrence self-join — return only the strongest edges. The
+        // graph UI (brain-map, ≤60 nodes) consumes only the heaviest connections, so an unbounded
+        // ORDER BY over every co-mentioned entity pair is wasted serialization on a large vault.
+        // Visibility is already enforced in WHERE; a trailing LIMIT trims magnitude only — it can
+        // never widen what is visible.
+        const MAX_GRAPH_EDGES: usize = 600;
         let sql = format!(
             "SELECT a.entity_id, b.entity_id, COUNT(*) AS weight
                FROM entity_mentions a
@@ -5130,7 +5136,8 @@ impl Db {
                       )
                     )
               GROUP BY a.entity_id, b.entity_id
-              ORDER BY weight DESC"
+              ORDER BY weight DESC
+              LIMIT {MAX_GRAPH_EDGES}"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
@@ -7649,6 +7656,51 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the thread reader has nothing to return after the purge"
+        );
+    }
+
+    /// Phase 4 durable thread→meeting binding: a thread row persisted against a PAST meeting
+    /// (the resolved FE-bound scope, `fe_id.or(current_meeting)` in `run_assistant_query`) is
+    /// retrievable under THAT meeting and is INVISIBLE under a DIFFERENT (e.g. currently-recording)
+    /// meeting — proving a bound thread durably answers about its own meeting, not whatever is
+    /// recording. The binding needs NO schema change: it rides the existing `meeting_id` column
+    /// (the resolved scope is what `persist_interaction` stores). RED if `run_assistant_query` had
+    /// kept binding to `current_meeting` while the FE viewed a past meeting.
+    #[test]
+    fn thread_binds_to_its_own_meeting_not_a_different_recording() {
+        let db = mem_db();
+        // The PAST meeting the FE thread is bound to, and a DIFFERENT meeting that is "recording".
+        db.insert_meeting(&sample_meeting("m-past", "2026-07-01T09:00:00Z"))
+            .unwrap();
+        db.insert_meeting(&sample_meeting("m-recording", "2026-07-06T09:00:00Z"))
+            .unwrap();
+        // Persist the exchange against the RESOLVED scope (the FE-bound past meeting) — this is what
+        // `run_assistant_query` now does with
+        // `resolve_scope_meeting(Some("m-past"), None, Some("m-recording"))` (Phase 6: fe > focus > recording).
+        db.insert_assistant_interaction(
+            "m-past",
+            "o czym to spotkanie",
+            "It was the Q3 budget review.",
+            &["[[Budget review]]".to_string()],
+            "ok",
+            Some("research"),
+            Some("t-past"),
+            Some("budget review"),
+            "2026-07-06T09:05:00Z",
+        )
+        .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        // The bound past meeting owns the thread.
+        let past = db.list_assistant_threads_visible("m-past", &nothing).unwrap();
+        assert_eq!(past.len(), 1, "the bound past meeting must own its thread row");
+        assert_eq!(past[0].thread_id, "t-past");
+        // The recording meeting must NOT see it — the binding is durable to the past meeting.
+        assert!(
+            db.list_assistant_threads_visible("m-recording", &nothing)
+                .unwrap()
+                .is_empty(),
+            "a different (recording) meeting must NOT surface the bound thread"
         );
     }
 
