@@ -22,7 +22,7 @@
 //!   `tool+args` into "already retrieved" instead of burning the budget.
 
 use crate::error::Result;
-use crate::reason::LocalReasoner;
+use crate::reason::{GenOptions, LocalReasoner};
 
 /// The BRAIN CASCADE escalation sentinel (Phase 5). A tier's system prompt instructs the model to
 /// reply EXACTLY `{"answer":"__ESCALATE__"}` when the question is NOT answerable at that tier. The
@@ -84,6 +84,13 @@ const RESULT_BUDGET: usize = 4000;
 /// Drive the brain in a bounded decide-or-finish loop over the gated executor. See the module-level
 /// contract. PANIC-FREE: a tool error is recorded `ok=false` and the loop continues; a `structured()`
 /// error is propagated for the caller to floor on.
+///
+/// `opts` (Brain v2 P0.3) is the per-step [`GenOptions`] threaded into EVERY model turn via
+/// [`LocalReasoner::structured_with`] — the live path passes [`GenOptions::live_answer`] (1024-token
+/// cap + 30 s wall-clock timeout), the Ask path [`GenOptions::ask_answer`] (2048 + 30 s). Honored on
+/// the on-device GGUF reasoner (`GenOptions::default()` carries NO timeout — those steps run
+/// unbounded, the pre-P0 behavior); a best-effort no-op on the stub/cloud (their default
+/// `structured_with` delegates to `structured`).
 pub fn run_agentic_loop(
     reasoner: &dyn LocalReasoner,
     system: &str,
@@ -91,6 +98,7 @@ pub fn run_agentic_loop(
     executor: &dyn ToolExecutor,
     max_steps: usize,
     sink: Option<&dyn DeltaSink>,
+    opts: GenOptions,
 ) -> Result<Option<AgentOutcome>> {
     let catalog = render_catalog(&executor.specs());
     let agent_system = format!(
@@ -115,7 +123,8 @@ pub fn run_agentic_loop(
 
     for _ in 0..max_steps {
         // PROPAGATE a structured() error (esp. Unavailable on no-consent) — never swallow it.
-        let v = reasoner.structured(&agent_system, &transcript, &step_schema)?;
+        // P0.3: every step rides the caller's GenOptions (token cap; timeout on the GGUF path).
+        let v = reasoner.structured_with(&agent_system, &transcript, &step_schema, opts)?;
 
         if let Some(answer) = v.get("answer").and_then(|a| a.as_str()) {
             let answer = answer.trim();
@@ -294,6 +303,7 @@ mod tests {
             &EchoExec,
             4,
             Some(&sink as &dyn DeltaSink),
+            GenOptions::default(),
         )
         .unwrap()
         .expect("converged → Some");
@@ -320,7 +330,7 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "a" } }),
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "b" } }),
         ]);
-        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 2, None).unwrap();
+        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 2, None, GenOptions::default()).unwrap();
         assert!(
             out.is_none(),
             "non-convergence must return Ok(None), not a fabricated answer"
@@ -332,7 +342,7 @@ mod tests {
         // structured() errors (e.g. no-consent cloud) → the loop PROPAGATES Err, never swallows it,
         // so the caller can floor + emit needs_consent.
         let r = ScriptReasoner::with(vec![Err(AppError::Unavailable("no consent".into()))]);
-        let res = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None);
+        let res = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None, GenOptions::default());
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
             "Unavailable must propagate"
@@ -354,7 +364,7 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": {} }),
             serde_json::json!({ "answer": "done despite the error" }),
         ]);
-        let out = run_agentic_loop(&r, "sys", "q", &ErrExec, 4, None)
+        let out = run_agentic_loop(&r, "sys", "q", &ErrExec, 4, None, GenOptions::default())
             .unwrap()
             .unwrap();
         assert_eq!(out.answer, "done despite the error");
@@ -388,7 +398,7 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "x" } }),
             serde_json::json!({ "answer": "answered after a dedup" }),
         ]);
-        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 5, None)
+        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 5, None, GenOptions::default())
             .unwrap()
             .unwrap();
         assert_eq!(out.answer, "answered after a dedup");
