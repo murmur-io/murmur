@@ -137,7 +137,26 @@ pub struct AppState {
     /// handle), caching only the expensive local GGUF instance. Consumers call
     /// `state.reasoner.current()` per turn — never hold a resolved reasoner across turns.
     pub reasoner: crate::reason::ReasonerCell,
+    /// The RECORDING pointer: `Some` ONLY while a recording is in flight — set at
+    /// `start_recording`, `take()`-cleared at `stop_recording`. It is NOT a "what the user is
+    /// looking at" pointer; a past meeting the user opens while idle (or while a DIFFERENT meeting
+    /// records) is NOT here. Using it as the brain's "this meeting" scope was the root of the
+    /// wrong-meeting fragility — that role now belongs to [`AppState::focus_meeting`] (Phase 6),
+    /// with `current_meeting` demoted to the last-resort recording fallback in
+    /// [`crate::transcribe::live::resolve_scope_meeting`].
     pub current_meeting: Mutex<Option<uuid::Uuid>>,
+    /// PHASE 6 — the FOCUS pointer: the meeting the user is currently VIEWING / anchored to (a
+    /// meeting-detail or conversation the FE opened), INDEPENDENT of recording. The FE sets it via
+    /// `set_focus_meeting(Some(id))` when it opens a meeting view and clears it (`None`) when it
+    /// closes — so the brain's Tier-1 "this meeting" scope is deterministic even when nothing is
+    /// recording AND when a different meeting is recording. Precedence
+    /// (`resolve_scope_meeting`): an explicit FE-sent `meeting_id` (a bound thread) wins over
+    /// `focus_meeting`, which wins over `current_meeting` (recording). This is ONLY an id (never
+    /// meeting content), so it needs no
+    /// seal/clear-on-relock — a relock re-masks the focused meeting's CONTENT through the same
+    /// `meeting_is_visible` gate `gated_live_context` already fail-closes on; the stale id itself
+    /// leaks nothing. Blank/whitespace counts as absent. No PII (opaque id only).
+    pub focus_meeting: Mutex<Option<String>>,
     /// Accumulated rough transcript of the recording IN PROGRESS, built from the live captions
     /// (`transcribe::live`). Segments aren't persisted until Stop, so this is the ONLY in-flight
     /// view of "what's being said right now" — the in-meeting assistant injects it so it can answer
@@ -259,6 +278,7 @@ impl AppState {
             config,
             reasoner,
             current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
             capped_notified: AtomicBool::new(false),
             reactions_shadow_count: AtomicU64::new(0),

@@ -321,6 +321,12 @@
     }
   </section>
 
+  <!-- LIVE CONTEXT — enrich this note with fresh detail from connected tools (Jira / Slack / web).
+       Sits right after the note summary; egress is on-demand + kept loud. Only rendered for an
+       unlocked meeting (note-panel itself is under the detail view's `@else (!locked())`). Bubbles
+       apply/clear up via (noteChanged) so the parent reloads the note. -->
+  <app-stage2-panel [meetingId]="meetingId()" (noteChanged)="noteChanged.emit()" />
+
   <!-- ASSISTANT Q&A (persisted in-meeting voice exchanges). -->
   @if (interactions().length) {
     <section class="block print-keep">
@@ -373,6 +379,18 @@
   </section>
 
   <!-- RELATED BY MEANING (semantic neighbors; silent when empty). -->
-  <app-related-meetings [meetingId]="meetingId()" (open)="openRelated.emit($event)" />
+  <!-- PERF/OOM (P1): defer until it scrolls into view. Its `_load` effect fires the on-device e5
+       embedder the instant it mounts; on a fresh meeting open that ran CONCURRENTLY with the
+       timeline's heavy model load (a second resident model) — a compounding factor in the open-a-1h
+       -meeting OOM. `on viewport` means a plain Note-tab open (Related sits below the fold) never
+       loads the embedder until the user actually scrolls to it. docs/research/2026-07-07-perf-memory-audit.md -->
+  @defer (on viewport) {
+    <app-related-meetings
+      [meetingId]="meetingId()"
+      (open)="openRelated.emit($event)"
+    />
+  } @placeholder {
+    <div class="related-defer-placeholder" aria-hidden="true"></div>
+  }
 </div>
   

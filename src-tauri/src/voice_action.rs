@@ -37,6 +37,22 @@ use crate::settings::AppConfig;
 use crate::storage::Db;
 use crate::tools::{execute_tool, ToolCall};
 
+/// Which BRAIN CASCADE tier answered this turn (Phase 5) — set DETERMINISTICALLY by the ladder from
+/// the tier that CONVERGED, never string-sniffed from the answer. Surfaced to the FE (as
+/// `answeredFrom`) so it can render a "answered from: this meeting / your vault / connectors" chip.
+/// `None` ⇒ this result did not run through the cascade (the deterministic floor, an error, or a
+/// non-cascade surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnsweredFrom {
+    /// Tier 1 — answered from the current meeting in isolation.
+    CurrentMeeting,
+    /// Tier 2 — answered from the owned vault.
+    Vault,
+    /// Tier 3 — answered with the help of connectors/web.
+    Connectors,
+}
+
 /// The outcome of dispatching one [`VoiceIntent`], emitted to the FE as a live event. Carries NO raw
 /// transcript beyond the user's own dictated command — `summary` is the brain's answer (research/
 /// recall) or a short status line; `citations` are the `[[Title]]` wikilinks the answer was grounded
@@ -70,6 +86,10 @@ pub struct VoiceActionResult {
     /// the right pending bubble. Serializes to `threadId`; the dispatch threads it on via
     /// [`Self::with_thread_id`]. NOT PII (an opaque UUID).
     pub thread_id: Option<String>,
+    /// Which BRAIN CASCADE tier answered (Phase 5), set DETERMINISTICALLY by the ladder from the tier
+    /// that converged — never string-sniffed. Serializes to `answeredFrom`. `None` when this result
+    /// did not run through the cascade (the deterministic floor / error / a non-cascade surface).
+    pub answered_from: Option<AnsweredFrom>,
 }
 
 impl VoiceActionResult {
@@ -82,6 +102,7 @@ impl VoiceActionResult {
             citations: Vec::new(),
             proposed_note: None,
             thread_id: None,
+            answered_from: None,
         }
     }
 
@@ -115,21 +136,42 @@ impl VoiceActionResult {
     /// Map a converged agentic-loop [`crate::agent::AgentOutcome`] onto the FE result DTO. The intent
     /// KIND comes from the resolved intent (recall vs research); the answer + GATED citations come
     /// straight off the loop. `command` is threaded on by the caller via [`Self::with_command`].
-    pub fn from_agent(intent: &VoiceIntent, outcome: crate::agent::AgentOutcome) -> Self {
+    ///
+    /// Phase 5: `answered_from` is set DETERMINISTICALLY by the ladder to the tier that converged
+    /// (never string-sniffed). `extra_citations` lets the ladder PREPEND tier-specific attributions
+    /// that the loop's `gathered`-scraped citations miss: Tier 1's own `[[Title]]` (prompt-injected
+    /// current-meeting content produces no wikilink in `gathered`), and Tier 3 connector loud-lines
+    /// (like `rag_answer`). They are merged in FIRST-SEEN order, de-duplicated against the loop's own.
+    pub fn from_agent(
+        intent: &VoiceIntent,
+        outcome: crate::agent::AgentOutcome,
+        answered_from: AnsweredFrom,
+        extra_citations: Vec<String>,
+    ) -> Self {
         let intent_kind = match intent {
             VoiceIntent::Recall { .. } => "recall",
             _ => "research",
         };
+        // Merge tier-specific citations FIRST, then the loop's gated ones, de-duplicated in
+        // first-seen order (mirrors `extract_citations`'s de-dup discipline).
+        let mut citations: Vec<String> = Vec::new();
+        for c in extra_citations.into_iter().chain(outcome.citations) {
+            let c = c.trim().to_string();
+            if !c.is_empty() && !citations.contains(&c) {
+                citations.push(c);
+            }
+        }
         Self {
             intent_kind: intent_kind.to_string(),
             status: "ok".to_string(),
             summary: outcome.answer,
             command: String::new(),
-            citations: outcome.citations,
+            citations,
             // The caller (`run_informational`) threads any `propose_note` draft on via
             // `with_proposed_note` after reading the executor; the loop outcome itself has none.
             proposed_note: None,
             thread_id: None,
+            answered_from: Some(answered_from),
         }
     }
 
@@ -154,6 +196,29 @@ impl VoiceActionResult {
 const NO_MODEL_ANSWER_NOTICE: &str = "No AI model is available to answer — showing matching notes \
     instead. Pick a provider or download an on-device model in Settings.";
 
+/// RECORDING-AWARENESS phrases — the THREE load-bearing substrings the CLOUD cascade prompt
+/// ([`crate::transcribe::live::assistant_system_prompt`]) already asserts (test
+/// `assistant_system_prompt_scopes_empty_buffer_to_the_live_recording`), lifted into ONE place so the
+/// deterministic FLOOR (`rag_answer`, reasoner-only backend that skips the cascade) frames a live
+/// recording IDENTICALLY and the two prompts cannot drift. These are BARE substrings composed into the
+/// prose below — NOT the whole clause — so both prompts read naturally while sharing the exact wording
+/// the cascade test pins.
+///
+/// - [`RECORDING_NOW_PHRASE`]: a meeting is being **recorded RIGHT NOW** (both the empty-buffer and
+///   has-content recording cases open with it).
+/// - [`MEETING_JUST_STARTED_PHRASE`]: the honest empty-buffer answer — the **meeting just started** and
+///   little has been captured.
+/// - [`NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE`]: the substitution BAN — **do NOT search the vault for
+///   other saved meetings** and describe them as if they were this one.
+///
+/// The cascade `assistant_system_prompt` duplicates this wording verbatim (its own tests pin the exact
+/// substrings); wiring these consts INTO it would risk those verified tests, so it keeps its literal
+/// prose with a cross-reference comment. The shared consts are the single source the FLOOR uses.
+pub(crate) const RECORDING_NOW_PHRASE: &str = "recorded RIGHT NOW";
+pub(crate) const MEETING_JUST_STARTED_PHRASE: &str = "meeting just started";
+pub(crate) const NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE: &str =
+    "do NOT search the vault for other saved meetings";
+
 /// Dispatch one parsed [`VoiceIntent`] over the GATED vault + consent-gated brain. Synchronous (the
 /// live loop spawns it off-thread) and PANIC-FREE: every fallible step degrades to a graceful
 /// `VoiceActionResult`.
@@ -166,6 +231,20 @@ const NO_MODEL_ANSWER_NOTICE: &str = "No AI model is available to answer — sho
 /// "pogoda"), NOT a brain-translated/normalized topic that the exact-term FTS would miss. The brain
 /// topic is still used for SYNTHESIS + as an additional retrieval leg; the literal terms are the
 /// must-have. Empty/whitespace falls back to the intent topic alone.
+///
+/// `current_meeting_context` is the CURRENT (recording / focused-and-viewed) meeting's gated live
+/// context — its live transcript tail + the user's typed notes, ALREADY visibility-gated by the
+/// caller through `gated_live_context` (a sealed-not-visible meeting yields an EMPTY string, so this
+/// path never reads ungated content). When non-empty it is PREPENDED to the vault grounding as the
+/// PRIMARY, clearly-labeled source so the floor answers about THIS meeting first (fixing the
+/// "describes other meetings" symptom on the local/reasoner-only backend that skips the cascade).
+/// EMPTY ⇒ vault-only grounding, byte-identical to the prior floor.
+///
+/// `recording_in_progress` is the recorder-lock flag (`state.recorder.lock().map(|g| g.is_some())`),
+/// NOT a content read — the same bool the CLOUD cascade computes. It gives the FLOOR RECORDING
+/// AWARENESS so a live recording is framed as the current meeting being **recorded RIGHT NOW** (see
+/// [`RECORDING_NOW_PHRASE`] and the two recording branches in [`rag_answer`]). `false` ⇒ the prior
+/// viewed-past-meeting / idle behavior is byte-compatible.
 #[allow(clippy::too_many_arguments)] // cohesive dispatch surface: intent + gated state + the AppHandle.
 pub fn handle_voice_action(
     intent: &VoiceIntent,
@@ -175,6 +254,8 @@ pub fn handle_voice_action(
     config: &AppConfig,
     meeting_id: &str,
     literal_command: &str,
+    current_meeting_context: &str,
+    recording_in_progress: bool,
     app: Option<&tauri::AppHandle>,
 ) -> VoiceActionResult {
     match intent {
@@ -182,6 +263,8 @@ pub fn handle_voice_action(
             "research",
             topic,
             literal_command,
+            current_meeting_context,
+            recording_in_progress,
             reasoner,
             db,
             unlocked,
@@ -192,6 +275,8 @@ pub fn handle_voice_action(
             "recall",
             entity,
             literal_command,
+            current_meeting_context,
+            recording_in_progress,
             reasoner,
             db,
             unlocked,
@@ -354,6 +439,330 @@ fn retrieval_queries(topic: &str, literal_command: &str) -> Vec<String> {
     queries
 }
 
+/// The coarse `intent_kind` discriminant for a [`VoiceIntent`] — the SAME mapping the card path uses
+/// (`from_agent`): `Recall` → `"recall"`, everything else → `"research"`. Used by the deterministic
+/// current-first floor to badge its Tier-1 answer consistently with the fan-out floor. Since the
+/// floor only ever runs read intents (`floor_intent_for` demotes writes to `Research`), this is
+/// always `research` or `recall` on the floor.
+pub(crate) fn intent_kind_str(intent: &VoiceIntent) -> &'static str {
+    match intent {
+        VoiceIntent::Recall { .. } => "recall",
+        _ => "research",
+    }
+}
+
+/// TIER-1 CLASSIFIER (deterministic, EN + PL) — is the user asking about the CURRENT meeting itself
+/// ("what is THIS meeting about", "summarize this recording", "co tu ustaliliśmy")? A CONSERVATIVE
+/// match: it fires ONLY on a clear "this meeting / this conversation / here" question so the
+/// current-first floor can answer from the current meeting in ISOLATION (no vault fan-out, no web
+/// leg). When unsure it returns `false`, and the floor behaves EXACTLY as before (the vault + web
+/// fan-out), so cross-meeting ("co ustaliliśmy z Weroniką") and world ("jaka pogoda") questions are
+/// untouched.
+///
+/// This is the structural fix for "o czym jest to spotkanie" web-searching the WORD "meeting":
+/// deterministically recognizing a current-meeting question lets the floor STOP at the current
+/// meeting instead of fanning a `research` intent out to the web.
+///
+/// The matcher is intentionally lexical (substring over a normalized command), not a model call —
+/// the whole point of the deterministic floor is that a weak local model can't be trusted to route.
+pub(crate) fn is_about_current_meeting(command: &str) -> bool {
+    // Normalize: lowercase + strip Polish diacritics so "rozmowę"/"rozmowe" and "spotkaniu" match on
+    // stems, and collapse whitespace. We match on stems/substrings, never whole-word equality, so
+    // inflected Polish endings (spotkani-e/-u/-a, rozmow-a/-e/-ie) all hit.
+    let norm = normalize_for_match(command);
+    let n = norm.as_str();
+    if n.is_empty() {
+        return false;
+    }
+
+    // A "HERE" DEICTIC — "tu"/"tutaj"/"here" ONLY (NOT "to"/"this"), for the `pl_here_verb` rule
+    // ("co TU ustaliliśmy"). Deliberately excludes "to"/"this": the Polish relative pronoun "to co"
+    // ("that which") in a CROSS-MEETING "podsumuj TO CO ustaliliśmy na spotkaniach" carries "to" but
+    // is NOT a here-anchor, and matching it stole that request into current-meeting isolation
+    // (adversarial 2026-07-09 round 2). Whole-token "tu" so it never sub-matches "sta**tu**s".
+    let has_here = n.contains(" tu ")
+        || n.starts_with("tu ")
+        || n.ends_with(" tu")
+        || n.contains(" tutaj")
+        || n.contains("tutaj ")
+        || n.contains(" here")
+        || n.contains("here ");
+
+    // A "THIS MEETING" PHRASE — the deictic IMMEDIATELY ADJACENT to a current-meeting noun (EN + PL
+    // singular, diacritics stripped). This is the load-bearing discriminant: matching a bare "this"
+    // + a "meeting" noun ANYWHERE in the string false-matched "summarize THIS WEEK'S MEETINGS" /
+    // "podsumuj TO co ustaliliśmy NA SPOTKANIACH" (deictic modifies "week's", not the meeting; the
+    // noun is plural/cross-meeting) → those got stolen from the vault fan-out (adversarial 2026-07-09).
+    // Requiring adjacency ("this meeting" / "to spotkanie" / "tę rozmowę") keeps the current-meeting
+    // cases and rejects "this week's meetings" (not adjacent). PL feminine list uses singular forms
+    // only ("ta/te/tej rozmow…", "te rozmowe" = tę rozmowę acc) so "te rozmowy" (plural) doesn't hit.
+    const THIS_MEETING_PHRASES: &[&str] = &[
+        // English "this <meeting-noun>".
+        "this meeting", "this conversation", "this call", "this recording",
+        // Polish neuter (spotkanie / nagranie): to/tego/tym <noun>.
+        "to spotkani", "tego spotkani", "tym spotkani", "to nagrani", "tego nagrani", "tym nagrani",
+        // Polish feminine (rozmowa) — SINGULAR only.
+        "ta rozmow", "te rozmowe", "tej rozmow",
+    ];
+    let has_this_meeting_phrase = THIS_MEETING_PHRASES.iter().any(|p| n.contains(p));
+
+    // "what is X about" / "o czym (jest) X" — the canonical describe-this question.
+    let about_phrasing = n.contains("what is")
+        || n.contains("what's")
+        || n.contains("whats ")
+        || n.contains("o czym");
+    if about_phrasing && has_this_meeting_phrase {
+        return true;
+    }
+
+    // A reference to ANOTHER PARTY ("with X" / "z X") makes it a CROSS-MEETING question
+    // ("co ustaliliśmy z Weroniką", "what did we decide with Weronika") — never current-first.
+    let has_other_party = n.contains(" with ") || n.contains(" z ");
+
+    // "summarize / recap / streść / podsumuj THIS meeting|recording|conversation". REQUIRES the
+    // adjacent "this <meeting-noun>" phrase AND no other party — so a CROSS-MEETING summarize
+    // ("podsumuj moje spotkania", "summarize my meetings", "summarize this week's meetings",
+    // "podsumuj spotkania z Weroniką") is NOT stolen from the vault fan-out. A bare "summarize this"
+    // (verb + deictic, no meeting noun) is deliberately NOT matched — it degrades to the fan-out floor
+    // (a MISS is safe; a false-steal is a regression).
+    let summarize_verb = n.contains("summarize")
+        || n.contains("summarise")
+        || n.contains("recap")
+        || n.contains("podsumuj")
+        || n.contains("streszcz") // streść → strescz after diacritic-strip of ś→s, ć→c
+        || n.contains("stresc");
+    if summarize_verb && has_this_meeting_phrase && !has_other_party {
+        return true;
+    }
+
+    // PL "co (tu/tutaj) ustaliliśmy / omówiliśmy / zdecydowaliśmy / powiedziano" — a "what happened
+    // HERE" question. REQUIRES the HERE deictic ("tu"/"tutaj") — NOT a bare "to" — so a cross-meeting
+    // "co ustaliliśmy z Weroniką" (no here-anchor) and "podsumuj to co ustaliliśmy na spotkaniach"
+    // (relative "to co", plural "na spotkaniach") do NOT match.
+    let pl_here_verb = n.contains("ustalili")
+        || n.contains("omowili")
+        || n.contains("zdecydowali")
+        || n.contains("powiedziano")
+        || n.contains("powiedzielismy");
+    if pl_here_verb && has_here && !has_other_party {
+        return true;
+    }
+
+    // EN "what did we (just) discuss / decide (here)" — SELF-ANCHORING to the current conversation
+    // ("we, now"), so it fires WITHOUT a separate deictic — UNLESS it references another party
+    // ("...with Weronika"), which makes it cross-meeting.
+    let en_self_verb = n.contains("did we discuss")
+        || n.contains("did we decide")
+        || n.contains("we just discuss")
+        || n.contains("we just decide")
+        || n.contains("we just talk");
+    if en_self_verb && !has_other_party {
+        return true;
+    }
+
+    false
+}
+
+/// Lowercase + strip common Polish diacritics + collapse internal whitespace, so the current-meeting
+/// classifier can stem-match inflected Polish ("rozmowę"→"rozmowe", "streść"→"stresc") without a
+/// dependency. Pure + total; never panics.
+fn normalize_for_match(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_ws = true; // trim leading whitespace
+    for ch in s.chars() {
+        let lc = match ch {
+            'ą' | 'Ą' => 'a',
+            'ć' | 'Ć' => 'c',
+            'ę' | 'Ę' => 'e',
+            'ł' | 'Ł' => 'l',
+            'ń' | 'Ń' => 'n',
+            'ó' | 'Ó' => 'o',
+            'ś' | 'Ś' => 's',
+            'ż' | 'Ż' | 'ź' | 'Ź' => 'z',
+            other => other,
+        };
+        if lc.is_whitespace() {
+            if !last_ws {
+                out.push(' ');
+                last_ws = true;
+            }
+        } else {
+            for c in lc.to_lowercase() {
+                out.push(c);
+            }
+            last_ws = false;
+        }
+    }
+    // trim trailing whitespace
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// TIER-1 ISOLATED ANSWER (deterministic current-first floor): synthesize a concise answer over ONLY
+/// the CURRENT meeting's own content — NO vault fan-out, NO web leg, NO calendar. The caller
+/// (`run_informational`) has already assembled `current_content` through a VISIBILITY-GATED reader
+/// (live buffer via `gated_live_context`, OR a viewed past meeting's `get_segments` +
+/// `get_note_if_visible` under `meeting_is_visible`); a sealed-not-unlocked meeting yields an EMPTY
+/// string, so this path never reads or synthesizes sealed content.
+///
+/// EMPTY `current_content` ⇒ an HONEST short notice in the user's language (recording → "just
+/// started / nothing captured yet"; viewed past meeting → "no transcript/notes to summarize"), with
+/// NO fan-out. This is what stops "o czym jest to spotkanie" from web-searching the word "meeting".
+///
+/// The prompt deliberately does NOT hand the model a literal "THIS MEETING" section header (which the
+/// weak local model would echo as its opening words) — it frames the content as "the transcript and
+/// notes below" and instructs the model not to preface with a label.
+///
+/// `meeting_title` is the current meeting's OWN gated title (resolved by the caller via
+/// `get_meeting`, VISIBLE-only) — cited as `[[Title]]` so the answer attributes itself to the
+/// current meeting, never to a vault/web source.
+///
+/// EGRESS: rides the SAME consent-gated reasoner as every other floor answer (a Cloud reasoner routes
+/// through `make_provider`'s consent gate + RedactingProvider). No new egress class; the ONLY content
+/// that reaches the model is the already-gated current meeting.
+pub(crate) fn answer_current_meeting_isolated(
+    intent_kind: &str,
+    literal_command: &str,
+    current_content: &str,
+    recording_in_progress: bool,
+    meeting_title: Option<&str>,
+    reasoner: &dyn LocalReasoner,
+) -> VoiceActionResult {
+    let content = current_content.trim();
+    let citations: Vec<String> = meeting_title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| vec![format!("[[{t}]]")])
+        .unwrap_or_default();
+
+    // EMPTY current content ⇒ honest "just started / no content" notice, in the user's language. NO
+    // fan-out, NO web, NO other-meeting substitution. We ask the reasoner ONLY to translate a short
+    // honest sentence into the user's language (with an English fallback baked in), so even here the
+    // model never sees vault/web content and never describes another meeting.
+    if content.is_empty() {
+        let english = if recording_in_progress {
+            "This meeting just started — nothing has been captured from it yet, so there is \
+             nothing to summarize."
+        } else {
+            "This meeting has no transcript or notes to summarize."
+        };
+        // STUB / no brain: return the English notice verbatim (no translation available). Honest,
+        // no fan-out.
+        if reasoner.id() == "stub" {
+            return VoiceActionResult {
+                intent_kind: intent_kind.to_string(),
+                status: "ok".to_string(),
+                summary: english.to_string(),
+                command: String::new(),
+                citations,
+                proposed_note: None,
+                thread_id: None,
+                answered_from: Some(AnsweredFrom::CurrentMeeting),
+            };
+        }
+        let system = "You are an in-meeting assistant. Reply with EXACTLY the sentence below, \
+                      translated into the SAME language the user wrote their request in (look at \
+                      the user's OWN words, NOT this English instruction). Do not add anything, do \
+                      not mention other meetings, do not search anything.";
+        let user = format!(
+            "User's request (their own words): {}\n\nSentence to translate: {english}",
+            literal_command.trim()
+        );
+        let summary = match reasoner.reason(system, &user) {
+            Ok(a) if !a.trim().is_empty() => a.trim().to_string(),
+            // Any failure (incl. no-consent Unavailable) ⇒ the honest English notice, never a
+            // fan-out. The user still gets a truthful, non-leaking answer.
+            _ => english.to_string(),
+        };
+        return VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "ok".to_string(),
+            summary,
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+            answered_from: Some(AnsweredFrom::CurrentMeeting),
+        };
+    }
+
+    // STUB / no real brain: cannot synthesize. Return the honest no-model notice + KEEP the current
+    // meeting's own citation (mirrors the `rag_answer` stub shim), never a fan-out.
+    if reasoner.id() == "stub" {
+        return VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "unavailable".to_string(),
+            summary: NO_MODEL_ANSWER_NOTICE.to_string(),
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+            answered_from: Some(AnsweredFrom::CurrentMeeting),
+        };
+    }
+
+    // ISOLATED SYNTHESIS over ONLY the current meeting. No "THIS MEETING" label the model can parrot;
+    // no instruction to consult the vault or the web. Language directive mirrors the fan-out floor.
+    let system = "You are summarizing the meeting the user is currently in. Answer their question \
+                  about it CONCISELY (2-4 sentences) using ONLY the transcript and notes provided \
+                  below — do not use any other source and do not invent facts. Do NOT preface your \
+                  answer with a label or heading (no \"This meeting:\"); answer naturally. Write \
+                  your answer in the SAME language the user actually wrote in — look at the user's \
+                  OWN words below, NOT the language of this instruction or of the transcript. If the \
+                  user wrote in Polish, answer in Polish; NEVER default to English.";
+    let user = format!(
+        "User's request (their own words): {}\n\nThe meeting's transcript and the user's notes:\n{content}",
+        literal_command.trim()
+    );
+    match reasoner.reason(system, &user) {
+        Ok(answer) if !answer.trim().is_empty() => VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "ok".to_string(),
+            summary: answer.trim().to_string(),
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+            answered_from: Some(AnsweredFrom::CurrentMeeting),
+        },
+        Ok(_) => VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "ok".to_string(),
+            summary: "I have this meeting's transcript but couldn't compose a summary just now."
+                .to_string(),
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+            answered_from: Some(AnsweredFrom::CurrentMeeting),
+        },
+        // No cloud consent ⇒ fail closed with a graceful notice — NEVER a fan-out to the web.
+        Err(AppError::Unavailable(_)) => VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "needs_consent".to_string(),
+            summary: "The cloud brain needs your one-time consent to answer (Settings ▸ Privacy)."
+                .to_string(),
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+            answered_from: Some(AnsweredFrom::CurrentMeeting),
+        },
+        Err(e) => VoiceActionResult {
+            intent_kind: intent_kind.to_string(),
+            status: "error".to_string(),
+            summary: non_pii_error(&e),
+            command: String::new(),
+            citations,
+            proposed_note: None,
+            thread_id: None,
+            answered_from: Some(AnsweredFrom::CurrentMeeting),
+        },
+    }
+}
+
 /// Local-first RAG over the user's OWN gated vault (NOT a web search): run the gated read tools for
 /// the topic/entity, feed ONLY the gated results to the brain, return a brief cited answer.
 ///
@@ -365,6 +774,8 @@ fn rag_answer(
     intent_kind: &str,
     topic: &str,
     literal_command: &str,
+    current_meeting_context: &str,
+    recording_in_progress: bool,
     reasoner: &dyn LocalReasoner,
     db: &Db,
     unlocked: &HashSet<String>,
@@ -510,6 +921,17 @@ fn rag_answer(
     }
     let grounding = grounding.trim();
 
+    // CURRENT-MEETING-FIRST (fixes the "describes other meetings" symptom on the local/reasoner-only
+    // floor): the caller already fetched THIS meeting's live transcript + typed notes through the
+    // GATED `gated_live_context` (a sealed-not-visible meeting yields ""), so it is safe to use here —
+    // no ungated read happens in this function. When present, it becomes the PRIMARY, clearly-labeled
+    // grounding section, PREPENDED before the vault notes, so the brain answers about THIS meeting
+    // first and only reaches for the vault for cross-meeting context. EMPTY ⇒ vault-only, byte-
+    // identical to the prior floor. It does NOT feed vault-citation extraction below (it is the
+    // current meeting, not a cross-note citation) and its presence alone counts as real grounding.
+    let current_ctx = current_meeting_context.trim();
+    let has_current = !current_ctx.is_empty();
+
     // CITATIONS: derived from a GATED `search_visible` over the SAME live unlocked set — every hit
     // names a VISIBLE meeting (a sealed-not-unlocked meeting is filtered out by visibility_clause),
     // rendered as `[[Title]]`. Plus any `[[Title]]` wikilinks the tool grounding already carried
@@ -562,8 +984,10 @@ fn rag_answer(
         }
     }
 
-    // No grounding at all → don't burn a brain call; return a clean "nothing found".
-    if grounding.is_empty() {
+    // No grounding at all → don't burn a brain call; return a clean "nothing found". The CURRENT
+    // meeting's gated context counts as grounding, so a live/focused meeting is always answerable from
+    // itself even when the vault legs found nothing.
+    if grounding.is_empty() && !has_current {
         return VoiceActionResult::new(
             intent_kind,
             "ok",
@@ -588,22 +1012,98 @@ fn rag_answer(
             citations,
             proposed_note: None,
             thread_id: None,
+            // The deterministic floor is not a cascade tier.
+            answered_from: None,
         };
     }
 
     // The brain may now ground its answer on BOTH the user's vault notes AND any web results. The
     // prompt allows web facts (attributed) so a "what's the weather" question the vault can't answer
     // is still answered from the web leg, while vault-answerable questions stay vault-grounded.
-    let system = "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 \
-                  sentences) using ONLY the provided context: the user's own meeting notes AND any \
-                  WEB results (lines beginning \"[web\"). Cite vault meetings by their [[Title]] \
-                  wikilink and attribute web facts as \"(via web)\". If the context doesn't cover \
-                  it, say so plainly. Do not invent facts.";
-    let user = format!("Request: {display_query}\n\nNotes from the vault:\n{grounding}");
+    //
+    // CURRENT-FIRST: when THIS meeting's gated context is present the prompt tells the brain to answer
+    // about "this meeting" from its own transcript FIRST and treat the vault notes as SECONDARY (cross-
+    // meeting) context only — this is what stops the local floor from describing OTHER meetings.
+    //
+    // LANGUAGE (fixes the English-answer symptom): mirror the cascade/agent directive
+    // (agent.rs) — the final answer must be in the SAME language the USER actually wrote in (their own
+    // words in the request, NOT the language of these English instructions). Polish in → Polish out.
+    // The user's literal command is echoed into the `user` message below so the model can see the
+    // original words even when `display_query` is a brain-translated/normalized topic.
+    // RECORDING AWARENESS (back-ported from the CLOUD cascade's `assistant_system_prompt`): when a
+    // recording is IN PROGRESS the floor must frame the current meeting as the LIVE recording, not a
+    // viewed past meeting — and, critically, when the live buffer is EMPTY (meeting just started) it
+    // must NOT let the vault grounding be described as if it were this meeting. The exact wording of
+    // the three load-bearing phrases is SHARED with the cascade via the `*_PHRASE` consts so the two
+    // prompts cannot drift. Three cases (see the four-way matrix on recording × has_current):
+    //   1. recording + buffer HAS content  → THIS MEETING section is the live transcript; answer from
+    //      it FIRST, vault is cross-meeting context only.
+    //   2. recording + buffer EMPTY         → the gap this task closes: say plainly the meeting just
+    //      started; forbid substituting other saved meetings even though vault grounding is present.
+    //   3. NOT recording                    → unchanged prior behavior (viewed-past-meeting clause when
+    //      has_current; empty otherwise) — no regression for the Ask page / idle / viewed-meeting.
+    let current_clause = if recording_in_progress && has_current {
+        format!(
+            " A meeting is being {RECORDING_NOW_PHRASE} and the THIS MEETING section is its LIVE \
+             transcript (plus the user's own typed notes) so far — answer about THIS meeting from that \
+             section FIRST. When the user asks what \"this meeting\"/\"this conversation\"/\"ta \
+             rozmowa\" is about, answer FROM that live transcript; {NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE} \
+             and describe them as if they were this one. The vault notes are cross-meeting context only, \
+             never the primary subject."
+        )
+    } else if recording_in_progress {
+        // Buffer EMPTY while recording: the meeting just started (or the user hasn't spoken / captions
+        // lag). Vault grounding may still be present for an EXPLICIT saved-notes question, but the
+        // framing FORBIDS treating it as the current meeting.
+        format!(
+            " A meeting is being {RECORDING_NOW_PHRASE} but nothing has been transcribed from it yet \
+             (it just started or the user has not spoken much). If the user asks about THIS \
+             meeting/\"this conversation\"/\"ta rozmowa\", say plainly the {MEETING_JUST_STARTED_PHRASE} \
+             and little has been captured so far — {NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE} and describe \
+             them as if they were this one. Use the vault notes ONLY when the user EXPLICITLY asks about \
+             their saved notes/past meetings."
+        )
+    } else if has_current {
+        " The provided context includes a THIS MEETING section (the current meeting's live transcript \
+         and the user's own typed notes) — answer about THIS meeting from that section FIRST, and use \
+         the vault notes only for cross-meeting context, not as the primary subject."
+            .to_string()
+    } else {
+        String::new()
+    };
+    let system = format!(
+        "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 sentences) using \
+         ONLY the provided context: the current meeting, the user's own meeting notes AND any WEB \
+         results (lines beginning \"[web\").{current_clause} Cite vault meetings by their [[Title]] \
+         wikilink and attribute web facts as \"(via web)\". If the context doesn't cover it, say so \
+         plainly. Do not invent facts. Write your final answer in the SAME language the USER actually \
+         wrote in — look at the user's OWN words in their request below, NOT at the language of these \
+         instructions or the surrounding context (which are in English). If the user wrote in Polish, \
+         answer in Polish; match the user's language exactly and NEVER default to English."
+    );
+    // The user message leads with the user's ORIGINAL dictated words (so the model can match their
+    // language even when `display_query` is a normalized/translated topic), then the CURRENT meeting's
+    // gated context as the PRIMARY source, then the vault notes as SECONDARY context.
+    let original_words = {
+        let lit = literal_command.trim();
+        if lit.is_empty() { display_query.as_str() } else { lit }
+    };
+    let mut user = format!("Request (user's own words): {original_words}");
+    if !display_query.is_empty() && display_query != original_words {
+        user.push_str(&format!("\nTopic: {display_query}"));
+    }
+    if has_current {
+        user.push_str(&format!(
+            "\n\nTHIS MEETING (current transcript + your notes):\n{current_ctx}"
+        ));
+    }
+    if !grounding.is_empty() {
+        user.push_str(&format!("\n\nNotes from the vault (secondary context):\n{grounding}"));
+    }
 
     // EGRESS SEAM: a Cloud reasoner routes through make_provider (consent gate + RedactingProvider).
     // A no-consent refusal comes back as AppError::Unavailable → graceful "needs consent", no leak.
-    match reasoner.reason(system, &user) {
+    match reasoner.reason(&system, &user) {
         Ok(answer) => {
             let answer = answer.trim();
             let summary = if answer.is_empty() {
@@ -619,6 +1119,8 @@ fn rag_answer(
                 citations,
                 proposed_note: None,
                 thread_id: None,
+                // The deterministic floor is not a cascade tier.
+                answered_from: None,
             }
         }
         Err(AppError::Unavailable(_)) => VoiceActionResult {
@@ -632,6 +1134,7 @@ fn rag_answer(
             citations,
             proposed_note: None,
             thread_id: None,
+            answered_from: None,
         },
         Err(e) => VoiceActionResult {
             intent_kind: intent_kind.to_string(),
@@ -641,6 +1144,7 @@ fn rag_answer(
             citations,
             proposed_note: None,
             thread_id: None,
+            answered_from: None,
         },
     }
 }
@@ -1064,6 +1568,7 @@ mod tests {
             app: None,
             allow_writes: false,
             note_drafts: true,
+            scope: crate::tools::AssistantScope::Full,
             proposed_note: std::sync::Mutex::new(None),
         };
 
@@ -1159,6 +1664,8 @@ mod tests {
             &cfg,
             "live-mtg",
             "",
+            "",
+            false,
             None,
         );
 
@@ -1207,6 +1714,8 @@ mod tests {
             &AppConfig::default(),
             "live-mtg",
             "",
+            "",
+            false,
             None,
         );
 
@@ -1261,6 +1770,8 @@ mod tests {
             &AppConfig::default(),
             "live-mtg",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.intent_kind, "recall");
@@ -1287,6 +1798,8 @@ mod tests {
             &AppConfig::default(),
             "live-mtg",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.status, "ok");
@@ -1324,6 +1837,8 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.intent_kind, "note_aside");
@@ -1349,6 +1864,8 @@ mod tests {
             &AppConfig::default(),
             "sealed1",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.status, "error");
@@ -1372,6 +1889,8 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.intent_kind, "slack_search");
@@ -1400,6 +1919,8 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.status, "unrecognized");
@@ -1425,6 +1946,8 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.status, "error");
@@ -1451,6 +1974,8 @@ mod tests {
             &AppConfig::default(),
             "live1",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res.status, "needs_consent");
@@ -1738,6 +2263,8 @@ mod tests {
             &cfg,
             "live-mtg",
             "jaka była pogoda",
+            "",
+            false,
             None,
         );
         assert_eq!(res.status, "ok");
@@ -1771,6 +2298,8 @@ mod tests {
             &cfg,
             "live-mtg",
             "",
+            "",
+            false,
             None,
         );
         assert_eq!(res2.status, "ok");
@@ -1782,5 +2311,513 @@ mod tests {
             reasoner2.last_user.lock().unwrap().is_none(),
             "no grounding ⇒ no brain call on the translated-only path"
         );
+    }
+
+    /// A reasoner that records BOTH the system and user strings it was handed, so we can assert the
+    /// synthesis prompt (system) and the grounding order (user). Echoes a fixed answer.
+    struct CaptureReasoner {
+        last_system: std::sync::Mutex<Option<String>>,
+        last_user: std::sync::Mutex<Option<String>>,
+    }
+    impl CaptureReasoner {
+        fn new() -> Self {
+            Self {
+                last_system: std::sync::Mutex::new(None),
+                last_user: std::sync::Mutex::new(None),
+            }
+        }
+    }
+    impl LocalReasoner for CaptureReasoner {
+        fn id(&self) -> &str {
+            "capture"
+        }
+        fn reason(&self, system: &str, user: &str) -> crate::error::Result<String> {
+            *self.last_system.lock().unwrap() = Some(system.to_string());
+            *self.last_user.lock().unwrap() = Some(user.to_string());
+            Ok("ok".to_string())
+        }
+        fn structured(
+            &self,
+            _system: &str,
+            _user: &str,
+            _schema: &Value,
+        ) -> crate::error::Result<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    /// (A) RED-before-GREEN (2026-07-08, local-brain English-answer bug): the deterministic floor's
+    /// synthesis SYSTEM prompt MUST carry a same-language directive (Polish in → Polish out), mirroring
+    /// the cloud cascade/agent path. RED on the pre-fix prompt (no language line at all).
+    #[test]
+    fn floor_synthesis_prompt_has_same_language_directive() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db); // non-empty vault grounding ⇒ the brain is actually called.
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            "", // no current-meeting context on this leg — vault-only, tests the language line
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let system = reasoner
+            .last_system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the brain MUST be called with vault grounding present");
+        assert!(
+            system.contains("SAME language"),
+            "synthesis prompt must instruct answering in the user's OWN language; got: {system}"
+        );
+        assert!(
+            system.contains("Polish"),
+            "the language directive must name the Polish→Polish case like the agent path; got: {system}"
+        );
+    }
+
+    /// (B) RED-before-GREEN: given a CURRENT-meeting grounding string, it MUST appear in the reasoner's
+    /// USER input labeled as THIS meeting AND BEFORE the vault notes (current-FIRST). Vault retrieval is
+    /// PRESERVED — the vault notes are still present, just SECONDARY. RED on the pre-fix `rag_answer`
+    /// (no current-meeting param, no "THIS MEETING" section).
+    #[test]
+    fn floor_prepends_current_meeting_before_vault_notes() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db); // "Atlas Kickoff" note is the VAULT (secondary) grounding.
+        let reasoner = CaptureReasoner::new();
+        let current = "Live transcript (so far):\nAlice: let's finalize the CURRENT-Q3-BUDGET today.";
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            current,
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner
+            .last_user
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the brain MUST be called");
+        let this_meeting_at = user
+            .find("THIS MEETING")
+            .expect("the current meeting must be labeled 'THIS MEETING' in the brain input");
+        assert!(
+            user.contains("CURRENT-Q3-BUDGET"),
+            "the current-meeting transcript must reach the brain input: {user}"
+        );
+        // Vault retrieval is PRESERVED (current-FIRST, not vault-only): the vault note is still there…
+        let vault_at = user
+            .find("Atlas Kickoff")
+            .expect("the vault note must STILL be present as secondary grounding");
+        // …but AFTER the current meeting.
+        assert!(
+            this_meeting_at < vault_at,
+            "the current meeting MUST come BEFORE the vault notes (current-first); user: {user}"
+        );
+        // The synthesis prompt must tell the brain the current meeting is the primary subject.
+        let system = reasoner.last_system.lock().unwrap().clone().unwrap();
+        assert!(
+            system.contains("THIS MEETING"),
+            "the system prompt must scope the answer to THIS meeting first; got: {system}"
+        );
+    }
+
+    /// (B2) Byte-identical guard: an EMPTY current-meeting context yields NO "THIS MEETING" section —
+    /// the vault-only floor behaves exactly as before. Guards the backward-compatibility promise for
+    /// every existing caller (which passes "").
+    #[test]
+    fn floor_empty_current_context_is_vault_only_no_this_meeting_section() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            "", // empty ⇒ no current-meeting section
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            !user.contains("THIS MEETING"),
+            "empty current context must NOT inject a THIS MEETING section: {user}"
+        );
+        // Vault grounding is still present and drives the answer.
+        assert!(
+            user.contains("Atlas Kickoff"),
+            "the vault note must still be the grounding when no current context: {user}"
+        );
+    }
+
+    /// (C) RED-before-GREEN (2026-07-09, recording-awareness back-port): the CORE SYMPTOM. During a
+    /// LIVE recording whose buffer is still EMPTY (meeting just started), asking the LOCAL floor about
+    /// "this meeting" must NOT let the vault grounding be described as if it were the current meeting.
+    /// The synthesis SYSTEM prompt MUST say a meeting is being recorded RIGHT NOW, offer the honest
+    /// "meeting just started" answer, and FORBID substituting other saved meetings — the SAME wording
+    /// the cloud cascade already uses (shared via the `*_PHRASE` consts). RED on the pre-fix floor:
+    /// with `recording_in_progress` absent the empty-buffer prompt carried no recording awareness at
+    /// all, so the brain summarized unrelated vault meetings as "this meeting". Vault grounding is
+    /// present here (seeded), so the early "nothing found" return does NOT fire — we reach the brain.
+    #[test]
+    fn floor_recording_empty_buffer_forbids_substituting_other_meetings() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db); // non-empty vault grounding ("Atlas Kickoff") ⇒ the brain runs.
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            "", // EMPTY current context — the meeting just started
+            true, // recording_in_progress
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let system = reasoner
+            .last_system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the brain MUST be called (vault grounding present)");
+        assert!(
+            system.contains(RECORDING_NOW_PHRASE),
+            "must tell the model a meeting is being recorded now; got: {system}"
+        );
+        assert!(
+            system.contains(MEETING_JUST_STARTED_PHRASE),
+            "must offer the honest 'meeting just started' answer for an empty buffer; got: {system}"
+        );
+        assert!(
+            system.contains(NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE),
+            "must forbid substituting other saved meetings for the current one; got: {system}"
+        );
+        // These exact substrings are the SAME ones the cloud cascade prompt test pins — the shared
+        // consts guarantee the floor and cascade cannot drift.
+        assert_eq!(RECORDING_NOW_PHRASE, "recorded RIGHT NOW");
+        assert_eq!(MEETING_JUST_STARTED_PHRASE, "meeting just started");
+        assert_eq!(
+            NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE,
+            "do NOT search the vault for other saved meetings"
+        );
+    }
+
+    /// (D) RED-before-GREEN: during a LIVE recording WITH transcribed content, the floor must frame the
+    /// THIS MEETING section as the live recording ("recorded RIGHT NOW"), still current-first with the
+    /// vault as secondary. RED on the pre-fix floor: the has_current clause never mentioned an active
+    /// recording (it read like a viewed PAST meeting).
+    #[test]
+    fn floor_recording_with_content_frames_live_transcript_current_first() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db); // "Atlas Kickoff" = the SECONDARY vault grounding.
+        let reasoner = CaptureReasoner::new();
+        let current = "Live transcript (so far):\nAlice: let's finalize the CURRENT-Q3-BUDGET today.";
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            current,
+            true, // recording_in_progress
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let system = reasoner.last_system.lock().unwrap().clone().unwrap();
+        assert!(
+            system.contains(RECORDING_NOW_PHRASE),
+            "a live recording with content must be framed as recorded RIGHT NOW; got: {system}"
+        );
+        assert!(
+            system.contains("THIS MEETING"),
+            "still scopes the answer to THIS meeting first; got: {system}"
+        );
+        // Current-first ordering is PRESERVED: the current transcript reaches the brain BEFORE the vault.
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        let this_at = user.find("THIS MEETING").expect("THIS MEETING labeled in user input");
+        let vault_at = user
+            .find("Atlas Kickoff")
+            .expect("vault note still present as secondary grounding");
+        assert!(
+            this_at < vault_at,
+            "the live meeting must come BEFORE the vault notes (current-first); user: {user}"
+        );
+    }
+
+    /// (E) NO-REGRESSION: when NOT recording (viewed past meeting / idle / Ask page), the floor must
+    /// make NO "recorded RIGHT NOW" claim — the language directive + current-first from the prior fix
+    /// stay, but nothing frames the context as a live recording. Guards byte-compatibility for the
+    /// `recording_in_progress=false` path that every legacy caller now passes.
+    #[test]
+    fn floor_not_recording_makes_no_live_recording_claim() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db);
+        let reasoner = CaptureReasoner::new();
+        // A viewed PAST meeting (has_current) but NOT recording.
+        let viewed = "Live transcript (so far):\nWe reviewed last quarter's numbers.";
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig::default(),
+            "live-mtg",
+            "",
+            viewed,
+            false, // NOT recording — viewed past meeting
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let system = reasoner.last_system.lock().unwrap().clone().unwrap();
+        assert!(
+            !system.contains(RECORDING_NOW_PHRASE),
+            "no live-recording claim when not recording; got: {system}"
+        );
+        assert!(
+            !system.contains(MEETING_JUST_STARTED_PHRASE),
+            "no 'meeting just started' claim when not recording; got: {system}"
+        );
+        // The prior viewed-past-meeting behavior is intact: still THIS-MEETING-first + the language line.
+        assert!(
+            system.contains("THIS MEETING"),
+            "viewed-meeting current-first framing preserved; got: {system}"
+        );
+        assert!(
+            system.contains("SAME language"),
+            "the same-language directive from the prior fix stays; got: {system}"
+        );
+    }
+
+    // ── Tier-1 current-first classifier + isolated answer (2026-07-09 structural fix) ─────────────
+
+    /// The current-meeting classifier fires on CLEAR "this meeting" questions (EN + PL, inflected),
+    /// and does NOT fire on cross-meeting or world questions (so the fan-out stays for those).
+    #[test]
+    fn is_about_current_meeting_matches_this_meeting_questions() {
+        // Polish "what is this meeting/recording/conversation about".
+        for q in [
+            "o czym jest to spotkanie",
+            "o czym jest to spotkanie?",
+            "o czym jest ta rozmowa",
+            "o czym to nagranie",
+            "o czym jest ta rozmowę", // inflected accusative — stem-matches
+            "Claudku, o czym jest to spotkanie",
+        ] {
+            assert!(is_about_current_meeting(q), "should match PL about-this: {q}");
+        }
+        // Polish "summarize / streść THIS meeting/recording/conversation" — the summarize rule
+        // requires the deictic AND a meeting-noun (a bare "streść to" with no meeting-noun is a
+        // deliberate MISS → fan-out, so a cross-meeting "podsumuj moje spotkania" can't slip in).
+        for q in [
+            "podsumuj to spotkanie",
+            "podsumuj to nagranie",
+            "streść tę rozmowę",
+        ] {
+            assert!(is_about_current_meeting(q), "should match PL summarize-this: {q}");
+        }
+        // Polish "what did we (here) decide / discuss".
+        for q in [
+            "co tu ustaliliśmy",
+            "co tutaj ustaliliśmy",
+            "co tu omówiliśmy",
+            "co tu zdecydowaliśmy",
+        ] {
+            assert!(is_about_current_meeting(q), "should match PL here-verb: {q}");
+        }
+        // English.
+        for q in [
+            "what is this meeting about",
+            "what's this conversation about",
+            "summarize this meeting",
+            "recap this call",
+            "what did we just discuss",
+            "what did we decide here",
+        ] {
+            assert!(is_about_current_meeting(q), "should match EN about-this: {q}");
+        }
+    }
+
+    /// Conservative: cross-meeting and world questions do NOT match, so they still fan out to the
+    /// vault / web on the floor (no regression). This is the load-bearing negative case.
+    #[test]
+    fn is_about_current_meeting_ignores_cross_note_and_world_questions() {
+        for q in [
+            "co ustaliliśmy z Weroniką",           // cross-meeting (a person), NOT "here"
+            "jaka pogoda",                          // world / web
+            "jaka jest pogoda w Warszawie",         // world / web
+            "moje otwarte zadania",                 // vault, not this-meeting
+            "co wiemy o projekcie Atlas",           // cross-note recall
+            "what's the weather",                   // world / web
+            "who won the game yesterday",           // world / web
+            "what did we decide with Weronika",     // cross-meeting (no deictic)
+            // CROSS-MEETING SUMMARIZE (adversarial 2026-07-09 regression): a summarize verb + a
+            // PLURAL/possessive-other meeting noun with NO "this/here" deictic must fan out to the
+            // vault, NOT be stolen to the current-meeting isolation.
+            "podsumuj moje spotkania",              // summarize MY meetings (plural, no deictic)
+            "summarize my meetings",
+            "podsumuj wszystkie spotkania",         // summarize ALL meetings
+            "streść wszystkie moje rozmowy",        // summarize ALL my conversations
+            "podsumuj spotkania z Weroniką",        // summarize meetings WITH a person
+            "recap my last call with Bob",          // recap a call WITH a person
+            "podsumuj nasze rozmowy z tego tygodnia", // summarize this week's conversations (plural)
+            // DEICTIC-NOT-ADJACENT (adversarial 2026-07-09 round 2): "this" modifies a TIME word, not
+            // the meeting-noun → cross-meeting/vault, must NOT be stolen to the current-meeting isolation.
+            "summarize this week's meetings",       // "this" → "week's", meetings is plural/cross
+            "summarize this month's meetings",
+            "recap this week's calls",
+            "podsumuj to co ustaliliśmy na spotkaniach", // relative "to co" + plural "na spotkaniach"
+            "",                                     // empty
+            "   ",                                  // whitespace
+        ] {
+            assert!(
+                !is_about_current_meeting(q),
+                "must NOT match (should fan out): {q:?}"
+            );
+        }
+    }
+
+    /// Tier-1 ISOLATION: given a current-meeting question WITH current content, the answer is
+    /// synthesized from ONLY that content — the model's user message contains the current content and
+    /// NOTHING vault/web, the system prompt has NO "THIS MEETING" label to parrot, and the citation is
+    /// the current meeting's own [[Title]] (never a vault/web source).
+    #[test]
+    fn tier1_isolated_answer_uses_only_current_content_no_fanout_no_label() {
+        let reasoner = CaptureReasoner::new();
+        let current = "Transcript:\n[0s] We agreed to ship the connector on Friday.";
+        let res = answer_current_meeting_isolated(
+            "research",
+            "o czym jest to spotkanie",
+            current,
+            /* recording */ true,
+            Some("Connector Sync"),
+            &reasoner,
+        );
+        assert_eq!(res.status, "ok");
+        assert_eq!(res.answered_from, Some(AnsweredFrom::CurrentMeeting));
+        // The citation is the CURRENT meeting's own title — not a vault/web source.
+        assert_eq!(res.citations, vec!["[[Connector Sync]]".to_string()]);
+        // The model saw ONLY the current content — nothing was fanned out.
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            user.contains("We agreed to ship the connector on Friday"),
+            "the current content must be handed to the model: {user}"
+        );
+        assert!(
+            !user.contains("vault") && !user.contains("web") && !user.to_lowercase().contains("secondary"),
+            "NO vault/web/secondary grounding in the isolated Tier-1 prompt: {user}"
+        );
+        // NO literal "THIS MEETING" label the weak model would echo as its opening words.
+        let system = reasoner.last_system.lock().unwrap().clone().unwrap();
+        assert!(
+            !system.contains("THIS MEETING"),
+            "the Tier-1 prompt must not hand the model a 'THIS MEETING' label: {system}"
+        );
+        // The same-language directive is preserved (Polish in → Polish out).
+        assert!(
+            system.contains("SAME language"),
+            "the Tier-1 isolated prompt keeps the same-language directive: {system}"
+        );
+    }
+
+    /// Tier-1 EMPTY: an about-current question with NO current content → an HONEST "just started / no
+    /// content" answer, NO fan-out, NO web. The model is only asked to TRANSLATE a short honest
+    /// sentence (it never sees vault/web/other-meeting content).
+    #[test]
+    fn tier1_empty_current_content_is_honest_and_never_fans_out() {
+        // Recording, buffer empty → "just started" phrasing. Reasoner echoes; assert honest content.
+        let reasoner = CaptureReasoner::new();
+        let res = answer_current_meeting_isolated(
+            "research",
+            "o czym jest to spotkanie",
+            "", // NO current content
+            /* recording */ true,
+            None,
+            &reasoner,
+        );
+        assert_eq!(res.status, "ok");
+        assert_eq!(res.answered_from, Some(AnsweredFrom::CurrentMeeting));
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        // The ONLY thing handed to the model is an honest sentence to translate — no vault/web.
+        assert!(
+            user.contains("just started"),
+            "recording+empty ⇒ 'just started' honest sentence: {user}"
+        );
+        assert!(
+            !user.to_lowercase().contains("vault") && !user.to_lowercase().contains("[["),
+            "empty Tier-1 must NOT fan out to the vault: {user}"
+        );
+
+        // A STUB reasoner (no brain) ⇒ the honest English notice verbatim, still no fan-out.
+        let stub = crate::reason::StubReasoner;
+        let res2 = answer_current_meeting_isolated(
+            "research",
+            "summarize this meeting",
+            "",
+            /* recording */ false, // viewed past meeting with no content
+            None,
+            &stub,
+        );
+        assert_eq!(res2.status, "ok");
+        assert!(
+            res2.summary.contains("no transcript or notes"),
+            "viewed+empty ⇒ 'no transcript or notes' honest notice: {}",
+            res2.summary
+        );
+        assert!(res2.citations.is_empty(), "no citations when there is no content");
+    }
+
+    /// Tier-1 with a STUB reasoner but PRESENT content ⇒ honest no-model notice + KEEP the current
+    /// meeting's own citation, still NO fan-out.
+    #[test]
+    fn tier1_stub_with_content_returns_no_model_notice_and_own_citation() {
+        let stub = crate::reason::StubReasoner;
+        let res = answer_current_meeting_isolated(
+            "research",
+            "o czym to spotkanie",
+            "Transcript:\n[0s] Budget approved.",
+            true,
+            Some("Budget Review"),
+            &stub,
+        );
+        assert_eq!(res.status, "unavailable");
+        assert_eq!(res.summary, NO_MODEL_ANSWER_NOTICE);
+        assert_eq!(res.citations, vec!["[[Budget Review]]".to_string()]);
+        assert_eq!(res.answered_from, Some(AnsweredFrom::CurrentMeeting));
     }
 }

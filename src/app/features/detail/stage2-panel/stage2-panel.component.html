@@ -1,0 +1,79 @@
+<div class="stage2-panel">
+  <!-- LIVE CONTEXT — connector enrichment (EGRESS, on-demand). Compact button row +
+       a one-line egress hint (the query-leaves-the-device moment stays LOUD, without
+       the old full-width warning block). -->
+  <section class="lane live-lane">
+    <div class="lane-actions">
+      <button
+        type="button"
+        class="btn btn-primary"
+        (click)="fetchContext()"
+        [disabled]="running()"
+      >
+        @if (running() && hits() === null) {
+          Fetching…
+        } @else {
+          Fetch live context
+        }
+      </button>
+      @if (hits(); as h) {
+        @if (h.length > 0) {
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="addToNote()"
+            [disabled]="running() || applied()"
+          >
+            Add to note
+          </button>
+        }
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="clearContext()"
+          [disabled]="running()"
+        >
+          Clear
+        </button>
+      }
+    </div>
+
+    <p class="live-hint text-secondary" role="note">
+      <span class="pill is-warning">Connectors · sends a query out</span>
+      Sends a redacted query to your connected tools (Jira / Slack / web) to fold
+      fresh detail into this note — the moment a query leaves your device.
+    </p>
+
+    @if (hits(); as h) {
+      @if (h.length === 0) {
+        <p class="text-secondary">No live context found for this note.</p>
+      } @else {
+        <ul class="hit-list">
+          @for (hit of h; track hit.source + "|" + hit.detail) {
+            <li class="hit-item">
+              <span class="pill hit-source">via {{ hit.source }}</span>
+              <span class="hit-detail">{{ hit.detail }}</span>
+              @if (hit.url) {
+                <a [href]="hit.url" target="_blank" rel="noopener">Open</a>
+              }
+            </li>
+          }
+        </ul>
+      }
+    }
+
+    @if (applied()) {
+      <p class="text-secondary">
+        Added — the note now carries the live context in a foldable callout.
+      </p>
+    }
+    @if (cleared()) {
+      <p class="text-secondary">
+        Cleared — the live-context callout was removed from the note.
+      </p>
+    }
+    @if (error(); as e) {
+      <p class="banner is-warning" role="alert">{{ e }}</p>
+    }
+  </section>
+</div>

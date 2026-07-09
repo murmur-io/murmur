@@ -398,6 +398,47 @@ pub struct MeetingDetailDto {
 
 // ── Commands (PHASE0-PLAN §7) ──
 
+/// PHASE 6 — set (or clear) the FOCUS meeting: the meeting the user is currently VIEWING /
+/// anchored to, DISTINCT from the recording pointer (`state.current_meeting`, `Some` only while
+/// recording). The FE calls this with `Some(id)` when it opens a meeting-detail / conversation
+/// view and `None` when it closes, so the brain's Tier-1 "this meeting" scope
+/// ([`crate::transcribe::live::resolve_scope_meeting`]) is deterministic even when nothing is
+/// recording AND when a DIFFERENT meeting is recording — the backend safety-net for any assistant
+/// path that falls back off an explicit FE `meeting_id` (the voice/wake twin). This stores ONLY an
+/// id (never meeting content), so there is no seal/verify-before-destroy or clear-on-relock to do:
+/// a relock re-masks the focused meeting's CONTENT through the existing `meeting_is_visible` gate
+/// (`gated_live_context` fail-closes), and the stale id itself leaks nothing. A blank/whitespace
+/// id is treated as clear (`None`). Fail-safe: a poisoned focus mutex recovers via `into_inner()`
+/// (the pointer carries no invariant) rather than bricking the setter. No PII (opaque id only).
+#[tauri::command]
+pub fn set_focus_meeting(
+    state: State<'_, AppState>,
+    meeting_id: Option<String>,
+) -> Result<(), AppError> {
+    set_focus_meeting_inner(state.inner(), meeting_id);
+    Ok(())
+}
+
+/// Inner of [`set_focus_meeting`] taking `&AppState` so it is headless-testable without a
+/// `tauri::State`. Normalizes a blank/whitespace id to `None` (clear) and fail-safes on a poisoned
+/// focus mutex via `into_inner()` (the pointer carries no invariant, so recovering it is safe and
+/// never bricks the setter). No PII (opaque id only).
+pub(crate) fn set_focus_meeting_inner(state: &AppState, meeting_id: Option<String>) {
+    let normalized = meeting_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut focus = state
+        .focus_meeting
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *focus = normalized;
+    tracing::debug!(
+        target: "brain",
+        has_focus = focus.is_some(),
+        "focus meeting updated"
+    );
+}
+
 /// Begin mic capture. Inserts a Meeting(Draft→Recording), stores Recorder in state,
 /// sets current_meeting. Returns the new meeting id. Errors if already recording.
 #[tauri::command]
@@ -983,11 +1024,16 @@ pub(crate) fn end_voice_command_inner(state: &AppState) -> Result<VoiceCommandEn
 /// `thread_id` is OPTIONAL: the FE passes an @brain thread's id to keep the exchange in that
 /// thread; when absent (the voice/wake twin sends none) the backend GENERATES a UUID v4 inside the
 /// turn, so every persisted exchange carries a thread identity going forward.
+/// `meeting_id` (FE camelCase `meetingId`) is the OPTIONAL scope meeting this thread is bound to
+/// (Phase 4): the backend resolves `meeting_id.or(state.current_meeting)`, so an explicit FE id wins
+/// (a past/anchored thread scopes correctly) while a `None` keeps the live-recording pointer. This is
+/// what kills the wrong-meeting bug (idle @brain no longer defaults to a vault-wide arbitrary meeting).
 #[tauri::command]
 pub fn ask_assistant_text(
     app: AppHandle,
     text: String,
     thread_id: Option<String>,
+    meeting_id: Option<String>,
 ) -> Result<(), AppError> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -997,7 +1043,7 @@ pub fn ask_assistant_text(
         crate::events::EVENT_VOICE_COMMAND_PROCESSING,
         crate::events::VoiceCommandProcessingPayload { active: true },
     );
-    crate::transcribe::live::spawn_assistant_turn(app, text, thread_id);
+    crate::transcribe::live::spawn_assistant_turn(app, text, thread_id, meeting_id);
     Ok(())
 }
 
@@ -1053,12 +1099,18 @@ fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
 /// the @brain thread this exchange belongs to, and the note text the thread was anchored to. A
 /// missing `thread_id` is backend-generated (UUID v4) so every persisted exchange carries one. The
 /// PERSISTED row's `command` is `latest` — the user's newest message, never the rendered history.
+/// `meeting_id` (FE camelCase `meetingId`) is the OPTIONAL scope meeting the FE binds this thread to
+/// (Phase 4): resolved as `meeting_id.or(state.current_meeting)` so an explicit FE id wins (a bound
+/// past/anchored thread answers about ITS meeting even while a different meeting records) and a
+/// `None` keeps the live-recording pointer. The resolved id is what `gated_live_context` /
+/// the executor scope to AND what the persisted thread row is bound to — killing the wrong-meeting bug.
 #[tauri::command]
 pub async fn ask_assistant_chat(
     app: AppHandle,
     messages: Vec<ChatMsg>,
     thread_id: Option<String>,
     anchor_text: Option<String>,
+    meeting_id: Option<String>,
 ) -> Result<crate::voice_action::VoiceActionResult, AppError> {
     let (latest, conversation) = format_chat(&messages)?;
     let thread_id = crate::transcribe::live::ensure_thread_id(thread_id);
@@ -1070,6 +1122,7 @@ pub async fn ask_assistant_chat(
             crate::events::EVENT_CHAT_TOOL,
             &thread_id,
             anchor_text.as_deref(),
+            meeting_id.as_deref(),
         )
     })
     .await
@@ -1330,6 +1383,299 @@ pub(crate) fn apply_note_verify_markers_inner(
         markdown: marked,
         exported_path: existing.exported_path,
     })
+}
+
+/// `enrich_note_context(meeting_id) -> Vec<ContextHit>` — CONNECTOR-AGNOSTIC preview of live context
+/// to fold into the note. Read side: gathers hits from EVERY exposed (enabled + consented + keyed)
+/// connector via the same registry the brain uses. Two modes (see the research brief):
+/// - **Identifier lookup** (precise, minimal egress): Jira issue keys already in the note → live
+///   `jira_lookup`. Only a validated `PROJ-123` leaves the Mac — never note content.
+/// - **Free-text search** (fuzzy): every OTHER exposed connector (Slack/web) is searched for the
+///   meeting's TITLE, through the framework's redaction + content-free egress ledger.
+///
+/// This is the EGRESS moment (an explicit user action, like `verify_note_sources`); the returned
+/// hits are reviewed in the FE and only WRITTEN by `apply_note_enrichment`. Lock-gated: a
+/// sealed-not-unlocked meeting refuses BEFORE any connector call. Empty vec = nothing to add.
+#[tauri::command]
+pub async fn enrich_note_context(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::enrich::ContextHit>, AppError> {
+    enrich_note_context_inner(state.inner(), meeting_id).await
+}
+
+/// How many free-text search hits to keep per connector (bounds egress-result noise; the caller
+/// still reviews + can drop each before applying).
+const ENRICH_SEARCH_HITS_PER_CONNECTOR: usize = 3;
+
+pub(crate) async fn enrich_note_context_inner(
+    state: &AppState,
+    meeting_id: String,
+) -> Result<Vec<crate::enrich::ContextHit>, AppError> {
+    // READ-GATE FIRST — a sealed-not-unlocked meeting refuses before ANY connector egress.
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to add live context".into(),
+        ));
+    }
+    let note = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    // Clean base = the note with our own prior context block stripped, so key-extraction sees the
+    // canonical prose (never our appended callout).
+    let base = crate::enrich::apply_context_markers(&note.markdown, &[], "");
+    let title = state
+        .db
+        .get_meeting(&meeting_id)?
+        .and_then(|m| m.title)
+        .unwrap_or_default();
+
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Other(anyhow::anyhow!("config lock")))?
+        .clone();
+    let registry = crate::connectors::ConnectorRegistry::build(&config);
+
+    let mut hits: Vec<crate::enrich::ContextHit> = Vec::new();
+
+    // ── Identifier-lookup mode (precise): Jira issue keys → live status. Egresses only the key. ──
+    if registry.has("jira") {
+        for (_line, key) in crate::verify::extract_issue_keys(&base) {
+            if let Ok(Some(snap)) = registry.jira_lookup(&key).await {
+                let mut detail = format!("{} · {}", snap.key, snap.status);
+                if let Some(due) = snap.due.as_deref().filter(|d| !d.is_empty()) {
+                    detail.push_str(&format!(" · due {due}"));
+                }
+                if !snap.summary.is_empty() {
+                    detail.push_str(&format!(" — {}", snap.summary));
+                }
+                hits.push(crate::enrich::ContextHit {
+                    source: "Jira".to_string(),
+                    detail,
+                    url: Some(snap.url).filter(|u| !u.is_empty()),
+                });
+            }
+        }
+    }
+
+    // ── Free-text search mode (fuzzy): every OTHER exposed connector, queried on the meeting title.
+    // The query is redacted + ledgered by the registry; skip when there is no title to search on. ──
+    if !title.trim().is_empty() {
+        for id in registry.ids() {
+            if id == "jira" {
+                continue; // handled precisely above — never double-pull Jira.
+            }
+            if let Ok(results) = registry.search(id, &title).await {
+                for hit in results.into_iter().take(ENRICH_SEARCH_HITS_PER_CONNECTOR) {
+                    let detail = if hit.snippet.trim().is_empty() {
+                        hit.title
+                    } else {
+                        format!("{} — {}", hit.title, hit.snippet)
+                    };
+                    hits.push(crate::enrich::ContextHit {
+                        // Loud attribution from the connector itself (e.g. "Slack", "web · Brave").
+                        source: hit.source_label,
+                        detail,
+                        url: Some(hit.url).filter(|u| !u.is_empty()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
+/// `apply_note_enrichment(meeting_id, hits) -> NoteDto` — WRITE the reviewed context hits into the
+/// note as one consolidated `> [!context]-` callout (dated now), via the EXACT `update_note` save +
+/// re-export tail — so it persists in the CANONICAL DB note markdown and SEALS with the note under
+/// the folder lock (NOT the vault-file-only path). No egress here (the hits were fetched by
+/// `enrich_note_context`). Lock-gated. Passing an empty `hits` STRIPS the block (byte-exact undo).
+#[tauri::command]
+pub fn apply_note_enrichment(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    hits: Vec<crate::enrich::ContextHit>,
+) -> Result<NoteDto, AppError> {
+    apply_note_enrichment_inner(state.inner(), meeting_id, hits)
+}
+
+pub(crate) fn apply_note_enrichment_inner(
+    state: &AppState,
+    meeting_id: String,
+    hits: Vec<crate::enrich::ContextHit>,
+) -> Result<NoteDto, AppError> {
+    // BLK-1 / TOCTOU: hold the lifecycle guard across the whole check-then-write so a concurrent seal
+    // cannot slip between the gate and the `upsert_note`+`overwrite_note` (same leak class Lane A's
+    // `link_related_notes_inner` guards). Lock order `lifecycle ⊃ db`.
+    let _lifecycle = lifecycle_guard(state);
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to edit the note".into(),
+        ));
+    }
+    // SEAL-SAFETY GATE (mirrors Lane A): a SEALED note (any provider row carries a content_blob) has a
+    // TRANSIENT `markdown` column — blanked on relock, restored from `content_blob` on unlock. Writing
+    // enriched markdown into it would be silently dropped on the next relock (content_blob is
+    // canonical), and — for the auto-file-into-locked case where the column is blank but the folder is
+    // session-unlocked — could re-materialize plaintext into a sealed note. So refuse enrichment on a
+    // sealed note even when the session has it unlocked.
+    let sealed = state
+        .db
+        .sealable_notes_for_meeting(&meeting_id)?
+        .iter()
+        .any(|n| n.content_blob.is_some());
+    if sealed {
+        return Err(AppError::Locked(
+            "this meeting's note is sealed — enrichment can't be persisted while locked".into(),
+        ));
+    }
+    let existing = state
+        .db
+        .get_latest_note_for_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
+    let as_of = chrono::Utc::now().to_rfc3339();
+    let enriched = crate::enrich::apply_context_markers(&existing.markdown, &hits, &as_of);
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.clone(),
+        provider_id: existing.provider_id.clone(),
+        markdown: enriched.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
+    })?;
+    if let Some(path) = existing.exported_path.as_deref() {
+        crate::export::overwrite_note(std::path::Path::new(path), &enriched)?;
+    }
+    Ok(NoteDto {
+        meeting_id,
+        provider_id: existing.provider_id,
+        markdown: enriched,
+        exported_path: existing.exported_path,
+    })
+}
+
+/// Max cross-meeting links Lane A appends to a note (small + high-precision — a note gains a handful
+/// of related links, not a research dump).
+const MAX_RELATED_LINKS: usize = 4;
+
+/// Stage 2 / Lane A — the DETERMINISTIC, ZERO-EGRESS cross-meeting LINKING pass over a FINISHED note.
+///
+/// Mirrors [`apply_note_enrichment_inner`] (the shipped Lane B persist seam): gate → retrieve →
+/// render → `upsert_note` (DB-canonical, so the links SEAL with the note) → re-export the vault
+/// `.md`. Retrieval is [`related_context::related_note_links`], which is DOUBLE visibility-gated
+/// (`search_visible` + `get_note_if_visible` on the live unlock set) and self-excluding — a
+/// sealed-not-unlocked related note contributes NO link. Empty hits STRIP any stale links block
+/// (byte-exact undo), so re-running self-heals the link graph. Idempotent + reversible via
+/// `apply_link_markers`.
+///
+/// EGRESS: NONE. Lane A is fully local — a search over OWNED notes plus a local task-free gist. No
+/// provider, no connector, no consent gate needed (nothing leaves the device).
+///
+/// SEAL-SAFETY (stronger than the read gate, load-bearing): after the `meeting_is_unlocked` read
+/// gate, we ALSO require the note to be genuinely UNSEALED (`content_blob IS NULL` on every provider
+/// row). A note in a locked folder is SEALED: its `markdown` column is transient (blanked on relock,
+/// restored from `content_blob` on unlock) and its durable source of truth is `content_blob`.
+/// Writing links into a sealed note's `markdown` column would either corrupt a just-sealed (blanked)
+/// column (the auto-file-into-locked case, where the column is empty but the folder is session-
+/// unlocked) or be silently dropped on the next relock (the column is discarded, `content_blob` is
+/// canonical). So a sealed meeting is skipped even when the session happens to have it unlocked —
+/// which is exactly what makes "persist DB-canonical so it SEALS with the note" true here.
+pub(crate) fn link_related_notes_inner(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
+    // BLK-1 / TOCTOU: hold the lifecycle guard for the WHOLE check-then-write so a concurrent
+    // `lock_folder`/`move_into_locked_folder`/`relock` cannot seal this meeting BETWEEN the seal-safety
+    // gate below and the `upsert_note`+`overwrite_note` — which would re-materialize a plaintext `.md`
+    // into a now-locked folder's vault dir (the Phase-2 lock-security TOCTOU leak). Every seal path
+    // holds this same guard (`lock_folder_inner`/`move_into_locked_folder`/`relock_all_inner`/
+    // `remove_lock_inner`), and the storage-prune was forced to take it by a prior TOCTOU finding.
+    // Lock order is `lifecycle ⊃ db` (matching `lock_folder_inner`).
+    let _lifecycle = lifecycle_guard(state);
+    // READ GATE: a sealed-not-session-unlocked meeting is silently skipped — never link a locked note.
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Ok(());
+    }
+    // SEAL-SAFETY GATE: only write the markdown COLUMN of an UNSEALED note (durable canonical). A
+    // sealed note (any provider row has a content_blob) is skipped even if session-unlocked. Read
+    // UNDER the lifecycle guard, so a seal cannot slip in after this check and before the write.
+    let sealed = state
+        .db
+        .sealable_notes_for_meeting(meeting_id)?
+        .iter()
+        .any(|n| n.content_blob.is_some());
+    if sealed {
+        return Ok(());
+    }
+    let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? else {
+        return Ok(()); // no note yet → nothing to link.
+    };
+    let title = state
+        .db
+        .get_meeting(meeting_id)?
+        .and_then(|m| m.title)
+        .unwrap_or_default();
+    // Derive the salient query from the CANONICAL prose — strip our OWN links block first so a
+    // re-link never keys the query off a previous run's `[[Title]]` links (stable / self-healing).
+    let base = crate::enrich::apply_link_markers(&existing.markdown, &[]);
+    let query = crate::summarize::related_context::salient_query(
+        (!title.trim().is_empty()).then_some(title.as_str()),
+        &base,
+    );
+    // Snapshot the live unlocked set (the SAME gate the retrieval keys on).
+    let unlocked = {
+        state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone()
+    };
+    let hits = crate::summarize::related_context::related_note_links(
+        &state.db,
+        meeting_id,
+        &query,
+        &unlocked,
+        MAX_RELATED_LINKS,
+    )?;
+    // Empty hits ⇒ `apply_link_markers` strips any stale links block (byte-exact). Non-empty ⇒ replace.
+    // No `as_of`: cross-meeting links are timeless (owned notes), so the block is a pure function of
+    // (note, hits) → the `linked == existing.markdown` short-circuit below skips a rewrite when the
+    // link set is unchanged, so the deferred auto-pass never churns the note / vault `.md`.
+    let linked = crate::enrich::apply_link_markers(&existing.markdown, &hits);
+    // No change (no hits AND no stale block) ⇒ nothing to persist; avoid a needless write + re-export.
+    if linked == existing.markdown {
+        return Ok(());
+    }
+    let created_at = chrono::Utc::now().to_rfc3339();
+    state.db.upsert_note(&NoteRecord {
+        meeting_id: meeting_id.to_string(),
+        provider_id: existing.provider_id.clone(),
+        markdown: linked.clone(),
+        created_at,
+        exported_path: existing.exported_path.clone(),
+        model_requested: existing.model_requested.clone(),
+        model_served: existing.model_served.clone(),
+        gateway_host: existing.gateway_host.clone(),
+    })?;
+    if let Some(path) = existing.exported_path.as_deref() {
+        crate::export::overwrite_note(std::path::Path::new(path), &linked)?;
+    }
+    Ok(())
+}
+
+/// `link_related_notes(meeting_id)` — MANUAL re-link / backfill trigger for the Stage 2 / Lane A
+/// pass. The AUTO pipeline runs the same [`link_related_notes_inner`] as a deferred post-`Exported`
+/// pass; this command lets the user (or a backfill over old notes) re-run it on demand. Lock-gated +
+/// seal-safe (a sealed meeting is a silent no-op) and ZERO egress.
+#[tauri::command]
+pub fn link_related_notes(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), AppError> {
+    link_related_notes_inner(state.inner(), &meeting_id)
 }
 
 /// brain2 realtime typed @brain notes — persist the user's free-text notes typed DURING a meeting
@@ -3236,9 +3582,9 @@ pub async fn ask_vault(
     .await
 }
 
-/// Max agentic rounds for the Ask surface. Not live-latency-bound like the in-meeting loop
-/// (`CLOUD_MAX_STEPS` = 4), so it gets a little more room to search + read before answering —
-/// still strictly bounded.
+/// Max agentic rounds for the Ask surface. Not live-latency-bound like the in-meeting cascade tiers
+/// (`TIER1/2/3_MAX_STEPS` in `transcribe::live`, kept small so up-to-three tiers stay live-safe), so
+/// the deliberately vault-wide Ask page gets a little more room to search + read — still bounded.
 const ASK_MAX_STEPS: usize = 6;
 
 /// Cap the incoming Ask history to the last [`CHAT_CONTEXT_TURNS`] turns — the same discipline as
@@ -3280,6 +3626,10 @@ fn ask_vault_agentic_attempt(
         app: Some(app),
         allow_writes: false,
         note_drafts: false,
+        // The Ask page is DELIBERATELY vault-wide (Phase 5 preserves it unchanged) — the FULL
+        // per-surface catalog, NOT a cascade tier: it is not the in-meeting @brain surface the
+        // current-first cascade governs.
+        scope: crate::tools::AssistantScope::Full,
         proposed_note: std::sync::Mutex::new(None),
     };
     let sink = crate::transcribe::live::ToolEventSink {
@@ -3602,6 +3952,7 @@ mod ask_vault_tests {
             app: None,
             allow_writes: false,
             note_drafts: false,
+            scope: crate::tools::AssistantScope::Full,
             proposed_note: Mutex::new(None),
         }
     }
@@ -3899,6 +4250,7 @@ mod ask_vault_tests {
             app: None,
             allow_writes: false,
             note_drafts: true,
+            scope: crate::tools::AssistantScope::Full,
             proposed_note: Mutex::new(None),
         };
         assert!(
@@ -4325,6 +4677,64 @@ pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> 
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     Ok(config_to_dto(&config))
+}
+
+/// Build the ready-to-paste Claude Code MCP config block for the localhost MCP server, WITH the
+/// bearer token when `mcp_require_token` is on (the default). Fixes the handshake failure where
+/// the copied snippet had no token so Claude Code got `-32001 unauthorized` on `initialize`.
+///
+/// Shape (pretty-printed, 2-space indent — `type: "http"` is required by Claude Code):
+/// ```json
+/// {
+///   "mcpServers": {
+///     "murmur": {
+///       "type": "http",
+///       "url": "http://127.0.0.1:8765",
+///       "headers": { "Authorization": "Bearer <token>" }
+///     }
+///   }
+/// }
+/// ```
+/// When `mcp_require_token` is OFF the server serves unauthenticated, so the `headers` block is
+/// omitted entirely (no stale/placeholder Authorization header is ever emitted).
+///
+/// SECURITY: this surfaces the MCP bearer token to the LOCAL frontend for display in Settings so
+/// the user can paste it into their own Claude Code config. It is NOT network egress — the token
+/// never leaves the machine except by the user's manual copy. When the token flag is off no token
+/// is read at all. Lock-security review requested.
+#[tauri::command]
+pub fn get_mcp_config(state: State<'_, AppState>) -> Result<String, AppError> {
+    get_mcp_config_inner(state.inner())
+}
+
+/// Headless core of [`get_mcp_config`] — testable without a Tauri `State`.
+pub(crate) fn get_mcp_config_inner(state: &AppState) -> Result<String, AppError> {
+    // Read the flag the same way lib.rs does: fail CLOSED (require the token) on a poisoned lock,
+    // so a broken config never emits an unauthenticated config for a server that DOES enforce.
+    let require_token = state
+        .config
+        .lock()
+        .map(|c| c.mcp_require_token)
+        .unwrap_or(true);
+
+    let url = format!("http://127.0.0.1:{}", crate::mcp::MCP_PORT);
+    let mut server = serde_json::json!({
+        "type": "http",
+        "url": url,
+    });
+    if require_token {
+        // Only read/mint the token when the server actually enforces it. On a keychain failure this
+        // returns AppError (the FE shows an error) — never a config with an empty/placeholder token.
+        let token = crate::secrets::get_or_create_mcp_token()?;
+        server["headers"] = serde_json::json!({
+            "Authorization": format!("Bearer {token}"),
+        });
+    }
+    let config = serde_json::json!({
+        "mcpServers": { "murmur": server },
+    });
+    serde_json::to_string_pretty(&config)
+        .map_err(|e| AppError::Other(anyhow::anyhow!("serialize MCP config: {e}")))
 }
 
 /// Persist config to settings table + refresh in-memory cache. Does NOT touch Keychain.
@@ -6743,6 +7153,33 @@ fn move_into_locked_folder(
     // association), THEN seal that one meeting's note + extras under the folder CK.
     state.db.set_meeting_folder(meeting_id, Some(folder_id))?;
     seal_moved_note(state, folder_id, meeting_id, &ck)?;
+
+    // The destination folder is SESSION-UNLOCKED (checked above), so the moved note MUST be READABLE
+    // in-session exactly like its folder-mates — otherwise it shows EMPTY under the open padlock (the
+    // seal just blanked its plaintext and nothing restored it: the "private note came back empty"
+    // bug). Decrypt the just-sealed note markdown + transcript/timeline/audio back into the plaintext
+    // columns FOR THE SESSION; every `content_blob`/`*_blob`/`.enc` STAYS at rest (folder is still
+    // `locked=1` on disk), so a relock/app-kill re-seals cleanly with no plaintext left behind. This
+    // is verify-clean by construction: `seal_moved_note` above already proved each blob decrypts back
+    // byte-identical BEFORE it blanked anything, so this restore can only reproduce that same content.
+    // Mirrors `unlock_folder`'s per-meeting restore, scoped to this one moved meeting. Under the
+    // lifecycle guard held for the whole move, so no relock can interleave.
+    for n in &state.db.sealable_notes_for_meeting(meeting_id)? {
+        let Some(blob) = &n.content_blob else { continue };
+        let aad = aad_content(folder_id, meeting_id, &n.provider_id, "note");
+        let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
+        let markdown = String::from_utf8(pt)
+            .map_err(|_| AppError::Storage("decrypted moved note is not valid UTF-8".into()))?;
+        state
+            .db
+            .restore_note_markdown(meeting_id, &n.provider_id, &markdown)?;
+    }
+    unseal_meeting_extras(state, folder_id, meeting_id, &ck)?;
+    // Re-index this one meeting so semantic search / related-meetings recover in-session (its note
+    // markdown was just restored above). Model-gated (never a stub vector); best-effort — a re-index
+    // hiccup must not fail (or half-undo) the completed move.
+    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    reindex_meetings_after_unseal(state, &[meeting_id.to_string()], meeting_embedder.as_deref());
     Ok(())
 }
 
@@ -8442,6 +8879,71 @@ fn reindex_meetings_after_unseal(
     }
 }
 
+/// SESSION-unseal the transcript + timeline + typed notes + audio of ONE meeting back into its
+/// plaintext columns under the folder CK, KEEPING every `*_blob` / `.enc` at rest (the folder is
+/// still `locked=1` on disk). Extracted verbatim from `unseal_folder_extras`'s per-meeting body so
+/// the SAME verified restore serves both a full folder unlock AND a single note MOVED into a
+/// session-unlocked locked folder — the moved note must read identically to its folder-mates, never
+/// come back blank under the open padlock. Does NOT restore the note MARKDOWN (that is per-provider,
+/// keyed on `content_blob`, and the callers restore it before/after this) nor re-index (also caller's
+/// job — after markdown is back).
+fn unseal_meeting_extras(
+    state: &AppState,
+    folder_id: &str,
+    mid: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    for s in state.db.raw_segments(mid)? {
+        let Some(blob) = &s.text_blob else { continue };
+        let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
+        let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+        let text = String::from_utf8(pt)
+            .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
+        state.db.restore_segment_text(mid, s.idx, &text)?;
+    }
+    if let Some(tl) = state.db.raw_timeline(mid)? {
+        if let Some(blob) = &tl.data_blob {
+            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
+            let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+            let data = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted timeline is not valid UTF-8".into()))?;
+            state.db.restore_timeline_data(mid, &data)?;
+        }
+    }
+    // Typed notes: decrypt the sealed blob back into the plaintext column for the session (the
+    // blob is kept — the folder is still locked on disk). Mirrors the timeline unseal.
+    if let Some(rn) = state.db.raw_manual_notes(mid)? {
+        if let Some(blob) = &rn.blob {
+            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
+            let pt = crate::crypto::decrypt(ck, blob, &aad)?;
+            let text = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted manual notes is not valid UTF-8".into()))?;
+            state.db.set_manual_notes(mid, &text)?;
+        }
+    }
+    // Audio at rest: materialize a playable WAV for the session (playback + both masters), each
+    // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts); the
+    // .enc is kept (folder still locked on disk).
+    let (pb_role, pb_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Playback);
+    if let Some(plain) = session_unseal_audio(
+        ck,
+        state.db.get_meeting(mid)?.and_then(|m| m.audio_path),
+        &[&pb_role, &pb_less],
+    )? {
+        state.db.set_meeting_audio_path(mid, Some(&plain))?;
+    }
+    let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
+    let (mic_role, mic_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Mic);
+    if let Some(plain) = session_unseal_audio(ck, mic, &[&mic_role, &mic_less])? {
+        state.db.set_meeting_mic_master_path(mid, Some(&plain))?;
+    }
+    let (sys_role, sys_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Sys);
+    if let Some(plain) = session_unseal_audio(ck, sys, &[&sys_role, &sys_less])? {
+        state.db.set_meeting_sys_master_path(mid, Some(&plain))?;
+    }
+    Ok(())
+}
+
 /// `meeting_embedder` is the model-gated embedder for the MEETING re-index, resolved by the CALLER
 /// (`embed_model_present().then(active_embedder)`) and passed in — `Some(real e5)` re-indexes the
 /// folder's meetings, `None` (model absent) writes nothing (never a stub vector). It is injected
@@ -8456,56 +8958,7 @@ fn unseal_folder_extras(
 ) -> Result<(), AppError> {
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     for mid in &meeting_ids {
-        for s in state.db.raw_segments(mid)? {
-            let Some(blob) = &s.text_blob else { continue };
-            let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
-            let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-            let text = String::from_utf8(pt)
-                .map_err(|_| AppError::Storage("decrypted segment is not valid UTF-8".into()))?;
-            state.db.restore_segment_text(mid, s.idx, &text)?;
-        }
-        if let Some(tl) = state.db.raw_timeline(mid)? {
-            if let Some(blob) = &tl.data_blob {
-                let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
-                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let data = String::from_utf8(pt).map_err(|_| {
-                    AppError::Storage("decrypted timeline is not valid UTF-8".into())
-                })?;
-                state.db.restore_timeline_data(mid, &data)?;
-            }
-        }
-        // Typed notes: decrypt the sealed blob back into the plaintext column for the session (the
-        // blob is kept — the folder is still locked on disk). Mirrors the timeline unseal.
-        if let Some(rn) = state.db.raw_manual_notes(mid)? {
-            if let Some(blob) = &rn.blob {
-                let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
-                let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-                let text = String::from_utf8(pt).map_err(|_| {
-                    AppError::Storage("decrypted manual notes is not valid UTF-8".into())
-                })?;
-                state.db.set_manual_notes(mid, &text)?;
-            }
-        }
-        // Audio at rest: materialize a playable WAV for the session (playback + both masters), each
-        // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts); the
-        // .enc is kept (folder still locked on disk).
-        let (pb_role, pb_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Playback);
-        if let Some(plain) = session_unseal_audio(
-            ck,
-            state.db.get_meeting(mid)?.and_then(|m| m.audio_path),
-            &[&pb_role, &pb_less],
-        )? {
-            state.db.set_meeting_audio_path(mid, Some(&plain))?;
-        }
-        let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
-        let (mic_role, mic_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Mic);
-        if let Some(plain) = session_unseal_audio(ck, mic, &[&mic_role, &mic_less])? {
-            state.db.set_meeting_mic_master_path(mid, Some(&plain))?;
-        }
-        let (sys_role, sys_less) = audio_decrypt_ladder(mid, folder_id, StreamRole::Sys);
-        if let Some(plain) = session_unseal_audio(ck, sys, &[&sys_role, &sys_less])? {
-            state.db.set_meeting_sys_master_path(mid, Some(&plain))?;
-        }
+        unseal_meeting_extras(state, folder_id, mid, ck)?;
     }
     // Document ingestion: decrypt each sealed document's text back into the plaintext column for the
     // session (the blob is kept — folder still locked on disk), then RE-EMBED so semantic search /
@@ -10964,6 +11417,7 @@ mod lifecycle_tests {
             config: Arc::new(Mutex::new(AppConfig::default())),
             reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
             current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
             reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
@@ -11049,6 +11503,271 @@ mod lifecycle_tests {
         assert!(
             matches!(e3, AppError::Unavailable(_)),
             "past the lock gate, an unconfigured Jira verify fails Unavailable, got: {e3:?}"
+        );
+    }
+
+    /// `get_mcp_config` must emit a ready-to-paste Claude Code config: `type: "http"`, the
+    /// localhost url, and — when `mcp_require_token` is ON (the default the server enforces) — an
+    /// `Authorization: Bearer <token>` header with a NON-EMPTY token (fixes the `-32001 unauthorized`
+    /// handshake). When the flag is OFF the server serves unauthenticated, so NO `headers` block is
+    /// emitted (no stale/placeholder header). Runs in a debug/test build, so `get_or_create_mcp_token`
+    /// mints into the dev-secrets file store — no Keychain, no `security` CLI.
+    #[test]
+    fn get_mcp_config_carries_token_when_required_and_omits_it_when_off() {
+        let state = build_state("mcp-config");
+
+        // require_token ON (default) → type/url present + a real bearer token in headers.
+        state.config.lock().unwrap().mcp_require_token = true;
+        let on = get_mcp_config_inner(&state).unwrap();
+        let v_on: serde_json::Value = serde_json::from_str(&on).expect("config is valid JSON");
+        let server = &v_on["mcpServers"]["murmur"];
+        assert_eq!(server["type"], "http", "config must declare type: http");
+        assert_eq!(
+            server["url"],
+            format!("http://127.0.0.1:{}", crate::mcp::MCP_PORT),
+            "config url must be the localhost MCP address"
+        );
+        let auth = server["headers"]["Authorization"]
+            .as_str()
+            .expect("Authorization header present when token required");
+        let bearer = auth
+            .strip_prefix("Bearer ")
+            .expect("Authorization is a Bearer header");
+        assert!(
+            !bearer.is_empty(),
+            "the bearer token must be non-empty (never a placeholder), got: {auth:?}"
+        );
+
+        // require_token OFF → the server is unauthenticated, so NO headers block is emitted.
+        state.config.lock().unwrap().mcp_require_token = false;
+        let off = get_mcp_config_inner(&state).unwrap();
+        let v_off: serde_json::Value = serde_json::from_str(&off).expect("config is valid JSON");
+        let server_off = &v_off["mcpServers"]["murmur"];
+        assert_eq!(server_off["type"], "http");
+        assert!(
+            server_off.get("headers").is_none(),
+            "no Authorization header when the token flag is off, got: {off}"
+        );
+    }
+
+    /// ENRICH lock gate (RED-before-GREEN): both `enrich_note_context` (read/egress) and
+    /// `apply_note_enrichment` (write) MUST refuse a SEALED-and-not-session-unlocked meeting with
+    /// `AppError::Locked` BEFORE any note read / connector egress / write. With NO connectors
+    /// configured, once unlocked the preview returns an empty vec (nothing to add — graceful),
+    /// proving Locked was the FIRST gate.
+    #[test]
+    fn enrich_commands_refuse_a_sealed_meeting() {
+        let state = build_state("enrich-lockgate");
+        make_open_folder(&state.db, "f-elock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-elock".to_string(),
+                started_at: "2026-07-05T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-elock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-elock".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-05T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-elock", Some("f-elock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-elock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Sealed → both refuse Locked before any egress/write.
+        let e1 = block_on(enrich_note_context_inner(&state, "m-elock".to_string())).unwrap_err();
+        assert!(matches!(e1, AppError::Locked(_)), "preview must fail Locked, got: {e1:?}");
+        let hit = crate::enrich::ContextHit {
+            source: "Jira".into(),
+            detail: "PROJ-1 · Done".into(),
+            url: None,
+        };
+        let e2 =
+            apply_note_enrichment_inner(&state, "m-elock".to_string(), vec![hit]).unwrap_err();
+        assert!(matches!(e2, AppError::Locked(_)), "apply must fail Locked, got: {e2:?}");
+
+        // Session-unlock → the lock gate passes; with no connectors the preview is graceful-empty.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-elock".to_string());
+        let hits = block_on(enrich_note_context_inner(&state, "m-elock".to_string())).unwrap();
+        assert!(hits.is_empty(), "no connectors configured ⇒ nothing to enrich, got: {hits:?}");
+    }
+
+    /// The enrich WRITE path persists a reviewed context block into the canonical DB note and
+    /// strips it byte-exact on an empty apply — through the real command tail (upsert + re-export).
+    #[test]
+    fn apply_note_enrichment_writes_then_strips_byte_exact() {
+        let state = build_state("enrich-write");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_meeting(&state.db, "m1", "# Notes\n- decided to ship\n", Some("f-open"));
+        let original = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown;
+
+        let hits = vec![crate::enrich::ContextHit {
+            source: "Jira".into(),
+            detail: "PROJ-1 · In Progress".into(),
+            url: Some("https://x/browse/PROJ-1".into()),
+        }];
+        let dto = apply_note_enrichment_inner(&state, "m1".to_string(), hits).unwrap();
+        assert!(dto.markdown.contains("> [!context]-"), "the context callout was written");
+        assert!(dto.markdown.contains("PROJ-1 · In Progress (via Jira)"), "loud attribution present");
+        assert!(dto.markdown.starts_with(&original), "the original note is preserved verbatim");
+        // The DB note now carries the block.
+        assert!(state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown
+            .contains("[!context]-"));
+
+        // Empty apply strips it byte-exact back to the original.
+        let undone = apply_note_enrichment_inner(&state, "m1".to_string(), vec![]).unwrap();
+        assert_eq!(undone.markdown, original, "empty enrichment strips the block byte-for-byte");
+    }
+
+    /// Stage 2 / Lane A happy path: over a FINISHED note in an OPEN folder, `link_related_notes_inner`
+    /// appends a `> [!related]-` block of `[[Title]]` links + TASK-FREE gists, persisted DB-canonical,
+    /// preserving the original body — and is idempotent (the block never stacks).
+    #[test]
+    fn link_related_notes_writes_related_block_in_open_folder() {
+        let state = build_state("lanea-open");
+        make_open_folder(&state.db, "f-open", "Project");
+        // The note we link FROM. Kept lean so the salient query is a subset of the related note's
+        // terms (FTS5 MATCH is implicit-AND — every query term must be present in the related note).
+        seed_meeting(&state.db, "this", "Apollo migration.\n", Some("f-open"));
+        state.db.set_meeting_title("this", "Apollo Migration").unwrap();
+        // A related PRIOR note (open folder → visible) whose Summary is the ideal task-free gist and
+        // whose Action items must NEVER enter the link detail.
+        seed_meeting(
+            &state.db,
+            "prior",
+            "## Summary\n\nApollo migration groundwork and rollout roadmap.\n\n## Action items\n\n- [ ] SECRET-TASK\n",
+            Some("f-open"),
+        );
+        state.db.set_meeting_title("prior", "Apollo Kickoff").unwrap();
+
+        link_related_notes_inner(&state, "this").unwrap();
+
+        let md = state
+            .db
+            .get_latest_note_for_meeting("this")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert!(md.contains("> [!related]- Related notes"), "the Related block was written; got: {md}");
+        assert!(md.contains("[[Apollo Kickoff]]"), "the [[Title]] link is present; got: {md}");
+        assert!(md.contains("(via Murmur)"), "loud Murmur attribution; got: {md}");
+        assert!(md.contains("groundwork and rollout"), "the task-free gist prose is present; got: {md}");
+        assert!(!md.contains("SECRET-TASK"), "an action item must NEVER enter a link detail; got: {md}");
+        assert!(
+            md.starts_with("Apollo migration.\n"),
+            "the original note body is preserved verbatim; got: {md}"
+        );
+
+        // Idempotent: re-linking does not stack the block.
+        link_related_notes_inner(&state, "this").unwrap();
+        let md2 = state
+            .db
+            .get_latest_note_for_meeting("this")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(
+            md2.matches("<!-- murmur:links -->").count(),
+            1,
+            "the links block never stacks on re-link"
+        );
+    }
+
+    /// SEAL-SAFETY (RED-before-GREEN, load-bearing): Lane A must NEVER write the transient `markdown`
+    /// column of a SEALED note — even when the session happens to have its folder unlocked (so the
+    /// `meeting_is_unlocked` read gate passes). Without the `content_blob` guard, Lane A would derive a
+    /// query from the title, retrieve a visible related note, and upsert plaintext links into the
+    /// blanked column — resurrecting content that would be lost on the next relock. The guard makes it
+    /// a no-op: the sealed column stays blank and `content_blob` stays intact.
+    #[test]
+    fn link_related_notes_never_touches_a_sealed_note() {
+        let state = build_state("lanea-sealsafe");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "sealed", "# Secret body\n", Some("f-lock"));
+        state
+            .db
+            .set_meeting_title("sealed", "Atlas Acquisition Roadmap")
+            .unwrap();
+        // A visible related note in an OPEN folder that the sealed meeting's title WOULD retrieve.
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(
+            &state.db,
+            "prior",
+            "## Summary\n\nAtlas acquisition roadmap groundwork.\n",
+            Some("f-open"),
+        );
+        state.db.set_meeting_title("prior", "Atlas Kickoff").unwrap();
+
+        // Seal the note (content_blob present, markdown blanked), lock the folder, and SESSION-UNLOCK it
+        // so the read gate passes and ONLY the seal-safety guard can stop the write.
+        state
+            .db
+            .seal_note("sealed", "claude_code", &b"ciphertext-blob"[..])
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+
+        assert!(
+            meeting_is_unlocked(&state, "sealed").unwrap(),
+            "precondition: the sealed meeting is session-unlocked (so meeting_is_unlocked passes)"
+        );
+        link_related_notes_inner(&state, "sealed").unwrap();
+
+        // The sealed note's transient markdown column is untouched (still blank) — no plaintext links.
+        let md = state
+            .db
+            .get_latest_note_for_meeting("sealed")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(md, "", "a sealed note's transient markdown column must NEVER be written by Lane A");
+        // The seal (content_blob) is intact.
+        assert!(
+            state
+                .db
+                .sealable_notes_for_meeting("sealed")
+                .unwrap()
+                .iter()
+                .any(|n| n.content_blob.is_some()),
+            "the seal (content_blob) is left intact"
         );
     }
 
@@ -12633,6 +13352,72 @@ mod lifecycle_tests {
         );
     }
 
+    /// PHASE 6: `set_focus_meeting` sets and clears the focus pointer; a blank/whitespace id clears.
+    #[test]
+    fn set_focus_meeting_sets_and_clears_the_pointer() {
+        let state = build_state("focus-set-clear");
+        assert!(
+            state.focus_meeting.lock().unwrap().is_none(),
+            "precondition: no focus set"
+        );
+
+        // Set a focus id.
+        set_focus_meeting_inner(&state, Some("m-focused".to_string()));
+        assert_eq!(
+            state.focus_meeting.lock().unwrap().as_deref(),
+            Some("m-focused"),
+            "focus is set to the viewed meeting"
+        );
+
+        // A whitespace id normalizes to a clear (None), not a blank string.
+        set_focus_meeting_inner(&state, Some("   ".to_string()));
+        assert!(
+            state.focus_meeting.lock().unwrap().is_none(),
+            "a blank/whitespace focus id clears the pointer"
+        );
+
+        // Set again, then explicitly clear with None (meeting-view close).
+        set_focus_meeting_inner(&state, Some(" m-2 ".to_string()));
+        assert_eq!(
+            state.focus_meeting.lock().unwrap().as_deref(),
+            Some("m-2"),
+            "focus is trimmed and set"
+        );
+        set_focus_meeting_inner(&state, None);
+        assert!(
+            state.focus_meeting.lock().unwrap().is_none(),
+            "None clears the focus pointer on view close"
+        );
+    }
+
+    /// PHASE 6 fail-safe: a POISONED focus mutex must not brick the setter — it recovers the guard
+    /// via `into_inner()` (the pointer carries no invariant) and still writes the new value.
+    #[test]
+    fn set_focus_meeting_recovers_from_a_poisoned_mutex() {
+        let state = build_state("focus-poisoned");
+        // Poison the focus mutex.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = state.focus_meeting.lock().unwrap();
+            panic!("poison the focus mutex");
+        }));
+        assert!(
+            state.focus_meeting.is_poisoned(),
+            "precondition: the focus mutex is poisoned"
+        );
+
+        // The setter still works (fail-safe recovery).
+        set_focus_meeting_inner(&state, Some("m-after-poison".to_string()));
+        let g = state
+            .focus_meeting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            g.as_deref(),
+            Some("m-after-poison"),
+            "a poisoned focus mutex fails safe and still sets the pointer"
+        );
+    }
+
     /// brain2 realtime notes: with the meeting in an OPEN folder (or no folder) the gate is open, so
     /// `save`/`get` round-trip the buffer.
     #[test]
@@ -13851,9 +14636,15 @@ mod lifecycle_tests {
         assert!(n.content_blob.is_none(), "never sealed");
     }
 
-    /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it to the
-    /// folder's at-rest shape — `content_blob` set, `markdown` blanked, transcript blanked — so no
-    /// plaintext ever lands in a locked folder, and the note is reassigned to the target.
+    /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it AT REST
+    /// (`content_blob`/`text_blob` set) but keeps it READABLE IN-SESSION — the restored plaintext
+    /// markdown + transcript come back exactly like the folder's other unlocked notes, so it never
+    /// shows blank under the open padlock, and no vault `.md` is left behind.
+    ///
+    /// REGRESSION (RED-before-GREEN): before the fix, `seal_moved_note` blanked the plaintext and
+    /// nothing restored it, so a note moved into a session-unlocked folder came back EMPTY under the
+    /// open padlock (the "private note came back empty" bug the user hit). The OLD assertion
+    /// `markdown.is_empty()` enshrined that bug; this asserts the correct in-session-readable state.
     #[test]
     fn move_into_locked_unlocked_folder_seals_the_moved_note() {
         const MID: &str = "m-blk2s";
@@ -13876,7 +14667,8 @@ mod lifecycle_tests {
 
         move_into_locked_folder(&state, MID, TARGET).unwrap();
 
-        // Reassigned into the target AND sealed at rest (blob set, plaintext blanked).
+        // Reassigned into the target, sealed AT REST (blob set) but READABLE IN-SESSION (plaintext
+        // restored — the folder is session-unlocked, so it must read like its folder-mates).
         assert_eq!(
             state.db.folder_for_meeting(MID).unwrap().as_deref(),
             Some(TARGET)
@@ -13884,20 +14676,42 @@ mod lifecycle_tests {
         let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
         assert!(
             n.content_blob.is_some(),
-            "moved note must be sealed (content_blob set)"
+            "moved note must be sealed at rest (content_blob set)"
         );
-        assert!(
-            n.markdown.is_empty(),
-            "moved note plaintext markdown blanked at rest"
+        assert_eq!(
+            n.markdown, MD,
+            "moved note must stay READABLE in-session (regression: it used to come back empty under the open padlock)"
         );
         assert!(
             n.exported_path.is_none(),
             "no vault .md for a note in a locked folder"
         );
-        // Transcript sealed too (text blanked, text_blob present).
+        // The visible read path (what the meeting-detail UI uses) returns the note, NON-empty.
+        let unlocked = state.unlocked_folders.lock().unwrap().clone();
+        let visible = state
+            .db
+            .get_note_if_visible(MID, &unlocked)
+            .unwrap()
+            .expect("note is visible while its folder is session-unlocked");
+        assert_eq!(
+            visible.markdown, MD,
+            "the meeting-detail read must show the moved note's content, not an empty note"
+        );
+        // Transcript: blob kept AT REST, but plaintext RESTORED for the session (not left blank).
+        let restored_transcript: String = state
+            .db
+            .raw_segments(MID)
+            .unwrap()
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !restored_transcript.trim().is_empty(),
+            "transcript must be restored for the session (regression: left blank)"
+        );
         for s in state.db.raw_segments(MID).unwrap() {
-            assert!(s.text.is_empty(), "segment text blanked");
-            assert!(s.text_blob.is_some(), "segment text_blob present");
+            assert!(s.text_blob.is_some(), "segment text_blob kept at rest");
         }
 
         // And it round-trips: a permanent remove-lock restores the original plaintext (no loss).
@@ -13960,8 +14774,10 @@ mod lifecycle_tests {
     }
 
     /// Auto-organize seam (seal half): a note auto-filed into a session-unlocked locked folder via
-    /// [`seal_auto_filed_note`] is sealed to the folder's at-rest shape (blob set, markdown blanked)
-    /// and reassigned — exactly like a manual move. No plaintext survives in the sealed dir.
+    /// [`seal_auto_filed_note`] is sealed AT REST (blob set) but stays READABLE IN-SESSION (plaintext
+    /// restored) and reassigned — exactly like a manual move. No plaintext `.md` survives in the
+    /// sealed dir, and it never comes back empty under the open padlock (same regression as the manual
+    /// move: the old `markdown.is_empty()` assertion enshrined the "came back empty" bug).
     #[test]
     fn seal_auto_filed_note_seals_into_unlocked_locked_folder() {
         const MID: &str = "m-autofile";
@@ -13989,11 +14805,22 @@ mod lifecycle_tests {
         let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
         assert!(
             n.content_blob.is_some(),
-            "auto-filed note sealed (content_blob set)"
+            "auto-filed note sealed at rest (content_blob set)"
         );
-        assert!(
-            n.markdown.is_empty(),
-            "auto-filed note plaintext blanked at rest"
+        assert_eq!(
+            n.markdown, MD,
+            "auto-filed note must stay READABLE in-session (regression: it used to come back empty)"
+        );
+        // Visible read path returns the note, non-empty.
+        let unlocked = state.unlocked_folders.lock().unwrap().clone();
+        assert_eq!(
+            state
+                .db
+                .get_note_if_visible(MID, &unlocked)
+                .unwrap()
+                .expect("auto-filed note visible while its folder is session-unlocked")
+                .markdown,
+            MD
         );
     }
 
