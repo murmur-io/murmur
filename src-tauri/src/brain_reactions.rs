@@ -140,7 +140,35 @@ fn extract_fact_candidates_capped(
 
 /// Chars of the live-transcript TAIL fed to one reactions scan — a bounded recent window (the far
 /// side's latest utterances), kept small so the light extraction stays a ~2–3-sentence task.
+/// LEGACY substrate: used only when the running bullets are empty/off (see [`reaction_window`]).
 const REACTION_WINDOW_CHARS: usize = 600;
+
+/// Chars of VERBATIM transcript tail appended after the running bullets in the L4 substrate —
+/// the bullets carry the meeting's accumulated context, so the verbatim part only needs the very
+/// latest utterance.
+const REACTION_VERBATIM_TAIL_CHARS: usize = 300;
+
+/// Brain v2 L4 — assemble the scan window (PURE): with non-empty running `bullets` the substrate
+/// is `bullets + the last `[`REACTION_VERBATIM_TAIL_CHARS`]` chars verbatim` (the bullets give the
+/// extraction the meeting's context, the tail gives it the fresh utterance); with bullets
+/// empty/off it is EXACTLY the legacy [`REACTION_WINDOW_CHARS`] tail — byte-identical behavior.
+///
+/// ACCEPTED POSTURE (lock-security nit, 2026-07-10): the `bullets` input is the UNGATED RAM read
+/// of `AppState::live_bullets` in [`reactions_scan`] — the same class as the pre-existing ungated
+/// `live_transcript` tail (the CURRENT recording's own captions, already on-screen). It feeds
+/// ONLY the on-device light engine (never a cloud call); the widened exposure is that a
+/// WhisperCard can QUOTE from the whole-meeting bullets digest (up to 4k chars) rather than the
+/// 600-char raw tail, and the boundary queue (≤30s max-hold + drain-on-stop) can emit such a card
+/// shortly after a mid-recording relock. Accepted because the substrate never leaves the device,
+/// the RAM buffer is cleared at recording start/Stop + the lock-surface idle hygiene, and every
+/// PERSISTED / prompt-injected read of the bullets IS gated (`gated_live_bullets`, fail-closed).
+pub(crate) fn reaction_window(bullets: &str, live: &str) -> String {
+    let b = bullets.trim();
+    if b.is_empty() {
+        return tail(live, REACTION_WINDOW_CHARS);
+    }
+    format!("{b}\n{}", tail(live, REACTION_VERBATIM_TAIL_CHARS))
+}
 
 /// The gated result of one live-loop reactions scan: the cards + whether they should be EMITTED (the
 /// contradiction sub-toggle is ON) or SHADOW-counted (OFF). Computed OFF the live tick thread.
@@ -151,10 +179,21 @@ pub struct ReactionScan {
 
 /// One Realtime-Reactions scan wired to the running app (spec §4). GATED: no cards unless Brain Live
 /// is ON and the LIGHT model is present (a stub reasoner yields nothing — feature degraded, NEVER a
-/// cloud call). Reads the live-transcript tail + gated entities and runs [`detect_reactions`] on the
-/// light engine. `emit` mirrors the `brain_contradiction_cards` sub-toggle (OFF ⇒ shadow: count,
+/// cloud call). Reads the scan substrate ([`reaction_window`] — running bullets + a short verbatim
+/// tail when the L4 bullets are on, the legacy raw tail otherwise) and runs [`detect_reactions`] on
+/// the light engine. `emit` mirrors the `brain_contradiction_cards` sub-toggle (OFF ⇒ shadow: count,
 /// don't show). IMPURE, Mac-verified inference path; the CALLER runs it OFF the live tick thread.
-pub fn reactions_scan(app: &tauri::AppHandle, now: &str) -> ReactionScan {
+///
+/// Brain v2 L4: `entities` is the caller's tick-thread [`crate::transcribe::novelty::RefreshableEntityCache`]
+/// snapshot (the gated `list_entities_visible` read, refreshed every ~60 ticks) — passed in so the
+/// scan stops re-fetching the list per scan. Staleness affects TRIGGER/candidate names only, never
+/// content: the fact reads inside [`detect_reactions`] re-check `list_facts_visible` against the
+/// FRESH unlocked set, so a mid-recording relock still surfaces nothing.
+pub fn reactions_scan(
+    app: &tauri::AppHandle,
+    now: &str,
+    entities: &[(String, String)],
+) -> ReactionScan {
     use tauri::Manager;
     let empty = ReactionScan {
         cards: Vec::new(),
@@ -185,24 +224,27 @@ pub fn reactions_scan(app: &tauri::AppHandle, now: &str) -> ReactionScan {
         .lock()
         .map(|u| u.clone())
         .unwrap_or_default();
-    let current = st
-        .current_meeting
+    // Brain v2 L4 substrate: running bullets (RAM — populated only when `live_bullets_enabled`
+    // AND a light model is present, so empty ⇒ the legacy raw tail, byte-identical behavior).
+    // Both inputs stay on-device: the window feeds ONLY the local light extraction below.
+    let bullets = st
+        .live_bullets
         .lock()
-        .ok()
-        .and_then(|m| m.map(|id| id.to_string()))
+        .map(|b| b.clone())
         .unwrap_or_default();
-    let window = st
+    let live = st
         .live_transcript
         .lock()
-        .map(|b| tail(&b, REACTION_WINDOW_CHARS))
+        .map(|b| b.clone())
         .unwrap_or_default();
+    let window = reaction_window(&bullets, &live);
     if window.trim().is_empty() {
         return ReactionScan {
             cards: Vec::new(),
             emit,
         };
     }
-    let entities = resolve_window_entities(&st.db, &unlocked, &current, &window);
+    let entities = filter_window_entities(entities, &window);
     let cards = detect_reactions(&*reasoner, &st.db, &unlocked, &entities, &window, now);
     // SESSION dedup (deep-review): a contradiction surfaces at most ONCE per recording — else the same
     // card re-emits every ~21 s scan and (in shadow mode) re-inflates the calibration count. Keyed on
@@ -238,25 +280,24 @@ fn tail(s: &str, n: usize) -> String {
     }
 }
 
-/// Resolve the VISIBLE entities whose name appears in the `window` (case-insensitive substring), for
-/// fact lookup. The current meeting is not special-cased: its facts aren't persisted mid-recording, so
-/// there is nothing of its own to surface. Gated: `list_entities_visible` already drops sealed-only
-/// entities. Best-effort — a failed read yields no entities (no cards), never a panic.
-fn resolve_window_entities(
-    db: &Db,
-    unlocked: &HashSet<String>,
-    _current_meeting_id: &str,
+/// Filter the caller-supplied VISIBLE entity list (the tick thread's shared cache — gated at fetch
+/// time by `list_entities_visible`) down to the entities whose name appears in the `window`
+/// (case-insensitive substring), for fact lookup. The current meeting is not special-cased: its
+/// facts aren't persisted mid-recording, so there is nothing of its own to surface. Pure —
+/// headless-testable; the content gate stays downstream (`list_facts_visible` on the FRESH
+/// unlocked set inside [`detect_reactions`]).
+pub(crate) fn filter_window_entities(
+    entities: &[(String, String)],
     window: &str,
 ) -> Vec<(String, String)> {
     let wl = window.to_lowercase();
-    db.list_entities_visible(unlocked)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|n| {
-            let name = n.name.trim();
+    entities
+        .iter()
+        .filter(|(_, name)| {
+            let name = name.trim();
             !name.is_empty() && wl.contains(&name.to_lowercase())
         })
-        .map(|n| (n.id, n.name))
+        .cloned()
         .collect()
 }
 
@@ -336,6 +377,36 @@ mod tests {
         assert!(should_defer_scan(&flag), "user turn in flight: defer");
         flag.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!should_defer_scan(&flag), "turn ended: the scan resumes");
+    }
+
+    /// Brain v2 L4 — the scan substrate: with bullets EMPTY the window is byte-identical to the
+    /// legacy 600-char tail; with bullets present it is `bullets + last-300-chars verbatim`.
+    #[test]
+    fn reaction_window_is_legacy_tail_without_bullets_and_bullets_plus_tail_with() {
+        let live = "x".repeat(1_000);
+        // Empty / whitespace bullets ⇒ EXACTLY the legacy tail.
+        assert_eq!(reaction_window("", &live), tail(&live, 600));
+        assert_eq!(reaction_window("   \n", &live), tail(&live, 600));
+        // Bullets present ⇒ bullets first, then only the short verbatim tail.
+        let w = reaction_window("- [deal]: pricing agreed", &live);
+        assert!(w.starts_with("- [deal]: pricing agreed\n"));
+        let verbatim = w.split_once('\n').unwrap().1;
+        assert_eq!(verbatim.chars().count(), 300, "verbatim tail bounded at 300");
+    }
+
+    /// Brain v2 L4 — the entity filter over the SHARED tick-thread cache: whole-window
+    /// case-insensitive containment, empty names dropped, non-mentioned entities dropped.
+    #[test]
+    fn filter_window_entities_matches_case_insensitively() {
+        let entities = vec![
+            ("e1".to_string(), "Atlas".to_string()),
+            ("e2".to_string(), "Kraken".to_string()),
+            ("e3".to_string(), "  ".to_string()),
+        ];
+        let hits = filter_window_entities(&entities, "wracamy do tematu atlas w przyszłym tygodniu");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "e1");
+        assert!(filter_window_entities(&entities, "nic o nich").is_empty());
     }
 
     #[test]

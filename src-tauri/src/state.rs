@@ -177,6 +177,19 @@ pub struct AppState {
     /// Prevents the same contradiction re-emitting every ~21 s scan (and re-inflating the shadow count)
     /// — the "does not resurface this session" contract (deep-review). Cleared at each `start_recording`.
     pub reactions_emitted: Mutex<std::collections::HashSet<String>>,
+    /// Brain v2 L4 — the RUNNING LIVE BULLETS of the recording IN PROGRESS (RAM, capped at
+    /// `transcribe::bullets::MAX_BULLETS_CHARS`, front-trimmed on line boundaries). Updated by the
+    /// reactions worker (`transcribe::bullets::bullets_tick`, behind `reactions_busy`); consumed
+    /// by the reactions substrate (`brain_reactions::reaction_window`), the gated live-question
+    /// inject (`transcribe::live::compose_live_inject`), and — via the crash-recovery
+    /// `live_bullets` DB row — the Stop-time note (`SummarizeRequest::live_bullets`). Cleared at
+    /// recording start + Stop + the lock-surface idle hygiene (mirrors `live_transcript`); prompt
+    /// reads are gated on the scope meeting's visibility (`gated_live_bullets`, fail-closed).
+    pub live_bullets: Mutex<String>,
+    /// Brain v2 L4 — the bullets' delta position over `live_transcript` (offset + anchor, see
+    /// `transcribe::bullets::BulletsTracker`), advanced by the WORKER at its own busy-gated pace
+    /// so a skipped scan's text reaches the next update. Reset with `live_bullets`.
+    pub live_bullets_tracker: Mutex<crate::transcribe::bullets::BulletsTracker>,
     /// Brain v2 P0.3 — per-meeting IN-FLIGHT assistant-turn counter: how many assistant turns are
     /// currently running for each scope meeting (key = the FE-sent meeting id, "" for the unscoped
     /// voice/wake path). `spawn_assistant_turn` DEDUPS on it: a second turn for the same key while one
@@ -292,6 +305,8 @@ impl AppState {
             current_meeting: Mutex::new(None),
             focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: AtomicBool::new(false),
             reactions_shadow_count: AtomicU64::new(0),
             reactions_emitted: Mutex::new(std::collections::HashSet::new()),
