@@ -25,6 +25,30 @@ pub const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
 pub const DIARIZE_SEG_MODEL_FILE: &str = "sherpa-pyannote-segmentation-3.0.onnx";
 pub const DIARIZE_EMB_MODEL_FILE: &str = "wespeaker_en_voxceleb_CAM++.onnx";
 
+/// OPTIONAL parakeet live-ASR engine (NVIDIA parakeet-tdt-0.6b-v3 int8, sherpa-onnx nemo
+/// transducer, CPU-only). The four model files live under `<models_dir>/<PARAKEET_SUBDIR>/`,
+/// downloaded on demand from the csukuangfj sherpa-onnx HF mirror. ~600 MB total (encoder +
+/// decoder are the bulk; the joiner + tokens are tiny). See `transcribe::parakeet`.
+pub const PARAKEET_SUBDIR: &str = "parakeet-tdt-0.6b-v3-int8";
+pub const PARAKEET_ENCODER: &str = "encoder.int8.onnx";
+pub const PARAKEET_DECODER: &str = "decoder.int8.onnx";
+pub const PARAKEET_JOINER: &str = "joiner.int8.onnx";
+pub const PARAKEET_TOKENS: &str = "tokens.txt";
+
+/// The four parakeet model files, in a stable order for download aggregation + presence checks.
+const PARAKEET_FILES: &[&str] = &[
+    PARAKEET_ENCODER,
+    PARAKEET_DECODER,
+    PARAKEET_JOINER,
+    PARAKEET_TOKENS,
+];
+
+/// RAM floor for loading the parakeet CPU recognizer alongside whisper + the brain: the int8
+/// transducer is ~600 MB resident, so refuse it on affirmatively-below-8-GB machines (parity with
+/// the reasoner's whisper-large refuse). A BROKEN RAM probe (`None`) fails OPEN — never refuse
+/// captions on a measurement we couldn't take.
+const PARAKEET_MIN_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// QUANT-SUFFIXED model sizes accepted by [`model_filename`] (T2 quant plumbing; the CONDITIONAL
 /// default flip lives in [`default_model_size`]). Each maps `"<size>-<quant>"` →
 /// `ggml-<size>-<quant>.bin`, verified BY URL SHAPE against the ggerganov/whisper.cpp HF
@@ -293,6 +317,93 @@ pub fn models_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Transcribe(format!("create models dir: {e}")))?;
     Ok(dir)
+}
+
+/// The directory holding the OPTIONAL parakeet live-ASR models:
+/// `<models_dir>/parakeet-tdt-0.6b-v3-int8`. Created if absent (mirrors [`models_dir`]).
+pub fn parakeet_dir() -> Result<PathBuf> {
+    let dir = models_dir()?.join(PARAKEET_SUBDIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Transcribe(format!("create parakeet dir: {e}")))?;
+    Ok(dir)
+}
+
+/// The four resolved parakeet model file paths under [`parakeet_dir`] (encoder/decoder/joiner
+/// int8 ONNX + tokens). Errors only if the models dir can't be resolved/created; whether the
+/// files actually EXIST is [`ParakeetModelPaths::all_present`] / [`parakeet_models_present`].
+pub fn parakeet_model_paths() -> Result<crate::transcribe::live_asr::ParakeetModelPaths> {
+    let dir = parakeet_dir()?;
+    Ok(crate::transcribe::live_asr::ParakeetModelPaths {
+        encoder: dir.join(PARAKEET_ENCODER),
+        decoder: dir.join(PARAKEET_DECODER),
+        joiner: dir.join(PARAKEET_JOINER),
+        tokens: dir.join(PARAKEET_TOKENS),
+    })
+}
+
+/// Whether ALL FOUR parakeet model files exist under [`parakeet_dir`]. GRACEFUL: any error
+/// resolving the dir ⇒ `false` (mirrors `embed_model_present` — a probe failure means "not
+/// present", never a panic). Consumed by the `parakeet_models_present` command + `build_live_asr`.
+pub fn parakeet_models_present() -> bool {
+    let Ok(dir) = parakeet_dir() else {
+        return false;
+    };
+    PARAKEET_FILES.iter().all(|f| dir.join(f).is_file())
+}
+
+/// HF mirror URL for a parakeet model file (csukuangfj's sherpa-onnx nemo parakeet release). All
+/// four files (`encoder.int8.onnx` / `decoder.int8.onnx` / `joiner.int8.onnx` / `tokens.txt`) are
+/// verified HTTP-200 against `resolve/main`. INBOUND ONLY (no request body / no egress).
+pub fn parakeet_model_url(filename: &str) -> String {
+    format!(
+        "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/{filename}"
+    )
+}
+
+/// RAM guard for loading the parakeet CPU recognizer — `false` ONLY when total RAM is
+/// affirmatively below [`PARAKEET_MIN_RAM_BYTES`]. Fails OPEN (returns `true`) when the probe
+/// can't read RAM, so a broken measurement never silently disables captions. Mirrors the pattern
+/// used elsewhere for RAM-sensitive model loads.
+pub fn parakeet_ram_permits_now() -> bool {
+    match total_ram_bytes() {
+        Some(b) => b >= PARAKEET_MIN_RAM_BYTES,
+        None => true,
+    }
+}
+
+/// Ensure all four parakeet model files exist under [`parakeet_dir`], downloading any missing one
+/// (atomic `.part` → rename, via [`download_model_streaming`]) from the csukuangfj HF mirror.
+/// `on_progress(downloaded, total)` reports the AGGREGATE byte progress across the four files
+/// (per-file byte sum; `total` is `None` once any file's server omits `Content-Length`). A file
+/// already present is skipped (its bytes are counted toward the running total so the bar doesn't
+/// jump). Best-effort + atomic; a failure leaves the caller on whisper captions (the seam falls
+/// back). No PII logged (file id / byte counts only).
+pub async fn ensure_parakeet_models<F>(mut on_progress: F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    let dir = parakeet_dir()?;
+    // Aggregate progress across the four files: carry the bytes of already-finished files forward
+    // so each file's per-file `downloaded` is offset onto the running total.
+    let mut base: u64 = 0;
+    for file in PARAKEET_FILES {
+        let dest = dir.join(file);
+        if dest.is_file() {
+            // Count an existing file's size toward the running total so a resumed/partial set
+            // reports monotonically increasing progress.
+            base = base.saturating_add(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
+            continue;
+        }
+        download_model_streaming(&parakeet_model_url(file), &dest, |d, _t| {
+            // The aggregate total is unknown across four files (mixed Content-Length availability),
+            // so report the running byte sum with `None` total — the FE shows an indeterminate/byte
+            // progress, consistent with the whisper multi-GB bar.
+            on_progress(base.saturating_add(d), None);
+        })
+        .await?;
+        base = base.saturating_add(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
+    }
+    Ok(())
 }
 
 /// Resolve the model path the transcriber should load.
@@ -798,5 +909,55 @@ mod tests {
             vad_model_url(VAD_MODEL_FILE),
             "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
         );
+    }
+
+    /// The parakeet download URLs point at the csukuangfj sherpa-onnx nemo mirror (`resolve/main`),
+    /// one per file — the exact repo whose four files are verified HTTP-200.
+    #[test]
+    fn parakeet_urls_point_at_sherpa_nemo_mirror() {
+        let base = "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main";
+        for f in [
+            PARAKEET_ENCODER,
+            PARAKEET_DECODER,
+            PARAKEET_JOINER,
+            PARAKEET_TOKENS,
+        ] {
+            assert_eq!(parakeet_model_url(f), format!("{base}/{f}"));
+        }
+    }
+
+    /// `parakeet_models_present` (via the same all-four-files predicate over a temp dir): a
+    /// half-present bundle reads as ABSENT; only all four files ⇒ present. Uses the PARAKEET_FILES
+    /// list directly against a temp dir so the check is testable without touching the real
+    /// app-data models dir.
+    #[test]
+    fn parakeet_present_requires_every_file() {
+        let dir = std::env::temp_dir().join(format!("murmur-parakeet-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = |d: &Path| PARAKEET_FILES.iter().all(|f| d.join(f).is_file());
+
+        assert!(!present(&dir), "nothing on disk → absent");
+        // Write three of four → still absent.
+        for f in [PARAKEET_ENCODER, PARAKEET_DECODER, PARAKEET_JOINER] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert!(!present(&dir), "three of four → still absent");
+        // The fourth completes the set → present.
+        std::fs::write(dir.join(PARAKEET_TOKENS), b"x").unwrap();
+        assert!(present(&dir), "all four → present");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `parakeet_model_paths` resolves to `<parakeet_dir>/<file>` for each of the four files — the
+    /// SAME layout `parakeet_models_present` checks (they must never diverge).
+    #[test]
+    fn parakeet_model_paths_match_dir_and_consts() {
+        let paths = parakeet_model_paths().unwrap();
+        let dir = parakeet_dir().unwrap();
+        assert_eq!(paths.encoder, dir.join(PARAKEET_ENCODER));
+        assert_eq!(paths.decoder, dir.join(PARAKEET_DECODER));
+        assert_eq!(paths.joiner, dir.join(PARAKEET_JOINER));
+        assert_eq!(paths.tokens, dir.join(PARAKEET_TOKENS));
     }
 }
