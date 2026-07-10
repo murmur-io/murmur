@@ -365,6 +365,21 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_assistant_interactions_meeting
                ON assistant_interactions(meeting_id);
+             -- Brain v2 L4: CRASH-RECOVERY row for the incremental live bullets of a recording in
+             -- progress (`transcribe::bullets`). RAM (`AppState::live_bullets`) is authoritative
+             -- during the recording; this row lets a crash-salvaged meeting still feed its bullets
+             -- into the Stop-time note (`SummarizeRequest::live_bullets`). DERIVED meeting content
+             -- (the L2 lesson): PURGED on every seal path (`purge_chunks_for_meetings`,
+             -- `blank_sealed_notes_in_folders`, `reblank_locked_folders_at_rest`,
+             -- `discard_folder_seal`) and on `delete_meeting` (explicit + FK CASCADE); the write
+             -- refuses in-tx when the meeting is sealed at rest (`upsert_live_bullets`); consumed
+             -- + cleared by the note pipeline at Stop. Never read by an FE command.
+             CREATE TABLE IF NOT EXISTS live_bullets (
+               meeting_id TEXT PRIMARY KEY,
+               bullets_md TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
              -- brain2 R2: the BITEMPORAL FACTS layer. One row per entity·predicate·object
              -- assertion with TWO time axes: valid_from/valid_to (valid time — when the fact was
              -- true; valid_to NULL = currently valid, set when superseded) and recorded_at
@@ -2052,6 +2067,10 @@ impl Db {
         // purge_supersessions_tx). Their pre-images hold plaintext note bytes; a deleted meeting must
         // leave none behind.
         Self::purge_supersessions_tx(&tx, &[id.to_string()])?;
+        // Brain v2 L4: drop this meeting's live-bullets crash-recovery row EXPLICITLY in the same
+        // tx (the meetings FK CASCADE also covers it — the explicit delete keeps the purge visible
+        // and test-bound alongside the other derived artifacts).
+        Self::purge_live_bullets_tx(&tx, &[id.to_string()])?;
         // Brain v2 L2.2: purge this meeting's user facts EXPLICITLY (direct DELETE) rather than
         // relying on the meetings FK cascade alone — the direct DELETE reliably fires the
         // `fts_user_facts_ad` trigger, so the deleted facts' tokens leave the FTS index in this
@@ -2655,6 +2674,10 @@ impl Db {
         // Voice-assistant Q&A log is plaintext-derived convenience data mirroring sealed content —
         // drop it in the SAME seal tx (purge-on-seal, like corrections). Dropped by design.
         Self::purge_assistant_interactions_tx(&tx, meeting_ids)?;
+        // Brain v2 L4 LOCK-SAFETY: the live-bullets crash-recovery row is plaintext-derived
+        // running notes of the meeting — drop it in the SAME seal tx (purge-on-seal, like the
+        // assistant interactions above). Dropped by design; the transcript stays sealed+restorable.
+        Self::purge_live_bullets_tx(&tx, meeting_ids)?;
         // brain2 R2: bitemporal facts are DERIVED content tied to the meeting (plaintext at rest);
         // drop them in the SAME seal tx so a sealed meeting contributes no fact — same purge-on-seal
         // contract as corrections / chunks / assistant interactions.
@@ -4419,7 +4442,7 @@ impl Db {
     /// In one transaction, scoped to THIS folder's meetings + documents: NULL every sealed blob and
     /// blank the (already-empty) plaintext columns, purge every derived table that could hold
     /// sealed-content-derived data (chunks/vectors/facts/user-facts/correction-log/assistant-log/
-    /// voiceprints), then clear the folder's `wrapped_key` and set `locked = 0`. Returns the at-rest
+    /// voiceprints/live-bullets), then clear the folder's `wrapped_key` and set `locked = 0`. Returns the at-rest
     /// audio columns of the folder's meetings so the caller can delete the orphaned `.enc` files on
     /// disk (the DB layer stays pure-SQL). NEVER call this without the caller's non-recoverability
     /// proof — it is the one path that discards sealed content by design (and now provably only the
@@ -4542,6 +4565,11 @@ impl Db {
             "facts",
             "user_facts",
             "speaker_voiceprints",
+            // Brain v2 L4 (lock-security W3): the live-bullets crash-recovery row is the same
+            // derived-plaintext class — purge it with the rest (contract consistency; a reachable
+            // row at discard time only ever digests never-sealed plaintext, but the "purge every
+            // derived table" contract must not silently exclude one table).
+            "live_bullets",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE meeting_id IN ({FOLDER_MEETINGS})"),
@@ -4856,6 +4884,10 @@ impl Db {
             // (re-blanked / sealed) folders — an applied row's plaintext note pre-image must not
             // linger at rest for a sealed folder (same purge-on-seal contract as corrections above).
             Self::purge_supersessions_tx(&tx, &meeting_ids)?;
+            // Brain v2 L4 LOCK-SAFETY: drop the live-bullets crash-recovery rows of every meeting
+            // in these (re-blanked / sealed) folders in this SAME relock tx — running notes are
+            // plaintext derived from the transcript and must not survive a relock at rest.
+            Self::purge_live_bullets_tx(&tx, &meeting_ids)?;
             // NOTE: the typed-notes (`manual_notes`) re-blank does NOT live here — it is SEALED-AND-
             // RESTORED content (not a derived/purgeable artifact like chunks/corrections), so its
             // plaintext is re-blanked only WHERE the `manual_notes_blob` exists, by
@@ -4961,6 +4993,15 @@ impl Db {
         // a restart. Same purge-on-seal contract as the correction-log above.
         tx.execute(
             &format!("DELETE FROM assistant_interactions WHERE meeting_id IN ({LOCKED_MEETINGS})"),
+            [],
+        )
+        .map_err(map_err)?;
+        // Brain v2 L4 LOCK-SAFETY: purge the live-bullets crash-recovery rows for every meeting in
+        // a locked folder, in this same reconciliation transaction — so a crash mid-recording into
+        // a since-sealed folder cannot leave the plaintext running notes at rest after a restart.
+        // Same purge-on-seal contract as the assistant-interactions above.
+        tx.execute(
+            &format!("DELETE FROM live_bullets WHERE meeting_id IN ({LOCKED_MEETINGS})"),
             [],
         )
         .map_err(map_err)?;
@@ -5843,6 +5884,103 @@ impl Db {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM assistant_interactions WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    // ── Brain v2 L4 — the `live_bullets` crash-recovery row (transcribe::bullets) ───────────────
+
+    /// Upsert the running live bullets for the recording in progress (crash recovery for the
+    /// Stop-time note input). Written by the reactions worker only while the meeting records;
+    /// consumed + cleared by the note pipeline at Stop.
+    ///
+    /// TOCTOU LOCK-SAFETY (lock-security W2, 2026-07-10 — the same shape as the in-tx re-check in
+    /// `index_meeting_topic_chunks`): a `lock_folder` can commit BETWEEN the worker's
+    /// `current_meeting` check and this write — its seal tx purged the row, and a plaintext
+    /// re-upsert would leave sealed-meeting running notes at rest until the next relock /
+    /// Stop-consume / startup reconcile. So the write re-checks the SESSION-INDEPENDENT DB-side
+    /// sealed-at-rest invariant (a `notes` row with `content_blob` present and blank `markdown`)
+    /// inside its own transaction and REFUSES silently (`Ok(())` — the worker is best-effort; the
+    /// RAM copy is cleared by the lock surface anyway).
+    pub fn upsert_live_bullets(
+        &self,
+        meeting_id: &str,
+        bullets_md: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let sealed_at_rest: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM notes
+                    WHERE meeting_id = ?1
+                      AND content_blob IS NOT NULL
+                      AND (markdown IS NULL OR markdown = '')
+                 )",
+                rusqlite::params![meeting_id],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if sealed_at_rest {
+            // Rollback via drop — nothing written. IDs only in the log (no bullet text — PII rule).
+            tracing::debug!(target: "bullets", meeting_id, "live-bullets upsert refused: meeting is sealed at rest");
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO live_bullets (meeting_id, bullets_md, updated_at)
+                  VALUES (?1, ?2, ?3)
+             ON CONFLICT(meeting_id) DO UPDATE
+                    SET bullets_md = excluded.bullets_md, updated_at = excluded.updated_at",
+            rusqlite::params![meeting_id, bullets_md, updated_at],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The stored live bullets for `meeting_id`, or `None`. INTERNAL PRODUCER READ ONLY — the note
+    /// pipeline consumes it while producing the meeting's own note plaintext (the same
+    /// ungated-by-design classification as `get_manual_notes` there); it must NEVER back an FE
+    /// command without a `meeting_is_unlocked` gate. A sealed meeting has no row anyway
+    /// (purge-on-seal — `purge_live_bullets_tx`), so this is defense-in-depth layering, not the
+    /// gate itself.
+    pub fn get_live_bullets(&self, meeting_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT bullets_md FROM live_bullets WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Drop the live-bullets row for `meeting_id` (the Stop-time consume). Idempotent.
+    pub fn clear_live_bullets(&self, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM live_bullets WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// LOCK-SAFETY (the L2 lesson): delete every `live_bullets` row for `meeting_ids` within an
+    /// EXISTING transaction, so the purge lands in the SAME atomic unit as the plaintext blanking
+    /// on a seal (and on `delete_meeting` / the startup reconcile). Live bullets are
+    /// plaintext-DERIVED running notes mirroring the meeting's transcript; a sealed meeting must
+    /// surface NOTHING, so — exactly like `assistant_interactions` / `facts` / `note_chunks` — we
+    /// DELETE rather than key-seal. Dropped by design + not recoverable (never keyed); the
+    /// underlying transcript is still sealed + restorable.
+    fn purge_live_bullets_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM live_bullets WHERE meeting_id = ?1",
                 rusqlite::params![mid],
             )
             .map_err(map_err)?;
@@ -8764,6 +8902,176 @@ mod tests {
             interaction_count(&db, "m1"),
             0,
             "delete_meeting must purge the meeting's assistant_interactions rows"
+        );
+    }
+
+    // ── Brain v2 L4 — live_bullets: round-trip + purge on EVERY seal path (the L2 lesson) ──────
+
+    fn bullets_row(db: &Db, meeting_id: &str) -> Option<String> {
+        db.get_live_bullets(meeting_id).unwrap()
+    }
+
+    #[test]
+    fn live_bullets_round_trip_upsert_get_clear() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        assert_eq!(bullets_row(&db, "m1"), None, "no row before the first upsert");
+        db.upsert_live_bullets("m1", "- [a]: one", "2026-07-10T10:01:00Z")
+            .unwrap();
+        assert_eq!(bullets_row(&db, "m1").as_deref(), Some("- [a]: one"));
+        // Upsert REPLACES (one row per meeting — the RAM buffer is the accumulator).
+        db.upsert_live_bullets("m1", "- [a]: one\n- [b]: two", "2026-07-10T10:02:00Z")
+            .unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1").as_deref(),
+            Some("- [a]: one\n- [b]: two")
+        );
+        db.clear_live_bullets("m1").unwrap();
+        assert_eq!(bullets_row(&db, "m1"), None, "cleared (Stop-time consume)");
+        db.clear_live_bullets("m1").unwrap(); // idempotent
+    }
+
+    /// PURGE-ON-SEAL (RED-shaped: content seeded, seal, assert blank). Dropping the
+    /// `purge_live_bullets_tx` call from `purge_chunks_for_meetings` leaves the row at rest in a
+    /// locked folder and fails this.
+    #[test]
+    fn live_bullets_purged_on_seal() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.upsert_live_bullets("m1", "- [deal]: pricing agreed", "2026-07-10T10:05:00Z")
+            .unwrap();
+        assert!(bullets_row(&db, "m1").is_some(), "row present before seal");
+
+        // The seal purge runs in the SAME tx that drops chunks + interactions for sealed meetings.
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1"),
+            None,
+            "live_bullets must be purged on seal (running notes are derived plaintext)"
+        );
+    }
+
+    /// PURGE-ON-RELOCK: the relock re-blank tx (`blank_sealed_notes_in_folders`) drops the row too
+    /// — a session-unlocked folder that recorded new bullets must not keep them at rest after
+    /// relock.
+    #[test]
+    fn live_bullets_purged_on_relock_reblank() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.upsert_live_bullets("m1", "- [deal]: pricing agreed", "2026-07-10T10:05:00Z")
+            .unwrap();
+
+        let mut folders = HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1"),
+            None,
+            "relock must purge the live-bullets row"
+        );
+    }
+
+    /// PURGE-AT-REST (startup reconcile): a crash mid-recording into a since-locked folder leaves
+    /// the row behind — `reblank_locked_folders_at_rest` must drop it like the Q&A log.
+    #[test]
+    fn live_bullets_purged_by_at_rest_reconcile() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.set_folder_locked("f-locked", true, None).unwrap();
+        db.upsert_live_bullets("m1", "- [deal]: pricing agreed", "2026-07-10T10:05:00Z")
+            .unwrap();
+
+        db.reblank_locked_folders_at_rest().unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1"),
+            None,
+            "startup reconciliation must purge a locked folder's live-bullets row"
+        );
+    }
+
+    /// TOCTOU (lock-security W2, 2026-07-10 — mirrors
+    /// `topic_index_refuses_write_when_sealed_at_rest_mid_flight`): a `lock_folder` committing
+    /// BETWEEN the worker's `current_meeting` check and the row upsert purged the row and sealed
+    /// the note at rest (markdown blanked, `content_blob` kept) — the upsert's own in-tx
+    /// sealed-at-rest re-check must then REFUSE to re-write plaintext bullets for the sealed
+    /// meeting. RED before the fix: the plain upsert wrote the row unconditionally.
+    #[test]
+    fn live_bullets_upsert_refuses_when_sealed_at_rest_mid_flight() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.set_folder_locked("f-locked", true, None).unwrap();
+        // "lock_folder committed mid-model-call": note sealed at rest — exactly what
+        // `blank_sealed_notes_in_folders` leaves behind.
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE notes SET markdown = '', content_blob = X'00' WHERE meeting_id = 'm1'",
+                [],
+            )
+            .unwrap();
+        }
+        db.upsert_live_bullets("m1", "- [deal]: pricing agreed", "2026-07-10T10:05:00Z")
+            .unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1"),
+            None,
+            "the in-tx sealed-at-rest re-check must refuse re-upserting plaintext bullets"
+        );
+    }
+
+    /// PURGE-ON-DISCARD (lock-security W3, 2026-07-10): `discard_folder_seal` purges every other
+    /// derived table — the live-bullets row must go with them (contract consistency; RED before
+    /// `live_bullets` joined the discard purge list).
+    #[test]
+    fn live_bullets_purged_on_discard_folder_seal() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.upsert_live_bullets("m1", "- [deal]: pricing agreed", "2026-07-10T10:05:00Z")
+            .unwrap();
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        db.discard_folder_seal("f-locked").unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1"),
+            None,
+            "discard_folder_seal must purge the live-bullets row like every other derived table"
+        );
+    }
+
+    /// PURGE-ON-DELETE: deleting a meeting removes its live-bullets row (explicit purge + FK).
+    #[test]
+    fn live_bullets_purged_on_delete_meeting() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        db.upsert_live_bullets("m1", "- [deal]: pricing agreed", "2026-07-10T10:05:00Z")
+            .unwrap();
+        db.delete_meeting("m1").unwrap();
+        assert_eq!(
+            bullets_row(&db, "m1"),
+            None,
+            "delete_meeting must purge the live-bullets row"
         );
     }
 

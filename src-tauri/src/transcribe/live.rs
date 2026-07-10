@@ -25,9 +25,9 @@ use crate::transcribe::Transcriber;
 
 /// How often to attempt a live caption.
 const TICK: Duration = Duration::from_millis(3000);
-/// How many ticks between Realtime-Reactions scans (~21 s at the 3 s TICK) — matches the light-engine
-/// min-interval so a slow extraction can't pile up (spec §4.2).
-const REACTIONS_SCAN_EVERY: u32 = 7;
+// NOTE (Brain v2 L4): the fixed `REACTIONS_SCAN_EVERY = 7` cadence was replaced by the
+// content-driven novelty gatekeeper (`crate::transcribe::novelty::NoveltyState`) — the hard
+// minimum interval lives there (`MIN_FIRE_INTERVAL_TICKS`, ~15 s).
 /// How many trailing seconds of audio to transcribe each tick (overlapping window).
 const WINDOW_SECS: usize = 14;
 
@@ -116,6 +116,13 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
     if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
         lt.clear();
     }
+    // Brain v2 L4: fresh bullets per recording too (belt-and-braces beside the
+    // `start_recording`/`stop_recording` clears) — stale running notes must never seed a new
+    // meeting's substrate or prompt inject.
+    {
+        let state = app.state::<AppState>();
+        crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
+    }
     let transcriber = match Transcriber::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
@@ -133,10 +140,26 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
     let mut proactive = crate::proactive::ProactiveState::default();
 
     // REALTIME REACTIONS state — the light-engine contradiction scan runs OFF this tick thread (a
-    // 5–10 s extraction inline would stall captions), throttled + skip-if-busy so ASR stays the
-    // priority tenant (spec §4.2, review perf #7 / code-truth #11).
+    // 5–10 s extraction inline would stall captions), skip-if-busy so ASR stays the priority
+    // tenant (spec §4.2, review perf #7 / code-truth #11). Brain v2 L4: the fixed
+    // every-7-ticks cadence is replaced by the NOVELTY GATEKEEPER below.
     let reactions_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut reactions_ticks: u32 = 0;
+
+    // Brain v2 L4 state — FRESH per recording:
+    // - `novelty` decides WHEN the reactions/bullets worker is worth spawning (new speech / a
+    //   question / a known-entity mention / a lull, under a hard ~15 s floor);
+    // - `entity_cache` is the visible-entity (id, name) list refreshed every ~60 ticks, shared
+    //   between the gatekeeper's entity-hit trigger and the worker's scan (which previously
+    //   re-fetched it per scan);
+    // - whisper cards + proactive hints QUEUE (`pending` + the worker→tick `mpsc`) and emit at a
+    //   conversational BOUNDARY (`boundary`), with drain-on-stop after the loop. Event names +
+    //   payloads are UNCHANGED — only the emit TIMING moved.
+    let mut novelty = crate::transcribe::novelty::NoveltyState::default();
+    let mut entity_cache = crate::transcribe::novelty::RefreshableEntityCache::default();
+    let mut boundary = crate::transcribe::novelty::BoundaryGate::default();
+    let (surface_tx, surface_rx) = std::sync::mpsc::channel::<QueuedSurface>();
+    let mut pending: Vec<QueuedSurface> = Vec::new();
+    let mut last_caption = String::new();
 
     loop {
         std::thread::sleep(TICK);
@@ -147,28 +170,59 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         // K-th tick — only while `proactive_hints_enabled` is ON — the deterministic matcher scans
         // the NEW live-tail delta against the gated local substrates (entities / commitments /
         // facts / FTS) and surfaces AT MOST one recall card. Fully local: no provider, no consent,
-        // no egress. Best-effort — it can never disrupt the caption or the recording.
+        // no egress. Best-effort — it can never disrupt the caption or the recording. Brain v2 L4:
+        // the hint is QUEUED and emitted at the next conversational boundary (its own scan logic —
+        // throttle, dedup, scoring — is untouched; only the emit moved).
         if let Some(hint) = crate::proactive::scan_tick(&app, &mut proactive) {
-            // PII rule (§8): log the kind + score only — never the title or any content.
-            tracing::info!(
-                target: "proactive",
-                kind = %hint.kind,
-                score = hint.score,
-                "proactive hint emitted"
-            );
-            let _ = app.emit(crate::events::EVENT_PROACTIVE_HINT, hint);
+            pending.push(QueuedSurface::Hint(hint));
         }
 
-        // REALTIME REACTIONS (Brain Live): every REACTIONS_SCAN_EVERY ticks, if no scan is in flight,
-        // run the light-engine contradiction scan on a WORKER thread (never this tick thread) and emit
-        // the whisper cards — or, in shadow mode, count would-have-fired. Skip-if-busy: a slow scan
-        // drops this trigger; the recording never waits on the LLM.
-        reactions_ticks = reactions_ticks.wrapping_add(1);
-        if reactions_ticks % REACTIONS_SCAN_EVERY == 0
+        // NOVELTY GATEKEEPER (Brain v2 L4): the visible-entity cache ticks (a gated
+        // `list_entities_visible` read every ~60 ticks over the FRESH unlocked set — staleness
+        // affects trigger sensitivity only, never content; every downstream fact/content read
+        // re-gates itself), then the gatekeeper folds this tick's live-buffer delta into its
+        // pending triggers and decides whether the worker fires NOW.
+        let entities: Vec<(String, String)> = {
+            let state = app.state::<AppState>();
+            entity_cache
+                .on_tick(|| {
+                    let unlocked = state
+                        .unlocked_folders
+                        .lock()
+                        .map(|u| u.clone())
+                        .unwrap_or_default();
+                    state
+                        .db
+                        .list_entities_visible(&unlocked)
+                        .map(|v| v.into_iter().map(|n| (n.id, n.name)).collect())
+                        .unwrap_or_else(|e| {
+                            tracing::debug!(target: "live", error = %e, "entity cache refresh failed; keeping empty");
+                            Vec::new()
+                        })
+                })
+                .to_vec()
+        };
+        let live_buf = app
+            .state::<AppState>()
+            .live_transcript
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        let novelty_tick = novelty.on_tick(&live_buf, &entities);
+
+        // REALTIME REACTIONS + LIVE BULLETS (Brain Live / Brain v2 L4): when the gatekeeper fires
+        // and no scan is in flight, run the worker on its OWN thread (never this tick thread):
+        // FIRST the incremental bullets update (`bullets_tick` — flag- and stub-gated, it is the
+        // substrate the scan reads), THEN the light-engine contradiction scan. Cards are SENT back
+        // over the mpsc queue and emitted at a boundary — or, in shadow mode, counted. Skip-if-
+        // busy: a slow scan drops this trigger; the recording never waits on the LLM.
+        if novelty_tick.fire
             && !reactions_busy.swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             let app2 = app.clone();
             let busy2 = std::sync::Arc::clone(&reactions_busy);
+            let tx2 = surface_tx.clone();
+            let entities2 = entities.clone();
             std::thread::spawn(move || {
                 // RAII: reset the busy flag on EVERY exit — including a panic inside reactions_scan.
                 // Without this, one panic would wedge the flag `true` and silently kill ALL further
@@ -180,12 +234,17 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                     }
                 }
                 let _reset = BusyReset(busy2);
+                // L4: bullets BEFORE the scan — the scan's window reads the just-updated bullets.
+                crate::transcribe::bullets::bullets_tick(&app2);
                 let now = chrono::Utc::now().to_rfc3339();
-                let scan = crate::brain_reactions::reactions_scan(&app2, &now);
+                let scan = crate::brain_reactions::reactions_scan(&app2, &now, &entities2);
                 let n = scan.cards.len() as u64;
                 if scan.emit {
                     for card in scan.cards {
-                        let _ = app2.emit(crate::events::EVENT_WHISPER_CARD, card);
+                        // Boundary-timed surfacing: queue to the tick thread. The send fails only
+                        // when the loop has ended (receiver dropped) — the card is then dropped
+                        // (the recording is over; a late card about it has no surface).
+                        let _ = tx2.send(QueuedSurface::Whisper(card));
                     }
                 } else if n > 0 {
                     // Shadow mode: count would-have-fired for user-local calibration; emit nothing.
@@ -194,6 +253,20 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                         .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 }
             });
+        }
+
+        // BOUNDARY-TIMED SURFACING (Brain v2 L4): fold in any worker-queued cards, then emit the
+        // whole queue at a conversational boundary — a short lull, the (previous tick's) caption
+        // ending a sentence, or the 30 s max-hold force-emit. `last_caption` lags one tick by
+        // construction (this runs before this tick's transcription) — an accepted ~3 s skew on
+        // the sentence-final signal, not on the lull.
+        while let Ok(item) = surface_rx.try_recv() {
+            pending.push(item);
+        }
+        if boundary.on_tick(!pending.is_empty(), novelty_tick.new_chars > 0, &last_caption) {
+            for item in pending.drain(..) {
+                emit_surface(&app, item);
+            }
         }
 
         // Snapshot the recent tail; stop as soon as the recording is gone.
@@ -292,6 +365,9 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 }
 
                 if !text.is_empty() {
+                    // Brain v2 L4: remember the latest caption for the NEXT tick's boundary check
+                    // (sentence-final punctuation = a good moment to surface queued cards).
+                    last_caption.clone_from(&text);
                     // In-meeting voice trigger (Phase A: DETECT + SURFACE only — NO action dispatch;
                     // that needs the local brain in a later phase). Best-effort + panic-free: the
                     // detection is a pure function and the emit error is ignored, so a wake miss/hit
@@ -350,6 +426,44 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 }
             }
             Err(e) => tracing::debug!(target: "live", error = %e, "live transcribe tick failed"),
+        }
+    }
+
+    // DRAIN-ON-STOP (Brain v2 L4): the recording ended (recorder gone / poisoned lock) — emit
+    // everything still queued so a boundary-held card is never silently lost with the recording.
+    // A worker STILL in flight past this point sends to a dropped receiver and its cards are
+    // dropped (the recording is over; there is no live surface left for them).
+    while let Ok(item) = surface_rx.try_recv() {
+        pending.push(item);
+    }
+    for item in pending.drain(..) {
+        emit_surface(&app, item);
+    }
+}
+
+/// One queued live surface (Brain v2 L4 boundary-timed surfacing): a Realtime-Reactions whisper
+/// card or a proactive recall hint, held on the tick thread until a conversational boundary.
+/// Event names + payloads are the UNCHANGED existing contracts — only the emit timing moved.
+enum QueuedSurface {
+    Whisper(crate::brain_reactions::WhisperCard),
+    Hint(crate::events::ProactiveHintPayload),
+}
+
+/// Emit one queued surface on its ORIGINAL event channel (payloads unchanged — FE untouched).
+/// Best-effort; PII rule (§8): the hint log carries kind + score only, never title/content.
+fn emit_surface(app: &AppHandle, item: QueuedSurface) {
+    match item {
+        QueuedSurface::Whisper(card) => {
+            let _ = app.emit(crate::events::EVENT_WHISPER_CARD, card);
+        }
+        QueuedSurface::Hint(hint) => {
+            tracing::info!(
+                target: "proactive",
+                kind = %hint.kind,
+                score = hint.score,
+                "proactive hint emitted"
+            );
+            let _ = app.emit(crate::events::EVENT_PROACTIVE_HINT, hint);
         }
     }
 }
@@ -806,6 +920,11 @@ fn run_informational(
     // new egress class (it rides the same RedactingProvider + consent gate inside `handle_voice_action`).
     let (live, typed_notes) =
         gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
+    // Brain v2 L4: when running bullets exist (gated IDENTICALLY to the live buffer), the floor's
+    // current-meeting block becomes the tighter bullets+verbatim composition; with bullets empty
+    // this is byte-identical to before (compose is the identity then).
+    let bullets = gated_live_bullets(&state.db, &state.live_bullets, meeting_id, unlocked);
+    let live = compose_live_inject(&live, &bullets);
     let current_meeting_context = floor_current_context(&live, &typed_notes);
     let floor_intent = floor_intent_for(intent, command);
     crate::voice_action::handle_voice_action(
@@ -976,6 +1095,11 @@ fn run_cascade(
     // filtered against the user's CURRENT command (`command`, never the whole rendered conversation).
     let (live, typed_notes) =
         gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
+    // Brain v2 L4: the live-question inject becomes `2k bullets + 2k verbatim tail` when running
+    // bullets exist — gated IDENTICALLY to the live buffer (`gated_live_bullets` fail-closes on
+    // the same `meeting_is_visible` check), byte-identical to the legacy 6k tail when they don't.
+    let bullets = gated_live_bullets(&state.db, &state.live_bullets, meeting_id, unlocked);
+    let live = compose_live_inject(&live, &bullets);
     let memory_brief =
         gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled, command);
     let recording_in_progress = state.recorder.lock().map(|g| g.is_some()).unwrap_or(false);
@@ -1674,6 +1798,52 @@ fn gated_live_context(
         .unwrap_or_default();
     let typed = db.get_manual_notes(meeting_id).unwrap_or_default();
     (live, typed)
+}
+
+/// Brain v2 L4 — the RUNNING BULLETS of the recording in progress, GATED for prompt injection
+/// EXACTLY like [`gated_live_context`]: the RAM buffer only ever holds the CURRENT recording
+/// (cleared at recording start + Stop), and it is injected ONLY when the scope meeting is VISIBLE
+/// to the LIVE per-turn `unlocked` set — fail-closed: no scope meeting, a sealed-not-unlocked
+/// meeting, or a gate error yields "" (no injection, and [`compose_live_inject`] then degrades to
+/// the legacy behavior). Best-effort: a poisoned lock degrades to "".
+fn gated_live_bullets(
+    db: &crate::storage::Db,
+    live_bullets: &std::sync::Mutex<String>,
+    meeting_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> String {
+    let visible =
+        !meeting_id.is_empty() && db.meeting_is_visible(meeting_id, unlocked).unwrap_or(false);
+    if !visible {
+        return String::new();
+    }
+    live_bullets.lock().map(|b| b.clone()).unwrap_or_default()
+}
+
+/// Chars of running bullets injected into the live-question prompt (Brain v2 L4).
+const LIVE_BULLETS_INJECT_CHARS: usize = 2_000;
+/// Chars of VERBATIM transcript tail injected ALONGSIDE the bullets (Brain v2 L4) — together a
+/// tighter 4k budget than the legacy 6k raw tail, better for small models.
+const LIVE_VERBATIM_INJECT_CHARS: usize = 2_000;
+
+/// Brain v2 L4 — compose the live-question inject (PURE): with running `bullets` present the
+/// injected "live transcript" becomes `≤2k bullets + ≤2k verbatim tail` (labeled sub-sections);
+/// with bullets empty (feature off / stub / not visible / nothing noted yet) OR an empty live
+/// buffer, the inject is EXACTLY the input `live` — byte-identical legacy behavior (the
+/// `assistant_system_prompt` 6k tail + its empty-buffer branches are untouched). Both inputs are
+/// already gated by the caller ([`gated_live_context`] / [`gated_live_bullets`]); the composed
+/// block rides the SAME redaction firewall + consent gate as the rest of the prompt.
+fn compose_live_inject(live: &str, bullets: &str) -> String {
+    let b = bullets.trim();
+    let l = live.trim();
+    if b.is_empty() || l.is_empty() {
+        return live.to_string();
+    }
+    format!(
+        "RUNNING NOTES (auto-generated from this meeting so far):\n{}\n\nMOST RECENT TRANSCRIPT (verbatim):\n{}",
+        tail_chars(b, LIVE_BULLETS_INJECT_CHARS),
+        tail_chars(l, LIVE_VERBATIM_INJECT_CHARS)
+    )
 }
 
 /// Phase 3 CROSS-MEETING USER MEMORY: synthesize the injectable memory brief from the CURRENTLY-
@@ -2571,6 +2741,74 @@ mod tests {
         })
         .unwrap();
         db.set_meeting_folder(mid, folder_id).unwrap();
+    }
+
+    #[test]
+    fn compose_live_inject_is_identity_without_bullets_and_composes_with() {
+        // Brain v2 L4 — no bullets (feature off / stub / nothing noted): the inject is EXACTLY the
+        // legacy live string, so every downstream prompt is byte-identical.
+        assert_eq!(compose_live_inject("live tail", ""), "live tail");
+        assert_eq!(compose_live_inject("live tail", "  \n"), "live tail");
+        // Empty live buffer: bullets alone must NOT flip the empty-buffer prompt branches.
+        assert_eq!(compose_live_inject("", "- [a]: b"), "");
+        // Both present: labeled bullets + verbatim tail, each bounded at its 2k budget.
+        let long_live = "w ".repeat(3_000); // 6k chars
+        let composed = compose_live_inject(&long_live, "- [deal]: pricing agreed");
+        assert!(composed.starts_with("RUNNING NOTES (auto-generated from this meeting so far):\n- [deal]: pricing agreed"));
+        let verbatim = composed
+            .split("MOST RECENT TRANSCRIPT (verbatim):\n")
+            .nth(1)
+            .expect("verbatim section present");
+        assert!(
+            verbatim.chars().count() <= LIVE_VERBATIM_INJECT_CHARS + 1, // + the '…' marker
+            "verbatim tail bounded at 2k, got {}",
+            verbatim.chars().count()
+        );
+        // The composed block stays under the prompt's own 6k tail budget → never re-truncated.
+        assert!(composed.chars().count() < LIVE_TRANSCRIPT_INJECT_CHARS);
+        // And it flows into the live prompt as the injected transcript section.
+        let prompt = assistant_system_prompt(&composed, "", "", true);
+        assert!(prompt.contains("RUNNING NOTES"));
+        assert!(prompt.contains("- [deal]: pricing agreed"));
+    }
+
+    /// Brain v2 L4 — the bullets prompt read is gated EXACTLY like the live buffer: a
+    /// sealed-not-unlocked scope meeting injects NO bullets (fail-closed), a session unlock
+    /// re-injects them, and the RAM buffer itself is never wiped by the gate.
+    #[test]
+    fn gated_live_bullets_masks_for_sealed_meeting_and_reinjects_on_unlock() {
+        let db = tmp_db("bullets-gate");
+        db.insert_folder(&crate::storage::Folder {
+            id: "f1".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed_meeting(&db, "m1", Some("f1"));
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let bullets = std::sync::Mutex::new("- [deal]: pricing agreed".to_string());
+        let unlocked = std::collections::HashSet::new();
+        assert!(
+            gated_live_bullets(&db, &bullets, "m1", &unlocked).is_empty(),
+            "sealed-not-unlocked meeting must inject NO bullets"
+        );
+        assert!(
+            gated_live_bullets(&db, &bullets, "", &unlocked).is_empty(),
+            "no scope meeting ⇒ no injection (fail-closed default)"
+        );
+        // Session unlock → the SAME buffer injects again (the gate is the live set, not a wipe).
+        let mut unlocked2 = std::collections::HashSet::new();
+        unlocked2.insert("f1".to_string());
+        assert_eq!(
+            gated_live_bullets(&db, &bullets, "m1", &unlocked2),
+            "- [deal]: pricing agreed"
+        );
+        assert_eq!(*bullets.lock().unwrap(), "- [deal]: pricing agreed");
     }
 
     #[test]
