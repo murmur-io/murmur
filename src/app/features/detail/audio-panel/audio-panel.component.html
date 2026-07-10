@@ -100,10 +100,12 @@
       [currentTime]="currentTime()"
       [loading]="timelineLoading()"
       [error]="timelineError()"
+      [needsGeneration]="timelineNeedsGeneration()"
       [hasAudio]="!!audioSrc()"
       [suggestions]="speakerSuggestions()"
       (seek)="seekTo($event)"
       (retry)="retryTimeline.emit()"
+      (generate)="generateTimeline.emit()"
       (pin)="pin.emit($event)"
       (renameSpeaker)="renameSpeaker.emit($event)"
     />

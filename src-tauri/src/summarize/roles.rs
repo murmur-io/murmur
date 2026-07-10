@@ -275,6 +275,30 @@ mod tests {
         assert_eq!(connection_display_name("brand_new"), "brand_new");
     }
 
+    /// OOM DEFERRAL (perf-memory-audit): the exact decision `timeline_generation_on_device` makes —
+    /// `is_on_device_provider(&resolve(Notes).connection)`. An explicit LOCAL Notes role ⇒ on-device
+    /// (generation is a heavy multi-GB load → the FE hides it behind a click, so a passive Audio-tab
+    /// open can't beachball the Mac); the default CLOUD provider ⇒ NOT on-device (cheap → auto-fired).
+    #[test]
+    fn timeline_generation_on_device_matches_resolved_notes_provider() {
+        use crate::summarize::timeline::is_on_device_provider;
+        // Explicit local Notes override → resolved connection is on-device (heavy → deferred).
+        let local = AppConfig {
+            role_notes_connection: CONN_LOCAL.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            is_on_device_provider(&resolve(Role::Notes, &local).connection),
+            "explicit local Notes role must classify as on-device (heavy generation)"
+        );
+        // Default (no role override) with a cloud default provider → NOT on-device (auto-generate).
+        let cloud = legacy_cfg("claude_code", BrainBackend::Cloud);
+        assert!(
+            !is_on_device_provider(&resolve(Role::Notes, &cloud).connection),
+            "cloud Notes provider must NOT classify as on-device (cheap → auto)"
+        );
+    }
+
     /// A discriminating legacy config: every legacy knob set to a distinct value so the identity
     /// matrix can tell exactly which knob each resolution read.
     fn legacy_cfg(provider_id: &str, backend: BrainBackend) -> AppConfig {

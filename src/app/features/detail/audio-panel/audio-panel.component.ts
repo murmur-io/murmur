@@ -79,6 +79,12 @@ export class AudioPanelComponent {
   readonly timelineLoading = input(false);
   /** True when the timeline fetch failed (shows Retry). */
   readonly timelineError = input(false);
+  /**
+   * True when there's no cached timeline and generation is on-device (heavy) — the panel shows a
+   * "Generate timeline" affordance instead of auto-loading a multi-GB model (perf/OOM). Cloud
+   * installs never see this (they auto-generate).
+   */
+  readonly timelineNeedsGeneration = input(false);
   /** Opt-in voiceprint speaker suggestions for the timeline legend. */
   readonly speakerSuggestions = input<SpeakerSuggestion[]>([]);
   /** Transient pin confirmation ("Pinned 2:14 — …"). */
@@ -89,6 +95,8 @@ export class AudioPanelComponent {
   // --- Outputs back to the shell (which owns the IPC) ---------------------
   /** Retry the timeline fetch (from the timeline's (retry)). */
   readonly retryTimeline = output<void>();
+  /** Explicit on-device timeline generation (from the timeline's (generate) click). */
+  readonly generateTimeline = output<void>();
   /** Pin the current moment (seconds) — the shell writes the block ref + link. */
   readonly pin = output<number>();
   /** Rename a timeline speaker lane. */
