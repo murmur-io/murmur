@@ -573,6 +573,10 @@ impl Db {
         // table (see `crate::connectors::mcp`). Additive + guarded so migrate() stays idempotent.
         Self::migrate_briefs(&conn)?;
         Self::migrate_mcp_servers(&conn)?;
+        // M6 Shared Brain — the local org state + the outbound org-share state machine (mirrors
+        // `outbound_shares`). NOT the org_items/chunks ingest tables (a later slice owns those).
+        // Additive + guarded so migrate() stays idempotent.
+        Self::migrate_orgs(&conn)?;
         // Phase 2a — vector retrieval layer (note_chunks + the vec0 KNN table). Additive + guarded
         // (CREATE TABLE / CREATE VIRTUAL TABLE IF NOT EXISTS) so migrate() stays idempotent.
         Self::migrate_vector(&conn)?;
@@ -1317,6 +1321,53 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// M6 Shared Brain — local org bookkeeping. Two tables, additive + guarded, mirroring the
+    /// `outbound_shares` conventions:
+    ///
+    /// - `org_state` — one row per org the user has JOINED (create/status caches it): the org id,
+    ///   display name, the caller's role, join time, the local consent flag, and the last synced feed
+    ///   `seq` cursor. No content — just membership metadata.
+    /// - `org_shares` — the OUTBOUND share state machine (one row per "Share to Brain" action):
+    ///   `queued → uploaded` (published to the feed) or `→ failed`; `revoke_pending → revoked` (server
+    ///   tombstone). Carries the local anchor (`meeting_id` XOR `document_id`), the item `kind`, the
+    ///   `content_sha256` (self-share dedup key), the server `item_id` once published, and the last
+    ///   error string (non-PII). NO note title/body/OCK ever lands here. NOT the org_items/chunks
+    ///   ingest tables (a later slice owns the decrypted-replica + retrieval side).
+    fn migrate_orgs(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_state (
+               org_id     TEXT PRIMARY KEY,
+               name       TEXT NOT NULL,
+               role       TEXT NOT NULL,
+               joined_at  TEXT NOT NULL,
+               consented  INTEGER NOT NULL DEFAULT 0,
+               last_seq   INTEGER NOT NULL DEFAULT 0,
+               generation INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE IF NOT EXISTS org_shares (
+               id             TEXT PRIMARY KEY,
+               org_id         TEXT NOT NULL,
+               meeting_id     TEXT,
+               document_id    TEXT,
+               kind           TEXT NOT NULL,
+               title          TEXT,
+               rev            INTEGER NOT NULL DEFAULT 1,
+               generation     INTEGER NOT NULL DEFAULT 1,
+               content_sha256 BLOB,
+               item_id        TEXT,
+               state          TEXT NOT NULL DEFAULT 'queued'
+                              CHECK (state IN ('queued','uploaded','failed','revoke_pending','revoked')),
+               last_error     TEXT,
+               created_at     TEXT NOT NULL,
+               updated_at     TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_shares_org ON org_shares(org_id);
+             CREATE INDEX IF NOT EXISTS idx_org_shares_state ON org_shares(state);
+             CREATE INDEX IF NOT EXISTS idx_org_shares_item ON org_shares(item_id);",
+        )
+        .map_err(map_err)
+    }
+
     /// Add `column` to `table` if it is not already present (idempotent migration guard).
     fn add_column_if_missing(
         conn: &Connection,
@@ -1535,6 +1586,330 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    // ── M6 Shared Brain: local org state + the outbound org-share state machine ──────────────────
+
+    /// Upsert the locally-cached membership of an org (create/status). Preserves the local `consented`
+    /// + `last_seq` on an existing row (an incoming status refresh MUST NOT reset the consent flag or
+    /// rewind the sync cursor). NO content — membership metadata only.
+    pub fn upsert_org_state(&self, o: &crate::storage::OrgState) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO org_state (org_id, name, role, joined_at, consented, last_seq, generation)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(org_id) DO UPDATE SET
+               name = excluded.name,
+               role = excluded.role,
+               generation = excluded.generation",
+            rusqlite::params![
+                o.org_id,
+                o.name,
+                o.role,
+                o.joined_at,
+                o.consented as i64,
+                o.last_seq,
+                o.generation as i64
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    fn map_org_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::storage::OrgState> {
+        Ok(crate::storage::OrgState {
+            org_id: r.get(0)?,
+            name: r.get(1)?,
+            role: r.get(2)?,
+            joined_at: r.get(3)?,
+            consented: r.get::<_, i64>(4)? != 0,
+            last_seq: r.get(5)?,
+            generation: r.get::<_, i64>(6)? as u32,
+        })
+    }
+
+    /// The locally-cached state of one org (or `None` if not joined locally).
+    pub fn get_org_state(&self, org_id: &str) -> Result<Option<crate::storage::OrgState>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT org_id, name, role, joined_at, consented, last_seq, generation
+               FROM org_state WHERE org_id = ?1",
+            rusqlite::params![org_id],
+            Self::map_org_state,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Every locally-joined org (for the launch sweep + a future multi-org list). Ordered by join time.
+    pub fn list_org_states(&self) -> Result<Vec<crate::storage::OrgState>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT org_id, name, role, joined_at, consented, last_seq, generation
+                   FROM org_state ORDER BY joined_at ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], Self::map_org_state)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Set the local org-egress consent flag for an org (mirrors the config consent grants: the ONLY
+    /// mutator, so a status refresh can't clear it). Fail-safe ordering is the caller's concern.
+    pub fn set_org_consented(&self, org_id: &str, consented: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_state SET consented = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, consented as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Advance the synced feed cursor for an org (monotonic; a caller never rewinds it below the
+    /// stored value). Used by the feed-sync slice; kept here so the schema owner defines the writer.
+    pub fn set_org_last_seq(&self, org_id: &str, last_seq: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_state SET last_seq = ?2 WHERE org_id = ?1 AND ?2 > last_seq",
+            rusqlite::params![org_id, last_seq],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Update the cached live generation for an org (after a rotation the owner drove, or a status pull).
+    pub fn set_org_generation(&self, org_id: &str, generation: u32) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_state SET generation = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, generation as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Drop the local org row (on leave / removal). Idempotent; leaves `org_shares` alone (a leave
+    /// doesn't retroactively un-share — the items stay published unless explicitly revoked).
+    pub fn delete_org_state(&self, org_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM org_state WHERE org_id = ?1",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Insert a fresh outbound org share in the `queued` state (the "Share to Brain" action). The
+    /// caller sets `meeting_id` XOR `document_id`. `content_sha256` is the plaintext-envelope hash.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_org_share(
+        &self,
+        id: &str,
+        org_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+        kind: &str,
+        title: Option<&str>,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        created_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO org_shares
+               (id, org_id, meeting_id, document_id, kind, title, rev, generation,
+                content_sha256, item_id, state, last_error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'queued', NULL, ?10, ?10)",
+            rusqlite::params![
+                id,
+                org_id,
+                meeting_id,
+                document_id,
+                kind,
+                title,
+                rev as i64,
+                generation as i64,
+                content_sha256,
+                created_at
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Advance a queued org share to `uploaded`, recording the server-assigned `item_id`. Clears any
+    /// prior error. Idempotent on the share id.
+    pub fn set_org_share_uploaded(
+        &self,
+        id: &str,
+        item_id: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET state = 'uploaded', item_id = ?2, last_error = NULL,
+               updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, item_id, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Mark an org share `failed` with a non-PII error string (for the launch sweep to retry / the FE
+    /// to surface). The error is a fixed message + status, never note content.
+    pub fn set_org_share_failed(&self, id: &str, error: &str, updated_at: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET state = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, error, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Set an org share's state directly (e.g. `queued` → retry a `failed`, `uploaded` →
+    /// `revoke_pending`, `revoke_pending` → `revoked`). Idempotent; unknown id is a no-op.
+    pub fn set_org_share_state(&self, id: &str, state: &str, updated_at: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET state = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, state, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    fn map_org_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::storage::OrgShareRow> {
+        Ok(crate::storage::OrgShareRow {
+            id: r.get(0)?,
+            org_id: r.get(1)?,
+            meeting_id: r.get(2)?,
+            document_id: r.get(3)?,
+            kind: r.get(4)?,
+            title: r.get(5)?,
+            rev: r.get::<_, i64>(6)? as u32,
+            generation: r.get::<_, i64>(7)? as u32,
+            content_sha256: r.get(8)?,
+            item_id: r.get(9)?,
+            state: r.get(10)?,
+            last_error: r.get(11)?,
+            created_at: r.get(12)?,
+            updated_at: r.get(13)?,
+        })
+    }
+
+    const ORG_SHARE_COLS: &'static str =
+        "id, org_id, meeting_id, document_id, kind, title, rev, generation,
+         content_sha256, item_id, state, last_error, created_at, updated_at";
+
+    /// One org share by its local id.
+    pub fn get_org_share(&self, id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!("SELECT {} FROM org_shares WHERE id = ?1", Self::ORG_SHARE_COLS),
+            rusqlite::params![id],
+            Self::map_org_share,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// The org share bearing a given server `item_id` (for revoke-by-item + self-share dedup).
+    pub fn org_share_by_item(&self, item_id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM org_shares WHERE item_id = ?1",
+                Self::ORG_SHARE_COLS
+            ),
+            rusqlite::params![item_id],
+            Self::map_org_share,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// All org shares in a given `state` (the launch sweep pulls `queued` + `revoke_pending`).
+    pub fn list_org_shares_in_state(
+        &self,
+        state: &str,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares WHERE state = ?1 ORDER BY created_at ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![state], Self::map_org_share)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Every org share for an org (the FE list). Newest first.
+    pub fn list_org_shares_for_org(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares WHERE org_id = ?1 ORDER BY created_at DESC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], Self::map_org_share)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The ACTIVE (queued/uploaded/revoke_pending — not revoked/failed) org shares anchored to a
+    /// folder's meetings + notes, for the lock×shares warn/revoke dialog. Content-free enough for the
+    /// dialog (an `(item_id?, title?)` pair per share; titles render only to the local owner).
+    pub fn active_org_shares_for_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(Option<String>, Option<String>)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.item_id, s.title
+                   FROM org_shares s
+                   LEFT JOIN notes n  ON n.meeting_id = s.meeting_id
+                   LEFT JOIN documents d ON d.id = s.document_id
+                  WHERE s.state IN ('queued','uploaded','revoke_pending')
+                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
     }
 
     // ── M5-CLIENT: TOFU pins, mode-B outbound bookkeeping, inbound accept idempotency (spec §4.8/§7) ──
