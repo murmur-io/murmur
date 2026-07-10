@@ -201,6 +201,24 @@ export class NoteEditorComponent {
    */
   private dirtyFull = false;
 
+  // --- Single-writer save queue --------------------------------------------
+  /**
+   * The persistence chain — EVERY backend write for this note (cheap
+   * `saveNoteText` and full `updateNoteDoc`) is appended here, so writes reach
+   * the backend strictly in order. Without it the debounced cheap save and a
+   * boundary full save could be concurrently in flight with different payloads,
+   * and a stale older write could land after a newer one.
+   */
+  private saveChain: Promise<void> = Promise.resolve();
+  /**
+   * The single coalesced pending save (latest-wins): while a save is in flight,
+   * new requests only escalate/refresh this slot — they never stack. `"full"`
+   * supersedes `"text"` (the full save persists a superset). The payload is
+   * snapshotted from the signals when the queued save RUNS, so the newest text
+   * always wins.
+   */
+  private pendingSave: "text" | "full" | null = null;
+
   /** The rendered preview HTML source — a cached `computed` off title + doc markdown. */
   readonly previewMarkdown = computed(() =>
     serializeDoc(this.tags(), this.properties(), this.body()),
@@ -422,7 +440,45 @@ export class NoteEditorComponent {
     }
     this.dirtyFull = true;
     this.saveState.set("saving");
-    this.debounce.schedule("note-editor-save", () => void this.saveText(), AUTOSAVE_MS);
+    this.debounce.schedule(
+      "note-editor-save",
+      () => void this.queueSave("text"),
+      AUTOSAVE_MS,
+    );
+  }
+
+  /**
+   * Enqueue a save on the single-writer chain. If a save is already QUEUED (not
+   * yet started), the request only escalates/refreshes the pending slot —
+   * latest-payload-wins, since the payload is read from the signals when the
+   * save runs. If a save is IN FLIGHT, the queued one starts only after it
+   * settles, so writes reach the backend in order. Returns a promise that
+   * resolves once this request's save has landed (the chain never rejects —
+   * both save paths handle their own errors via `saveState`/toast).
+   */
+  private queueSave(kind: "text" | "full"): Promise<void> {
+    const alreadyQueued = this.pendingSave !== null;
+    this.pendingSave =
+      this.pendingSave === "full" || kind === "full" ? "full" : "text";
+    if (!alreadyQueued) {
+      this.saveChain = this.saveChain
+        .then(() => this.runPendingSave())
+        // Defensive: a rejected link would wedge the chain forever; both save
+        // paths already catch, so this only guards the truly unexpected.
+        .catch(() => undefined);
+    }
+    return this.saveChain;
+  }
+
+  /** Execute (and clear) the coalesced pending save. Runs on the chain only. */
+  private async runPendingSave(): Promise<void> {
+    const kind = this.pendingSave;
+    this.pendingSave = null;
+    if (kind === "full") {
+      await this.saveFull();
+    } else if (kind === "text") {
+      await this.saveText();
+    }
   }
 
   /** The current title + full markdown (front-matter re-emitted). */
@@ -437,6 +493,7 @@ export class NoteEditorComponent {
    * CHEAP persist — text only (no re-index, no export). Used by the frequent
    * autosave + blur so typing never triggers the e5 re-embed. The DB text is
    * canonical, so nothing is lost; the brain index catches up on the next full save.
+   * Runs ONLY via {@link runPendingSave} on the single-writer chain.
    */
   private async saveText(): Promise<void> {
     const doc = this.note();
@@ -459,48 +516,55 @@ export class NoteEditorComponent {
 
   /**
    * FULL save (fire-and-forget) — persist + RE-INDEX (brain) + vault re-export via
-   * `updateNoteDoc`. Runs ONLY on natural boundaries (Preview, editor close, retry) so
-   * the e5 re-embed never fires per keystroke-pause. NOT awaited by navigation, so
-   * leaving is instant and the backend catches up. Clears `dirtyFull` on success.
+   * `updateNoteDoc`. Requested ONLY on natural boundaries (Preview, editor close,
+   * retry) so the e5 re-embed never fires per keystroke-pause. NOT awaited by
+   * navigation, so leaving is instant and the backend catches up. Joins the same
+   * single-writer chain as the cheap saves, superseding any pending cheap save.
    */
   private flushFull(): void {
+    this.debounce.cancel("note-editor-save");
+    void this.queueSave("full");
+  }
+
+  /**
+   * The full-save body — persist + re-index + export, clearing `dirtyFull` on
+   * success. Runs ONLY via {@link runPendingSave} on the single-writer chain.
+   */
+  private async saveFull(): Promise<void> {
     const doc = this.note();
     if (!doc || doc.locked) {
       return;
     }
-    this.debounce.cancel("note-editor-save");
     const { title, markdown } = this.currentPayload();
     this.saveState.set("saving");
-    void this.ipc
-      .updateNoteDoc(doc.id, title, markdown)
-      .then((fresh) => {
-        this.dirtyFull = false;
-        this.note.update((cur) =>
-          cur
-            ? {
-                ...cur,
-                updatedAt: fresh.updatedAt,
-                exportedPath: fresh.exportedPath,
-                shared: fresh.shared,
-                locked: fresh.locked,
-              }
-            : cur,
-        );
-        this.saveState.set("saved");
-      })
-      .catch((e) => {
-        this.saveState.set("error");
-        if (String(e).includes("Locked")) {
-          this.toast.danger("This note is locked — unlock its folder to edit.");
-        }
-      });
+    try {
+      const fresh = await this.ipc.updateNoteDoc(doc.id, title, markdown);
+      this.dirtyFull = false;
+      this.note.update((cur) =>
+        cur
+          ? {
+              ...cur,
+              updatedAt: fresh.updatedAt,
+              exportedPath: fresh.exportedPath,
+              shared: fresh.shared,
+              locked: fresh.locked,
+            }
+          : cur,
+      );
+      this.saveState.set("saved");
+    } catch (e) {
+      this.saveState.set("error");
+      if (String(e).includes("Locked")) {
+        this.toast.danger("This note is locked — unlock its folder to edit.");
+      }
+    }
   }
 
   /** Blur handler (title / body) — flush the pending CHEAP save immediately. */
   onBlur(): void {
     if (this.saveState() === "saving") {
       this.debounce.cancel("note-editor-save");
-      void this.saveText();
+      void this.queueSave("text");
     }
   }
 
@@ -947,9 +1011,10 @@ export class NoteEditorComponent {
       return;
     }
     this.closeMenus();
-    // Persist the latest text first (cheap) so the exported file is current.
+    // Persist the latest text first (cheap) so the exported file is current —
+    // awaited through the single-writer chain so it lands after any in-flight save.
     this.debounce.cancel("note-editor-save");
-    await this.saveText();
+    await this.queueSave("text");
     try {
       const path = await this.ipc.exportNoteDoc(doc.id);
       this.note.update((cur) => (cur ? { ...cur, exportedPath: path } : cur));
@@ -971,9 +1036,10 @@ export class NoteEditorComponent {
     if (!doc || doc.locked) {
       return;
     }
-    // Persist the latest text (cheap) so the shared body is current.
+    // Persist the latest text (cheap, via the single-writer chain) so the
+    // shared body is current.
     this.debounce.cancel("note-editor-save");
-    void this.saveText();
+    void this.queueSave("text");
     this.shareOpen.set(true);
   }
 
@@ -1019,9 +1085,12 @@ export class NoteEditorComponent {
     if (!doc) {
       return;
     }
-    // Cancel a pending autosave + clear the dirty flag so the teardown full-save never
-    // resurrects the just-deleted note.
+    // Cancel a pending autosave, drop any queued-but-not-started save, and clear
+    // the dirty flag so neither the queue nor the teardown full-save resurrects
+    // the just-deleted note. (An already in-flight save cannot be recalled —
+    // same as before — but nothing new is started.)
     this.debounce.cancel("note-editor-save");
+    this.pendingSave = null;
     this.dirtyFull = false;
     try {
       await this.notes.remove(doc.id);
