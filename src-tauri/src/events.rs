@@ -138,6 +138,24 @@ pub struct ProactiveHintPayload {
     pub score: f32,
 }
 
+/// Brain v2 L5 — emitted when the scheduled-brief runner STAGES a proposed brief
+/// (`brief_runs` row, status "pending"). Propose-accept: the FE shows a card and the user accepts
+/// (vault export) or dismisses. Carries the run id, the schedule's user-authored label, and a
+/// char count — NEVER the brief markdown itself (the FE fetches pending runs via the command).
+pub const EVENT_BRIEF_PROPOSED: &str = "murmur://brief-proposed";
+
+/// Payload for [`EVENT_BRIEF_PROPOSED`]. Run id + user-authored schedule label + size only.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefProposedPayload {
+    /// The staged `brief_runs` row id (opaque).
+    pub run_id: String,
+    /// The schedule's user-authored label (config data the user typed, not meeting content).
+    pub label: String,
+    /// Size of the proposed markdown in bytes (a coarse signal — never the content).
+    pub char_count: usize,
+}
+
 /// Progress for the on-device brain (reasoning GGUF) download. Carries byte counts only — NO PII.
 pub const EVENT_BRAIN_DOWNLOAD: &str = "murmur://brain-download";
 

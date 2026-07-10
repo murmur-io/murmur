@@ -56,6 +56,9 @@ import type {
   SupersessionDto,
   ApplyResult,
   UserMemory,
+  BriefSchedule,
+  BriefRun,
+  BriefProposedPayload,
   VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
@@ -110,6 +113,8 @@ export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 // Recording hit the 4h hard TIME cap and self-stopped (distinct from the byte-based prune).
 export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
+// Brain v2 L5 — a scheduled brief was STAGED (propose-accept; run id + label + size only).
+export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -826,6 +831,81 @@ export class IpcService {
    */
   importMemories(text: string): Promise<number> {
     return invoke<number>("import_memories", { text });
+  }
+
+  // ── Brain v2 L5 — scheduled briefs (schedule CRUD + propose-accept runs) ─
+
+  /** All brief schedules (config rows — labels, timing, hints). */
+  listBriefSchedules(): Promise<BriefSchedule[]> {
+    return invoke<BriefSchedule[]>("list_brief_schedules");
+  }
+
+  /**
+   * Create one brief schedule. `dayOfWeek`: 0 = Monday … 6 = Sunday, null =
+   * daily. The backend runner fires it at most once per local day, at the first
+   * 60s tick at/after `hour:minute` local. Rejects `InvalidArg` on out-of-range
+   * timing / an empty label.
+   */
+  createBriefSchedule(input: {
+    label: string;
+    dayOfWeek: number | null;
+    hourLocal: number;
+    minuteLocal: number;
+    scopeDays?: number;
+    promptHint?: string;
+  }): Promise<BriefSchedule> {
+    return invoke<BriefSchedule>("create_brief_schedule", {
+      label: input.label,
+      dayOfWeek: input.dayOfWeek,
+      hourLocal: input.hourLocal,
+      minuteLocal: input.minuteLocal,
+      scopeDays: input.scopeDays ?? null,
+      promptHint: input.promptHint ?? null,
+    });
+  }
+
+  /** Update a schedule's editable fields (label / timing / window / hint / enabled). */
+  updateBriefSchedule(schedule: BriefSchedule): Promise<void> {
+    return invoke<void>("update_brief_schedule", { schedule });
+  }
+
+  /** Delete a schedule AND its staged (pending) runs. */
+  deleteBriefSchedule(scheduleId: string): Promise<void> {
+    return invoke<void>("delete_brief_schedule", { scheduleId });
+  }
+
+  /**
+   * The PENDING proposed brief runs (the cards). `noteMd` was synthesized from
+   * visible-only content backend-side (the runner reads with the empty unlock
+   * set — sealed content can never be in a brief by construction).
+   */
+  listBriefRuns(): Promise<BriefRun[]> {
+    return invoke<BriefRun[]>("list_brief_runs");
+  }
+
+  /**
+   * Accept a proposed brief: exports its markdown to `<vault>/Briefs/` and
+   * CONSUMES the staged copy. Resolves with the exported path. Rejects
+   * `InvalidArg` when no vault is configured or the run was already handled.
+   */
+  acceptBrief(runId: string): Promise<string> {
+    return invoke<string>("accept_brief", { runId });
+  }
+
+  /** Dismiss a proposed brief — the staged row (markdown included) is deleted. */
+  dismissBrief(runId: string): Promise<void> {
+    return invoke<void>("dismiss_brief", { runId });
+  }
+
+  /**
+   * A brief was STAGED by the background runner (propose-accept). Payload is
+   * run id + label + size only — refresh the pending list via
+   * {@link listBriefRuns} to render the card.
+   */
+  onBriefProposed(cb: (p: BriefProposedPayload) => void): Promise<UnlistenFn> {
+    return listen<BriefProposedPayload>(EVENT_BRIEF_PROPOSED, (e) =>
+      cb(e.payload),
+    );
   }
 
   // ── brain2 documents — expand the brain with imported .md/.txt files ────
