@@ -313,6 +313,17 @@ export interface AppConfigDto {
   roleLiveConnection: string;
   roleLiveModel: string;
   roleLiveEffort: string;
+  /**
+   * Notes feature — the three in-note selection-assistant actions (Refine ·
+   * Shorten · Enhance context), each independently toggleable. All default TRUE
+   * (mirrors Rust `AppConfigDto.note_assist_refine` / `note_assist_shorten` /
+   * `note_assist_enhance`, camelCase). Round-tripped on every `save_config` like
+   * the other flags. OPTIONAL on the DTO so the Settings UI works before the
+   * backend fields land — the FE treats an absent value as TRUE.
+   */
+  noteAssistRefine?: boolean;
+  noteAssistShorten?: boolean;
+  noteAssistEnhance?: boolean;
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
@@ -1446,6 +1457,11 @@ export interface MyShareEntry {
    * same as `title`).
    */
   meetingId: string | null;
+  /**
+   * The LOCAL authored-note `document_id` this share belongs to (WP6) — the filter key for a NOTE's
+   * share panel. `null` for a meeting share or a share created on another device (masked like `title`).
+   */
+  documentId: string | null;
   /** The server-enforced open cap (`null` ⇒ uncapped) driving the `X / Y opens` label. Display-only. */
   maxDownloads: number | null;
   /** `link` (mode-A zero-knowledge link) vs `user` (mode-B Murmur↔Murmur grant). */
@@ -1551,4 +1567,154 @@ export interface SupersessionDto {
 export interface ApplyResult {
   applied: number;
   skippedSealed: number;
+}
+
+// ── Notes feature — first-class authored notes (documents kind='note') ──────
+// DTOs mirror the frozen IPC contract in docs/notes-feature/DESIGN.md §2 (Rust
+// `#[serde(rename_all = "camelCase")]`). Every list/get/export/assistant path is
+// GATED on the note's folder-unlock: a sealed-and-not-session-unlocked note is
+// MASKED (title "🔒 Locked", no body/snippet/tags) — never leaked per-row.
+
+/**
+ * One row of the Notes list (`list_notes`). Leak-free: a sealed-not-unlocked note
+ * carries NO body (`snippet` "", `tags` []) and its `title` is masked to
+ * "🔒 Locked" (topics can leak through a title). Mirrors the Rust `NoteSummary`.
+ */
+export interface NoteSummary {
+  id: string;
+  /** Display title; "🔒 Locked" when sealed-not-unlocked. */
+  title: string;
+  folderId: string;
+  /** Body excerpt; "" when locked. */
+  snippet: string;
+  /** Front-matter tags; [] when locked. */
+  tags: string[];
+  /** Epoch ms of the last edit. */
+  updatedAt: number;
+  createdAt: number;
+  /** Sealed AND not session-unlocked (render a lock badge, no snippet). */
+  locked: boolean;
+  /** Has an active outbound share. */
+  shared: boolean;
+}
+
+/**
+ * The full note payload for the editor (`get_note` / `update_note`). Mirrors the
+ * Rust `NoteDoc`. When `locked` is true the payload is MASKED: `title`
+ * "🔒 Locked", `markdown` "", `tags` [], `properties` {} — the editor shows the
+ * lock gate instead of the body. `markdown` is the FULL document INCLUDING the
+ * YAML front-matter (properties/tags are vault-native, owned-file).
+ */
+export interface NoteDoc {
+  id: string;
+  title: string;
+  folderId: string;
+  /** FULL markdown incl. front-matter; "" when masked. */
+  markdown: string;
+  /** Front-matter tags; [] when masked. */
+  tags: string[];
+  /** Parsed front-matter (excluding tags); {} when masked. */
+  properties: Record<string, string>;
+  updatedAt: number;
+  createdAt: number;
+  /** Vault `.md` path, or null when never exported / sealed. */
+  exportedPath: string | null;
+  /** Masked (no markdown) when true. */
+  locked: boolean;
+  /** Has an active outbound share. */
+  shared: boolean;
+}
+
+/**
+ * The three selection-assistant actions. `refine`/`shorten` REPLACE the selection;
+ * `enhance` retrieves related brain context and proposes an ADDITIVE passage.
+ */
+export type NoteAssistAction = "refine" | "shorten" | "enhance";
+
+/**
+ * A selection-assistant request (`note_assistant_action`). Mirrors the Rust
+ * `NoteAssistRequest`. `before`/`after` carry a bounded slice of surrounding
+ * context (~500 chars each) so the model can act coherently on the selection.
+ */
+export interface NoteAssistRequest {
+  noteId: string;
+  action: NoteAssistAction;
+  /** The selected text to act on. */
+  selection: string;
+  /** Up to ~500 chars of context before the selection. */
+  before?: string;
+  /** Up to ~500 chars of context after the selection. */
+  after?: string;
+}
+
+/**
+ * One provenance citation for an `enhance` result — the brain source the additive
+ * passage drew on. Mirrors the Rust `NoteCitation`. Click-through opens the source
+ * note/meeting.
+ */
+export interface NoteCitation {
+  kind: "meeting" | "note";
+  id: string;
+  title: string;
+  snippet: string;
+}
+
+/**
+ * The result of a selection-assistant action (`note_assistant_action`). Mirrors
+ * the Rust `NoteAssistResult`. `suggestion` REPLACES the selection for
+ * refine/shorten, or is an ADDITIVE passage to INSERT after the selection for
+ * enhance. `citations` is populated for enhance only (else []). `modelLabel`/
+ * `mode`/`redacted` reflect the resolved `provider_for(Role::Notes)` routing —
+ * the popover DISPLAYS them (never decides them).
+ */
+export interface NoteAssistResult {
+  action: NoteAssistAction;
+  /** refine/shorten: the replacement. enhance: an additive passage to insert. */
+  suggestion: string;
+  /** enhance-context provenance; [] for refine/shorten. */
+  citations: NoteCitation[];
+  /** e.g. "Claude" | "Qwen2.5 4B (local)" — shown in the popover mode chip. */
+  modelLabel: string;
+  /** Whether the action ran on-device or in the cloud. */
+  mode: "local" | "cloud";
+  /** True when the cloud path redacted the payload before egress. */
+  redacted: boolean;
+}
+
+/**
+ * One proposed move in an auto-organize plan (`plan_organize_notes`). Mirrors the
+ * Rust `OrganizeMove`. `toFolderId` is null when `toFolder` names a NEW folder to
+ * create on apply. Non-destructive: nothing moves until `apply_organize_plan`.
+ */
+export interface OrganizeMove {
+  noteId: string;
+  title: string;
+  fromFolderId: string;
+  fromFolder: string;
+  /** The proposed folder NAME (existing or new). */
+  toFolder: string;
+  /** null ⇒ a new folder to create on apply. */
+  toFolderId: string | null;
+  /** One-line why (shown to the user). */
+  reason: string;
+}
+
+/** An auto-organize plan (`plan_organize_notes`). Mirrors the Rust `OrganizePlan`. */
+export interface OrganizePlan {
+  moves: OrganizeMove[];
+}
+
+/**
+ * A note-kind folder (`list_note_folders` / `create_note_folder`). Reuses the
+ * folder machinery with `kind='note'`; mirrors the Rust `NoteFolder`. `path` is
+ * rooted under a "Notes/" vault prefix so it never collides with meeting-folder
+ * paths.
+ */
+export interface NoteFolder {
+  id: string;
+  name: string;
+  path: string;
+  parentId: string | null;
+  locked: boolean;
+  kind: string;
 }

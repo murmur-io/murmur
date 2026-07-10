@@ -1,0 +1,349 @@
+/* The selection Brain popover floats OVER the editor → OPAQUE overlay (T3):
+   --surface-overlay, --border-strong, --shadow-lg, backdrop-filter:none. Never
+   the frosted .card. Positioned in JS (top/left set from the selection rect). */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none; /* only the popover box itself is interactive */
+}
+
+.brain-pop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 340px;
+  max-width: calc(100vw - 2 * var(--space-3));
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: pop-in var(--transition) var(--ease-spring) both;
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* --- Header ---------------------------------------------------------------- */
+.pop-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.pop-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+.pop-brand-glyph {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--accent-gradient);
+  box-shadow: 0 0 12px var(--accent-soft);
+}
+.pop-mode {
+  font-size: 0.7rem;
+  font-weight: 550;
+  color: var(--text-muted);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+}
+.pop-mode.is-resolved {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+}
+.pop-close {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.pop-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.pop-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* --- Action picker --------------------------------------------------------- */
+.pop-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.pop-action {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.pop-action:hover {
+  background: var(--surface-hover);
+}
+.pop-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.pop-action-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.8rem;
+}
+
+/* --- Step tracker ---------------------------------------------------------- */
+.pop-flow {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-1) 0 var(--space-2);
+}
+.pop-flow-title {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.pop-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.pop-step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  transition: color var(--transition);
+}
+.pop-step.is-running {
+  color: var(--text-primary);
+}
+.pop-step.is-done {
+  color: var(--text-secondary);
+}
+.pop-step-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 0.72rem;
+  color: var(--accent);
+}
+.pop-step.is-done .pop-step-ico {
+  color: var(--success);
+}
+.pop-step-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+.pop-step-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.6px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  animation: pop-spin 0.7s linear infinite;
+}
+@keyframes pop-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* Shimmer sweep under the steps while working. */
+.pop-shimmer {
+  height: 2px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--accent) 45%,
+    var(--accent-hover) 55%,
+    transparent
+  );
+  background-size: 200% 100%;
+  animation: pop-shimmer 1.3s ease-in-out infinite;
+}
+@keyframes pop-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* --- Diff / result --------------------------------------------------------- */
+.pop-result,
+.pop-error {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.pop-diff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 260px;
+  overflow-y: auto;
+}
+.pop-diff-tag {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.pop-original {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  text-decoration: line-through;
+  text-decoration-color: var(--text-muted);
+}
+.pop-suggestion {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.pop-suggestion.is-add {
+  background: var(--success-soft);
+  border-color: color-mix(in srgb, var(--success) 30%, transparent);
+}
+
+/* --- Citation chips -------------------------------------------------------- */
+.pop-cites {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.pop-cite {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding: 3px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+.pop-cite:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+.pop-cite:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.pop-cite-kind {
+  color: var(--accent-hover);
+  text-transform: capitalize;
+}
+.pop-cite-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+
+.pop-redacted {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* --- Buttons --------------------------------------------------------------- */
+.pop-buttons {
+  display: flex;
+  gap: var(--space-2);
+}
+.pop-btn {
+  height: 34px;
+  padding: 0 var(--space-3);
+  font-size: 0.85rem;
+}
+
+.pop-error-text {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brain-pop,
+  .pop-step-spin,
+  .pop-shimmer {
+    animation: none;
+  }
+}

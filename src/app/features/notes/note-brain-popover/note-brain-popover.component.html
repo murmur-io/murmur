@@ -1,0 +1,177 @@
+<!-- OPAQUE floating popover (T3): --surface-overlay + backdrop-filter:none.
+     Positioned in JS (afterNextRender) above the selection rect. Re-positions
+     on any scroll/resize via the directive (DestroyRef-cleaned listeners). -->
+<div
+  #popover
+  class="brain-pop"
+  appRepositionOnScroll
+  (reposition)="reposition()"
+  role="dialog"
+  aria-label="Brain assistant"
+>
+  <!-- Header: the "Brain" identity + the mode chip (neutral until a result). -->
+  <div class="pop-head">
+    <span class="pop-brand">
+      <span class="pop-brand-glyph" aria-hidden="true"></span>
+      Brain
+    </span>
+    <span class="pop-mode" [class.is-resolved]="result() !== null">
+      {{ modeLabel() }}
+    </span>
+    <button
+      type="button"
+      class="pop-close"
+      (click)="discard()"
+      aria-label="Close"
+    >
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+        <path
+          d="M4 4l8 8M12 4l-8 8"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+        />
+      </svg>
+    </button>
+  </div>
+
+  @switch (phase()) {
+    <!-- PHASE 1 — the action picker. -->
+    @case ("actions") {
+      <div class="pop-actions" role="group" aria-label="Assistant actions">
+        @if (toggles().refine) {
+          <button type="button" class="pop-action" (click)="run('refine')">
+            <span class="pop-action-ico" aria-hidden="true">✎</span>
+            Refine
+          </button>
+        }
+        @if (toggles().shorten) {
+          <button type="button" class="pop-action" (click)="run('shorten')">
+            <span class="pop-action-ico" aria-hidden="true">⤶</span>
+            Shorten
+          </button>
+        }
+        @if (toggles().enhance) {
+          <button type="button" class="pop-action" (click)="run('enhance')">
+            <span class="pop-action-ico" aria-hidden="true">✦</span>
+            Enhance context
+          </button>
+        }
+      </div>
+    }
+
+    <!-- PHASE 2 — the animated step tracker. -->
+    @case ("running") {
+      <div class="pop-flow" role="status" aria-live="polite">
+        <p class="pop-flow-title">{{ actionLabel(activeAction()!) }}</p>
+        <ul class="pop-steps">
+          @for (step of steps(); track step.id) {
+            <li
+              class="pop-step"
+              [class.is-running]="step.state === 'running'"
+              [class.is-done]="step.state === 'done'"
+            >
+              <span class="pop-step-ico" aria-hidden="true">
+                @if (step.state === "done") {
+                  ✓
+                } @else if (step.state === "running") {
+                  <span class="pop-step-spin"></span>
+                } @else {
+                  <span class="pop-step-dot"></span>
+                }
+              </span>
+              <span class="pop-step-label">{{ step.label }}</span>
+            </li>
+          }
+        </ul>
+        <span class="pop-shimmer" aria-hidden="true"></span>
+      </div>
+    }
+
+    <!-- PHASE 3 — the reviewable diff + Accept / Discard / Retry. -->
+    @case ("result") {
+      @if (result(); as res) {
+        <div class="pop-result">
+          <p class="pop-flow-title">{{ actionLabel(res.action) }}</p>
+
+          @if (isEnhanceResult()) {
+            <!-- Enhance is ADDITIVE: keep the selection, show the passage to insert. -->
+            <div class="pop-diff">
+              <span class="pop-diff-tag">Keeps your text; adds</span>
+              <div class="pop-suggestion is-add">{{ res.suggestion }}</div>
+            </div>
+            @if (res.citations.length > 0) {
+              <div class="pop-cites" aria-label="Sources">
+                @for (cite of res.citations; track cite.id) {
+                  <button
+                    type="button"
+                    class="pop-cite"
+                    (click)="openCitation(cite)"
+                    [attr.title]="cite.snippet"
+                  >
+                    <span class="pop-cite-kind">{{ cite.kind }}</span>
+                    <span class="pop-cite-title">{{ cite.title }}</span>
+                  </button>
+                }
+              </div>
+            }
+          } @else {
+            <!-- Refine/Shorten REPLACE: struck original vs accent suggestion. -->
+            <div class="pop-diff">
+              <div class="pop-original">{{ original() }}</div>
+              <div class="pop-suggestion">{{ res.suggestion }}</div>
+            </div>
+          }
+
+          @if (res.redacted) {
+            <p class="pop-redacted">
+              <span aria-hidden="true">🛡</span>
+              Sensitive details were redacted before this left your Mac.
+            </p>
+          }
+
+          <div class="pop-buttons">
+            <button
+              type="button"
+              class="btn btn-primary pop-btn"
+              (click)="accept()"
+            >
+              {{ isEnhanceResult() ? "Insert" : "Accept" }}
+            </button>
+            <button type="button" class="btn btn-ghost pop-btn" (click)="retry()">
+              Retry
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost pop-btn"
+              (click)="discard()"
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      }
+    }
+
+    <!-- PHASE 4 — an inline error with Retry. -->
+    @case ("error") {
+      <div class="pop-error" role="alert">
+        <p class="pop-error-text">
+          Couldn’t complete that. {{ errorMsg() }}
+        </p>
+        <div class="pop-buttons">
+          <button
+            type="button"
+            class="btn btn-primary pop-btn"
+            (click)="retry()"
+          >
+            Retry
+          </button>
+          <button type="button" class="btn btn-ghost pop-btn" (click)="discard()">
+            Dismiss
+          </button>
+        </div>
+      </div>
+    }
+  }
+</div>

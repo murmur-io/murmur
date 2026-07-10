@@ -1,0 +1,205 @@
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+  background: rgba(0, 0, 0, 0.5);
+}
+
+/* Floating modal → OPAQUE (trap T3): never the frosted .card, or the note list
+   behind it bleeds through. */
+.sheet {
+  width: 100%;
+  max-width: 34rem;
+  max-height: calc(100vh - 2 * var(--space-5));
+  max-height: calc(100dvh - 2 * var(--space-5));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: sheet-in var(--transition-fast);
+}
+.sheet:focus {
+  outline: none;
+}
+@keyframes sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sheet {
+    animation: none;
+  }
+}
+
+/* --- Header: title + live summary + select-all/none --- */
+.sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex: none;
+}
+.sheet-head-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.sheet-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+.sheet-summary {
+  margin: 0;
+  font-size: 0.85rem;
+}
+.select-all-btn {
+  flex: none;
+  font-size: 0.85rem;
+}
+
+/* --- Body: the scrollable list of proposed moves --- */
+.move-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.move-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  transition:
+    opacity var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.move-row.is-excluded {
+  opacity: 0.5;
+}
+
+.move-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding-top: 2px;
+  cursor: pointer;
+}
+
+.move-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.move-title {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.move-path {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.move-from {
+  color: var(--text-muted);
+}
+.move-arrow {
+  color: var(--text-muted);
+}
+.move-to {
+  color: var(--text-primary);
+  font-weight: 550;
+}
+.move-new {
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+}
+.move-reason {
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+/* --- Empty state --- */
+.organize-empty {
+  align-items: center;
+  text-align: center;
+}
+.empty-title {
+  margin: 0 0 var(--space-2);
+  font-size: 1.05rem;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+.empty-body {
+  margin: 0 0 var(--space-4);
+  max-width: 40ch;
+}
+
+/* --- Footer --- */
+.sheet-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  flex: none;
+}
+.sheet-actions .btn {
+  flex: none;
+}
+
+/* Inline spinner on the Apply button (matches the during-meetings block). */
+.spin-ring {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--text-on-accent);
+  animation: spin 0.8s linear infinite;
+  margin-right: var(--space-2);
+  vertical-align: -2px;
+  display: inline-block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin-ring {
+    animation: none;
+  }
+}
