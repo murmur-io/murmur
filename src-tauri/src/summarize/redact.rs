@@ -377,6 +377,89 @@ fn word_is_name_like(word: &str) -> bool {
     true
 }
 
+/// The fixed, non-restoring placeholder the COMPLETE-path person-name-title scrub substitutes.
+/// Deliberately NOT a `⟪…⟫` token: nothing enters the restore map (drop-only, the same hard
+/// guarantee as the summarize-path vault-title FILTER — the name can never come back on egress).
+const PERSON_TITLE_PLACEHOLDER: &str = "(person)";
+
+/// R6 (P0.1 follow-up, 2026-07-10) — the NO-NER person-name-title scrub for the COMPLETE path.
+///
+/// The L3 lock-security review disclosed the gap: on installs WITHOUT the NER model, note/meeting
+/// TITLES that are bare person names egress through [`RedactingProvider::complete_with_meta`] /
+/// `complete_json_with_meta` untouched — the JIT meeting listing (`- <id> | <title> | <date>`
+/// lines seeded into the Ask persona's SYSTEM prompt) and `[[Title]]` wikilinks in packed
+/// corpora/citations both carry auto-created `[[Person Name]]` page titles. The summarize path's
+/// syntactic fallback ([`title_looks_like_person_name`]) only filtered `vault_titles`.
+///
+/// This applies the SAME conservative predicate to the two STRUCTURAL title shapes free-form
+/// prompts carry (free text is deliberately NOT touched — a general Title-Case scan would garble
+/// prompts):
+/// - `[[Target]]` wikilink targets — a person-shaped target becomes `[[(person)]]`;
+/// - 3-field pipe listing lines (`… | <title> | …`, the JIT listing shape) — a person-shaped
+///   middle field becomes `(person)` (id + date survive, so `get_meeting`-by-id still works).
+///
+/// DROP-ONLY like the summarize filter: the placeholder is a fixed literal, no restore token, so
+/// the name cannot ride back out in any later prompt either. Text with no matching shape is
+/// returned byte-identical. Callers gate on [`NameRedactor::is_noop`] — with a real NER layer the
+/// mask+restore name firewall owns names and this scrub stays OFF.
+pub(crate) fn scrub_person_name_titles(text: &str) -> String {
+    scrub_wikilink_person_targets(&text_listing_scrub(text))
+}
+
+/// The pipe-listing half of [`scrub_person_name_titles`]: line-preserving (works on
+/// `split_inclusive('\n')` segments, so byte-identity holds for untouched input).
+fn text_listing_scrub(text: &str) -> String {
+    if !text.contains(" | ") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for seg in text.split_inclusive('\n') {
+        let (line, nl) = match seg.strip_suffix('\n') {
+            Some(l) => (l, "\n"),
+            None => (seg, ""),
+        };
+        let parts: Vec<&str> = line.split(" | ").collect();
+        if parts.len() == 3 && title_looks_like_person_name(parts[1].trim()) {
+            out.push_str(parts[0]);
+            out.push_str(" | ");
+            out.push_str(PERSON_TITLE_PLACEHOLDER);
+            out.push_str(" | ");
+            out.push_str(parts[2]);
+        } else {
+            out.push_str(line);
+        }
+        out.push_str(nl);
+    }
+    out
+}
+
+/// The wikilink half of [`scrub_person_name_titles`]: rewrites only `[[…]]` targets that trip the
+/// person-name predicate; everything else (including a dangling `[[`) passes through byte-exact.
+fn scrub_wikilink_person_targets(text: &str) -> String {
+    if !text.contains("[[") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start + 2]);
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find("]]") else {
+            break; // dangling open — the remainder is pushed verbatim below.
+        };
+        let target = &rest[..end];
+        if title_looks_like_person_name(target.trim()) {
+            out.push_str(PERSON_TITLE_PLACEHOLDER);
+        } else {
+            out.push_str(target);
+        }
+        out.push_str("]]");
+        rest = &rest[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Restore name placeholders produced by a [`NameRedactor`] back to the original names. Disjoint
 /// from [`restore`] (the regex token namespace) so the two layers compose without collision.
 fn restore_names(text: &str, pairs: &[(String, String)]) -> String {
@@ -720,6 +803,18 @@ impl SummarizerProvider for RedactingProvider {
         let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
         let (ruser, more) = self.names.redact_names(&ruser);
         name_pairs.extend(more);
+        // R6 (P0.1 follow-up) — with NO NER model the name layer detects nothing, so person-name
+        // TITLES (the JIT listing lines / [[wikilinks]] in the prompt) would egress verbatim on
+        // this COMPLETE path. Apply the drop-only syntactic title scrub — active ONLY under the
+        // no-op layer, exactly like the summarize path's vault-title fallback.
+        let (rsys, ruser) = if self.names.is_noop() {
+            (
+                scrub_person_name_titles(&rsys),
+                scrub_person_name_titles(&ruser),
+            )
+        } else {
+            (rsys, ruser)
+        };
         let (out, meta) = self.inner.complete_with_meta(&rsys, &ruser).await?;
         let out = restore_names(&out, &name_pairs);
         let out = restore(&out, &map);
@@ -768,6 +863,16 @@ impl SummarizerProvider for RedactingProvider {
         let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
         let (ruser, more) = self.names.redact_names(&ruser);
         name_pairs.extend(more);
+        // R6 — same no-NER-only person-name-title scrub as `complete_with_meta` (the structured
+        // side-tasks embed the same listing/wikilink title shapes).
+        let (rsys, ruser) = if self.names.is_noop() {
+            (
+                scrub_person_name_titles(&rsys),
+                scrub_person_name_titles(&ruser),
+            )
+        } else {
+            (rsys, ruser)
+        };
         // Forward to the INNER's own complete_json_with_meta — dispatches to the gateway's native
         // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
         let (value, meta) = self
@@ -1662,6 +1767,62 @@ mod tests {
         assert!(
             !egress.contains("Anna Kowalska"),
             "the person name must not appear anywhere in the egressed content: {egress}"
+        );
+    }
+
+    /// R6 (P0.1 follow-up, 2026-07-10) — the COMPLETE-path gap the L3 lock-security review
+    /// disclosed: the JIT meeting listing (`- <id> | <title> | <date>` lines riding the SYSTEM
+    /// prompt) and `[[Title]]` corpus/citation links egress through
+    /// `RedactingProvider::complete_with_meta`, where the vault-title syntactic person-name
+    /// fallback did NOT apply — on a no-NER install an auto-created person-page title
+    /// ("Anna Kowalska") rode to the cloud verbatim. The fix applies the SAME
+    /// [`title_looks_like_person_name`] fallback (drop-only, no restore tokens) to those two
+    /// structural title shapes on the complete path, ACTIVE ONLY under the no-op name layer.
+    ///
+    /// RED-before-GREEN via EchoProvider: on the unpatched code the echoed prompt contained
+    /// "Anna Kowalska" (captured failing run); after the fix the name is absent while
+    /// meeting-shaped titles survive untouched.
+    #[test]
+    fn person_name_titles_scrubbed_on_complete_path_when_no_ner() {
+        let prov = RedactingProvider::with_name_redactor(
+            Arc::new(EchoProvider),
+            Arc::new(NoopNameRedactor), // the production no-NER-model shape
+        );
+        let system = "Meetings you can read (id | title | date):\n\
+                      - 3f2b1a | Anna Kowalska | 2026-07-01\n\
+                      - 9c8d7e | Weekly Sync | 2026-07-02";
+        let user = "Ground your answer in [[Anna Kowalska]] and [[Roadmap Review]].";
+        let out = block_on(prov.complete(system, user)).unwrap();
+        assert!(
+            !out.contains("Anna Kowalska"),
+            "a person-name title must NOT egress on the complete path with no NER model: {out}"
+        );
+        assert!(
+            out.contains("Weekly Sync") && out.contains("Roadmap Review"),
+            "meeting-shaped titles survive as usable targets: {out}"
+        );
+        assert!(
+            out.contains("- 3f2b1a |") && out.contains("| 2026-07-01"),
+            "the listing line structure (id + date) survives so get_meeting-by-id still works: {out}"
+        );
+    }
+
+    /// R6 counter-proof: with a REAL name layer active (`is_noop() == false`) the syntactic
+    /// complete-path fallback stays OFF — the NER layer owns names (mask + restore), so the
+    /// prompt text is not additionally rewritten by the drop-only scrub.
+    #[test]
+    fn complete_path_syntactic_scrub_inactive_when_ner_present() {
+        let prov = RedactingProvider::with_name_redactor(
+            Arc::new(EchoProvider),
+            Arc::new(FixtureNameRedactor), // a real (non-noop) name layer
+        );
+        // A listing-shaped line whose title the FIXTURE does not detect: with NER active the
+        // syntactic fallback must NOT fire, so the title passes through (the NER layer's job).
+        let system = "- 3f2b1a | Tomasz Nowak | 2026-07-01";
+        let out = block_on(prov.complete(system, "question")).unwrap();
+        assert!(
+            out.contains("Tomasz Nowak"),
+            "with a real NER layer the syntactic complete-path fallback stays off: {out}"
         );
     }
 

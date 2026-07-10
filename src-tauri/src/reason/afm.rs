@@ -57,11 +57,12 @@ const ENV_OVERRIDE: &str = "MURMUR_AFM_SIDECAR";
 /// can never block the reasoner call.
 const SIDECAR_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// TEST-ONLY process-wide lock serializing every test that reads/writes the [`ENV_OVERRIDE`] env var
-/// (in THIS module AND in `reason` / `commands` tests). `cargo test` runs in parallel, so without it
-/// the spawn round-trip (which SETS `MURMUR_AFM_SIDECAR`) could race the stub-fallback tests (which
-/// require it UNSET) and flip an "absent sidecar → stub" assertion into an "afm" id. Mirrors
-/// `crate::embed::EMBED_SELECTION_TEST_LOCK`. Hold it for the whole set→act→restore span.
+/// TEST-ONLY process-wide lock serializing tests that require [`ENV_OVERRIDE`] to be UNSET (the
+/// `reason.rs` dispatch tests, which `remove_var` it defensively against an externally-exported
+/// value). Since the R8 hardening (2026-07-10) NO test SETS the env var anymore — every fixture
+/// test injects its sidecar path via [`sidecar_path_with_override`] / [`probe_at`] instead — so
+/// the old set→act→restore race is gone by construction; this lock only serializes the residual
+/// `remove_var` writers. Mirrors `crate::embed::EMBED_SELECTION_TEST_LOCK`.
 #[cfg(test)]
 pub(crate) static AFM_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -122,12 +123,29 @@ struct AfmProbeEnvelope {
 ///    macOS-26 SDK machine, so `option_env!` is `None` today).
 ///
 /// NEVER panics; a missing binary is `None`, which the callers treat as "use the stub".
+///
+/// THIN ENV WRAPPER (R8, 2026-07-10): the override VALUE is read here once and injected into
+/// [`sidecar_path_with_override`], so tests exercise the exact same resolution logic by passing
+/// the override as an ARGUMENT — no test ever mutates the process-wide env var (the old
+/// `set_var`/`remove_var` dance raced parallel tests).
 pub fn sidecar_path(app: Option<&AppHandle>) -> Option<PathBuf> {
-    // 1. DEV/TEST runtime override — debug/test builds ONLY (matches the MURMUR_DEV_* precedent), so a
-    //    signed release can never be pointed at a bring-your-own sidecar via the process env.
+    // DEV/TEST runtime override — debug/test builds ONLY (matches the MURMUR_DEV_* precedent), so a
+    // signed release can never be pointed at a bring-your-own sidecar via the process env.
     #[cfg(any(test, debug_assertions))]
-    if let Ok(p) = std::env::var(ENV_OVERRIDE) {
-        let path = PathBuf::from(p);
+    let override_path = std::env::var(ENV_OVERRIDE).ok().map(PathBuf::from);
+    #[cfg(not(any(test, debug_assertions)))]
+    let override_path: Option<PathBuf> = None;
+    sidecar_path_with_override(override_path, app)
+}
+
+/// Core of [`sidecar_path`] with the dev/test override INJECTED as an argument (R8): pure with
+/// respect to the `MURMUR_AFM_SIDECAR` env var, so parallel tests can never race on it.
+fn sidecar_path_with_override(
+    override_path: Option<PathBuf>,
+    app: Option<&AppHandle>,
+) -> Option<PathBuf> {
+    // 1. The injected dev/test override (a fixture script / a developer's own sidecar).
+    if let Some(path) = override_path {
         if path.exists() {
             return Some(path);
         }
@@ -336,7 +354,13 @@ fn run_probe(bin: &Path) -> Result<String> {
 ///
 /// NEVER panics, NEVER egresses (a local availability check only).
 pub fn probe(app: Option<&AppHandle>) -> AfmStatus {
-    let Some(bin) = sidecar_path(app) else {
+    probe_at(sidecar_path(app))
+}
+
+/// Core of [`probe`] over an already-resolved sidecar path (R8): env-free, so tests drive the
+/// probe against a fixture (or `None`) without touching `MURMUR_AFM_SIDECAR`.
+fn probe_at(bin: Option<PathBuf>) -> AfmStatus {
+    let Some(bin) = bin else {
         return AfmStatus {
             sidecar_present: false,
             model_available: None,
@@ -524,25 +548,30 @@ mod tests {
 
     // ---- availability probe: the sidecar-ABSENT path (this CLT-only machine) -------------------
 
-    /// On every non-macOS-26 machine the sidecar is absent, so `probe(None)` reports
+    /// On every non-macOS-26 machine the sidecar is absent, so the probe reports
     /// `sidecar_present:false, model_available:None` and NEVER panics — the graceful capability
-    /// floor `afm_available` returns.
+    /// floor `afm_available` returns. Driven through the env-free [`probe_at`] core (R8), so a
+    /// parallel test / an exported shell var can never flip this into a present sidecar.
     #[test]
     fn probe_reports_absent_when_no_sidecar() {
-        let _g = AFM_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(ENV_OVERRIDE);
-        let status = probe(None);
+        let status = probe_at(None);
         assert!(!status.sidecar_present);
         assert_eq!(status.model_available, None);
         assert!(!status.reason.is_empty());
     }
 
-    /// With no sidecar resolvable, both constructors degrade to the deterministic stub (id `"stub"`)
-    /// — byte-identical to `BrainBackend::Off`, zero egress, no panic.
+    /// With no sidecar resolvable, the resolution core returns `None` for every candidate on this
+    /// machine (no override injected, no bundle, no OUT_DIR sidecar), which the constructors map to
+    /// the deterministic stub (id `"stub"`) — byte-identical to `BrainBackend::Off`, zero egress,
+    /// no panic. Env-free via [`sidecar_path_with_override`] (R8).
     #[test]
     fn constructors_fall_back_to_stub_without_sidecar() {
-        let _g = AFM_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var(ENV_OVERRIDE);
+        assert!(
+            sidecar_path_with_override(None, None).is_none(),
+            "no sidecar candidate resolves on a CLT-only machine"
+        );
+        // The constructors' mapping over an unresolvable path is the stub. (They read the env
+        // wrapper, which no test sets anymore — deterministic in-process.)
         let cfg = AppConfig::default();
         assert_eq!(afm_reasoner(&cfg).id(), "stub");
         assert_eq!(afm_reasoner_arc(&cfg).id(), "stub");
@@ -575,36 +604,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reason_round_trips_through_a_fixture_sidecar() {
-        let _g = AFM_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = write_fixture("reason", r#"{"status":"ok","text":"canned answer"}"#);
-        std::env::set_var(ENV_OVERRIDE, &fixture);
 
-        // Resolve via sidecar_path(None) → the env-override branch → the fixture.
-        let bin = sidecar_path(None).expect("fixture must resolve via MURMUR_AFM_SIDECAR");
+        // Resolve through the SAME override branch production takes — the value injected as an
+        // argument (R8), never via the shared process env.
+        let bin = sidecar_path_with_override(Some(fixture.clone()), None)
+            .expect("fixture must resolve via the injected override");
         let r = AfmReasoner::new(bin);
         assert_eq!(r.id(), "afm");
         let got = r.reason("system prompt", "user prompt").unwrap();
         assert_eq!(got, "canned answer");
 
-        std::env::remove_var(ENV_OVERRIDE);
         let _ = std::fs::remove_file(&fixture);
     }
 
     #[cfg(unix)]
     #[test]
     fn structured_round_trips_native_json_through_a_fixture_sidecar() {
-        let _g = AFM_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = write_fixture("structured", r#"{"status":"ok","json":{"n":2,"ok":true}}"#);
-        std::env::set_var(ENV_OVERRIDE, &fixture);
 
-        let bin = sidecar_path(None).expect("fixture must resolve via MURMUR_AFM_SIDECAR");
+        let bin = sidecar_path_with_override(Some(fixture.clone()), None)
+            .expect("fixture must resolve via the injected override");
         let r = AfmReasoner::new(bin);
         let schema = serde_json::json!({ "type": "object" });
         let v = r.structured("sys", "user", &schema).unwrap();
         assert_eq!(v["n"], serde_json::json!(2));
         assert_eq!(v["ok"], serde_json::json!(true));
 
-        std::env::remove_var(ENV_OVERRIDE);
         let _ = std::fs::remove_file(&fixture);
     }
 
@@ -613,35 +639,38 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unavailable_envelope_propagates_as_err_through_the_spawn_path() {
-        let _g = AFM_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = write_fixture("unavail", r#"{"status":"unavailable","reason":"no model"}"#);
-        std::env::set_var(ENV_OVERRIDE, &fixture);
 
-        let bin = sidecar_path(None).unwrap();
+        let bin = sidecar_path_with_override(Some(fixture.clone()), None).unwrap();
         let r = AfmReasoner::new(bin);
         match r.reason("s", "u") {
             Err(AppError::Unavailable(reason)) => assert_eq!(reason, "no model"),
             other => panic!("expected Unavailable from the sidecar, got {other:?}"),
         }
 
-        std::env::remove_var(ENV_OVERRIDE);
         let _ = std::fs::remove_file(&fixture);
     }
 
     /// The probe path over a fixture: a `--probe` reply of `available` is reported as
-    /// `sidecar_present:true, model_available:Some(true)`.
+    /// `sidecar_present:true, model_available:Some(true)`. Driven through the env-free
+    /// [`probe_at`] core (R8) — no `set_var`, no race with the stub-fallback tests.
     #[cfg(unix)]
     #[test]
     fn probe_reports_available_through_a_fixture_sidecar() {
-        let _g = AFM_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = write_fixture("probe", r#"{"status":"available","reason":"ready"}"#);
-        std::env::set_var(ENV_OVERRIDE, &fixture);
 
-        let status = probe(None);
+        let status = probe_at(Some(fixture.clone()));
         assert!(status.sidecar_present);
         assert_eq!(status.model_available, Some(true));
 
-        std::env::remove_var(ENV_OVERRIDE);
         let _ = std::fs::remove_file(&fixture);
+    }
+
+    /// R8 — a non-existent injected override falls through the override branch (never resolves a
+    /// missing file), exactly like the env wrapper did.
+    #[test]
+    fn missing_override_path_falls_through() {
+        let bogus = PathBuf::from("/definitely/not/a/real/sidecar-fixture");
+        assert!(sidecar_path_with_override(Some(bogus), None).is_none());
     }
 }
