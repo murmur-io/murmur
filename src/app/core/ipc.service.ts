@@ -1126,9 +1126,31 @@ export class IpcService {
     return invoke<FolderNode | null>("unlock_meeting", { meetingId });
   }
 
-  /** AI-derived speaker + topic timeline for a meeting (generated + cached on first call). */
+  /**
+   * READ-ONLY: the cached AI-derived speaker + topic timeline (or an EMPTY one when none is cached).
+   * NEVER generates — a passive Audio-tab open must not load a multi-GB on-device model. Use
+   * `generateTimeline` to derive it, gated by `timelineGenerationOnDevice` (perf/OOM).
+   */
   getTimeline(meetingId: string): Promise<MeetingTimeline> {
     return invoke<MeetingTimeline>("get_timeline", { meetingId });
+  }
+
+  /**
+   * EXPLICIT (heavy) timeline generation — derives + caches the speaker/topic map via the Notes-role
+   * provider. For an on-device provider this loads a multi-GB model, so the FE only calls it
+   * automatically for cheap cloud providers and behind a user click for on-device ones.
+   */
+  generateTimeline(meetingId: string): Promise<MeetingTimeline> {
+    return invoke<MeetingTimeline>("generate_timeline", { meetingId });
+  }
+
+  /**
+   * True when deriving this install's timeline would load a residency-bound on-device model (local
+   * GGUF / Ollama / Apple FM) — i.e. generation is HEAVY and must be hidden behind an explicit
+   * click, not auto-fired on tab open. False for cloud providers (cheap → auto-generate).
+   */
+  timelineGenerationOnDevice(): Promise<boolean> {
+    return invoke<boolean>("timeline_generation_on_device");
   }
 
   /** Rename a speaker across a meeting's timeline (e.g. "User 1" → "Sarah"). */

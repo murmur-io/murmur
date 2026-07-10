@@ -108,7 +108,26 @@ struct LoopTranscript {
     /// Blocks already folded into the `"[N earlier results omitted]"` marker.
     omitted: usize,
     /// The appended blocks, newest last, each WITHOUT its `"\n\n"` joiner.
-    blocks: Vec<String>,
+    blocks: Vec<Block>,
+}
+
+/// The STRUCTURAL kind of one appended block (L3 follow-up, 2026-07-10): compaction folds only
+/// old RESULT blocks into the omitted counter — MARKER blocks (the dedup / failure steering
+/// notes) survive compaction even when they sit between evicted results, so the model never
+/// re-runs a failed or already-retrieved tool just because its warning was compacted away.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum BlockKind {
+    /// A tool RESULT — bulky grounding; old ones are safe to fold into the omitted counter.
+    Result,
+    /// A structural steering MARKER (`[… failed — …]` / `[… already retrieved — …]`) — tiny and
+    /// load-bearing for loop termination; never evicted.
+    Marker,
+}
+
+/// One owned loop-transcript block: its structural kind + its rendered text.
+struct Block {
+    kind: BlockKind,
+    text: String,
 }
 
 impl LoopTranscript {
@@ -120,8 +139,20 @@ impl LoopTranscript {
         }
     }
 
-    fn push_block(&mut self, block: String) {
-        self.blocks.push(block);
+    /// Append a tool-RESULT block (compactable once old).
+    fn push_result(&mut self, block: String) {
+        self.blocks.push(Block {
+            kind: BlockKind::Result,
+            text: block,
+        });
+    }
+
+    /// Append a structural MARKER block (dedup / failure note — survives every compaction).
+    fn push_marker(&mut self, block: String) {
+        self.blocks.push(Block {
+            kind: BlockKind::Marker,
+            text: block,
+        });
     }
 
     /// Exact length of [`render`](Self::render)'s output, without allocating it.
@@ -131,19 +162,28 @@ impl LoopTranscript {
         } else {
             0
         };
-        self.head.len() + marker + self.blocks.iter().map(|b| 2 + b.len()).sum::<usize>()
+        self.head.len() + marker + self.blocks.iter().map(|b| 2 + b.text.len()).sum::<usize>()
     }
 
-    /// DETERMINISTIC compaction (no model call): drop all but the LAST [`KEEP_LAST_BLOCKS`] blocks
-    /// WHOLE, accumulating the dropped count into `omitted`. With ≤ KEEP_LAST_BLOCKS blocks there
-    /// is nothing to drop — a no-op. Repeated compactions keep folding into the same counter.
+    /// DETERMINISTIC compaction (no model call): keep the LAST [`KEEP_LAST_BLOCKS`] blocks WHOLE
+    /// (whatever their kind — the freshest grounding), keep every older MARKER block (tiny,
+    /// steering-critical), and fold every older RESULT block into the `omitted` counter. With
+    /// ≤ KEEP_LAST_BLOCKS blocks there is nothing to drop — a no-op. Repeated compactions keep
+    /// folding into the same counter.
     fn compact(&mut self) {
         if self.blocks.len() <= KEEP_LAST_BLOCKS {
             return;
         }
-        let drop_n = self.blocks.len() - KEEP_LAST_BLOCKS;
-        self.blocks.drain(..drop_n);
-        self.omitted += drop_n;
+        let keep_from = self.blocks.len() - KEEP_LAST_BLOCKS;
+        let mut kept: Vec<Block> = Vec::with_capacity(self.blocks.len());
+        for (i, b) in self.blocks.drain(..).enumerate() {
+            if i >= keep_from || b.kind == BlockKind::Marker {
+                kept.push(b);
+            } else {
+                self.omitted += 1;
+            }
+        }
+        self.blocks = kept;
     }
 
     /// Render for the model: head, then (when anything was folded) the omitted-count marker, then
@@ -158,7 +198,7 @@ impl LoopTranscript {
         }
         for b in &self.blocks {
             s.push_str("\n\n");
-            s.push_str(b);
+            s.push_str(&b.text);
         }
         s
     }
@@ -263,7 +303,7 @@ pub fn run_agentic_loop(
             let key = format!("{name}:{args}");
             if seen.contains(&key) {
                 // Already retrieved this exact call — tell the model, don't burn the budget on a repeat.
-                transcript.push_block(format!(
+                transcript.push_marker(format!(
                     "[{name} already retrieved — choose a different tool or answer]"
                 ));
                 continue;
@@ -281,7 +321,7 @@ pub fn run_agentic_loop(
                     }
                     gathered.push_str(out);
                     gathered.push_str("\n\n");
-                    transcript.push_block(format!(
+                    transcript.push_result(format!(
                         "[{name} result]\n{}",
                         truncate(out, RESULT_BUDGET)
                     ));
@@ -297,7 +337,7 @@ pub fn run_agentic_loop(
                         s.tool_done(&name, false, 0);
                     }
                     transcript
-                        .push_block(format!("[{name} failed — try another tool or answer]"));
+                        .push_marker(format!("[{name} failed — try another tool or answer]"));
                     steps.push(AgentStep {
                         tool: name,
                         ok: false,
@@ -564,7 +604,7 @@ mod tests {
     fn loop_transcript(n: usize, block_chars: usize) -> LoopTranscript {
         let mut t = LoopTranscript::new("what did we decide?");
         for i in 0..n {
-            t.push_block(format!(
+            t.push_result(format!(
                 "[search_meetings result]\nblock-{i}-{}",
                 "x".repeat(block_chars)
             ));
@@ -591,7 +631,7 @@ mod tests {
         assert_eq!(t.rendered_len(), c.len(), "length math matches after compaction");
 
         // Re-compaction after more blocks FOLDS into the same counter.
-        t.push_block("[search_meetings result]\nblock-5-new".to_string());
+        t.push_result("[search_meetings result]\nblock-5-new".to_string());
         t.compact();
         let c2 = t.render();
         assert!(c2.contains("[4 earlier results omitted]"), "counter folds: {c2}");
@@ -605,6 +645,51 @@ mod tests {
         let mut none = LoopTranscript::new("hello");
         none.compact();
         assert_eq!(none.render(), "User request: hello");
+    }
+
+    /// L3 follow-up (R3): structural MARKER blocks (the `[… failed — …]` / `[… already retrieved
+    /// — …]` steering notes) SURVIVE compaction even when they sit BETWEEN evicted results —
+    /// only old RESULT blocks fold into the omitted counter, and the keep-window (last 2 blocks)
+    /// semantics are unchanged. Without this the model could re-run a failed/duplicate tool the
+    /// moment its warning was compacted away.
+    #[test]
+    fn markers_between_evicted_results_survive_compaction() {
+        let mut t = LoopTranscript::new("what did we decide?");
+        t.push_result(format!("[search_meetings result]\nres-0-{}", "x".repeat(100)));
+        t.push_marker("[get_meeting failed — try another tool or answer]".to_string());
+        t.push_result(format!("[search_meetings result]\nres-1-{}", "x".repeat(100)));
+        t.push_marker(
+            "[search_meetings already retrieved — choose a different tool or answer]".to_string(),
+        );
+        t.push_result(format!("[get_meeting result]\nres-2-{}", "x".repeat(100)));
+        t.push_result(format!("[get_meeting result]\nres-3-{}", "x".repeat(100)));
+
+        t.compact();
+        let c = t.render();
+        // Both markers sit OUTSIDE the keep-window (last 2 blocks = res-2, res-3) yet survive.
+        assert!(
+            c.contains("[get_meeting failed — try another tool or answer]"),
+            "the failure marker must survive compaction: {c}"
+        );
+        assert!(
+            c.contains("[search_meetings already retrieved — choose a different tool or answer]"),
+            "the dedup marker must survive compaction: {c}"
+        );
+        // The keep-window results are verbatim; the two OLD results folded into the counter.
+        assert!(c.contains("res-2-") && c.contains("res-3-"), "newest 2 blocks kept: {c}");
+        assert!(!c.contains("res-0-") && !c.contains("res-1-"), "old results omitted: {c}");
+        assert!(
+            c.contains("[2 earlier results omitted]"),
+            "only the 2 evicted RESULTS count as omitted: {c}"
+        );
+        assert_eq!(t.rendered_len(), c.len(), "length math matches after marker-aware compaction");
+
+        // Re-compaction is stable: markers keep surviving, the counter never double-counts them.
+        t.push_result(format!("[get_meeting result]\nres-4-{}", "x".repeat(100)));
+        t.compact();
+        let c2 = t.render();
+        assert!(c2.contains("[get_meeting failed — try another tool or answer]"));
+        assert!(c2.contains("[3 earlier results omitted]"), "res-2 folds on re-compaction: {c2}");
     }
 
     /// IN-LOOP: an over-budget transcript is compacted before the next model step (the reasoner

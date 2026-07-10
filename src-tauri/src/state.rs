@@ -241,6 +241,14 @@ pub struct AppState {
     /// `Mutex<()>` used purely as a critical-section guard: a poisoned `()` carries no invalid
     /// state, so acquirers recover via `into_inner()` rather than bricking all future lock ops.
     pub lifecycle: Mutex<()>,
+    /// SEAL EPOCH (L2 follow-up, 2026-07-10) — a monotonic counter bumped at the ENTRY of every
+    /// lock-surface mutation (`lock_folder` / `relock_folder` / `relock_all` / `remove_lock`, via
+    /// `commands::bump_seal_epoch`). The hourly memory-consolidation job snapshots it before
+    /// reading facts and re-checks it before EVERY rollup write (`memory::run_consolidation_pass`):
+    /// a mismatch means a seal/relock interleaved mid-pass, so the pass aborts silently instead of
+    /// resurrecting just-sealed content into a rollup (the pass-vs-seal TOCTOU). Content-free
+    /// (a bare counter) — no PII, nothing to seal.
+    pub seal_epoch: AtomicU64,
 }
 
 impl AppState {
@@ -325,6 +333,7 @@ impl AppState {
             account_session: Mutex::new(None),
             share_refresh_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),
+            seal_epoch: AtomicU64::new(0),
         })
     }
 
