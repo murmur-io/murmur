@@ -71,6 +71,7 @@ async fn main() {
         vault_titles,
         related_context: None,
         user_notes: None,
+        live_bullets: None,
     };
 
     let provider = ClaudeCodeProvider::new();

@@ -1,6 +1,8 @@
+pub mod bullets;
 pub mod diarize;
 pub mod live;
 pub mod model;
+pub mod novelty;
 pub mod types;
 pub mod vad;
 pub mod whisper;

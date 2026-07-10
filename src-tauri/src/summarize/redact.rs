@@ -549,8 +549,8 @@ impl SummarizerProvider for RedactingProvider {
     ///
     /// FIREWALL CONTRACT — every `SummarizeRequest` field that EGRESSES to the inner (cloud)
     /// provider is scrubbed here before the `req.clone()` is forwarded. The classification:
-    /// - `transcript`, `related_context`, `user_notes` — full firewall: regex (email/card/phone)
-    ///   via the shared map + the NER name layer, tokens restored in the reply.
+    /// - `transcript`, `related_context`, `user_notes`, `live_bullets` — full firewall: regex
+    ///   (email/card/phone) via the shared map + the NER name layer, tokens restored in the reply.
     /// - `template` (rides the SYSTEM prompt) and `meta.title_hint` (rides `render_user_content`) —
     ///   regex layer via the shared map, tokens restored in the reply (defense-in-depth; low-risk
     ///   instruction/label strings).
@@ -584,6 +584,13 @@ impl SummarizerProvider for RedactingProvider {
             .user_notes
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
+        // Brain v2 L4: the running live bullets ride the prompt as the "Live notes (auto)"
+        // section — scrub them through the SAME shared map as the transcript they were derived
+        // from, so a value redacted anywhere restores consistently in the reply.
+        let red_bullets = req
+            .live_bullets
+            .as_ref()
+            .map(|c| redact_into(c, &mut map, &mut rev));
         // Name layer (default no-op → text unchanged, `name_pairs` empty → byte-identical egress).
         let (red_transcript, mut name_pairs) = self.names.redact_names(&red_transcript);
         let red_related = red_related.map(|c| {
@@ -592,6 +599,11 @@ impl SummarizerProvider for RedactingProvider {
             c2
         });
         let red_notes = red_notes.map(|c| {
+            let (c2, more) = self.names.redact_names(&c);
+            name_pairs.extend(more);
+            c2
+        });
+        let red_bullets = red_bullets.map(|c| {
             let (c2, more) = self.names.redact_names(&c);
             name_pairs.extend(more);
             c2
@@ -657,11 +669,13 @@ impl SummarizerProvider for RedactingProvider {
         // Byte sizes of the REDACTED content (sizes, never the text itself).
         let user_bytes = red_transcript.len()
             + red_related.as_ref().map(|c| c.len()).unwrap_or(0)
-            + red_notes.as_ref().map(|c| c.len()).unwrap_or(0);
+            + red_notes.as_ref().map(|c| c.len()).unwrap_or(0)
+            + red_bullets.as_ref().map(|c| c.len()).unwrap_or(0);
         let mut r = req.clone();
         r.transcript = red_transcript;
         r.related_context = red_related;
         r.user_notes = red_notes;
+        r.live_bullets = red_bullets;
         r.template = red_template;
         r.meta.title_hint = red_title_hint;
         r.vault_titles = red_titles;
@@ -885,6 +899,7 @@ mod tests {
             vault_titles: Vec::new(),
             related_context: None,
             user_notes: None,
+            live_bullets: None,
         }
     }
 
@@ -1743,6 +1758,7 @@ mod tests {
             ],
             related_context: Some("s-related@leak.example".to_string()), // SCRUBBED (regex + NER)
             user_notes: Some("s-notes@leak.example".to_string()),        // SCRUBBED (regex + NER)
+            live_bullets: Some("s-bullets@leak.example".to_string()),    // SCRUBBED (regex + NER)
         };
         let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
         let provider = RedactingProvider::new(inner.clone());
@@ -1756,6 +1772,7 @@ mod tests {
             "s-title@leak.example",
             "s-related@leak.example",
             "s-notes@leak.example",
+            "s-bullets@leak.example",
         ] {
             assert!(
                 !egress.contains(sentinel),

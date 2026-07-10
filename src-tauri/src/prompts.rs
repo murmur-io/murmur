@@ -63,6 +63,33 @@ pub const MEETING_JUST_STARTED_PHRASE: &str = "meeting just started";
 pub const NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE: &str =
     "do NOT search the vault for other saved meetings";
 
+// ── Brain v2 L4 — INCREMENTAL LIVE BULLETS (the running-notes prompt) ────────────────────────────
+// Used by `transcribe::bullets::update_bullets` on the LOCAL light reasoner only (never a cloud
+// call): previous bullets + the new transcript delta → at most 3 NEW bullets, or the literal
+// `NOTHING`. Prefix-prompted so the (KV-cached) previous bullets stay a stable prefix across calls.
+
+/// The literal token the bullets model must emit when the delta adds nothing noteworthy.
+/// `transcribe::bullets::update_bullets` treats it (case-insensitively) as "no new bullets".
+pub const LIVE_BULLETS_NOTHING: &str = "NOTHING";
+
+/// System prompt for the incremental live-bullets update (Brain v2 L4). Small-model-friendly:
+/// one narrow task, a fixed line format, and an explicit no-op token.
+pub const LIVE_BULLETS_SYSTEM: &str = "You maintain RUNNING NOTES for a meeting in progress. You \
+    are given the bullets so far and a NEW fragment of the live transcript. Output ONLY new \
+    bullets for genuinely NEW information in the fragment (decisions, facts, owners, dates, open \
+    questions) — never restate an existing bullet. Format: at most 3 lines, each exactly \
+    `- [topic]: point`, in the language of the transcript. If the fragment adds nothing \
+    noteworthy (filler, repetition, small talk), reply with EXACTLY the single word NOTHING and \
+    nothing else. No preamble, no commentary, no numbering.";
+
+/// The user message for one incremental bullets update: the bullets so far (may be empty) + the
+/// new transcript delta. Pure formatting — no I/O.
+pub fn live_bullets_user(previous_bullets: &str, delta: &str) -> String {
+    let prev = previous_bullets.trim();
+    let prev_block = if prev.is_empty() { "(none yet)" } else { prev };
+    format!("NOTES SO FAR:\n{prev_block}\n\nNEW TRANSCRIPT FRAGMENT:\n{}", delta.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +112,18 @@ mod tests {
     fn prompt_version_is_a_dated_stamp() {
         assert!(PROMPT_VERSION.starts_with('v'));
         assert!(PROMPT_VERSION.len() >= "v2026-01-01".len());
+    }
+
+    /// Brain v2 L4 — the bullets prompt carries the exact no-op token `update_bullets` detects,
+    /// and the user message renders both blocks (empty previous bullets get the "(none yet)"
+    /// placeholder so the prefix shape is stable).
+    #[test]
+    fn live_bullets_prompt_carries_nothing_token_and_renders_blocks() {
+        assert!(LIVE_BULLETS_SYSTEM.contains(LIVE_BULLETS_NOTHING));
+        let u = live_bullets_user("- [budget]: capped at 10k", "we also agreed Anna owns QA");
+        assert!(u.contains("NOTES SO FAR:\n- [budget]: capped at 10k"));
+        assert!(u.contains("NEW TRANSCRIPT FRAGMENT:\nwe also agreed Anna owns QA"));
+        assert!(live_bullets_user("", "delta").contains("(none yet)"));
     }
 
     /// The recording-awareness phrases stay the exact substrings the cascade prompt tests pin —

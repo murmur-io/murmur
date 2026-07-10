@@ -98,3 +98,9 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
   SSL Full, but disable Rocket-Loader/Email-Obfuscation or they break the strict-CSP viewer).
 - **Status:** superseded by `2026-07-05 landing/API deploy` (final fix was CNAME + TXT +
   wait/poll; cert became `CERTIFICATE_STATUS_TYPE_VALID`)
+
+### [2026-07-10 brain-l4-live] Never run the MUTATING adversarial verifier concurrently with the READ-ONLY lock auditor
+- **Pattern:** both verifiers dispatched in parallel on the same uncommitted diff; the adversarial's mutation-probe (removing a purge site, then restoring byte-identical) overlapped the lock reviewer's audit window — the lock reviewer saw the mutated tree, reported a "blocking leak" for code that was present before and after, and burned a FAIL verdict + an investigation on a concurrency artifact.
+- **Caught by:** the lock reviewer's own tree-state warning (diff hunk count changed mid-audit) + a post-hoc grep/test on the settled tree.
+- **Lesson:** patch-and-restore verifiers get EXCLUSIVE tree access. Run adversarial first, lock-security after (or vice versa) — never both at once on a dirty tree. If parallelism matters, give the mutating verifier a worktree.
+- **Status:** journal

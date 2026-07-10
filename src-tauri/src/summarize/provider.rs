@@ -45,6 +45,14 @@ pub struct SummarizeRequest {
     /// to the provider in the prompt — `RedactingProvider` MUST scrub it alongside the
     /// transcript (summarize/redact.rs) before egress. Today's append mode never egresses it.
     pub user_notes: Option<String>,
+    /// Brain v2 L4 — the RUNNING LIVE BULLETS captured during the recording
+    /// (`transcribe::bullets`), rendered by `render_user_content` as the "LIVE NOTES (auto)"
+    /// section BEFORE the transcript. `None`/blank (no recording bullets — the default, the
+    /// flag-off case, and every resummarize after the Stop-time consume) ⇒ the rendered prompt is
+    /// byte-identical to before this field existed (same contract as `user_notes`). SECURITY:
+    /// this string EGRESSES to the provider in the prompt — `RedactingProvider` MUST scrub it
+    /// alongside the transcript (summarize/redact.rs) before egress.
+    pub live_bullets: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +266,7 @@ mod tests {
             vault_titles: vec![],
             related_context: None,
             user_notes: None,
+            live_bullets: None,
         };
         let (text, meta) = p.summarize_with_meta(&req).await.unwrap();
         assert_eq!(text, "note body");
