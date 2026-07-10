@@ -433,6 +433,216 @@ mod tests {
         );
     }
 
+    /// `u64` env knob with a default — shared by the env-driven `#[ignore]` harnesses below.
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Greedy (Fast-profile) decode with an EXPLICIT `audio_ctx` override for the duty-cycle
+    /// sim: `0` = leave whisper's full 30 s encoder context (the PRE-fix behavior),
+    /// `n > 0` = right-size it (e.g. 832 = the shipped `LIVE_AUDIO_CTX`). Mirrors
+    /// `build_params(Fast)` + the print-silencing in `transcribe_with`, but returns only the
+    /// segment count — the sim measures TIME, not text.
+    fn duty_decode(t: &Transcriber, samples_16k: &[f32], audio_ctx: i32) -> Result<usize> {
+        let mut state = t
+            .ctx
+            .create_state()
+            .map_err(|e| AppError::Transcribe(format!("create whisper state: {e}")))?;
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        if audio_ctx > 0 {
+            params.set_audio_ctx(audio_ctx);
+        }
+        params.set_language(None);
+        params.set_print_special(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        state
+            .full(params, samples_16k)
+            .map_err(|e| AppError::Transcribe(format!("whisper inference failed: {e}")))?;
+        Ok(state.full_n_segments().max(0) as usize)
+    }
+
+    /// T0 — LIVE DUTY-CYCLE simulation (env-driven `#[ignore]`, the instrument behind the
+    /// live-power baseline in `scripts/measure-live-power.sh`). MIRRORS `live.rs` SEMANTICS,
+    /// not its code: a virtual clock advances in 3 s ticks over an endless
+    /// `[WAV + injected silence]` loop; each tick snapshots the trailing 14 s window; the
+    /// optional Silero gate (same newest-3 s-delta scan + 2-tick hangover as the live loop)
+    /// decides decode-or-skip; a decode runs the Fast/greedy profile with the `audio_ctx`
+    /// override; then the tick SLEEPS its wall-clock remainder so the idle/busy pattern is
+    /// REAL — `powermetrics` sampling alongside sees the true duty cycle.
+    ///
+    /// Envs: MURMUR_DUTY_WAV (16 kHz mono), MURMUR_DUTY_MODEL (ggml path),
+    /// MURMUR_DUTY_MINUTES (default 3), MURMUR_DUTY_GATE (1 = Silero gate, default 1; the VAD
+    /// model must be in the app models dir), MURMUR_DUTY_AUDIO_CTX (0 = full context, else e.g.
+    /// 832), MURMUR_DUTY_SILENCE_SECS (default 240 — zeros injected between WAV loop-plays so
+    /// speech density approximates a real meeting's mic share, ~35% with the 2-min A/B WAV).
+    ///
+    /// Prints ONE machine-greppable line at the end:
+    ///   DUTY_RESULT model=<name> gate=<0/1> audio_ctx=<n> ticks=<n> decodes=<n>
+    ///   decode_ms_total=<n> wall_s=<n> duty_pct=<n.n>
+    /// PANICS NEVER — missing env / bad paths skip-soft (the `asr_ab_harness_from_env`
+    /// pattern). Needs a real Mac + a loaded GGUF; headless `cargo test` proves nothing here.
+    #[test]
+    #[ignore = "real duty-cycle sim: needs MURMUR_DUTY_WAV + MURMUR_DUTY_MODEL on a Mac with Metal"]
+    fn live_duty_cycle_sim_from_env() {
+        /// Nominal live tick (live.rs `TICK`), seconds.
+        const TICK_SECS: usize = 3;
+        /// Rolling window the live loop decodes (live.rs `WINDOW_SECS`), seconds.
+        const WINDOW_SECS: usize = 14;
+        /// Post-speech decode hangover (live.rs `VAD_HANGOVER_TICKS`), ticks.
+        const HANGOVER_TICKS: u8 = 2;
+        const RATE: usize = 16_000;
+
+        let Ok(wav) = std::env::var("MURMUR_DUTY_WAV") else {
+            eprintln!("SKIP: set MURMUR_DUTY_WAV to a 16 kHz mono WAV path");
+            return;
+        };
+        let Ok(model) = std::env::var("MURMUR_DUTY_MODEL") else {
+            eprintln!("SKIP: set MURMUR_DUTY_MODEL to a ggml model path");
+            return;
+        };
+        let minutes = env_u64("MURMUR_DUTY_MINUTES", 3);
+        let gate = env_u64("MURMUR_DUTY_GATE", 1) != 0;
+        let audio_ctx = env_u64("MURMUR_DUTY_AUDIO_CTX", 0) as i32;
+        let silence_secs = env_u64("MURMUR_DUTY_SILENCE_SECS", 240) as usize;
+
+        let speech = match read_wav_16k_mono(Path::new(&wav)) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                eprintln!("SKIP: MURMUR_DUTY_WAV is empty");
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP: could not read WAV: {e}");
+                return;
+            }
+        };
+        let transcriber = match Transcriber::load(Path::new(&model)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIP: model load failed: {e}");
+                return;
+            }
+        };
+        // Silero gate (CPU-only — see transcribe::vad): resolved from the shared app models
+        // dir, exactly the file the live loop uses.
+        let mut vad = if gate {
+            let vad_path = match crate::transcribe::model::models_dir() {
+                Ok(d) => d.join(crate::transcribe::model::VAD_MODEL_FILE),
+                Err(e) => {
+                    eprintln!("SKIP: models dir unresolvable for the VAD model: {e}");
+                    return;
+                }
+            };
+            match crate::transcribe::vad::VadSegmenter::load(&vad_path) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("SKIP: gate=1 but Silero VAD model not loadable: {e}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // The endless [speech + silence] virtual stream: position p maps into the loop period.
+        let period = speech.len() + silence_secs * RATE;
+        let sample_at = |p: usize| -> f32 {
+            let i = p % period;
+            if i < speech.len() {
+                speech[i]
+            } else {
+                0.0
+            }
+        };
+
+        let ticks_total = ((minutes as usize) * 60 / TICK_SECS).max(1);
+        let window_len = WINDOW_SECS * RATE;
+        let delta_len = TICK_SECS * RATE;
+        eprintln!(
+            "duty sim: {ticks_total} ticks of {TICK_SECS}s, speech {:.1}s / period {:.1}s (~{:.0}% density), gate={gate}, audio_ctx={audio_ctx}",
+            speech.len() as f64 / RATE as f64,
+            period as f64 / RATE as f64,
+            100.0 * speech.len() as f64 / period as f64,
+        );
+
+        let mut cursor = 0usize; // virtual samples elapsed
+        let mut hangover = 0u8;
+        let mut decodes = 0usize;
+        let mut decode_ms_total = 0u128;
+        let run_started = std::time::Instant::now();
+        for tick in 0..ticks_total {
+            let tick_started = std::time::Instant::now();
+            cursor += delta_len;
+            let start = cursor.saturating_sub(window_len);
+            let window: Vec<f32> = (start..cursor).map(sample_at).collect();
+
+            // Gate: Silero over the newest 3 s delta; speech re-arms the hangover, silence
+            // spends it, spent hangover ⇒ skip. A VAD error fails OPEN (decode) — the live
+            // loop's contract.
+            let do_decode = match vad.as_mut() {
+                None => true,
+                Some(v) => {
+                    let delta = &window[window.len().saturating_sub(delta_len)..];
+                    let has_speech = match v.speech_regions(delta) {
+                        Ok(regions) => !regions.is_empty(),
+                        Err(e) => {
+                            eprintln!("tick {tick}: VAD failed ({e}); decoding (fail-open)");
+                            true
+                        }
+                    };
+                    if has_speech {
+                        hangover = HANGOVER_TICKS;
+                        true
+                    } else if hangover > 0 {
+                        hangover -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if do_decode {
+                let started = std::time::Instant::now();
+                if let Err(e) = duty_decode(&transcriber, &window, audio_ctx) {
+                    eprintln!("tick {tick}: decode failed: {e}");
+                }
+                decode_ms_total += started.elapsed().as_millis();
+                decodes += 1;
+            }
+
+            // Sleep the tick remainder so the WALL-CLOCK duty cycle is real (powermetrics
+            // samples the true idle/busy pattern). An overrunning decode stretches the tick,
+            // exactly like the live loop under load.
+            let spent = tick_started.elapsed();
+            let tick_dur = std::time::Duration::from_secs(TICK_SECS as u64);
+            if spent < tick_dur {
+                std::thread::sleep(tick_dur - spent);
+            }
+        }
+
+        let wall_s = run_started.elapsed().as_secs_f64();
+        let duty_pct = if wall_s > 0.0 {
+            (decode_ms_total as f64 / 1000.0) / wall_s * 100.0
+        } else {
+            0.0
+        };
+        // Model NAME only (a ggml filename), never the path — §8.
+        let model_name = Path::new(&model)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("custom");
+        println!(
+            "DUTY_RESULT model={model_name} gate={} audio_ctx={audio_ctx} ticks={ticks_total} decodes={decodes} decode_ms_total={decode_ms_total} wall_s={wall_s:.0} duty_pct={duty_pct:.1}",
+            u8::from(gate)
+        );
+    }
+
     /// T0.3 — env-driven A/B harness: decode the SAME WAV through TWO models at BOTH profiles
     /// and print wall-clock per leg + write each transcript to a temp file for diffing. The
     /// instrument behind every speed/Polish-quality claim of the 2026-07-09 transcription plan
