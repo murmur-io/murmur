@@ -1559,6 +1559,7 @@ mod tests {
             allow_writes: false,
             note_drafts: true,
             scope: crate::tools::AssistantScope::Full,
+            seal: None,
             proposed_note: std::sync::Mutex::new(None),
         };
 

@@ -370,23 +370,42 @@ fn reconcile_locked_at_rest(db: &Db) {
         let _ = std::fs::remove_file(p);
     }
     // 2026-07-10 audit F2 (filesystem half): a session unlock re-exports each authored note's vault
-    // `.md`; a crash while unlocked leaves that plaintext on disk. Delete the recorded files, THEN
-    // clear the column (delete-then-clear: a crash between the two keeps the path recorded so the
-    // next startup retries). Mirrors the clean-relock cleanup in `reblank_folder_extras`. Count-only
-    // log — never paths (they embed note titles).
+    // `.md`; a crash while unlocked leaves that plaintext on disk. PER ROW (residual W5): delete the
+    // recorded file, and clear THAT note's `exported_path` only when the delete succeeded or the
+    // file is already absent — a FAILED delete keeps the path recorded so the next startup retries
+    // (the pre-fix bulk clear forgot the leaked `.md` forever). Count-only log — never paths (they
+    // embed note titles).
     if !note_md_exports.is_empty() {
-        for p in &note_md_exports {
-            let _ = std::fs::remove_file(p);
+        let mut cleared: usize = 0;
+        let mut kept: usize = 0;
+        for (doc_id, p) in &note_md_exports {
+            let removed = match std::fs::remove_file(p) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "state",
+                        error = %e,
+                        "startup reconciliation: deleting a re-exported note .md failed — keeping exported_path for retry"
+                    );
+                    false
+                }
+            };
+            if removed {
+                match db.set_note_doc_exported_path(doc_id, None) {
+                    Ok(()) => cleared += 1,
+                    Err(e) => tracing::warn!(target: "state", error = %e, "startup reconciliation: clearing a note exported_path failed"),
+                }
+            } else {
+                kept += 1;
+            }
         }
-        if let Err(e) = db.clear_note_exported_paths_in_locked_folders() {
-            tracing::warn!(target: "state", error = %e, "startup reconciliation: clearing locked note exported_path failed");
-        } else {
-            tracing::warn!(
-                target: "state",
-                count = note_md_exports.len(),
-                "startup reconciliation: removed re-exported plaintext note .md files left by a crash while unlocked"
-            );
-        }
+        tracing::warn!(
+            target: "state",
+            cleared,
+            kept,
+            "startup reconciliation: reconciled re-exported plaintext note .md files left by a crash while unlocked"
+        );
     }
     for row in rows {
         let crate::storage::LockedMeetingAudio {
@@ -581,6 +600,66 @@ mod tests {
             db.note_exported_paths_in_folder("f1").unwrap().is_empty(),
             "startup reconcile must clear documents.exported_path for the locked folder"
         );
+    }
+
+    /// Residual W5 (RED-before-GREEN, startup half): when the reconcile FAILS to delete a
+    /// re-exported note `.md`, that note's `exported_path` must be KEPT so the next startup pass
+    /// retries — before the fix the bulk clear NULLed every locked-folder path regardless,
+    /// forgetting the leaked plaintext `.md` forever. A deletable sibling is still cleaned +
+    /// cleared normally.
+    #[test]
+    fn reconcile_keeps_exported_path_when_md_delete_fails() {
+        use crate::storage::models::Folder;
+        let db = Db::open_with_key(&tmp_path("note-md-keep-path"), GOOD_KEY).unwrap();
+        db.insert_folder(&Folder {
+            id: "f1".to_string(),
+            name: "Secret".to_string(),
+            path: "Notes/Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-10T08:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_note("n-keep", "f1", "undeletable", "Undeletable", "", 1)
+            .unwrap();
+        db.insert_note("n-gone", "f1", "deletable", "Deletable", "", 1)
+            .unwrap();
+
+        // A DIRECTORY at the recorded path makes `remove_file` fail with a non-NotFound error —
+        // the undeletable-crash shape; a plain file is the normal deletable shape.
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-reconcile-undeletable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("deletable.md");
+        std::fs::write(&file, "# re-exported plaintext").unwrap();
+        db.set_note_doc_exported_path("n-keep", Some(dir.to_str().unwrap()))
+            .unwrap();
+        db.set_note_doc_exported_path("n-gone", Some(file.to_str().unwrap()))
+            .unwrap();
+        db.set_folder_locked("f1", true, None).unwrap();
+
+        reconcile_locked_at_rest(&db);
+
+        let keep_row = db.get_note_row("n-keep").unwrap().unwrap();
+        assert_eq!(
+            keep_row.exported_path.as_deref(),
+            dir.to_str(),
+            "a FAILED .md delete must keep exported_path recorded for the next startup retry"
+        );
+        let gone_row = db.get_note_row("n-gone").unwrap().unwrap();
+        assert!(
+            gone_row.exported_path.is_none(),
+            "a successful .md delete clears exported_path"
+        );
+        assert!(!file.exists(), "the deletable .md is removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// B4 sweep: a PLAINTEXT `*.pre-encrypt.bak` (the live at-rest leak older builds wrote) is
