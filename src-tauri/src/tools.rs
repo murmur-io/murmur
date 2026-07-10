@@ -864,6 +864,17 @@ fn format_hits_and_docs(
 /// decides the user asked for a NOTE (vs a plain answer), it calls `propose_note(content)`, which
 /// records the draft HERE (no DB write). The caller (`run_informational`) reads it after the loop and
 /// threads it onto the result so the FE can offer "Add to notes" — the user commits on Accept.
+/// SEAL ACCESS for the executor's ONE content write (`save_note`, residual W1): the two `AppState`
+/// handles the manual-notes seal-on-write seam needs — the session master-KEK mutex (unwrap the
+/// folder CK; fail-closed `AppError::Locked` when it is zeroized) and the BLK-1 lifecycle mutex
+/// (hold it across gate+write so a relock cannot interleave between the visibility check and the
+/// write). Deliberately NARROW: the executor never gets the whole `AppState`. Built `None` only by
+/// headless tests; every production construction passes the live handles.
+pub struct SealAccess<'a> {
+    pub master_kek: &'a std::sync::Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
+    pub lifecycle: &'a std::sync::Mutex<()>,
+}
+
 pub struct GatedToolExecutor<'a> {
     pub db: &'a Db,
     pub unlocked: &'a std::sync::Mutex<HashSet<String>>,
@@ -871,6 +882,10 @@ pub struct GatedToolExecutor<'a> {
     pub meeting_id: &'a str,
     pub app: Option<&'a tauri::AppHandle>,
     pub allow_writes: bool,
+    /// Seal-on-write handles for `save_note` (residual W1). `None` (headless tests without an
+    /// `AppState`) FAIL-CLOSES a locked-folder write with `AppError::Locked` — never plaintext
+    /// behind a lock; open/rootless meetings write plainly either way.
+    pub seal: Option<SealAccess<'a>>,
     /// Advertise the DB-free `propose_note` DRAFT tool on this surface. TRUE for the in-meeting
     /// surfaces (they have a notes flow + an "Add to notes" Accept affordance); FALSE for surfaces
     /// with no notes flow (the vault-wide Ask page), where a drafted note could never be accepted.
@@ -1065,7 +1080,7 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             "propose_note" => self.propose_note(&s("content")),
             // ── WRITE tools (advertised only when `allow_writes`; the allowlist check above already
             //    refused them otherwise). Each is GATED to a VISIBLE/unlocked meeting before it mutates.
-            "save_note" => self.save_note(&s("text"), &unlocked),
+            "save_note" => self.save_note(&s("text")),
             "create_reminder" => {
                 let due = args
                     .get("due")
@@ -1101,11 +1116,20 @@ impl GatedToolExecutor<'_> {
 
     /// WRITE — append the agent's note to the CURRENT meeting's durable typed-notes buffer
     /// (`meetings.manual_notes`, Feature A): the sealed-and-restored, folds-into-the-note home. Read
-    /// the existing buffer, append the new line, and write it back — a non-destructive append (the
-    /// folder seal lifecycle still owns verify-before-destroy; this only ever GROWS plaintext for a
-    /// VISIBLE meeting). GATED: refuses (`AppError::Locked`) when there is no live meeting or the
-    /// meeting is sealed-not-unlocked, so the agent can never resurrect/write plaintext behind a lock.
-    fn save_note(&self, text: &str, unlocked: &HashSet<String>) -> Result<String> {
+    /// the existing buffer, append the new line, and write it back — a non-destructive append (this
+    /// only ever GROWS plaintext for a VISIBLE meeting). GATED: refuses (`AppError::Locked`) when
+    /// there is no live meeting or the meeting is sealed-not-unlocked, so the agent can never
+    /// resurrect/write plaintext behind a lock.
+    ///
+    /// SEAL-ON-WRITE (residual W1): the write routes through the SAME
+    /// [`crate::commands::set_manual_notes_reseal_with`] seam the `save_manual_notes` command uses —
+    /// a meeting in a session-unlocked LOCKED folder gets its fresh buffer re-sealed into
+    /// `manual_notes_blob` in the same write (the pre-fix plain write was DESTROYED at the next
+    /// relock by the stale blob restore; with no blob it survived plaintext-at-rest behind the
+    /// lock). FAIL-CLOSED: no [`SealAccess`] / no cached KEK ⇒ `AppError::Locked`. The
+    /// gate + read + write run under the BLK-1 lifecycle guard (when available) with the unlocked
+    /// set RE-READ inside it, so a relock cannot interleave between the check and the write.
+    fn save_note(&self, text: &str) -> Result<String> {
         let text = text.trim();
         if text.is_empty() {
             return Err(AppError::InvalidArg("nothing to note".into()));
@@ -1116,9 +1140,23 @@ impl GatedToolExecutor<'_> {
                 "no meeting is being recorded — there is nothing to attach the note to".into(),
             ));
         }
-        // GATE: write ONLY to a meeting the live session can see. The in-progress recording has no
-        // note row yet → trivially visible; a sealed-not-unlocked meeting is refused, never written.
-        if !self.db.meeting_is_visible(meeting_id, unlocked)? {
+        // BLK-1 (when the handles are present): hold the lifecycle guard across gate+read+write. A
+        // poisoned `()` guard carries no invalid state — recover via `into_inner` like
+        // `commands::lifecycle_guard`.
+        let _lifecycle = self.seal.as_ref().map(|s| {
+            s.lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        // GATE: write ONLY to a meeting the live session can see, on the unlocked set RE-READ under
+        // the guard (never the loop-start snapshot). The in-progress recording has no note row yet
+        // → trivially visible; a sealed-not-unlocked meeting is refused, never written.
+        let unlocked = self
+            .unlocked
+            .lock()
+            .map_err(|_| AppError::Other(anyhow::anyhow!("unlocked set mutex poisoned")))?
+            .clone();
+        if !self.db.meeting_is_visible(meeting_id, &unlocked)? {
             return Err(AppError::Locked(
                 "this meeting is locked — unlock it to save a note".into(),
             ));
@@ -1131,7 +1169,12 @@ impl GatedToolExecutor<'_> {
         } else {
             format!("{existing}\n{text}")
         };
-        self.db.set_manual_notes(meeting_id, &merged)?;
+        crate::commands::set_manual_notes_reseal_with(
+            self.db,
+            self.seal.as_ref().map(|s| s.master_kek),
+            meeting_id,
+            &merged,
+        )?;
         // PII rule: log the meeting id + new-buffer length only — never the note text.
         tracing::debug!(target: "agent", meeting_id = %meeting_id, len = merged.len(), "agent saved a note to manual_notes");
         Ok("Saved a note to this meeting.".to_string())
@@ -1471,6 +1514,7 @@ mod tests {
             allow_writes: true,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         let names_specs = writeable.specs();
@@ -1498,6 +1542,7 @@ mod tests {
             allow_writes: false,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         let ro_names_specs = readonly.specs();
@@ -1534,6 +1579,7 @@ mod tests {
             allow_writes: true,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
 
@@ -1597,6 +1643,7 @@ mod tests {
             allow_writes: true,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "secret note" }));
@@ -1628,6 +1675,7 @@ mod tests {
             allow_writes: true,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("save_note", &serde_json::json!({ "text": "orphan note" }));
@@ -1654,6 +1702,7 @@ mod tests {
             allow_writes: false, // read-only — write tools not advertised
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run(
@@ -1689,6 +1738,7 @@ mod tests {
                 allow_writes,
                 note_drafts: true,
                 scope: AssistantScope::Full,
+                seal: None,
                 proposed_note: Mutex::new(None),
             };
             let names_specs = exec.specs();
@@ -1727,6 +1777,7 @@ mod tests {
             allow_writes: false, // propose works even read-only
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
 
@@ -1782,6 +1833,7 @@ mod tests {
             allow_writes: false,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         // A plain read tool (the kind a question would use) does NOT set a proposal.
@@ -1813,6 +1865,7 @@ mod tests {
             allow_writes: false,
             note_drafts: true,
             scope: AssistantScope::Full,
+            seal: None,
             proposed_note: Mutex::new(None),
         };
         let res = exec.run("propose_note", &serde_json::json!({ "content": "   " }));
@@ -1850,6 +1903,7 @@ mod tests {
             allow_writes: false,
             note_drafts: true,
             scope,
+            seal: None,
             proposed_note: Mutex::new(None),
         }
     }
