@@ -63,6 +63,30 @@ pub fn escalation_entry(connection: &str, from_tier: u8, to_tier: u8) -> EgressE
     }
 }
 
+/// Brain v2 L5 (lock-security WEAKNESS fix, 2026-07-10) — the CONTENT-FREE ledger row for an
+/// MCP-server CONNECTION TEST (`test_mcp_server`: JSON-RPC `initialize` + `tools/list`). The probe
+/// egresses NO user content (only the protocol handshake), but it IS egress to the external server
+/// — for a stdio server it LAUNCHES the configured binary — so the privacy receipt must show the
+/// attempt, exactly like every connector search. `provider_id` is the per-server truthful
+/// attribution (`mcp_<server_id>`, the SAME id the connector's search rows carry via
+/// [`crate::connectors::mcp::connector_id`]); a distinct `call_kind` (`"mcp_probe"`, mirroring
+/// jira's `"connector_lookup"` split from `"connector_search"`) so a test connection is never
+/// mistaken for a query. Zero byte sizes / counts by construction. Pure, so it is unit-testable
+/// without touching the global sink (mirrors [`escalation_entry`]).
+pub fn mcp_probe_entry(server_id: &str) -> EgressEntry {
+    EgressEntry {
+        provider_id: crate::connectors::mcp::connector_id(server_id),
+        destination: "MCP server (connection test)".to_string(),
+        model_requested: String::new(),
+        call_kind: "mcp_probe",
+        meta: CallMeta::default(),
+        redactions: RedactionCounts::default(),
+        system_bytes: 0,
+        user_bytes: 0,
+        meeting_id: None,
+    }
+}
+
 /// Receiver for egress audit entries. Implementations MUST be `Send + Sync` and MUST NOT panic
 /// on error (a logging failure must never break summarization).
 pub trait EgressSink: Send + Sync {
@@ -170,6 +194,30 @@ mod tests {
     fn active_sink_never_panics() {
         let sink = active_sink();
         sink.record(sample_entry()); // must not panic regardless of which sink is active
+    }
+
+    /// Brain v2 L5 — the MCP connection-test ledger row is CONTENT-FREE by construction and
+    /// attributed PER SERVER (`mcp_<server_id>` — the same provider_id the connector's search
+    /// rows carry), with the distinct `"mcp_probe"` kind so a test connection never reads as a
+    /// query in the privacy receipt.
+    #[test]
+    fn mcp_probe_entry_is_content_free_and_attributed_per_server() {
+        let e = mcp_probe_entry("abc123");
+        assert_eq!(e.provider_id, "mcp_abc123");
+        assert_eq!(
+            e.provider_id,
+            crate::connectors::mcp::connector_id("abc123"),
+            "the probe row and the connector's search rows share one per-server attribution"
+        );
+        assert_eq!(e.call_kind, "mcp_probe");
+        assert_eq!(e.destination, "MCP server (connection test)");
+        assert_eq!(e.model_requested, "");
+        assert_eq!(e.system_bytes, 0);
+        assert_eq!(e.user_bytes, 0);
+        assert!(e.meeting_id.is_none());
+        // Content-free by construction: only the server id enters, and only as an id.
+        let dbg = format!("{e:?}");
+        assert!(!dbg.contains("http"), "no endpoint/server strings in the row: {dbg}");
     }
 
     /// Brain v2 L3 — the escalation ledger row is CONTENT-FREE by construction: `call_kind`

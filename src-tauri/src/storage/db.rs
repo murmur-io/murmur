@@ -564,6 +564,10 @@ impl Db {
         Self::migrate_user_facts_fts(&conn)?;
         // Brain v2 L2.1 — memory consolidation tables (see `crate::memory`). Additive + guarded.
         Self::migrate_memory(&conn)?;
+        // Brain v2 L5 — scheduled-brief tables (see `crate::brief_runner`) + the MCP-server config
+        // table (see `crate::connectors::mcp`). Additive + guarded so migrate() stays idempotent.
+        Self::migrate_briefs(&conn)?;
+        Self::migrate_mcp_servers(&conn)?;
         // Phase 2a — vector retrieval layer (note_chunks + the vec0 KNN table). Additive + guarded
         // (CREATE TABLE / CREATE VIRTUAL TABLE IF NOT EXISTS) so migrate() stays idempotent.
         Self::migrate_vector(&conn)?;
@@ -1217,6 +1221,67 @@ impl Db {
         Self::add_column_if_missing(conn, "memory_rollups", "fact_set_hash", "TEXT")?;
         Self::add_column_if_missing(conn, "facts", "importance", "REAL")?;
         Ok(())
+    }
+
+    /// Brain v2 L5 — idempotent SCHEDULED-BRIEF schema. `brief_schedules` = the user's structured
+    /// local-time schedules (config data only); `brief_runs` = the propose-accept staging rows.
+    /// Lock posture (documented, audited by the lock-security review): `brief_runs.note_md` is
+    /// synthesized by `crate::brief_runner` from VISIBLE-ONLY content — the runner reads with the
+    /// EMPTY unlock set (the consolidation-job discipline), so sealed content can never enter a
+    /// brief AT synthesis time. But `note_md` IS derived meeting content (a cross-meeting
+    /// synthesis — the memory-rollup class, one layer removed): a folder locked AFTER a brief was
+    /// proposed would leave that paraphrase readable, so every seal path
+    /// (`purge_chunks_for_meetings` / `blank_sealed_notes_in_folders` /
+    /// `reblank_locked_folders_at_rest`) AND `delete_meeting` purges PENDING rows whose
+    /// `meeting_ids` (a JSON id array) intersect the sealed/deleted meetings
+    /// (`purge_pending_brief_runs_tx`). ACCEPTED rows are consumed on accept (`note_md` blanked —
+    /// ids + timestamps only) and survive.
+    fn migrate_briefs(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS brief_schedules (
+               id TEXT PRIMARY KEY,
+               label TEXT NOT NULL,
+               day_of_week INTEGER,
+               hour_local INTEGER NOT NULL,
+               minute_local INTEGER NOT NULL,
+               scope_days INTEGER NOT NULL DEFAULT 7,
+               prompt_hint TEXT,
+               enabled INTEGER NOT NULL DEFAULT 1,
+               last_run_at TEXT,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS brief_runs (
+               id TEXT PRIMARY KEY,
+               schedule_id TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               note_md TEXT NOT NULL DEFAULT '',
+               meeting_ids TEXT NOT NULL DEFAULT '[]',
+               proposed_at TEXT NOT NULL,
+               accepted_at TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_brief_runs_schedule ON brief_runs(schedule_id);",
+        )
+        .map_err(map_err)
+    }
+
+    /// Brain v2 L5 — idempotent MCP-SERVER config schema. One row per user-configured external MCP
+    /// server: transport + endpoint + args + the ENABLED and per-server CONSENTED flags (consent
+    /// default 0 — fail-closed; flipped only by the dedicated consent commands). Connection config
+    /// only — never query text or results.
+    fn migrate_mcp_servers(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_servers (
+               id TEXT PRIMARY KEY,
+               label TEXT NOT NULL,
+               transport TEXT NOT NULL,
+               endpoint TEXT NOT NULL,
+               args TEXT NOT NULL DEFAULT '[]',
+               enabled INTEGER NOT NULL DEFAULT 1,
+               consented INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL
+             );",
+        )
+        .map_err(map_err)
     }
 
     /// Add `column` to `table` if it is not already present (idempotent migration guard).
@@ -2077,6 +2142,10 @@ impl Db {
         // same tx (their `memory_scores` rows cascade off the user_facts FK). This also makes
         // "delete the synthetic Memory Import meeting ⇒ the import is undone" structural.
         Self::purge_user_facts_tx(&tx, &[id.to_string()])?;
+        // Brain v2 L5: purge any PENDING scheduled-brief row referencing this meeting in the same
+        // tx — its `note_md` paraphrases the deleted meeting's note (accepted rows were consumed
+        // on accept and keep only ids + timestamps).
+        Self::purge_pending_brief_runs_tx(&tx, &[id.to_string()])?;
         // Brain v2 L2.1: purge ALL memory rollups in this same tx — a rollup may paraphrase the
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
@@ -2699,6 +2768,11 @@ impl Db {
         // sealed note content and returns (with the stamp) on unlock/remove-lock; only the undo
         // scratch is dropped.
         Self::purge_supersessions_tx(&tx, meeting_ids)?;
+        // Brain v2 L5 LOCK-SAFETY: a PENDING scheduled-brief row (`brief_runs.note_md`) is a
+        // cross-meeting synthesis of the referenced meetings' notes — purge any pending run
+        // referencing a just-sealed meeting in this SAME seal tx (accepted rows were consumed on
+        // accept and carry no content). Same purge-on-seal contract as the rollups below.
+        Self::purge_pending_brief_runs_tx(&tx, meeting_ids)?;
         // Brain v2 L2.1 LOCK-SAFETY: memory ROLLUPS are cross-meeting synthesis that may paraphrase
         // the just-sealed facts — purge ALL of them in this SAME seal tx (cheap, re-derivable: the
         // next hourly pass regenerates from the still-VISIBLE facts only). The caller deletes the
@@ -2728,6 +2802,34 @@ impl Db {
         drop(stmt);
         tx.execute("DELETE FROM memory_rollups", []).map_err(map_err)?;
         Ok(paths)
+    }
+
+    /// Brain v2 L5 LOCK-SAFETY (lock-security LEAK fix, 2026-07-10): delete every PENDING
+    /// `brief_runs` row whose `meeting_ids` references any of `meeting_ids`, within an EXISTING
+    /// transaction. A pending brief's `note_md` is a cross-meeting SYNTHESIS of the referenced
+    /// meetings' notes — the same derived-plaintext class as memory rollups, one layer removed —
+    /// so it must not survive the seal (or deletion) of any source meeting: un-purged it stays
+    /// readable via `list_brief_runs` and exportable via `accept_brief`, outside every gate.
+    /// ACCEPTED rows are left alone: their `note_md` was CONSUMED on accept (blanked — the
+    /// exported vault `.md` became the copy), so the row holds only ids + timestamps.
+    ///
+    /// Matching (documented choice): `meeting_ids` is a JSON TEXT array of quote-delimited UUID
+    /// strings, so the per-id `LIKE '%"<id>"%'` intersection is exact — a UUID (hex + hyphens,
+    /// no `%`/`_`/`"`) can never partially match inside another quoted id. Simpler than parsing
+    /// the JSON in Rust and it stays a pure per-id statement inside the caller's seal tx.
+    fn purge_pending_brief_runs_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM brief_runs WHERE status = 'pending' \
+                   AND meeting_ids LIKE '%\"' || ?1 || '\"%'",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
     }
 
     /// brain2 R2 LOCK-SAFETY: delete every `facts` row for `meeting_ids` within an EXISTING
@@ -4577,6 +4679,9 @@ impl Db {
             )
             .map_err(map_err)?;
         }
+        // (Deliberate, mirrors `memory_rollups`: PENDING `brief_runs` are NOT purged on discard —
+        // discard returns every source meeting to OPEN plaintext, so a pending brief over now-open
+        // content is not a leak. Every SEAL path purges them: `purge_pending_brief_runs_tx`.)
 
         // Documents anchored on this folder: drop sealed ciphertext + plaintext + their chunks/vectors.
         tx.execute(
@@ -4895,6 +5000,12 @@ impl Db {
             // it here (unconditionally, with no CK to re-seal) would destroy the only copy of a
             // typed buffer that had not yet been sealed — the verify-before-destroy violation.
 
+            // Brain v2 L5 LOCK-SAFETY: purge any PENDING scheduled-brief row referencing a meeting
+            // in these (re-blanked / sealed) folders in this SAME tx — a pending brief's `note_md`
+            // paraphrases the sealed notes (accepted rows were consumed on accept). Same
+            // purge-on-seal contract as the rollups below.
+            Self::purge_pending_brief_runs_tx(&tx, &meeting_ids)?;
+
             // Brain v2 L2.1 LOCK-SAFETY: purge ALL memory rollups in this SAME relock tx — a rollup
             // may paraphrase the just-re-sealed facts. Cheap re-derivable synthesis; regenerates
             // from VISIBLE facts on the next hourly pass. The caller deletes the exported `.md`s.
@@ -5043,6 +5154,21 @@ impl Db {
                 "DELETE FROM supersessions \
                    WHERE source_meeting_id IN ({LOCKED_MEETINGS}) \
                       OR superseding_meeting_id IN ({LOCKED_MEETINGS})"
+            ),
+            [],
+        )
+        .map_err(map_err)?;
+        // Brain v2 L5 LOCK-SAFETY: purge every PENDING scheduled-brief row referencing a meeting in
+        // a locked folder, in this same reconciliation transaction — a pending brief's `note_md` is
+        // cross-meeting synthesis of the referenced notes and must not survive a restart while a
+        // source folder is sealed (accepted rows were consumed on accept — ids + timestamps only).
+        // `meeting_ids` is a JSON TEXT array of quote-delimited UUIDs, so the per-id LIKE
+        // intersection is exact (see `purge_pending_brief_runs_tx`).
+        tx.execute(
+            &format!(
+                "DELETE FROM brief_runs WHERE status = 'pending' AND EXISTS (\
+                   SELECT 1 FROM ({LOCKED_MEETINGS}) lm \
+                    WHERE brief_runs.meeting_ids LIKE '%\"' || lm.meeting_id || '\"%')"
             ),
             [],
         )
@@ -7291,6 +7417,244 @@ impl Db {
         Ok(out)
     }
 
+    // ── Brain v2 L5 — scheduled briefs (config + propose-accept staging) ────────────────────────
+
+    /// All brief schedules (config rows — no meeting content).
+    pub fn list_brief_schedules(&self) -> Result<Vec<crate::storage::models::BriefSchedule>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, label, day_of_week, hour_local, minute_local, scope_days, \
+                        prompt_hint, enabled, last_run_at, created_at \
+                   FROM brief_schedules ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_brief_schedule).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Insert one brief schedule (caller validates ranges — see `create_brief_schedule`).
+    pub fn insert_brief_schedule(&self, s: &crate::storage::models::BriefSchedule) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO brief_schedules \
+               (id, label, day_of_week, hour_local, minute_local, scope_days, prompt_hint, \
+                enabled, last_run_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                s.id,
+                s.label,
+                s.day_of_week,
+                s.hour_local,
+                s.minute_local,
+                s.scope_days,
+                s.prompt_hint,
+                s.enabled as i64,
+                s.last_run_at,
+                s.created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Update one brief schedule's editable fields (label / timing / window / hint / enabled).
+    /// `last_run_at` / `created_at` are runner/system-owned and never updated here.
+    pub fn update_brief_schedule(&self, s: &crate::storage::models::BriefSchedule) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE brief_schedules SET label = ?2, day_of_week = ?3, hour_local = ?4, \
+                    minute_local = ?5, scope_days = ?6, prompt_hint = ?7, enabled = ?8 \
+              WHERE id = ?1",
+            rusqlite::params![
+                s.id,
+                s.label,
+                s.day_of_week,
+                s.hour_local,
+                s.minute_local,
+                s.scope_days,
+                s.prompt_hint,
+                s.enabled as i64,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete one brief schedule AND its staged runs (a dangling pending run would render a card
+    /// for a schedule that no longer exists).
+    pub fn delete_brief_schedule(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM brief_runs WHERE schedule_id = ?1", [id])
+            .map_err(map_err)?;
+        conn.execute("DELETE FROM brief_schedules WHERE id = ?1", [id])
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Stamp the once-per-local-day guard: `last_run_at` = the LOCAL date (`YYYY-MM-DD`).
+    pub fn set_brief_schedule_last_run(&self, id: &str, local_date: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE brief_schedules SET last_run_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, local_date],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Insert one proposed brief run (status "pending"). `meeting_ids` serializes to a JSON array
+    /// of opaque ids.
+    pub fn insert_brief_run(&self, r: &crate::storage::models::BriefRun) -> Result<()> {
+        let ids = serde_json::to_string(&r.meeting_ids)
+            .map_err(|e| AppError::Storage(format!("meeting_ids serialize: {e}")))?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO brief_runs (id, schedule_id, status, note_md, meeting_ids, proposed_at, accepted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                r.id,
+                r.schedule_id,
+                r.status,
+                r.note_md,
+                ids,
+                r.proposed_at,
+                r.accepted_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The PENDING (not yet accepted/dismissed) brief runs, newest first — the FE's proposal cards.
+    pub fn list_pending_brief_runs(&self) -> Result<Vec<crate::storage::models::BriefRun>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, schedule_id, status, note_md, meeting_ids, proposed_at, accepted_at \
+                   FROM brief_runs WHERE status = 'pending' ORDER BY proposed_at DESC, id DESC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_brief_run).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// One brief run by id.
+    pub fn get_brief_run(&self, id: &str) -> Result<Option<crate::storage::models::BriefRun>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, schedule_id, status, note_md, meeting_ids, proposed_at, accepted_at \
+               FROM brief_runs WHERE id = ?1",
+            [id],
+            row_to_brief_run,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Mark a run ACCEPTED and CONSUME its markdown (the exported vault `.md` becomes the copy —
+    /// the staging row keeps only ids + timestamps afterwards).
+    pub fn accept_brief_run(&self, id: &str, accepted_at: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE brief_runs SET status = 'accepted', accepted_at = ?2, note_md = '' \
+              WHERE id = ?1",
+            rusqlite::params![id, accepted_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Dismiss = DELETE the staged run row (nothing is kept).
+    pub fn delete_brief_run(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM brief_runs WHERE id = ?1", [id])
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    // ── Brain v2 L5 — MCP server config rows ────────────────────────────────────────────────────
+
+    /// All configured MCP servers (connection config only — never query text or results).
+    pub fn list_mcp_servers(&self) -> Result<Vec<crate::storage::models::McpServer>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, label, transport, endpoint, args, enabled, consented, created_at \
+                   FROM mcp_servers ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_mcp_server).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// One MCP server by id.
+    pub fn get_mcp_server(&self, id: &str) -> Result<Option<crate::storage::models::McpServer>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, label, transport, endpoint, args, enabled, consented, created_at \
+               FROM mcp_servers WHERE id = ?1",
+            [id],
+            row_to_mcp_server,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Insert one MCP server row (caller validates transport/endpoint — see `add_mcp_server`).
+    pub fn insert_mcp_server(&self, s: &crate::storage::models::McpServer) -> Result<()> {
+        let args = serde_json::to_string(&s.args)
+            .map_err(|e| AppError::Storage(format!("mcp args serialize: {e}")))?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO mcp_servers (id, label, transport, endpoint, args, enabled, consented, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                s.id,
+                s.label,
+                s.transport,
+                s.endpoint,
+                args,
+                s.enabled as i64,
+                s.consented as i64,
+                s.created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Remove one MCP server row (revokes its tool exposure on the next registry/spec build).
+    pub fn delete_mcp_server(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM mcp_servers WHERE id = ?1", [id])
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Flip one MCP server's per-server egress consent (the ONLY writer of `consented`).
+    pub fn set_mcp_server_consented(&self, id: &str, consented: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE mcp_servers SET consented = ?2 WHERE id = ?1",
+            rusqlite::params![id, consented as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Persist ONE voiceprint (opt-in voice biometric) for a diarized cluster of `meeting_id`.
     /// `embedding` is the L2-normalized CAM++ vector; it is stored as a little-endian f32 BLOB.
     /// `label` is NULL initially (bound later on enroll-by-rename). NO PII is logged (the embedding,
@@ -7677,6 +8041,58 @@ fn row_to_user_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
         recorded_at: row.get(6)?,
         meeting_id: row.get(7)?,
         confidence: row.get(8)?,
+    })
+}
+
+/// Map a `brief_schedules` row (id, label, day_of_week, hour_local, minute_local, scope_days,
+/// prompt_hint, enabled, last_run_at, created_at) to a [`crate::storage::models::BriefSchedule`].
+fn row_to_brief_schedule(
+    row: &Row<'_>,
+) -> rusqlite::Result<crate::storage::models::BriefSchedule> {
+    Ok(crate::storage::models::BriefSchedule {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        day_of_week: row.get(2)?,
+        hour_local: row.get(3)?,
+        minute_local: row.get(4)?,
+        scope_days: row.get(5)?,
+        prompt_hint: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? != 0,
+        last_run_at: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+/// Map a `brief_runs` row (id, schedule_id, status, note_md, meeting_ids JSON, proposed_at,
+/// accepted_at) to a [`crate::storage::models::BriefRun`]. A malformed `meeting_ids` JSON degrades
+/// to an empty id list (ids are advisory provenance, never content).
+fn row_to_brief_run(row: &Row<'_>) -> rusqlite::Result<crate::storage::models::BriefRun> {
+    let ids_json: String = row.get(4)?;
+    Ok(crate::storage::models::BriefRun {
+        id: row.get(0)?,
+        schedule_id: row.get(1)?,
+        status: row.get(2)?,
+        note_md: row.get(3)?,
+        meeting_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
+        proposed_at: row.get(5)?,
+        accepted_at: row.get(6)?,
+    })
+}
+
+/// Map an `mcp_servers` row (id, label, transport, endpoint, args JSON, enabled, consented,
+/// created_at) to a [`crate::storage::models::McpServer`]. Malformed `args` JSON degrades to no
+/// args (fail-quiet on config, never a crash).
+fn row_to_mcp_server(row: &Row<'_>) -> rusqlite::Result<crate::storage::models::McpServer> {
+    let args_json: String = row.get(4)?;
+    Ok(crate::storage::models::McpServer {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        transport: row.get(2)?,
+        endpoint: row.get(3)?,
+        args: serde_json::from_str(&args_json).unwrap_or_default(),
+        enabled: row.get::<_, i64>(5)? != 0,
+        consented: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
     })
 }
 
@@ -9057,6 +9473,121 @@ mod tests {
             None,
             "discard_folder_seal must purge the live-bullets row like every other derived table"
         );
+    }
+
+    // ── Brain v2 L5 — PENDING `brief_runs` purge-on-seal (lock-security LEAK fix, 2026-07-10) ────
+
+    /// Seed one `brief_runs` row directly. `note_md` carries a RECOGNIZABLE marker so the leak
+    /// asserts can prove the synthesized content is gone, not just a row id.
+    fn seed_brief_run(db: &Db, id: &str, status: &str, note_md: &str, meeting_ids: &[&str]) {
+        db.insert_brief_run(&crate::storage::models::BriefRun {
+            id: id.to_string(),
+            schedule_id: "sched1".to_string(),
+            status: status.to_string(),
+            note_md: note_md.to_string(),
+            meeting_ids: meeting_ids.iter().map(|s| s.to_string()).collect(),
+            proposed_at: "2026-07-10T09:00:00Z".to_string(),
+            accepted_at: None,
+        })
+        .unwrap();
+    }
+
+    /// Every `brief_runs` (id, note_md) AT REST — the raw table, not the pending-only listing, so
+    /// a test asserts what actually survives a seal.
+    fn brief_rows_at_rest(db: &Db) -> Vec<(String, String)> {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, note_md FROM brief_runs ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Seed the leak shape: meeting `m1` (in `f-locked`) + open meeting `m2`; a PENDING run whose
+    /// synthesis references the soon-sealed `m1`, a PENDING run over only `m2`, and an ACCEPTED
+    /// (consumed — `note_md` blanked on accept) run referencing `m1`.
+    fn seed_brief_leak_shape(db: &Db) {
+        seed_folder(db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        db.insert_meeting(&sample_meeting("m2", "2026-07-10T11:00:00Z"))
+            .unwrap();
+        seed_brief_run(db, "r-leak", "pending", "SYNTH-LEAK pricing agreed", &["m1", "m2"]);
+        seed_brief_run(db, "r-other", "pending", "other-scope synthesis", &["m2"]);
+        seed_brief_run(db, "r-done", "accepted", "", &["m1"]);
+    }
+
+    /// Assert the post-seal shape: the intersecting PENDING run (and its synthesized content) is
+    /// GONE; the unrelated pending run and the accepted (consumed) run SURVIVE.
+    fn assert_brief_leak_purged(db: &Db) {
+        let rows = brief_rows_at_rest(db);
+        assert!(
+            !rows.iter().any(|(id, _)| id == "r-leak"),
+            "the pending run referencing the sealed meeting must be purged: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, md)| md.contains("SYNTH-LEAK")),
+            "no synthesized content survives the seal: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(id, _)| id == "r-other"),
+            "a pending run over other meetings survives: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(id, _)| id == "r-done"),
+            "an accepted (consumed) run survives: {rows:?}"
+        );
+    }
+
+    /// PURGE-ON-SEAL (RED-before-GREEN, the reproduced L5 leak): a PENDING brief run whose
+    /// `meeting_ids` references a just-sealed meeting paraphrases that meeting's note — the seal
+    /// tx (`purge_chunks_for_meetings`, which `lock_folder` runs) must delete it, exactly like the
+    /// memory rollups it mirrors.
+    #[test]
+    fn pending_brief_runs_purged_on_seal_accepted_and_unrelated_survive() {
+        let db = mem_db();
+        seed_brief_leak_shape(&db);
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert_brief_leak_purged(&db);
+    }
+
+    /// PURGE-ON-RELOCK: the relock re-blank tx (`blank_sealed_notes_in_folders`) drops the
+    /// intersecting pending run too — a brief proposed during a session-unlock must not keep its
+    /// synthesis at rest after relock.
+    #[test]
+    fn pending_brief_runs_purged_on_relock_reblank() {
+        let db = mem_db();
+        seed_brief_leak_shape(&db);
+        let mut folders = HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+        assert_brief_leak_purged(&db);
+    }
+
+    /// PURGE-AT-REST (startup reconcile): a crash after the 09:00 schedule staged a brief over a
+    /// since-locked folder leaves the row behind — `reblank_locked_folders_at_rest` must drop it
+    /// like every other derived-plaintext table.
+    #[test]
+    fn pending_brief_runs_purged_by_at_rest_reconcile() {
+        let db = mem_db();
+        seed_brief_leak_shape(&db);
+        db.set_folder_locked("f-locked", true, None).unwrap();
+        db.reblank_locked_folders_at_rest().unwrap();
+        assert_brief_leak_purged(&db);
+    }
+
+    /// PURGE-ON-DELETE: deleting a meeting drops any PENDING brief run referencing it (its
+    /// `note_md` paraphrases the deleted note); the accepted/unrelated rows survive.
+    #[test]
+    fn pending_brief_runs_purged_on_delete_meeting() {
+        let db = mem_db();
+        seed_brief_leak_shape(&db);
+        db.delete_meeting("m1").unwrap();
+        assert_brief_leak_purged(&db);
     }
 
     /// PURGE-ON-DELETE: deleting a meeting removes its live-bullets row (explicit purge + FK).

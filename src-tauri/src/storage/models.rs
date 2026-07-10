@@ -160,6 +160,74 @@ pub struct MemoryScore {
     pub scored_at: String,
 }
 
+/// Brain v2 L5 — one SCHEDULED-BRIEF definition (`brief_schedules`): a structured local-time
+/// schedule (NO cron syntax / crate), a lookback window, and an optional user prompt hint. The
+/// runner (`crate::brief_runner`) fires it at most ONCE per local day.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefSchedule {
+    pub id: String,
+    /// User-authored display label (e.g. "Monday kickoff"). Config data, not meeting content.
+    pub label: String,
+    /// ISO weekday the brief fires on: 0 = Monday … 6 = Sunday
+    /// (`chrono::Weekday::num_days_from_monday`). `None` = daily.
+    pub day_of_week: Option<i64>,
+    /// Local wall-clock hour (0–23) the brief becomes due.
+    pub hour_local: i64,
+    /// Local wall-clock minute (0–59) the brief becomes due.
+    pub minute_local: i64,
+    /// How many days back the brief's corpus window reaches (default 7).
+    pub scope_days: i64,
+    /// Optional user focus hint appended to the synthesis prompt (user-authored config).
+    pub prompt_hint: Option<String>,
+    pub enabled: bool,
+    /// The LOCAL date (`YYYY-MM-DD`) this schedule last ran — the once-per-day guard.
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+}
+
+/// Brain v2 L5 — one PROPOSED brief run (`brief_runs`, the propose-accept staging row). `note_md`
+/// is synthesized from VISIBLE-ONLY content (the runner reads with the EMPTY unlock set, like the
+/// memory consolidation job), so it cannot contain sealed content by construction; it is CONSUMED
+/// (blanked) on accept. `meeting_ids` are opaque ids only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefRun {
+    pub id: String,
+    pub schedule_id: String,
+    /// "pending" | "accepted" (dismissed rows are DELETED).
+    pub status: String,
+    /// The proposed brief markdown; blanked once accepted (the vault `.md` becomes the copy).
+    pub note_md: String,
+    /// The source meeting ids the corpus was built from (ids only — never content).
+    pub meeting_ids: Vec<String>,
+    pub proposed_at: String,
+    pub accepted_at: Option<String>,
+}
+
+/// Brain v2 L5 — one configured external MCP server (`mcp_servers`). `consented` is the
+/// per-server egress consent flag (preserve-only, flipped solely by `consent_to_mcp_server` /
+/// `revoke_mcp_consent`); an unconsented or disabled server is fail-closed ABSENT from the
+/// connector registry and the brain's tool list. Carries connection config only — never results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    /// Opaque id (hyphen-free so it embeds in the `mcp_<id>_query` tool name).
+    pub id: String,
+    /// User-authored display label.
+    pub label: String,
+    /// "http" (JSON-RPC over HTTP) or "stdio" (a local process — CODE EXECUTION; absolute path only).
+    pub transport: String,
+    /// The HTTP endpoint URL, or the ABSOLUTE stdio command path.
+    pub endpoint: String,
+    /// stdio command arguments (empty for http).
+    pub args: Vec<String>,
+    pub enabled: bool,
+    /// One-time per-server egress consent — default FALSE, fail-closed.
+    pub consented: bool,
+    pub created_at: String,
+}
+
 /// A vault folder Murmur tracks for organization + per-folder locking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
