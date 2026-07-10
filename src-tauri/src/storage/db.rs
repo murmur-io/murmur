@@ -1679,9 +1679,9 @@ impl Db {
 
     // ── M6 Shared Brain: local org state + the outbound org-share state machine ──────────────────
 
-    /// Upsert the locally-cached membership of an org (create/status). Preserves the local `consented`
-    /// + `last_seq` on an existing row (an incoming status refresh MUST NOT reset the consent flag or
-    /// rewind the sync cursor). NO content — membership metadata only.
+    /// Upsert the locally-cached membership of an org (create/status). Preserves an existing row's
+    /// local `consented` flag and `last_seq` cursor (an incoming status refresh MUST NOT reset the
+    /// consent flag or rewind the sync cursor). NO content — membership metadata only.
     pub fn upsert_org_state(&self, o: &crate::storage::OrgState) -> Result<()> {
         let conn = self.lock();
         conn.execute(
