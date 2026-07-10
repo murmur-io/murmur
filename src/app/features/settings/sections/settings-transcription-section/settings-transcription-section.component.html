@@ -118,5 +118,88 @@
               <p class="model-error text-danger">{{ derr }}</p>
             }
           </div>
+
+          <div class="card model-card">
+            <div class="model-copy">
+              <h3>Live caption engine</h3>
+              <p class="text-secondary model-sub">
+                Choose what powers the LIVE captions while you record. Whisper is
+                the default and always transcribes the final, high-accuracy note
+                after you stop. Parakeet runs on the CPU (off the GPU), freeing the
+                Mac's graphics for the on-device brain during a call — Polish-capable
+                and fast.
+              </p>
+            </div>
+
+            <div class="model-grid">
+              <label class="field">
+                <span class="field-label">Live engine</span>
+                <select formControlName="liveAsrEngine">
+                  <option value="whisper">Whisper (default)</option>
+                  <option value="parakeet">
+                    Parakeet — faster, off-GPU, Polish-capable
+                  </option>
+                </select>
+                <span class="field-help text-muted">
+                  Only affects live captions. The saved note is always produced by
+                  Whisper at full accuracy after you stop recording. If Parakeet is
+                  selected but not downloaded, live captions fall back to Whisper.
+                </span>
+              </label>
+            </div>
+
+            <div class="model-status-row">
+              @if (parakeetPresent() === true) {
+                <span class="pill is-success">
+                  <span class="pill-dot"></span>
+                  Downloaded ✓
+                </span>
+                <span class="text-muted model-note">
+                  Stored on this Mac — used for live captions when selected.
+                </span>
+              } @else if (parakeetPresent() === false) {
+                @if (downloadingParakeet()) {
+                  <div class="brain-progress" role="status">
+                    <div class="brain-progress-track" aria-hidden="true">
+                      <div
+                        class="brain-progress-fill"
+                        [style.width.%]="parakeetDownloadFrac() * 100"
+                      ></div>
+                    </div>
+                    <span class="brain-progress-label text-muted">
+                      @if (parakeetDownloadFrac() > 0) {
+                        Downloading… {{ parakeetPct() }}
+                      } @else {
+                        Downloading…
+                      }
+                    </span>
+                  </div>
+                  <span class="text-muted model-note">
+                    Fetching the Parakeet engine (~600 MB) — this can take a few
+                    minutes.
+                  </span>
+                } @else {
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    (click)="downloadParakeet()"
+                  >
+                    Download Parakeet (~600 MB)
+                  </button>
+                  <span class="text-muted model-note">
+                    ~600 MB, one time, on-device. CC-BY-4.0 (NVIDIA).
+                  </span>
+                }
+              } @else {
+                <span class="pill">
+                  <span class="pill-dot"></span>
+                  Checking…
+                </span>
+              }
+            </div>
+            @if (parakeetDownloadError(); as perr) {
+              <p class="model-error text-danger">{{ perr }}</p>
+            }
+          </div>
 </div>
-  
+

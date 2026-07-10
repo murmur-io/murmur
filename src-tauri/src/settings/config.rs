@@ -165,6 +165,16 @@ pub struct AppConfig {
     /// RAM-safe) everywhere else, so an existing install never gets a surprise download. All
     /// sizes stay selectable; the chosen model is downloaded on demand via `download_model`.
     pub model_size: String,
+    /// OPTIONAL live-caption ASR engine selector: `"whisper"` (the default) or `"parakeet"`. When
+    /// `"parakeet"` AND its models are downloaded (`transcribe::model::parakeet_models_present`),
+    /// the live caption tick decodes on the CPU-only NVIDIA parakeet engine (off the Metal GPU, so
+    /// the brain LLM keeps the GPU) via the `LiveAsr` seam; whisper stays the BATCH authority and
+    /// the wake/manual-capture paths. Any other value — or the models being absent — falls back to
+    /// whisper (`transcribe::live_asr::should_use_parakeet`), so a mis-set value can never wedge the
+    /// loop. `#[serde(default = "default_live_asr_engine")]` ⇒ a config persisted before this field
+    /// existed loads as `"whisper"` (byte-identical to today's behavior).
+    #[serde(default = "default_live_asr_engine")]
+    pub live_asr_engine: String,
     /// T1.3 (transcription heat) — the LIVE caption tick's model PIN. Non-empty (default
     /// `"small"`) ⇒ while recording, the live loop decodes with THIS size whenever its file is
     /// downloaded, regardless of `model_size` and `brain_live` — live captions are throwaway
@@ -539,6 +549,11 @@ fn default_live_model_pin() -> String {
     "small".to_string()
 }
 
+/// serde default for [`AppConfig::live_asr_engine`] — the whisper live path (today's behavior).
+fn default_live_asr_engine() -> String {
+    crate::transcribe::live_asr::ENGINE_WHISPER.to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -567,6 +582,7 @@ impl Default for AppConfig {
             // big-RAM install, else "small"); the ONE decision lives in
             // `transcribe::model::default_model_size`. Onboarding preselects THIS value.
             model_size: crate::transcribe::model::default_model_size_now().to_string(),
+            live_asr_engine: default_live_asr_engine(),
             live_model_pin: default_live_model_pin(),
             live_vad_gate: true,
             voice_trigger: false,
@@ -653,6 +669,7 @@ const K_POST_AEC_ENABLED: &str = "post_aec_enabled";
 const K_AUDIO_STORAGE_LIMIT_GB: &str = "audio_storage_limit_gb";
 const K_AUDIO_AUTO_PRUNE: &str = "audio_auto_prune";
 const K_MODEL_SIZE: &str = "model_size";
+const K_LIVE_ASR_ENGINE: &str = "live_asr_engine";
 const K_LIVE_MODEL_PIN: &str = "live_model_pin";
 const K_LIVE_VAD_GATE: &str = "live_vad_gate";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
@@ -779,6 +796,13 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_MODEL_SIZE)? {
             if !v.is_empty() {
                 cfg.model_size = v;
+            }
+        }
+        // Live ASR engine: an empty stored value keeps the `"whisper"` default (mirrors
+        // `model_size`, not `provider_model` — `""` is never a meaningful engine).
+        if let Some(v) = db.get_setting(K_LIVE_ASR_ENGINE)? {
+            if !v.is_empty() {
+                cfg.live_asr_engine = v;
             }
         }
         // `""` is a VALID stored value (= pin disabled), so it is taken verbatim — only an
@@ -1043,6 +1067,7 @@ impl AppConfig {
             },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
+        db.set_setting(K_LIVE_ASR_ENGINE, &self.live_asr_engine)?;
         db.set_setting(K_LIVE_MODEL_PIN, &self.live_model_pin)?;
         db.set_setting(
             K_LIVE_VAD_GATE,
@@ -1525,6 +1550,51 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert_eq!(AppConfig::load(&db).unwrap().live_model_pin, "small-q8_0");
+    }
+
+    /// OPTIONAL parakeet live-ASR: `live_asr_engine` defaults to `"whisper"` (fresh struct AND
+    /// empty settings table — so today's behavior is unchanged), a `"parakeet"` selection
+    /// round-trips through save/load, and an empty stored value falls back to the `"whisper"`
+    /// default (never a blank engine).
+    #[test]
+    fn live_asr_engine_defaults_whisper_and_round_trips() {
+        assert_eq!(AppConfig::default().live_asr_engine, "whisper");
+        let db = temp_db();
+        assert_eq!(AppConfig::load(&db).unwrap().live_asr_engine, "whisper");
+
+        // An explicit parakeet selection persists + reloads.
+        let cfg = AppConfig {
+            live_asr_engine: "parakeet".to_string(),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert_eq!(AppConfig::load(&db).unwrap().live_asr_engine, "parakeet");
+
+        // An empty stored value falls back to the "whisper" default (non-empty guard).
+        let cfg = AppConfig {
+            live_asr_engine: String::new(),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert_eq!(AppConfig::load(&db).unwrap().live_asr_engine, "whisper");
+    }
+
+    /// A config payload that OMITS `liveAsrEngine` (persisted before the field existed) deserializes
+    /// it as `"whisper"` via `#[serde(default = "default_live_asr_engine")]`.
+    #[test]
+    fn missing_live_asr_engine_deserializes_whisper() {
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.live_asr_engine, "whisper");
     }
 
     #[test]
