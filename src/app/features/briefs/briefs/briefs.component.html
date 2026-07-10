@@ -1,0 +1,199 @@
+<section class="br">
+  <button
+    type="button"
+    class="br-toggle"
+    [attr.aria-expanded]="open()"
+    (click)="open.set(!open())"
+  >
+    <svg
+      class="br-chevron"
+      [class.is-open]="open()"
+      viewBox="0 0 16 16"
+      width="14"
+      height="14"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M5.5 4l5 4-5 4"
+        stroke="currentColor"
+        stroke-width="1.7"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+    <span class="br-title">Scheduled briefs</span>
+    @if (pendingCount() > 0) {
+      <span class="count br-count">{{ pendingCount() }}</span>
+    }
+    <span class="br-sub">
+      Recurring digests of your recent meetings, proposed for your review.
+    </span>
+  </button>
+
+  <!-- Pending proposals surface even while the section is collapsed — a staged
+       brief is the one thing that should never be missed. -->
+  @if (open() || pendingCount() > 0) {
+    @for (run of store.pending(); track run.id) {
+      <div class="card br-run">
+        <header class="br-run-head">
+          <span class="br-run-label">{{ runLabel(run) }}</span>
+          <span class="br-run-date text-secondary">{{ runDate(run) }}</span>
+        </header>
+        <p class="br-run-preview">{{ runPreview(run) }}</p>
+        <footer class="br-run-actions">
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="dismiss(run)"
+            [disabled]="busyId() === run.id"
+          >
+            Dismiss
+          </button>
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="accept(run)"
+            [disabled]="busyId() === run.id"
+          >
+            {{ busyId() === run.id ? "Saving…" : "Save to vault" }}
+          </button>
+        </footer>
+      </div>
+    }
+  }
+
+  @if (open()) {
+    @if (store.loading()) {
+      <div class="card state-card">
+        <p class="empty">Loading your brief schedules…</p>
+      </div>
+    } @else if (store.error()) {
+      <div class="card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">Couldn’t load briefs</p>
+        <p class="empty">{{ store.error() }}</p>
+      </div>
+    } @else {
+      @if (store.schedules().length === 0) {
+        <div class="card empty-state">
+          <span class="empty-mark" aria-hidden="true"></span>
+          <p class="empty-title">No briefs scheduled yet</p>
+          <p class="empty">
+            Schedule a recurring brief — say, every Monday at 08:30 — and
+            Murmur will propose a digest of your recent meetings, open action
+            items, and what it knows. You review each one before it touches
+            your vault. Briefs only ever read content that isn’t locked.
+          </p>
+        </div>
+      } @else {
+        <div class="card br-card">
+          <ul class="br-list">
+            @for (s of store.schedules(); track s.id) {
+              <li class="br-item" [class.is-off]="!s.enabled">
+                <div class="br-item-main">
+                  <span class="br-item-label">{{ s.label }}</span>
+                  <span class="br-item-when text-secondary">
+                    {{ scheduleLine(s) }}
+                  </span>
+                  @if (s.promptHint; as hint) {
+                    <span class="br-item-hint text-secondary">
+                      Focus: {{ hint }}
+                    </span>
+                  }
+                </div>
+                <div class="br-item-actions">
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    (click)="toggleEnabled(s)"
+                    [disabled]="busyId() === s.id"
+                  >
+                    {{ s.enabled ? "Pause" : "Resume" }}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost br-delete"
+                    (click)="remove(s)"
+                    [disabled]="busyId() === s.id"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </li>
+            }
+          </ul>
+        </div>
+      }
+
+      <!-- Create form -->
+      <div class="card br-form">
+        <div class="br-form-row">
+          <label class="br-field">
+            <span class="br-field-label">Name</span>
+            <input
+              type="text"
+              class="br-input"
+              placeholder="Monday kickoff"
+              [value]="formLabel()"
+              (input)="onLabelInput($event)"
+            />
+          </label>
+          <label class="br-field">
+            <span class="br-field-label">Day</span>
+            <select
+              class="br-input"
+              [value]="formDay()"
+              (change)="onDayChange($event)"
+            >
+              <option [value]="-1">Daily</option>
+              @for (d of weekdays; track d; let i = $index) {
+                <option [value]="i">{{ d }}</option>
+              }
+            </select>
+          </label>
+          <label class="br-field br-field-time">
+            <span class="br-field-label">Time</span>
+            <input
+              type="time"
+              class="br-input"
+              [value]="formTime()"
+              (input)="onTimeInput($event)"
+            />
+          </label>
+          <label class="br-field br-field-days">
+            <span class="br-field-label">Look back</span>
+            <input
+              type="number"
+              class="br-input"
+              min="1"
+              max="90"
+              [value]="formScopeDays()"
+              (input)="onScopeInput($event)"
+            />
+          </label>
+        </div>
+        <div class="br-form-row">
+          <label class="br-field br-field-grow">
+            <span class="br-field-label">Focus (optional)</span>
+            <input
+              type="text"
+              class="br-input"
+              placeholder="e.g. blockers and deadlines"
+              [value]="formHint()"
+              (input)="onHintInput($event)"
+            />
+          </label>
+          <button
+            type="button"
+            class="btn btn-primary br-add"
+            (click)="create()"
+            [disabled]="!canCreate()"
+          >
+            {{ creating() ? "Scheduling…" : "Schedule brief" }}
+          </button>
+        </div>
+      </div>
+    }
+  }
+</section>

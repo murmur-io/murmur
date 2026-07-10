@@ -1014,6 +1014,52 @@ export interface UserMemory {
 }
 
 /**
+ * Brain v2 L5 — one SCHEDULED-BRIEF definition (`brief_schedules`). Mirrors the
+ * backend `crate::storage::models::BriefSchedule`. Config data the user typed —
+ * never meeting content. `dayOfWeek`: 0 = Monday … 6 = Sunday, null = daily;
+ * `lastRunAt` is the LOCAL `YYYY-MM-DD` of the last fire (once-per-day guard).
+ */
+export interface BriefSchedule {
+  id: string;
+  label: string;
+  dayOfWeek: number | null;
+  hourLocal: number;
+  minuteLocal: number;
+  scopeDays: number;
+  promptHint: string | null;
+  enabled: boolean;
+  lastRunAt: string | null;
+  createdAt: string;
+}
+
+/**
+ * Brain v2 L5 — one PROPOSED brief run (`brief_runs`, propose-accept staging).
+ * `noteMd` was synthesized backend-side from VISIBLE-ONLY content (the runner
+ * reads with the empty unlock set) and is CONSUMED (blanked) on accept;
+ * `meetingIds` are opaque source ids only.
+ */
+export interface BriefRun {
+  id: string;
+  scheduleId: string;
+  status: "pending" | "accepted";
+  noteMd: string;
+  meetingIds: string[];
+  proposedAt: string;
+  acceptedAt: string | null;
+}
+
+/**
+ * Brain v2 L5 — payload of `EVENT_BRIEF_PROPOSED` (a brief was staged). Carries
+ * the run id + the schedule's user-authored label + a size signal — never the
+ * brief markdown (fetch pending runs via `listBriefRuns`).
+ */
+export interface BriefProposedPayload {
+  runId: string;
+  label: string;
+  charCount: number;
+}
+
+/**
  * Phase D — progress for the on-device PERSON-name NER model (mDeBERTa-v3)
  * download (`EVENT_NER_DOWNLOAD`). Mirrors the backend `NerDownloadPayload`: the
  * model is 3 files, so progress is reported per-file (`fileIndex` / `fileCount`).

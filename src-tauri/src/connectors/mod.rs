@@ -28,6 +28,8 @@
 
 pub mod calendar;
 pub mod jira;
+pub mod mcp;
+pub mod mcp_client;
 pub mod slack;
 pub mod web;
 
@@ -205,6 +207,25 @@ impl ConnectorRegistry {
             names: active_name_redactor(),
             sink: active_sink(),
         }
+    }
+
+    /// Brain v2 L5 — [`Self::build`] EXTENDED with the user's configured MCP servers (the caller
+    /// reads the rows from the DB — the registry itself stays DB-free). Each row is fail-closed
+    /// through [`mcp::McpConnector::from_row_if_available`]: only an `enabled` AND `consented`
+    /// server with a valid transport shape is exposed; everything else is simply absent. Every
+    /// exposed MCP connector inherits the framework's redaction + content-free ledger row exactly
+    /// like the built-in connectors.
+    pub fn build_with_mcp(
+        config: &AppConfig,
+        mcp_servers: &[crate::storage::models::McpServer],
+    ) -> Self {
+        let mut registry = Self::build(config);
+        for row in mcp_servers {
+            if let Some(c) = mcp::McpConnector::from_row_if_available(row) {
+                registry.connectors.push(Box::new(c));
+            }
+        }
+        registry
     }
 
     /// Is a connector with this id currently exposed (enabled + consented + configured)?

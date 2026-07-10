@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod audio;
 pub mod brain_reactions;
+pub mod brief_runner;
 pub mod calendar;
 pub mod commands;
 pub mod connectors;
@@ -163,6 +164,21 @@ pub fn run() {
             commands::consent_to_web_search,
             commands::consent_to_jira,
             commands::consent_to_slack,
+            // Brain v2 L5 — scheduled briefs (schedule CRUD + propose-accept runs).
+            commands::list_brief_schedules,
+            commands::create_brief_schedule,
+            commands::update_brief_schedule,
+            commands::delete_brief_schedule,
+            commands::list_brief_runs,
+            commands::accept_brief,
+            commands::dismiss_brief,
+            // Brain v2 L5 — MCP server config (per-server consent-gated external connectors).
+            commands::list_mcp_servers,
+            commands::add_mcp_server,
+            commands::remove_mcp_server,
+            commands::consent_to_mcp_server,
+            commands::revoke_mcp_consent,
+            commands::test_mcp_server,
             // M3-CLIENT — sharing account + zero-knowledge link shares (mode A).
             commands::account_status,
             commands::account_signup,
@@ -429,6 +445,23 @@ pub fn run() {
                         if let Err(e) = joined {
                             tracing::warn!(target: "memory", error = %e, "consolidation tick join failed");
                         }
+                    }
+                });
+            }
+            // Brain v2 L5 — the 60s SCHEDULED-BRIEF runner (mirrors the memory loop above: each
+            // tick re-reads the LIVE schedules + config from AppState, warns-and-continues on any
+            // failure, never exits; the FIRST tick is a full interval after launch). Corpus reads
+            // are gated with the EMPTY unlock set inside `brief_tick`; synthesis rides the Notes
+            // provider seam (consent gate + redaction + ledger). Quiet when no schedules exist.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::brief_runner::BRIEF_TICK_SECS,
+                        ))
+                        .await;
+                        crate::brief_runner::brief_tick(&handle).await;
                     }
                 });
             }

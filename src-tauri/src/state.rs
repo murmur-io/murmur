@@ -202,6 +202,13 @@ pub struct AppState {
     /// background Realtime-Reactions scan checks it and DEFERS its light-model extraction, so a
     /// user-facing answer never competes with a background scan for the on-device engine. No PII.
     pub user_turn_in_progress: std::sync::atomic::AtomicBool,
+    /// Brain v2 L5 — the SESSION verify cache: meeting id → the last verify-pass findings, so a
+    /// re-open of the same note this session re-renders the panel WITHOUT a second Jira egress.
+    /// RAM-ONLY by design (never persisted — findings paraphrase live connector values about note
+    /// lines), and CLEARED on every relock (`relock_folder` / `relock_all_inner`) so a re-sealed
+    /// meeting's verification detail can't outlive its session unlock. Keys are opaque meeting
+    /// ids — the gate is re-checked by `verify_note_sources` BEFORE the cache is read.
+    pub verify_cache: Mutex<std::collections::HashMap<String, Vec<crate::verify::VerifyFinding>>>,
     /// Folder ids unlocked in the current session: sealed folders decrypted for in-app view +
     /// MCP until relock (cleared on screen-share start or app exit). Arc so the MCP server
     /// thread shares the SAME set as the command surface.
@@ -312,6 +319,7 @@ impl AppState {
             reactions_emitted: Mutex::new(std::collections::HashSet::new()),
             in_flight_turns: Mutex::new(std::collections::HashMap::new()),
             user_turn_in_progress: AtomicBool::new(false),
+            verify_cache: Mutex::new(std::collections::HashMap::new()),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),
