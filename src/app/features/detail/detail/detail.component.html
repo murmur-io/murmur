@@ -293,10 +293,12 @@
             [timelineTotal]="timelineTotal()"
             [timelineLoading]="timelineLoading()"
             [timelineError]="timelineError()"
+            [timelineNeedsGeneration]="timelineNeedsGeneration()"
             [speakerSuggestions]="speakerSuggestions()"
             [pinMsg]="pinMsg()"
             [pinError]="pinError()"
             (retryTimeline)="loadTimeline()"
+            (generateTimeline)="generateTimeline()"
             (pin)="onPin($event)"
             (renameSpeaker)="onRenameSpeaker($event)"
           />

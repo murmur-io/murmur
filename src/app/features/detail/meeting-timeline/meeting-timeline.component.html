@@ -31,6 +31,23 @@
         }
       </div>
     </div>
+  } @else if (needsGeneration()) {
+    <!-- On-device generation is HEAVY (loads a local model) — never auto-run on open; the user asks
+         for it explicitly here, so a passive Audio-tab open can't swap-death the Mac (perf/OOM).
+         Cloud installs auto-generate and never reach this branch. -->
+    <div class="tl-unavailable">
+      <span class="tl-unavailable-dot" aria-hidden="true"></span>
+      <span class="tl-unavailable-text"
+        >Speaker &amp; topic timeline runs an on-device model</span
+      >
+      <button
+        type="button"
+        class="btn btn-primary tl-retry"
+        (click)="generate.emit()"
+      >
+        Generate timeline
+      </button>
+    </div>
   } @else if (unavailable()) {
     <!-- Quiet, non-blocking fallback with a retry affordance. -->
     <div class="tl-unavailable">
