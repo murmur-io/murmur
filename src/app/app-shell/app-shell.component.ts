@@ -144,10 +144,10 @@ export class AppShellComponent {
     this.searchOpen.set(true);
   }
 
-  /** Quick action: jump to Record to start a new note (⌘N). */
+  /** Quick action: create a new standalone note and open its editor (⌘N). */
   newNote(): void {
     this.searchOpen.set(false);
-    void this.router.navigate(["/record"]);
+    void this.router.navigate(["/notes/new"]);
   }
 
   /**
