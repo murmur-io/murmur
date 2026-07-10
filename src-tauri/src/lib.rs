@@ -30,6 +30,7 @@ pub mod share;
 pub mod state;
 pub mod storage;
 pub mod summarize;
+pub mod thermal;
 pub mod tools;
 pub mod transcribe;
 pub mod update;

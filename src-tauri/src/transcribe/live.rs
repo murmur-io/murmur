@@ -16,15 +16,18 @@
 //!   context reflect what YOU say during the call; the other side is folded in only after Stop.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state::AppState;
 use crate::transcribe::Transcriber;
 
-/// How often to attempt a live caption.
-const TICK: Duration = Duration::from_millis(3000);
+// NOTE (T1.5, 2026-07-09 transcription plan): the historical fixed `TICK = 3000 ms` sleep is
+// now THERMAL-GOVERNED — `crate::thermal::ThermalGovernor::effective_tick()` returns the same
+// 3 s at Nominal and stretches to 6 s / 9 s under Fair / Serious+ thermal pressure. Every
+// "tick"-counted window below (wake dedup, hangovers, backstop budgets) is counted in TICKS,
+// so under pressure those windows stretch in WALL-CLOCK terms with the tick — intended: the
+// whole live layer backs off together.
 // NOTE (Brain v2 L4): the fixed `REACTIONS_SCAN_EVERY = 7` cadence was replaced by the
 // content-driven novelty gatekeeper (`crate::transcribe::novelty::NoveltyState`) — the hard
 // minimum interval lives there (`MIN_FIRE_INTERVAL_TICKS`, ~15 s).
@@ -88,6 +91,109 @@ impl WakeDedup {
         self.cooldown = WAKE_DEDUP_TICKS;
         true
     }
+
+    /// Whether a wake-suppression window is currently ACTIVE (a wake just fired within the last
+    /// [`WAKE_DEDUP_TICKS`] ticks). The VAD tick gate BYPASSES itself while this is true: right
+    /// after a wake the user is mid-flow with the assistant, and a mis-gated tick there would be
+    /// user-visible in a way a silent-lull skip never is.
+    fn is_suppressing(&self) -> bool {
+        self.cooldown > 0
+    }
+}
+
+/// FLOOR on how many trailing seconds of the 16 kHz window the VAD gate scans for speech per
+/// tick (the historical fixed delta at the 3 s nominal tick). The ACTUAL span is
+/// [`vad_scan_span_secs`]: everything that arrived since the LAST VAD scan — the thermal
+/// governor stretches the tick to 6 s/9 s, and suspended/deferred/short-tail ticks skip the
+/// scan entirely, so a fixed 3 s would leave the rest of the new audio permanently unscanned
+/// (a short utterance there would scroll out of the window undecoded — a lost caption/wake).
+const VAD_DELTA_SECS: usize = 3;
+
+/// Extra seconds added on top of the measured since-last-scan span, covering loop-body time
+/// (decode latency, resample) between the wall-clock measurement and the audio snapshot.
+const VAD_SCAN_HEADROOM_SECS: usize = 2;
+
+/// Seconds of the freshest window audio the VAD gate scans THIS tick: the wall-clock span
+/// since the last scan (however the tick was stretched or how many ticks were skipped) plus
+/// [`VAD_SCAN_HEADROOM_SECS`], floored at [`VAD_DELTA_SECS`] and clamped to the rolling
+/// window itself. Guarantees the fail-open contract (speech ⇒ decode) holds under
+/// thermally-stretched ticks: no new audio is ever left un-scanned between scans.
+fn vad_scan_span_secs(secs_since_last_scan: f64) -> usize {
+    // `as usize` is a SATURATING float cast (NaN → 0, negative → 0, +∞ → usize::MAX), so every
+    // degenerate input lands safely between the floor and the window clamp below.
+    let elapsed = secs_since_last_scan.ceil() as usize;
+    elapsed
+        .saturating_add(VAD_SCAN_HEADROOM_SECS)
+        .clamp(VAD_DELTA_SECS, WINDOW_SECS)
+}
+
+/// How many extra ticks the gate keeps decoding after the LAST speech-positive tick. Bridges
+/// short mid-sentence pauses (a 2-tick hangover ≈ 6 s at the nominal tick) so a caption never
+/// cuts off on a breath; only a genuine lull stops the decode.
+const VAD_HANGOVER_TICKS: u8 = 2;
+
+/// T1.4 — the Silero VAD TICK GATE for the live loop: the PURE per-tick decision whether this
+/// tick's whisper decode should run. Today the loop decodes the rolling window UNCONDITIONALLY
+/// — even a fully silent meeting burns a full Metal encode every 3 s. The gate skips the decode
+/// on silent ticks; everything downstream (captions, live buffer, bullets, reactions, wake)
+/// consumes decoded TEXT, and silence produces none, so a skipped tick is behavior-identical to
+/// a decoded-empty tick — minus the GPU burn.
+///
+/// Inputs per tick:
+/// - `speech`: `Some(true/false)` = the CPU-only Silero verdict over the newest ~3 s delta;
+///   `None` = VAD unavailable this tick (model absent / load or inference failed) ⇒ FAIL-OPEN,
+///   decode (gate disabled = today's behavior — the gate may only ever REMOVE redundant work,
+///   never a caption someone needed).
+/// - `bypass`: manual voice-capture armed / wake-suppression window active ⇒ always decode
+///   (those flows consume every tick's transcript directly).
+///
+/// Pure + stateful (hangover), no I/O — headless-testable ([`live_vad_gate_decision_matrix`]).
+#[derive(Debug, Default)]
+struct LiveVadGate {
+    /// Remaining no-speech ticks that still decode after the last speech-positive tick.
+    hangover: u8,
+}
+
+impl LiveVadGate {
+    /// Decide whether THIS tick decodes. Speech re-arms the hangover; silence spends it;
+    /// silence with the hangover spent ⇒ skip. Bypass/VAD-unavailable ⇒ decode (fail-open),
+    /// leaving the hangover untouched.
+    fn should_decode(&mut self, speech: Option<bool>, bypass: bool) -> bool {
+        if bypass {
+            return true;
+        }
+        match speech {
+            None => true, // VAD unavailable ⇒ fail-open: today's decode-every-tick behavior.
+            Some(true) => {
+                self.hangover = VAD_HANGOVER_TICKS;
+                true
+            }
+            Some(false) => {
+                if self.hangover > 0 {
+                    self.hangover -= 1;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Coarse, non-PII MODEL-SIZE LABEL for the `live_perf` telemetry, derived from the ggml model
+/// FILENAME only (never the path — §8): `ggml-small.bin` → `small`, `ggml-large-v3-q5_0.bin` →
+/// `large-v3-q5_0`. A file that doesn't follow the ggml naming (an explicit
+/// `whisper_model_path` pointing at an arbitrary user file) yields `custom` — its name is
+/// deliberately NOT logged.
+fn model_size_label(model_path: &std::path::Path) -> String {
+    let stem = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match stem.strip_prefix("ggml-") {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => "custom".to_string(),
+    }
 }
 
 /// Normalize a wake command for dedup comparison: lowercase, collapse whitespace, drop surrounding
@@ -111,6 +217,9 @@ pub fn spawn(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
 }
 
 fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
+    // T1.5 — QoS: the caption tick is background inference; tag this thread UTILITY so macOS
+    // schedules it onto efficiency cores under contention. Best-effort C call, never fatal.
+    crate::thermal::set_utility_qos();
     // Fresh transcript per recording: clear any leftover from a previous meeting so the in-meeting
     // assistant can never answer about a stale recording.
     if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
@@ -123,6 +232,8 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         let state = app.state::<AppState>();
         crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
     }
+    // T0.1 telemetry label — the coarse model SIZE only (never the path), computed once.
+    let model_label = model_size_label(&model_path);
     let transcriber = match Transcriber::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
@@ -130,6 +241,54 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             return;
         }
     };
+
+    // T1.4 — the Silero VAD tick gate (config `live_vad_gate`, default ON): load the tiny
+    // (~885 kB) Silero model ONCE per recording, CPU-ONLY on purpose — a SECOND ggml Metal
+    // context alongside the whisper context makes ggml's scheduler `ggml_abort` the process
+    // (see `transcribe::vad::VadSegmenter::load`). Flag off / model absent / load failure ⇒
+    // gate disabled (today's decode-every-tick behavior), logged ONCE here.
+    let vad_gate_enabled = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map(|c| c.live_vad_gate)
+        .unwrap_or(true);
+    let mut vad = if vad_gate_enabled {
+        match crate::transcribe::model::models_dir() {
+            Ok(dir) => {
+                let path = dir.join(crate::transcribe::model::VAD_MODEL_FILE);
+                if path.is_file() {
+                    match crate::transcribe::vad::VadSegmenter::load(&path) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::warn!(target: "live", error = %e, "live VAD gate off (model load failed); decoding every tick");
+                            None
+                        }
+                    }
+                } else {
+                    tracing::info!(target: "live", "live VAD gate off (VAD model not downloaded); decoding every tick");
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::debug!(target: "live", error = %e, "live VAD gate off (models dir unresolved); decoding every tick");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut vad_gate = LiveVadGate::default();
+    // Wall-clock cursor for the VAD scan span (see `vad_scan_span_secs`): advanced whenever a
+    // tick's fresh audio is either VAD-scanned or unconditionally decoded (bypass / no VAD).
+    // Ticks that skip both (thermal suspend, turn-defer, short tail, resample failure) leave
+    // it in place so the NEXT scan covers their accumulated audio too.
+    let mut last_vad_scan = std::time::Instant::now();
+
+    // T1.5 — thermal governor (tick-stretch + reactions pause + caption suspend under load) and
+    // the one-tick user-turn decode defer. Recording + the post-Stop batch are NEVER touched.
+    let mut governor = crate::thermal::ThermalGovernor::default();
+    let mut turn_defer = crate::thermal::TurnDefer::default();
 
     // DEDUP state for the wake trigger (#23): detect_wake now fires ANYWHERE in the overlapping tail,
     // so without this the same spoken wake re-fires every tick it stays visible. Lives across ticks.
@@ -162,7 +321,10 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
     let mut last_caption = String::new();
 
     loop {
-        std::thread::sleep(TICK);
+        // T1.5 — the sleep is thermal-governed: 3 s nominal (the historical TICK), stretching to
+        // 6 s / 9 s as the Mac heats up. One guarded FFI read per tick; degrade-to-Nominal.
+        std::thread::sleep(governor.effective_tick());
+        governor.observe(crate::thermal::read_thermal_level());
         // Age out an expired wake-suppression window once per tick (before this tick's wake check).
         wake_dedup.tick();
 
@@ -216,7 +378,10 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         // substrate the scan reads), THEN the light-engine contradiction scan. Cards are SENT back
         // over the mpsc queue and emitted at a boundary — or, in shadow mode, counted. Skip-if-
         // busy: a slow scan drops this trigger; the recording never waits on the LLM.
+        // T1.5: under `Serious`+ thermal pressure the reactions/bullets worker is PAUSED
+        // (checked BEFORE the busy-flag swap so a paused tick can't wedge the flag).
         if novelty_tick.fire
+            && !governor.reactions_paused()
             && !reactions_busy.swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             let app2 = app.clone();
@@ -224,6 +389,8 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             let tx2 = surface_tx.clone();
             let entities2 = entities.clone();
             std::thread::spawn(move || {
+                // T1.5 — QoS: the reactions worker is background inference too → UTILITY.
+                crate::thermal::set_utility_qos();
                 // RAII: reset the busy flag on EVERY exit — including a panic inside reactions_scan.
                 // Without this, one panic would wedge the flag `true` and silently kill ALL further
                 // reaction scans this recording (deep-review: worker-thread-panic stuck-busy).
@@ -291,6 +458,63 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             continue; // <1s captured so far — nothing worth transcribing yet
         }
 
+        // BYPASS (computed BEFORE the thermal suspend below): while a manual voice-capture is
+        // armed or a wake-suppression window is active, EVERY tick must decode — those flows
+        // consume the per-tick transcript directly (`step_manual_capture` accumulates it and
+        // owns the user's stop click + the backstop budget; a just-fired wake is mid-flow).
+        let bypass = {
+            let state = app.state::<AppState>();
+            let manual_armed = state
+                .voice_command_capture
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            manual_armed || wake_dedup.is_suppressing()
+        };
+
+        // T1.5 — CRITICAL thermal: suspend the caption decode entirely (the recording and the
+        // post-Stop batch pipeline are untouched; the loop keeps ticking so recorder-gone
+        // still ends it). Checked AFTER the snapshot so self-termination is never delayed,
+        // BEFORE the resample so the skip costs ~nothing — but NEVER while a bypass flow is
+        // live: an armed click-to-stop capture must keep accumulating and stay stoppable
+        // (`step_manual_capture` is behind the decode), or the FE wedges in "listening" until
+        // thermal recovers. One in-flight utterance's worth of decodes is an acceptable
+        // thermal cost; freezing a user-armed flow is not.
+        if governor.captions_suspended() && !bypass {
+            tracing::debug!(target: "live", "critical thermal state; caption decode suspended this tick");
+            continue;
+        }
+
+        // TURN-DEFER (T1.5): while a user-initiated assistant turn runs on the LOCAL GGUF
+        // brain (the shared-Metal co-residency spike), skip ONE decode tick per turn window —
+        // the same flag-read discipline as `brain_reactions::should_defer_scan`. Evaluated
+        // ONLY on non-bypass ticks so a bypassed tick can't consume the turn window's single
+        // defer without an actual skip (and the resolve isn't computed needlessly). Trade-off:
+        // a turn window that both starts and ends entirely inside a bypass stretch leaves
+        // `deferred_for_current` armed, costing the NEXT local turn its one defer — fail-safe
+        // (fewer skips), never an extra skip.
+        if !bypass {
+            let user_turn = app
+                .state::<AppState>()
+                .user_turn_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let live_local = user_turn
+                && app
+                    .state::<AppState>()
+                    .config
+                    .lock()
+                    .map(|c| {
+                        crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, &c)
+                            .connection
+                            == crate::summarize::roles::CONN_LOCAL
+                    })
+                    .unwrap_or(false);
+            if turn_defer.should_skip(user_turn, live_local) {
+                tracing::debug!(target: "live", "user turn on the local brain; deferring one decode tick");
+                continue;
+            }
+        }
+
         let samples_16k = match crate::audio::resample_to_16k(&tail, rate) {
             Ok(s) => s,
             Err(e) => {
@@ -299,11 +523,54 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             }
         };
 
+        // VAD TICK GATE (T1.4): CPU-only Silero over EVERYTHING that arrived since the last
+        // scan (`vad_scan_span_secs` — the governed tick stretches to 6-9 s and skipped ticks
+        // accumulate, so a fixed 3 s delta would leave audio permanently unscanned). Silence
+        // with the hangover spent ⇒ skip the whisper decode; a VAD error fails OPEN (decode).
+        // Everything downstream consumes decoded TEXT — silence produces none — so a skipped
+        // tick changes no consumer's behavior, only the GPU burn.
+        let speech: Option<bool> = match vad.as_mut() {
+            Some(v) if !bypass => {
+                let span = vad_scan_span_secs(last_vad_scan.elapsed().as_secs_f64());
+                last_vad_scan = std::time::Instant::now();
+                let delta_start = samples_16k.len().saturating_sub(span * 16_000);
+                match v.speech_regions(&samples_16k[delta_start..]) {
+                    Ok(regions) => Some(!regions.is_empty()),
+                    Err(e) => {
+                        tracing::debug!(target: "live", error = %e, "live VAD tick failed; decoding");
+                        None
+                    }
+                }
+            }
+            _ => {
+                // Bypass or no VAD loaded: this tick decodes unconditionally (fail-open), so
+                // its fresh audio is consumed by the decode — advance the scan cursor too.
+                last_vad_scan = std::time::Instant::now();
+                None
+            }
+        };
+        if !vad_gate.should_decode(speech, bypass) {
+            continue;
+        }
+
         // LIVE captions use the Fast (greedy/best_of:1) profile via `transcribe` — NOT the
         // batch beam-search path. Captions tick every few seconds on overlapping windows, so
         // latency must dominate; beam search + temperature fallback would burn CPU per tick.
         // The authoritative high-quality transcript is produced once at Stop (pipeline.rs).
-        match transcriber.transcribe(&samples_16k, lang.as_deref()) {
+        let decode_started = std::time::Instant::now();
+        let decoded = transcriber.transcribe(&samples_16k, lang.as_deref());
+        // T0.1 — per-tick decode telemetry (target `live_perf`): durations / window length /
+        // coarse model label ONLY — never content, never paths (§8). The in-app instrument
+        // behind `scripts/measure-live-power.sh`.
+        tracing::info!(
+            target: "live_perf",
+            decode_ms = decode_started.elapsed().as_millis() as u64,
+            window_s = samples_16k.len() as f64 / 16_000.0,
+            model = %model_label,
+            ok = decoded.is_ok(),
+            "live decode tick"
+        );
+        match decoded {
             Ok(t) => {
                 let text = t
                     .segments
@@ -2011,6 +2278,107 @@ fn assistant_system_prompt(
 mod tests {
     use super::*;
     use crate::audio::wake::VoiceIntent;
+
+    // ── T1.4: the Silero VAD tick gate (pure decision matrix, stub-VAD) ──────────────────────────
+
+    /// The full gate matrix over stubbed VAD verdicts: speech decodes + re-arms the hangover;
+    /// silence spends the hangover then SKIPS; bypass (manual capture / wake window) always
+    /// decodes; VAD-unavailable (`None`) fails OPEN (today's decode-every-tick behavior).
+    #[test]
+    fn live_vad_gate_decision_matrix() {
+        // Speech ⇒ decode, hangover armed to 2.
+        let mut g = LiveVadGate::default();
+        assert!(g.should_decode(Some(true), false), "speech decodes");
+        // Two silent ticks ride the hangover, the THIRD is skipped.
+        assert!(g.should_decode(Some(false), false), "hangover tick 1 decodes");
+        assert!(g.should_decode(Some(false), false), "hangover tick 2 decodes");
+        assert!(
+            !g.should_decode(Some(false), false),
+            "silence with hangover spent SKIPS the decode"
+        );
+        assert!(
+            !g.should_decode(Some(false), false),
+            "continued silence keeps skipping"
+        );
+        // Speech returns ⇒ decode + hangover re-armed.
+        assert!(g.should_decode(Some(true), false), "speech resumes decoding");
+        assert!(g.should_decode(Some(false), false), "hangover re-armed");
+
+        // A FRESH gate (hangover 0) skips pure silence immediately…
+        let mut fresh = LiveVadGate::default();
+        assert!(
+            !fresh.should_decode(Some(false), false),
+            "a silent recording start is not decoded"
+        );
+        // …but BYPASS always decodes, without touching the hangover state…
+        assert!(fresh.should_decode(Some(false), true), "bypass always decodes");
+        assert!(
+            !fresh.should_decode(Some(false), false),
+            "bypass did not arm a hangover"
+        );
+        // …and VAD-unavailable fails OPEN.
+        assert!(
+            fresh.should_decode(None, false),
+            "no VAD verdict ⇒ gate disabled ⇒ decode (fail-open)"
+        );
+    }
+
+    /// T1.4/T1.5 fix-round — the VAD scan span tracks the wall clock since the last scan, so a
+    /// thermally-stretched tick (6 s Fair / 9 s Serious) or a run of skipped ticks (thermal
+    /// suspend, turn-defer, short tail) can never leave fresh audio permanently unscanned: a
+    /// wake phrase or short caption in that region is still caught by the next scan.
+    #[test]
+    fn vad_scan_span_scales_to_stretched_and_skipped_ticks() {
+        // Nominal 3 s tick: span = 3 s elapsed + 2 s headroom = 5 s (≥ the old fixed 3 s).
+        assert_eq!(vad_scan_span_secs(3.0), 5);
+        // Governed ticks: Fair 6 s → 8 s, Serious 9 s → 11 s — the whole stretched delta is
+        // scanned (the MAJOR finding: a fixed 3 s missed 3-6 s of each stretched tick).
+        assert_eq!(vad_scan_span_secs(6.0), 8);
+        assert_eq!(vad_scan_span_secs(9.0), 11);
+        // Sub-second loop-body drift still ceils up and keeps the headroom.
+        assert_eq!(vad_scan_span_secs(3.4), 6);
+        // Accumulated skipped ticks (thermal suspend / defer) clamp to the rolling window —
+        // the scan can never index past the audio that actually exists.
+        assert_eq!(vad_scan_span_secs(60.0), WINDOW_SECS);
+        // Degenerate inputs floor at the historical minimum, never underflow.
+        assert_eq!(vad_scan_span_secs(0.0), VAD_DELTA_SECS);
+        assert_eq!(vad_scan_span_secs(-1.0), VAD_DELTA_SECS);
+        assert_eq!(vad_scan_span_secs(f64::NAN), VAD_DELTA_SECS);
+        assert_eq!(vad_scan_span_secs(f64::INFINITY), WINDOW_SECS);
+    }
+
+    /// The wake-suppression window doubles as a VAD-gate bypass signal: active right after a
+    /// fire, expired after `WAKE_DEDUP_TICKS` tick() calls.
+    #[test]
+    fn wake_dedup_suppression_window_reports_active_then_expires() {
+        let mut d = WakeDedup::default();
+        assert!(!d.is_suppressing(), "fresh dedup: no window");
+        assert!(d.should_fire("zrób research o testach"));
+        assert!(d.is_suppressing(), "window armed by the fire");
+        for _ in 0..WAKE_DEDUP_TICKS {
+            d.tick();
+        }
+        assert!(!d.is_suppressing(), "window expired after WAKE_DEDUP_TICKS");
+    }
+
+    // ── T0.1: the telemetry model label (non-PII: ggml size token or "custom") ───────────────────
+
+    #[test]
+    fn model_size_label_extracts_ggml_size_or_custom() {
+        use std::path::Path;
+        assert_eq!(model_size_label(Path::new("/m/ggml-small.bin")), "small");
+        assert_eq!(
+            model_size_label(Path::new("/m/ggml-large-v3-turbo-q8_0.bin")),
+            "large-v3-turbo-q8_0"
+        );
+        assert_eq!(model_size_label(Path::new("/m/ggml-small.en.bin")), "small.en");
+        // A user-supplied arbitrary file name is NEVER echoed into logs.
+        assert_eq!(
+            model_size_label(Path::new("/Users/kim/my-meeting-model.bin")),
+            "custom"
+        );
+        assert_eq!(model_size_label(Path::new("")), "custom");
+    }
 
     // ── Brain v2 P0.3: in-flight assistant-turn dedup registry ────────────────────────────────────
 
