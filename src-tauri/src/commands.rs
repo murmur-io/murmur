@@ -22450,6 +22450,34 @@ pub async fn revoke_shares_for_folder(
     }
 }
 
+/// Cadence of the background org-feed sync loop (M6 Shared Brain, spawned in `lib.rs` setup). The
+/// first tick fires `ORG_SYNC_FIRST_DELAY_SECS` after launch (no startup contention); subsequent
+/// ticks every `ORG_SYNC_TICK_SECS`. Every tick is a cheap no-op while logged out / no org joined.
+pub const ORG_SYNC_FIRST_DELAY_SECS: u64 = 20;
+pub const ORG_SYNC_TICK_SECS: u64 = 300;
+
+/// One background org-sync tick: drain the outbound share queue, then pull + ingest the inbound feed
+/// into the local int8 partition. This is what makes the org brain a REPLICATED brain — every
+/// member's app stays fresh for Ask/MCP WITHOUT anyone opening Settings. Best-effort: each half
+/// warns-and-continues (a transient failure never kills the loop), and both inners gate to an early
+/// `Ok` when logged out / no org joined, so this is a no-op until a session is live. Logs only
+/// non-PII counts on a productive tick.
+pub(crate) async fn org_background_sync_tick(state: &AppState) {
+    if let Err(e) = org_sweep_pending_inner(state).await {
+        tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
+    }
+    match org_sync_now_inner(state).await {
+        Ok(r) if r.ingested > 0 || r.tombstoned > 0 => tracing::info!(
+            target: "org",
+            ingested = r.ingested,
+            tombstoned = r.tombstoned,
+            "org feed synced"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(target: "org", error = %e, "org feed sync tick failed"),
+    }
+}
+
 /// `org_sweep_pending()` — the on-launch org queue sweep (extends the mode-B `share_rewrap_pending`
 /// launch pattern). Idempotent + OFFLINE-TOLERANT: logged out / no server / a per-row failure leaves
 /// the row where it is for the next pass (never an error). Two queues:
