@@ -8,19 +8,20 @@ const DEFAULT_APP_ROUTE = "/record";
 
 /**
  * A "drill-down" is a route that HIDES the primary rail so the current flow owns
- * the window with its own back-affordance: Settings, Meetings/Library, AND a
- * meeting's detail (`/meeting/:id`) — opening a meeting stays "inside" the
- * Meetings flow (its own "← Meetings" back), so the primary rail must NOT
- * reappear there. The "← Murmur" back target must be a NON-drill-down route, so
- * both this service and app-shell's rail-hide gate share this single predicate.
- * Keep the two in lockstep — a new drill-down route added here is also hidden in
- * app-shell.
+ * the window with its own back-affordance: Settings, Meetings/Library, a
+ * meeting's detail (`/meeting/:id`), AND Notes (`/notes` home + `/notes/:id`
+ * editor) — the Notes home owns its own [rail | content] layout and the editor
+ * stays "inside" the Notes flow, so the primary rail must NOT reappear there.
+ * The "← Murmur" back target must be a NON-drill-down route, so both this service
+ * and app-shell's rail-hide gate share this single predicate. Keep the two in
+ * lockstep — a new drill-down route added here is also hidden in app-shell.
  */
 export function isDrilldownRoute(url: string): boolean {
   return (
     url.startsWith("/settings") ||
     url.startsWith("/library") ||
-    url.startsWith("/meeting")
+    url.startsWith("/meeting") ||
+    url.startsWith("/notes")
   );
 }
 

@@ -1,0 +1,45 @@
+<div class="card note-assist-card" [formGroup]="form">
+  <div class="use-group">
+    <span class="use-group-label text-muted">Note assistant</span>
+
+    <label class="toggle-row">
+      <span class="toggle-copy">
+        <span class="toggle-title">Refine</span>
+        <span class="text-secondary toggle-sub">
+          Improve the selected text's clarity, grammar and flow — same meaning,
+          better wording.
+        </span>
+      </span>
+      <mur-toggle formControlName="noteAssistRefine" />
+    </label>
+
+    <label class="toggle-row">
+      <span class="toggle-copy">
+        <span class="toggle-title">Shorten</span>
+        <span class="text-secondary toggle-sub">
+          Tighten the selection into a more concise version, keeping the point.
+        </span>
+      </span>
+      <mur-toggle formControlName="noteAssistShorten" />
+    </label>
+
+    <label class="toggle-row">
+      <span class="toggle-copy">
+        <span class="toggle-title">Enhance context</span>
+        <span class="text-secondary toggle-sub">
+          Pull related notes and meetings from your brain and add a grounded
+          passage with sources — never overwrites what you wrote.
+        </span>
+      </span>
+      <mur-toggle formControlName="noteAssistEnhance" />
+    </label>
+
+    <p class="text-secondary note-assist-note">
+      In-note Brain actions (Refine · Shorten · Enhance context) run on your
+      Notes model@if (noteAssistModelLabel(); as model) {
+        <span class="note-assist-model"> ({{ model }})</span>
+      }, so they follow the same local or cloud connection you set for Notes
+      above.
+    </p>
+  </div>
+</div>
