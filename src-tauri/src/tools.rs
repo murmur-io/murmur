@@ -382,11 +382,25 @@ pub fn execute_tool(
         }
         ToolCall::GetMeeting { meeting_id } => {
             let mid = meeting_id.as_str();
-            // A sealed-and-not-unlocked meeting is invisible — including its transcript.
+            // A sealed-and-not-unlocked meeting is invisible — including its transcript AND its
+            // title (the masked reply carries only the caller-supplied id, never a title).
             match db.meeting_is_visible(mid, unlocked) {
                 Ok(false) => Ok(format!("No data for meeting {mid}.")),
                 Err(e) => Err(AppError::Storage(format!("visibility check failed: {e}"))),
                 Ok(true) => {
+                    // Brain v2 L3 (JIT `get_meeting`): prepend the meeting's TITLE as a
+                    // `[[Title]]` line so the agent can cite a bare-id fetch. Read ONLY inside
+                    // this Ok(true) visibility arm — a sealed-not-unlocked meeting never reaches
+                    // here. Additive for the MCP surface (a new first line in a free-text payload).
+                    let title_line = db
+                        .get_meeting(mid)
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.title)
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| format!("TITLE: [[{t}]]\n\n"))
+                        .unwrap_or_default();
                     let note = db.get_note_if_visible(mid, unlocked).ok().flatten();
                     let segs = db.get_segments(mid).unwrap_or_default();
                     let transcript = segs
@@ -397,10 +411,12 @@ pub fn execute_tool(
                         .join(" ");
                     match note {
                         Some(n) => Ok(format!(
-                            "NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}",
+                            "{title_line}NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}",
                             n.markdown
                         )),
-                        None if !transcript.is_empty() => Ok(format!("TRANSCRIPT:\n{transcript}")),
+                        None if !transcript.is_empty() => {
+                            Ok(format!("{title_line}TRANSCRIPT:\n{transcript}"))
+                        }
                         None => Ok(format!("No data for meeting {mid}.")),
                     }
                 }
@@ -1770,6 +1786,70 @@ mod tests {
             matches!(res, Err(AppError::InvalidArg(_))),
             "Tier 2 must REFUSE a connector tool (no egress at Tier 2): {res:?}"
         );
+    }
+
+    // ── Brain v2 L3: the JIT `get_meeting` read path (lock-critical) ────────────────────────────────
+
+    /// LOCK INVARIANT (the JIT-retrieval read): `get_meeting` on a SEALED-not-unlocked meeting —
+    /// seeded WITH real segment content, so only the GATE (not data absence) can hide it — returns
+    /// the masked "No data" reply: no note, no transcript, no TITLE. Once the folder is
+    /// session-unlocked the same call legitimately returns the content, WITH the `[[Title]]` line
+    /// the JIT agent cites. RED-able: drop the `meeting_is_visible` arm and the sealed transcript
+    /// leaks.
+    #[test]
+    fn get_meeting_sealed_not_unlocked_is_masked_and_unlocks_with_title() {
+        let db = tmp_db();
+        seed_sealed_meeting(&db, "sealed1", "fsec");
+        // Give the sealed meeting REAL transcript content — the gate, not emptiness, must mask it.
+        db.insert_segments(
+            "sealed1",
+            &[crate::transcribe::Segment {
+                idx: 0,
+                start_s: 0.0,
+                end_s: 2.0,
+                text: "SECRET-ACQUISITION price five million".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new()); // nothing unlocked ⇒ sealed1 invisible
+        let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::Vault);
+        let out = exec
+            .run("get_meeting", &serde_json::json!({ "meetingId": "sealed1" }))
+            .unwrap();
+        assert_eq!(
+            out, "No data for meeting sealed1.",
+            "sealed-not-unlocked get_meeting must be fully masked"
+        );
+        assert!(!out.contains("SECRET-ACQUISITION"), "transcript must not leak");
+        assert!(!out.contains("Sealed"), "the title must not leak either");
+
+        // Session-unlock the folder ⇒ the SAME call now returns the gated content + the title line.
+        unlocked.lock().unwrap().insert("fsec".to_string());
+        let out2 = exec
+            .run("get_meeting", &serde_json::json!({ "meetingId": "sealed1" }))
+            .unwrap();
+        assert!(
+            out2.contains("SECRET-ACQUISITION"),
+            "unlocked content legitimately returns: {out2}"
+        );
+        assert!(
+            out2.starts_with("TITLE: [[Sealed]]"),
+            "the JIT citation title line leads the payload: {out2}"
+        );
+    }
+
+    /// JIT scope contract: `get_meeting` is reachable at Vault / Connectors / Full — but NEVER at
+    /// Tier 1 (CurrentMeeting), whose isolation is the whole point of the cascade.
+    #[test]
+    fn get_meeting_reachable_at_vault_connectors_full_not_current_meeting() {
+        assert!(!AssistantScope::CurrentMeeting.allows("get_meeting"));
+        assert!(AssistantScope::Vault.allows("get_meeting"));
+        assert!(AssistantScope::Connectors.allows("get_meeting"));
+        assert!(AssistantScope::Full.allows("get_meeting"));
     }
 
     /// The TIER PREDICATE partitions the catalog correctly across tiers (the source-of-truth the

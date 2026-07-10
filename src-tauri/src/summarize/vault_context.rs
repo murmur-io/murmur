@@ -154,6 +154,59 @@ pub fn build_vault_context_hybrid_visible(
     Ok((corpus, sources))
 }
 
+/// Brain v2 L3 (JIT retrieval, behind `ask_jit_retrieval`) — a COMPACT, GATED meeting LISTING for
+/// the agentic Ask persona: one `- id | title | date` line per candidate (title char-capped so a
+/// line stays ~80 chars), top `limit` hits for `query` — HYBRID (FTS ∪ vector, RRF-fused) when
+/// `query_vec` is non-empty, gated FTS otherwise, falling back to the most recent VISIBLE meetings
+/// when nothing matches (the same candidate discipline as the corpus builders above).
+///
+/// GATE (load-bearing): every candidate comes from `search_hybrid_visible` /
+/// `search_visible_in_range` / `list_meetings_visible` — all `visibility_clause`-backed against the
+/// live `unlocked` set — so a sealed-and-not-unlocked meeting contributes NO line (not even its
+/// title or id). The listing carries titles/ids/dates only, NEVER note or transcript content: the
+/// agent must `get_meeting` (itself gated) to read anything.
+pub fn build_meeting_listing_visible(
+    db: &Db,
+    query: &str,
+    query_vec: &[f32],
+    limit: i64,
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    /// Keep a whole listing line at ~80 chars: id (36) + separators + date (10) leave ~28 for the title.
+    const TITLE_CAP: usize = 28;
+    let date_filter =
+        crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
+    let mut meetings: Vec<crate::storage::models::Meeting> = if query_vec.is_empty() {
+        db.search_visible_in_range(query, limit, unlocked, date_filter)?
+            .into_iter()
+            .map(|h| h.meeting)
+            .collect()
+    } else {
+        db.search_hybrid_visible(query, query_vec, limit, unlocked, date_filter)?
+            .into_iter()
+            .map(|h| h.meeting)
+            .collect()
+    };
+    if meetings.is_empty() {
+        meetings = db.list_meetings_visible(limit, unlocked)?;
+    }
+    let lines: Vec<String> = meetings
+        .iter()
+        .map(|m| {
+            let title: String = m
+                .title
+                .clone()
+                .unwrap_or_else(|| "(untitled)".to_string())
+                .chars()
+                .take(TITLE_CAP)
+                .collect();
+            let date = m.started_at.split(['T', ' ']).next().unwrap_or("");
+            format!("- {} | {} | {}", m.id, title.trim(), date)
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
 /// Append a budget-capped `## Documents` section of gated document-chunk snippets to `corpus`. The
 /// retrieval is the RRF fusion of `search_doc_chunks_visible` (vector KNN — skipped when
 /// `query_vec` is empty, i.e. the flag-off / model-less path) and `search_doc_chunks_fts_visible`
@@ -343,6 +396,60 @@ mod tests {
             "unlocked content must reappear"
         );
         assert!(sources2.iter().any(|s| s.meeting_id == "sealed"));
+    }
+
+    /// Brain v2 L3 (JIT) — the compact meeting LISTING is gated by the SAME visibility predicate:
+    /// a sealed-and-not-unlocked meeting contributes NO line (not even its title/id — an id in the
+    /// listing invites a `get_meeting` probe and a title alone is already a leak), and it reappears
+    /// once session-unlocked. Lines carry id | title | date ONLY — never note content.
+    #[test]
+    fn meeting_listing_is_gated_and_content_free() {
+        let db = temp_db();
+        seed_note(&db, "open", "Open Meeting", "OPEN-SECRET apollo", None);
+        seed_folder(&db, "f-locked");
+        seed_note(
+            &db,
+            "sealed",
+            "Sealed Secret Sync",
+            "LOCKED-SECRET price",
+            Some("f-locked"),
+        );
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        // Query "Secret" MATCHES the sealed meeting too (its title) — so only the visibility gate,
+        // not query relevance, is what keeps it out of the listing.
+        let nothing = HashSet::new();
+        let listing = build_meeting_listing_visible(&db, "Secret", &[], 30, &nothing).unwrap();
+        assert!(listing.contains("- open"), "open meeting listed: {listing}");
+        assert!(listing.contains("Open Meeting"));
+        assert!(listing.contains("2026-06-26"), "date column present: {listing}");
+        assert!(!listing.contains("sealed"), "sealed id must not be listed: {listing}");
+        assert!(!listing.contains("Sealed Secret"), "sealed title must not leak: {listing}");
+        // Content-free: never note text, even for visible meetings.
+        assert!(!listing.contains("OPEN-SECRET"), "note content must never enter the listing");
+
+        // Session-unlock ⇒ the sealed meeting's line legitimately reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let listing2 = build_meeting_listing_visible(&db, "Secret", &[], 30, &unlocked).unwrap();
+        assert!(listing2.contains("Sealed Secret"), "unlocked meeting reappears: {listing2}");
+
+        // A long title is char-capped so a line stays compact (~80 chars).
+        seed_note(
+            &db,
+            "long",
+            "An Extremely Long Meeting Title That Would Blow The Line Budget Wide Open",
+            "body",
+            None,
+        );
+        let listing3 =
+            build_meeting_listing_visible(&db, "Extremely Long Meeting", &[], 30, &nothing)
+                .unwrap();
+        let line = listing3
+            .lines()
+            .find(|l| l.contains("long |"))
+            .expect("the long-title meeting is listed");
+        assert!(line.len() <= 90, "listing line stays compact, got {}: {line}", line.len());
     }
 
     /// Phase 2b: the HYBRID corpus builder is gated by the SAME visibility predicate. A sealed-not-

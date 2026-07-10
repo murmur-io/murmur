@@ -366,6 +366,7 @@ mod tests {
             config: format!("RRF_K={}", crate::embed::RRF_K),
             embedder_id: crate::embed::selected_embed_model().id.to_string(),
             embedder_real: crate::embed::embed_model_present(),
+            prompt_version: crate::prompts::PROMPT_VERSION.to_string(),
         };
         write_artifact_if_requested(&crate::eval::format_report_markdown(&report, &ctx));
     }
@@ -428,6 +429,7 @@ mod tests {
             ),
             embedder_id: crate::embed::selected_embed_model().id.to_string(),
             embedder_real: real,
+            prompt_version: crate::prompts::PROMPT_VERSION.to_string(),
         };
         let markdown = crate::eval::format_report_markdown(&report, &ctx);
         println!("\n{markdown}");
@@ -469,6 +471,7 @@ mod tests {
             config: "RRF_K=60".to_string(),
             embedder_id: crate::embed::DEFAULT_EMBED_MODEL_ID.to_string(),
             embedder_real: false,
+            prompt_version: crate::prompts::PROMPT_VERSION.to_string(),
         };
         let md = crate::eval::format_report_markdown(&report, &ctx);
         assert!(md.contains("| fts |") && md.contains("| semantic |") && md.contains("| hybrid |"));

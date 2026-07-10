@@ -237,6 +237,7 @@ fn assess_importance(reasoner: &dyn LocalReasoner, facts: &[&Fact]) -> HashMap<S
         temperature: Some(0.1),
         enable_thinking: false,
         timeout: Some(LLM_TIMEOUT),
+        ..GenOptions::default()
     };
     let value = match reasoner.structured_with(IMPORTANCE_SYSTEM, &user, &schema, opts) {
         Ok(v) => v,
@@ -285,6 +286,7 @@ fn reflect(reasoner: &dyn LocalReasoner, label: &str, facts: &[&Fact]) -> Option
         temperature: Some(0.3),
         enable_thinking: false,
         timeout: Some(LLM_TIMEOUT),
+        ..GenOptions::default()
     };
     match reasoner.reason_with(REFLECT_SYSTEM, &user, opts) {
         Ok(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
