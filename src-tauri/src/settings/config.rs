@@ -157,9 +157,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub audio_auto_prune: bool,
     /// Whisper model size: "tiny" | "base" | "small" | "medium" | "large-v3-turbo" |
-    /// "large-v3". Default "small" (~466 MB) — a RAM-safe default: `large-v3` is ~3 GB and swaps
-    /// on 8 GB Macs, and onboarding already preselects `small`. All sizes (incl. `large-v3`, best
-    /// for Polish) stay selectable; the chosen model is downloaded on demand via `download_model`.
+    /// "large-v3" | the quant variants (e.g. "large-v3-turbo-q8_0"). The DEFAULT is the
+    /// machine-conditional T2 flip (`transcribe::model::default_model_size_now`):
+    /// `large-v3-turbo-q8_0` when it is already downloaded OR on a FRESH install (no whisper
+    /// model on disk) with ≥ 12 GB RAM — measured same batch wall-clock as `small` at far better
+    /// Polish (docs/research/2026-07-09-transcription-performance.md); `small` (~470 MB,
+    /// RAM-safe) everywhere else, so an existing install never gets a surprise download. All
+    /// sizes stay selectable; the chosen model is downloaded on demand via `download_model`.
     pub model_size: String,
     /// T1.3 (transcription heat) — the LIVE caption tick's model PIN. Non-empty (default
     /// `"small"`) ⇒ while recording, the live loop decodes with THIS size whenever its file is
@@ -559,7 +563,10 @@ impl Default for AppConfig {
             post_aec_enabled: false,
             audio_storage_limit_gb: None,
             audio_auto_prune: false,
-            model_size: "small".to_string(),
+            // T2 DEFAULT FLIP — machine-conditional (turbo-q8_0 when already downloaded / fresh
+            // big-RAM install, else "small"); the ONE decision lives in
+            // `transcribe::model::default_model_size`. Onboarding preselects THIS value.
+            model_size: crate::transcribe::model::default_model_size_now().to_string(),
             live_model_pin: default_live_model_pin(),
             live_vad_gate: true,
             voice_trigger: false,
@@ -1468,15 +1475,23 @@ mod tests {
         assert!(!AppConfig::load(&db).unwrap().capture_system_audio);
     }
 
-    /// A2 — the app default whisper model is `small` (RAM-safe; `large-v3` is ~3 GB and swaps on
-    /// 8 GB Macs). Must match `transcribe::model_filename("", _)`'s empty-size fallback so a config
-    /// that bypasses onboarding no longer lands on `large-v3`. All sizes stay selectable.
+    /// A2 + T2 flip — the app default whisper model is the MACHINE-CONDITIONAL resolver's pick
+    /// (`transcribe::model::default_model_size_now`): turbo-q8_0 when already downloaded or on a
+    /// fresh big-RAM install, `small` (RAM-safe) otherwise. Machine-dependent BY DESIGN, so
+    /// assert consistency with the resolver (the ONE decision) rather than a literal, plus the
+    /// closed set of sanctioned defaults. `large-v3` (~3 GB) is never a default.
     #[test]
-    fn model_size_defaults_to_small() {
-        assert_eq!(AppConfig::default().model_size, "small");
+    fn model_size_default_matches_conditional_resolver() {
+        let expected = crate::transcribe::model::default_model_size_now();
+        assert_eq!(AppConfig::default().model_size, expected);
         // Empty settings table loads the same default.
         let db = temp_db();
-        assert_eq!(AppConfig::load(&db).unwrap().model_size, "small");
+        assert_eq!(AppConfig::load(&db).unwrap().model_size, expected);
+        // Whatever the machine, the default is one of the two sanctioned sizes.
+        assert!(
+            expected == "small" || expected == crate::transcribe::model::TURBO_DEFAULT_SIZE,
+            "unsanctioned default: {expected}"
+        );
     }
 
     /// T1.3/T1.4 — the live-tick pin defaults to `small` and the VAD tick gate defaults ON

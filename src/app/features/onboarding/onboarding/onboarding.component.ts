@@ -63,6 +63,7 @@ const SIZE_HINTS: Record<string, string> = {
   tiny: "~75 MB",
   base: "~150 MB",
   small: "~470 MB",
+  "large-v3-turbo-q8_0": "~875 MB",
   medium: "~1.5 GB",
   "large-v3": "~3 GB",
 };

@@ -616,23 +616,55 @@ pub async fn start_recording(
         // pass on the configured model is the authoritative transcript and is unaffected).
         // `""` disables the pin → the configured model, with the LEGACY `brain_live` pin-to-small
         // (D1, spec §4.3: the live tick must not starve the light reasoner) still applying — the
-        // full decision lives in `model::live_pin_size`. If the pinned model file is absent,
-        // fall back to the configured model + warn (pinning to an absent file would kill the
-        // live loop).
+        // full decision lives in `model::live_pin_size`.
+        //
+        // ABSENT-FILE fallback (T2 default-flip follow-up — a fresh ≥12 GB install downloads
+        // ONLY `ggml-large-v3-turbo-q8_0.bin`, so the pinned `small` is absent on the flip's
+        // target machines): prefer the largest downloaded live-SAFE model (small → base →
+        // tiny); a live-safe CONFIGURED model still works as before; but a medium/large-class
+        // configured model is NEVER handed to the live tick — captions are skipped for THIS
+        // recording and the pinned size is downloaded in the background (single-flight,
+        // best-effort) so the next recording — and the wake listener, which reconciles via
+        // `restart_voice_listener` when this recording stops — has it.
         let live_model = match crate::transcribe::model::live_pin_size(
             &cfg.live_model_pin,
             cfg.brain_live,
         ) {
             Some(size) => match crate::transcribe::model::resolve_model_path(None, &size, lang) {
                 Ok(Some(p)) => Some(p),
-                _ => {
-                    tracing::warn!(
-                        target: "live",
-                        pin = %size,
-                        "pinned live model absent; live tick uses the configured whisper model (may run hot / contend with the light reasoner)"
-                    );
-                    configured()
-                }
+                _ => match crate::transcribe::model::live_fallback_model(lang) {
+                    Some(p) => {
+                        tracing::warn!(
+                            target: "live",
+                            pin = %size,
+                            "pinned live model absent; live tick uses the largest downloaded live-safe whisper model"
+                        );
+                        Some(p)
+                    }
+                    None => match configured() {
+                        Some(p) if !crate::transcribe::model::is_live_heavy_model_file(&p) => {
+                            tracing::warn!(
+                                target: "live",
+                                pin = %size,
+                                "pinned live model absent; live tick uses the configured whisper model (may contend with the light reasoner)"
+                            );
+                            Some(p)
+                        }
+                        Some(_) => {
+                            // Only medium/large-class models downloaded (e.g. the fresh
+                            // turbo-default install): NEVER run a large encoder on the 3 s
+                            // live tick (T1.3 heat).
+                            tracing::warn!(
+                                target: "live",
+                                pin = %size,
+                                "pinned live model absent and only medium/large models downloaded; live captions off for this recording; downloading the pinned model in the background"
+                            );
+                            spawn_live_pin_download(size, lang.to_string());
+                            None
+                        }
+                        None => None,
+                    },
+                },
             },
             None => configured(),
         };
@@ -651,6 +683,36 @@ pub async fn start_recording(
     );
 
     Ok(StartResult { meeting_id })
+}
+
+/// Best-effort BACKGROUND download of the pinned LIVE model (T2 default-flip follow-up): a
+/// fresh turbo-default install has no live-safe whisper model on disk, so the first record
+/// start fetches the pinned size (~487 MB `small`) off the recording path. Single-flight (an
+/// `AtomicBool` latch — consecutive record starts while a download is in flight must not race
+/// two writers onto the same `.part` file); failure is logged and re-armed (next record start
+/// retries). Deliberately does NOT spawn the live loop when the download lands mid-meeting:
+/// a belated `live::spawn` could race a NEXT recording's own live loop and clear its
+/// `live_transcript`. The model serves the next recording + the wake listener instead.
+fn spawn_live_pin_download(size: String, language: String) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        match crate::transcribe::model::ensure_model(None, &size, &language, |_, _| {}).await {
+            Ok(_) => {
+                tracing::info!(target: "live", pin = %size, "pinned live model downloaded; live captions available from the next recording")
+            }
+            Err(e) => {
+                tracing::warn!(target: "live", pin = %size, error = %e, "pinned live model download failed; will retry on a later record start")
+            }
+        }
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Stop capture, then run the full pipeline (pipeline::run_after_stop). Returns the
@@ -6896,9 +6958,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         audio_storage_limit_gb: d.audio_storage_limit_gb,
         audio_auto_prune: d.audio_auto_prune,
         model_size: if d.model_size.trim().is_empty() {
-            // Mirror AppConfig::default().model_size — an empty/blank choice from the FE must
-            // fall back to the multilingual large-v3 default (best Polish quality), NOT a
-            // smaller model that would silently downgrade transcription.
+            // Mirror AppConfig::default().model_size — an empty/blank choice from the FE
+            // resolves the machine-conditional T2 default (`model::default_model_size_now`:
+            // turbo-q8_0 when already downloaded / fresh ≥12 GB install, else `small`), the
+            // same ONE decision every other blank-size path takes.
             AppConfig::default().model_size
         } else {
             d.model_size
