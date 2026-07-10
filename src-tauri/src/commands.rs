@@ -21171,6 +21171,90 @@ mod lifecycle_tests {
         assert_eq!(failed[0].last_error.as_deref(), Some("upload_failed"));
     }
 
+    /// CROSS-SLICE AAD FIX (RED-before-GREEN for the round-trip bug): the envelope AAD item nonce is
+    /// `hex(content_sha256)`, which BOTH the publisher (from the envelope it seals) and every consumer
+    /// (from the feed's `content_sha256`) derive identically — so a cross-member open SUCCEEDS. The
+    /// old code sealed under the LOCAL row_id (unknowable to a consumer) → open would have FAILED. This
+    /// test seals as the publisher, then opens as a consumer using ONLY the feed hash (never the local
+    /// row id), proving the two AADs match.
+    #[test]
+    fn org_envelope_aad_nonce_is_content_hash_so_cross_member_open_succeeds() {
+        use crate::share::org_envelope::{open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind};
+
+        let ock = crate::crypto::random_key().unwrap();
+        let env = OrgEnvelope::new(
+            OrgItemKind::Note,
+            "Roadmap",
+            "the apollo migration ships friday",
+            "anna",
+            "2026-07-10T09:00:00Z",
+            1,
+        );
+        let content_sha = env.content_sha256();
+
+        // PUBLISHER seals under hex(content_sha) — NOT the local row id. (The server would assign a
+        // different item_id; we simulate that by using a DISTINCT server id below.)
+        let publisher_nonce = org_item_nonce(&content_sha);
+        let (ciphertext, feed_sha) =
+            seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
+        assert_eq!(feed_sha, content_sha, "the feed carries the PLAINTEXT hash");
+
+        // CONSUMER derives the nonce from ONLY the feed's content_sha256 (it never learns row_id, and
+        // the server item_id 'server-xyz' is deliberately different from any local id).
+        let consumer_nonce = org_item_nonce(&feed_sha);
+        assert_eq!(publisher_nonce, consumer_nonce, "both sides derive the same AAD nonce");
+        let opened = open_org_envelope(&ock, &ciphertext, "org-1", &consumer_nonce).unwrap();
+        assert_eq!(opened, env, "a consumer opens the cell with only the feed hash");
+
+        // Sanity: the SERVER item id would NOT open it (proving the old row_id/item_id approach was
+        // broken — the nonce must be the content hash, not any id).
+        assert!(
+            open_org_envelope(&ock, &ciphertext, "org-1", "server-xyz").is_err(),
+            "opening under the server item_id (the old broken nonce) must fail"
+        );
+    }
+
+    /// `org_item_nonce` is deterministic lowercase-hex of the 32-byte hash (stable across devices).
+    #[test]
+    fn org_item_nonce_is_lowercase_hex() {
+        let n = org_item_nonce(&[0x0a, 0xff, 0x00, 0x10]);
+        assert_eq!(n, "0aff0010");
+    }
+
+    /// `org_get_item` command returns the full decrypted item, and `None` for a tombstoned/unknown id.
+    #[test]
+    fn org_get_item_returns_detail_and_none_for_tombstone() {
+        let state = build_state("org-get-item");
+        state
+            .db
+            .upsert_org_item(
+                "it-g",
+                "org-1",
+                1,
+                "anna",
+                "Weekly Sync",
+                "the roadmap for the platform team",
+                "2026-07-10T09:00:00Z",
+                2,
+                1,
+                &vec![5u8; 32],
+                None,
+            )
+            .unwrap();
+        let got = state.db.get_org_item("it-g").unwrap().unwrap();
+        assert_eq!(got.item_id, "it-g");
+        assert_eq!(got.title, "Weekly Sync");
+        assert_eq!(got.author_hint, "anna");
+        assert_eq!(got.rev, 2);
+        assert!(got.markdown.contains("platform team"));
+
+        // Tombstone → the viewer returns None.
+        state.db.tombstone_org_item("it-g").unwrap();
+        assert!(state.db.get_org_item("it-g").unwrap().is_none());
+        // Unknown id → None.
+        assert!(state.db.get_org_item("nope").unwrap().is_none());
+    }
+
     /// `org_state` upsert preserves the LOCAL consent + sync cursor across a status refresh (a refresh
     /// carrying role/name/generation must NOT reset consent or rewind last_seq), and the consent +
     /// generation + last_seq setters work as the single mutators.

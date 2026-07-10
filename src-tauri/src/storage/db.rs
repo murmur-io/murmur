@@ -10054,6 +10054,204 @@ mod tests {
         db.migrate().unwrap();
     }
 
+    // ── M6 Shared Brain — org ingest + retrieval ────────────────────────────────────────────────
+
+    fn sha32(tag: u8) -> Vec<u8> {
+        vec![tag; 32]
+    }
+
+    /// Ingest round-trip: upsert an org item WITH a real (stub) embedder → both the int8 KNN leg AND
+    /// the FTS leg retrieve it back with the right author/title/snippet + content hash.
+    #[test]
+    fn org_ingest_round_trips_through_int8_knn_and_fts() {
+        let db = mem_db();
+        let emb = crate::embed::StubEmbedder;
+        let sha = sha32(1);
+        db.upsert_org_item(
+            "it-1",
+            "org-1",
+            5,
+            "anna",
+            "Roadmap sync",
+            "decided the budget for the apollo project this quarter",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha,
+            Some(&emb),
+        )
+        .unwrap();
+
+        // FTS leg finds it.
+        let fts = db.search_org_chunks_fts("apollo budget", 10).unwrap();
+        assert_eq!(fts.len(), 1, "FTS must retrieve the ingested item");
+        assert_eq!(fts[0].item_id, "it-1");
+        assert_eq!(fts[0].author_hint, "anna");
+        assert_eq!(fts[0].title, "Roadmap sync");
+        assert_eq!(fts[0].content_sha256, sha);
+        assert!(fts[0].snippet.contains("apollo"));
+
+        // int8 KNN leg finds it (query embedded with the SAME stub embedder → identical space).
+        let qv = emb
+            .embed_query(&["apollo budget".to_string()])
+            .unwrap()
+            .remove(0);
+        let knn = db.search_org_chunks_knn(&qv, 10).unwrap();
+        assert!(
+            knn.iter().any(|h| h.item_id == "it-1"),
+            "int8 KNN must retrieve the ingested item"
+        );
+
+        // The full decrypted item is readable for the viewer.
+        let detail = db.get_org_item("it-1").unwrap().unwrap();
+        assert_eq!(detail.title, "Roadmap sync");
+        assert_eq!(detail.author_hint, "anna");
+        assert!(detail.markdown.contains("apollo"));
+    }
+
+    /// FTS-only fallback: ingesting with NO embedder writes chunks (FTS-reachable) but ZERO int8
+    /// vectors — so the KNN leg finds nothing while FTS still does. Proves the StubEmbedder-absent
+    /// (ftsOnly) path writes no vectors at rest.
+    #[test]
+    fn org_ingest_fts_only_when_no_embedder() {
+        let db = mem_db();
+        db.upsert_org_item(
+            "it-x",
+            "org-1",
+            1,
+            "bob",
+            "Notes",
+            "quarterly hiring plan for the platform team",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(2),
+            None, // no embedder → FTS-only
+        )
+        .unwrap();
+
+        let fts = db.search_org_chunks_fts("hiring platform", 10).unwrap();
+        assert_eq!(fts.len(), 1, "FTS reaches an FTS-only ingested item");
+
+        // No vectors were written → a KNN over any vector finds nothing.
+        let qv = crate::embed::StubEmbedder
+            .embed_query(&["hiring platform".to_string()])
+            .unwrap()
+            .remove(0);
+        let knn = db.search_org_chunks_knn(&qv, 10).unwrap();
+        assert!(knn.is_empty(), "no int8 vectors when ingested FTS-only");
+
+        // The re-embed backlog lists exactly this item.
+        let backlog = db.org_items_needing_embed("org-1", 10).unwrap();
+        assert_eq!(backlog, vec!["it-x".to_string()]);
+    }
+
+    /// Tombstone eviction: a tombstoned item disappears from BOTH retrieval legs + the viewer, and
+    /// its chunks/vectors/FTS rows are purged. Re-tombstoning is idempotent.
+    #[test]
+    fn org_tombstone_evicts_from_retrieval_and_viewer() {
+        let db = mem_db();
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-t",
+            "org-1",
+            1,
+            "carol",
+            "Secret plan",
+            "the classified atlas acquisition timeline",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(3),
+            Some(&emb),
+        )
+        .unwrap();
+        assert_eq!(
+            db.search_org_chunks_fts("atlas acquisition", 10).unwrap().len(),
+            1
+        );
+
+        db.tombstone_org_item("it-t").unwrap();
+
+        assert!(
+            db.search_org_chunks_fts("atlas acquisition", 10).unwrap().is_empty(),
+            "tombstoned item must vanish from FTS"
+        );
+        let qv = emb
+            .embed_query(&["atlas acquisition".to_string()])
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.search_org_chunks_knn(&qv, 10).unwrap().is_empty(),
+            "tombstoned item must vanish from KNN"
+        );
+        assert!(
+            db.get_org_item("it-t").unwrap().is_none(),
+            "the viewer must not return a tombstoned item"
+        );
+        // Its chunks/vectors are gone.
+        let n: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM org_chunks WHERE item_id='it-t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "org_chunks purged on tombstone");
+        // Idempotent re-tombstone.
+        db.tombstone_org_item("it-t").unwrap();
+    }
+
+    /// Re-pull idempotency: upserting the SAME item id twice REPLACES (never duplicates) its chunks —
+    /// a clean re-index, and a bumped rev overwrites the body.
+    #[test]
+    fn org_upsert_is_idempotent_and_replaces_on_rev_bump() {
+        let db = mem_db();
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-r", "org-1", 1, "dan", "V1", "first version body alpha", "t", 1, 1, &sha32(4),
+            Some(&emb),
+        )
+        .unwrap();
+        db.upsert_org_item(
+            "it-r", "org-1", 2, "dan", "V2", "second version body bravo", "t", 2, 1, &sha32(5),
+            Some(&emb),
+        )
+        .unwrap();
+        // Only the v2 body is chunked (no duplicate/stale chunks).
+        assert!(
+            db.search_org_chunks_fts("bravo", 10).unwrap().len() == 1,
+            "the re-index surfaces the new body"
+        );
+        assert!(
+            db.search_org_chunks_fts("alpha", 10).unwrap().is_empty(),
+            "the stale v1 body is fully replaced (no orphan chunks)"
+        );
+        let detail = db.get_org_item("it-r").unwrap().unwrap();
+        assert_eq!(detail.rev, 2);
+        assert_eq!(detail.title, "V2");
+    }
+
+    /// The self-share dedup source: `all_org_shared_content_hashes` returns every non-null
+    /// `content_sha256` from local `org_shares` — the set a retrieval hit is checked against.
+    #[test]
+    fn org_shared_content_hashes_are_collected() {
+        let db = mem_db();
+        let now = "2026-07-10T00:00:00Z";
+        db.insert_org_share(
+            "s1", "org-1", Some("m1"), None, "note", Some("T1"), 1, 1, &sha32(7), now,
+        )
+        .unwrap();
+        db.insert_org_share(
+            "s2", "org-1", None, Some("d1"), "note", Some("T2"), 1, 1, &sha32(8), now,
+        )
+        .unwrap();
+        let hashes = db.all_org_shared_content_hashes().unwrap();
+        assert!(hashes.contains(&sha32(7)));
+        assert!(hashes.contains(&sha32(8)));
+    }
+
     /// NOTES feature — the additive columns exist after migrate() and re-migrating is a no-op
     /// (idempotent guard). `documents.title/updated_at/exported_path` + `folders.kind` are present,
     /// and existing folders default to `kind='meeting'`.
