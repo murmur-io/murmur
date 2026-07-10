@@ -218,6 +218,8 @@ pub fn run() {
             commands::org_sweep_pending,
             commands::org_sync_now,
             commands::org_get_item,
+            commands::folder_active_shares,
+            commands::revoke_shares_for_folder,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::set_gateway_key,
