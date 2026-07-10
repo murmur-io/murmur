@@ -8,8 +8,7 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe,
-    CalendarContext,
+    ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe, CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
     NoteRecord, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
@@ -657,11 +656,7 @@ pub async fn stop_recording(
     // A POISONED `spill_writer` mutex (`.lock().ok()` ⇒ None) merely DEFERS this clean-stop cleanup:
     // the spill lingers to next launch, where `claim_inflight` sees the row is no longer RECORDING and
     // DiscardOrphans it — benign (no leak, no content loss), so tolerating the poison here is correct.
-    let _spill_guard = state
-        .spill_writer
-        .lock()
-        .ok()
-        .and_then(|mut s| s.take());
+    let _spill_guard = state.spill_writer.lock().ok().and_then(|mut s| s.take());
 
     // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
     // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
@@ -1671,10 +1666,7 @@ pub(crate) fn link_related_notes_inner(state: &AppState, meeting_id: &str) -> Re
 /// pass; this command lets the user (or a backfill over old notes) re-run it on demand. Lock-gated +
 /// seal-safe (a sealed meeting is a silent no-op) and ZERO egress.
 #[tauri::command]
-pub fn link_related_notes(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<(), AppError> {
+pub fn link_related_notes(state: State<'_, AppState>, meeting_id: String) -> Result<(), AppError> {
     link_related_notes_inner(state.inner(), &meeting_id)
 }
 
@@ -3064,7 +3056,8 @@ pub(crate) fn preview_supersessions_inner(
         };
         // The superseding meeting is now known-unlocked, so its title is safe to surface (`None` only
         // when it was never exported to the vault).
-        let superseding_note_title = note_file_for(state, &r.superseding_meeting_id)?.map(|(_, s)| s);
+        let superseding_note_title =
+            note_file_for(state, &r.superseding_meeting_id)?.map(|(_, s)| s);
         out.push(SupersessionDto {
             id: r.id,
             entity: r.entity,
@@ -3172,9 +3165,11 @@ pub(crate) fn apply_supersessions_inner(
         // between write and mark-applied still leaves a recoverable un-stamped pre-image. `COALESCE`
         // never clobbers an already-stored pristine backup and, combined with the pristine cache, the
         // stored bytes are NEVER a re-snapshot of a stamped file.
-        state
-            .db
-            .store_supersession_pre_images(id, Some(&source_pre), superseding_pre.as_deref())?;
+        state.db.store_supersession_pre_images(
+            id,
+            Some(&source_pre),
+            superseding_pre.as_deref(),
+        )?;
 
         // Stamp the SOURCE note: append the callout to the CURRENT on-disk content (idempotent — a
         // retry over an already-stamped file is a no-op). The undo pre-image is the pristine cache
@@ -3571,6 +3566,14 @@ pub async fn ask_vault(
     // Gated cross-meeting USER MEMORY brief (parity with the @brain loop): VISIBLE facts only under
     // this same unlock snapshot, empty when memory is disabled ⇒ the floor prompt is byte-identical.
     let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked);
+    // Brain v2 L1.4 — the Ask-only reranker: resolve from the LIVE Ask-role reasoner.
+    // `active_reranker` degrades stub/cloud reasoners to the identity StubReranker (rerank is
+    // strictly on-device — a cloud reasoner would turn each pointwise judgment into egress).
+    let reranker = crate::rerank::active_reranker(
+        state
+            .reasoner
+            .current_for(crate::summarize::roles::Role::Ask),
+    );
     ask_vault_floor(
         &state.db,
         &config,
@@ -3578,6 +3581,7 @@ pub async fn ask_vault(
         &question,
         &history,
         &memory_brief,
+        Some(reranker.as_ref()),
     )
     .await
 }
@@ -3771,6 +3775,7 @@ fn build_ask_vault_floor_prompt(
     question: &str,
     history: &[ChatTurn],
     memory_brief: &str,
+    reranker: Option<&dyn crate::rerank::Reranker>,
 ) -> Result<AskFloorPrompt, AppError> {
     // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪
     // vector KNN, RRF-fused) — embedding the query with the active embedder — then pack with the
@@ -3793,7 +3798,7 @@ fn build_ask_vault_floor_prompt(
             .next()
             .unwrap_or_default();
         crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            db, question, &ask_conn, &query_vec, unlocked,
+            db, question, &ask_conn, &query_vec, unlocked, reranker,
         )?
     } else {
         crate::summarize::vault_context::build_vault_context_visible(
@@ -3828,8 +3833,17 @@ async fn ask_vault_floor(
     question: &str,
     history: &[ChatTurn],
     memory_brief: &str,
+    reranker: Option<&dyn crate::rerank::Reranker>,
 ) -> Result<AskVaultResult, AppError> {
-    match build_ask_vault_floor_prompt(db, config, unlocked, question, history, memory_brief)? {
+    match build_ask_vault_floor_prompt(
+        db,
+        config,
+        unlocked,
+        question,
+        history,
+        memory_brief,
+        reranker,
+    )? {
         AskFloorPrompt::Empty(result) => Ok(result),
         AskFloorPrompt::Ready {
             system,
@@ -4020,7 +4034,7 @@ mod ask_vault_tests {
         let (want_system, want_user) =
             crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "").unwrap() {
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None).unwrap() {
             AskFloorPrompt::Ready {
                 system,
                 user,
@@ -4051,7 +4065,7 @@ mod ask_vault_tests {
 
         // The empty-vault early return keeps the EXACT pre-change canned answer.
         let empty = tmp_db();
-        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "").unwrap() {
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None).unwrap() {
             AskFloorPrompt::Empty(r) => {
                 assert_eq!(
                     r.answer,
@@ -4091,6 +4105,7 @@ mod ask_vault_tests {
             "atlas?",
             &[],
             "",
+            None,
         ));
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
@@ -5826,7 +5841,8 @@ pub(crate) fn rename_speaker_inner(
     // the still-original turns. A label with no overlapping diarized cluster (the "me" lane, or a
     // non-diarized meeting with no segments) → None → enroll nothing.
     let old_cluster = parse_others_cluster(old_label).or_else(|| {
-        reconcile_meeting_speakers(state, meeting_id, Some(&tl.speakers)).cluster_for_label(old_label)
+        reconcile_meeting_speakers(state, meeting_id, Some(&tl.speakers))
+            .cluster_for_label(old_label)
     });
 
     for turn in &mut tl.speakers {
@@ -5978,9 +5994,17 @@ pub(crate) fn suggest_speaker_labels_inner(
                 .label_for_cluster(cluster)
                 .map(str::to_string)
                 .unwrap_or_else(|| {
-                    format!("{}-{}", crate::audio::merge::SPEAKER_OTHERS, s.cluster_index)
+                    format!(
+                        "{}-{}",
+                        crate::audio::merge::SPEAKER_OTHERS,
+                        s.cluster_index
+                    )
                 });
-            SpeakerSuggestion { speaker, suggested_label: s.label, score: s.score }
+            SpeakerSuggestion {
+                speaker,
+                suggested_label: s.label,
+                score: s.score,
+            }
         })
         .collect())
 }
@@ -6012,7 +6036,11 @@ fn reconcile_meeting_speakers(
     let turns = turns.unwrap_or(&loaded);
     let turn_refs: Vec<TurnRef<'_>> = turns
         .iter()
-        .map(|t| TurnRef { start_s: t.start_s, end_s: t.end_s, label: &t.speaker })
+        .map(|t| TurnRef {
+            start_s: t.start_s,
+            end_s: t.end_s,
+            label: &t.speaker,
+        })
         .collect();
     reconcile_speakers(&segments, &turn_refs)
 }
@@ -6348,7 +6376,10 @@ pub fn brain_model_retirement_nudge(
         c.brain_model_id.clone()
     };
     let dir = crate::transcribe::models_dir()?;
-    Ok(crate::reason::retired_model_nudge(selected.as_deref(), &dir))
+    Ok(crate::reason::retired_model_nudge(
+        selected.as_deref(),
+        &dir,
+    ))
 }
 
 /// The DERIVED Murmur Brain posture (spec §2.1) for the Settings display — computed from the live
@@ -6842,6 +6873,12 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
                         if let Err(e) = db.index_meeting_chunks(&m.id, &segments, embedder) {
                             // Never abort the whole backfill on one bad note — log (no PII) and continue.
                             tracing::warn!(target: "rag", error = %e, "reindex: indexing one meeting failed (skipped)");
+                        } else if let Err(e) =
+                            db.index_meeting_topic_chunks(&m.id, &segments, embedder, unlocked)
+                        {
+                            // Brain v2 L1.1 — topic chunks follow the note/transcript index (whose
+                            // clean-replace purge covers all chunk classes). Same best-effort posture.
+                            tracing::warn!(target: "rag", error = %e, "reindex: topic indexing failed (skipped)");
                         }
                     }
                     Err(e) => {
@@ -7174,7 +7211,9 @@ fn move_into_locked_folder(
     // Mirrors `unlock_folder`'s per-meeting restore, scoped to this one moved meeting. Under the
     // lifecycle guard held for the whole move, so no relock can interleave.
     for n in &state.db.sealable_notes_for_meeting(meeting_id)? {
-        let Some(blob) = &n.content_blob else { continue };
+        let Some(blob) = &n.content_blob else {
+            continue;
+        };
         let aad = aad_content(folder_id, meeting_id, &n.provider_id, "note");
         let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
         let markdown = String::from_utf8(pt)
@@ -7188,7 +7227,11 @@ fn move_into_locked_folder(
     // markdown was just restored above). Model-gated (never a stub vector); best-effort — a re-index
     // hiccup must not fail (or half-undo) the completed move.
     let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    reindex_meetings_after_unseal(state, &[meeting_id.to_string()], meeting_embedder.as_deref());
+    reindex_meetings_after_unseal(
+        state,
+        &[meeting_id.to_string()],
+        meeting_embedder.as_deref(),
+    );
     Ok(())
 }
 
@@ -7576,9 +7619,7 @@ pub async fn unlock_folder(
                             crate::secrets::list_master_kek_candidates("Recover the folder key")
                         })
                         .await
-                        .map_err(|e| {
-                            AppError::Auth(format!("kek-recovery task join failed: {e}"))
-                        })?
+                        .map_err(|e| AppError::Auth(format!("kek-recovery task join failed: {e}")))?
                         .unwrap_or_else(|_| Zeroizing::new(Vec::new()));
                         match try_unwrap_ck_with_candidates(&candidates, &wrapped, &folder_id, None)
                         {
@@ -8884,6 +8925,21 @@ fn reindex_meetings_after_unseal(
         };
         if let Err(e) = state.db.index_meeting_chunks(mid, &segments, embedder) {
             tracing::warn!(target: "rag", error = %e, "meeting re-index on unlock failed (note plaintext already restored)");
+        } else {
+            // Brain v2 L1.1 — rebuild the TOPIC chunks too (the seal purged them via the shared
+            // choke point). The folder was just session-unlocked, so pass the LIVE unlock set —
+            // the visibility gate inside must see this meeting as visible.
+            let unlocked = state
+                .unlocked_folders
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            if let Err(e) = state
+                .db
+                .index_meeting_topic_chunks(mid, &segments, embedder, &unlocked)
+            {
+                tracing::warn!(target: "rag", error = %e, "topic re-index on unlock failed (content unaffected)");
+            }
         }
     }
 }
@@ -8925,8 +8981,9 @@ fn unseal_meeting_extras(
         if let Some(blob) = &rn.blob {
             let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
             let pt = crate::crypto::decrypt(ck, blob, &aad)?;
-            let text = String::from_utf8(pt)
-                .map_err(|_| AppError::Storage("decrypted manual notes is not valid UTF-8".into()))?;
+            let text = String::from_utf8(pt).map_err(|_| {
+                AppError::Storage("decrypted manual notes is not valid UTF-8".into())
+            })?;
             state.db.set_manual_notes(mid, &text)?;
         }
     }
@@ -9641,8 +9698,8 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
     // ("no cached account key") and the FE falls back to the password CTA. The probe result still
     // short-circuits `true` when it does find the item.
     let probe_says_cached = crate::secrets::keychain::account_mk_cached().unwrap_or(false);
-    let biometric_unlock_available = logged_in
-        && (probe_says_cached || cfg!(all(target_os = "macos", not(debug_assertions))));
+    let biometric_unlock_available =
+        logged_in && (probe_says_cached || cfg!(all(target_os = "macos", not(debug_assertions))));
     let cfg = state
         .config
         .lock()
@@ -10003,7 +10060,14 @@ pub async fn share_note_to_link(
     password: Option<String>,
     max_downloads: Option<u32>,
 ) -> Result<String, AppError> {
-    share_note_to_link_inner(state.inner(), meeting_id, expires_days, password, max_downloads).await
+    share_note_to_link_inner(
+        state.inner(),
+        meeting_id,
+        expires_days,
+        password,
+        max_downloads,
+    )
+    .await
 }
 
 /// Core of [`share_note_to_link`] over `&AppState` so the lock gate + consent gate are unit-testable
@@ -10841,7 +10905,12 @@ async fn finalize_accepted_share(
         &chrono::Utc::now().to_rfc3339(),
     )?;
     state.db.delete_pending_share_accept(share_id)?;
-    crate::share::ledger_row(&state.db, &client.host(), "share_accept", content_cell.len());
+    crate::share::ledger_row(
+        &state.db,
+        &client.host(),
+        "share_accept",
+        content_cell.len(),
+    );
     Ok(result)
 }
 
@@ -11484,14 +11553,20 @@ mod lifecycle_tests {
                 gateway_host: None,
             })
             .unwrap();
-        state.db.set_note_folder("m-vlock", Some("f-vlock")).unwrap();
+        state
+            .db
+            .set_note_folder("m-vlock", Some("f-vlock"))
+            .unwrap();
         state
             .db
             .set_folder_locked("f-vlock", true, Some(&b"wrapped"[..]))
             .unwrap();
         // NOT session-unlocked: both commands fail closed with Locked.
         let e1 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
-        assert!(matches!(e1, AppError::Locked(_)), "verify must fail Locked, got: {e1:?}");
+        assert!(
+            matches!(e1, AppError::Locked(_)),
+            "verify must fail Locked, got: {e1:?}"
+        );
         let finding = crate::verify::VerifyFinding {
             line_no: 2,
             key: "PROJ-1".into(),
@@ -11499,9 +11574,12 @@ mod lifecycle_tests {
             detail: "PROJ-1 not found in Jira".into(),
             url: String::new(),
         };
-        let e2 =
-            apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding]).unwrap_err();
-        assert!(matches!(e2, AppError::Locked(_)), "apply must fail Locked, got: {e2:?}");
+        let e2 = apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding])
+            .unwrap_err();
+        assert!(
+            matches!(e2, AppError::Locked(_)),
+            "apply must fail Locked, got: {e2:?}"
+        );
 
         // Session-unlock → the lock gate passes; verify now falls to the fail-closed connector gate
         // (no Jira configured ⇒ jira_lookup NeedsConsent ⇒ Unavailable), proving Locked was the gate.
@@ -11596,7 +11674,10 @@ mod lifecycle_tests {
                 gateway_host: None,
             })
             .unwrap();
-        state.db.set_note_folder("m-elock", Some("f-elock")).unwrap();
+        state
+            .db
+            .set_note_folder("m-elock", Some("f-elock"))
+            .unwrap();
         state
             .db
             .set_folder_locked("f-elock", true, Some(&b"wrapped"[..]))
@@ -11604,15 +11685,20 @@ mod lifecycle_tests {
 
         // Sealed → both refuse Locked before any egress/write.
         let e1 = block_on(enrich_note_context_inner(&state, "m-elock".to_string())).unwrap_err();
-        assert!(matches!(e1, AppError::Locked(_)), "preview must fail Locked, got: {e1:?}");
+        assert!(
+            matches!(e1, AppError::Locked(_)),
+            "preview must fail Locked, got: {e1:?}"
+        );
         let hit = crate::enrich::ContextHit {
             source: "Jira".into(),
             detail: "PROJ-1 · Done".into(),
             url: None,
         };
-        let e2 =
-            apply_note_enrichment_inner(&state, "m-elock".to_string(), vec![hit]).unwrap_err();
-        assert!(matches!(e2, AppError::Locked(_)), "apply must fail Locked, got: {e2:?}");
+        let e2 = apply_note_enrichment_inner(&state, "m-elock".to_string(), vec![hit]).unwrap_err();
+        assert!(
+            matches!(e2, AppError::Locked(_)),
+            "apply must fail Locked, got: {e2:?}"
+        );
 
         // Session-unlock → the lock gate passes; with no connectors the preview is graceful-empty.
         state
@@ -11621,7 +11707,10 @@ mod lifecycle_tests {
             .unwrap()
             .insert("f-elock".to_string());
         let hits = block_on(enrich_note_context_inner(&state, "m-elock".to_string())).unwrap();
-        assert!(hits.is_empty(), "no connectors configured ⇒ nothing to enrich, got: {hits:?}");
+        assert!(
+            hits.is_empty(),
+            "no connectors configured ⇒ nothing to enrich, got: {hits:?}"
+        );
     }
 
     /// The enrich WRITE path persists a reviewed context block into the canonical DB note and
@@ -11630,7 +11719,12 @@ mod lifecycle_tests {
     fn apply_note_enrichment_writes_then_strips_byte_exact() {
         let state = build_state("enrich-write");
         make_open_folder(&state.db, "f-open", "Project");
-        seed_meeting(&state.db, "m1", "# Notes\n- decided to ship\n", Some("f-open"));
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Notes\n- decided to ship\n",
+            Some("f-open"),
+        );
         let original = state
             .db
             .get_latest_note_for_meeting("m1")
@@ -11644,9 +11738,18 @@ mod lifecycle_tests {
             url: Some("https://x/browse/PROJ-1".into()),
         }];
         let dto = apply_note_enrichment_inner(&state, "m1".to_string(), hits).unwrap();
-        assert!(dto.markdown.contains("> [!context]-"), "the context callout was written");
-        assert!(dto.markdown.contains("PROJ-1 · In Progress (via Jira)"), "loud attribution present");
-        assert!(dto.markdown.starts_with(&original), "the original note is preserved verbatim");
+        assert!(
+            dto.markdown.contains("> [!context]-"),
+            "the context callout was written"
+        );
+        assert!(
+            dto.markdown.contains("PROJ-1 · In Progress (via Jira)"),
+            "loud attribution present"
+        );
+        assert!(
+            dto.markdown.starts_with(&original),
+            "the original note is preserved verbatim"
+        );
         // The DB note now carries the block.
         assert!(state
             .db
@@ -11658,7 +11761,10 @@ mod lifecycle_tests {
 
         // Empty apply strips it byte-exact back to the original.
         let undone = apply_note_enrichment_inner(&state, "m1".to_string(), vec![]).unwrap();
-        assert_eq!(undone.markdown, original, "empty enrichment strips the block byte-for-byte");
+        assert_eq!(
+            undone.markdown, original,
+            "empty enrichment strips the block byte-for-byte"
+        );
     }
 
     /// Stage 2 / Lane A happy path: over a FINISHED note in an OPEN folder, `link_related_notes_inner`
@@ -11671,7 +11777,10 @@ mod lifecycle_tests {
         // The note we link FROM. Kept lean so the salient query is a subset of the related note's
         // terms (FTS5 MATCH is implicit-AND — every query term must be present in the related note).
         seed_meeting(&state.db, "this", "Apollo migration.\n", Some("f-open"));
-        state.db.set_meeting_title("this", "Apollo Migration").unwrap();
+        state
+            .db
+            .set_meeting_title("this", "Apollo Migration")
+            .unwrap();
         // A related PRIOR note (open folder → visible) whose Summary is the ideal task-free gist and
         // whose Action items must NEVER enter the link detail.
         seed_meeting(
@@ -11680,7 +11789,10 @@ mod lifecycle_tests {
             "## Summary\n\nApollo migration groundwork and rollout roadmap.\n\n## Action items\n\n- [ ] SECRET-TASK\n",
             Some("f-open"),
         );
-        state.db.set_meeting_title("prior", "Apollo Kickoff").unwrap();
+        state
+            .db
+            .set_meeting_title("prior", "Apollo Kickoff")
+            .unwrap();
 
         link_related_notes_inner(&state, "this").unwrap();
 
@@ -11690,11 +11802,26 @@ mod lifecycle_tests {
             .unwrap()
             .unwrap()
             .markdown;
-        assert!(md.contains("> [!related]- Related notes"), "the Related block was written; got: {md}");
-        assert!(md.contains("[[Apollo Kickoff]]"), "the [[Title]] link is present; got: {md}");
-        assert!(md.contains("(via Murmur)"), "loud Murmur attribution; got: {md}");
-        assert!(md.contains("groundwork and rollout"), "the task-free gist prose is present; got: {md}");
-        assert!(!md.contains("SECRET-TASK"), "an action item must NEVER enter a link detail; got: {md}");
+        assert!(
+            md.contains("> [!related]- Related notes"),
+            "the Related block was written; got: {md}"
+        );
+        assert!(
+            md.contains("[[Apollo Kickoff]]"),
+            "the [[Title]] link is present; got: {md}"
+        );
+        assert!(
+            md.contains("(via Murmur)"),
+            "loud Murmur attribution; got: {md}"
+        );
+        assert!(
+            md.contains("groundwork and rollout"),
+            "the task-free gist prose is present; got: {md}"
+        );
+        assert!(
+            !md.contains("SECRET-TASK"),
+            "an action item must NEVER enter a link detail; got: {md}"
+        );
         assert!(
             md.starts_with("Apollo migration.\n"),
             "the original note body is preserved verbatim; got: {md}"
@@ -11738,7 +11865,10 @@ mod lifecycle_tests {
             "## Summary\n\nAtlas acquisition roadmap groundwork.\n",
             Some("f-open"),
         );
-        state.db.set_meeting_title("prior", "Atlas Kickoff").unwrap();
+        state
+            .db
+            .set_meeting_title("prior", "Atlas Kickoff")
+            .unwrap();
 
         // Seal the note (content_blob present, markdown blanked), lock the folder, and SESSION-UNLOCK it
         // so the read gate passes and ONLY the seal-safety guard can stop the write.
@@ -11769,7 +11899,10 @@ mod lifecycle_tests {
             .unwrap()
             .unwrap()
             .markdown;
-        assert_eq!(md, "", "a sealed note's transient markdown column must NEVER be written by Lane A");
+        assert_eq!(
+            md, "",
+            "a sealed note's transient markdown column must NEVER be written by Lane A"
+        );
         // The seal (content_blob) is intact.
         assert!(
             state
@@ -11881,8 +12014,15 @@ mod lifecycle_tests {
         let (bytes, winner, idx) =
             try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", Some(&kek_new))
                 .expect("recovery must find the sealing KEK among the candidates");
-        assert_eq!(bytes.as_slice(), ck.as_slice(), "recovered CK must be the original");
-        assert_eq!(*winner, kek_old, "the winner is the KEK that sealed the folder");
+        assert_eq!(
+            bytes.as_slice(),
+            ck.as_slice(),
+            "recovered CK must be the original"
+        );
+        assert_eq!(
+            *winner, kek_old,
+            "the winner is the KEK that sealed the folder"
+        );
         assert_eq!(idx, 1);
 
         // No matching candidate → None (the caller surfaces the primary error).
@@ -11925,8 +12065,7 @@ mod lifecycle_tests {
         );
 
         // Enumeration COMPLETED with a candidate that unwraps → recoverable → refuse (Ok(false)).
-        let recoverable: Result<Zeroizing<Vec<[u8; 32]>>, AppError> =
-            Ok(Zeroizing::new(vec![kek]));
+        let recoverable: Result<Zeroizing<Vec<[u8; 32]>>, AppError> = Ok(Zeroizing::new(vec![kek]));
         assert!(
             !discard_proof_complete(recoverable, &wrapped, "f-x").unwrap(),
             "a completed enumeration with a matching candidate is RECOVERABLE (refuse)"
@@ -12103,7 +12242,9 @@ mod lifecycle_tests {
 
         // The session survives untouched — nothing cleared, refresh token still spendable.
         let g = state.account_session.lock().unwrap();
-        let s = g.as_ref().expect("session must NOT be cleared on a transient failure");
+        let s = g
+            .as_ref()
+            .expect("session must NOT be cleared on a transient failure");
         assert_eq!(s.refresh_token, "r0");
     }
 
@@ -12648,14 +12789,19 @@ mod lifecycle_tests {
         let db = &state.db;
         make_open_folder(db, "f-sealed", "Secret");
         make_open_folder(db, "f-open", "Standups");
-        seed_titled_meeting(db, "m-sealed", "Board strategy", "/data/m-sealed.wav.enc", "f-sealed");
+        seed_titled_meeting(
+            db,
+            "m-sealed",
+            "Board strategy",
+            "/data/m-sealed.wav.enc",
+            "f-sealed",
+        );
         seed_titled_meeting(db, "m-open", "Open standup", "/data/m-open.wav", "f-open");
         db.set_folder_locked("f-sealed", true, Some(&b"wrapped"[..]))
             .unwrap();
         // NOT session-unlocked: `unlocked_folders` stays empty.
 
-        let masked =
-            mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let masked = mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
         let sealed = masked.iter().find(|m| m.id == "m-sealed").unwrap();
         assert_eq!(
             sealed.title.as_deref(),
@@ -12683,8 +12829,7 @@ mod lifecycle_tests {
             .lock()
             .unwrap()
             .insert("f-sealed".to_string());
-        let unmasked =
-            mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let unmasked = mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
         let now = unmasked.iter().find(|m| m.id == "m-sealed").unwrap();
         assert_eq!(now.title.as_deref(), Some("Board strategy"));
         assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));
@@ -13096,12 +13241,7 @@ mod lifecycle_tests {
     /// `seed_meeting`'s placeholder segments/timeline). Each `(start, end, tag)` segment carries the
     /// RAW diarization tag; each `(start, end, label)` turn carries the LLM DISPLAY label the FE lane
     /// renders — the two key spaces the reconciler must bridge.
-    fn seed_diarized(
-        db: &Db,
-        mid: &str,
-        segs: &[(f64, f64, &str)],
-        turns: &[(f64, f64, &str)],
-    ) {
+    fn seed_diarized(db: &Db, mid: &str, segs: &[(f64, f64, &str)], turns: &[(f64, f64, &str)]) {
         let segments: Vec<Segment> = segs
             .iter()
             .enumerate()
@@ -13139,7 +13279,14 @@ mod lifecycle_tests {
         let anna = vec![1.0f32, 0.0, 0.0];
         state
             .db
-            .insert_voiceprint("vp-prior", "prior", 0, Some("Anna"), &anna, "2026-07-01T00:00:00Z")
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Anna"),
+                &anna,
+                "2026-07-01T00:00:00Z",
+            )
             .unwrap();
 
         // Current meeting: diarized cluster 1 (segments tagged `others-1`), whose timeline lane the
@@ -13214,7 +13361,14 @@ mod lifecycle_tests {
         let sam = vec![0.0f32, 1.0, 0.0];
         state
             .db
-            .insert_voiceprint("vp-prior", "prior", 0, Some("Sam"), &sam, "2026-07-01T00:00:00Z")
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Sam"),
+                &sam,
+                "2026-07-01T00:00:00Z",
+            )
             .unwrap();
 
         // Current single-cluster meeting: plain `others` segments, LLM lane "Speaker 1", cluster 0.
@@ -13234,7 +13388,10 @@ mod lifecycle_tests {
         // Suggest is keyed by the display label.
         let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
         assert_eq!(sugg.len(), 1);
-        assert_eq!(sugg[0].speaker, "Speaker 1", "1:1 suggestion keyed by the display label");
+        assert_eq!(
+            sugg[0].speaker, "Speaker 1",
+            "1:1 suggestion keyed by the display label"
+        );
         assert_eq!(sugg[0].suggested_label, "Sam");
 
         // Enroll via the display label reconstructs cluster 0.
@@ -13244,7 +13401,11 @@ mod lifecycle_tests {
             .into_iter()
             .find(|v| v.meeting_id == "cur")
             .unwrap();
-        assert_eq!(cur_row.label.as_deref(), Some("Sam"), "1:1 enroll bound cluster 0");
+        assert_eq!(
+            cur_row.label.as_deref(),
+            Some("Sam"),
+            "1:1 enroll bound cluster 0"
+        );
         assert_eq!(cur_row.cluster_index, 0);
     }
 
@@ -13604,11 +13765,17 @@ mod lifecycle_tests {
 
         // A buffer added into the folder AFTER the seal (as if typed during a later session-unlock):
         // its note plaintext is the ONLY copy, content_blob stays NULL (never sealed).
-        seed_meeting(&state.db, "m2", "NEVER SEALED — the only copy", Some("f-lock"));
+        seed_meeting(
+            &state.db,
+            "m2",
+            "NEVER SEALED — the only copy",
+            Some("f-lock"),
+        );
 
         // Make the folder unrecoverable (foreign wrapped key no candidate holds).
         let foreign_wrapped =
-            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
+                .unwrap();
         state
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
@@ -14310,7 +14477,8 @@ mod lifecycle_tests {
         for n in state.db.notes_in_folder(folder_id).unwrap() {
             if let Some(blob) = &n.content_blob {
                 let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
-                let md = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                let md =
+                    String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
                 state
                     .db
                     .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
@@ -14344,14 +14512,31 @@ mod lifecycle_tests {
         );
         // Index while the folder is OPEN (the stub stands in for a present model, as every other
         // meeting-chunk test does) → chunks + vectors present.
-        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
-        assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
-        assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectored while open");
+        state
+            .db
+            .index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
+            .unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: chunked while open"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "precondition: vectored while open"
+        );
 
         // LOCK (production seal) → meeting chunks + vectors purged.
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
-        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "note_chunks purged on lock");
-        assert_eq!(state.db.note_vec_count("m1").unwrap(), 0, "vec_chunks purged on lock");
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "note_chunks purged on lock"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "vec_chunks purged on lock"
+        );
 
         // Restore note markdown exactly as `unlock_folder` does BEFORE `unseal_folder_extras`.
         let ck = restore_notes_and_ck(&state, "f-lock");
@@ -14398,11 +14583,21 @@ mod lifecycle_tests {
             "# Roadmap\n\nrevisit auth and the billing migration next sprint",
             Some("f-lock"),
         );
-        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
-        assert!(state.db.note_chunk_count("m1").unwrap() > 0, "precondition: chunked while open");
+        state
+            .db
+            .index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
+            .unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: chunked while open"
+        );
 
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
-        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "purged on lock");
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
 
         // `remove_lock_inner` restores the note markdown (Step 1) BEFORE `unseal_folder_extras_permanent`.
         let ck = restore_notes_and_ck(&state, "f-lock");
@@ -14422,12 +14617,16 @@ mod lifecycle_tests {
 
         // MODEL-PRESENT (Some): permanent unseal re-indexes the now-open folder's meetings. RED on the
         // pre-fix code (unseal_folder_extras_permanent had no meeting re-index → stayed 0).
-        unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder))
+            .unwrap();
         assert!(
             state.db.note_chunk_count("m1").unwrap() > 0,
             "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
         );
-        assert!(state.db.note_vec_count("m1").unwrap() > 0, "remove-lock re-indexes meeting vec_chunks");
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "remove-lock re-indexes meeting vec_chunks"
+        );
     }
 
     /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
@@ -14444,11 +14643,18 @@ mod lifecycle_tests {
             "# Notes\n\nlaunch on the 14th; hire two engineers",
             Some("f-lock"),
         );
-        state.db.index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder).unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
+            .unwrap();
 
         // Lock → purge.
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
-        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0, "purged on lock");
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
 
         // Session-unlock: restore markdown + the PRODUCTION unseal with a present (stub) model, which
         // rebuilds the meeting chunks — so the relock below has something to re-purge.
@@ -14463,7 +14669,10 @@ mod lifecycle_tests {
             state.db.note_chunk_count("m1").unwrap() > 0,
             "precondition: meeting re-indexed while session-unlocked"
         );
-        assert!(state.db.note_vec_count("m1").unwrap() > 0, "precondition: vectors rebuilt");
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "precondition: vectors rebuilt"
+        );
 
         // RELOCK → re-purge. Zero meeting chunks AND zero vectors at rest.
         relock_all_inner(&state).unwrap();
@@ -16095,7 +16304,10 @@ mod lifecycle_tests {
             ],
             "2026-06-20T00:00:00Z",
         );
-        assert!(self_rows.is_empty(), "same-meeting refinement is not a cross-note supersession");
+        assert!(
+            self_rows.is_empty(),
+            "same-meeting refinement is not a cross-note supersession"
+        );
     }
 
     /// Seed a summarized meeting in a folder, its note pointing at an on-disk `.md` (or a DB-only path
@@ -16109,7 +16321,12 @@ mod lifecycle_tests {
         filename: &str,
         md_bytes: Option<&str>,
     ) -> std::path::PathBuf {
-        seed_meeting(&state.db, mid, md_bytes.unwrap_or("# note"), Some(folder_id));
+        seed_meeting(
+            &state.db,
+            mid,
+            md_bytes.unwrap_or("# note"),
+            Some(folder_id),
+        );
         state.db.set_note_folder(mid, Some(folder_id)).unwrap();
         let dir = vault.join(folder_name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -16132,9 +16349,25 @@ mod lifecycle_tests {
         let vault = tmp_vault("retruth-gate");
         let state = build_state_with_vault("retruth-gate", &vault);
         make_open_folder(&state.db, "f-src", "Work");
-        seed_note_on_disk(&state, &vault, "m1", "f-src", "Work", "kickoff.md", Some("# Kickoff\n"));
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some("# Kickoff\n"),
+        );
         make_open_folder(&state.db, "f-new", "Reviews");
-        seed_note_on_disk(&state, &vault, "m2", "f-new", "Reviews", "review.md", Some("# Review\n"));
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "review.md",
+            Some("# Review\n"),
+        );
         state
             .db
             .record_supersessions(&[SupersessionRow {
@@ -16161,7 +16394,9 @@ mod lifecycle_tests {
             .set_folder_locked("f-src", true, Some(&b"wrapped"[..]))
             .unwrap();
         assert!(
-            preview_supersessions_inner(&state, "m2").unwrap().is_empty(),
+            preview_supersessions_inner(&state, "m2")
+                .unwrap()
+                .is_empty(),
             "a sealed source contributes nothing"
         );
 
@@ -16173,7 +16408,9 @@ mod lifecycle_tests {
             .unwrap()
             .insert("f-src".to_string());
         assert!(
-            preview_supersessions_inner(&state, "m2").unwrap().is_empty(),
+            preview_supersessions_inner(&state, "m2")
+                .unwrap()
+                .is_empty(),
             "session-unlock does not re-open a sealed source for stamping"
         );
     }
@@ -16243,7 +16480,10 @@ mod lifecycle_tests {
         assert_eq!(res.skipped_sealed, 0);
 
         let src_after = std::fs::read_to_string(&src_md).unwrap();
-        assert!(src_after.contains("## Re-Truth updates"), "section: {src_after}");
+        assert!(
+            src_after.contains("## Re-Truth updates"),
+            "section: {src_after}"
+        );
         assert!(
             src_after.contains(
                 "> **status** — in-progress → shipped · see [[2026-06-20 1000 - Launch review]]"
@@ -16264,7 +16504,10 @@ mod lifecycle_tests {
         let res2 = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
         assert_eq!(res2.applied, 0, "already-applied row is not re-stamped");
         assert_eq!(
-            std::fs::read_to_string(&src_md).unwrap().matches("> **status** — in-progress → shipped").count(),
+            std::fs::read_to_string(&src_md)
+                .unwrap()
+                .matches("> **status** — in-progress → shipped")
+                .count(),
             1,
             "no duplicate callout body"
         );
@@ -16311,7 +16554,15 @@ mod lifecycle_tests {
             Some(src_original),
         );
         make_open_folder(&state.db, "f-new", "Reviews");
-        seed_note_on_disk(&state, &vault, "m2", "f-new", "Reviews", "review.md", Some("# Review\n"));
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "review.md",
+            Some("# Review\n"),
+        );
         state
             .db
             .record_supersessions(&[SupersessionRow {
@@ -16338,7 +16589,10 @@ mod lifecycle_tests {
 
         let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
         assert_eq!(res.applied, 0);
-        assert_eq!(res.skipped_sealed, 1, "a source sealed after preview is skipped");
+        assert_eq!(
+            res.skipped_sealed, 1,
+            "a source sealed after preview is skipped"
+        );
         // The `.md` was NOT touched (no callout written into a locked folder).
         assert_eq!(
             std::fs::read_to_string(&src_md).unwrap(),
@@ -16346,15 +16600,13 @@ mod lifecycle_tests {
             "never write into a locked folder"
         );
         // Still pending (not marked applied).
-        assert!(
-            state
-                .db
-                .get_supersession("s1")
-                .unwrap()
-                .unwrap()
-                .applied_at
-                .is_none()
-        );
+        assert!(state
+            .db
+            .get_supersession("s1")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_none());
     }
 
     /// GATE BOTH SIDES: `preview_supersessions` must EXCLUDE a row whose SUPERSEDING meeting is sealed
@@ -16367,9 +16619,25 @@ mod lifecycle_tests {
         let vault = tmp_vault("retruth-supgate");
         let state = build_state_with_vault("retruth-supgate", &vault);
         make_open_folder(&state.db, "f-src", "Work");
-        seed_note_on_disk(&state, &vault, "m1", "f-src", "Work", "kickoff.md", Some("# Kickoff\n"));
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some("# Kickoff\n"),
+        );
         make_open_folder(&state.db, "f-new", "Reviews");
-        seed_note_on_disk(&state, &vault, "m2", "f-new", "Reviews", "review.md", Some("# Review\n"));
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "review.md",
+            Some("# Review\n"),
+        );
         state
             .db
             .record_supersessions(&[SupersessionRow {
@@ -16396,7 +16664,9 @@ mod lifecycle_tests {
             .set_folder_locked("f-new", true, Some(&b"wrapped"[..]))
             .unwrap();
         assert!(
-            preview_supersessions_inner(&state, "m2").unwrap().is_empty(),
+            preview_supersessions_inner(&state, "m2")
+                .unwrap()
+                .is_empty(),
             "a sealed superseding meeting must surface no new_value (gate BOTH sides)"
         );
     }
@@ -16413,8 +16683,15 @@ mod lifecycle_tests {
         let state = build_state_with_vault("retruth-retry", &vault);
         let original = "# Kickoff\n\nAtlas is in progress.\n";
         make_open_folder(&state.db, "f-src", "Work");
-        let src_md =
-            seed_note_on_disk(&state, &vault, "m1", "f-src", "Work", "kickoff.md", Some(original));
+        let src_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some(original),
+        );
         // Superseding meeting stays open but WITHOUT a vault file we care about — the backlink is
         // irrelevant to this source-undo test (no superseding stem link ⇒ simpler assertions).
         make_open_folder(&state.db, "f-new", "Reviews");
@@ -16495,12 +16772,33 @@ mod lifecycle_tests {
         let state = build_state_with_vault("retruth-multi", &vault);
         // One open folder holding the superseding note + two old source notes.
         make_open_folder(&state.db, "f", "Work");
-        let new_md =
-            seed_note_on_disk(&state, &vault, "m-new", "f", "Work", "new.md", Some("# New\n"));
-        let old1_md =
-            seed_note_on_disk(&state, &vault, "m-old1", "f", "Work", "old1.md", Some("# Old one\n"));
-        let old2_md =
-            seed_note_on_disk(&state, &vault, "m-old2", "f", "Work", "old2.md", Some("# Old two\n"));
+        let new_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-new",
+            "f",
+            "Work",
+            "new.md",
+            Some("# New\n"),
+        );
+        let old1_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old1",
+            "f",
+            "Work",
+            "old1.md",
+            Some("# Old one\n"),
+        );
+        let old2_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old2",
+            "f",
+            "Work",
+            "old2.md",
+            Some("# Old two\n"),
+        );
 
         // Three rows, ALL superseded by m-new:
         //   r1, r2 → SOURCE m-old1 (two facts from one old note ⇒ shared SOURCE note)
@@ -16540,17 +16838,26 @@ mod lifecycle_tests {
         assert_eq!(res.skipped_sealed, 0);
         // The shared superseding note carries all THREE backlinks; each source its own callout(s).
         assert_eq!(
-            std::fs::read_to_string(&new_md).unwrap().matches("> [!supersedes]").count(),
+            std::fs::read_to_string(&new_md)
+                .unwrap()
+                .matches("> [!supersedes]")
+                .count(),
             3,
             "shared superseding note accumulates all backlinks"
         );
         assert_eq!(
-            std::fs::read_to_string(&old1_md).unwrap().matches("> [!superseded]").count(),
+            std::fs::read_to_string(&old1_md)
+                .unwrap()
+                .matches("> [!superseded]")
+                .count(),
             2,
             "shared source note accumulates both callouts"
         );
         assert_eq!(
-            std::fs::read_to_string(&old2_md).unwrap().matches("> [!superseded]").count(),
+            std::fs::read_to_string(&old2_md)
+                .unwrap()
+                .matches("> [!superseded]")
+                .count(),
             1
         );
 
@@ -16593,12 +16900,33 @@ mod lifecycle_tests {
         let vault = tmp_vault("retruth-partial");
         let state = build_state_with_vault("retruth-partial", &vault);
         make_open_folder(&state.db, "f", "Work");
-        let new_md =
-            seed_note_on_disk(&state, &vault, "m-new", "f", "Work", "new.md", Some("# New\n"));
-        let old1_md =
-            seed_note_on_disk(&state, &vault, "m-old1", "f", "Work", "old1.md", Some("# Old one\n"));
-        let old2_md =
-            seed_note_on_disk(&state, &vault, "m-old2", "f", "Work", "old2.md", Some("# Old two\n"));
+        let new_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-new",
+            "f",
+            "Work",
+            "new.md",
+            Some("# New\n"),
+        );
+        let old1_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old1",
+            "f",
+            "Work",
+            "old1.md",
+            Some("# Old one\n"),
+        );
+        let old2_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old2",
+            "f",
+            "Work",
+            "old2.md",
+            Some("# Old two\n"),
+        );
         let mk = |id: &str, source: &str, predicate: &str, old: &str, new: &str| SupersessionRow {
             id: id.into(),
             superseding_meeting_id: "m-new".into(),
@@ -16634,36 +16962,85 @@ mod lifecycle_tests {
         undo_supersessions_inner(&state, &["r1".to_string()]).unwrap();
 
         // r2, r3 stay applied; r1 cleared.
-        assert!(state.db.get_supersession("r1").unwrap().unwrap().applied_at.is_none());
-        assert!(state.db.get_supersession("r2").unwrap().unwrap().applied_at.is_some());
-        assert!(state.db.get_supersession("r3").unwrap().unwrap().applied_at.is_some());
+        assert!(state
+            .db
+            .get_supersession("r1")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_none());
+        assert!(state
+            .db
+            .get_supersession("r2")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_some());
+        assert!(state
+            .db
+            .get_supersession("r3")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_some());
 
         // old1.md: r2's callout SURVIVES, r1's is GONE.
         let old1 = std::fs::read_to_string(&old1_md).unwrap();
-        assert!(old1.contains("> **owner** — Anna → Bob"), "r2 (survivor) callout kept: {old1}");
+        assert!(
+            old1.contains("> **owner** — Anna → Bob"),
+            "r2 (survivor) callout kept: {old1}"
+        );
         assert!(
             !old1.contains("> **status** — in-progress → shipped"),
             "r1 (undone) callout removed: {old1}"
         );
         // new.md: r2 + r3 backlinks SURVIVE, r1's is GONE.
         let new = std::fs::read_to_string(&new_md).unwrap();
-        assert!(new.contains("> **owner** — supersedes Anna → Bob in [[old1]]"), "r2 backlink kept: {new}");
-        assert!(new.contains("> **stage** — supersedes alpha → beta in [[old2]]"), "r3 backlink kept: {new}");
+        assert!(
+            new.contains("> **owner** — supersedes Anna → Bob in [[old1]]"),
+            "r2 backlink kept: {new}"
+        );
+        assert!(
+            new.contains("> **stage** — supersedes alpha → beta in [[old2]]"),
+            "r3 backlink kept: {new}"
+        );
         assert!(
             !new.contains("> **status** — supersedes in-progress → shipped in [[old1]]"),
             "r1 backlink removed: {new}"
         );
         // old2.md: r3 untouched (never in an undo set).
-        assert_eq!(std::fs::read(&old2_md).unwrap(), old2_after_apply, "r3's source note unchanged");
+        assert_eq!(
+            std::fs::read(&old2_md).unwrap(),
+            old2_after_apply,
+            "r3's source note unchanged"
+        );
 
         // Now UNDO r2, r3 → every file byte-identical to pristine, all rows unapplied.
         undo_supersessions_inner(&state, &["r2".to_string(), "r3".to_string()]).unwrap();
-        assert_eq!(std::fs::read(&new_md).unwrap(), new_pre, "superseding note back to pristine");
-        assert_eq!(std::fs::read(&old1_md).unwrap(), old1_pre, "shared source note back to pristine");
-        assert_eq!(std::fs::read(&old2_md).unwrap(), old2_pre, "other source note back to pristine");
+        assert_eq!(
+            std::fs::read(&new_md).unwrap(),
+            new_pre,
+            "superseding note back to pristine"
+        );
+        assert_eq!(
+            std::fs::read(&old1_md).unwrap(),
+            old1_pre,
+            "shared source note back to pristine"
+        );
+        assert_eq!(
+            std::fs::read(&old2_md).unwrap(),
+            old2_pre,
+            "other source note back to pristine"
+        );
         for id in ["r1", "r2", "r3"] {
             assert!(
-                state.db.get_supersession(id).unwrap().unwrap().applied_at.is_none(),
+                state
+                    .db
+                    .get_supersession(id)
+                    .unwrap()
+                    .unwrap()
+                    .applied_at
+                    .is_none(),
                 "row {id} unapplied after full undo"
             );
         }

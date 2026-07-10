@@ -48,6 +48,49 @@ const TRANSCRIPT_CHUNK_OVERLAP_CHARS: usize = 150;
 /// rank position; 60 is the widely-used default from the original RRF paper.
 pub const RRF_K: f64 = 60.0;
 
+// ── Brain v2 L1.1 — topic segmentation constants (spec §L1.1; named, eval-tunable) ──────────────
+
+/// A silence gap of at least this many seconds between consecutive spoken segments opens a new
+/// topic (a lull usually marks an agenda transition).
+pub const TOPIC_LULL_GAP_S: f64 = 30.0;
+
+/// A speaker flip AFTER a run of at least this many consecutive same-speaker segments opens a new
+/// topic (a long monologue ending is a strong topical boundary; ordinary turn-taking is not).
+pub const TOPIC_SPEAKER_RUN_MIN: usize = 5;
+
+/// Window size (in segments, each side) for the lexical-shift boundary signal.
+pub const TOPIC_LEXICAL_WINDOW: usize = 6;
+
+/// A Jaccard similarity BELOW this between the token sets of the two adjacent
+/// [`TOPIC_LEXICAL_WINDOW`]-segment windows opens a new topic (vocabulary shifted).
+pub const TOPIC_LEXICAL_JACCARD_MIN: f64 = 0.15;
+
+/// Topic segments SHORTER than this (seconds) merge forward into the next topic —
+/// over-segmentation is preferred over under-segmentation, but slivers carry no retrieval value.
+pub const TOPIC_MERGE_MIN_DURATION_S: f64 = 60.0;
+
+/// Minimum token length (chars) counted by the lexical-shift signal (shorter tokens are noise).
+const TOPIC_TOKEN_MIN_CHARS: usize = 3;
+
+// ── Brain v2 L1.2 — contextual augmentation caps (spec §L1.2) ───────────────────────────────────
+
+/// Max attendees rendered into an augmented-chunk header.
+pub const AUG_MAX_ATTENDEES: usize = 5;
+
+/// Max facts rendered into an augmented-chunk header.
+pub const AUG_MAX_FACTS: usize = 8;
+
+// ── Brain v2 L1.3 — score-fusion weights (spec §L1.3; named consts, calibrated by the eval gate) ─
+
+/// Weight of the keyword (FTS/BM25) leg in [`score_fuse`].
+pub const SCORE_FUSE_W_FTS: f64 = 0.4;
+
+/// Weight of the vector-KNN leg in [`score_fuse`].
+pub const SCORE_FUSE_W_KNN: f64 = 0.4;
+
+/// Weight of the entity-graph leg in [`score_fuse`].
+pub const SCORE_FUSE_W_GRAPH: f64 = 0.2;
+
 /// The swappable embedding backend. Pure + synchronous: `embed` maps a batch of texts to a batch
 /// of `dim()`-length vectors. The real model implements this over multilingual-e5-small; tests +
 /// the no-model floor use [`StubEmbedder`].
@@ -434,26 +477,30 @@ fn group_turns(segments: &[crate::transcribe::types::Segment]) -> Vec<Turn> {
     let mut cur_start = 0.0f64;
     let mut cur_end = 0.0f64;
 
-    let flush = |turns: &mut Vec<Turn>, speaker: &Option<String>, text: &str, start: f64, end: f64| {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
-        }
-        let label = match speaker {
-            Some(s) if !s.trim().is_empty() => s.trim(),
-            _ => "unknown",
+    let flush =
+        |turns: &mut Vec<Turn>, speaker: &Option<String>, text: &str, start: f64, end: f64| {
+            let text = text.trim();
+            if text.is_empty() {
+                return;
+            }
+            let label = match speaker {
+                Some(s) if !s.trim().is_empty() => s.trim(),
+                _ => "unknown",
+            };
+            turns.push(Turn {
+                line: format!("[{}-{}] ({label})\n{text}", mmss(start), mmss(end)),
+            });
         };
-        turns.push(Turn {
-            line: format!("[{}-{}] ({label})\n{text}", mmss(start), mmss(end)),
-        });
-    };
 
     for seg in segments {
         let text = seg.text.trim();
         if text.is_empty() {
             continue; // pure-gap segment — no content to attribute.
         }
-        let same = cur_speaker.as_ref().map(|s| s == &seg.speaker).unwrap_or(false);
+        let same = cur_speaker
+            .as_ref()
+            .map(|s| s == &seg.speaker)
+            .unwrap_or(false);
         if same {
             if !cur_text.is_empty() {
                 cur_text.push(' ');
@@ -515,7 +562,11 @@ pub fn chunk_transcript(
 
     for turn in &turns {
         let line = turn.line.as_str();
-        let add = if window.is_empty() { line.len() } else { line.len() + 1 };
+        let add = if window.is_empty() {
+            line.len()
+        } else {
+            line.len() + 1
+        };
         // Close the current window before it overflows (but never emit an empty one).
         if !window.is_empty() && window_len + add > TRANSCRIPT_CHUNK_CHAR_TARGET {
             emit(&mut chunks, &window);
@@ -524,7 +575,11 @@ pub fn chunk_transcript(
             let mut carry: Vec<&str> = Vec::new();
             let mut carry_len = 0usize;
             for &prev in window.iter().rev() {
-                let plen = if carry.is_empty() { prev.len() } else { prev.len() + 1 };
+                let plen = if carry.is_empty() {
+                    prev.len()
+                } else {
+                    prev.len() + 1
+                };
                 if carry_len + plen > TRANSCRIPT_CHUNK_OVERLAP_CHARS && !carry.is_empty() {
                     break;
                 }
@@ -533,18 +588,296 @@ pub fn chunk_transcript(
             }
             carry.reverse();
             window = carry;
-            window_len = window
-                .iter()
-                .map(|l| l.len())
-                .sum::<usize>()
-                + window.len().saturating_sub(1);
+            window_len =
+                window.iter().map(|l| l.len()).sum::<usize>() + window.len().saturating_sub(1);
         }
-        let add = if window.is_empty() { line.len() } else { line.len() + 1 };
+        let add = if window.is_empty() {
+            line.len()
+        } else {
+            line.len() + 1
+        };
         window.push(line);
         window_len += add;
     }
     emit(&mut chunks, &window);
     chunks
+}
+
+/// One TOPIC segment (Brain v2 L1.1): a contiguous, topically-coherent span of transcript
+/// segments, carrying its wall-clock span and the merged speaker-tagged text. Pure output of
+/// [`segment_topics`]; persisted by `Db::index_meeting_topic_chunks`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopicSegment {
+    /// Start of the topic (seconds into the meeting, from the first contributing segment).
+    pub start_s: f64,
+    /// End of the topic (seconds, from the last contributing segment).
+    pub end_s: f64,
+    /// The topic's raw text: one `(speaker) text` line per contributing non-blank segment,
+    /// newline-joined. Deterministic for identical input.
+    pub text: String,
+}
+
+/// Lexical-shift tokens: lowercased alphanumeric tokens of at least [`TOPIC_TOKEN_MIN_CHARS`]
+/// chars, with EN+PL stopwords removed (shares the single `is_stopword` list — no second set to
+/// drift). Returned as a set (Jaccard is set-based).
+fn topic_tokens(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= TOPIC_TOKEN_MIN_CHARS)
+        .filter(|t| !crate::summarize::related_context::is_stopword(t))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Jaccard similarity of two token sets. Both empty ⇒ 1.0 (no evidence of a shift); one empty ⇒
+/// 1.0 as well (an empty window can't attest a boundary — fail toward NO boundary).
+fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 1.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 {
+        1.0
+    } else {
+        inter / union
+    }
+}
+
+/// Brain v2 L1.1 — deterministic TOPIC segmentation of a meeting's transcript segments.
+///
+/// A boundary opens BEFORE segment `i` when ANY of three signals fires (spec §L1.1):
+/// 1. **Lull** — `start_s(i) - end_s(i-1) >= `[`TOPIC_LULL_GAP_S`];
+/// 2. **Speaker flip after a long run** — the speaker changes at `i` AND the outgoing speaker held
+///    at least [`TOPIC_SPEAKER_RUN_MIN`] consecutive segments;
+/// 3. **Lexical shift** — the Jaccard similarity between the token sets of the previous and next
+///    [`TOPIC_LEXICAL_WINDOW`]-segment windows is below [`TOPIC_LEXICAL_JACCARD_MIN`]
+///    (tokens: lowercase alnum ≥ [`TOPIC_TOKEN_MIN_CHARS`] chars, EN+PL stopwords removed).
+///
+/// Topics shorter than [`TOPIC_MERGE_MIN_DURATION_S`] merge FORWARD into the next topic (a
+/// trailing short topic merges backward). Blank-text segments are skipped for content (their
+/// timestamps still shape the lull signal via their neighbours' spans). Pure + deterministic:
+/// identical segments always yield identical topics — the property `content_hash` idempotency
+/// rides on. Empty/all-blank input yields no topics.
+pub fn segment_topics(segments: &[crate::transcribe::types::Segment]) -> Vec<TopicSegment> {
+    // Work over the non-blank segments only (blank rows carry no content to attribute).
+    let spoken: Vec<&crate::transcribe::types::Segment> = segments
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
+    if spoken.is_empty() {
+        return Vec::new();
+    }
+
+    // Precompute per-segment token sets once (the lexical windows re-use them).
+    let tokens: Vec<std::collections::HashSet<String>> =
+        spoken.iter().map(|s| topic_tokens(&s.text)).collect();
+
+    // boundary[i] == true ⇒ a new topic starts AT spoken[i].
+    let n = spoken.len();
+    let mut boundary = vec![false; n];
+    let mut run_len = 1usize; // consecutive same-speaker run ending at i-1.
+    for i in 1..n {
+        let prev = spoken[i - 1];
+        let cur = spoken[i];
+
+        // 1) lull.
+        let lull = cur.start_s - prev.end_s >= TOPIC_LULL_GAP_S;
+
+        // 2) speaker flip after a long same-speaker run.
+        let flip = cur.speaker != prev.speaker && run_len >= TOPIC_SPEAKER_RUN_MIN;
+
+        // 3) lexical shift over the two adjacent windows.
+        let lo = i.saturating_sub(TOPIC_LEXICAL_WINDOW);
+        let hi = (i + TOPIC_LEXICAL_WINDOW).min(n);
+        let mut before: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &tokens[lo..i] {
+            before.extend(t.iter().cloned());
+        }
+        let mut after: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &tokens[i..hi] {
+            after.extend(t.iter().cloned());
+        }
+        let shift = jaccard(&before, &after) < TOPIC_LEXICAL_JACCARD_MIN;
+
+        if lull || flip || shift {
+            boundary[i] = true;
+        }
+        run_len = if cur.speaker == prev.speaker {
+            run_len + 1
+        } else {
+            1
+        };
+    }
+
+    // Materialize raw topics from the boundary vector.
+    let render = |seg: &crate::transcribe::types::Segment| -> String {
+        let label = match &seg.speaker {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => "unknown",
+        };
+        format!("({label}) {}", seg.text.trim())
+    };
+    let mut topics: Vec<TopicSegment> = Vec::new();
+    let mut start_idx = 0usize;
+    for i in 1..=n {
+        if i == n || boundary[i] {
+            let span = &spoken[start_idx..i];
+            let text = span
+                .iter()
+                .map(|s| render(s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            topics.push(TopicSegment {
+                start_s: span[0].start_s,
+                end_s: span[span.len() - 1].end_s,
+                text,
+            });
+            start_idx = i;
+        }
+    }
+
+    // Merge short topics FORWARD (< TOPIC_MERGE_MIN_DURATION_S); a trailing short one merges back.
+    let mut merged: Vec<TopicSegment> = Vec::new();
+    let mut carry: Option<TopicSegment> = None;
+    for t in topics {
+        let t = match carry.take() {
+            Some(c) => TopicSegment {
+                start_s: c.start_s,
+                end_s: t.end_s,
+                text: format!("{}\n{}", c.text, t.text),
+            },
+            None => t,
+        };
+        if t.end_s - t.start_s < TOPIC_MERGE_MIN_DURATION_S {
+            carry = Some(t); // too short — merge into the NEXT topic.
+        } else {
+            merged.push(t);
+        }
+    }
+    if let Some(c) = carry {
+        // Trailing short topic: merge backward into the previous, or stand alone if it is all we have.
+        match merged.last_mut() {
+            Some(last) => {
+                last.end_s = c.end_s;
+                last.text = format!("{}\n{}", last.text, c.text);
+            }
+            None => merged.push(c),
+        }
+    }
+    merged
+}
+
+/// Brain v2 L1.2 — deterministic CONTEXTUAL AUGMENTATION of a chunk (Anthropic's
+/// contextual-retrieval mechanism at zero LLM cost): prepend a one-line situating header —
+/// `<title> | <date> | <attendees> | <facts>` — to the raw chunk text, so both the FTS tokens and
+/// the passage embedding carry the meeting's provenance and entity/fact context. Empty parts are
+/// skipped; attendees are capped at [`AUG_MAX_ATTENDEES`] and facts at [`AUG_MAX_FACTS`]
+/// (defensive — the gated readers already cap). Pure string formatting.
+pub fn augment_chunk_text(
+    title: &str,
+    date: &str,
+    attendees: &[String],
+    facts: &[String],
+    raw: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !title.trim().is_empty() {
+        parts.push(title.trim().to_string());
+    }
+    if !date.trim().is_empty() {
+        parts.push(date.trim().to_string());
+    }
+    let attendees_s = attendees
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .take(AUG_MAX_ATTENDEES)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !attendees_s.is_empty() {
+        parts.push(attendees_s);
+    }
+    let facts_s = facts
+        .iter()
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .take(AUG_MAX_FACTS)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !facts_s.is_empty() {
+        parts.push(facts_s);
+    }
+    if parts.is_empty() {
+        return raw.to_string();
+    }
+    format!("{}\n{raw}", parts.join(" | "))
+}
+
+/// Brain v2 L1.3 — weighted SCORE FUSION of the three retrieval legs (spec §L1.3). Replaces
+/// rank-only RRF when raw scores are available; [`rrf_fuse`] stays as the fallback.
+///
+/// Leg contracts:
+/// - `fts` — HIGHER-better raw relevance per meeting (callers pass `-bm25`, since SQLite FTS5
+///   `bm25()` is lower/more-negative = better);
+/// - `knn` — RAW vector DISTANCES per meeting (lower = better); inverted here via
+///   `sim = 1 / (1 + d)` per the spec;
+/// - `graph` — HIGHER-better (e.g. `1/rank` of the entity-neighbourhood ordering).
+///
+/// Each leg is min-max normalized to `[0, 1]` independently (a constant/single-entry leg
+/// normalizes to all-1.0 — presence in a leg is signal), then blended
+/// `0.4·fts + 0.4·knn + 0.2·graph` ([`SCORE_FUSE_W_FTS`]/[`SCORE_FUSE_W_KNN`]/
+/// [`SCORE_FUSE_W_GRAPH`]). Returns `(id, fused)` sorted DESC, ties broken by id ASC (stable,
+/// deterministic). Pure — no DB, no model.
+pub fn score_fuse(
+    fts: &[(String, f64)],
+    knn: &[(String, f64)],
+    graph: &[(String, f64)],
+) -> Vec<(String, f64)> {
+    fn minmax(leg: &[(String, f64)]) -> Vec<(String, f64)> {
+        if leg.is_empty() {
+            return Vec::new();
+        }
+        let min = leg.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+        let max = leg
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f64::NEG_INFINITY, f64::max);
+        leg.iter()
+            .map(|(id, s)| {
+                let norm = if max > min {
+                    (s - min) / (max - min)
+                } else {
+                    1.0
+                };
+                (id.clone(), norm)
+            })
+            .collect()
+    }
+
+    // Invert KNN distances into similarities BEFORE normalizing (spec: sim = 1/(1+d)).
+    let knn_sim: Vec<(String, f64)> = knn
+        .iter()
+        .map(|(id, d)| (id.clone(), 1.0 / (1.0 + d.max(0.0))))
+        .collect();
+
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    for (leg, w) in [
+        (minmax(fts), SCORE_FUSE_W_FTS),
+        (minmax(&knn_sim), SCORE_FUSE_W_KNN),
+        (minmax(graph), SCORE_FUSE_W_GRAPH),
+    ] {
+        for (id, s) in leg {
+            *scores.entry(id).or_insert(0.0) += w * s;
+        }
+    }
+    let mut fused: Vec<(String, f64)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    fused
 }
 
 /// Reciprocal Rank Fusion over any number of ranked id-lists (each already ordered best-first).
@@ -724,7 +1057,13 @@ mod tests {
         assert_eq!(chunk_note("T", "D", &big).len(), 2);
     }
 
-    fn seg(idx: i64, start: f64, end: f64, speaker: Option<&str>, text: &str) -> crate::transcribe::types::Segment {
+    fn seg(
+        idx: i64,
+        start: f64,
+        end: f64,
+        speaker: Option<&str>,
+        text: &str,
+    ) -> crate::transcribe::types::Segment {
         crate::transcribe::types::Segment {
             idx,
             start_s: start,
@@ -737,10 +1076,19 @@ mod tests {
 
     #[test]
     fn chunk_transcript_empty_and_blank_yield_no_chunks() {
-        assert!(chunk_transcript("T", "D", &[]).is_empty(), "no segments → no chunks");
+        assert!(
+            chunk_transcript("T", "D", &[]).is_empty(),
+            "no segments → no chunks"
+        );
         // Segments with only whitespace text carry no content → no chunks.
-        let blanks = [seg(0, 0.0, 1.0, Some("me"), "   "), seg(1, 1.0, 2.0, Some("others"), "")];
-        assert!(chunk_transcript("T", "D", &blanks).is_empty(), "all-blank transcript → no chunks");
+        let blanks = [
+            seg(0, 0.0, 1.0, Some("me"), "   "),
+            seg(1, 1.0, 2.0, Some("others"), ""),
+        ];
+        assert!(
+            chunk_transcript("T", "D", &blanks).is_empty(),
+            "all-blank transcript → no chunks"
+        );
     }
 
     #[test]
@@ -749,8 +1097,14 @@ mod tests {
         let chunks = chunk_transcript("Quarterly Sync", "2026-06-28", &segs);
         assert_eq!(chunks.len(), 1);
         let c = &chunks[0];
-        assert!(c.starts_with("Quarterly Sync · 2026-06-28\n"), "must carry the <title> · <date> header, got: {c:?}");
-        assert!(c.contains("[00:05-00:12] (me)"), "must carry [mm:ss-mm:ss] (speaker) provenance, got: {c:?}");
+        assert!(
+            c.starts_with("Quarterly Sync · 2026-06-28\n"),
+            "must carry the <title> · <date> header, got: {c:?}"
+        );
+        assert!(
+            c.contains("[00:05-00:12] (me)"),
+            "must carry [mm:ss-mm:ss] (speaker) provenance, got: {c:?}"
+        );
         assert!(c.contains("let us discuss the budget"));
     }
 
@@ -767,10 +1121,17 @@ mod tests {
         assert_eq!(chunks.len(), 1, "short transcript fits one chunk");
         let body = &chunks[0];
         // Exactly two turn headers (me merged, others separate).
-        assert_eq!(body.matches("(me)").count(), 1, "consecutive me segments must merge into one turn");
+        assert_eq!(
+            body.matches("(me)").count(),
+            1,
+            "consecutive me segments must merge into one turn"
+        );
         assert_eq!(body.matches("(others)").count(), 1);
         // The merged me turn spans 0:00-0:06 and joins both texts.
-        assert!(body.contains("[00:00-00:06] (me)\nhello there and welcome"), "got: {body:?}");
+        assert!(
+            body.contains("[00:00-00:06] (me)\nhello there and welcome"),
+            "got: {body:?}"
+        );
         assert!(body.contains("[00:06-00:09] (others)"));
     }
 
@@ -790,10 +1151,20 @@ mod tests {
     #[test]
     fn chunk_transcript_unicode_polish_speaker_tag_preserved() {
         // A non-me/others Unicode speaker label (Polish) must round-trip verbatim into the turn header.
-        let segs = [seg(0, 0.0, 4.0, Some("Łukasz"), "budżet na kwartał wygląda dobrze")];
+        let segs = [seg(
+            0,
+            0.0,
+            4.0,
+            Some("Łukasz"),
+            "budżet na kwartał wygląda dobrze",
+        )];
         let chunks = chunk_transcript("T", "D", &segs);
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].contains("(Łukasz)"), "Unicode speaker tag must survive, got: {:?}", chunks[0]);
+        assert!(
+            chunks[0].contains("(Łukasz)"),
+            "Unicode speaker tag must survive, got: {:?}",
+            chunks[0]
+        );
         assert!(chunks[0].contains("budżet na kwartał"));
     }
 
@@ -802,7 +1173,11 @@ mod tests {
         let segs = [seg(0, 0.0, 4.0, None, "unattributed legacy line")];
         let chunks = chunk_transcript("T", "D", &segs);
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].contains("(unknown)"), "None speaker → (unknown), got: {:?}", chunks[0]);
+        assert!(
+            chunks[0].contains("(unknown)"),
+            "None speaker → (unknown), got: {:?}",
+            chunks[0]
+        );
     }
 
     #[test]
@@ -813,26 +1188,49 @@ mod tests {
             let speaker = if i % 2 == 0 { "me" } else { "others" };
             // ~110-char utterance so a handful of turns exceed the 1000-char window target.
             let text = format!("this is turn number {i} with a fair amount of spoken content to push the running window past the target size");
-            segs.push(seg(i, i as f64 * 5.0, i as f64 * 5.0 + 4.0, Some(speaker), &text));
+            segs.push(seg(
+                i,
+                i as f64 * 5.0,
+                i as f64 * 5.0 + 4.0,
+                Some(speaker),
+                &text,
+            ));
         }
         let chunks = chunk_transcript("Long", "2026-06-28", &segs);
-        assert!(chunks.len() >= 2, "long transcript must split into multiple windows, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "long transcript must split into multiple windows, got {}",
+            chunks.len()
+        );
         // Every chunk carries the header.
         for c in &chunks {
-            assert!(c.starts_with("Long · 2026-06-28\n"), "chunk missing header: {c:?}");
+            assert!(
+                c.starts_with("Long · 2026-06-28\n"),
+                "chunk missing header: {c:?}"
+            );
         }
         // OVERLAP: the LAST turn line of chunk N must reappear as (near) the FIRST body line of chunk N+1
         // (whole-turn carry). Assert at least one shared turn line across the first boundary.
         let turn_lines = |c: &str| -> Vec<String> {
-            c.lines().filter(|l| l.starts_with('[')).map(str::to_string).collect::<Vec<_>>()
+            c.lines()
+                .filter(|l| l.starts_with('['))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         };
         let a = turn_lines(&chunks[0]);
         let b = turn_lines(&chunks[1]);
         let shared = a.iter().rev().take(3).any(|t| b.contains(t));
         assert!(shared, "sliding window must overlap: a tail turn of chunk 0 must reappear in chunk 1\n0={a:?}\n1={b:?}");
         // Overlap stays BOUNDED — the carried body must be well under a full window.
-        let carried_chars: usize = b.iter().take_while(|t| a.contains(t)).map(|t| t.len()).sum();
-        assert!(carried_chars <= TRANSCRIPT_CHUNK_CHAR_TARGET / 2, "overlap must be ~15%, not half a window (got {carried_chars} chars)");
+        let carried_chars: usize = b
+            .iter()
+            .take_while(|t| a.contains(t))
+            .map(|t| t.len())
+            .sum();
+        assert!(
+            carried_chars <= TRANSCRIPT_CHUNK_CHAR_TARGET / 2,
+            "overlap must be ~15%, not half a window (got {carried_chars} chars)"
+        );
     }
 
     #[test]
@@ -844,6 +1242,294 @@ mod tests {
         let a = chunk_transcript("T", "D", &segs);
         let b = chunk_transcript("T", "D", &segs);
         assert_eq!(a, b, "chunk_transcript must be pure + deterministic");
+    }
+
+    // ── L1.1 segment_topics ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn segment_topics_empty_and_blank_yield_nothing() {
+        assert!(segment_topics(&[]).is_empty());
+        let blanks = [
+            seg(0, 0.0, 1.0, Some("me"), "   "),
+            seg(1, 1.0, 2.0, Some("others"), ""),
+        ];
+        assert!(segment_topics(&blanks).is_empty());
+    }
+
+    #[test]
+    fn segment_topics_splits_on_lull() {
+        // Two long conversational blocks separated by a 40s silence — the lull is the boundary.
+        // Each block is > 60s so neither merges away.
+        let mut segs = Vec::new();
+        for i in 0..4i64 {
+            segs.push(seg(
+                i,
+                i as f64 * 20.0,
+                i as f64 * 20.0 + 18.0,
+                Some("me"),
+                "planning the atlas budget numbers",
+            ));
+        }
+        // Block 2 starts 40s after block 1 ended (78.0 + 40 = 118.0).
+        for i in 0..4i64 {
+            segs.push(seg(
+                4 + i,
+                118.0 + i as f64 * 20.0,
+                118.0 + i as f64 * 20.0 + 18.0,
+                Some("me"),
+                "planning the atlas budget numbers",
+            ));
+        }
+        let topics = segment_topics(&segs);
+        assert_eq!(
+            topics.len(),
+            2,
+            "a ≥30s lull must open a new topic, got {topics:?}"
+        );
+        assert!(topics[0].end_s <= 78.0 + 1e-9);
+        assert!((topics[1].start_s - 118.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn segment_topics_splits_on_lexical_shift() {
+        // Same speaker, no lull — but the vocabulary flips completely between two 6-segment
+        // windows, so the Jaccard-shift signal must fire. Both halves are > 60s.
+        let mut segs = Vec::new();
+        for i in 0..6i64 {
+            segs.push(seg(
+                i,
+                i as f64 * 15.0,
+                i as f64 * 15.0 + 14.0,
+                Some("me"),
+                "budżet finanse kwartał wydatki koszty licencje",
+            ));
+        }
+        for i in 6..12i64 {
+            segs.push(seg(
+                i,
+                i as f64 * 15.0,
+                i as f64 * 15.0 + 14.0,
+                Some("me"),
+                "rekrutacja kandydat rozmowa oferta zatrudnienie zespół",
+            ));
+        }
+        let topics = segment_topics(&segs);
+        assert_eq!(
+            topics.len(),
+            2,
+            "a lexical shift must open a new topic, got {topics:?}"
+        );
+        assert!(topics[0].text.contains("budżet"));
+        assert!(!topics[0].text.contains("rekrutacja"));
+        assert!(topics[1].text.contains("rekrutacja"));
+    }
+
+    #[test]
+    fn segment_topics_speaker_flip_needs_a_long_run() {
+        // Ordinary turn-taking (1-2 segment runs) must NOT split; a flip after a ≥5-run must.
+        // Use a SHARED vocabulary so the lexical signal stays silent.
+        let text = "wspólny temat projektu atlas status zadania postęp";
+        let mut segs = Vec::new();
+        // 6-segment "me" run…
+        for i in 0..6i64 {
+            segs.push(seg(
+                i,
+                i as f64 * 15.0,
+                i as f64 * 15.0 + 14.0,
+                Some("me"),
+                text,
+            ));
+        }
+        // …then "others" takes over for 6 segments (flip AFTER a 6-run ⇒ boundary).
+        for i in 6..12i64 {
+            segs.push(seg(
+                i,
+                i as f64 * 15.0,
+                i as f64 * 15.0 + 14.0,
+                Some("others"),
+                text,
+            ));
+        }
+        let topics = segment_topics(&segs);
+        assert_eq!(
+            topics.len(),
+            2,
+            "flip after a ≥5-run must split, got {topics:?}"
+        );
+
+        // Pure alternation (run length 1) must stay ONE topic.
+        let mut alt = Vec::new();
+        for i in 0..12i64 {
+            let sp = if i % 2 == 0 { "me" } else { "others" };
+            alt.push(seg(
+                i,
+                i as f64 * 15.0,
+                i as f64 * 15.0 + 14.0,
+                Some(sp),
+                text,
+            ));
+        }
+        assert_eq!(
+            segment_topics(&alt).len(),
+            1,
+            "ordinary turn-taking must not split"
+        );
+    }
+
+    #[test]
+    fn segment_topics_merges_short_topics_forward() {
+        // A 30s sliver before a lull merges into the (long) following topic instead of standing
+        // alone. Shared vocabulary keeps the lexical signal out of the picture.
+        let text = "wspólny temat projektu atlas status zadania postęp";
+        let mut segs = Vec::new();
+        segs.push(seg(0, 0.0, 30.0, Some("me"), text)); // 30s sliver…
+                                                        // …lull ≥ 30s opens a boundary, then a 90s block.
+        for i in 0..6i64 {
+            segs.push(seg(
+                1 + i,
+                70.0 + i as f64 * 15.0,
+                70.0 + i as f64 * 15.0 + 14.0,
+                Some("me"),
+                text,
+            ));
+        }
+        let topics = segment_topics(&segs);
+        assert_eq!(
+            topics.len(),
+            1,
+            "a <60s topic must merge forward, got {topics:?}"
+        );
+        assert!(
+            (topics[0].start_s - 0.0).abs() < 1e-9,
+            "merged topic keeps the sliver's start"
+        );
+    }
+
+    #[test]
+    fn segment_topics_is_deterministic_and_tags_speakers() {
+        let segs = [
+            seg(0, 0.0, 4.0, Some("me"), "deterministic topic check"),
+            seg(
+                1,
+                4.0,
+                8.0,
+                Some("Łukasz"),
+                "deterministyczna kontrola tematu",
+            ),
+        ];
+        let a = segment_topics(&segs);
+        let b = segment_topics(&segs);
+        assert_eq!(a, b, "segment_topics must be pure + deterministic");
+        assert_eq!(a.len(), 1);
+        assert!(a[0].text.contains("(me) deterministic topic check"));
+        assert!(a[0]
+            .text
+            .contains("(Łukasz) deterministyczna kontrola tematu"));
+    }
+
+    // ── L1.2 augment_chunk_text ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn augment_chunk_text_formats_header_and_caps() {
+        let attendees: Vec<String> = (0..7).map(|i| format!("Person {i}")).collect();
+        let facts: Vec<String> = (0..10).map(|i| format!("fact {i}")).collect();
+        let out = augment_chunk_text(
+            "Quarterly Sync",
+            "2026-06-28",
+            &attendees,
+            &facts,
+            "raw body",
+        );
+        let header = out.lines().next().unwrap();
+        assert!(header.starts_with("Quarterly Sync | 2026-06-28 | "));
+        assert!(header.contains("Person 0, Person 1, Person 2, Person 3, Person 4"));
+        assert!(
+            !header.contains("Person 5"),
+            "attendees must cap at {AUG_MAX_ATTENDEES}"
+        );
+        assert!(header.contains("fact 7"));
+        assert!(
+            !header.contains("fact 8"),
+            "facts must cap at {AUG_MAX_FACTS}"
+        );
+        assert!(out.ends_with("\nraw body"));
+    }
+
+    #[test]
+    fn augment_chunk_text_skips_empty_parts() {
+        // No attendees/facts ⇒ just "title | date\nraw".
+        let out = augment_chunk_text("T", "2026-01-01", &[], &[], "raw");
+        assert_eq!(out, "T | 2026-01-01\nraw");
+        // Everything empty ⇒ the raw text unchanged (no dangling header line).
+        assert_eq!(augment_chunk_text("", " ", &[], &[], "raw"), "raw");
+        // Deterministic.
+        assert_eq!(
+            augment_chunk_text("T", "D", &["A".into()], &["f".into()], "r"),
+            augment_chunk_text("T", "D", &["A".into()], &["f".into()], "r"),
+        );
+    }
+
+    // ── L1.3 score_fuse ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn score_fuse_single_leg_preserves_order() {
+        let fts = vec![
+            ("a".to_string(), 5.0),
+            ("b".to_string(), 3.0),
+            ("c".to_string(), 1.0),
+        ];
+        let fused = score_fuse(&fts, &[], &[]);
+        let ids: Vec<&str> = fused.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        // Empty legs contribute nothing; the leg's best gets the full leg weight.
+        assert!((fused[0].1 - SCORE_FUSE_W_FTS).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_fuse_two_legs_reward_agreement() {
+        // "m2" is mid-pack in FTS but is also a KNN hit; "m1" tops FTS only, "m3" KNN only.
+        let fts = vec![
+            ("m1".to_string(), 9.0),
+            ("m2".to_string(), 5.0),
+            ("x".to_string(), 1.0),
+        ];
+        let knn = vec![
+            ("m3".to_string(), 0.1),
+            ("m2".to_string(), 0.2),
+            ("y".to_string(), 2.0),
+        ];
+        let fused = score_fuse(&fts, &knn, &[]);
+        let pos = |want: &str| fused.iter().position(|(id, _)| id == want).unwrap();
+        assert!(
+            pos("m2") < pos("m3"),
+            "a both-legs hit must beat a one-leg hit: {fused:?}"
+        );
+        assert!(pos("m2") < pos("x"));
+    }
+
+    #[test]
+    fn score_fuse_inverts_knn_distances() {
+        // Smaller distance = better: d=0.1 must outrank d=1.5.
+        let knn = vec![("far".to_string(), 1.5), ("near".to_string(), 0.1)];
+        let fused = score_fuse(&[], &knn, &[]);
+        assert_eq!(
+            fused[0].0, "near",
+            "smaller KNN distance must fuse higher: {fused:?}"
+        );
+        assert!(fused[0].1 > fused[1].1);
+    }
+
+    #[test]
+    fn score_fuse_empty_legs_and_ties() {
+        assert!(score_fuse(&[], &[], &[]).is_empty());
+        // A constant leg normalizes to all-1.0 (presence is signal), ties break by id ASC.
+        let graph = vec![("b".to_string(), 1.0), ("a".to_string(), 1.0)];
+        let fused = score_fuse(&[], &[], &graph);
+        assert_eq!(fused[0].0, "a");
+        assert!(
+            (fused[0].1 - fused[1].1).abs() < 1e-12,
+            "constant leg ⇒ equal scores"
+        );
     }
 
     #[test]
