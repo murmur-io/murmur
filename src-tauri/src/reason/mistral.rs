@@ -53,6 +53,20 @@ use crate::reason::{parse_first_json, GenOptions, LocalReasoner};
 /// §3.3). REFUSE-don't-evict at the cap (see the module header).
 const MODEL_CACHE_CAP: usize = 2;
 
+/// Brain v2 L3 — the TINY-schema ceiling for the flag-gated grammar constraint: only a schema
+/// whose serialized form is under this many bytes may be decode-constrained
+/// (`Constraint::JsonSchema`). The Bielik-11B context overflow that killed the original constraint
+/// path was a HUGE schema; a 3-key enum / bool-flag schema is 1-2 orders of magnitude below this.
+const GRAMMAR_SCHEMA_MAX_BYTES: usize = 512;
+
+/// Brain v2 L3 — the PURE decision: constrain THIS structured call's decode? True only when the
+/// caller opted in (`GenOptions::use_grammar_constraint`, itself gated by the
+/// `brain_heavy_grammar_enabled` config flag) AND the serialized schema is tiny. Factored out so
+/// the size-threshold branch is unit-testable without a model.
+fn grammar_constraint_applies(opted_in: bool, schema_bytes: usize) -> bool {
+    opted_in && schema_bytes < GRAMMAR_SCHEMA_MAX_BYTES
+}
+
 /// KV / activation / runtime headroom factor applied to a GGUF's on-disk (weights) size to estimate
 /// its true peak resident footprint (P0.3, perf-memory-audit §2). The GGUF weights stay quantized in
 /// RAM (~on-disk size — audit §1 BF16 note), but the prefill KV cache + Metal buffers + activations
@@ -284,7 +298,7 @@ impl MistralReasoner {
         let system = system.to_string();
         let user = user.to_string();
         run_bounded(opts.timeout, move || {
-            generate_blocking(&model, &system, &user, opts)
+            generate_blocking(&model, &system, &user, opts, None)
         })
     }
 
@@ -292,12 +306,61 @@ impl MistralReasoner {
     /// (mistralrs' `Constraint::JsonSchema` overflowed the context on Bielik-11B; see the module
     /// header) and recover the object via the robust extractor — the SAME approach `CloudReasoner`
     /// uses. Threads the token cap through so the realtime path stays bounded.
+    ///
+    /// Brain v2 L3 (flag-gated exception): when the caller opted in via
+    /// `opts.use_grammar_constraint` AND the serialized schema is TINY
+    /// ([`grammar_constraint_applies`], < [`GRAMMAR_SCHEMA_MAX_BYTES`] — never the Bielik-overflow
+    /// class), FIRST try a llguidance-constrained decode ([`Self::structured_constrained`]).
+    /// ANY failure there — load, constraint build, generation, timeout, parse — falls back
+    /// GRACEFULLY to the schema-in-prompt path below (a content-free debug log, never an error to
+    /// the caller). Verified only as compiling headless; real constrained-decode quality needs a
+    /// real Mac + a GGUF (spec decision #4 — hence the default-off config gate).
     fn structured_with_opts(&self, system: &str, user: &str, json_schema: &Value, opts: GenOptions) -> Result<Value> {
+        let schema_bytes = serde_json::to_string(json_schema)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX); // unserializable schema ⇒ never constrain.
+        if grammar_constraint_applies(opts.use_grammar_constraint, schema_bytes) {
+            match self.structured_constrained(system, user, json_schema, opts) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // NO PII: the error + schema SIZE only — never the prompt/schema content.
+                    tracing::debug!(
+                        target: "reason",
+                        error = %e,
+                        schema_bytes,
+                        "grammar-constrained decode failed; falling back to schema-in-prompt"
+                    );
+                }
+            }
+        }
         let sys = format!(
             "{system}\n\nRespond with ONLY a single JSON object conforming to this schema: \
              {json_schema}. No prose, no markdown fences."
         );
         let content = self.reason_with_opts(&sys, user, opts)?;
+        parse_first_json(&content)
+    }
+
+    /// Brain v2 L3 — ONE grammar-constrained structured attempt: build the chat request with
+    /// mistralrs `Constraint::JsonSchema(schema)` (verified against mistralrs 0.8.1:
+    /// `mistralrs_core::request::Constraint::JsonSchema(serde_json::Value)`, applied via
+    /// `RequestBuilder::set_constraint` — the same shape `Model::send_chat_request_structured`
+    /// uses internally) and recover the object with the SAME robust extractor as the prompt path.
+    /// Rides the caller's timeout via [`run_bounded`]. Callers treat ANY `Err` as "fall back".
+    fn structured_constrained(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+    ) -> Result<Value> {
+        let model = self.model()?;
+        let system = system.to_string();
+        let user = user.to_string();
+        let constraint = mistralrs::Constraint::JsonSchema(json_schema.clone());
+        let content = run_bounded(opts.timeout, move || {
+            generate_blocking(&model, &system, &user, opts, Some(constraint))
+        })?;
         parse_first_json(&content)
     }
 
@@ -342,12 +405,14 @@ impl LocalReasoner for MistralReasoner {
 /// The BLOCKING generation core: build one chat request over an already-resolved engine and drive
 /// it to completion. Runs on the [`run_with_timeout`] worker thread — that thread has no ambient
 /// runtime, so the inner scoped `block_on` is safe regardless of caller context. `enable_thinking`
-/// / temperature / token cap come from the [`GenOptions`].
+/// / temperature / token cap come from the [`GenOptions`]; `constraint` (Brain v2 L3) is the
+/// OPTIONAL llguidance decode constraint — `None` on every default path (byte-identical request).
 fn generate_blocking(
     model: &Arc<Model>,
     system: &str,
     user: &str,
     opts: GenOptions,
+    constraint: Option<mistralrs::Constraint>,
 ) -> Result<String> {
     let mut req = RequestBuilder::new()
         .add_message(TextMessageRole::System, system)
@@ -358,6 +423,9 @@ fn generate_blocking(
     }
     if let Some(n) = opts.max_tokens {
         req = req.set_sampler_max_len(n);
+    }
+    if let Some(c) = constraint {
+        req = req.set_constraint(c);
     }
     let rt = brain_rt().ok_or_else(|| AppError::Summarize("brain runtime unavailable".into()))?;
     let resp = block_on(rt, model.send_chat_request(req))?
@@ -587,6 +655,31 @@ mod tests {
             matches!(res, Err(AppError::Summarize(_))),
             "a worker panic must become a graceful Err, got {res:?}"
         );
+    }
+
+    /// Brain v2 L3 — the grammar-constraint SIZE-THRESHOLD decision (the only headless-testable
+    /// part; the real constrained decode needs a model on a real Mac): opt-out ⇒ never; opt-in ⇒
+    /// only under the 512-byte ceiling; an unserializable schema (`usize::MAX` sentinel) ⇒ never.
+    #[test]
+    fn grammar_constraint_applies_only_when_opted_in_and_schema_is_tiny() {
+        // Flag off ⇒ never, regardless of size.
+        assert!(!grammar_constraint_applies(false, 0));
+        assert!(!grammar_constraint_applies(false, 100));
+        // Flag on ⇒ boundary at GRAMMAR_SCHEMA_MAX_BYTES (strictly under).
+        assert!(grammar_constraint_applies(true, 0));
+        assert!(grammar_constraint_applies(true, GRAMMAR_SCHEMA_MAX_BYTES - 1));
+        assert!(!grammar_constraint_applies(true, GRAMMAR_SCHEMA_MAX_BYTES));
+        assert!(!grammar_constraint_applies(true, GRAMMAR_SCHEMA_MAX_BYTES + 1));
+        // The unserializable-schema sentinel is way over the ceiling ⇒ never constrained.
+        assert!(!grammar_constraint_applies(true, usize::MAX));
+        // A realistic tiny schema (the rerank/importance class) serializes well under the ceiling.
+        let tiny = serde_json::json!({
+            "type": "object",
+            "properties": { "relevant": { "type": "boolean" } },
+            "required": ["relevant"]
+        });
+        let bytes = serde_json::to_string(&tiny).unwrap().len();
+        assert!(grammar_constraint_applies(true, bytes), "tiny schema ({bytes} B) must qualify");
     }
 
     /// The best-effort `available_ram_bytes` probe is crash-safe: it returns EITHER `Some(>0)` on a

@@ -42,6 +42,27 @@ pub struct EgressEntry {
     pub meeting_id: Option<String>,
 }
 
+/// Brain v2 L3 — build the CONTENT-FREE "cascade escalation" ledger row: a tier of the in-meeting
+/// brain cascade declined to answer and the ladder stepped up to the next tier, which will run on
+/// `connection` (a provider connection — the caller must NOT record a local-tier escalation whose
+/// next tier stays on-device; that is not egress). Carries ONLY the connection id and the tier
+/// transition (`"cascade tier1→tier2"`) — NEVER the query, the tier prompt, or any content. Zero
+/// token counts / byte sizes: the escalation itself sends nothing; the next tier's own provider
+/// call writes its own row. Pure, so it is unit-testable without touching the global sink.
+pub fn escalation_entry(connection: &str, from_tier: u8, to_tier: u8) -> EgressEntry {
+    EgressEntry {
+        provider_id: connection.to_string(),
+        destination: format!("cascade tier{from_tier}→tier{to_tier}"),
+        model_requested: String::new(),
+        call_kind: "escalation",
+        meta: CallMeta::default(),
+        redactions: RedactionCounts::default(),
+        system_bytes: 0,
+        user_bytes: 0,
+        meeting_id: None,
+    }
+}
+
 /// Receiver for egress audit entries. Implementations MUST be `Send + Sync` and MUST NOT panic
 /// on error (a logging failure must never break summarization).
 pub trait EgressSink: Send + Sync {
@@ -149,6 +170,27 @@ mod tests {
     fn active_sink_never_panics() {
         let sink = active_sink();
         sink.record(sample_entry()); // must not panic regardless of which sink is active
+    }
+
+    /// Brain v2 L3 — the escalation ledger row is CONTENT-FREE by construction: `call_kind`
+    /// "escalation", the tier transition in the destination label, zero counts/sizes, and no way
+    /// for query text to enter (the constructor takes only the connection id + two tier numbers).
+    #[test]
+    fn escalation_entry_is_content_free_and_kind_tagged() {
+        let e = escalation_entry("claude_code", 1, 2);
+        assert_eq!(e.call_kind, "escalation");
+        assert_eq!(e.provider_id, "claude_code");
+        assert_eq!(e.destination, "cascade tier1→tier2");
+        assert_eq!(e.model_requested, "");
+        assert_eq!(e.system_bytes, 0);
+        assert_eq!(e.user_bytes, 0);
+        assert!(e.meeting_id.is_none());
+        // Debug output carries only ids/labels/zeros — the recording sink can never leak content.
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("escalation"));
+        assert!(dbg.contains("tier1"));
+        // And a NoopEgressSink record of it is panic-free (the pre-wiring default).
+        NoopEgressSink.record(escalation_entry("anthropic", 2, 3));
     }
 
     /// The content-free proof: `format!("{:?}", entry)` must not contain the scrubbed input values.

@@ -119,6 +119,18 @@ pub trait SummarizerProvider: Send + Sync {
     async fn complete_json(&self, system: &str, user: &str, schema: &Value) -> Result<Value> {
         Ok(self.complete_json_with_meta(system, user, schema).await?.0)
     }
+
+    /// Does this provider enforce valid JSON NATIVELY (constrained decoding — e.g. the
+    /// OpenAI-compatible `response_format: {"type":"json_schema", …}`) rather than
+    /// schema-in-prompt + [`crate::reason::parse_first_json`] recovery?
+    ///
+    /// Brain v2 L3 structured-output hardening: a CAPABILITY SEAM ONLY for now — nothing
+    /// dispatches on it yet (per spec §L3, `CloudReasoner` keeps its current path until the
+    /// shadow data justifies a cutover). Default `false`; the gateway provider (which already
+    /// sends `response_format` json_schema in `complete_json_with_meta`) overrides to `true`.
+    fn supports_native_json(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +156,14 @@ mod tests {
         async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
             Ok(self.0.to_string())
         }
+    }
+
+    /// Brain v2 L3 — `supports_native_json` DEFAULTS to false: a provider that does not override
+    /// it is on the schema-in-prompt + `parse_first_json` recovery path (only the gateway, which
+    /// sends `response_format: json_schema`, overrides to true — tested in `gateway.rs`).
+    #[test]
+    fn supports_native_json_defaults_to_false() {
+        assert!(!FixedProvider("x").supports_native_json());
     }
 
     /// `complete_with_meta` default returns the plain `complete` output paired with empty `CallMeta`.

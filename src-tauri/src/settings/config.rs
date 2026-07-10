@@ -421,6 +421,31 @@ pub struct AppConfig {
     /// grants nor clears it; it round-trips through the load/save keys.
     #[serde(default)]
     pub ground_summary: bool,
+    /// Brain v2 L3 — gate for the TINY-schema grammar constraint on the on-device structured
+    /// decode (`GenOptions::use_grammar_constraint` → mistralrs `Constraint::JsonSchema`, schemas
+    /// < 512 bytes only, graceful fallback to schema-in-prompt). Default OFF / OPT-IN
+    /// (`#[serde(default)]` ⇒ `false`): constrained-decode quality on Qwen3-4B needs a real-Mac
+    /// spike before this can default on (spec decision #4). ADDITIVE; not on the settings DTO
+    /// (preserve-only in `dto_to_config`); round-trips via K_BRAIN_HEAVY_GRAMMAR_ENABLED.
+    #[serde(default)]
+    pub brain_heavy_grammar_enabled: bool,
+    /// Brain v2 L3 — JUST-IN-TIME retrieval for the AGENTIC Ask path: instead of the model
+    /// searching blind, its persona is seeded with a compact GATED meeting LISTING
+    /// (id | title | date, top-30 hybrid hits, ~80 chars each) + search-then-`get_meeting`
+    /// instructions. Default OFF (`#[serde(default)]` ⇒ `false`; spec decision #3: stays off until
+    /// the eval run compares JIT vs packed-corpus answer faithfulness) — OFF is BYTE-IDENTICAL to
+    /// the legacy agentic prompt. The non-agentic FLOOR keeps its packed corpus either way.
+    /// ADDITIVE; not on the settings DTO; round-trips via K_ASK_JIT_RETRIEVAL.
+    #[serde(default)]
+    pub ask_jit_retrieval: bool,
+    /// Brain v2 L3 — deterministic agentic-loop transcript COMPACTION (keep the user request +
+    /// last 2 tool results + an "[N earlier results omitted]" marker once the loop transcript
+    /// passes 32k chars). Default ON (`#[serde(default = "default_true")]` ⇒ pre-existing configs
+    /// load `true`) — the escape hatch exists so a compaction-suspected regression can be ruled
+    /// out in the field. ADDITIVE; not on the settings DTO; round-trips via
+    /// K_LOOP_TRANSCRIPT_COMPACTION.
+    #[serde(default = "default_true")]
+    pub loop_transcript_compaction: bool,
     /// Model-role override — the CONNECTION serving the **Notes** role (everything Murmur writes).
     /// `""` (the default, and every pre-role install) = inherit the legacy mapping EXACTLY — see
     /// [`crate::summarize::roles::resolve`]. Values: `claude_code`/`anthropic`/`ollama`/`gateway`
@@ -531,6 +556,9 @@ impl Default for AppConfig {
             user_memory_enabled: true,
             memory_consolidation_enabled: true,
             ground_summary: false,
+            brain_heavy_grammar_enabled: false,
+            ask_jit_retrieval: false,
+            loop_transcript_compaction: true,
             role_notes_connection: String::new(),
             role_notes_model: String::new(),
             role_notes_effort: String::new(),
@@ -605,6 +633,9 @@ const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
 const K_USER_MEMORY_ENABLED: &str = "user_memory_enabled";
 const K_MEMORY_CONSOLIDATION_ENABLED: &str = "memory_consolidation_enabled";
 const K_GROUND_SUMMARY: &str = "ground_summary";
+const K_BRAIN_HEAVY_GRAMMAR_ENABLED: &str = "brain_heavy_grammar_enabled";
+const K_ASK_JIT_RETRIEVAL: &str = "ask_jit_retrieval";
+const K_LOOP_TRANSCRIPT_COMPACTION: &str = "loop_transcript_compaction";
 const K_ROLE_NOTES_CONNECTION: &str = "role_notes_connection";
 const K_ROLE_NOTES_MODEL: &str = "role_notes_model";
 const K_ROLE_NOTES_EFFORT: &str = "role_notes_effort";
@@ -810,6 +841,15 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_GROUND_SUMMARY)? {
             cfg.ground_summary = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_BRAIN_HEAVY_GRAMMAR_ENABLED)? {
+            cfg.brain_heavy_grammar_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_ASK_JIT_RETRIEVAL)? {
+            cfg.ask_jit_retrieval = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_LOOP_TRANSCRIPT_COMPACTION)? {
+            cfg.loop_transcript_compaction = v == "true";
         }
         // Model-role keys: `""` is a VALID value (= inherit legacy) and also the default, so the
         // stored value is taken verbatim (mirrors `provider_model`, not `anthropic_model`).
@@ -1092,6 +1132,26 @@ impl AppConfig {
         db.set_setting(
             K_GROUND_SUMMARY,
             if self.ground_summary { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_BRAIN_HEAVY_GRAMMAR_ENABLED,
+            if self.brain_heavy_grammar_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_ASK_JIT_RETRIEVAL,
+            if self.ask_jit_retrieval { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_LOOP_TRANSCRIPT_COMPACTION,
+            if self.loop_transcript_compaction {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_ROLE_NOTES_CONNECTION, &self.role_notes_connection)?;
         db.set_setting(K_ROLE_NOTES_MODEL, &self.role_notes_model)?;

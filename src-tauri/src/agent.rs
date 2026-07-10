@@ -81,6 +81,95 @@ pub trait DeltaSink: Send + Sync {
 /// Bound on re-fed tool output per step — caps context growth + cloud egress amplification.
 const RESULT_BUDGET: usize = 4000;
 
+/// Brain v2 L3 — char budget on the WHOLE loop transcript before deterministic compaction kicks in
+/// (~8k tokens: inside a small local model's effective context, and a hard cap on per-step cloud
+/// egress growth). `pub(crate)` so [`crate::reason::GenOptions::transcript_compaction`]'s doc can
+/// cite it.
+pub(crate) const TRANSCRIPT_BUDGET: usize = 32_000;
+
+/// How many of the NEWEST appended blocks compaction keeps verbatim.
+const KEEP_LAST_BLOCKS: usize = 2;
+
+/// Brain v2 L3 — the loop transcript with OWNED, STRUCTURAL block boundaries.
+///
+/// The loop owns every append site, so block boundaries are tracked as a `Vec<String>` instead of
+/// being re-detected by string-scanning. This is the fix for the 2026-07-10 adversarial finding:
+/// the old compactor scanned the RENDERED transcript for `"\n\n["`, which collides with normal
+/// markdown — a `"\n\n[[Weekly Sync]]"` citation paragraph in the conversation head ate the user's
+/// newest question, and one inside the newest `get_meeting` result decapitated the freshest
+/// grounding. Structurally:
+/// - `head` (the "User request: …" line + the caller's whole rendered conversation) is NEVER cut;
+/// - each appended block (tool result / failure marker / dedup marker) is one owned `String`;
+/// - compaction drops only WHOLE OLD blocks, folding them into the `omitted` count.
+struct LoopTranscript {
+    /// "User request: {user}" — kept verbatim forever; markdown inside it is content, never a
+    /// boundary.
+    head: String,
+    /// Blocks already folded into the `"[N earlier results omitted]"` marker.
+    omitted: usize,
+    /// The appended blocks, newest last, each WITHOUT its `"\n\n"` joiner.
+    blocks: Vec<String>,
+}
+
+impl LoopTranscript {
+    fn new(user: &str) -> Self {
+        Self {
+            head: format!("User request: {user}"),
+            omitted: 0,
+            blocks: Vec::new(),
+        }
+    }
+
+    fn push_block(&mut self, block: String) {
+        self.blocks.push(block);
+    }
+
+    /// Exact length of [`render`](Self::render)'s output, without allocating it.
+    fn rendered_len(&self) -> usize {
+        let marker = if self.omitted > 0 {
+            2 + omitted_marker(self.omitted).len()
+        } else {
+            0
+        };
+        self.head.len() + marker + self.blocks.iter().map(|b| 2 + b.len()).sum::<usize>()
+    }
+
+    /// DETERMINISTIC compaction (no model call): drop all but the LAST [`KEEP_LAST_BLOCKS`] blocks
+    /// WHOLE, accumulating the dropped count into `omitted`. With ≤ KEEP_LAST_BLOCKS blocks there
+    /// is nothing to drop — a no-op. Repeated compactions keep folding into the same counter.
+    fn compact(&mut self) {
+        if self.blocks.len() <= KEEP_LAST_BLOCKS {
+            return;
+        }
+        let drop_n = self.blocks.len() - KEEP_LAST_BLOCKS;
+        self.blocks.drain(..drop_n);
+        self.omitted += drop_n;
+    }
+
+    /// Render for the model: head, then (when anything was folded) the omitted-count marker, then
+    /// the surviving blocks — each joined with `"\n\n"`, byte-identical to the pre-structural
+    /// rendering for the same content.
+    fn render(&self) -> String {
+        let mut s = String::with_capacity(self.rendered_len());
+        s.push_str(&self.head);
+        if self.omitted > 0 {
+            s.push_str("\n\n");
+            s.push_str(&omitted_marker(self.omitted));
+        }
+        for b in &self.blocks {
+            s.push_str("\n\n");
+            s.push_str(b);
+        }
+        s
+    }
+}
+
+/// The compaction marker line (shared by `render` + `rendered_len` so the length math never
+/// drifts from the rendering).
+fn omitted_marker(n: usize) -> String {
+    format!("[{n} earlier results omitted]")
+}
+
 /// Drive the brain in a bounded decide-or-finish loop over the gated executor. See the module-level
 /// contract. PANIC-FREE: a tool error is recorded `ok=false` and the loop continues; a `structured()`
 /// error is propagated for the caller to floor on.
@@ -117,14 +206,42 @@ pub fn run_agentic_loop(
 
     let mut steps: Vec<AgentStep> = Vec::new();
     let mut gathered = String::new();
-    let mut transcript = format!("User request: {user}");
+    let mut transcript = LoopTranscript::new(user);
     // Per-turn no-repeat guard (ReAct non-termination): a (tool,args) pair already run is skipped.
     let mut seen: Vec<String> = Vec::new();
 
     for _ in 0..max_steps {
+        // L3: deterministic transcript COMPACTION once the loop context exceeds the budget — keeps
+        // the user request + the freshest grounding verbatim and replaces older blocks with a
+        // count marker, so a long multi-tool turn can't blow a small model's context (or amplify
+        // cloud egress step over step). STRUCTURAL: only whole owned blocks are ever dropped, the
+        // head never. Gated by the caller's options (`loop_transcript_compaction` config flag,
+        // default ON).
+        if opts.transcript_compaction && transcript.rendered_len() > TRANSCRIPT_BUDGET {
+            transcript.compact();
+        }
+        let rendered = transcript.render();
         // PROPAGATE a structured() error (esp. Unavailable on no-consent) — never swallow it.
         // P0.3: every step rides the caller's GenOptions (token cap; timeout on the GGUF path).
-        let v = reasoner.structured_with(&agent_system, &transcript, &step_schema, opts)?;
+        // L3 structured-output hardening: a MALFORMED-JSON reply (the `parse_first_json` error
+        // class, centralized in `is_malformed_json_error`) gets exactly ONE corrective retry —
+        // the same transcript plus an explicit "reply with exactly …" instruction. A second
+        // failure propagates as before; every OTHER error class (Unavailable, Storage, …)
+        // propagates immediately with no retry.
+        let v = match reasoner.structured_with(&agent_system, &rendered, &step_schema, opts) {
+            Ok(v) => v,
+            Err(e) if crate::reason::is_malformed_json_error(&e) => {
+                // PII rule: the error text carries no model output beyond serde's token position.
+                tracing::debug!(target: "agent", error = %e, "malformed JSON step; one corrective retry");
+                let corrective = format!(
+                    "{rendered}\n\n[Your last response was not valid JSON. Reply with EXACTLY one \
+                     JSON object — either {{\"tool\":\"<name>\",\"args\":{{…}}}} or \
+                     {{\"answer\":\"<your final answer>\"}} — and nothing else.]"
+                );
+                reasoner.structured_with(&agent_system, &corrective, &step_schema, opts)?
+            }
+            Err(e) => return Err(e),
+        };
 
         if let Some(answer) = v.get("answer").and_then(|a| a.as_str()) {
             let answer = answer.trim();
@@ -146,8 +263,8 @@ pub fn run_agentic_loop(
             let key = format!("{name}:{args}");
             if seen.contains(&key) {
                 // Already retrieved this exact call — tell the model, don't burn the budget on a repeat.
-                transcript.push_str(&format!(
-                    "\n\n[{name} already retrieved — choose a different tool or answer]"
+                transcript.push_block(format!(
+                    "[{name} already retrieved — choose a different tool or answer]"
                 ));
                 continue;
             }
@@ -164,8 +281,8 @@ pub fn run_agentic_loop(
                     }
                     gathered.push_str(out);
                     gathered.push_str("\n\n");
-                    transcript.push_str(&format!(
-                        "\n\n[{name} result]\n{}",
+                    transcript.push_block(format!(
+                        "[{name} result]\n{}",
                         truncate(out, RESULT_BUDGET)
                     ));
                     steps.push(AgentStep {
@@ -180,7 +297,7 @@ pub fn run_agentic_loop(
                         s.tool_done(&name, false, 0);
                     }
                     transcript
-                        .push_str(&format!("\n\n[{name} failed — try another tool or answer]"));
+                        .push_block(format!("[{name} failed — try another tool or answer]"));
                     steps.push(AgentStep {
                         tool: name,
                         ok: false,
@@ -232,16 +349,21 @@ mod tests {
     /// double (NOT a shipped mock); the production loop drives the real CloudReasoner/MistralReasoner.
     struct ScriptReasoner {
         script: Mutex<VecDeque<Result<Value>>>,
+        /// Every `user` transcript handed to the model, so tests can bind prompt content
+        /// (e.g. the malformed-JSON corrective retry instruction).
+        seen: Mutex<Vec<String>>,
     }
     impl ScriptReasoner {
         fn ok(steps: Vec<Value>) -> Self {
             Self {
                 script: Mutex::new(steps.into_iter().map(Ok).collect()),
+                seen: Mutex::new(Vec::new()),
             }
         }
         fn with(seq: Vec<Result<Value>>) -> Self {
             Self {
                 script: Mutex::new(seq.into_iter().collect()),
+                seen: Mutex::new(Vec::new()),
             }
         }
     }
@@ -252,7 +374,8 @@ mod tests {
         fn reason(&self, _s: &str, _u: &str) -> Result<String> {
             Ok("unused".into())
         }
-        fn structured(&self, _s: &str, _u: &str, _schema: &Value) -> Result<Value> {
+        fn structured(&self, _s: &str, user: &str, _schema: &Value) -> Result<Value> {
+            self.seen.lock().unwrap().push(user.to_string());
             self.script
                 .lock()
                 .unwrap()
@@ -269,6 +392,51 @@ mod tests {
         }
         fn run(&self, name: &str, _a: &Value) -> Result<String> {
             Ok(format!("ran {name}"))
+        }
+    }
+
+    /// Records every `user` transcript the loop hands the model, then keeps asking for another
+    /// tool with distinct args (so blocks keep accumulating) until the countdown runs dry, then
+    /// answers "done". Shared by the compaction tests + the false-boundary probes.
+    struct RecordingReasoner {
+        seen: Mutex<Vec<String>>,
+        countdown: Mutex<usize>,
+    }
+    impl RecordingReasoner {
+        fn asking(n: usize) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                countdown: Mutex::new(n),
+            }
+        }
+    }
+    impl LocalReasoner for RecordingReasoner {
+        fn id(&self) -> &str {
+            "recording"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn structured(&self, _s: &str, user: &str, _schema: &Value) -> Result<Value> {
+            self.seen.lock().unwrap().push(user.to_string());
+            let mut n = self.countdown.lock().unwrap();
+            if *n == 0 {
+                return Ok(serde_json::json!({ "answer": "done" }));
+            }
+            *n -= 1;
+            Ok(serde_json::json!({ "tool": "search_meetings", "args": { "query": format!("q{}", *n) } }))
+        }
+    }
+
+    /// Returns a fat result each call so the transcript crosses TRANSCRIPT_BUDGET quickly
+    /// (just under RESULT_BUDGET, kept whole by `truncate()`).
+    struct FatExec;
+    impl ToolExecutor for FatExec {
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            crate::tools::tool_specs()
+        }
+        fn run(&self, _n: &str, _a: &Value) -> Result<String> {
+            Ok("y".repeat(3900))
         }
     }
 
@@ -387,6 +555,231 @@ mod tests {
         );
         assert!(!is_escalation("This is answerable here."), "a real answer never escalates");
         assert!(!is_escalation(""), "an empty answer is not an escalation");
+    }
+
+    // ── Brain v2 L3: deterministic loop-transcript compaction ────────────────────────────────────
+
+    /// Build a loop-shaped structural transcript: a head + `n` tool-result blocks (the exact
+    /// `"[{name} result]\n…"` block shape `run_agentic_loop` pushes).
+    fn loop_transcript(n: usize, block_chars: usize) -> LoopTranscript {
+        let mut t = LoopTranscript::new("what did we decide?");
+        for i in 0..n {
+            t.push_block(format!(
+                "[search_meetings result]\nblock-{i}-{}",
+                "x".repeat(block_chars)
+            ));
+        }
+        t
+    }
+
+    /// Compaction keeps the head + the LAST 2 blocks WHOLE and folds the rest into the count
+    /// marker; with ≤ 2 blocks it is a no-op; repeated compaction keeps folding into the same
+    /// counter (never a marker-inside-a-marker). `rendered_len` always equals `render().len()`.
+    #[test]
+    fn compact_transcript_keeps_head_marker_and_last_two_blocks() {
+        let mut t = loop_transcript(5, 100);
+        assert_eq!(t.rendered_len(), t.render().len(), "length math matches rendering");
+        t.compact();
+        let c = t.render();
+        assert!(c.starts_with("User request: what did we decide?"));
+        assert!(c.contains("[3 earlier results omitted]"), "5 blocks - 2 kept = 3 omitted: {c}");
+        assert!(c.contains("block-3-"), "second-to-last block kept verbatim");
+        assert!(c.contains("block-4-"), "last block kept verbatim");
+        for dropped in ["block-0-", "block-1-", "block-2-"] {
+            assert!(!c.contains(dropped), "{dropped} must be omitted");
+        }
+        assert_eq!(t.rendered_len(), c.len(), "length math matches after compaction");
+
+        // Re-compaction after more blocks FOLDS into the same counter.
+        t.push_block("[search_meetings result]\nblock-5-new".to_string());
+        t.compact();
+        let c2 = t.render();
+        assert!(c2.contains("[4 earlier results omitted]"), "counter folds: {c2}");
+        assert!(c2.contains("block-5-new"));
+
+        // ≤ 2 blocks ⇒ rendering unchanged by compact() (nothing to drop).
+        let mut small = loop_transcript(2, 100);
+        let before = small.render();
+        small.compact();
+        assert_eq!(small.render(), before);
+        let mut none = LoopTranscript::new("hello");
+        none.compact();
+        assert_eq!(none.render(), "User request: hello");
+    }
+
+    /// IN-LOOP: an over-budget transcript is compacted before the next model step (the reasoner
+    /// sees the marker + only the last 2 result blocks), while an under-budget one is untouched,
+    /// and `transcript_compaction: false` (the flag wired off) disables it entirely.
+    #[test]
+    fn loop_compacts_transcript_over_budget_and_respects_the_flag() {
+        // 10 tool steps × ~3.9k chars ⇒ well past the 32k budget mid-loop.
+        let r = RecordingReasoner::asking(10);
+        let out = run_agentic_loop(&r, "sys", "q", &FatExec, 12, None, GenOptions::default())
+            .unwrap()
+            .expect("converges on the scripted answer");
+        assert_eq!(out.answer, "done");
+        let seen = r.seen.lock().unwrap();
+        let last = seen.last().unwrap();
+        assert!(
+            last.contains("earlier results omitted]"),
+            "an over-budget transcript must reach the model COMPACTED"
+        );
+        assert!(
+            last.len() <= TRANSCRIPT_BUDGET + 2 * 4200,
+            "the compacted transcript stays near head + marker + 2 blocks, got {} chars",
+            last.len()
+        );
+        // Early steps (under budget) were untouched — no marker.
+        assert!(!seen[0].contains("earlier results omitted]"));
+
+        // Flag OFF ⇒ never compacted, even over budget (the legacy unbounded shape).
+        let r_off = RecordingReasoner::asking(10);
+        let opts_off = GenOptions::default().with_transcript_compaction(false);
+        let _ = run_agentic_loop(&r_off, "sys", "q", &FatExec, 12, None, opts_off)
+            .unwrap()
+            .expect("still converges");
+        assert!(
+            r_off
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|t| !t.contains("earlier results omitted]")),
+            "with compaction disabled the marker must never appear"
+        );
+    }
+
+    /// REGRESSION (adversarial finding 2026-07-10, MAJOR #1 — RED on the string-scanning
+    /// `"\n\n["` compactor): a rendered-conversation HEAD containing normal markdown
+    /// (`"\n\n[[Weekly Sync]]…"` — the personas MANDATE `[[Title]]` citations, so this shape is
+    /// routine in chat history) must NEVER be cut by compaction. The user's newest question
+    /// survives verbatim in every transcript the model sees, even once the loop is over budget.
+    #[test]
+    fn compaction_never_cuts_the_head_on_markdown_wikilinks() {
+        let user = "Assistant: **Takeaway**\n\n[[Weekly Sync]] decided X.\nUser: THE-REAL-QUESTION";
+        let r = RecordingReasoner::asking(10);
+        let out = run_agentic_loop(&r, "sys", user, &FatExec, 12, None, GenOptions::default())
+            .unwrap()
+            .expect("converges on the scripted answer");
+        assert_eq!(out.answer, "done");
+        let seen = r.seen.lock().unwrap();
+        let last = seen.last().unwrap();
+        assert!(
+            last.contains("earlier results omitted]"),
+            "probe precondition: the final transcript must actually have been compacted"
+        );
+        assert!(
+            last.contains("THE-REAL-QUESTION"),
+            "compaction must NEVER cut inside the head — the newest user question vanished"
+        );
+        assert!(
+            last.contains("[[Weekly Sync]] decided X."),
+            "head markdown must survive whole — a \\n\\n[[wikilink]] is content, not a boundary"
+        );
+    }
+
+    /// REGRESSION (adversarial finding 2026-07-10, MAJOR #2 — RED on the string-scanning
+    /// compactor): the NEWEST tool result whose CONTENT carries `"\n\n[[wikilink]]"` paragraphs
+    /// (the `get_meeting` note-markdown shape) must be kept WHOLE by compaction — its head (the
+    /// NEWEST-HEAD sentinel) must survive, never be decapitated by a false boundary inside it.
+    #[test]
+    fn compaction_keeps_the_newest_tool_result_whole_despite_wikilink_paragraphs() {
+        /// Fat padding for the early calls; the LAST call returns a note-markdown result whose
+        /// body contains two `\n\n[[wikilink]]` paragraphs behind a head sentinel.
+        struct WikilinkExec {
+            calls: Mutex<usize>,
+            last_call: usize,
+        }
+        impl ToolExecutor for WikilinkExec {
+            fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+                crate::tools::tool_specs()
+            }
+            fn run(&self, _n: &str, _a: &Value) -> Result<String> {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                if *c == self.last_call {
+                    Ok(format!(
+                        "NEWEST-HEAD: Weekly Sync — decisions\n\n[[Roadmap Review]] follows up \
+                         on the launch.\n\n[[Budget Sync]] owns the numbers.\n{}",
+                        "z".repeat(3500)
+                    ))
+                } else {
+                    Ok("y".repeat(3900))
+                }
+            }
+        }
+        // 16 tool steps: the loop compacts around step 10, accumulates again, and the transcript
+        // is over budget once more right after the wikilink result (call 16) lands — so the FINAL
+        // compaction runs with the wikilink block as the newest kept block.
+        let r = RecordingReasoner::asking(16);
+        let exec = WikilinkExec {
+            calls: Mutex::new(0),
+            last_call: 16,
+        };
+        let out = run_agentic_loop(&r, "sys", "q", &exec, 18, None, GenOptions::default())
+            .unwrap()
+            .expect("converges on the scripted answer");
+        assert_eq!(out.answer, "done");
+        let seen = r.seen.lock().unwrap();
+        let last = seen.last().unwrap();
+        assert!(
+            last.contains("earlier results omitted]"),
+            "probe precondition: the final transcript must actually have been compacted"
+        );
+        assert!(
+            last.contains("NEWEST-HEAD"),
+            "the newest tool result's head must survive compaction whole — freshest grounding \
+             must reach the model untruncated"
+        );
+        assert!(
+            last.contains("[[Roadmap Review]]"),
+            "the newest block is kept in one piece, wikilink paragraphs included"
+        );
+    }
+
+    // ── Brain v2 L3: structured-output hardening (one corrective retry on malformed JSON) ───────
+
+    /// A reasoner step that fails with the MALFORMED-JSON error class gets exactly ONE corrective
+    /// retry (the transcript + a "reply with exactly …" instruction); the retry converging makes
+    /// the loop converge.
+    #[test]
+    fn loop_retries_once_on_malformed_json_then_converges() {
+        let r = ScriptReasoner::with(vec![
+            Err(AppError::Summarize("reasoner: no JSON object in reply".into())),
+            Ok(serde_json::json!({ "answer": "recovered" })),
+        ]);
+        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None, GenOptions::default())
+            .unwrap()
+            .expect("the corrective retry must converge the loop");
+        assert_eq!(out.answer, "recovered");
+        // The retry prompt carried the corrective instruction (bound via the recorded users).
+        let seen = r.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "exactly one retry");
+        assert!(
+            seen[1].contains("not valid JSON"),
+            "the retry must carry the corrective instruction: {}",
+            seen[1]
+        );
+    }
+
+    /// A SECOND consecutive malformed-JSON failure propagates as today — the retry is one-shot,
+    /// never a loop.
+    #[test]
+    fn loop_propagates_a_second_malformed_json_failure() {
+        let r = ScriptReasoner::with(vec![
+            Err(AppError::Summarize("reasoner: invalid JSON (expected value)".into())),
+            Err(AppError::Summarize("reasoner: no JSON object in reply".into())),
+        ]);
+        let res = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None, GenOptions::default());
+        assert!(
+            matches!(res, Err(AppError::Summarize(_))),
+            "a second malformed reply must propagate: {res:?}"
+        );
+        assert_eq!(
+            r.seen.lock().unwrap().len(),
+            2,
+            "the retry is ONE-shot — no third model call"
+        );
     }
 
     #[test]

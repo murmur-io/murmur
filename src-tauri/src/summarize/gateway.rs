@@ -543,6 +543,13 @@ impl SummarizerProvider for OpenAiCompatProvider {
     }
     // `complete_json` inherits the delegating default: calls `complete_json_with_meta` and
     // drops the meta — callers that only need the value are unchanged.
+
+    /// Brain v2 L3: the gateway DOES enforce JSON natively (`complete_json_with_meta` above sends
+    /// `response_format: json_schema` — constrained decoding server-side). Capability flag only;
+    /// nothing dispatches on it yet (spec §L3).
+    fn supports_native_json(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -802,6 +809,19 @@ mod tests {
             p7.chat_endpoint().as_str(),
             "https://gw.example.com/v1/chat/completions",
             "already-full endpoint must be returned as-is"
+        );
+    }
+
+    /// Brain v2 L3 — the gateway OVERRIDES `supports_native_json` to true (its
+    /// `complete_json_with_meta` sends `response_format: json_schema`, i.e. server-side
+    /// constrained decoding). Capability seam only — nothing dispatches on it yet.
+    #[test]
+    fn gateway_reports_native_json_support() {
+        let p = OpenAiCompatProvider::new("http://localhost:4000".to_string(), String::new(), None)
+            .unwrap();
+        assert!(
+            p.supports_native_json(),
+            "the gateway enforces JSON natively via response_format json_schema"
         );
     }
 
