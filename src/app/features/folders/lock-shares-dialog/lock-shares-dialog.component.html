@@ -1,0 +1,91 @@
+<div class="scrim">
+  <!-- OPAQUE overlay (trap T3): floats OVER the tree → never the frosted .card.
+       Dismissal = the Cancel button or Escape on the panel (no scrim-click
+       handler, keeping the a11y lint clean like share-verify-sheet). -->
+  <div
+    #panel
+    class="sheet"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="lock-shares-title"
+    tabindex="-1"
+    (keydown.escape)="cancelled.emit()"
+  >
+    <h2 id="lock-shares-title" class="sheet-title">
+      “{{ folderName() }}” has active shares
+    </h2>
+
+    <p class="sheet-copy">
+      {{ totalCount() }} {{ totalCount() === 1 ? "item is" : "items are" }} shared
+      @if (orgCount() > 0) {
+        ({{ orgCount() }} in Org Brain)
+      }. Locking this folder encrypts its notes, but does
+      <strong>not</strong> take back shares that already left this Mac.
+    </p>
+
+    <!-- Breakdown of the active shares. -->
+    <ul class="share-breakdown">
+      @if (report().links > 0) {
+        <li>
+          <span class="sb-count">{{ report().links }}</span>
+          zero-knowledge {{ report().links === 1 ? "link" : "links" }}
+        </li>
+      }
+      @if (report().users > 0) {
+        <li>
+          <span class="sb-count">{{ report().users }}</span>
+          direct {{ report().users === 1 ? "share" : "shares" }} to people
+        </li>
+      }
+      @if (orgCount() > 0) {
+        <li>
+          <span class="sb-count">{{ orgCount() }}</span>
+          in Org Brain
+          <ul class="org-items">
+            @for (item of report().org; track item.itemId) {
+              <li class="org-item-title">{{ item.title }}</li>
+            }
+          </ul>
+        </li>
+      }
+    </ul>
+
+    @if (orgCount() > 0) {
+      <p class="sheet-warn">
+        <span class="warn-mark" aria-hidden="true">⚠</span>
+        Revoking removes the org copies from the feed, but colleagues who already
+        synced them may still have a local copy. Revoking can't reach into their
+        devices.
+      </p>
+    }
+
+    <div class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        (click)="cancelled.emit()"
+        [disabled]="busy()"
+      >
+        Cancel
+      </button>
+      <button
+        type="button"
+        class="btn"
+        [class.btn-primary]="!revokeIsDefault()"
+        (click)="lockAnyway.emit()"
+        [disabled]="busy()"
+      >
+        Lock anyway
+      </button>
+      <button
+        type="button"
+        class="btn"
+        [class.btn-primary]="revokeIsDefault()"
+        (click)="revokeAndLock.emit()"
+        [disabled]="busy()"
+      >
+        {{ busy() ? "Revoking…" : "Revoke & lock" }}
+      </button>
+    </div>
+  </div>
+</div>

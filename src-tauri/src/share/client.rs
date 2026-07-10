@@ -442,6 +442,274 @@ impl ShareClient {
         }
         Ok(buf)
     }
+
+    // ─────────────────────── Organizations / Shared Brain (M6) ───────────────────────
+    //
+    // The server is a zero-knowledge relay for orgs too: every body is an opaque id, a role, a
+    // wrapped OCK grant, ciphertext, or a hash — NEVER a note title / body / OCK / plaintext. The
+    // OCK is wrapped/unwrapped ONLY client-side (`e2ee::org`); it never appears in any request here.
+
+    /// `POST /v1/orgs {name}` (bearer) — create an org; caller becomes sole `owner`.
+    pub async fn org_create(
+        &self,
+        access_token: &str,
+        name: &str,
+    ) -> Result<super::org_dto::OrgResponse> {
+        self.post_json(
+            "/v1/orgs",
+            Some(access_token),
+            &super::org_dto::CreateOrgRequest {
+                name: name.to_string(),
+            },
+            "org-create",
+        )
+        .await
+    }
+
+    /// `GET /v1/orgs/{id}` (member-gated) — the caller's view of an org (name + role + generation).
+    pub async fn org_status(
+        &self,
+        access_token: &str,
+        org_id: &str,
+    ) -> Result<super::org_dto::OrgResponse> {
+        Self::guard_id(org_id)?;
+        self.get_json(&format!("/v1/orgs/{org_id}"), access_token, "org-status")
+            .await
+    }
+
+    /// `POST /v1/orgs/{id}/members {email}` (owner-only) — add a registered account by email.
+    /// Returns the resolved member's account id.
+    pub async fn org_add_member(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        email: &str,
+    ) -> Result<super::org_dto::AddMemberResponse> {
+        Self::guard_id(org_id)?;
+        self.post_json(
+            &format!("/v1/orgs/{org_id}/members"),
+            Some(access_token),
+            &super::org_dto::AddMemberRequest {
+                email: email.to_string(),
+            },
+            "org-add-member",
+        )
+        .await
+    }
+
+    /// `DELETE /v1/orgs/{id}/members/{userId}` (owner-only) — soft-remove a member. A missing/owner/
+    /// non-member target is a uniform 404, treated as "already gone" (idempotent).
+    pub async fn org_remove_member(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        member_id: &str,
+    ) -> Result<()> {
+        Self::guard_id(org_id)?;
+        Self::guard_id(member_id)?;
+        let url = self.url(&format!("/v1/orgs/{org_id}/members/{member_id}"))?;
+        let resp = self
+            .http
+            .delete(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::Unavailable("org-remove-member: could not reach the server".into())
+            })?;
+        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(Self::status_err("org-remove-member", resp.status()))
+        }
+    }
+
+    /// `GET /v1/orgs/{id}/members` (member-gated) — the org's active members (content-free).
+    pub async fn org_list_members(
+        &self,
+        access_token: &str,
+        org_id: &str,
+    ) -> Result<super::org_dto::OrgMembersResponse> {
+        Self::guard_id(org_id)?;
+        self.get_json(
+            &format!("/v1/orgs/{org_id}/members"),
+            access_token,
+            "org-list-members",
+        )
+        .await
+    }
+
+    /// `POST /v1/orgs/{id}/leave` (member self-removal). 204 on success; a 404 (already gone) is
+    /// idempotent-OK.
+    pub async fn org_leave(&self, access_token: &str, org_id: &str) -> Result<()> {
+        Self::guard_id(org_id)?;
+        let url = self.url(&format!("/v1/orgs/{org_id}/leave"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| AppError::Unavailable("org-leave: could not reach the server".into()))?;
+        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(Self::status_err("org-leave", resp.status()))
+        }
+    }
+
+    /// `PUT /v1/orgs/{id}/key-grants` (member-gated) — upload opaque wrapped-OCK grants for a
+    /// generation. The bytes are stored as-is, never verified server-side (§4.8).
+    pub async fn org_put_key_grants(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        grants: Vec<super::org_dto::KeyGrantInput>,
+    ) -> Result<()> {
+        Self::guard_id(org_id)?;
+        let url = self.url(&format!("/v1/orgs/{org_id}/key-grants"))?;
+        let resp = self
+            .http
+            .put(url)
+            .bearer_auth(access_token)
+            .json(&super::org_dto::PutKeyGrantsRequest { grants })
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::Unavailable("org-put-key-grants: could not reach the server".into())
+            })?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::status_err("org-put-key-grants", resp.status()))
+        }
+    }
+
+    /// `GET /v1/orgs/{id}/key-grants` (member-gated) — the CALLER's own wrapped-OCK grants.
+    pub async fn org_get_key_grants(
+        &self,
+        access_token: &str,
+        org_id: &str,
+    ) -> Result<super::org_dto::KeyGrantsResponse> {
+        Self::guard_id(org_id)?;
+        self.get_json(
+            &format!("/v1/orgs/{org_id}/key-grants"),
+            access_token,
+            "org-get-key-grants",
+        )
+        .await
+    }
+
+    /// `POST /v1/blobs` (bearer) — upload raw ciphertext (`application/octet-stream`). Returns
+    /// `{blobId}`. Used to stage an org-item envelope before `publish_item`.
+    pub async fn put_blob(&self, access_token: &str, ciphertext: Vec<u8>) -> Result<String> {
+        let url = self.url("/v1/blobs")?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(access_token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(ciphertext)
+            .send()
+            .await
+            .map_err(|_| AppError::Unavailable("put-blob: could not reach the server".into()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Self::status_err("put-blob", status));
+        }
+        let created: super::org_dto::BlobCreatedResponse = resp
+            .json()
+            .await
+            .map_err(|_| AppError::Unavailable("put-blob: malformed server response".into()))?;
+        Ok(created.blob_id)
+    }
+
+    /// `POST /v1/orgs/{id}/items` (member-gated) — publish a staged ciphertext blob as an org item.
+    pub async fn org_publish_item(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        req: super::org_dto::PublishItemRequest,
+    ) -> Result<super::org_dto::PublishItemResponse> {
+        Self::guard_id(org_id)?;
+        self.post_json(
+            &format!("/v1/orgs/{org_id}/items"),
+            Some(access_token),
+            &req,
+            "org-publish-item",
+        )
+        .await
+    }
+
+    /// `GET /v1/orgs/{id}/items?sinceSeq=&limit=` (member-gated) — the append-only feed from a cursor.
+    pub async fn org_feed(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        since_seq: u64,
+        limit: u32,
+    ) -> Result<super::org_dto::OrgItemsResponse> {
+        Self::guard_id(org_id)?;
+        let path = format!("/v1/orgs/{org_id}/items?sinceSeq={since_seq}&limit={limit}");
+        self.get_json(&path, access_token, "org-feed").await
+    }
+
+    /// `DELETE /v1/orgs/{id}/items/{itemId}` (author OR owner) — tombstone an item + destroy its
+    /// ciphertext. A 404 (already gone / not authorized) is idempotent-OK for a revoke.
+    pub async fn org_tombstone_item(
+        &self,
+        access_token: &str,
+        org_id: &str,
+        item_id: &str,
+    ) -> Result<()> {
+        Self::guard_id(org_id)?;
+        Self::guard_id(item_id)?;
+        let url = self.url(&format!("/v1/orgs/{org_id}/items/{item_id}"))?;
+        let resp = self
+            .http
+            .delete(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::Unavailable("org-tombstone-item: could not reach the server".into())
+            })?;
+        if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(Self::status_err("org-tombstone-item", resp.status()))
+        }
+    }
+
+    /// `POST /v1/orgs/{id}/generation` (owner) — bump the OCK generation (monotonic +1). The owner
+    /// must have already PUT grants for gen N+1 for every active member (the server checks counts).
+    pub async fn org_bump_generation(&self, access_token: &str, org_id: &str) -> Result<()> {
+        Self::guard_id(org_id)?;
+        let url = self.url(&format!("/v1/orgs/{org_id}/generation"))?;
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::Unavailable("org-bump-generation: could not reach the server".into())
+            })?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::status_err("org-bump-generation", resp.status()))
+        }
+    }
+
+    /// Guard a path segment that we mint (a UUID) against traversal / query injection. A stray `/`
+    /// or `?` is a client bug, refused before the request is built.
+    fn guard_id(id: &str) -> Result<()> {
+        if id.contains('/') || id.contains('?') || id.contains('#') || id.is_empty() {
+            return Err(AppError::InvalidArg("invalid org/member/item id".into()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

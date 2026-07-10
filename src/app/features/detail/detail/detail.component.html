@@ -69,6 +69,15 @@
               {{ fb.name }}
             </span>
           }
+          <!-- "In Org Brain" badge — this meeting has an active org-brain share.
+               Hidden while locked (nothing to advertise on a masked note). -->
+          @if (orgShared() && !locked()) {
+            <span class="meta-sep" aria-hidden="true">·</span>
+            <span
+              class="pill is-accent"
+              title="This note is in your organization's shared brain"
+            >In Org Brain</span>
+          }
           <!-- ENHANCE-MY-NOTES: provenance badge — shown only when the backend
                stamped murmur_enhanced: true in the front-matter. Derives from
                the note() computed (parseNote over markdown) — nil for locked/
@@ -315,6 +324,7 @@
             [editing]="editing()"
             [locked]="locked()"
             (setupSharing)="goToSharingSettings()"
+            (changed)="onShareChanged()"
           />
         }
       }

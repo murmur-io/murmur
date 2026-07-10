@@ -263,6 +263,11 @@ fn tools_spec() -> Value {
             "name": "get_entity_dossier",
             "description": "Assemble a DOSSIER on one person or project across all your meetings: a timeline of mentions, the entity's open commitments, and co-occurring people/projects — each citing its source meeting [[Title]]. Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id. Returns the gated source material for YOU to synthesize the 'state of [[entity]]' (Overview, Timeline, Open commitments, Last said / next step). Sealed-and-locked meetings are excluded.",
             "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" } }, "required": ["entity"] }
+        },
+        {
+            "name": "org_search",
+            "description": "Search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
+            "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         }
     ])
 }
@@ -359,6 +364,17 @@ fn dispatch_tool(
                 entity: entity.to_string(),
             }
         }
+        // Shared Brain — LOCAL, egress-free search of the org partition (synced colleagues' shares).
+        // Untrusted multi-writer content: `execute_tool` provenance-labels + fence-neutralizes it. Not
+        // folder-lock gated (org items live outside the lock domain), so `unlocked_set` is irrelevant
+        // to it; when no org is joined/consented the partition is empty ⇒ "no results" (never a leak).
+        "org_search" => ToolCall::OrgBrainSearch {
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
     // The `semantic_search_enabled` flag lives in the whole-DB-encrypted settings table; load it from
@@ -396,16 +412,18 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_six_tools() {
+    fn tools_list_has_seven_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "get_open_commitments"));
         // The Phase 5b entity-dossier tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "get_entity_dossier"));
+        // Shared Brain — the org partition search tool is advertised.
+        assert!(tools.iter().any(|t| t["name"] == "org_search"));
     }
 
     #[test]

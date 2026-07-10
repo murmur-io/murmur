@@ -96,6 +96,10 @@ impl CaptureState {
     }
 }
 
+/// Session-cached Organization Content Keys, keyed by `(org_id, generation)`. RAM-only, each value
+/// `Zeroizing` so it is wiped on drop/replace (see [`AppState::org_ock_cache`]).
+pub type OrgOckCache = std::collections::HashMap<(String, u32), zeroize::Zeroizing<[u8; 32]>>;
+
 pub struct AppState {
     /// Some while recording.
     pub recorder: Mutex<Option<Recorder>>,
@@ -217,6 +221,13 @@ pub struct AppState {
     /// `Zeroizing` so the bytes are wiped from RAM whenever the cached copy is dropped/replaced (C4),
     /// in addition to the explicit `zeroize()` on relock-all.
     pub master_kek: Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
+    /// M6 Shared Brain — the Organization Content Keys (OCKs) unwrapped for THIS session, keyed by
+    /// `(org_id, generation)`. RAM-ONLY by design (spec §"Trust model"): the OCK is unwrapped on
+    /// demand from the member's server-relayed grant (via `e2ee::org::open_own_grant`, gated on the
+    /// account MK session) and cached here so repeated org seals/opens in one session don't re-fetch +
+    /// re-unwrap. NEVER persisted to SQLite/Keychain, NEVER logged. Held in `Zeroizing` so each cached
+    /// OCK is wiped from RAM on drop/replace; cleared wholesale on logout.
+    pub org_ock_cache: Mutex<OrgOckCache>,
     /// M3-CLIENT (spec §3/§4) — the logged-in sharing account for THIS session, or `None` when logged
     /// out. Holds the account id, the unwrapped account master key `MK` (zeroized on drop), the cached
     /// device id, and the current identity generation. The MK never touches SQLite (it is unwrapped
@@ -330,6 +341,7 @@ impl AppState {
             verify_cache: Mutex::new(std::collections::HashMap::new()),
             unlocked_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(std::collections::HashMap::new()),
             account_session: Mutex::new(None),
             share_refresh_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),

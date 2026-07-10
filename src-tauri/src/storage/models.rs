@@ -498,6 +498,65 @@ pub struct DocChunkHit {
     pub snippet: String,
 }
 
+/// Shared Brain v1 — one ORG-partition retrieval hit: the nearest/best chunk's snippet + the
+/// source org item's id, `author_hint`, and title. The parallel of [`DocChunkHit`] for the org
+/// leg; the retrieval fusion turns it into a [`VaultSource`] with `origin = SourceOrigin::org(..)`
+/// so the FE renders the `[org · <author>]` provenance chip. `content_sha256` rides along so the
+/// self-share dedup (drop a hit whose plaintext hash matches a local `org_shares` row) is applied
+/// at the fusion layer without a second DB read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgChunkHit {
+    pub item_id: String,
+    pub author_hint: String,
+    pub title: String,
+    pub snippet: String,
+    /// SHA-256 of the item's canonical plaintext envelope (self-share dedup key). May be empty for a
+    /// legacy row that predates the hash.
+    pub content_sha256: Vec<u8>,
+}
+
+/// Shared Brain v1 — the full decrypted org item for the read-only FE viewer (`org_get_item`).
+/// `markdown` is the plaintext envelope body — deliberately-disclosed org content (no lock gate
+/// applies to org items). Mirrors the FE `OrgItemDetail` (camelCase).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgItemDetail {
+    pub item_id: String,
+    pub author_hint: String,
+    pub title: String,
+    pub created_at: String,
+    pub rev: u32,
+    pub markdown: String,
+}
+
+/// Shared Brain v1 — a summary row of a synced org item (feed replica). Mirrors the FE
+/// `OrgItemSummary` (camelCase).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgItemSummary {
+    pub item_id: String,
+    pub author_hint: String,
+    pub title: String,
+    pub created_at: String,
+    pub rev: u32,
+}
+
+/// Shared Brain v1 — the content-free result of a manual `org_sync_now()` (counts + errors only).
+/// `fts_only` is true when the local member has no real embedder (StubEmbedder ⇒ the org partition
+/// is indexed FTS-only until a model appears + a re-embed runs). Mirrors the FE `OrgSyncReport`
+/// (camelCase: `pulled, ingested, tombstoned, lastSeq, ftsOnly, errors`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgSyncReport {
+    pub pulled: u32,
+    pub ingested: u32,
+    pub tombstoned: u32,
+    pub last_seq: u64,
+    pub fts_only: bool,
+    /// Content-free error strings (per-item OPEN/ingest failures that were SKIPPED, not fatal).
+    pub errors: Vec<String>,
+}
+
 /// A standalone authored note — the LIST-row DTO (leak-free: no body for a sealed note). A note is a
 /// `documents(kind='note')` row. `title` falls back to `name` when the `title` column is NULL;
 /// `updatedAt` falls back to `createdAt` when `updated_at` is NULL. When the owning folder is
@@ -715,6 +774,33 @@ pub struct PinResult {
     pub mmss: String,
 }
 
+/// Shared Brain v1 — where a retrieval hit came from. `kind:"local"` (owned meeting/note the user
+/// recorded/authored) or `kind:"org"` (an org-brain item synced from a colleague's share). For an
+/// org hit, `author` is the item's `author_hint` label and `org_item_id` is the id the read-only
+/// org-item viewer loads via `org_get_item`. Mirrors the FE `SourceOrigin` (camelCase). CONTENT-FREE
+/// beyond the author label the local user is already allowed to see.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceOrigin {
+    /// `"local"` | `"org"`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_item_id: Option<String>,
+}
+
+impl SourceOrigin {
+    /// The provenance of an ORG-brain hit (renders the `[org · <author>]` chip → the viewer route).
+    pub fn org(author: impl Into<String>, org_item_id: impl Into<String>) -> Self {
+        Self {
+            kind: "org".to_string(),
+            author: Some(author.into()),
+            org_item_id: Some(org_item_id.into()),
+        }
+    }
+}
+
 /// A meeting referenced as a source in an Ask-My-Vault answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -722,6 +808,11 @@ pub struct VaultSource {
     pub meeting_id: String,
     pub title: String,
     pub started_at: String,
+    /// Shared Brain v1 — absent/null for a plain LOCAL owned-content source; present with
+    /// `kind:"org"` for an org-brain hit synced from a colleague. Lets the FE render an org-origin
+    /// chip (author + date) routing to the read-only org-item viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SourceOrigin>,
 }
 
 /// Result of an Ask-My-Vault query: the grounded answer + the source meetings used.
@@ -860,6 +951,41 @@ pub struct TopicThread {
     pub label: String,
     pub count: usize,
     pub mentions: Vec<TopicMention>,
+}
+
+/// M6 Shared Brain — a locally-joined org (row of `org_state`). Membership metadata only; no content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgState {
+    pub org_id: String,
+    pub name: String,
+    pub role: String,
+    pub joined_at: String,
+    pub consented: bool,
+    pub last_seq: i64,
+    pub generation: u32,
+}
+
+/// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a
+/// local `meeting_id` XOR `document_id`; carries the item kind, the content-hash dedup key, the
+/// server `item_id` once published, and the current `state`. NO note title/body/OCK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgShareRow {
+    pub id: String,
+    pub org_id: String,
+    pub meeting_id: Option<String>,
+    pub document_id: Option<String>,
+    pub kind: String,
+    /// A local display title for the owner's own share list (renders only to the local owner who can
+    /// already read it). NOT sent to the server.
+    pub title: Option<String>,
+    pub rev: u32,
+    pub generation: u32,
+    pub content_sha256: Option<Vec<u8>>,
+    pub item_id: Option<String>,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[cfg(test)]

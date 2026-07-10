@@ -204,6 +204,13 @@ pub struct AppConfigDto {
     /// `revoke_share_egress`, so a settings save can neither grant nor clear it.
     #[serde(default)]
     pub share_egress_consented: bool,
+    /// M6 Shared Brain: one-time ORG-egress consent. DISPLAY-ONLY on this DTO (same discipline as
+    /// `share_egress_consented`): `get_config` carries the stored value out so the FE can show org
+    /// consent status; `dto_to_config` PRESERVES it. Mutated ONLY by `consent_to_org_egress` /
+    /// `revoke_org_egress`, so a settings save can neither grant nor clear it. `#[serde(default)]` =
+    /// false (fail-closed).
+    #[serde(default)]
+    pub org_egress_consented: bool,
     /// Sharing-onboarding gate — whether the user has RESOLVED the first-run sharing decision
     /// (chose local-only OR went through the account door). DISPLAY-ONLY on this DTO, same
     /// preserve-only discipline as `share_egress_consented`: `get_config` carries the stored value
@@ -5285,6 +5292,7 @@ fn agent_outcome_to_ask_result(
                     meeting_id: m.id,
                     title: m.title.unwrap_or_else(|| title.to_string()),
                     started_at: m.started_at,
+                    origin: None,
                 });
             }
             Ok(_) => {}
@@ -6919,6 +6927,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         cloud_egress_consented: c.cloud_egress_consented,
         // DISPLAY-ONLY out (M3-CLIENT): FE shows share-egress consent status; cannot set it back.
         share_egress_consented: c.share_egress_consented,
+        // DISPLAY-ONLY out (M6): FE shows org-egress consent status; cannot set it back.
+        org_egress_consented: c.org_egress_consented,
         // DISPLAY-ONLY out: the init gateway reads this to know whether the first-run sharing
         // choice was already made; the FE cannot set it back (preserved in `dto_to_config`).
         sharing_choice_made: c.sharing_choice_made,
@@ -7050,6 +7060,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // BLK-4 (M3-CLIENT): share-egress consent is NEVER set from the DTO — preserve the live value.
         // Only `consent_to_share_egress` may flip it. An omitting/zeroed save is inert.
         share_egress_consented: current.share_egress_consented,
+        // M6 Shared Brain: org-egress consent is NEVER set from the DTO — preserve the live value.
+        // Only `consent_to_org_egress` may flip it. An omitting/zeroed save is inert.
+        org_egress_consented: current.org_egress_consented,
         // Sharing-onboarding gate: the first-run choice latch is NEVER set from the DTO — preserve the
         // live value. Only `mark_sharing_choice_made` may flip it, so a settings save can never set or
         // clear it (a re-save from an older FE that omits the key can't accidentally reopen the gate).
@@ -12393,6 +12406,12 @@ pub async fn account_logout(state: State<'_, AppState>) -> Result<(), AppError> 
     if let Ok(mut session) = state.account_session.lock() {
         *session = None; // drops the AccountSession → zeroizes MK.
     }
+    // Drop every unwrapped org content key too — the OCK cache is RAM-only and MUST be cleared
+    // wholesale on logout (state.rs contract; lock-security review 2026-07-10). Best-effort so a
+    // poisoned mutex can't block the rest of logout.
+    if let Ok(mut ocks) = state.org_ock_cache.lock() {
+        ocks.clear();
+    }
     crate::share::clear_tokens()?;
     crate::secrets::keychain::clear_account_mk()?; // drop the biometric MK cache too (idempotent).
     Ok(())
@@ -12781,8 +12800,14 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
 /// `revoke_share(share_id)` — DELETE the server ciphertext + flip the local state. Idempotent.
 #[tauri::command]
 pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
-    let base = share_base_url(state.inner())?;
-    let access = valid_access_token(state.inner()).await?;
+    revoke_share_inner(state.inner(), share_id).await
+}
+
+/// Inner of [`revoke_share`] taking `&AppState` so bulk callers (`revoke_shares_for_folder`) can reuse
+/// the exact link/user revoke path (server revoke → local `revoked` → content-free ledger).
+pub(crate) async fn revoke_share_inner(state: &AppState, share_id: String) -> Result<(), AppError> {
+    let base = share_base_url(state)?;
+    let access = valid_access_token(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     client.revoke_share(&access, &share_id).await?;
     state.db.set_outbound_share_state(&share_id, "revoked")?;
@@ -14049,6 +14074,7 @@ mod lifecycle_tests {
             verify_cache: Mutex::new(std::collections::HashMap::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(std::collections::HashMap::new()),
             account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
             share_refresh_lock: tokio::sync::Mutex::new(()),
@@ -21146,6 +21172,1895 @@ mod lifecycle_tests {
             );
         }
     }
+
+    // ── M6 Shared Brain (Organizations) command-layer gate/consent/scrub/state-machine tests ──────
+
+    /// Seed a locked folder + a meeting + note in it (the sealed-source fixture for the org read-gate).
+    fn seed_locked_meeting_with_note(state: &AppState, folder: &str, meeting: &str) {
+        make_open_folder(&state.db, folder, "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: meeting.to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some(folder.to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: meeting.to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "---\nattendees:\n  - Alice\n---\n# secret\ncall me at 415-555-0100"
+                    .to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder(meeting, Some(folder)).unwrap();
+        state
+            .db
+            .set_folder_locked(folder, true, Some(&b"wrapped"[..]))
+            .unwrap();
+    }
+
+    /// RED-before-GREEN (leak class #2): `share_meeting_to_org` on a SEALED-and-not-session-unlocked
+    /// meeting MUST refuse with `AppError::Locked` BEFORE any read/consent/network — a sealed meeting is
+    /// unshareable. Runs with NO consent + NO login/server, so a non-`Locked` return is a gate-order
+    /// violation. After a session unlock, the NEXT failure is the fail-closed CONSENT gate (Unavailable),
+    /// proving the Locked was the FIRST gate, not a downstream error.
+    #[test]
+    fn share_meeting_to_org_refuses_a_sealed_meeting() {
+        let state = build_state("org-share-lockgate");
+        seed_locked_meeting_with_note(&state, "f-lock", "m-locked");
+        // NOT session-unlocked: unlocked_folders stays empty.
+        let err = block_on(share_to_org_inner(
+            &state,
+            Some("m-locked".to_string()),
+            None,
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must fail closed with Locked, got: {err:?}"
+        );
+
+        // Session-unlock → the read-gate passes; the NEXT gate (org-egress consent, still false) fails.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        let err2 = block_on(share_to_org_inner(
+            &state,
+            Some("m-locked".to_string()),
+            None,
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented org share fails Unavailable, got: {err2:?}"
+        );
+    }
+
+    /// The note-doc twin: `share_document_to_org` on a SEALED authored note refuses with `Locked`
+    /// first, then (once unlocked) fails the consent gate.
+    #[test]
+    fn share_document_to_org_refuses_a_sealed_note() {
+        let state = build_state("org-share-note-lockgate");
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-note".to_string(),
+                name: "Secret".to_string(),
+                path: "Secret".to_string(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-10T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n1", "f-note", "plan", "Plan", "# internal launch April", 1)
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-note", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let err = block_on(share_to_org_inner(
+            &state,
+            None,
+            Some("n1".to_string()),
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed note must fail closed with Locked, got: {err:?}"
+        );
+
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-note".to_string());
+        let err2 = block_on(share_to_org_inner(
+            &state,
+            None,
+            Some("n1".to_string()),
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented note org share fails Unavailable, got: {err2:?}"
+        );
+    }
+
+    /// `preview_org_share` never egresses AND still enforces the read-gate: a sealed meeting refuses.
+    /// Once unlocked, the preview returns the CLEANED + SCRUBBED body (frontmatter gone, the phone
+    /// number masked, the scrub count = 1 phone) — and the preview requires NO login/consent.
+    #[test]
+    fn preview_org_share_gates_then_returns_scrubbed_body_no_egress() {
+        let state = build_state("org-preview");
+        seed_locked_meeting_with_note(&state, "f-prev", "m-prev");
+
+        // Sealed → refuse (the preview is a read, so it is gated too).
+        let err = preview_org_share_inner(
+            &state,
+            Some("m-prev".to_string()),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)), "sealed preview must refuse");
+
+        // Unlock → preview returns the clean + scrubbed body, no egress, no login needed.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-prev".to_string());
+        let prev = preview_org_share_inner(
+            &state,
+            Some("m-prev".to_string()),
+            None,
+            true,
+        )
+        .unwrap();
+        // Frontmatter (attendees) stripped by clean_note_body.
+        assert!(
+            !prev.markdown.contains("attendees") && !prev.markdown.contains("Alice"),
+            "frontmatter must be stripped from the preview: {:?}",
+            prev.markdown
+        );
+        // The phone number was scrubbed (regex firewall), and the count reflects it.
+        assert!(
+            !prev.markdown.contains("415-555-0100"),
+            "the phone number must be scrubbed: {:?}",
+            prev.markdown
+        );
+        assert_eq!(prev.scrubbed.phones, 1, "one phone scrubbed");
+        assert_eq!(prev.scrubbed.emails, 0);
+        assert!(prev.scrub, "scrub flag echoed");
+        assert_eq!(prev.bytes, prev.markdown.len() as u32);
+    }
+
+    /// With `scrub=false` the preview keeps PII verbatim (counts all zero) — the toggle is honored.
+    #[test]
+    fn preview_org_share_without_scrub_keeps_pii() {
+        let state = build_state("org-preview-noscrub");
+        seed_locked_meeting_with_note(&state, "f-ns", "m-ns");
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-ns".to_string());
+        let prev = preview_org_share_inner(
+            &state,
+            Some("m-ns".to_string()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            prev.markdown.contains("415-555-0100"),
+            "unscrubbed preview keeps the phone number"
+        );
+        assert_eq!(prev.scrubbed.phones, 0);
+        assert!(!prev.scrub);
+    }
+
+    /// The org-share state machine transitions (DB layer): queued → uploaded → revoke_pending →
+    /// revoked, plus the queued → failed retry path. Also proves `org_share_by_item` + the state
+    /// filters used by the launch sweep.
+    #[test]
+    fn org_share_state_machine_transitions() {
+        let state = build_state("org-share-sm");
+        let sha = vec![7u8; 32];
+        state
+            .db
+            .insert_org_share(
+                "s1",
+                "org-1",
+                Some("m1"),
+                None,
+                "note",
+                Some("Weekly Sync"),
+                1,
+                1,
+                &sha,
+                "2026-07-10T10:00:00Z",
+            )
+            .unwrap();
+        // Fresh row is queued and appears in the sweep's queued pull.
+        assert_eq!(
+            state.db.list_org_shares_in_state("queued").unwrap().len(),
+            1
+        );
+        // queued → uploaded records the item id.
+        state
+            .db
+            .set_org_share_uploaded("s1", "item-abc", "2026-07-10T10:01:00Z")
+            .unwrap();
+        let row = state.db.org_share_by_item("item-abc").unwrap().unwrap();
+        assert_eq!(row.state, "uploaded");
+        assert_eq!(row.item_id.as_deref(), Some("item-abc"));
+        assert!(state.db.list_org_shares_in_state("queued").unwrap().is_empty());
+        // uploaded → revoke_pending → revoked.
+        state
+            .db
+            .set_org_share_state("s1", "revoke_pending", "2026-07-10T10:02:00Z")
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_org_shares_in_state("revoke_pending")
+                .unwrap()
+                .len(),
+            1
+        );
+        state
+            .db
+            .set_org_share_state("s1", "revoked", "2026-07-10T10:03:00Z")
+            .unwrap();
+        assert_eq!(state.db.get_org_share("s1").unwrap().unwrap().state, "revoked");
+
+        // A second row can go queued → failed (retry path) with a non-PII error.
+        state
+            .db
+            .insert_org_share(
+                "s2",
+                "org-1",
+                None,
+                Some("n2"),
+                "note",
+                Some("Draft"),
+                1,
+                1,
+                &sha,
+                "2026-07-10T11:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s2", "upload_failed", "2026-07-10T11:01:00Z")
+            .unwrap();
+        let failed = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("upload_failed"));
+    }
+
+    /// CROSS-SLICE AAD FIX (RED-before-GREEN for the round-trip bug): the envelope AAD item nonce is
+    /// `hex(content_sha256)`, which BOTH the publisher (from the envelope it seals) and every consumer
+    /// (from the feed's `content_sha256`) derive identically — so a cross-member open SUCCEEDS. The
+    /// old code sealed under the LOCAL row_id (unknowable to a consumer) → open would have FAILED. This
+    /// test seals as the publisher, then opens as a consumer using ONLY the feed hash (never the local
+    /// row id), proving the two AADs match.
+    #[test]
+    fn org_envelope_aad_nonce_is_content_hash_so_cross_member_open_succeeds() {
+        use crate::share::org_envelope::{open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind};
+
+        let ock = crate::crypto::random_key().unwrap();
+        let env = OrgEnvelope::new(
+            OrgItemKind::Note,
+            "Roadmap",
+            "the apollo migration ships friday",
+            "anna",
+            "2026-07-10T09:00:00Z",
+            1,
+        );
+        let content_sha = env.content_sha256();
+
+        // PUBLISHER seals under hex(content_sha) — NOT the local row id. (The server would assign a
+        // different item_id; we simulate that by using a DISTINCT server id below.)
+        let publisher_nonce = org_item_nonce(&content_sha);
+        let (ciphertext, feed_sha) =
+            seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
+        assert_eq!(feed_sha, content_sha, "the feed carries the PLAINTEXT hash");
+
+        // CONSUMER derives the nonce from ONLY the feed's content_sha256 (it never learns row_id, and
+        // the server item_id 'server-xyz' is deliberately different from any local id).
+        let consumer_nonce = org_item_nonce(&feed_sha);
+        assert_eq!(publisher_nonce, consumer_nonce, "both sides derive the same AAD nonce");
+        let opened = open_org_envelope(&ock, &ciphertext, "org-1", &consumer_nonce).unwrap();
+        assert_eq!(opened, env, "a consumer opens the cell with only the feed hash");
+
+        // Sanity: the SERVER item id would NOT open it (proving the old row_id/item_id approach was
+        // broken — the nonce must be the content hash, not any id).
+        assert!(
+            open_org_envelope(&ock, &ciphertext, "org-1", "server-xyz").is_err(),
+            "opening under the server item_id (the old broken nonce) must fail"
+        );
+    }
+
+    /// `org_item_nonce` is deterministic lowercase-hex of the 32-byte hash (stable across devices).
+    #[test]
+    fn org_item_nonce_is_lowercase_hex() {
+        let n = org_item_nonce(&[0x0a, 0xff, 0x00, 0x10]);
+        assert_eq!(n, "0aff0010");
+    }
+
+    /// `org_get_item` command returns the full decrypted item, and `None` for a tombstoned/unknown id.
+    #[test]
+    fn org_get_item_returns_detail_and_none_for_tombstone() {
+        let state = build_state("org-get-item");
+        state
+            .db
+            .upsert_org_item(
+                "it-g",
+                "org-1",
+                1,
+                "anna",
+                "Weekly Sync",
+                "the roadmap for the platform team",
+                "2026-07-10T09:00:00Z",
+                2,
+                1,
+                &[5u8; 32],
+                None,
+            )
+            .unwrap();
+        let got = state.db.get_org_item("it-g").unwrap().unwrap();
+        assert_eq!(got.item_id, "it-g");
+        assert_eq!(got.title, "Weekly Sync");
+        assert_eq!(got.author_hint, "anna");
+        assert_eq!(got.rev, 2);
+        assert!(got.markdown.contains("platform team"));
+
+        // Tombstone → the viewer returns None.
+        state.db.tombstone_org_item("it-g").unwrap();
+        assert!(state.db.get_org_item("it-g").unwrap().is_none());
+        // Unknown id → None.
+        assert!(state.db.get_org_item("nope").unwrap().is_none());
+    }
+
+    /// `org_state` upsert preserves the LOCAL consent + sync cursor across a status refresh (a refresh
+    /// carrying role/name/generation must NOT reset consent or rewind last_seq), and the consent +
+    /// generation + last_seq setters work as the single mutators.
+    #[test]
+    fn org_state_upsert_preserves_consent_and_cursor() {
+        let state = build_state("org-state");
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".into(),
+                name: "Acme".into(),
+                role: "owner".into(),
+                joined_at: "2026-07-10T09:00:00Z".into(),
+                consented: false,
+                last_seq: 0,
+                generation: 1,
+            })
+            .unwrap();
+        // Grant local consent + advance the cursor + bump the generation.
+        state.db.set_org_consented("org-1", true).unwrap();
+        state.db.set_org_last_seq("org-1", 42).unwrap();
+        state.db.set_org_generation("org-1", 2).unwrap();
+
+        // A status refresh (name/role/generation only) MUST NOT reset consent or rewind the cursor.
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".into(),
+                name: "Acme Corp".into(),
+                role: "owner".into(),
+                joined_at: "IGNORED".into(),
+                consented: false, // an incoming refresh's false must NOT clobber the local grant
+                last_seq: 0,      // …nor rewind the cursor
+                generation: 3,
+            })
+            .unwrap();
+        let row = state.db.get_org_state("org-1").unwrap().unwrap();
+        assert_eq!(row.name, "Acme Corp", "name refreshed");
+        assert_eq!(row.generation, 3, "generation refreshed");
+        assert!(row.consented, "local consent preserved across refresh");
+        assert_eq!(row.last_seq, 42, "sync cursor not rewound by refresh");
+
+        // last_seq is monotonic: a lower value is ignored.
+        state.db.set_org_last_seq("org-1", 10).unwrap();
+        assert_eq!(state.db.get_org_state("org-1").unwrap().unwrap().last_seq, 42);
+
+        // delete_org_state drops it (leave/removal).
+        state.db.delete_org_state("org-1").unwrap();
+        assert!(state.db.get_org_state("org-1").unwrap().is_none());
+    }
+
+    /// `active_org_shares_for_folder` returns the folder's ACTIVE (non-revoked/failed) org shares for
+    /// the lock×shares dialog — meeting-anchored AND note-anchored — and excludes revoked ones.
+    #[test]
+    fn active_org_shares_for_folder_lists_active_only() {
+        let state = build_state("org-active-folder");
+        make_open_folder(&state.db, "f1", "Team");
+        // A meeting in f1 with an uploaded org share.
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".into(),
+                started_at: "2026-07-10T09:00:00Z".into(),
+                ended_at: None,
+                title: Some("Sync".into()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f1".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".into(),
+                provider_id: "claude_code".into(),
+                markdown: "# n".into(),
+                created_at: "2026-07-10T09:05:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m1", Some("f1")).unwrap();
+        // A note in f1 with a queued org share, plus a REVOKED share that must be excluded.
+        state
+            .db
+            .insert_note("n1", "f1", "doc", "Doc", "# body", 1)
+            .unwrap();
+        let sha = vec![1u8; 32];
+        state
+            .db
+            .insert_org_share("s-m", "org-1", Some("m1"), None, "note", Some("Sync"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-m", "item-m", "t")
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-n", "org-1", None, Some("n1"), "note", Some("Doc"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-rev", "org-1", Some("m1"), None, "note", Some("Old"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_state("s-rev", "revoked", "t")
+            .unwrap();
+
+        let active = state.db.active_org_shares_for_folder("f1").unwrap();
+        // The uploaded meeting share + the queued note share = 2 active; the revoked one is excluded.
+        assert_eq!(active.len(), 2, "two active org shares, revoked excluded: {active:?}");
+        assert!(active.iter().any(|(item, _)| item.as_deref() == Some("item-m")));
+        assert!(active.iter().any(|(item, _)| item.is_none())); // the queued note share (no item yet)
+    }
+
+    /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
+    /// could be sealed with NO warning that its notes were still shared 1:1 (link/user). This proves
+    /// the enumeration that `folder_active_shares` (→ the dialog) reads: it surfaces the folder's
+    /// ACTIVE link + user shares, and excludes revoked shares AND shares in other folders.
+    #[test]
+    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders() {
+        let state = build_state("folder-1to1-shares");
+        make_open_folder(&state.db, "f1", "Team");
+        make_open_folder(&state.db, "f2", "Other");
+        let mk_note = |mid: &str, fid: &str, title: &str| {
+            state
+                .db
+                .insert_meeting(&Meeting {
+                    id: mid.into(),
+                    started_at: "2026-07-10T09:00:00Z".into(),
+                    ended_at: None,
+                    title: Some(title.into()),
+                    duration_s: 60,
+                    audio_path: None,
+                    status: MeetingStatus::Summarized,
+                    folder_id: Some(fid.into()),
+                })
+                .unwrap();
+            state
+                .db
+                .upsert_note(&NoteRecord {
+                    meeting_id: mid.into(),
+                    provider_id: "claude_code".into(),
+                    markdown: "# n".into(),
+                    created_at: "t".into(),
+                    exported_path: None,
+                    model_requested: None,
+                    model_served: None,
+                    gateway_host: None,
+                })
+                .unwrap();
+            state.db.set_note_folder(mid, Some(fid)).unwrap();
+        };
+        mk_note("m1", "f1", "Sync");
+        mk_note("m2", "f2", "Elsewhere");
+        // f1/m1: an active LINK + active USER share, plus a REVOKED link that must be excluded.
+        state.db.insert_outbound_share("lnk", "m1", "link", 1, "t").unwrap();
+        state.db.insert_outbound_share("usr", "m1", "user", 1, "t").unwrap();
+        state.db.insert_outbound_share("old", "m1", "link", 1, "t").unwrap();
+        state.db.set_outbound_share_state("old", "revoked").unwrap();
+        // f2/m2: a share in ANOTHER folder must not leak into f1's report.
+        state.db.insert_outbound_share("f2lnk", "m2", "link", 1, "t").unwrap();
+
+        let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
+        assert_eq!(
+            shares.len(),
+            2,
+            "two active 1:1 shares in f1 (revoked + other-folder excluded): {shares:?}"
+        );
+        let links = shares.iter().filter(|(_, m)| m == "link").count();
+        let users = shares.iter().filter(|(_, m)| m == "user").count();
+        assert_eq!((links, users), (1, 1), "one link + one user share");
+        assert!(
+            shares.iter().all(|(id, _)| id != "old" && id != "f2lnk"),
+            "revoked + other-folder shares excluded"
+        );
+    }
+}
+
+// ════════════════════════════════ M6 Shared Brain (Organizations) ════════════════════════════════
+//
+// The org command surface: create/status/members + consent + preview + share (meeting/document) +
+// list/revoke. Every content read is GATED first (`meeting_is_unlocked` / the sealed-doc refusal),
+// egress is fail-closed on the one-time org consent, the payload passes `clean_note_body` + a regex
+// PII scrub, and the envelope is sealed under the OCK with a LOCAL open-verify before it is uploaded.
+// A content-free egress-ledger row records each publish. The OCK is unwrapped on demand + cached in
+// RAM (`AppState::org_ock_cache`), NEVER persisted or logged.
+
+/// Content-free org status for the FE (spec DTO `OrgStatus`).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgStatus {
+    pub org_id: String,
+    pub name: String,
+    pub role: String,
+    pub member_count: u32,
+    pub consented: bool,
+    pub last_seq: i64,
+    pub item_count: u32,
+    pub pending_shares: u32,
+}
+
+/// One org member row for the FE (spec DTO `OrgMember`).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgMember {
+    pub user_id: String,
+    pub email: Option<String>,
+    pub role: String,
+    pub added_at: String,
+    pub removed: bool,
+}
+
+/// The exact post-clean, post-scrub preview of an outgoing org share (spec DTO `OrgSharePreview`).
+/// Returned WITHOUT any egress — the FE renders this so the user sees precisely what would leave.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgSharePreview {
+    pub title: String,
+    pub markdown: String,
+    pub bytes: u32,
+    pub chunk_count: u32,
+    pub scrubbed: OrgScrubCounts,
+    pub scrub: bool,
+}
+
+/// The count of PII placeholders the regex scrub removed, by kind (content-free).
+#[derive(serde::Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgScrubCounts {
+    pub emails: u32,
+    pub phones: u32,
+    pub cards: u32,
+}
+
+/// One outbound org-share entry for the FE (spec DTO `OrgShareEntry`).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgShareEntry {
+    pub item_id: Option<String>,
+    pub kind: String,
+    pub title: Option<String>,
+    pub shared_at: String,
+    pub rev: u32,
+    pub state: String,
+}
+
+/// The org-scoped "grant author" identity id we pin the OCK granter on. For v1 (single-org, owner
+/// issues all grants) this is the org's OWNER account id. Derived from the caller's own session for
+/// the owner path; the recipient pins it on first grant open. Uses the account fingerprint namespace
+/// consistent with mode-B (`key_fingerprint`).
+///
+/// The AAD item nonce that binds an org envelope's ciphertext — the LOWERCASE-HEX of the plaintext
+/// `content_sha256`. DETERMINISTIC + shared across members: the publisher derives it from the
+/// envelope it seals, and every consumer derives the SAME value from the feed's `content_sha256`
+/// (which Core populates with the PLAINTEXT hash). This is what makes a cross-member `open_org_envelope`
+/// succeed — the server's assigned `item_id` is NOT known to the publisher at seal time, so it can't
+/// be the nonce. Collision-resistant per content (SHA-256) so the anti-replay AAD binding holds.
+fn org_item_nonce(content_sha256: &[u8]) -> String {
+    let mut s = String::with_capacity(content_sha256.len() * 2);
+    for b in content_sha256 {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// A display label for `author_hint` in the OrgEnvelope — the email local-part, NEVER note content.
+fn org_author_hint(email: &str) -> String {
+    let e = email.trim();
+    match e.split_once('@') {
+        Some((local, _)) if !local.is_empty() => local.to_string(),
+        _ => "member".to_string(),
+    }
+}
+
+/// Regex-scrub emails / phones / cards out of `markdown` (names KEPT, per the user-approved org
+/// redaction policy). Returns `(scrubbed_markdown, counts)`. Reuses the SAME regex firewall
+/// primitive as the cloud path (`summarize::redact::redact`) so an org share is masked exactly like a
+/// cloud-bound prompt — minus the name layer (org peers keep names on purpose). Pure, no egress.
+fn scrub_org_markdown(markdown: &str) -> (String, OrgScrubCounts) {
+    let (scrubbed, map) = crate::summarize::redact::redact(markdown);
+    let mut counts = OrgScrubCounts::default();
+    for key in map.keys() {
+        let inner = key.trim_start_matches('\u{27ea}');
+        if inner.starts_with("EMAIL") {
+            counts.emails += 1;
+        } else if inner.starts_with("CARD") {
+            counts.cards += 1;
+        } else if inner.starts_with("PHONE") {
+            counts.phones += 1;
+        }
+    }
+    (scrubbed, counts)
+}
+
+/// A rough chunk count for the preview (mirrors the retrieval chunker's ~paragraph granularity
+/// without importing it — display-only). Non-empty blank-line-separated blocks, min 1 for any text.
+fn rough_chunk_count(markdown: &str) -> u32 {
+    let n = markdown
+        .split("\n\n")
+        .filter(|b| !b.trim().is_empty())
+        .count();
+    if n == 0 && !markdown.trim().is_empty() {
+        1
+    } else {
+        n as u32
+    }
+}
+
+/// The org's live OCK for `generation`, acquired for THIS session: served from the RAM cache
+/// (`AppState::org_ock_cache`) when present, else unwrapped from the caller's server-relayed grant
+/// (gated on the account MK session) and cached. NEVER persisted, NEVER logged. Fails closed
+/// (`Unavailable`) logged out, (`Auth`) on a forged/mismatched grant.
+async fn acquire_org_ock(
+    state: &AppState,
+    org_id: &str,
+    generation: u32,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, AppError> {
+    // Cache hit?
+    {
+        let cache = state
+            .org_ock_cache
+            .lock()
+            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
+        if let Some(k) = cache.get(&(org_id.to_string(), generation)) {
+            return Ok(zeroize::Zeroizing::new(**k));
+        }
+    }
+
+    // Miss → unwrap from the caller's server-relayed grant. Needs the MK session (to derive our
+    // identity keypair) + a valid bearer.
+    let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    let base = share_base_url(state)?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let recipient = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
+    let self_fp = crate::e2ee::key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+
+    let grants = client.org_get_key_grants(&access_token, org_id).await?;
+    // Find OUR grant for this generation (keyed by our server user id).
+    let grant = grants
+        .grants
+        .into_iter()
+        .find(|g| g.generation == generation && g.user_id == account_id)
+        .ok_or_else(|| {
+            AppError::Unavailable(format!(
+                "no org key grant for generation {generation} — ask the owner to re-share the key"
+            ))
+        })?;
+
+    // The granter identity: for v1 the OWNER issues grants (the wrapped_key frame carries the granter's
+    // pubkeys, and the grant signature is verified against them fail-closed in `open_own_grant`).
+    //
+    // HONEST V1 BOUNDARY (lock-security 2026-07-10, tracked follow-up): the granter fingerprint is
+    // pinned under ITSELF, so this TOFU detects nothing — a granter key substitution just yields a new
+    // first-contact pin, never a `Changed` block. That is acceptable ONLY under the documented
+    // honest-but-curious relay threat model (the server relays but does not forge). A MALICIOUS server
+    // could name a forged granter and inject org items. The hardening (a separate slice, mirroring
+    // mode-B) is to pin the granter under the org OWNER's STABLE account_id — resolvable from the
+    // member list (role='owner') — and surface a safety-word block on owner key rotation. Until then,
+    // org-item authenticity rests on the relay being honest, NOT on this pin.
+    let unpacked = crate::e2ee::wrap::unpack_wrapped_key(&grant.wrapped_key, &grant.grant_sig)?;
+    let granter_fp =
+        crate::e2ee::key_fingerprint(&unpacked.sender_pk_enc, &unpacked.sender_pk_sig);
+    match tofu_check(&state.db, &granter_fp, &granter_fp)? {
+        TofuState::Changed => {
+            return Err(AppError::Auth(
+                "the org key granter's identity changed — re-verify before trusting new keys".into(),
+            ));
+        }
+        _ => state.db.pin_contact(
+            &granter_fp,
+            None,
+            &granter_fp,
+            &chrono::Utc::now().to_rfc3339(),
+        )?,
+    }
+
+    let ock = crate::e2ee::org::open_own_grant(
+        &grant.wrapped_key,
+        &grant.grant_sig,
+        &recipient,
+        &self_fp,
+        &self_fp,
+        &granter_fp,
+        gen_id,
+        &granter_fp,
+        &unpacked.sender_pk_sig,
+        org_id,
+        generation,
+    )?;
+
+    // Cache in RAM for the session.
+    {
+        let mut cache = state
+            .org_ock_cache
+            .lock()
+            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
+        cache.insert((org_id.to_string(), generation), zeroize::Zeroizing::new(*ock));
+    }
+    Ok(zeroize::Zeroizing::new(*ock))
+}
+
+/// `org_create(name)` — create an org (caller becomes owner), then generate + self-grant the OCK so
+/// the owner can immediately seal items. Caches the org + generation-1 OCK locally.
+#[tauri::command]
+pub async fn org_create(state: State<'_, AppState>, name: String) -> Result<OrgStatus, AppError> {
+    org_create_inner(state.inner(), name).await
+}
+
+pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<OrgStatus, AppError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::InvalidArg("org name required".into()));
+    }
+    let base = share_base_url(state)?;
+    let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    let created = client.org_create(&access_token, &name).await?;
+
+    // Owner self-grant: generate the gen-1 OCK, wrap it to OURSELVES, PUT the grant so a second
+    // device (or this device after a re-login) can recover the OCK from the server.
+    let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
+    let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+    let ock = crate::e2ee::org::generate_ock()?;
+    let grant = crate::e2ee::org::wrap_ock_for_member(
+        &ock,
+        &created.org_id,
+        created.current_generation,
+        &owner.pk_enc,
+        &account_id, // recipient acct id = our server user id (grants are keyed by user_id)
+        &owner,
+        &owner_fp,
+        gen_id,
+    )?;
+    client
+        .org_put_key_grants(
+            &access_token,
+            &created.org_id,
+            vec![crate::share::org_dto::KeyGrantInput {
+                user_id: account_id.clone(),
+                generation: created.current_generation,
+                wrapped_key: grant.wrapped_key,
+                grant_sig: grant.grant_sig,
+            }],
+        )
+        .await?;
+
+    // Cache the org + OCK locally.
+    state.db.upsert_org_state(&crate::storage::OrgState {
+        org_id: created.org_id.clone(),
+        name: created.name.clone(),
+        role: created.role.clone(),
+        joined_at: created.created_at.clone(),
+        consented: false,
+        last_seq: 0,
+        generation: created.current_generation,
+    })?;
+    {
+        let mut cache = state
+            .org_ock_cache
+            .lock()
+            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
+        cache.insert(
+            (created.org_id.clone(), created.current_generation),
+            zeroize::Zeroizing::new(*ock),
+        );
+    }
+    crate::share::ledger_row(&state.db, &client.host(), "org_create", 0);
+
+    org_status_inner(state).await.map(|o| o.unwrap_or(OrgStatus {
+        org_id: created.org_id,
+        name: created.name,
+        role: created.role,
+        member_count: 1,
+        consented: false,
+        last_seq: 0,
+        item_count: 0,
+        pending_shares: 0,
+    }))
+}
+
+/// `org_status()` — the caller's current org (the FIRST locally-joined org in v1), or null.
+#[tauri::command]
+pub async fn org_status(state: State<'_, AppState>) -> Result<Option<OrgStatus>, AppError> {
+    org_status_inner(state.inner()).await
+}
+
+pub(crate) async fn org_status_inner(state: &AppState) -> Result<Option<OrgStatus>, AppError> {
+    let Some(local) = state.db.list_org_states()?.into_iter().next() else {
+        return Ok(None);
+    };
+    // Refresh membership/generation from the server when logged in (best-effort — offline shows the
+    // cached row).
+    let member_count = match (share_base_url(state), valid_access_token(state).await) {
+        (Ok(base), Ok(access)) if !base.trim().is_empty() => {
+            let client = crate::share::client::ShareClient::new(&base)?;
+            match client.org_status(&access, &local.org_id).await {
+                Ok(fresh) => {
+                    state.db.upsert_org_state(&crate::storage::OrgState {
+                        org_id: fresh.org_id.clone(),
+                        name: fresh.name.clone(),
+                        role: fresh.role.clone(),
+                        joined_at: local.joined_at.clone(),
+                        consented: local.consented,
+                        last_seq: local.last_seq,
+                        generation: fresh.current_generation,
+                    })?;
+                    state.db.set_org_generation(&local.org_id, fresh.current_generation)?;
+                    client
+                        .org_list_members(&access, &local.org_id)
+                        .await
+                        .map(|m| m.members.len() as u32)
+                        .unwrap_or(1)
+                }
+                Err(_) => 1,
+            }
+        }
+        _ => 1,
+    };
+    let refreshed = state.db.get_org_state(&local.org_id)?.unwrap_or(local);
+    let pending = state
+        .db
+        .list_org_shares_for_org(&refreshed.org_id)?
+        .iter()
+        .filter(|s| s.state == "queued" || s.state == "revoke_pending")
+        .count() as u32;
+    let item_count = state
+        .db
+        .list_org_shares_for_org(&refreshed.org_id)?
+        .iter()
+        .filter(|s| s.state == "uploaded")
+        .count() as u32;
+    // Consent is the GLOBAL org-egress config flag (mirrors share_egress_consented).
+    let consented = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .org_egress_consented;
+    Ok(Some(OrgStatus {
+        org_id: refreshed.org_id,
+        name: refreshed.name,
+        role: refreshed.role,
+        member_count,
+        consented,
+        last_seq: refreshed.last_seq,
+        item_count,
+        pending_shares: pending,
+    }))
+}
+
+/// `org_invite_member(email)` — owner adds a registered account, then wraps the CURRENT-generation
+/// OCK to them + PUTs the grant so they can decrypt the feed. Requires the OCK session.
+#[tauri::command]
+pub async fn org_invite_member(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<(), AppError> {
+    org_invite_member_inner(state.inner(), email).await
+}
+
+pub(crate) async fn org_invite_member_inner(state: &AppState, email: String) -> Result<(), AppError> {
+    let email = email.trim().to_string();
+    if email.is_empty() {
+        return Err(AppError::InvalidArg("email required".into()));
+    }
+    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+        return Err(AppError::InvalidArg("not a member of any org".into()));
+    };
+    let base = share_base_url(state)?;
+    let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // Resolve the new member's account id (server-side email lookup).
+    let added = client.org_add_member(&access_token, &org.org_id, &email).await?;
+
+    // Look up the member's published identity key to wrap the OCK to them.
+    let lookup = client.lookup_key(&access_token, &email).await?;
+    let key = lookup
+        .key
+        .filter(|_| lookup.registered)
+        .ok_or_else(|| AppError::InvalidArg("that address is not a registered account".into()))?;
+
+    let generation = org.generation;
+    let ock = acquire_org_ock(state, &org.org_id, generation).await?;
+    let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
+    let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+    let grant = crate::e2ee::org::wrap_ock_for_member(
+        &ock,
+        &org.org_id,
+        generation,
+        &key.pk_enc,
+        &added.user_id,
+        &owner,
+        &owner_fp,
+        gen_id,
+    )?;
+    client
+        .org_put_key_grants(
+            &access_token,
+            &org.org_id,
+            vec![crate::share::org_dto::KeyGrantInput {
+                user_id: added.user_id,
+                generation,
+                wrapped_key: grant.wrapped_key,
+                grant_sig: grant.grant_sig,
+            }],
+        )
+        .await?;
+    crate::share::ledger_row(&state.db, &client.host(), "org_invite_member", 0);
+    Ok(())
+}
+
+/// `org_list_members()` — the org's active members (content-free).
+#[tauri::command]
+pub async fn org_list_members(state: State<'_, AppState>) -> Result<Vec<OrgMember>, AppError> {
+    let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    let base = share_base_url(state.inner())?;
+    let access = valid_access_token(state.inner()).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let resp = client.org_list_members(&access, &org.org_id).await?;
+    Ok(resp
+        .members
+        .into_iter()
+        .map(|m| OrgMember {
+            user_id: m.user_id,
+            email: None, // the server does not return member emails (content-min); FE shows the id
+            role: m.role,
+            added_at: m.created_at,
+            removed: false,
+        })
+        .collect())
+}
+
+/// `org_remove_member(user_id)` — owner soft-removes a member, then ROTATES the OCK: generate gen
+/// N+1, wrap it to every REMAINING member, PUT the grants, and bump the server generation. The
+/// removed member keeps only the old-gen OCK (can't read anything sealed under N+1).
+#[tauri::command]
+pub async fn org_remove_member(
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<(), AppError> {
+    org_remove_member_inner(state.inner(), user_id).await
+}
+
+pub(crate) async fn org_remove_member_inner(state: &AppState, user_id: String) -> Result<(), AppError> {
+    let user_id = user_id.trim().to_string();
+    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+        return Err(AppError::InvalidArg("not a member of any org".into()));
+    };
+    let base = share_base_url(state)?;
+    let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    client
+        .org_remove_member(&access_token, &org.org_id, &user_id)
+        .await?;
+
+    // Rotate: new generation = current + 1. The owner generates the new OCK and MUST wrap it to every
+    // REMAINING active member (keyed by their published identity key) before bumping the generation.
+    //
+    // HONEST V1 BOUNDARY: the members endpoint is content-min (user_id/role/created_at only) and there
+    // is no "fetch a member's identity key by user_id" endpoint yet — only the email-keyed
+    // `keys/lookup`. So this v1 rotation re-grants the new OCK to the OWNER (whose key we derive
+    // locally) and bumps the generation; the removed member immediately loses access to anything sealed
+    // under gen N+1. Re-granting to OTHER remaining members needs a by-user_id key-directory read that
+    // the feed-sync slice adds — until then a rotation should be followed by re-inviting the remaining
+    // members (which re-wraps the current-gen OCK to each). This is a documented scope cut, not a leak:
+    // no content is exposed and the removed member is correctly locked out of future items.
+    let new_gen = org.generation.saturating_add(1);
+    let new_ock = crate::e2ee::org::generate_ock()?;
+    let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
+    let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+
+    let owner_grant = crate::e2ee::org::wrap_ock_for_member(
+        &new_ock,
+        &org.org_id,
+        new_gen,
+        &owner.pk_enc,
+        &account_id,
+        &owner,
+        &owner_fp,
+        gen_id,
+    )?;
+    client
+        .org_put_key_grants(
+            &access_token,
+            &org.org_id,
+            vec![crate::share::org_dto::KeyGrantInput {
+                user_id: account_id.clone(),
+                generation: new_gen,
+                wrapped_key: owner_grant.wrapped_key,
+                grant_sig: owner_grant.grant_sig,
+            }],
+        )
+        .await?;
+    // Bump the server generation (monotonic +1) — the server checks grant counts only.
+    client.org_bump_generation(&access_token, &org.org_id).await?;
+
+    // Update the cached generation + OCK.
+    state.db.set_org_generation(&org.org_id, new_gen)?;
+    {
+        let mut cache = state
+            .org_ock_cache
+            .lock()
+            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
+        cache.insert((org.org_id.clone(), new_gen), zeroize::Zeroizing::new(*new_ock));
+    }
+    crate::share::ledger_row(&state.db, &client.host(), "org_remove_member", 0);
+    Ok(())
+}
+
+/// `org_leave()` — the caller leaves the org (member self-removal). Drops the local org row + cached
+/// OCKs. Does NOT retroactively un-share the caller's already-published items (use `revoke_org_share`
+/// for that first if desired).
+#[tauri::command]
+pub async fn org_leave(state: State<'_, AppState>) -> Result<(), AppError> {
+    let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
+        return Ok(());
+    };
+    let base = share_base_url(state.inner())?;
+    let access = valid_access_token(state.inner()).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client.org_leave(&access, &org.org_id).await?;
+    state.inner().db.delete_org_state(&org.org_id)?;
+    // Drop every cached OCK for this org.
+    {
+        let mut cache = state
+            .inner()
+            .org_ock_cache
+            .lock()
+            .map_err(|_| AppError::Storage("org-ock cache mutex poisoned".into()))?;
+        cache.retain(|(oid, _), _| oid != &org.org_id);
+    }
+    crate::share::ledger_row(&state.inner().db, &client.host(), "org_leave", 0);
+    Ok(())
+}
+
+/// `consent_to_org_egress` — grant the one-time ORG-egress consent. Fail-closed: until set, every
+/// `share_meeting_to_org` / `share_document_to_org` refuses. Mirror of `consent_to_share_egress`.
+#[tauri::command]
+pub fn consent_to_org_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.grant_org_egress_consent(&state.db)?;
+    Ok(())
+}
+
+/// `revoke_org_egress` — revoke the org-egress consent (the next org share is refused fail-closed).
+#[tauri::command]
+pub fn revoke_org_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cfg.revoke_org_egress(&state.db)?;
+    Ok(())
+}
+
+/// Build the exact outgoing markdown for a meeting/note org share: the GATED read → `clean_note_body`
+/// → optional regex scrub. Returns `(title, clean_scrubbed_markdown, created_at, counts, kind)`. The
+/// read-gate is the FIRST thing this does (a sealed-not-unlocked source refuses). NO egress.
+fn build_org_share_body(
+    state: &AppState,
+    meeting_id: Option<&str>,
+    document_id: Option<&str>,
+    scrub: bool,
+) -> Result<(String, String, String, OrgScrubCounts, crate::share::org_envelope::OrgItemKind), AppError>
+{
+    let (title, markdown, created_at, kind) = match (meeting_id, document_id) {
+        (Some(mid), None) => {
+            // (1) READ-GATE FIRST — a sealed-not-unlocked meeting refuses before any read/egress.
+            if !meeting_is_unlocked(state, mid)? {
+                return Err(AppError::Locked(
+                    "this meeting's folder is locked — unlock it to share to the org".into(),
+                ));
+            }
+            let note = state
+                .db
+                .get_latest_note_for_meeting(mid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {mid}")))?;
+            let meeting = state.db.get_meeting(mid)?;
+            let title = meeting
+                .as_ref()
+                .and_then(|m| m.title.clone())
+                .unwrap_or_else(|| "Shared note".to_string());
+            let created_at = meeting
+                .as_ref()
+                .map(|m| m.started_at.clone())
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+            (
+                title,
+                note.markdown,
+                created_at,
+                crate::share::org_envelope::OrgItemKind::Note,
+            )
+        }
+        (None, Some(did)) => {
+            // (1) READ-GATE FIRST — a sealed authored note refuses (mirrors `share_note_to_link_doc`).
+            let row = state
+                .db
+                .get_note_row(did)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no note {did}")))?;
+            if !folder_is_unlocked(state, &row.folder_id)? {
+                return Err(AppError::Locked(
+                    "this note's folder is locked — unlock it to share to the org".into(),
+                ));
+            }
+            let title = note_display_title(&row);
+            let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339();
+            (
+                title,
+                row.text,
+                created_at,
+                crate::share::org_envelope::OrgItemKind::Note,
+            )
+        }
+        _ => {
+            return Err(AppError::InvalidArg(
+                "exactly one of meeting_id or document_id is required".into(),
+            ));
+        }
+    };
+
+    // (3) CLEAN (strip frontmatter + flatten wikilinks + drop obsidian:// refs — the leak-safe transform).
+    let cleaned = crate::share::envelope::clean_note_body(&markdown);
+    // (4) regex PII scrub (emails/phones/cards; names KEPT) when requested.
+    let (final_md, counts) = if scrub {
+        scrub_org_markdown(&cleaned)
+    } else {
+        (cleaned, OrgScrubCounts::default())
+    };
+    Ok((title, final_md, created_at, counts, kind))
+}
+
+/// `preview_org_share(meeting_id?, document_id?, scrub)` — the EXACT post-clean, post-scrub markdown +
+/// byte count + scrub counts, with NO egress. The read-gate still applies (a sealed source refuses).
+#[tauri::command]
+pub fn preview_org_share(
+    state: State<'_, AppState>,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+) -> Result<OrgSharePreview, AppError> {
+    preview_org_share_inner(state.inner(), meeting_id, document_id, scrub)
+}
+
+pub(crate) fn preview_org_share_inner(
+    state: &AppState,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+) -> Result<OrgSharePreview, AppError> {
+    let (title, markdown, _created, counts, _kind) = build_org_share_body(
+        state,
+        meeting_id.as_deref(),
+        document_id.as_deref(),
+        scrub,
+    )?;
+    let bytes = markdown.len() as u32;
+    let chunk_count = rough_chunk_count(&markdown);
+    Ok(OrgSharePreview {
+        title,
+        markdown,
+        bytes,
+        chunk_count,
+        scrubbed: counts,
+        scrub,
+    })
+}
+
+/// `share_meeting_to_org(meeting_id, scrub)` — the normative org share flow (spec gate order):
+/// (1) read-gate, (2) consent fail-closed, (3) clean, (4) scrub, (5) seal under OCK + local
+/// open-verify, (6) upload blob + publish item, (7) content-free egress-ledger entry.
+#[tauri::command]
+pub async fn share_meeting_to_org(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    scrub: bool,
+) -> Result<OrgShareEntry, AppError> {
+    share_to_org_inner(state.inner(), Some(meeting_id), None, scrub).await
+}
+
+/// `share_document_to_org(document_id, scrub)` — the note twin of [`share_meeting_to_org`].
+#[tauri::command]
+pub async fn share_document_to_org(
+    state: State<'_, AppState>,
+    document_id: String,
+    scrub: bool,
+) -> Result<OrgShareEntry, AppError> {
+    share_to_org_inner(state.inner(), None, Some(document_id), scrub).await
+}
+
+pub(crate) async fn share_to_org_inner(
+    state: &AppState,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+) -> Result<OrgShareEntry, AppError> {
+    // (1) READ-GATE + (3) clean + (4) scrub — all inside `build_org_share_body` (read-gate FIRST).
+    let (title, markdown, created_at, _counts, kind) = build_org_share_body(
+        state,
+        meeting_id.as_deref(),
+        document_id.as_deref(),
+        scrub,
+    )?;
+
+    // (2) consent fail-closed (the global one-time org-egress consent).
+    {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.org_egress_consented {
+            return Err(AppError::Unavailable(
+                "org sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+    }
+
+    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+        return Err(AppError::InvalidArg("not a member of any org".into()));
+    };
+    let base = share_base_url(state)?;
+    let (_account_id, _gen_id, _mk, access_token) = require_session_mk(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let generation = org.generation;
+
+    // Author hint = the account's email local-part (a display label, never note content).
+    let author_hint = {
+        let g = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        crate::share::require_login(&g)
+            .map(|s| org_author_hint(&s.email))
+            .unwrap_or_else(|_| "member".to_string())
+    };
+
+    // Persist a queued row FIRST (so a crash between seal + publish is recoverable by the launch
+    // sweep). The row id doubles as the envelope's item nonce (fresh per publish).
+    let row_id = crate::share::new_share_id();
+    let now = chrono::Utc::now().to_rfc3339();
+    let env = crate::share::org_envelope::OrgEnvelope::new(
+        kind,
+        title.clone(),
+        markdown,
+        author_hint,
+        created_at,
+        1,
+    );
+    let content_sha = env.content_sha256();
+    state.db.insert_org_share(
+        &row_id,
+        &org.org_id,
+        meeting_id.as_deref(),
+        document_id.as_deref(),
+        kind.as_str(),
+        Some(&title),
+        1,
+        generation,
+        &content_sha,
+        &now,
+    )?;
+
+    // (5) Seal under the OCK + LOCAL OPEN-VERIFY (the egress verify-before-destroy — publish only a
+    // blob we just proved we can decrypt back).
+    //
+    // AAD ITEM NONCE = hex(content_sha256_of_plaintext), NOT the local row_id: the server assigns its
+    // OWN item_id on publish (the client never controls it), so a per-publish LOCAL id would be
+    // unknowable to any OTHER member syncing the feed → they could never open the cell. The content
+    // hash is deterministic + rides the feed (`OrgItemEntry.content_sha256`), so every member
+    // reconstructs the SAME AAD. (2026-07-10 cross-slice fix — see org_sync_now's open side.)
+    let ock = acquire_org_ock(state, &org.org_id, generation).await?;
+    let item_nonce = org_item_nonce(&content_sha);
+    let (ciphertext, _sha) =
+        match crate::share::org_envelope::seal_org_envelope(&ock, &env, &org.org_id, &item_nonce) {
+            Ok(v) => v,
+            Err(e) => {
+                state.db.set_org_share_failed(&row_id, "seal_failed", &now)?;
+                return Err(e);
+            }
+        };
+
+    // (6) upload the ciphertext blob → publish the item. On failure, mark the row `failed` (the
+    // launch sweep retries a `queued`/`failed` row later).
+    let blob_id = match client.put_blob(&access_token, ciphertext).await {
+        Ok(id) => id,
+        Err(e) => {
+            state.db.set_org_share_failed(&row_id, "upload_failed", &now)?;
+            return Err(e);
+        }
+    };
+    let published = match client
+        .org_publish_item(
+            &access_token,
+            &org.org_id,
+            crate::share::org_dto::PublishItemRequest {
+                blob_id,
+                content_sha256: content_sha.clone(),
+                rev: 1,
+                generation,
+            },
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            state.db.set_org_share_failed(&row_id, "publish_failed", &now)?;
+            return Err(e);
+        }
+    };
+    state
+        .db
+        .set_org_share_uploaded(&row_id, &published.item_id, &now)?;
+
+    // (7) CONTENT-FREE egress ledger (host + ciphertext byte size). NEVER a title / note text / OCK.
+    crate::share::ledger_row(
+        &state.db,
+        &client.host(),
+        "org_share_publish",
+        content_sha.len(),
+    );
+
+    Ok(OrgShareEntry {
+        item_id: Some(published.item_id),
+        kind: kind.as_str().to_string(),
+        title: Some(title),
+        shared_at: now,
+        rev: 1,
+        state: "uploaded".to_string(),
+    })
+}
+
+/// `list_org_shares()` — the caller's outbound org shares (local rows; titles render only to the
+/// local owner). Content-free enough for the FE list.
+#[tauri::command]
+pub fn list_org_shares(state: State<'_, AppState>) -> Result<Vec<OrgShareEntry>, AppError> {
+    let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
+        return Ok(Vec::new());
+    };
+    let rows = state.inner().db.list_org_shares_for_org(&org.org_id)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OrgShareEntry {
+            item_id: r.item_id,
+            kind: r.kind,
+            title: r.title,
+            shared_at: r.created_at,
+            rev: r.rev,
+            state: r.state,
+        })
+        .collect())
+}
+
+/// `revoke_org_share(item_id)` — tombstone a published org item (destroys its server ciphertext) and
+/// mark the local row revoked. Marks `revoke_pending` first (crash-safe: the launch sweep completes a
+/// `revoke_pending` if the tombstone call didn't land).
+#[tauri::command]
+pub async fn revoke_org_share(state: State<'_, AppState>, item_id: String) -> Result<(), AppError> {
+    revoke_org_share_inner(state.inner(), item_id).await
+}
+
+pub(crate) async fn revoke_org_share_inner(state: &AppState, item_id: String) -> Result<(), AppError> {
+    let item_id = item_id.trim().to_string();
+    let Some(row) = state.db.org_share_by_item(&item_id)? else {
+        return Err(AppError::InvalidArg("no local org share for that item".into()));
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    state.db.set_org_share_state(&row.id, "revoke_pending", &now)?;
+
+    let base = share_base_url(state)?;
+    let access = valid_access_token(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client
+        .org_tombstone_item(&access, &row.org_id, &item_id)
+        .await?;
+    state.db.set_org_share_state(&row.id, "revoked", &now)?;
+    crate::share::ledger_row(&state.db, &client.host(), "org_share_revoke", 0);
+    Ok(())
+}
+
+/// One org-brain item still live for a folder (lock×shares dialog). `item_id` is the server item id
+/// for an uploaded share, or the local row id for a still-queued one (a stable key for the FE list;
+/// only uploaded ones are deep-linkable). Serializes camelCase → matches `models.ts` `OrgActiveShare`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgActiveShare {
+    pub item_id: String,
+    pub title: String,
+}
+
+/// The active-shares report for the lock×shares dialog. `links`/`users` are counts of the folder's
+/// live zero-knowledge LINK / Murmur↔Murmur USER shares; `org` lists the org-brain items shared from
+/// the folder. Content-free enough for a dialog (titles render only to the local owner). Mirrors the
+/// TS `ActiveSharesReport`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSharesReport {
+    pub links: u32,
+    pub users: u32,
+    pub org: Vec<OrgActiveShare>,
+}
+
+/// `folder_active_shares(folder_id)` — the folder's live outgoing shares, for the lock×shares dialog.
+/// Closes the pre-existing hole where `lock_folder` sealed a folder without ever warning that its
+/// notes were still shared (live 1:1 link/user shares were completely invisible; only org shares were
+/// tracked). READ-ONLY, no egress: link/user COUNTS + the org items' ids+titles.
+#[tauri::command]
+pub fn folder_active_shares(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<ActiveSharesReport, AppError> {
+    let st = state.inner();
+    let (mut links, mut users) = (0u32, 0u32);
+    for (_share_id, mode) in st.db.active_link_user_shares_for_folder(&folder_id)? {
+        match mode.as_str() {
+            "link" => links += 1,
+            "user" => users += 1,
+            _ => {}
+        }
+    }
+    let org = st
+        .db
+        .active_org_share_ids_for_folder(&folder_id)?
+        .into_iter()
+        .map(|(row_id, item_id, title)| OrgActiveShare {
+            item_id: item_id.unwrap_or(row_id),
+            title,
+        })
+        .collect();
+    Ok(ActiveSharesReport { links, users, org })
+}
+
+/// `revoke_shares_for_folder(folder_id)` — bulk-revoke every live share from a folder (the "Revoke &
+/// lock" path of the lock×shares dialog). Best-effort: attempts EVERY share even if one fails, then
+/// returns the FIRST error, so the FE never proceeds to seal on a partial revoke. Link/user → server
+/// revoke + local `revoked`; org uploaded → server tombstone; org still-queued → cancelled locally so
+/// the launch sweep never egresses it. Idempotent (an already-revoked share is simply re-listed out).
+#[tauri::command]
+pub async fn revoke_shares_for_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), AppError> {
+    let st = state.inner();
+    let link_user = st.db.active_link_user_shares_for_folder(&folder_id)?;
+    let org = st.db.active_org_share_ids_for_folder(&folder_id)?;
+    let mut first_err: Option<AppError> = None;
+
+    for (share_id, _mode) in link_user {
+        if let Err(e) = revoke_share_inner(st, share_id).await {
+            first_err.get_or_insert(e);
+        }
+    }
+    for (row_id, item_id, _title) in org {
+        let res = match item_id {
+            Some(id) => revoke_org_share_inner(st, id).await,
+            None => {
+                // Never uploaded — cancel locally so the launch sweep skips it (no server item).
+                let now = chrono::Utc::now().to_rfc3339();
+                st.db.set_org_share_state(&row_id, "revoked", &now)
+            }
+        };
+        if let Err(e) = res {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Cadence of the background org-feed sync loop (M6 Shared Brain, spawned in `lib.rs` setup). The
+/// first tick fires `ORG_SYNC_FIRST_DELAY_SECS` after launch (no startup contention); subsequent
+/// ticks every `ORG_SYNC_TICK_SECS`. Every tick is a cheap no-op while logged out / no org joined.
+pub const ORG_SYNC_FIRST_DELAY_SECS: u64 = 20;
+pub const ORG_SYNC_TICK_SECS: u64 = 300;
+
+/// One background org-sync tick: drain the outbound share queue, then pull + ingest the inbound feed
+/// into the local int8 partition. This is what makes the org brain a REPLICATED brain — every
+/// member's app stays fresh for Ask/MCP WITHOUT anyone opening Settings. Best-effort: each half
+/// warns-and-continues (a transient failure never kills the loop), and both inners gate to an early
+/// `Ok` when logged out / no org joined, so this is a no-op until a session is live. Logs only
+/// non-PII counts on a productive tick.
+pub(crate) async fn org_background_sync_tick(state: &AppState) {
+    if let Err(e) = org_sweep_pending_inner(state).await {
+        tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
+    }
+    match org_sync_now_inner(state).await {
+        Ok(r) if r.ingested > 0 || r.tombstoned > 0 => tracing::info!(
+            target: "org",
+            ingested = r.ingested,
+            tombstoned = r.tombstoned,
+            "org feed synced"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(target: "org", error = %e, "org feed sync tick failed"),
+    }
+}
+
+/// `org_sweep_pending()` — the on-launch org queue sweep (extends the mode-B `share_rewrap_pending`
+/// launch pattern). Idempotent + OFFLINE-TOLERANT: logged out / no server / a per-row failure leaves
+/// the row where it is for the next pass (never an error). Two queues:
+///   - `queued` (or `failed` retry) → re-seal under the current OCK + upload + publish → `uploaded`;
+///   - `revoke_pending` → tombstone the item server-side → `revoked`.
+/// Returns the number of rows ADVANCED. Reads ONLY the retained local rows' key/hash context — for a
+/// re-seal it re-reads the SOURCE note, so the per-row re-share still passes the READ-GATE (a source
+/// sealed since queueing refuses and the row is left `failed`, never egressing sealed content).
+#[tauri::command]
+pub async fn org_sweep_pending(state: State<'_, AppState>) -> Result<u32, AppError> {
+    org_sweep_pending_inner(state.inner()).await
+}
+
+pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, AppError> {
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(0);
+    }
+    // Logged out ⇒ nothing to do (best-effort launch sweep, not an error).
+    if valid_access_token(state).await.is_err() {
+        return Ok(0);
+    }
+    let mut advanced = 0u32;
+
+    // 1) Finish any pending revokes (a tombstone that didn't land before a crash).
+    for row in state.db.list_org_shares_in_state("revoke_pending")? {
+        let Some(item_id) = row.item_id.clone() else {
+            // No server item id ⇒ nothing to tombstone; just mark it revoked locally.
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = state.db.set_org_share_state(&row.id, "revoked", &now);
+            advanced += 1;
+            continue;
+        };
+        if revoke_org_share_inner(state, item_id).await.is_ok() {
+            advanced += 1;
+        }
+    }
+
+    // 2) Re-attempt any queued/failed publishes. Re-run the full gated share so a source sealed since
+    //    queueing NEVER egresses (the read-gate refuses → the row stays `failed`).
+    for state_label in ["queued", "failed"] {
+        for row in state.db.list_org_shares_in_state(state_label)? {
+            // Skip rows already published (defensive — shouldn't be in these states with an item_id).
+            if row.item_id.is_some() {
+                continue;
+            }
+            let res = share_to_org_inner(
+                state,
+                row.meeting_id.clone(),
+                row.document_id.clone(),
+                // A re-publish preserves the ORIGINAL scrub intent: if we can't know it, scrub ON
+                // (fail-safe toward LESS egress). The queued row doesn't record the flag, so default
+                // to scrubbing.
+                true,
+            )
+            .await;
+            if res.is_ok() {
+                // The new share created a fresh row; drop the stale queued/failed row so it doesn't
+                // re-fire. (A superseded queue entry — the retry replaced it.)
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = state.db.set_org_share_state(&row.id, "revoked", &now);
+                advanced += 1;
+            }
+        }
+    }
+
+    Ok(advanced)
+}
+
+/// `org_sync_now()` — pull the org feed from the last synced cursor, OPEN each ciphertext blob with
+/// the (RAM-cached / grant-unwrapped) OCK, and INGEST it into the local decrypted replica + int8
+/// retrieval partition. A TOMBSTONE evicts the item's chunks/vectors/FTS. Returns a content-free
+/// [`OrgSyncReport`] (counts + `fts_only` + per-item error strings). Best-effort per item: a single
+/// item whose OCK is unavailable / whose blob won't open is SKIPPED (recorded in `errors`), never
+/// crashing the whole sync — the cursor still advances past a tombstone but STOPS at the first
+/// un-openable LIVE item so a transient key gap is retried next sync (no silent skip-forward).
+#[tauri::command]
+pub async fn org_sync_now(
+    state: State<'_, AppState>,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    org_sync_now_inner(state.inner()).await
+}
+
+/// Server feed page size per `org_feed` request. The loop pages until the feed is drained.
+const ORG_FEED_PAGE: u32 = 200;
+
+pub(crate) async fn org_sync_now_inner(
+    state: &AppState,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    let mut report = crate::storage::models::OrgSyncReport::default();
+
+    // No org joined ⇒ nothing to sync (not an error).
+    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+        return Ok(report);
+    };
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(report);
+    }
+    // Logged out ⇒ best-effort no-op (the FE surfaces "sign in to sync").
+    let access = match valid_access_token(state).await {
+        Ok(a) => a,
+        Err(_) => return Ok(report),
+    };
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // Whether THIS member has a real embedder. StubEmbedder ⇒ FTS-only (no int8 vectors written);
+    // flag it so the FE can offer a re-embed once a model lands.
+    report.fts_only = !crate::embed::embed_model_present();
+
+    // ── ASYNC PULL PHASE — drain the feed, opening each cell; buffer decrypted items ──────────────
+    // The embedder (`dyn Embedder`, !Send) is deliberately NOT constructed here: the whole async
+    // section is Send-safe, and the synchronous INGEST phase below owns the embedder entirely (never
+    // held across an `.await`). A tombstone applies immediately (no key/blob needed). We STOP at the
+    // first un-openable LIVE item (never a silent skip-forward), so a transient key gap retries next
+    // sync — the cursor only advances past items we successfully ingested/tombstoned.
+    enum FeedAction {
+        Tombstone {
+            item_id: String,
+            seq: u64,
+        },
+        Ingest {
+            item_id: String,
+            seq: u64,
+            rev: u32,
+            generation: u32,
+            env: crate::share::org_envelope::OrgEnvelope,
+            sha: Vec<u8>,
+        },
+    }
+    let mut actions: Vec<FeedAction> = Vec::new();
+    let mut cursor = state.db.org_last_seq_for(&org.org_id)?;
+
+    'pages: loop {
+        let feed = client
+            .org_feed(&access, &org.org_id, cursor, ORG_FEED_PAGE)
+            .await?;
+        if feed.items.is_empty() {
+            break;
+        }
+        for item in &feed.items {
+            report.pulled += 1;
+
+            if item.tombstoned {
+                actions.push(FeedAction::Tombstone {
+                    item_id: item.item_id.clone(),
+                    seq: item.seq,
+                });
+                continue;
+            }
+
+            let Some(blob_id) = item.blob_id.clone() else {
+                report
+                    .errors
+                    .push(format!("item {}: live entry missing blob", item.item_id));
+                break 'pages;
+            };
+            // The AAD item nonce is hex(content_sha256) — the SAME value the publisher sealed under.
+            let Some(sha) = item.content_sha256.clone() else {
+                report
+                    .errors
+                    .push(format!("item {}: live entry missing content hash", item.item_id));
+                break 'pages;
+            };
+            let item_nonce = org_item_nonce(&sha);
+
+            // Resolve the OCK for THIS item's generation (RAM cache / grant unwrap; gated on MK
+            // session). Unavailable ⇒ transient key gap → record + STOP (retried next sync).
+            let ock = match acquire_org_ock(state, &org.org_id, item.generation).await {
+                Ok(k) => k,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("item {}: key unavailable ({})", item.item_id, brief_err(&e)));
+                    break 'pages;
+                }
+            };
+            let ciphertext = match client.get_blob(&access, &blob_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("item {}: blob fetch failed ({})", item.item_id, brief_err(&e)));
+                    break 'pages;
+                }
+            };
+            // OPEN (verify-before-trust: fails closed on wrong OCK / tampered cell / wrong AAD).
+            let env = match crate::share::org_envelope::open_org_envelope(
+                &ock,
+                &ciphertext,
+                &org.org_id,
+                &item_nonce,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    report.errors.push(format!(
+                        "item {}: envelope open failed ({})",
+                        item.item_id,
+                        brief_err(&e)
+                    ));
+                    break 'pages;
+                }
+            };
+            // INTEGRITY: the opened plaintext's own hash must equal the feed-supplied one the AAD was
+            // derived from (a successful AAD open already implies this, but assert so a server pairing
+            // a valid cell with a lying feed hash is caught).
+            if env.content_sha256() != sha {
+                report
+                    .errors
+                    .push(format!("item {}: content hash mismatch", item.item_id));
+                break 'pages;
+            }
+            actions.push(FeedAction::Ingest {
+                item_id: item.item_id.clone(),
+                seq: item.seq,
+                rev: item.rev,
+                generation: item.generation,
+                env,
+                sha,
+            });
+        }
+        if (feed.items.len() as u32) < ORG_FEED_PAGE {
+            break; // fewer than a full page ⇒ feed drained.
+        }
+        cursor = cursor.max(feed.next_seq);
+    }
+
+    // ── SYNC INGEST PHASE — embedder built ONCE, never crosses an await ───────────────────────────
+    let embedder: Option<Box<dyn crate::embed::Embedder>> = if report.fts_only {
+        None
+    } else {
+        Some(crate::embed::active_embedder())
+    };
+    let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
+    let mut applied = cursor;
+    for action in actions {
+        match action {
+            FeedAction::Tombstone { item_id, seq } => {
+                state.db.tombstone_org_item(&item_id)?;
+                report.tombstoned += 1;
+                applied = applied.max(seq);
+            }
+            FeedAction::Ingest {
+                item_id,
+                seq,
+                rev,
+                generation,
+                env,
+                sha,
+            } => {
+                state.db.upsert_org_item(
+                    &item_id,
+                    &org.org_id,
+                    seq,
+                    &env.author_hint,
+                    &env.title,
+                    &env.markdown,
+                    &env.created_at,
+                    rev,
+                    generation,
+                    &sha,
+                    embedder_ref,
+                )?;
+                report.ingested += 1;
+                applied = applied.max(seq);
+            }
+        }
+        // Advance the cursor per successfully-applied item (monotonic; Core's setter no-ops backward).
+        state.db.set_org_last_seq(&org.org_id, applied as i64)?;
+    }
+
+    report.last_seq = state.db.org_last_seq_for(&org.org_id)?;
+    tracing::info!(
+        target: "org",
+        pulled = report.pulled,
+        ingested = report.ingested,
+        tombstoned = report.tombstoned,
+        fts_only = report.fts_only,
+        errors = report.errors.len(),
+        "org feed sync"
+    );
+    Ok(report)
+}
+
+/// A short, PII-free rendering of an error for a sync report string (never note content — AppError
+/// Display here carries only stage/status labels the client controls).
+fn brief_err(e: &AppError) -> String {
+    match e {
+        AppError::Locked(_) => "locked".to_string(),
+        AppError::Auth(_) => "auth".to_string(),
+        AppError::Unavailable(_) => "unavailable".to_string(),
+        _ => "error".to_string(),
+    }
+}
+
+/// `org_get_item(item_id)` — the full decrypted org item for the read-only FE viewer. Org items are
+/// deliberately org-disclosed content (no folder lock gate applies). Returns `None` for an unknown or
+/// tombstoned item.
+#[tauri::command]
+pub fn org_get_item(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<Option<crate::storage::models::OrgItemDetail>, AppError> {
+    state.inner().db.get_org_item(&item_id)
 }
 
 #[cfg(test)]

@@ -353,6 +353,36 @@
           }
         }
       </div>
+
+      <!-- ORG BRAIN — publish this note to the org's shared brain (only in an org). -->
+      @if (org(); as orgStatus) {
+        <div class="panel-card org">
+          <div class="manage-head">
+            <span class="section-label">Org Brain</span>
+            <span class="hint-inline">{{ orgStatus.name }}</span>
+          </div>
+          <p class="consent-copy">
+            Add this note to <strong>{{ orgStatus.name }}</strong>'s shared brain so
+            your
+            {{ orgStatus.memberCount }}
+            {{ orgStatus.memberCount === 1 ? "teammate" : "teammates" }} can find
+            it. It's end-to-end encrypted; the server can't read it.
+          </p>
+          <button type="button" class="btn btn-ghost" (click)="openOrgSheet()">
+            Add to Org Brain
+          </button>
+        </div>
+      }
     }
   </div>
 </div>
+
+@if (orgSheetOpen() && org(); as orgStatus) {
+  <app-org-share-sheet
+    [target]="orgTarget()"
+    [orgName]="orgStatus.name"
+    [memberCount]="orgStatus.memberCount"
+    (shared)="onOrgShared()"
+    (cancelled)="closeOrgSheet()"
+  />
+}
