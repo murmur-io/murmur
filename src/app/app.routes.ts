@@ -99,6 +99,15 @@ export const routes: Routes = [
           ),
       },
       {
+        // Read-only org-brain item viewer — reached from an org-origin source
+        // chip in Ask. Renders one decrypted OrgItemDetail (author + date + md).
+        path: "org-item/:id",
+        loadComponent: () =>
+          import("./features/org/org-item-viewer/org-item-viewer.component").then(
+            (m) => m.OrgItemViewerComponent,
+          ),
+      },
+      {
         path: "brain",
         loadComponent: () =>
           import("./features/brain/brain/brain.component").then(

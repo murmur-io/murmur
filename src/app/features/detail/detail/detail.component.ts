@@ -201,6 +201,19 @@ export class DetailComponent implements OnInit {
    */
   readonly keepsMasters = signal(false);
 
+  // --- Org Brain badge (Shared Brain v1) -----------------------------------
+  /**
+   * True when THIS meeting is in the org brain — drives the "In Org Brain"
+   * header pill. Loaded best-effort from `list_org_shares` and refreshed when
+   * the share-panel reports a change.
+   *
+   * SEAM (Shared Brain v1): `list_org_shares` is content-free (item ids + titles,
+   * no `meetingId`), so we match by TITLE as the honest heuristic until the
+   * backend stamps an org-share row with the source meeting id. When it does,
+   * replace the title match in {@link refreshOrgShared} with a meeting-id join.
+   */
+  readonly orgShared = signal(false);
+
   // --- Export Canvas (Obsidian .canvas board) ------------------------------
   /** True while an exportCanvas IPC call is in flight (disables the button). */
   readonly exportingCanvas = signal(false);
@@ -386,6 +399,32 @@ export class DetailComponent implements OnInit {
   }
 
   /**
+   * Refresh the "In Org Brain" header pill from `list_org_shares`. See the
+   * {@link orgShared} SEAM note: matched by title (the content-free share list
+   * carries no meeting id yet). Fails closed to `false` on any error / no org.
+   */
+  private async refreshOrgShared(): Promise<void> {
+    const title = this.detail()?.meeting.title;
+    if (!title) {
+      this.orgShared.set(false);
+      return;
+    }
+    try {
+      const shares = await this.ipc.listOrgShares();
+      this.orgShared.set(
+        shares.some((s) => s.state !== "revoked" && s.title === title),
+      );
+    } catch {
+      this.orgShared.set(false);
+    }
+  }
+
+  /** The share-panel reported a create/revoke — refresh the org-shared pill. */
+  async onShareChanged(): Promise<void> {
+    await this.refreshOrgShared();
+  }
+
+  /**
    * Load (or reload) a meeting by id into the view. Resets the per-meeting
    * signals that aren't derived from `detail()` so an in-place reload never
    * shows the previous meeting's timeline/tags/graph or a stale open editor.
@@ -426,6 +465,8 @@ export class DetailComponent implements OnInit {
       this.config.set(null);
       this.keepsMasters.set(false);
     }
+    // Org Brain badge (best-effort, non-blocking; hidden on any failure).
+    void this.refreshOrgShared();
     // Locked (masked) meetings render the lock gate only — skip priming the
     // timeline/tags (they're empty/masked) and focus the Unlock button instead.
     if (this.locked()) {

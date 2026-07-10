@@ -84,6 +84,13 @@ import type {
   WakeDetectedPayload,
   UpdateInfo,
   AppInfo,
+  OrgStatus,
+  OrgMember,
+  OrgSharePreview,
+  OrgShareEntry,
+  OrgItemDetail,
+  OrgSyncReport,
+  ActiveSharesReport,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -508,6 +515,115 @@ export class IpcService {
   /** Decline an incoming share: drop the wrapped key server-side. Idempotent. */
   declineShare(shareId: string): Promise<void> {
     return invoke<void>("decline_share", { shareId });
+  }
+
+  // ── Shared Brain v1 — org-wide E2EE replicated brain ──
+  // One typed method per spec command. Org items are deliberately-disclosed
+  // content OUTSIDE the folder-lock domain; egress from THIS user is gated
+  // (`meeting_is_unlocked` + consent) backend-side. Never log a returned envelope.
+
+  /** Create a new org (this user becomes owner) → the fresh {@link OrgStatus}. */
+  orgCreate(name: string): Promise<OrgStatus> {
+    return invoke<OrgStatus>("org_create", { name });
+  }
+
+  /** The current org membership + sync state, or `null` when this user is in no org. */
+  orgStatus(): Promise<OrgStatus | null> {
+    return invoke<OrgStatus | null>("org_status");
+  }
+
+  /** Invite a member by email (owner only). Idempotent on an already-invited address. */
+  orgInviteMember(email: string): Promise<void> {
+    return invoke<void>("org_invite_member", { email });
+  }
+
+  /** List the org's members (owner sees emails to manage; drives the member list). */
+  orgListMembers(): Promise<OrgMember[]> {
+    return invoke<OrgMember[]>("org_list_members");
+  }
+
+  /** Remove a member (owner only) — drives the OCK generation rotation server-side. */
+  orgRemoveMember(userId: string): Promise<void> {
+    return invoke<void>("org_remove_member", { userId });
+  }
+
+  /** Leave the org (self-removal). The local org replica is dropped. */
+  orgLeave(): Promise<void> {
+    return invoke<void>("org_leave");
+  }
+
+  /** Grant the one-time org-egress consent (mirrors `consentToShareEgress`). PRESERVE-ONLY config key. */
+  consentToOrgEgress(): Promise<void> {
+    return invoke<void>("consent_to_org_egress");
+  }
+
+  /** Revoke the org-egress consent (the next org share is refused fail-closed). */
+  revokeOrgEgress(): Promise<void> {
+    return invoke<void>("revoke_org_egress");
+  }
+
+  /**
+   * Preview the EXACT outgoing org-share envelope for a meeting OR a note, at the
+   * given `scrub` setting — the OPAQUE preview sheet renders this verbatim before
+   * the user confirms. Pass exactly one of `meetingId` / `documentId`. Re-fetch
+   * whenever the scrub toggle flips (the markdown + counts change). Refuses
+   * (`Locked`) a sealed source. Mirrors the spec `preview_org_share`.
+   */
+  previewOrgShare(
+    args: { meetingId?: string; documentId?: string; scrub: boolean },
+  ): Promise<OrgSharePreview> {
+    return invoke<OrgSharePreview>("preview_org_share", {
+      meetingId: args.meetingId ?? null,
+      documentId: args.documentId ?? null,
+      scrub: args.scrub,
+    });
+  }
+
+  /**
+   * Publish a MEETING to the org brain (seal under the OCK + upload). Gate order
+   * backend-side: unlocked → consent → clean → scrub → seal → upload → ledger.
+   * Refuses (`Locked`) a sealed meeting; requires org membership + consent.
+   */
+  shareMeetingToOrg(meetingId: string, scrub: boolean): Promise<void> {
+    return invoke<void>("share_meeting_to_org", { meetingId, scrub });
+  }
+
+  /** Publish an authored NOTE to the org brain. Same gated pipeline as the meeting path. */
+  shareDocumentToOrg(documentId: string, scrub: boolean): Promise<void> {
+    return invoke<void>("share_document_to_org", { documentId, scrub });
+  }
+
+  /** This user's outgoing org shares (drives the "In Org Brain" state + per-item revoke). */
+  listOrgShares(): Promise<OrgShareEntry[]> {
+    return invoke<OrgShareEntry[]>("list_org_shares");
+  }
+
+  /** Revoke an org share: tombstone the feed item + drop the local ciphertext. Idempotent. */
+  revokeOrgShare(itemId: string): Promise<void> {
+    return invoke<void>("revoke_org_share", { itemId });
+  }
+
+  /** Manually pull + ingest the org feed now → the {@link OrgSyncReport} (counts + errors only). */
+  orgSyncNow(): Promise<OrgSyncReport> {
+    return invoke<OrgSyncReport>("org_sync_now");
+  }
+
+  /** The full decrypted org item for the read-only viewer route. */
+  orgGetItem(itemId: string): Promise<OrgItemDetail> {
+    return invoke<OrgItemDetail>("org_get_item", { itemId });
+  }
+
+  /**
+   * The active shares (link + user + org) for a folder — gathered before a lock so
+   * the lock×shares dialog can warn + offer Revoke & lock. Mirrors `folder_active_shares`.
+   */
+  folderActiveShares(folderId: string): Promise<ActiveSharesReport> {
+    return invoke<ActiveSharesReport>("folder_active_shares", { folderId });
+  }
+
+  /** Revoke EVERY active share (link + user + org) from a folder — used by "Revoke & lock". */
+  revokeSharesForFolder(folderId: string): Promise<void> {
+    return invoke<void>("revoke_shares_for_folder", { folderId });
   }
 
   setAnthropicKey(key: string): Promise<void> {

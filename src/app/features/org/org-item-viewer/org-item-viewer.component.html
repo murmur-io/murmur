@@ -1,0 +1,34 @@
+<section class="org-item">
+  <button type="button" class="back" (click)="nav.back()">
+    <span class="back-arrow" aria-hidden="true">←</span>
+    <span>Back</span>
+  </button>
+
+  @if (loading()) {
+    <div class="oi-state card">
+      <p class="empty">Loading…</p>
+    </div>
+  } @else if (error(); as err) {
+    <div class="oi-state card">
+      <p class="empty-title">Couldn't load this item</p>
+      <p class="empty">{{ err }}</p>
+    </div>
+  } @else if (item(); as it) {
+    <article class="card oi-card">
+      <header class="oi-head">
+        <span class="oi-org-chip">
+          <span class="oi-org-dot" aria-hidden="true"></span>
+          Org Brain
+        </span>
+        <h1 class="oi-title">{{ it.title }}</h1>
+        <p class="oi-meta">
+          Shared by <strong>{{ it.authorHint }}</strong>
+          · {{ formatDate(it.createdAt) }}
+        </p>
+      </header>
+      <div class="oi-body">
+        <app-markdown [markdown]="it.markdown" />
+      </div>
+    </article>
+  }
+</section>
