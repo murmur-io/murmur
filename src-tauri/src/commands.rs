@@ -609,23 +609,32 @@ pub async fn start_recording(
             .ok()
             .flatten()
         };
-        // D1 (spec §4.3): while Realtime Reactions (Brain Live) is on, pin the LIVE tick to `small`
-        // when present — a large-v3 live tick alone can saturate the Metal GPU the light reasoner also
-        // needs. If `small` is NOT on disk, fall back to the configured model + warn (pinning to an
-        // absent file would kill the live loop). The post-call ACCURATE pass is unaffected.
-        let live_model = if cfg.brain_live {
-            match crate::transcribe::model::resolve_model_path(None, "small", lang) {
+        // T1.3 — the UNCONDITIONAL live-model pin (`live_model_pin`, default "small"): the LIVE
+        // caption tick decodes with the pinned SIZE whenever its file is downloaded, regardless
+        // of `model_size` — a `large-v3` live tick saturates the shared Metal GPU for the whole
+        // meeting (the heat complaint), while captions are throwaway (the post-Stop ACCURATE
+        // pass on the configured model is the authoritative transcript and is unaffected).
+        // `""` disables the pin → the configured model, with the LEGACY `brain_live` pin-to-small
+        // (D1, spec §4.3: the live tick must not starve the light reasoner) still applying — the
+        // full decision lives in `model::live_pin_size`. If the pinned model file is absent,
+        // fall back to the configured model + warn (pinning to an absent file would kill the
+        // live loop).
+        let live_model = match crate::transcribe::model::live_pin_size(
+            &cfg.live_model_pin,
+            cfg.brain_live,
+        ) {
+            Some(size) => match crate::transcribe::model::resolve_model_path(None, &size, lang) {
                 Ok(Some(p)) => Some(p),
                 _ => {
                     tracing::warn!(
                         target: "live",
-                        "reactions on but ggml-small absent; live tick uses the configured whisper model (may contend with the light reasoner)"
+                        pin = %size,
+                        "pinned live model absent; live tick uses the configured whisper model (may run hot / contend with the light reasoner)"
                     );
                     configured()
                 }
-            }
-        } else {
-            configured()
+            },
+            None => configured(),
         };
         if let Some(model_path) = live_model {
             crate::transcribe::live::spawn(app.clone(), model_path, cfg.language.clone());
@@ -6799,6 +6808,11 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         } else {
             d.model_size
         },
+        // T1.3/T1.4 (transcription heat): the live-model pin + live VAD gate are NOT carried on
+        // the settings DTO (no FE toggles yet) — PRESERVE the live values (the L3/L4-flag
+        // discipline), each round-tripping through its dedicated K_* load/save key.
+        live_model_pin: current.live_model_pin.clone(),
+        live_vad_gate: current.live_vad_gate,
         voice_trigger: d.voice_trigger,
         onboarded: d.onboarded,
         note_style: if d.note_style.trim().is_empty() {
@@ -11350,13 +11364,8 @@ pub fn restart_voice_listener(app: AppHandle) {
     if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
         l.stop();
     }
-    let (enabled, configured, size, language) = match state.config.lock() {
-        Ok(c) => (
-            c.voice_trigger,
-            c.whisper_model_path.clone(),
-            c.model_size.clone(),
-            c.language.clone(),
-        ),
+    let (enabled, language) = match state.config.lock() {
+        Ok(c) => (c.voice_trigger, c.language.clone()),
         Err(_) => return,
     };
     if !enabled {
@@ -11366,16 +11375,24 @@ pub fn restart_voice_listener(app: AppHandle) {
     if state.recorder.lock().map(|g| g.is_some()).unwrap_or(false) {
         return;
     }
-    let p = configured.as_deref().map(std::path::Path::new);
-    match crate::transcribe::resolve_model_path(p, &size, language.as_deref().unwrap_or("")) {
-        Ok(Some(model_path)) => {
+    // T1.3 — the standby wake listener decodes a ~2.2 s mic window every few seconds for the
+    // WHOLE time it is armed, so it must run the SMALLEST downloaded model (tiny → base →
+    // small, first present), NEVER the configured model (a medium/large standby decode is a
+    // continuous heat + RAM source). Wake-phrase matching needs rough text only. With none of
+    // the three small sizes downloaded the listener does not start (download `tiny`/`base`/
+    // `small` to enable it) — it never silently escalates to a big model.
+    match crate::transcribe::model::smallest_wake_model(language.as_deref().unwrap_or("")) {
+        Some(model_path) => {
             let listener =
                 crate::audio::listener::VoiceListener::start(app.clone(), model_path, language);
             if let Ok(mut g) = state.voice_listener.lock() {
                 *g = Some(listener);
             }
         }
-        _ => tracing::warn!(target: "voice", "voice trigger enabled but no Whisper model present"),
+        None => tracing::warn!(
+            target: "voice",
+            "voice trigger enabled but no tiny/base/small whisper model downloaded; listener not started"
+        ),
     }
 }
 

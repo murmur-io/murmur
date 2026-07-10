@@ -58,6 +58,36 @@ const BATCH_NO_SPEECH_THOLD: f32 = 0.6;
 /// whisper.cpp's own default; set explicitly to document that previous-text conditioning is ON.
 const BATCH_N_MAX_TEXT_CTX: i32 = 16384;
 
+// ── Fast (live) decoding constants ──
+
+/// Encoder audio context for the FAST (live) profile ONLY (T1.2). The live loop decodes a
+/// ~14 s rolling window, but whisper pads every input to a 30 s encoder pass (1500 frames) —
+/// pure waste. Right-size it: `(14/30)*1500 + 128 ≈ 828 → 832` (rounded UP to a multiple of
+/// 64 for Metal kernel alignment; > the 768 floor ggerganov calls quality-safe — his measured
+/// `(len/30)*1500+128` formula held WER on base.en at ~3.4× encoder speed). 832 frames cover
+/// ~16.6 s of audio per encoder pass, ≥ every Fast caller's window (live 14 s, voice-trigger
+/// ~2.2 s; a longer manual-capture window decodes in successive passes — whisper advances
+/// `seek` from the last decoded segment, so no audio is dropped). The ACCURATE batch profile
+/// MUST keep the full context (quality authority) — `audio_ctx_for` returns `None` there.
+/// CAVEAT (honest): Polish-neutrality of a reduced audio_ctx is only measured on base.en
+/// upstream — gate on the in-house A/B harness (`asr_ab_harness_from_env`).
+const LIVE_AUDIO_CTX: i32 = 832;
+
+// Compile-time invariants (clippy `assertions_on_constants` forbids these as runtime asserts):
+// a multiple of 64 (Metal kernel alignment) and above the 768 quality floor.
+const _: () = assert!(LIVE_AUDIO_CTX % 64 == 0 && LIVE_AUDIO_CTX > 768);
+
+/// Which encoder `audio_ctx` a [`TranscribeQuality`] profile sets: the Fast/live profile
+/// right-sizes to [`LIVE_AUDIO_CTX`]; the Accurate/batch profile sets NOTHING (whisper's full
+/// 30 s context — the quality authority is never truncated). Pure — the headless-testable seam
+/// for the profile contract (`FullParams` exposes no getter to assert on directly).
+fn audio_ctx_for(quality: TranscribeQuality) -> Option<i32> {
+    match quality {
+        TranscribeQuality::Fast => Some(LIVE_AUDIO_CTX),
+        TranscribeQuality::Accurate => None,
+    }
+}
+
 /// Wraps a loaded whisper.cpp model (Metal). Construct once; reuse per transcription.
 ///
 /// `WhisperContext` is `Send + Sync`, so a single `Transcriber` can live in shared state
@@ -96,7 +126,17 @@ impl Transcriber {
         // WhisperContext (and thus the Metal device).
         std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
 
-        let ctx = WhisperContext::new_with_params(path_str, WhisperContextParameters::default())
+        // FLASH ATTENTION ON (T1.1, 2026-07-09 transcription-performance plan): upstream
+        // whisper.cpp 1.8.3 defaults `flash_attn = true`; whisper-rs 0.16's Rust-side
+        // `WhisperContextParameters::default()` still carries the OLD `false` — silently
+        // overriding upstream. Measured upstream (PR #2152, M1 Pro Metal): encoder ~13–21%
+        // faster, decoder ~10–20%, at equal output on the tested sets. We don't use DTW token
+        // timestamps, so FA's DTW conflict is moot. CAVEAT (honest): one unconfirmed report of
+        // FA slightly changing Japanese output (whisper.cpp #3020) — Polish quality under FA is
+        // unpublished; gate any doubt on the in-house A/B harness (`asr_ab_harness_from_env`).
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.flash_attn(true);
+        let ctx = WhisperContext::new_with_params(path_str, ctx_params)
             .map_err(|e| AppError::Transcribe(format!("failed to load whisper model: {e}")))?;
 
         tracing::info!(target: "transcribe", model = %model_path.display(), "whisper model loaded");
@@ -253,8 +293,15 @@ fn build_params<'a>(quality: TranscribeQuality) -> FullParams<'a, 'a> {
         // overlapping windows every couple of seconds, so latency dominates — beam search +
         // a 6-rung temperature ladder would multiply the per-tick cost for output the user
         // only glances at. Quality is the batch path's job, NOT the live path's. Do NOT add
-        // beam search here.
-        TranscribeQuality::Fast => FullParams::new(SamplingStrategy::Greedy { best_of: 1 }),
+        // beam search here. `audio_ctx` is right-sized to the live window (see LIVE_AUDIO_CTX);
+        // the Accurate arm deliberately never sets it.
+        TranscribeQuality::Fast => {
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            if let Some(audio_ctx) = audio_ctx_for(quality) {
+                params.set_audio_ctx(audio_ctx);
+            }
+            params
+        }
 
         // BATCH (post-Stop authoritative transcript): the anti-hallucination + inflection
         // levers. Beam search explores multiple hypotheses (better wording/grammar — matters
@@ -363,5 +410,98 @@ mod tests {
         assert_eq!(BATCH_ENTROPY_THOLD, 2.4);
         assert_eq!(BATCH_LOGPROB_THOLD, -1.0);
         assert_eq!(BATCH_NO_SPEECH_THOLD, 0.6);
+    }
+
+    /// T1.2 — the profile contract: ONLY the Fast/live profile right-sizes the encoder
+    /// context; the Accurate batch authority keeps whisper's full 30 s context.
+    #[test]
+    fn fast_profile_sets_live_audio_ctx_accurate_does_not() {
+        assert_eq!(audio_ctx_for(TranscribeQuality::Fast), Some(832));
+        assert_eq!(audio_ctx_for(TranscribeQuality::Accurate), None);
+    }
+
+    /// T1.2 — the 832 derivation: `(14/30)*1500 + 128 ≈ 828`, rounded UP to a multiple of 64,
+    /// and above the 768 quality floor (ggerganov guidance).
+    #[test]
+    fn live_audio_ctx_is_aligned_and_above_the_quality_floor() {
+        // Alignment + quality-floor invariants live as a compile-time `const _: () = assert!(…)`
+        // beside LIVE_AUDIO_CTX (clippy assertions_on_constants). Here: the non-constant derivation.
+        let derived = (14.0_f64 / 30.0 * 1500.0 + 128.0).ceil() as i32; // 828
+        assert!(
+            LIVE_AUDIO_CTX >= derived && LIVE_AUDIO_CTX - derived < 64,
+            "832 is the next multiple of 64 above the derived {derived}"
+        );
+    }
+
+    /// T0.3 — env-driven A/B harness: decode the SAME WAV through TWO models at BOTH profiles
+    /// and print wall-clock per leg + write each transcript to a temp file for diffing. The
+    /// instrument behind every speed/Polish-quality claim of the 2026-07-09 transcription plan
+    /// (flash-attn, audio_ctx=832, quants, live pin): record a fixed ~10-min PL/EN WAV once,
+    /// then run e.g.
+    ///   MURMUR_ASR_AB_WAV=~/asr/meeting-16k.wav \
+    ///   MURMUR_ASR_AB_MODEL_A=~/Library/Application\ Support/MeetNotes/models/ggml-small.bin \
+    ///   MURMUR_ASR_AB_MODEL_B=.../ggml-large-v3-turbo-q8_0.bin \
+    ///   cargo test --lib asr_ab_harness_from_env -- --ignored --nocapture
+    /// PANICS NEVER: missing env / bad paths / decode failures print a message and return
+    /// (follows the `run_bakeoff_over_real_db_from_env` env-driven `#[ignore]` pattern, but
+    /// skip-soft). Needs a real Mac + loaded GGUFs — headless `cargo test` proves nothing here.
+    #[test]
+    #[ignore = "real A/B: needs MURMUR_ASR_AB_WAV + MURMUR_ASR_AB_MODEL_A/B on a Mac with Metal"]
+    fn asr_ab_harness_from_env() {
+        let Ok(wav) = std::env::var("MURMUR_ASR_AB_WAV") else {
+            eprintln!("SKIP: set MURMUR_ASR_AB_WAV to a 16 kHz mono WAV path");
+            return;
+        };
+        let Ok(model_a) = std::env::var("MURMUR_ASR_AB_MODEL_A") else {
+            eprintln!("SKIP: set MURMUR_ASR_AB_MODEL_A to a ggml model path");
+            return;
+        };
+        let Ok(model_b) = std::env::var("MURMUR_ASR_AB_MODEL_B") else {
+            eprintln!("SKIP: set MURMUR_ASR_AB_MODEL_B to a ggml model path");
+            return;
+        };
+        let lang = std::env::var("MURMUR_ASR_AB_LANG").ok();
+        let samples = match read_wav_16k_mono(Path::new(&wav)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: could not read WAV: {e}");
+                return;
+            }
+        };
+        eprintln!(
+            "A/B over {:.1}s of audio (lang={})",
+            samples.len() as f64 / 16_000.0,
+            lang.as_deref().unwrap_or("auto")
+        );
+        for (leg, model_path) in [("A", &model_a), ("B", &model_b)] {
+            let transcriber = match Transcriber::load(Path::new(model_path)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SKIP leg {leg}: model load failed: {e}");
+                    continue;
+                }
+            };
+            for quality in [TranscribeQuality::Fast, TranscribeQuality::Accurate] {
+                let started = std::time::Instant::now();
+                match transcriber.transcribe_with(&samples, lang.as_deref(), quality) {
+                    Ok(t) => {
+                        let wall = started.elapsed();
+                        let out = std::env::temp_dir()
+                            .join(format!("murmur-asr-ab-{leg}-{quality:?}.txt"));
+                        if let Err(e) = std::fs::write(&out, &t.full_text) {
+                            eprintln!("leg {leg} {quality:?}: transcript write failed: {e}");
+                        }
+                        eprintln!(
+                            "leg {leg} {quality:?}: wall {:.2}s, {} segments, {} chars → {}",
+                            wall.as_secs_f64(),
+                            t.segments.len(),
+                            t.full_text.chars().count(),
+                            out.display()
+                        );
+                    }
+                    Err(e) => eprintln!("leg {leg} {quality:?}: decode failed: {e}"),
+                }
+            }
+        }
     }
 }
