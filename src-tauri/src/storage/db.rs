@@ -4711,6 +4711,16 @@ impl Db {
         Ok(())
     }
 
+    /// The synced feed cursor (`org_state.last_seq`) for an org — the max `seq` ingested so far.
+    /// Returns 0 when the org is unknown/never synced. (Companion to Core's monotonic
+    /// [`Db::set_org_last_seq`].)
+    pub fn org_last_seq_for(&self, org_id: &str) -> Result<u64> {
+        Ok(self
+            .get_org_state(org_id)?
+            .map(|s| s.last_seq.max(0) as u64)
+            .unwrap_or(0))
+    }
+
     /// GATED-FREE (no folder lock applies to org items) semantic KNN over the int8 org partition:
     /// the top-`k` nearest `org_vec_chunks` for the int8-quantized `query_vec`, joined to their
     /// (non-tombstoned) items, deduped to one hit per item (nearest). `query_vec` is the member's OWN
