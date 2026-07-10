@@ -102,6 +102,15 @@ export class SettingsOrganizationSectionComponent {
       } else {
         this._members.set([]);
       }
+      // On-open responsiveness: pull the org feed once (best-effort) so a freshly-joined member sees
+      // teammates' items right away instead of waiting for the next background sync tick. The periodic
+      // backend loop keeps it fresh thereafter; this only covers the "just opened Settings" moment.
+      if (st) {
+        void this.ipc
+          .orgSyncNow()
+          .then(async () => this._status.set(await this.ipc.orgStatus()))
+          .catch(() => undefined);
+      }
     } catch (e) {
       this._error.set(String(e));
     } finally {

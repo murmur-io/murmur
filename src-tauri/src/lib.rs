@@ -505,6 +505,30 @@ pub fn run() {
                     }
                 });
             }
+            // M6 Shared Brain — the background org-feed sync loop. Each tick best-effort (a) drains the
+            // OUTBOUND org-share queue (offline-failed publishes + pending revokes) and (b) pulls +
+            // ingests the INBOUND org feed into the local int8 partition, so every member's brain stays
+            // fresh for Ask/MCP WITHOUT opening Settings — the "replicated brain" contract. Mirrors the
+            // memory/brief loops: re-reads live AppState each tick via `try_state`, gates to a cheap
+            // no-op when logged out / no org joined, first tick a short delay after launch.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        crate::commands::ORG_SYNC_FIRST_DELAY_SECS,
+                    ))
+                    .await;
+                    loop {
+                        if let Some(state) = handle.try_state::<AppState>() {
+                            crate::commands::org_background_sync_tick(state.inner()).await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::commands::ORG_SYNC_TICK_SECS,
+                        ))
+                        .await;
+                    }
+                });
+            }
             // Screen-share auto-relock watcher: on capture START, relock all session-unlocked
             // folders + zeroize the KEK and toast the UI. Gated by K_RELOCK_ON_SCREENSHARE.
             crate::screenshare::spawn(app.handle().clone());
