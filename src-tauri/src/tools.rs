@@ -73,7 +73,12 @@ impl AssistantScope {
             "get_open_commitments",
             "get_entity_dossier",
         ];
-        const CONNECTORS: [&str; 4] = ["web_search", "calendar_lookup", "jira_search", "slack_search"];
+        const CONNECTORS: [&str; 4] = [
+            "web_search",
+            "calendar_lookup",
+            "jira_search",
+            "slack_search",
+        ];
         match self {
             // Tier 1 reaches NEITHER vault reads NOR connectors — it answers from injected
             // current-meeting content only. (propose_note / writes still pass the tier gate; the
@@ -300,6 +305,12 @@ pub fn execute_tool(
     match call {
         ToolCall::SearchMeetings { query } => {
             let q = query.as_str();
+            // Brain v2 L1.5 — time-aware expansion: a temporal phrase in the query ("last week",
+            // "zeszłego tygodnia") becomes a `started_at` window on the meeting leg. The query
+            // text itself is NOT stripped (BM25 tolerates the extra tokens). Query-time `now` is
+            // the correct anchor here (the user means THEIR last week).
+            let date_filter =
+                crate::summarize::temporal::extract_date_filter(q, chrono::Utc::now().date_naive());
             // Documents/brain notes ride the SAME fan-out — the gated keyword (FTS/BM25) doc leg
             // works WITHOUT the e5 model, so ingested content is reachable through the primary
             // search tool on a default install. `search_doc_chunks_fts_visible` applies the SAME
@@ -307,7 +318,7 @@ pub fn execute_tool(
             let docs = db
                 .search_doc_chunks_fts_visible(q, 20, unlocked)
                 .unwrap_or_default();
-            match db.search_visible(q, 20, unlocked) {
+            match db.search_visible_in_range(q, 20, unlocked, date_filter) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
                 }
@@ -317,13 +328,17 @@ pub fn execute_tool(
         }
         ToolCall::SearchSemantic { query } => {
             let q = query.as_str();
+            // Brain v2 L1.5 — the same time-aware window as `search_meetings` (all legs of the
+            // hybrid query apply it).
+            let date_filter =
+                crate::summarize::temporal::extract_date_filter(q, chrono::Utc::now().date_naive());
             // GATE: the master flag lives in the (whole-DB-encrypted) settings table. When OFF,
             // DEGRADE HONESTLY to gated keyword (BM25) matching — never an ungated read, and no
             // `vec_chunks`/`doc_vec_chunks` row is ever touched (no stub-vector KNN). The output is
             // labelled as keyword matching so the model is never told a semantic search ran.
             if !config.semantic_search_enabled {
                 let hits = db
-                    .search_visible(q, 20, unlocked)
+                    .search_visible_in_range(q, 20, unlocked, date_filter)
                     .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
                 let docs = db
                     .search_doc_chunks_fts_visible(q, 20, unlocked)
@@ -357,7 +372,7 @@ pub fn execute_tool(
                 .search_doc_chunks_fts_visible(q, 20, unlocked)
                 .unwrap_or_default();
             let docs = crate::embed::fuse_doc_hits(knn_docs, fts_docs);
-            match db.search_hybrid_visible(q, &query_vec, 20, unlocked) {
+            match db.search_hybrid_visible(q, &query_vec, 20, unlocked, date_filter) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
                 }
@@ -863,11 +878,15 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             },
             "jira_search" => match self.app {
                 Some(_) => block_on_tool(execute_jira_search(&s("query"), self.config)),
-                None => Err(AppError::InvalidArg("jira_search needs an AppHandle".into())),
+                None => Err(AppError::InvalidArg(
+                    "jira_search needs an AppHandle".into(),
+                )),
             },
             "slack_search" => match self.app {
                 Some(_) => block_on_tool(execute_slack_search(&s("query"), self.config)),
-                None => Err(AppError::InvalidArg("slack_search needs an AppHandle".into())),
+                None => Err(AppError::InvalidArg(
+                    "slack_search needs an AppHandle".into(),
+                )),
             },
             // ── PROPOSE (always-on, NO DB side effect): the model signals the user asked for a note.
             //    Records the draft in interior-mutable scratch; the caller threads it onto the result so
@@ -1075,7 +1094,9 @@ mod tests {
         let nothing = HashSet::new();
         let cfg = AppConfig::default();
         let res = execute_tool(
-            &ToolCall::JiraSearch { query: "login bug".into() },
+            &ToolCall::JiraSearch {
+                query: "login bug".into(),
+            },
             &db,
             &nothing,
             &cfg,
@@ -1092,7 +1113,10 @@ mod tests {
     fn jira_search_fail_closed_returns_sentinel_no_egress() {
         let cfg = AppConfig::default(); // jira disabled + unconsented
         let out = block_on(execute_jira_search("login bug", &cfg)).unwrap();
-        assert!(out.contains("not available"), "fail-closed sentinel, no egress: {out}");
+        assert!(
+            out.contains("not available"),
+            "fail-closed sentinel, no egress: {out}"
+        );
     }
 
     /// EGRESS GUARD: the synchronous, egress-free `execute_tool` MUST refuse a `SlackSearch` — like
@@ -1103,7 +1127,9 @@ mod tests {
         let nothing = HashSet::new();
         let cfg = AppConfig::default();
         let res = execute_tool(
-            &ToolCall::SlackSearch { query: "raport".into() },
+            &ToolCall::SlackSearch {
+                query: "raport".into(),
+            },
             &db,
             &nothing,
             &cfg,
@@ -1120,7 +1146,10 @@ mod tests {
     fn slack_search_fail_closed_returns_sentinel_no_egress() {
         let cfg = AppConfig::default(); // slack disabled + unconsented
         let out = block_on(execute_slack_search("raport", &cfg)).unwrap();
-        assert!(out.contains("not available"), "fail-closed sentinel, no egress: {out}");
+        assert!(
+            out.contains("not available"),
+            "fail-closed sentinel, no egress: {out}"
+        );
     }
 
     /// LOUD: calendar hits render with their `[calendar]` source label + the bounded context block,
@@ -1695,7 +1724,10 @@ mod tests {
         let cfg = AppConfig::default();
         let unlocked = Mutex::new(HashSet::new());
         let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::CurrentMeeting);
-        let res = exec.run("search_meetings", &serde_json::json!({ "query": "anything" }));
+        let res = exec.run(
+            "search_meetings",
+            &serde_json::json!({ "query": "anything" }),
+        );
         assert!(
             matches!(res, Err(AppError::InvalidArg(_))),
             "Tier 1 must REFUSE search_meetings (structural, not prompt-trust): {res:?}"
@@ -1721,7 +1753,12 @@ mod tests {
             names.contains(&"search_meetings") && names.contains(&"get_meeting"),
             "Tier 2 advertises the owned-vault reads: {names:?}"
         );
-        for connector in ["web_search", "jira_search", "slack_search", "calendar_lookup"] {
+        for connector in [
+            "web_search",
+            "jira_search",
+            "slack_search",
+            "calendar_lookup",
+        ] {
             assert!(
                 !names.contains(&connector),
                 "Tier 2 must NOT advertise the connector {connector}: {names:?}"

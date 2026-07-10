@@ -3,11 +3,20 @@
 //!
 //! ## Modes
 //!
-//! - **FTS** — `Db::search_visible(query)` → the meeting ids in BM25 order.
+//! - **FTS** — `Db::search_visible_in_range(query, …, temporal-window)` → the meeting ids in BM25
+//!   order (with the Brain v2 L1.5 date filter + temporal window fallback, exactly as the
+//!   `search_meetings` tool queries it).
 //! - **Semantic** — embed the query (asymmetric `embed_query`), then
 //!   `Db::search_semantic_visible(query_vec)` → the meeting ids in vector-distance order.
-//! - **Hybrid** — RRF-fuse the FTS and semantic id lists via [`crate::embed::rrf_fuse`] (the same
-//!   fusion the app uses for documents) → the fused meeting-id order.
+//! - **Hybrid** — the REAL `Db::search_hybrid_visible` (Brain v2 L1.3 score fusion over the
+//!   FTS ∪ topic-FTS, KNN ∪ topic-KNN, and entity-graph legs, plus the L1.5 date filter) — the
+//!   bake-off measures the retrieval the app actually ships, not a local re-implementation.
+//! - **Reranked** (optional) — hybrid + a [`crate::rerank::Reranker`] pass over the top
+//!   [`crate::rerank::RERANK_TOP_K`] candidates (Brain v2 L1.4).
+//!
+//! `today` is an EXPLICIT parameter (never `now()`): the synthetic runner passes the FIXED
+//! [`crate::eval::corpus::CORPUS_ANCHOR_DATE`] so temporal gold labels never rot; the real-vault
+//! runner passes the actual date.
 //!
 //! ## Gating (read the lock-model note in `mod.rs`)
 //!
@@ -25,16 +34,27 @@
 
 use std::collections::HashSet;
 
-use crate::embed::{rrf_fuse, Embedder, RRF_K};
+use crate::embed::Embedder;
 use crate::error::{AppError, Result};
 use crate::eval::{aggregate_metrics, BakeoffReport, LabeledSet, ModeMetrics, RetrievalMode};
+use crate::rerank::Reranker;
+use crate::storage::models::SearchHit;
 use crate::storage::Db;
+use crate::summarize::temporal::extract_date_filter;
 
-/// Retrieve the FTS meeting-id ranking for one query (BM25 order, deduped, visibility-gated).
-fn fts_ranked(db: &Db, query: &str, k: usize, unlocked: &HashSet<String>) -> Result<Vec<String>> {
+/// Retrieve the FTS meeting-id ranking for one query (BM25 order, deduped, visibility-gated),
+/// with the L1.5 temporal window — exactly the `search_meetings` tool path.
+fn fts_ranked(
+    db: &Db,
+    query: &str,
+    k: usize,
+    unlocked: &HashSet<String>,
+    today: chrono::NaiveDate,
+) -> Result<Vec<String>> {
     // Fetch a few extra candidates so the top-k cutoff is applied to a full list, not a truncated one.
     let limit = (k.max(1) * 4) as i64;
-    let hits = db.search_visible(query, limit, unlocked)?;
+    let date_filter = extract_date_filter(query, today);
+    let hits = db.search_visible_in_range(query, limit, unlocked, date_filter)?;
     Ok(hits.into_iter().map(|h| h.meeting.id).collect())
 }
 
@@ -62,25 +82,63 @@ fn semantic_ranked(
     Ok(hits.into_iter().map(|h| h.meeting.id).collect())
 }
 
-/// RRF-fuse the FTS and semantic rankings into one meeting-id order (the hybrid leg). Either list may
-/// be empty; RRF over the remaining one preserves its order. Uses the app's [`RRF_K`].
-fn hybrid_ranked(fts: &[String], semantic: &[String]) -> Vec<String> {
-    let fused = rrf_fuse(&[fts.to_vec(), semantic.to_vec()], RRF_K);
-    fused.into_iter().map(|(id, _score)| id).collect()
+/// The REAL hybrid retrieval, as shipped: `Db::search_hybrid_visible` (score fusion over
+/// FTS ∪ topic-FTS, KNN ∪ topic-KNN, entity graph) with the L1.5 temporal window.
+fn hybrid_hits(
+    db: &Db,
+    embedder: &dyn Embedder,
+    query: &str,
+    k: usize,
+    unlocked: &HashSet<String>,
+    today: chrono::NaiveDate,
+) -> Result<Vec<SearchHit>> {
+    let query_vec = embedder
+        .embed_query(&[query.to_string()])?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let date_filter = extract_date_filter(query, today);
+    db.search_hybrid_visible(
+        query,
+        &query_vec,
+        (k.max(1) * 4) as i64,
+        unlocked,
+        date_filter,
+    )
 }
 
-/// Run the full bake-off over `set` at cutoff `k`, returning per-mode averaged metrics.
-///
-/// For each labeled query we compute the three rankings, then average recall@k / nDCG@k / MRR across
-/// the set per mode. READ-ONLY + visibility-gated (see the module note). `k` is clamped to `>= 1`.
-/// A meaningful semantic/hybrid result requires a REAL embedder + an indexed vault; with the stub or
-/// an empty index the semantic leg is uninformative (documented, not an error).
+/// Run the full bake-off over `set` at cutoff `k`, returning per-mode averaged metrics
+/// (fts / semantic / hybrid). Delegates to [`run_bakeoff_with_rerank`] with no reranker.
 pub fn run_bakeoff(
     db: &Db,
     embedder: &dyn Embedder,
     set: &LabeledSet,
     k: usize,
     unlocked: &HashSet<String>,
+    today: chrono::NaiveDate,
+) -> Result<BakeoffReport> {
+    run_bakeoff_with_rerank(db, embedder, None, set, k, unlocked, today)
+}
+
+/// Run the full bake-off over `set` at cutoff `k`, returning per-mode averaged metrics.
+///
+/// For each labeled query we compute the rankings, then average recall@k / nDCG@k / MRR across
+/// the set per mode. READ-ONLY + visibility-gated (see the module note). `k` is clamped to `>= 1`.
+/// A meaningful semantic/hybrid result requires a REAL embedder + an indexed vault; with the stub or
+/// an empty index the semantic leg is uninformative (documented, not an error).
+///
+/// `reranker`: `Some` adds the fourth `hybrid+rerank` mode — the hybrid ranking's top
+/// [`crate::rerank::RERANK_TOP_K`] candidates reordered by the reranker (candidate text =
+/// title + snippet, exactly the Ask wiring in `vault_context`). Pass the PROMPTED reranker only
+/// when a real local model is resident; a stub reranker would measure the identity.
+pub fn run_bakeoff_with_rerank(
+    db: &Db,
+    embedder: &dyn Embedder,
+    reranker: Option<&dyn Reranker>,
+    set: &LabeledSet,
+    k: usize,
+    unlocked: &HashSet<String>,
+    today: chrono::NaiveDate,
 ) -> Result<BakeoffReport> {
     let k = k.max(1);
     if set.is_empty() {
@@ -92,21 +150,33 @@ pub fn run_bakeoff(
     let mut fts_rankings: Vec<Vec<String>> = Vec::with_capacity(set.len());
     let mut sem_rankings: Vec<Vec<String>> = Vec::with_capacity(set.len());
     let mut hyb_rankings: Vec<Vec<String>> = Vec::with_capacity(set.len());
+    let mut rr_rankings: Vec<Vec<String>> = Vec::with_capacity(set.len());
 
     for q in &set.0 {
-        let fts = fts_ranked(db, &q.query, k, unlocked)?;
+        let fts = fts_ranked(db, &q.query, k, unlocked, today)?;
         let sem = semantic_ranked(db, embedder, &q.query, k, unlocked)?;
-        let hyb = hybrid_ranked(&fts, &sem);
+        let hyb = hybrid_hits(db, embedder, &q.query, k, unlocked, today)?;
+        if let Some(rr) = reranker {
+            rr_rankings.push(rerank_hits(rr, &q.query, &hyb));
+        }
         fts_rankings.push(fts);
         sem_rankings.push(sem);
-        hyb_rankings.push(hyb);
+        hyb_rankings.push(hyb.into_iter().map(|h| h.meeting.id).collect());
     }
 
-    let modes: Vec<ModeMetrics> = vec![
+    let mut modes: Vec<ModeMetrics> = vec![
         aggregate_metrics(RetrievalMode::Fts, set, &fts_rankings, k),
         aggregate_metrics(RetrievalMode::Semantic, set, &sem_rankings, k),
         aggregate_metrics(RetrievalMode::Hybrid, set, &hyb_rankings, k),
     ];
+    if reranker.is_some() {
+        modes.push(aggregate_metrics(
+            RetrievalMode::Reranked,
+            set,
+            &rr_rankings,
+            k,
+        ));
+    }
 
     Ok(BakeoffReport {
         k,
@@ -115,43 +185,82 @@ pub fn run_bakeoff(
     })
 }
 
+/// Reorder a hybrid hit list's top [`crate::rerank::RERANK_TOP_K`] via `reranker` — the same
+/// candidate shape (`id`, `title\nsnippet`) and degrade-safety as the Ask wiring in
+/// `vault_context::build_vault_context_hybrid_visible`.
+fn rerank_hits(reranker: &dyn Reranker, query: &str, hits: &[SearchHit]) -> Vec<String> {
+    let ids: Vec<String> = hits.iter().map(|h| h.meeting.id.clone()).collect();
+    let k = crate::rerank::RERANK_TOP_K.min(hits.len());
+    if k < 2 {
+        return ids;
+    }
+    let candidates: Vec<(String, String)> = hits[..k]
+        .iter()
+        .map(|h| {
+            let title = h.meeting.title.clone().unwrap_or_default();
+            (h.meeting.id.clone(), format!("{title}\n{}", h.snippet))
+        })
+        .collect();
+    let order = reranker.rerank(query, &candidates, crate::rerank::RERANK_TIMEOUT_MS);
+    let mut head: Vec<String> = Vec::with_capacity(k);
+    let mut pool: Vec<String> = ids[..k].to_vec();
+    for id in order {
+        if let Some(pos) = pool.iter().position(|x| *x == id) {
+            head.push(pool.remove(pos));
+        }
+    }
+    head.extend(pool);
+    head.extend_from_slice(&ids[k..]);
+    head
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn hybrid_ranked_fuses_both_legs() {
-        // m2 appears in both legs (high in each) → should outrank m1/m3 (each in only one leg).
-        let fts = vec!["m1".to_string(), "m2".to_string()];
-        let sem = vec!["m3".to_string(), "m2".to_string(), "m1".to_string()];
-        let fused = hybrid_ranked(&fts, &sem);
-        let pos = |id: &str| fused.iter().position(|x| x == id).unwrap();
-        assert!(
-            pos("m2") < pos("m3"),
-            "m2 (both legs) must outrank m3 (one leg)"
-        );
-        assert!(
-            pos("m1") < pos("m3"),
-            "m1 (both legs) must outrank m3 (one leg)"
-        );
-        // Dedup: every id appears once.
-        assert_eq!(fused.len(), 3);
+    /// The fixed anchor the synthetic corpus + labeled set were authored against.
+    fn anchor_date() -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(crate::eval::corpus::CORPUS_ANCHOR_DATE, "%Y-%m-%d")
+            .expect("valid corpus anchor")
     }
 
     #[test]
-    fn hybrid_ranked_handles_empty_leg() {
-        // Semantic leg empty (e.g. no model / punctuation query) → hybrid preserves the FTS order.
-        let fts = vec!["a".to_string(), "b".to_string()];
-        let fused = hybrid_ranked(&fts, &[]);
-        assert_eq!(fused, vec!["a".to_string(), "b".to_string()]);
-        // FTS leg empty → hybrid preserves the semantic order.
-        let sem = vec!["x".to_string(), "y".to_string()];
-        assert_eq!(
-            hybrid_ranked(&[], &sem),
-            vec!["x".to_string(), "y".to_string()]
-        );
-        // Both empty → empty.
-        assert!(hybrid_ranked(&[], &[]).is_empty());
+    fn rerank_hits_reorders_topk_and_keeps_tail() {
+        // A reranker that reverses the candidate order; ids beyond RERANK_TOP_K must keep their
+        // positions, and a reranker that "loses" an id must not drop it (degrade-safety).
+        struct Reverser;
+        impl crate::rerank::Reranker for Reverser {
+            fn id(&self) -> &str {
+                "rev-test"
+            }
+            fn rerank(&self, _q: &str, candidates: &[(String, String)], _t: u64) -> Vec<String> {
+                let mut ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+                ids.reverse();
+                ids.pop(); // "lose" one id — rerank_hits must restore it.
+                ids
+            }
+        }
+        let mk = |id: &str| SearchHit {
+            meeting: crate::storage::models::Meeting {
+                id: id.to_string(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                ended_at: None,
+                title: Some(id.to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: crate::storage::models::MeetingStatus::Summarized,
+                folder_id: None,
+            },
+            snippet: String::new(),
+            matched_in: "note".to_string(),
+        };
+        let hits: Vec<SearchHit> = (0..12).map(|i| mk(&format!("m{i}"))).collect();
+        let out = rerank_hits(&Reverser, "q", &hits);
+        assert_eq!(out.len(), 12, "no id may be dropped");
+        // Top-10 reversed (m9..m1), the lost m0 re-appended, then the untouched tail m10, m11.
+        assert_eq!(out[0], "m9");
+        assert_eq!(out[9], "m0", "an id the reranker lost must be restored");
+        assert_eq!(&out[10..], &["m10", "m11"]);
     }
 
     #[test]
@@ -161,7 +270,7 @@ mod tests {
         let set = LabeledSet(vec![]);
         let db = throwaway_db("bakeoff-empty");
         let stub = crate::embed::StubEmbedder;
-        let err = run_bakeoff(&db, &stub, &set, 5, &HashSet::new()).unwrap_err();
+        let err = run_bakeoff(&db, &stub, &set, 5, &HashSet::new(), anchor_date()).unwrap_err();
         assert!(matches!(err, AppError::InvalidArg(_)));
     }
 
@@ -178,7 +287,7 @@ mod tests {
             lang: "en".to_string(),
             expected_meeting_ids: vec!["m-nonexistent".to_string()],
         }]);
-        let report = run_bakeoff(&db, &stub, &set, 5, &HashSet::new()).unwrap();
+        let report = run_bakeoff(&db, &stub, &set, 5, &HashSet::new(), anchor_date()).unwrap();
         assert_eq!(report.modes.len(), 3, "all three modes must be reported");
         assert_eq!(report.k, 5);
         assert_eq!(report.queries, 1);
@@ -232,7 +341,19 @@ mod tests {
         let embedder = crate::embed::active_embedder();
         // Empty unlocked set = eval OPEN content only. To include a sealed folder, unlock it in the
         // app and copy the WAL'd DB, or extend this to accept a folder-id list.
-        let report = run_bakeoff(&db, embedder.as_ref(), &set, k, &HashSet::new()).unwrap();
+        // Real vault ⇒ the REAL query-time anchor (the labeled set is authored against it).
+        let today = chrono::Utc::now().date_naive();
+        let reranker = local_reranker_or_note();
+        let report = run_bakeoff_with_rerank(
+            &db,
+            embedder.as_ref(),
+            reranker.as_deref(),
+            &set,
+            k,
+            &HashSet::new(),
+            today,
+        )
+        .unwrap();
         println!("\n{}", crate::eval::format_report_table(&report));
 
         // Spec §L1.6: honor MURMUR_BAKEOFF_OUT — write the committed markdown artifact. The corpus
@@ -275,7 +396,19 @@ mod tests {
 
         let set = LabeledSet::from_json(include_str!("fixtures/rag-bakeoff-synthetic.json"))
             .expect("parse synthetic labeled set");
-        let report = run_bakeoff(&db, embedder.as_ref(), &set, 5, &HashSet::new()).unwrap();
+        // The FIXED anchor (never now()) — the temporal gold labels are authored against it.
+        let today = anchor_date();
+        let reranker = local_reranker_or_note();
+        let report = run_bakeoff_with_rerank(
+            &db,
+            embedder.as_ref(),
+            reranker.as_deref(),
+            &set,
+            5,
+            &HashSet::new(),
+            today,
+        )
+        .unwrap();
 
         let ctx = crate::eval::ReportContext {
             date: today_utc(),
@@ -286,7 +419,13 @@ mod tests {
                 crate::eval::corpus::CORPUS_ANCHOR_DATE
             ),
             labeled_set: "src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json".to_string(),
-            config: format!("RRF_K={}", crate::embed::RRF_K),
+            config: format!(
+                "score_fuse {}/{}/{} + topic legs + temporal filter (RRF_K={} fallback)",
+                crate::embed::SCORE_FUSE_W_FTS,
+                crate::embed::SCORE_FUSE_W_KNN,
+                crate::embed::SCORE_FUSE_W_GRAPH,
+                crate::embed::RRF_K
+            ),
             embedder_id: crate::embed::selected_embed_model().id.to_string(),
             embedder_real: real,
         };
@@ -309,8 +448,8 @@ mod tests {
         let set =
             LabeledSet::from_json(include_str!("fixtures/rag-bakeoff-synthetic.json")).unwrap();
         assert_eq!(set.len(), 20);
-        let report = run_bakeoff(&db, &stub, &set, 5, &HashSet::new()).unwrap();
-        assert_eq!(report.modes.len(), 3, "no reranker yet — exactly 3 rows");
+        let report = run_bakeoff(&db, &stub, &set, 5, &HashSet::new(), anchor_date()).unwrap();
+        assert_eq!(report.modes.len(), 3, "no reranker passed — exactly 3 rows");
         let fts = report
             .modes
             .iter()
@@ -334,6 +473,27 @@ mod tests {
         let md = crate::eval::format_report_markdown(&report, &ctx);
         assert!(md.contains("| fts |") && md.contains("| semantic |") && md.contains("| hybrid |"));
         assert!(md.contains("WARNING — STUB EMBEDDER"));
+    }
+
+    /// Resolve the PROMPTED reranker over the LOCAL brain model when one is on disk, else `None`
+    /// (a stub reranker would measure the identity — the row is skipped with a printed note).
+    /// Test-only helper shared by both `#[ignore]` runners.
+    fn local_reranker_or_note() -> Option<Box<dyn crate::rerank::Reranker>> {
+        let cfg = crate::settings::AppConfig {
+            brain_backend: crate::settings::BrainBackend::Local,
+            ..Default::default()
+        };
+        let reranker = crate::rerank::active_reranker(std::sync::Arc::from(
+            crate::reason::active_reasoner(&cfg),
+        ));
+        if reranker.id() == "stub" {
+            eprintln!(
+                "NOTE: no local brain model on disk — the hybrid+rerank row is SKIPPED \
+                 (a stub reranker is the identity and would measure nothing)."
+            );
+            return None;
+        }
+        Some(reranker)
     }
 
     /// Write the artifact to `$MURMUR_BAKEOFF_OUT` when set (creating parent dirs). Test-only

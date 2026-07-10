@@ -18,6 +18,7 @@ pub mod orchestrate;
 pub mod pipeline;
 pub mod proactive;
 pub mod reason;
+pub mod rerank;
 pub mod screenshare;
 pub mod secrets;
 pub mod settings;
@@ -367,6 +368,38 @@ pub fn run() {
                     // reasoner-dispatch poison posture (unreadable config never relaxes auth).
                     .unwrap_or(true);
                 crate::mcp::spawn(db_path, unlocked, require_token);
+            }
+            // Brain v2 L1.1 — TOPIC-CHUNK startup backfill: index topic segments for every VISIBLE
+            // meeting that has a transcript, content-hash idempotent (an already-indexed vault is a
+            // cheap probe pass), in batches of 20 on a blocking worker so setup never stalls.
+            // Skipped entirely when the real embed model is absent (the no-stub-vector-at-rest
+            // invariant) — the default install writes nothing.
+            {
+                let state = app.state::<AppState>();
+                let db = state.db.clone();
+                // Respect the feature flag: with semantic search OFF the pipeline never
+                // auto-indexes, so the backfill must not write topic plaintext either
+                // (flag discipline — same posture as `should_auto_index`).
+                let semantic_enabled = state
+                    .config
+                    .lock()
+                    .map(|c| c.semantic_search_enabled)
+                    .unwrap_or(false);
+                tauri::async_runtime::spawn_blocking(move || {
+                    if !semantic_enabled || !crate::embed::embed_model_present() {
+                        return;
+                    }
+                    let embedder = crate::embed::active_embedder();
+                    match db.backfill_topic_chunks_idempotent(embedder.as_ref()) {
+                        Ok(indexed) if indexed > 0 => {
+                            tracing::info!(target: "rag", indexed, "topic-chunk backfill complete");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(target: "rag", error = %e, "topic-chunk backfill failed");
+                        }
+                    }
+                });
             }
             // Screen-share auto-relock watcher: on capture START, relock all session-unlocked
             // folders + zeroize the KEK and toast the UI. Gated by K_RELOCK_ON_SCREENSHARE.
