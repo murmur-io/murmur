@@ -484,6 +484,7 @@ mod tests {
     fn local_reranker_or_note() -> Option<Box<dyn crate::rerank::Reranker>> {
         let cfg = crate::settings::AppConfig {
             brain_backend: crate::settings::BrainBackend::Local,
+            brain_model_id: std::env::var("MURMUR_BAKEOFF_LIGHT_ID").ok(),
             ..Default::default()
         };
         let reranker = crate::rerank::active_reranker(std::sync::Arc::from(
