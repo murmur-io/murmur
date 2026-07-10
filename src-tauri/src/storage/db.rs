@@ -4855,6 +4855,25 @@ impl Db {
         Ok(n.max(0) as u64)
     }
 
+    /// Every non-null `content_sha256` from the local `org_shares` rows (across all orgs the user has
+    /// shared into) — the SELF-SHARE dedup key set. A retrieval hit whose hash is in this set is the
+    /// caller's OWN published item and is relabelled/dropped so a member never sees their own share
+    /// echoed back as an "org" result. Content-free (opaque hashes only).
+    pub fn all_org_shared_content_hashes(&self) -> Result<Vec<Vec<u8>>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT content_sha256 FROM org_shares WHERE content_sha256 IS NOT NULL")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// LIVE org item ids that still LACK any int8 vector (chunks present but no `org_vec_chunks`) —
     /// the re-embed backlog once a real embedder appears on a member that ingested FTS-only. Bounded
     /// by `limit`. Empty when every live item is already embedded (or FTS-only with no chunks).
