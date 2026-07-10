@@ -21364,6 +21364,20 @@ pub struct OrgShareEntry {
 /// the owner path; the recipient pins it on first grant open. Uses the account fingerprint namespace
 /// consistent with mode-B (`key_fingerprint`).
 ///
+/// The AAD item nonce that binds an org envelope's ciphertext — the LOWERCASE-HEX of the plaintext
+/// `content_sha256`. DETERMINISTIC + shared across members: the publisher derives it from the
+/// envelope it seals, and every consumer derives the SAME value from the feed's `content_sha256`
+/// (which Core populates with the PLAINTEXT hash). This is what makes a cross-member `open_org_envelope`
+/// succeed — the server's assigned `item_id` is NOT known to the publisher at seal time, so it can't
+/// be the nonce. Collision-resistant per content (SHA-256) so the anti-replay AAD binding holds.
+fn org_item_nonce(content_sha256: &[u8]) -> String {
+    let mut s = String::with_capacity(content_sha256.len() * 2);
+    for b in content_sha256 {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// A display label for `author_hint` in the OrgEnvelope — the email local-part, NEVER note content.
 fn org_author_hint(email: &str) -> String {
     let e = email.trim();
@@ -22063,9 +22077,16 @@ pub(crate) async fn share_to_org_inner(
 
     // (5) Seal under the OCK + LOCAL OPEN-VERIFY (the egress verify-before-destroy — publish only a
     // blob we just proved we can decrypt back).
+    //
+    // AAD ITEM NONCE = hex(content_sha256_of_plaintext), NOT the local row_id: the server assigns its
+    // OWN item_id on publish (the client never controls it), so a per-publish LOCAL id would be
+    // unknowable to any OTHER member syncing the feed → they could never open the cell. The content
+    // hash is deterministic + rides the feed (`OrgItemEntry.content_sha256`), so every member
+    // reconstructs the SAME AAD. (2026-07-10 cross-slice fix — see org_sync_now's open side.)
     let ock = acquire_org_ock(state, &org.org_id, generation).await?;
+    let item_nonce = org_item_nonce(&content_sha);
     let (ciphertext, _sha) =
-        match crate::share::org_envelope::seal_org_envelope(&ock, &env, &org.org_id, &row_id) {
+        match crate::share::org_envelope::seal_org_envelope(&ock, &env, &org.org_id, &item_nonce) {
             Ok(v) => v,
             Err(e) => {
                 state.db.set_org_share_failed(&row_id, "seal_failed", &now)?;
@@ -22238,6 +22259,243 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
     }
 
     Ok(advanced)
+}
+
+/// `org_sync_now()` — pull the org feed from the last synced cursor, OPEN each ciphertext blob with
+/// the (RAM-cached / grant-unwrapped) OCK, and INGEST it into the local decrypted replica + int8
+/// retrieval partition. A TOMBSTONE evicts the item's chunks/vectors/FTS. Returns a content-free
+/// [`OrgSyncReport`] (counts + `fts_only` + per-item error strings). Best-effort per item: a single
+/// item whose OCK is unavailable / whose blob won't open is SKIPPED (recorded in `errors`), never
+/// crashing the whole sync — the cursor still advances past a tombstone but STOPS at the first
+/// un-openable LIVE item so a transient key gap is retried next sync (no silent skip-forward).
+#[tauri::command]
+pub async fn org_sync_now(
+    state: State<'_, AppState>,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    org_sync_now_inner(state.inner()).await
+}
+
+/// Server feed page size per `org_feed` request. The loop pages until the feed is drained.
+const ORG_FEED_PAGE: u32 = 200;
+
+pub(crate) async fn org_sync_now_inner(
+    state: &AppState,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    let mut report = crate::storage::models::OrgSyncReport::default();
+
+    // No org joined ⇒ nothing to sync (not an error).
+    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+        return Ok(report);
+    };
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(report);
+    }
+    // Logged out ⇒ best-effort no-op (the FE surfaces "sign in to sync").
+    let access = match valid_access_token(state).await {
+        Ok(a) => a,
+        Err(_) => return Ok(report),
+    };
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // Whether THIS member has a real embedder. StubEmbedder ⇒ FTS-only (no int8 vectors written);
+    // flag it so the FE can offer a re-embed once a model lands.
+    report.fts_only = !crate::embed::embed_model_present();
+
+    // ── ASYNC PULL PHASE — drain the feed, opening each cell; buffer decrypted items ──────────────
+    // The embedder (`dyn Embedder`, !Send) is deliberately NOT constructed here: the whole async
+    // section is Send-safe, and the synchronous INGEST phase below owns the embedder entirely (never
+    // held across an `.await`). A tombstone applies immediately (no key/blob needed). We STOP at the
+    // first un-openable LIVE item (never a silent skip-forward), so a transient key gap retries next
+    // sync — the cursor only advances past items we successfully ingested/tombstoned.
+    enum FeedAction {
+        Tombstone {
+            item_id: String,
+            seq: u64,
+        },
+        Ingest {
+            item_id: String,
+            seq: u64,
+            rev: u32,
+            generation: u32,
+            env: crate::share::org_envelope::OrgEnvelope,
+            sha: Vec<u8>,
+        },
+    }
+    let mut actions: Vec<FeedAction> = Vec::new();
+    let mut cursor = state.db.org_last_seq_for(&org.org_id)?;
+
+    'pages: loop {
+        let feed = client
+            .org_feed(&access, &org.org_id, cursor, ORG_FEED_PAGE)
+            .await?;
+        if feed.items.is_empty() {
+            break;
+        }
+        for item in &feed.items {
+            report.pulled += 1;
+
+            if item.tombstoned {
+                actions.push(FeedAction::Tombstone {
+                    item_id: item.item_id.clone(),
+                    seq: item.seq,
+                });
+                continue;
+            }
+
+            let Some(blob_id) = item.blob_id.clone() else {
+                report
+                    .errors
+                    .push(format!("item {}: live entry missing blob", item.item_id));
+                break 'pages;
+            };
+            // The AAD item nonce is hex(content_sha256) — the SAME value the publisher sealed under.
+            let Some(sha) = item.content_sha256.clone() else {
+                report
+                    .errors
+                    .push(format!("item {}: live entry missing content hash", item.item_id));
+                break 'pages;
+            };
+            let item_nonce = org_item_nonce(&sha);
+
+            // Resolve the OCK for THIS item's generation (RAM cache / grant unwrap; gated on MK
+            // session). Unavailable ⇒ transient key gap → record + STOP (retried next sync).
+            let ock = match acquire_org_ock(state, &org.org_id, item.generation).await {
+                Ok(k) => k,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("item {}: key unavailable ({})", item.item_id, brief_err(&e)));
+                    break 'pages;
+                }
+            };
+            let ciphertext = match client.get_blob(&access, &blob_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("item {}: blob fetch failed ({})", item.item_id, brief_err(&e)));
+                    break 'pages;
+                }
+            };
+            // OPEN (verify-before-trust: fails closed on wrong OCK / tampered cell / wrong AAD).
+            let env = match crate::share::org_envelope::open_org_envelope(
+                &ock,
+                &ciphertext,
+                &org.org_id,
+                &item_nonce,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    report.errors.push(format!(
+                        "item {}: envelope open failed ({})",
+                        item.item_id,
+                        brief_err(&e)
+                    ));
+                    break 'pages;
+                }
+            };
+            // INTEGRITY: the opened plaintext's own hash must equal the feed-supplied one the AAD was
+            // derived from (a successful AAD open already implies this, but assert so a server pairing
+            // a valid cell with a lying feed hash is caught).
+            if env.content_sha256() != sha {
+                report
+                    .errors
+                    .push(format!("item {}: content hash mismatch", item.item_id));
+                break 'pages;
+            }
+            actions.push(FeedAction::Ingest {
+                item_id: item.item_id.clone(),
+                seq: item.seq,
+                rev: item.rev,
+                generation: item.generation,
+                env,
+                sha,
+            });
+        }
+        if (feed.items.len() as u32) < ORG_FEED_PAGE {
+            break; // fewer than a full page ⇒ feed drained.
+        }
+        cursor = cursor.max(feed.next_seq);
+    }
+
+    // ── SYNC INGEST PHASE — embedder built ONCE, never crosses an await ───────────────────────────
+    let embedder: Option<Box<dyn crate::embed::Embedder>> = if report.fts_only {
+        None
+    } else {
+        Some(crate::embed::active_embedder())
+    };
+    let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
+    let mut applied = cursor;
+    for action in actions {
+        match action {
+            FeedAction::Tombstone { item_id, seq } => {
+                state.db.tombstone_org_item(&item_id)?;
+                report.tombstoned += 1;
+                applied = applied.max(seq);
+            }
+            FeedAction::Ingest {
+                item_id,
+                seq,
+                rev,
+                generation,
+                env,
+                sha,
+            } => {
+                state.db.upsert_org_item(
+                    &item_id,
+                    &org.org_id,
+                    seq,
+                    &env.author_hint,
+                    &env.title,
+                    &env.markdown,
+                    &env.created_at,
+                    rev,
+                    generation,
+                    &sha,
+                    embedder_ref,
+                )?;
+                report.ingested += 1;
+                applied = applied.max(seq);
+            }
+        }
+        // Advance the cursor per successfully-applied item (monotonic; Core's setter no-ops backward).
+        state.db.set_org_last_seq(&org.org_id, applied as i64)?;
+    }
+
+    report.last_seq = state.db.org_last_seq_for(&org.org_id)?;
+    tracing::info!(
+        target: "org",
+        pulled = report.pulled,
+        ingested = report.ingested,
+        tombstoned = report.tombstoned,
+        fts_only = report.fts_only,
+        errors = report.errors.len(),
+        "org feed sync"
+    );
+    Ok(report)
+}
+
+/// A short, PII-free rendering of an error for a sync report string (never note content — AppError
+/// Display here carries only stage/status labels the client controls).
+fn brief_err(e: &AppError) -> String {
+    match e {
+        AppError::Locked(_) => "locked".to_string(),
+        AppError::Auth(_) => "auth".to_string(),
+        AppError::Unavailable(_) => "unavailable".to_string(),
+        _ => "error".to_string(),
+    }
+}
+
+/// `org_get_item(item_id)` — the full decrypted org item for the read-only FE viewer. Org items are
+/// deliberately org-disclosed content (no folder lock gate applies). Returns `None` for an unknown or
+/// tombstoned item.
+#[tauri::command]
+pub fn org_get_item(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<Option<crate::storage::models::OrgItemDetail>, AppError> {
+    state.inner().db.get_org_item(&item_id)
 }
 
 #[cfg(test)]
