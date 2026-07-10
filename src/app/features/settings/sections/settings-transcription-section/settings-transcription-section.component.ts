@@ -25,11 +25,22 @@ export class SettingsTranscriptionSectionComponent {
   readonly modelDownloadError = this.store.modelDownloadError;
   readonly downloadHint = this.store.downloadHint;
 
+  // OPTIONAL parakeet live-ASR engine (off-GPU live captions).
+  readonly parakeetPresent = this.store.parakeetPresent;
+  readonly downloadingParakeet = this.store.downloadingParakeet;
+  readonly parakeetDownloadFrac = this.store.parakeetDownloadFrac;
+  readonly parakeetPct = this.store.parakeetPct;
+  readonly parakeetDownloadError = this.store.parakeetDownloadError;
+
   onModelChoiceChange(): void {
     this.store.onModelChoiceChange();
   }
 
   downloadModel(): void {
     void this.store.downloadModel();
+  }
+
+  downloadParakeet(): void {
+    void this.store.downloadParakeet();
   }
 }

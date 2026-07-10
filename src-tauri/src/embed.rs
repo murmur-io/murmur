@@ -843,10 +843,28 @@ pub fn augment_chunk_text(
 /// - `graph` — HIGHER-better (e.g. `1/rank` of the entity-neighbourhood ordering).
 ///
 /// Each leg is min-max normalized to `[0, 1]` independently (a constant/single-entry leg
-/// normalizes to all-1.0 — presence in a leg is signal), then blended
-/// `0.4·fts + 0.4·knn + 0.2·graph` ([`SCORE_FUSE_W_FTS`]/[`SCORE_FUSE_W_KNN`]/
-/// [`SCORE_FUSE_W_GRAPH`]). Returns `(id, fused)` sorted DESC, ties broken by id ASC (stable,
-/// deterministic). Pure — no DB, no model.
+/// normalizes to all-1.0 — presence in a leg is signal), then blended with QUERY-ADAPTIVE
+/// weights derived from the const source ratios `0.4·fts + 0.4·knn + 0.2·graph`
+/// ([`SCORE_FUSE_W_FTS`]/[`SCORE_FUSE_W_KNN`]/[`SCORE_FUSE_W_GRAPH`]).
+///
+/// **Empty-leg redistribution (Brain v2 L1.3, query-adaptive):** a leg that returned ZERO
+/// candidates for THIS query contributes ZERO effective weight; its weight mass redistributes
+/// proportionally across the legs that DID return results. Concretely, each present leg's
+/// effective weight is its base weight divided by the sum of the base weights of the *present*
+/// legs. So:
+/// - all three legs present ⇒ weights unchanged (`0.4/0.4/0.2`) — no regression where every
+///   leg earns its weight (the divisor is `1.0`);
+/// - FTS empty, KNN+graph present ⇒ `{0.4, 0.2}` renormalize to `{0.667, 0.333}` — the near-
+///   useless empty leg no longer drags hybrid below its live legs;
+/// - a single present leg ⇒ weight `1.0` (hybrid == that leg's order);
+/// - all empty ⇒ empty.
+///
+/// This is a monotonic rescale of the present legs (same divisor for all of them), so it NEVER
+/// reorders a fixed set of present legs — only the empty-leg mass moves. Score normalization and
+/// the ties→id-ASC ordering are unchanged.
+///
+/// Returns `(id, fused)` sorted DESC, ties broken by id ASC (stable, deterministic). Pure — no DB,
+/// no model.
 pub fn score_fuse(
     fts: &[(String, f64)],
     knn: &[(String, f64)],
@@ -879,14 +897,32 @@ pub fn score_fuse(
         .map(|(id, d)| (id.clone(), 1.0 / (1.0 + d.max(0.0))))
         .collect();
 
+    // Query-adaptive effective weights: only legs that returned candidates for THIS query keep
+    // their base weight mass; empty legs' mass redistributes proportionally over the present legs.
+    // The base weights are the SOURCE ratios; the divisor is the sum of the present ones.
+    let present_mass: f64 = [
+        (!fts.is_empty(), SCORE_FUSE_W_FTS),
+        (!knn_sim.is_empty(), SCORE_FUSE_W_KNN),
+        (!graph.is_empty(), SCORE_FUSE_W_GRAPH),
+    ]
+    .iter()
+    .filter(|(present, _)| *present)
+    .map(|(_, w)| *w)
+    .sum();
+
     let mut scores: HashMap<String, f64> = HashMap::new();
-    for (leg, w) in [
-        (minmax(fts), SCORE_FUSE_W_FTS),
-        (minmax(&knn_sim), SCORE_FUSE_W_KNN),
-        (minmax(graph), SCORE_FUSE_W_GRAPH),
-    ] {
-        for (id, s) in leg {
-            *scores.entry(id).or_insert(0.0) += w * s;
+    if present_mass > 0.0 {
+        for (leg, base_w) in [
+            (minmax(fts), SCORE_FUSE_W_FTS),
+            (minmax(&knn_sim), SCORE_FUSE_W_KNN),
+            (minmax(graph), SCORE_FUSE_W_GRAPH),
+        ] {
+            // Empty legs never enter this loop body (their `leg` is empty), so only present legs
+            // contribute — each at its base weight renormalized over the present mass.
+            let w = base_w / present_mass;
+            for (id, s) in leg {
+                *scores.entry(id).or_insert(0.0) += w * s;
+            }
         }
     }
     let mut fused: Vec<(String, f64)> = scores.into_iter().collect();
@@ -1526,8 +1562,9 @@ mod tests {
         let fused = score_fuse(&fts, &[], &[]);
         let ids: Vec<&str> = fused.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
-        // Empty legs contribute nothing; the leg's best gets the full leg weight.
-        assert!((fused[0].1 - SCORE_FUSE_W_FTS).abs() < 1e-9);
+        // Query-adaptive redistribution: the two empty legs' mass moves onto the ONLY present
+        // leg, so it carries the full weight 1.0 — hybrid == that leg (its best normalizes to 1.0).
+        assert!((fused[0].1 - 1.0).abs() < 1e-9, "single present leg ⇒ weight 1.0: {fused:?}");
     }
 
     #[test]
@@ -1574,6 +1611,187 @@ mod tests {
         assert!(
             (fused[0].1 - fused[1].1).abs() < 1e-12,
             "constant leg ⇒ equal scores"
+        );
+    }
+
+    // Reference fixed-weight blend (the PRE-change math): min-max each leg, then
+    // `SCORE_FUSE_W_FTS·fts + SCORE_FUSE_W_KNN·knn_sim + SCORE_FUSE_W_GRAPH·graph`, empty legs
+    // contributing nothing and their mass simply LOST (no redistribution). Self-contained so the
+    // regression pin does not depend on the production `score_fuse` internals.
+    fn old_fixed_weight_blend(
+        fts: &[(String, f64)],
+        knn: &[(String, f64)],
+        graph: &[(String, f64)],
+    ) -> Vec<(String, f64)> {
+        fn minmax(leg: &[(String, f64)]) -> Vec<(String, f64)> {
+            if leg.is_empty() {
+                return Vec::new();
+            }
+            let min = leg.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+            let max = leg.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+            leg.iter()
+                .map(|(id, s)| {
+                    let norm = if max > min { (s - min) / (max - min) } else { 1.0 };
+                    (id.clone(), norm)
+                })
+                .collect()
+        }
+        let knn_sim: Vec<(String, f64)> = knn
+            .iter()
+            .map(|(id, d)| (id.clone(), 1.0 / (1.0 + d.max(0.0))))
+            .collect();
+        let mut scores: HashMap<String, f64> = HashMap::new();
+        for (leg, w) in [
+            (minmax(fts), SCORE_FUSE_W_FTS),
+            (minmax(&knn_sim), SCORE_FUSE_W_KNN),
+            (minmax(graph), SCORE_FUSE_W_GRAPH),
+        ] {
+            for (id, s) in leg {
+                *scores.entry(id).or_insert(0.0) += w * s;
+            }
+        }
+        let mut fused: Vec<(String, f64)> = scores.into_iter().collect();
+        fused.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        fused
+    }
+
+    // (1) REGRESSION PIN — all three legs present ⇒ effective weights == base weights (divisor
+    // 1.0), so the query-adaptive blend is BYTE-IDENTICAL (order AND scores) to the old fixed
+    // blend. This is the "no regression on keyword queries where every leg earns its weight" case.
+    #[test]
+    fn score_fuse_all_legs_present_identical_to_fixed_blend() {
+        let fts = vec![
+            ("m1".to_string(), 9.0),
+            ("m2".to_string(), 5.0),
+            ("x".to_string(), 1.0),
+        ];
+        let knn = vec![
+            ("m3".to_string(), 0.1),
+            ("m2".to_string(), 0.2),
+            ("y".to_string(), 2.0),
+        ];
+        let graph = vec![("m2".to_string(), 1.0), ("m4".to_string(), 0.5)];
+        let got = score_fuse(&fts, &knn, &graph);
+        let want = old_fixed_weight_blend(&fts, &knn, &graph);
+        assert_eq!(got.len(), want.len());
+        for ((gi, gs), (wi, ws)) in got.iter().zip(want.iter()) {
+            assert_eq!(gi, wi, "order diverged: {got:?} vs {want:?}");
+            assert!((gs - ws).abs() < 1e-12, "score diverged at {gi}: {gs} vs {ws}");
+        }
+    }
+
+    // (2) BUG FIX — FTS empty (paraphrase / cross-lingual query): the fused ranking must EQUAL the
+    // renormalized {knn, graph} blend (weights 0.4/0.2 → 0.667/0.333, summing to 1.0). RED against
+    // the old code, which applied the FTS 0.4 zero-mass and left {knn, graph} at raw 0.4/0.2.
+    #[test]
+    fn score_fuse_fts_empty_redistributes_to_semantic_and_graph() {
+        let knn = vec![
+            ("near".to_string(), 0.1),
+            ("mid".to_string(), 0.5),
+            ("far".to_string(), 2.0),
+        ];
+        let graph = vec![("mid".to_string(), 1.0), ("g2".to_string(), 0.5)];
+        let got = score_fuse(&[], &knn, &graph);
+
+        // Independently compute the renormalized {knn, graph} blend at 0.667/0.333.
+        let mass = SCORE_FUSE_W_KNN + SCORE_FUSE_W_GRAPH;
+        let wk = SCORE_FUSE_W_KNN / mass;
+        let wg = SCORE_FUSE_W_GRAPH / mass;
+        // knn min-max over sim = 1/(1+d): near=1/1.1, mid=1/1.5, far=1/3.0.
+        let knn_sim = [1.0 / 1.1_f64, 1.0 / 1.5_f64, 1.0 / 3.0_f64];
+        let (kmin, kmax) = (
+            knn_sim.iter().cloned().fold(f64::INFINITY, f64::min),
+            knn_sim.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        let kn = |s: f64| (s - kmin) / (kmax - kmin);
+        // graph min-max: mid=1.0, g2=0.5 ⇒ mid→1.0, g2→0.0.
+        let mut want: HashMap<String, f64> = HashMap::new();
+        *want.entry("near".to_string()).or_insert(0.0) += wk * kn(1.0 / 1.1);
+        *want.entry("mid".to_string()).or_insert(0.0) += wk * kn(1.0 / 1.5);
+        *want.entry("far".to_string()).or_insert(0.0) += wk * kn(1.0 / 3.0);
+        *want.entry("mid".to_string()).or_insert(0.0) += wg * 1.0;
+        *want.entry("g2".to_string()).or_insert(0.0) += wg * 0.0;
+        for (id, gs) in &got {
+            let ws = want.get(id).copied().unwrap_or(f64::NAN);
+            assert!(
+                (gs - ws).abs() < 1e-12,
+                "fts-empty fused score for {id} = {gs}, expected renormalized {ws}"
+            );
+        }
+        // And RED-vs-old: the top score under redistribution (0.667·1.0) is strictly greater than
+        // the old zero-mass score (0.4·1.0) — the fix lifts the live legs into full weight.
+        assert!(
+            got[0].1 > SCORE_FUSE_W_KNN + 1e-9,
+            "redistributed top score {} must exceed the old raw 0.4 leg weight",
+            got[0].1
+        );
+    }
+
+    // (3) SINGLE LEG — one present leg ⇒ fused order == that leg's order, best score 1.0.
+    #[test]
+    fn score_fuse_single_present_leg_equals_that_leg() {
+        let knn = vec![
+            ("far".to_string(), 1.5),
+            ("near".to_string(), 0.1),
+            ("mid".to_string(), 0.6),
+        ];
+        let fused = score_fuse(&[], &knn, &[]);
+        let ids: Vec<&str> = fused.iter().map(|(id, _)| id.as_str()).collect();
+        // Smaller distance ⇒ higher sim ⇒ higher fused: near > mid > far.
+        assert_eq!(ids, vec!["near", "mid", "far"], "{fused:?}");
+        assert!((fused[0].1 - 1.0).abs() < 1e-9, "single leg best ⇒ 1.0: {fused:?}");
+    }
+
+    // (4) ALL EMPTY ⇒ empty (unchanged).
+    #[test]
+    fn score_fuse_all_empty_is_empty() {
+        assert!(score_fuse(&[], &[], &[]).is_empty());
+    }
+
+    // DIAGNOSTIC (not a gate): count how many labeled queries have a genuinely EMPTY FTS leg on
+    // the real vault — i.e. how many queries the empty-leg redistribution can even affect. Reuses
+    // the bake-off env vars. `#[ignore]`d; run manually with the same MURMUR_BAKEOFF_* env as the
+    // real-vault bake-off. Reports empty-FTS vs non-empty-FTS split so the ranking-impact of the
+    // redistribution is honest (redistribution when FTS is empty only RESCALES the {knn,graph}
+    // blend by a constant — it does NOT reorder — so it changes recall ONLY through the all-legs-
+    // present cases, never the fts-empty ones; this count quantifies that).
+    #[test]
+    #[ignore = "diagnostic: needs MURMUR_BAKEOFF_DB/DEK/SET env on a Mac"]
+    fn diag_count_empty_fts_legs_on_real_set() {
+        use std::collections::HashSet;
+        let db_path = std::env::var("MURMUR_BAKEOFF_DB").expect("MURMUR_BAKEOFF_DB");
+        let dek = std::env::var("MURMUR_BAKEOFF_DEK").expect("MURMUR_BAKEOFF_DEK");
+        let set_path = std::env::var("MURMUR_BAKEOFF_SET").expect("MURMUR_BAKEOFF_SET");
+        let db = crate::storage::Db::open_with_key(std::path::Path::new(&db_path), &dek).unwrap();
+        let set = crate::eval::LabeledSet::from_json(
+            &std::fs::read_to_string(&set_path).unwrap(),
+        )
+        .unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let empties: HashSet<String> = HashSet::new();
+        let mut empty = 0usize;
+        let mut nonempty = 0usize;
+        for q in &set.0 {
+            let df = crate::summarize::temporal::extract_date_filter(&q.query, today);
+            let hits = db
+                .search_visible_in_range(&q.query, 40, &empties, df)
+                .unwrap();
+            if hits.is_empty() {
+                empty += 1;
+                println!("EMPTY-FTS: {}", q.query);
+            } else {
+                nonempty += 1;
+                println!("fts={:>2} hits: {}", hits.len(), q.query);
+            }
+        }
+        println!(
+            "\nFTS-empty legs: {empty}/{} ; non-empty (present, wrong-or-right): {nonempty}/{}",
+            set.0.len(),
+            set.0.len()
         );
     }
 

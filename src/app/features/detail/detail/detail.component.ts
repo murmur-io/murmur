@@ -304,11 +304,14 @@ export class DetailComponent implements OnInit {
         !this.locked() &&
         !this.timeline() &&
         !this.timelineLoading() &&
-        // Do NOT auto-retry after a failure: a persistent `get_timeline` error would otherwise
-        // re-fire this effect every time `timelineLoading` flips back to false → an infinite retry
-        // loop (and repeated multi-GB model loads). A failed load surfaces the Retry button, which
-        // clears `timelineError` and re-calls `loadTimeline` explicitly.
-        !this.timelineError()
+        // Do NOT auto-retry after a failure: a persistent error would otherwise re-fire this effect
+        // every time `timelineLoading` flips back to false → an infinite retry loop. A failed load
+        // surfaces the Retry button, which clears `timelineError` and re-calls `loadTimeline`.
+        !this.timelineError() &&
+        // Do NOT re-fire once we've surfaced the "Generate" affordance (on-device, no cache): the
+        // read leaves `timeline` null + `timelineLoading` false, so without this guard the effect
+        // would loop calling `loadTimeline` forever. Cleared only by the user's Generate click.
+        !this.timelineNeedsGeneration()
       ) {
         void this.loadTimeline();
       }
@@ -316,6 +319,19 @@ export class DetailComponent implements OnInit {
     { allowSignalWrites: true },
   );
   readonly timelineError = signal(false);
+  /**
+   * PERF/OOM: true when deriving THIS install's timeline would load a residency-bound on-device
+   * model (local GGUF / Ollama / Apple FM). When true, generation is HEAVY and is NEVER auto-fired
+   * on Audio-tab open — it hides behind an explicit "Generate timeline" click so a passive open can't
+   * swap-death-beachball the Mac (perf-memory-audit). Cloud (false) auto-generates (cheap). Loaded
+   * once per meeting-open from `timeline_generation_on_device` (install-global; best-effort).
+   */
+  readonly timelineOnDevice = signal(false);
+  /**
+   * True when the Audio tab opened, there is NO cached timeline, and generation is on-device (heavy)
+   * — so we show the "Generate timeline" affordance instead of silently loading a multi-GB model.
+   */
+  readonly timelineNeedsGeneration = signal(false);
   /**
    * Speaker voiceprint suggestions (opt-in) — one per diarized `others-{n}` lane
    * the backend re-identified against a prior labeled voiceprint. Fed to the
@@ -436,6 +452,7 @@ export class DetailComponent implements OnInit {
     // Clear non-derived per-meeting state for a clean same-route reload.
     this.timeline.set(null);
     this.timelineError.set(false);
+    this.timelineNeedsGeneration.set(false);
     this.speakerSuggestions.set([]);
     this.tags.set([]);
     this.graph.set(null);
@@ -467,6 +484,14 @@ export class DetailComponent implements OnInit {
     }
     // Org Brain badge (best-effort, non-blocking; hidden on any failure).
     void this.refreshOrgShared();
+    // PERF/OOM: is timeline generation heavy (on-device) on this install? Decides auto-generate vs
+    // the explicit "Generate" gate on the Audio tab. Best-effort; a failure defaults to "heavy"
+    // (safer: never a surprise multi-GB load on open).
+    try {
+      this.timelineOnDevice.set(await this.ipc.timelineGenerationOnDevice());
+    } catch {
+      this.timelineOnDevice.set(true);
+    }
     // Locked (masked) meetings render the lock gate only — skip priming the
     // timeline/tags (they're empty/masked) and focus the Unlock button instead.
     if (this.locked()) {
@@ -616,25 +641,42 @@ export class DetailComponent implements OnInit {
     }
   }
 
-  /** Fetch (or re-fetch, via Retry) the AI-derived speaker + topic timeline. */
+  /**
+   * READ the CACHED timeline on Audio-tab open, then decide how to derive a missing one:
+   *   - cached content present → show it;
+   *   - none + CLOUD provider (cheap) → generate inline;
+   *   - none + ON-DEVICE provider (heavy) → surface the "Generate" affordance, NEVER auto-load a
+   *     multi-GB model on a passive open (perf-memory-audit — the whole-Mac beachball).
+   * Also the Retry path (a failed read/gen re-runs this).
+   */
   async loadTimeline(): Promise<void> {
     const id = this.detail()?.meeting.id;
-    // In-flight guard: never start a second generation while one is running (the Audio-tab effect
-    // could otherwise re-fire). P0.4.
+    // In-flight guard: never start a second read/generation while one is running (the Audio-tab
+    // effect could otherwise re-fire). P0.4.
     if (!id || this.timelineLoading()) {
       return;
     }
     this.timelineError.set(false);
+    this.timelineNeedsGeneration.set(false);
     this.timelineLoading.set(true);
     try {
-      const tl = await this.ipc.getTimeline(id);
-      // STALE-RESULT guard: `get_timeline` can take many seconds (on-device LLM). If the user
-      // switched meetings mid-flight, drop this result so we never paint meeting A's timeline over
-      // meeting B (mirrors `resummarize`). P0.4.
+      const cached = await this.ipc.getTimeline(id);
+      // STALE-RESULT guard: if the user switched meetings mid-flight, drop this result so we never
+      // paint meeting A's timeline over meeting B (mirrors `resummarize`). P0.4.
       if (this.detail()?.meeting.id !== id) {
         return;
       }
-      this.timeline.set(tl);
+      if (cached.speakers.length > 0 || cached.topics.length > 0) {
+        this.timeline.set(cached);
+      } else if (this.timelineOnDevice()) {
+        // Heavy on-device generation is user-initiated only — show the Generate affordance.
+        this.timeline.set(null);
+        this.timelineNeedsGeneration.set(true);
+        return;
+      } else {
+        // Cloud is cheap → derive now under the same in-flight flag.
+        await this.deriveTimeline(id);
+      }
     } catch {
       if (this.detail()?.meeting.id === id) {
         this.timeline.set(null);
@@ -646,6 +688,45 @@ export class DetailComponent implements OnInit {
     // Voiceprint speaker suggestions (opt-in) — best-effort, never blocks the
     // timeline. Empty when the feature is off / meeting locked / nothing matched.
     void this.loadSpeakerSuggestions();
+  }
+
+  /**
+   * EXPLICIT heavy generation — the on-device "Generate timeline" click. Runs the multi-GB model
+   * pass deliberately (user asked for it), stale-guarded, under the shared in-flight flag.
+   */
+  async generateTimeline(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id || this.timelineLoading()) {
+      return;
+    }
+    this.timelineError.set(false);
+    this.timelineNeedsGeneration.set(false);
+    this.timelineLoading.set(true);
+    try {
+      await this.deriveTimeline(id);
+    } finally {
+      this.timelineLoading.set(false);
+    }
+    void this.loadSpeakerSuggestions();
+  }
+
+  /**
+   * Run the backend `generate_timeline` (the heavy provider pass) and land the result, stale-guarded.
+   * The CALLER owns `timelineLoading`; this only writes `timeline`/`timelineError`.
+   */
+  private async deriveTimeline(id: string): Promise<void> {
+    try {
+      const tl = await this.ipc.generateTimeline(id);
+      if (this.detail()?.meeting.id !== id) {
+        return; // stale — the user moved on
+      }
+      this.timeline.set(tl);
+    } catch {
+      if (this.detail()?.meeting.id === id) {
+        this.timeline.set(null);
+        this.timelineError.set(true);
+      }
+    }
   }
 
   /**

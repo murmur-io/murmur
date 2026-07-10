@@ -105,6 +105,13 @@ export interface AppConfigDto {
   /** Auto-delete oldest recordings' audio over the cap. Opt-in, default false. Mirrors Rust `audio_auto_prune`. */
   audioAutoPrune: boolean;
   modelSize: string;
+  /**
+   * OPTIONAL live-caption ASR engine (mirrors Rust `live_asr_engine`): `"whisper"` (default) or
+   * `"parakeet"`. When `"parakeet"` AND its models are downloaded, live captions decode on the
+   * CPU-only NVIDIA parakeet engine (off the Metal GPU); whisper stays the batch authority and the
+   * fallback. Settable from the Transcription settings toggle.
+   */
+  liveAsrEngine: string;
   voiceTrigger: boolean;
   onboarded: boolean;
   /**
