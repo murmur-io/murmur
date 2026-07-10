@@ -400,6 +400,13 @@ pub struct AppConfig {
     /// this field existed loads as `true` (memory stays on for existing installs).
     #[serde(default = "default_true")]
     pub user_memory_enabled: bool,
+    /// Brain v2 L2.1 — the hourly memory CONSOLIDATION/REFLECTION job (`crate::memory`): scores
+    /// user facts, synthesizes entity/weekly rollups on the LIGHT local reasoner (never cloud) and
+    /// exports them to `<vault>/brain/memory/`. Default ON; effective only when `user_memory_enabled`
+    /// is also on AND a local light model is present (the stub tick is a no-op). ADDITIVE:
+    /// `#[serde(default = "default_true")]` ⇒ configs persisted before this field load as `true`.
+    #[serde(default = "default_true")]
+    pub memory_consolidation_enabled: bool,
     /// Tier 3b (B) anti-hallucination — DETERMINISTIC GROUNDING of the generated note. When ON, a
     /// pure, on-device, ZERO-EGRESS pass (`crate::summarize::grounding`) runs after summarization and
     /// annotates any summary bullet / action item / prose line whose content words are NOT supported
@@ -522,6 +529,7 @@ impl Default for AppConfig {
             share_base_url: "https://murmur-server-production-b9e8.up.railway.app".to_string(),
             proactive_hints_enabled: true,
             user_memory_enabled: true,
+            memory_consolidation_enabled: true,
             ground_summary: false,
             role_notes_connection: String::new(),
             role_notes_model: String::new(),
@@ -595,6 +603,7 @@ const K_GATEWAY_MODEL: &str = "gateway_model";
 const K_SHARE_BASE_URL: &str = "share_base_url";
 const K_PROACTIVE_HINTS_ENABLED: &str = "proactive_hints_enabled";
 const K_USER_MEMORY_ENABLED: &str = "user_memory_enabled";
+const K_MEMORY_CONSOLIDATION_ENABLED: &str = "memory_consolidation_enabled";
 const K_GROUND_SUMMARY: &str = "ground_summary";
 const K_ROLE_NOTES_CONNECTION: &str = "role_notes_connection";
 const K_ROLE_NOTES_MODEL: &str = "role_notes_model";
@@ -795,6 +804,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_USER_MEMORY_ENABLED)? {
             cfg.user_memory_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_MEMORY_CONSOLIDATION_ENABLED)? {
+            cfg.memory_consolidation_enabled = v == "true";
         }
         if let Some(v) = db.get_setting(K_GROUND_SUMMARY)? {
             cfg.ground_summary = v == "true";
@@ -1064,6 +1076,14 @@ impl AppConfig {
         db.set_setting(
             K_USER_MEMORY_ENABLED,
             if self.user_memory_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_MEMORY_CONSOLIDATION_ENABLED,
+            if self.memory_consolidation_enabled {
                 "true"
             } else {
                 "false"

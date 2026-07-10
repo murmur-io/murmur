@@ -539,6 +539,16 @@ impl Db {
         // and ranking uses bm25(). SQLCipher is built with FTS5 compiled in (bundled-sqlcipher) —
         // ZERO new deps. Runs on the same locked connection as the rest of migrate().
         Self::migrate_fts(&conn)?;
+        // Brain v2 L2.2 — relevance-filtered memory brief: external-content FTS5 over `user_facts`
+        // (subject/predicate/object) kept in sync by the same _ai/_ad/_au trigger trio as the other
+        // FTS tables. Additive + guarded so migrate() stays idempotent. Lock model: the index only
+        // mirrors `user_facts`, which is PURGED on seal via a direct DELETE (`purge_user_facts_tx` /
+        // `reblank_locked_folders_at_rest`) — that DELETE fires the _ad trigger, so no sealed
+        // fact's tokens survive in the index; every READ goes through the gated
+        // `search_user_facts_visible` (same visibility predicate as `list_user_facts_visible`).
+        Self::migrate_user_facts_fts(&conn)?;
+        // Brain v2 L2.1 — memory consolidation tables (see `crate::memory`). Additive + guarded.
+        Self::migrate_memory(&conn)?;
         // Phase 2a — vector retrieval layer (note_chunks + the vec0 KNN table). Additive + guarded
         // (CREATE TABLE / CREATE VIRTUAL TABLE IF NOT EXISTS) so migrate() stays idempotent.
         Self::migrate_vector(&conn)?;
@@ -1072,6 +1082,125 @@ impl Db {
             )
             .map_err(map_err)?;
         }
+        Ok(())
+    }
+
+    /// Brain v2 L2.2 — idempotent FTS5 setup for `user_facts`: ONE external-content table over the
+    /// three content-bearing columns (`subject`/`predicate`/`object` — together the searchable
+    /// tokens of "<subject> <predicate>: <object>"), kept exact by the standard `_ai`/`_ad`/`_au`
+    /// trigger trio, plus a one-time backfill from existing rows. `user_facts` has a TEXT `id`
+    /// PRIMARY KEY, so it is a normal rowid table and `content_rowid='rowid'` mirrors it 1:1
+    /// (exactly like `fts_meetings`). Same Polish-safe tokenizer as the other FTS tables.
+    ///
+    /// LOCK MODEL: user facts are purged on seal via DIRECT `DELETE`s (`purge_user_facts_tx`,
+    /// `reblank_locked_folders_at_rest`) — those fire the `_ad` trigger, so a sealed meeting's fact
+    /// tokens are removed from the index in the SAME transaction. `delete_meeting` purges
+    /// explicitly too (not only via FK cascade) for the same trigger guarantee.
+    ///
+    /// CRASH SAFETY: the first-time CREATE (table + triggers) and the backfill run in ONE
+    /// transaction, so a crash mid-migration can never strand an EMPTY index that looks "already
+    /// built" — either everything lands (index complete) or nothing does (retried next launch).
+    fn migrate_user_facts_fts(conn: &Connection) -> Result<()> {
+        let already_built: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fts_user_facts'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
+
+        const CREATE: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_user_facts USING fts5(
+                 subject, predicate, object,
+                 content='user_facts',
+                 content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+             CREATE TRIGGER IF NOT EXISTS fts_user_facts_ai AFTER INSERT ON user_facts BEGIN
+                 INSERT INTO fts_user_facts(rowid, subject, predicate, object)
+                   VALUES (new.rowid, new.subject, new.predicate, new.object);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_user_facts_ad AFTER DELETE ON user_facts BEGIN
+                 INSERT INTO fts_user_facts(fts_user_facts, rowid, subject, predicate, object)
+                   VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_user_facts_au AFTER UPDATE ON user_facts BEGIN
+                 INSERT INTO fts_user_facts(fts_user_facts, rowid, subject, predicate, object)
+                   VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
+                 INSERT INTO fts_user_facts(rowid, subject, predicate, object)
+                   VALUES (new.rowid, new.subject, new.predicate, new.object);
+             END;";
+
+        if already_built {
+            // Idempotent re-run: everything below IF-NOT-EXISTS no-ops; no backfill.
+            conn.execute_batch(CREATE).map_err(map_err)?;
+            return Ok(());
+        }
+        // First build: create + one-time backfill ATOMICALLY (rollback-on-drop guards a crash).
+        let tx = conn.unchecked_transaction().map_err(map_err)?;
+        tx.execute_batch(CREATE).map_err(map_err)?;
+        tx.execute_batch(
+            "INSERT INTO fts_user_facts(rowid, subject, predicate, object)
+               SELECT rowid, subject, predicate, object FROM user_facts;",
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Brain v2 L2.1 — memory-consolidation tables (see `crate::memory` for the job semantics).
+    ///
+    /// `memory_scores` — one row per OPEN user fact: the deterministic recency/importance/relevance
+    /// components + the composite. FK `ON DELETE CASCADE` to `user_facts(id)` so BOTH the
+    /// purge-on-seal (`purge_user_facts_tx`'s direct DELETE) and `delete_meeting`'s cascade drop the
+    /// score with its fact — a sealed/deleted meeting leaves no score row behind. (Scores are
+    /// CONTENT-FREE — floats + ids — but the cascade keeps the store consistent.)
+    ///
+    /// `memory_rollups` — one row per reflection scope (`entity:<id>` / `weekly:<YYYY-WNN>`):
+    /// cross-meeting SYNTHESIS text. LOCK MODEL (two layers, both required):
+    ///   1. PURGED on EVERY seal path — `purge_memory_rollups_tx` runs inside the seal transactions
+    ///      (`purge_chunks_for_meetings` / `blank_sealed_notes_in_folders` /
+    ///      `reblank_locked_folders_at_rest` / `delete_meeting`) and the CALLER deletes the exported
+    ///      vault `.md`s from the returned `exported_path`s. Rollups are cheap re-derivable synthesis;
+    ///      they regenerate on the next hourly pass FROM VISIBLE FACTS ONLY.
+    ///   2. Per-pass regeneration/GC — `fact_set_hash` records the SORTED visible-open-fact id set a
+    ///      rollup was synthesized from; the hourly pass deletes no-longer-eligible scopes and
+    ///      re-reflects any scope whose hash changed (superseded/forgotten facts age out even without
+    ///      a seal). See `crate::memory::run_consolidation_pass`.
+    ///
+    /// `scope` is UNIQUE so the upsert is idempotent per scope. `fact_set_hash` is added guarded
+    /// (`add_column_if_missing`) for DBs that ran the earlier shape of this migration.
+    ///
+    /// Also adds `facts.importance` (guarded, additive): the light reasoner's batch-assessed 1–10
+    /// importance of an ENTITY fact, persisted so steady-state passes stay LLM-free. It backs the
+    /// spec's "or any fact with importance ≥ 7" reflection-eligibility arm. Content-free (a float).
+    fn migrate_memory(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_scores (
+               fact_id TEXT PRIMARY KEY,
+               scope TEXT NOT NULL DEFAULT 'user',
+               recency REAL NOT NULL,
+               importance REAL NOT NULL,
+               relevance REAL NOT NULL,
+               composite REAL NOT NULL,
+               scored_at TEXT NOT NULL,
+               FOREIGN KEY (fact_id) REFERENCES user_facts(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_scores_composite
+               ON memory_scores(composite);
+             CREATE TABLE IF NOT EXISTS memory_rollups (
+               id TEXT PRIMARY KEY,
+               scope TEXT NOT NULL UNIQUE,
+               content TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               exported_path TEXT
+             );",
+        )
+        .map_err(map_err)?;
+        Self::add_column_if_missing(conn, "memory_rollups", "fact_set_hash", "TEXT")?;
+        Self::add_column_if_missing(conn, "facts", "importance", "REAL")?;
         Ok(())
     }
 
@@ -1904,7 +2033,11 @@ impl Db {
 
     /// Delete a meeting and (via ON DELETE CASCADE) its segments, notes, and timeline.
     /// Audio + vault files are removed by the caller before this.
-    pub fn delete_meeting(&self, id: &str) -> Result<()> {
+    ///
+    /// Returns the `exported_path`s of the memory rollups purged in the same transaction (a rollup
+    /// may paraphrase the deleted meeting's facts — see `purge_memory_rollups_tx`); the CALLER
+    /// deletes those vault `.md` files (same layering as the note/audio file removal above).
+    pub fn delete_meeting(&self, id: &str) -> Result<Vec<String>> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         // Drop derived chunks/vectors FIRST, in the same tx. `vec_chunks` is a vec0 virtual table
@@ -1919,10 +2052,20 @@ impl Db {
         // purge_supersessions_tx). Their pre-images hold plaintext note bytes; a deleted meeting must
         // leave none behind.
         Self::purge_supersessions_tx(&tx, &[id.to_string()])?;
+        // Brain v2 L2.2: purge this meeting's user facts EXPLICITLY (direct DELETE) rather than
+        // relying on the meetings FK cascade alone — the direct DELETE reliably fires the
+        // `fts_user_facts_ad` trigger, so the deleted facts' tokens leave the FTS index in this
+        // same tx (their `memory_scores` rows cascade off the user_facts FK). This also makes
+        // "delete the synthetic Memory Import meeting ⇒ the import is undone" structural.
+        Self::purge_user_facts_tx(&tx, &[id.to_string()])?;
+        // Brain v2 L2.1: purge ALL memory rollups in this same tx — a rollup may paraphrase the
+        // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
+        // from the remaining visible facts only. The caller deletes the exported `.md`s.
+        let rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
-        Ok(())
+        Ok(rollup_exports)
     }
 
     pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>> {
@@ -2495,9 +2638,13 @@ impl Db {
     /// Purge (delete) every `note_chunks` + `vec_chunks` row for the given meetings. The vec0 row is
     /// deleted by its `chunk_id` (== note_chunks.id) BEFORE the note_chunks row, then the note_chunks
     /// rows go. Used standalone (lock_folder) and inside the relock transactions.
-    pub fn purge_chunks_for_meetings(&self, meeting_ids: &[String]) -> Result<()> {
+    ///
+    /// Returns the `exported_path`s of the memory rollups purged in the same transaction (see
+    /// `purge_memory_rollups_tx`) — the CALLER must delete those vault `.md` files (same layering
+    /// as the sealed-note `.md` deletion: DB rows in-tx here, filesystem at the command layer).
+    pub fn purge_chunks_for_meetings(&self, meeting_ids: &[String]) -> Result<Vec<String>> {
         if meeting_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
@@ -2529,8 +2676,35 @@ impl Db {
         // sealed note content and returns (with the stamp) on unlock/remove-lock; only the undo
         // scratch is dropped.
         Self::purge_supersessions_tx(&tx, meeting_ids)?;
+        // Brain v2 L2.1 LOCK-SAFETY: memory ROLLUPS are cross-meeting synthesis that may paraphrase
+        // the just-sealed facts — purge ALL of them in this SAME seal tx (cheap, re-derivable: the
+        // next hourly pass regenerates from the still-VISIBLE facts only). The caller deletes the
+        // returned exported vault `.md`s.
+        let rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
         tx.commit().map_err(map_err)?;
-        Ok(())
+        Ok(rollup_exports)
+    }
+
+    /// Brain v2 L2.1 LOCK-SAFETY: delete EVERY `memory_rollups` row within an EXISTING transaction
+    /// and return the recorded `exported_path`s so the CALLER can remove the exported vault `.md`s
+    /// (never any other file — only the paths this table recorded at export time; a missing file is
+    /// fine). ALL rollups go, not just the sealed scope's: a rollup is cross-meeting synthesis with
+    /// no single source meeting, so precision-purging is impossible — and rollups are cheap
+    /// re-derivable synthesis that the next hourly pass regenerates FROM VISIBLE FACTS ONLY.
+    fn purge_memory_rollups_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>> {
+        let mut stmt = tx
+            .prepare("SELECT exported_path FROM memory_rollups WHERE exported_path IS NOT NULL")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut paths = Vec::new();
+        for r in rows {
+            paths.push(r.map_err(map_err)?);
+        }
+        drop(stmt);
+        tx.execute("DELETE FROM memory_rollups", []).map_err(map_err)?;
+        Ok(paths)
     }
 
     /// brain2 R2 LOCK-SAFETY: delete every `facts` row for `meeting_ids` within an EXISTING
@@ -4613,12 +4787,20 @@ impl Db {
 
     /// Re-blank the plaintext `markdown` of every note in `folder_ids` that still has a sealed
     /// `content_blob` (relock / relock-all). Idempotent; leaves the blob intact.
-    pub fn blank_sealed_notes_in_folders(&self, folder_ids: &HashSet<String>) -> Result<()> {
+    ///
+    /// Returns the `exported_path`s of the memory rollups purged in the same transaction
+    /// (`purge_memory_rollups_tx` — a relock re-asserts the sealed shape, so sealed-derived rollup
+    /// synthesis must not linger either); the CALLER deletes those vault `.md` files.
+    pub fn blank_sealed_notes_in_folders(
+        &self,
+        folder_ids: &HashSet<String>,
+    ) -> Result<Vec<String>> {
         if folder_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let rollup_exports;
         {
             let mut stmt = tx
                 .prepare(
@@ -4680,9 +4862,14 @@ impl Db {
             // `reblank_folder_extras` (relock) / `reblank_locked_folders_at_rest` (startup). Blanking
             // it here (unconditionally, with no CK to re-seal) would destroy the only copy of a
             // typed buffer that had not yet been sealed — the verify-before-destroy violation.
+
+            // Brain v2 L2.1 LOCK-SAFETY: purge ALL memory rollups in this SAME relock tx — a rollup
+            // may paraphrase the just-re-sealed facts. Cheap re-derivable synthesis; regenerates
+            // from VISIBLE facts on the next hourly pass. The caller deletes the exported `.md`s.
+            rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
         }
         tx.commit().map_err(map_err)?;
-        Ok(())
+        Ok(rollup_exports)
     }
 
     /// SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of EVERY `locked=1`
@@ -4700,7 +4887,12 @@ impl Db {
     /// (`mic_master_path` / `sys_master_path`). A crash-while-unlocked decrypts EVERY stream that
     /// was sealed, so re-pointing only `audio_path` would leave `{id}.mic.wav` / `{id}.sys.wav`
     /// plaintext on disk forever (B1) — the masters must be reconciled with the same logic.
-    pub fn reblank_locked_folders_at_rest(&self) -> Result<Vec<LockedMeetingAudio>> {
+    ///
+    /// The second tuple element is the `exported_path`s of the memory rollups purged in-tx when any
+    /// folder is locked (`purge_memory_rollups_tx`) — the caller deletes those vault `.md` files.
+    pub fn reblank_locked_folders_at_rest(
+        &self,
+    ) -> Result<(Vec<LockedMeetingAudio>, Vec<String>)> {
         const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
              WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
         let mut conn = self.lock();
@@ -4882,8 +5074,25 @@ impl Db {
                 audio.push(r.map_err(map_err)?);
             }
         }
+        // Brain v2 L2.1 LOCK-SAFETY: when ANY folder is locked, purge ALL memory rollups in this
+        // same reconciliation transaction — a rollup synthesized before the seal (or during a
+        // crashed unlocked session) may paraphrase sealed facts. Skipped when nothing is locked
+        // (no sealed content ⇒ no leak ⇒ rollups survive restarts). The caller deletes the
+        // returned exported vault `.md`s.
+        let any_locked: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM folders WHERE locked = 1)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let rollup_exports = if any_locked {
+            Self::purge_memory_rollups_tx(&tx)?
+        } else {
+            Vec::new()
+        };
         tx.commit().map_err(map_err)?;
-        Ok(audio)
+        Ok((audio, rollup_exports))
     }
 
     /// Folder ids that are sealed (`locked=1`) — used to re-blank every sealed note on relock-all.
@@ -6675,6 +6884,275 @@ impl Db {
         Ok(out)
     }
 
+    /// Brain v2 L2.2 — GATED, RELEVANCE-FILTERED read: the top-`k` CURRENTLY-VALID (open) user
+    /// facts matching `query` (BM25 over `fts_user_facts`, best first), restricted by EXACTLY the
+    /// same visibility predicate as [`Self::list_user_facts_visible`] (source-meeting
+    /// `visibility_clause`; NULL `meeting_id` fail-closed via the INNER JOIN). The query is defused
+    /// through [`fts_match_query_any`] (an OR of quoted literal CONTENT terms — stopwords and
+    /// <3-char tokens are dropped, so a natural-language question must match a fact on a real
+    /// content word, never on "the"/"is"), so raw user text can never raise an FTS syntax error; an
+    /// empty / punctuation-only / all-stopword query returns NO hits (the caller falls back to the
+    /// full list). Only OPEN facts (`valid_to IS NULL`) are returned.
+    pub fn search_user_facts_visible(
+        &self,
+        query: &str,
+        k: usize,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::facts::Fact>> {
+        let Some(match_expr) = fts_match_query_any(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT uf.id, uf.subject, uf.predicate, uf.object, uf.valid_from, \
+                    uf.valid_to, uf.recorded_at, uf.meeting_id, uf.confidence \
+               FROM fts_user_facts \
+               JOIN user_facts uf ON uf.rowid = fts_user_facts.rowid \
+               JOIN meetings m ON m.id = uf.meeting_id \
+              WHERE fts_user_facts MATCH ?1 \
+                AND uf.valid_to IS NULL \
+                AND ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              ORDER BY bm25(fts_user_facts) ASC, uf.valid_from DESC, uf.id DESC \
+              LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![match_expr, k as i64],
+                row_to_user_fact,
+            )
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    // ── Brain v2 L2.1 — memory consolidation store (see `crate::memory`) ─────────────────────────
+    //
+    // `memory_scores` rows are CONTENT-FREE (ids + floats) and cascade off `user_facts` (FK), so
+    // purge-on-seal / delete-meeting are transitive. `memory_rollups` carry SYNTHESIS text derived
+    // ONLY from VISIBLE facts (the job reads through the gated `list_user_facts_visible` /
+    // `list_facts_visible` with the empty unlock set); they are ALL PURGED inside every seal tx
+    // (`purge_memory_rollups_tx` — the caller deletes the exported `.md`s) AND hash-tracked
+    // (`fact_set_hash`) so the hourly pass re-reflects/GCs any rollup whose visible fact set changed.
+
+    /// Upsert ONE memory score row (idempotent per `fact_id` — the job re-scores every pass).
+    #[allow(clippy::too_many_arguments)] // a flat score row: id + scope + 4 floats + instant.
+    pub fn upsert_memory_score(
+        &self,
+        fact_id: &str,
+        scope: &str,
+        recency: f64,
+        importance: f64,
+        relevance: f64,
+        composite: f64,
+        scored_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO memory_scores \
+               (fact_id, scope, recency, importance, relevance, composite, scored_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(fact_id) DO UPDATE SET \
+               scope = excluded.scope, recency = excluded.recency, \
+               importance = excluded.importance, relevance = excluded.relevance, \
+               composite = excluded.composite, scored_at = excluded.scored_at",
+            rusqlite::params![fact_id, scope, recency, importance, relevance, composite, scored_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// All persisted memory scores as `(fact_id, importance)` — the job's "already assessed" set,
+    /// so the light-reasoner importance call runs ONLY for never-scored facts (steady-state passes
+    /// are LLM-free). Content-free read.
+    pub fn memory_importance_map(&self) -> Result<std::collections::HashMap<String, f64>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT fact_id, importance FROM memory_scores")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .map_err(map_err)?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (id, imp) = r.map_err(map_err)?;
+            out.insert(id, imp);
+        }
+        Ok(out)
+    }
+
+    /// Drop score rows whose fact is CLOSED (`valid_to` set — forgotten/superseded). Purged/deleted
+    /// facts cascade off the FK; closed facts are UPDATEs, so the job sweeps their scores here.
+    pub fn delete_memory_scores_for_closed_facts(&self) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM memory_scores WHERE fact_id IN \
+                   (SELECT id FROM user_facts WHERE valid_to IS NOT NULL)",
+                [],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
+    /// Upsert ONE rollup by `scope` (idempotent — a re-reflection replaces the content, keeps the
+    /// row id + `created_at`, bumps `updated_at`, and resets `exported_path` until re-exported).
+    /// `fact_set_hash` is the deterministic hash of the SORTED visible-open-fact id set the content
+    /// was synthesized from (`crate::memory::fact_set_hash`) — the hourly pass compares it to decide
+    /// re-reflection.
+    pub fn upsert_memory_rollup(
+        &self,
+        scope: &str,
+        content: &str,
+        fact_set_hash: &str,
+        now: &str,
+    ) -> Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO memory_rollups \
+               (id, scope, content, created_at, updated_at, exported_path, fact_set_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL, ?5) \
+             ON CONFLICT(scope) DO UPDATE SET \
+               content = excluded.content, updated_at = excluded.updated_at, \
+               exported_path = NULL, fact_set_hash = excluded.fact_set_hash",
+            rusqlite::params![id, scope, content, now, fact_set_hash],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete ONE rollup by `scope` (the hourly pass's GC of a no-longer-eligible scope), returning
+    /// its recorded `exported_path` so the caller can remove the exported vault `.md` (only ever
+    /// that recorded path). `Ok(None)` when the scope has no row or was never exported.
+    pub fn delete_memory_rollup(&self, scope: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let path: Option<Option<String>> = conn
+            .query_row(
+                "SELECT exported_path FROM memory_rollups WHERE scope = ?1",
+                rusqlite::params![scope],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        conn.execute(
+            "DELETE FROM memory_rollups WHERE scope = ?1",
+            rusqlite::params![scope],
+        )
+        .map_err(map_err)?;
+        Ok(path.flatten())
+    }
+
+    /// The persisted `facts.importance` assessments as `(fact_id, importance)` — the reflection
+    /// job's "already assessed" set for ENTITY facts (only never-assessed facts hit the reasoner,
+    /// so steady-state passes are LLM-free). Content-free read (ids + floats).
+    pub fn fact_importance_map(&self) -> Result<std::collections::HashMap<String, f64>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, importance FROM facts WHERE importance IS NOT NULL")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .map_err(map_err)?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (id, imp) = r.map_err(map_err)?;
+            out.insert(id, imp);
+        }
+        Ok(out)
+    }
+
+    /// Persist the batch-assessed importance (1–10) of ONE entity fact (`facts.importance`).
+    pub fn set_fact_importance(&self, fact_id: &str, importance: f64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE facts SET importance = ?2 WHERE id = ?1",
+            rusqlite::params![fact_id, importance],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Stamp the vault path a rollup was exported to (after the atomic `.md` write succeeded).
+    pub fn set_memory_rollup_exported(&self, scope: &str, path: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE memory_rollups SET exported_path = ?2 WHERE scope = ?1",
+            rusqlite::params![scope, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// All rollups, stable scope order (the export pass + tests).
+    pub fn list_memory_rollups(&self) -> Result<Vec<crate::storage::models::MemoryRollup>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, scope, content, created_at, updated_at, exported_path, fact_set_hash \
+                   FROM memory_rollups ORDER BY scope ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::storage::models::MemoryRollup {
+                    id: r.get(0)?,
+                    scope: r.get(1)?,
+                    content: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                    exported_path: r.get(5)?,
+                    fact_set_hash: r.get(6)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// All memory scores (tests + diagnostics). Content-free rows.
+    pub fn list_memory_scores(&self) -> Result<Vec<crate::storage::models::MemoryScore>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT fact_id, scope, recency, importance, relevance, composite, scored_at \
+                   FROM memory_scores ORDER BY fact_id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::storage::models::MemoryScore {
+                    fact_id: r.get(0)?,
+                    scope: r.get(1)?,
+                    recency: r.get(2)?,
+                    importance: r.get(3)?,
+                    relevance: r.get(4)?,
+                    composite: r.get(5)?,
+                    scored_at: r.get(6)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Persist ONE voiceprint (opt-in voice biometric) for a diarized cluster of `meeting_id`.
     /// `embedding` is the L2-normalized CAM++ vector; it is stored as a little-endian f32 BLOB.
     /// `label` is NULL initially (bound later on enroll-by-rename). NO PII is logged (the embedding,
@@ -7123,6 +7601,51 @@ fn fts_match_query(q: &str) -> Option<String> {
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" "),
+    )
+}
+
+/// The OR-joined twin of [`fts_match_query`]: the same tokenize-and-quote defusal, but terms are
+/// joined with `OR` instead of implicit AND. Used for RELEVANCE filtering (Brain v2 L2.2), where the
+/// "query" is a whole natural-language question and a short fact row should match on ANY shared
+/// content word — an AND over the full question would almost never match a 5-word fact. BM25 still
+/// ranks multi-term matches above single-term ones.
+///
+/// CONTENT WORDS ONLY: stopwords (the shared EN+PL list, `related_context::is_stopword` — one
+/// source of truth) and tokens shorter than 3 chars are DROPPED before the OR is built. Without
+/// this, a question sharing only "the"/"co"/"is" with an irrelevant fact produces a non-empty hit
+/// set that DISPLACES the caller's full-list fallback (the reproduced brief-displacement bug —
+/// unicode61 has no stopword list and BM25 cannot rescue a hit set whose only members are stopword
+/// matches). Empty / punctuation-only / all-stopword input yields `None` — the caller's fallback
+/// owns that case.
+fn fts_match_query_any(q: &str) -> Option<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in q.chars() {
+        if ch.is_alphanumeric() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            terms.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        terms.push(cur);
+    }
+    // Keep only content words: lowercase (FTS unicode61 case-folds anyway), then drop stopwords
+    // and <3-char tokens so a function-word overlap can never produce a "relevant" hit.
+    let terms: Vec<String> = terms
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .filter(|t| t.chars().count() >= 3 && !crate::summarize::related_context::is_stopword(t))
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(
+        terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
     )
 }
 
@@ -12330,6 +12853,162 @@ mod lock_tests {
             db.user_facts_all().unwrap().is_empty(),
             "FK CASCADE drops user facts"
         );
+    }
+
+    /// Brain v2 L2.2 (RED-first): `search_user_facts_visible` is BM25-relevance-filtered AND runs
+    /// the SAME visibility gate as `list_user_facts_visible` — a sealed-not-unlocked source
+    /// meeting's fact never matches, a session unlock re-admits it, only OPEN facts return, and an
+    /// empty/punctuation-only query returns nothing (the caller's fallback owns that case).
+    #[test]
+    fn search_user_facts_visible_is_relevance_filtered_and_gated() {
+        let db = file_db("user-facts-search");
+        seed_folder(&db, "f-s", "Secret");
+        seed_note(&db, "m-open", "open note", None);
+        seed_note(&db, "m-priv", "private note", Some("f-s"));
+        db.apply_user_fact_ops(&[
+            user_add_op("works on", "Project Atlas", "2026-07-01T00:00:00Z", "m-open"),
+            user_add_op("prefer", "Polish replies", "2026-07-01T00:00:00Z", "m-open"),
+            user_add_op("salary", "Atlas bonus", "2026-07-01T00:00:00Z", "m-priv"),
+        ])
+        .unwrap();
+        let none = HashSet::new();
+
+        // Relevance: an "atlas" query matches the two Atlas facts, not the Polish-replies one.
+        let hits = db.search_user_facts_visible("what about atlas?", 8, &none).unwrap();
+        assert_eq!(hits.len(), 2, "both atlas facts match while all folders are open");
+        assert!(hits.iter().all(|f| f.object.contains("Atlas")));
+
+        // Empty / punctuation-only query ⇒ no hits (fallback belongs to the caller).
+        assert!(db.search_user_facts_visible("", 8, &none).unwrap().is_empty());
+        assert!(db
+            .search_user_facts_visible("?!():", 8, &none)
+            .unwrap()
+            .is_empty());
+        // FIX 3: a STOPWORD-ONLY query is no query at all — it must return zero hits (so the
+        // caller's full-list fallback owns it), never a stopword-overlap "match".
+        assert!(db
+            .search_user_facts_visible("what about the", 8, &none)
+            .unwrap()
+            .is_empty());
+
+        // GATE: seal the private folder — its fact drops out of the SAME query.
+        db.set_folder_locked("f-s", true, None).unwrap();
+        let hits = db.search_user_facts_visible("atlas", 8, &none).unwrap();
+        assert_eq!(hits.len(), 1, "the sealed source's fact must not match");
+        assert_eq!(hits[0].meeting_id.as_deref(), Some("m-open"));
+
+        // A session unlock re-admits it (reversible gate).
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-s".to_string());
+        assert_eq!(
+            db.search_user_facts_visible("atlas", 8, &unlocked).unwrap().len(),
+            2
+        );
+
+        // Only OPEN facts: forget the open-folder Atlas fact → it stops matching.
+        let open_fact_id = db
+            .list_user_facts_visible(&none)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.object == "Project Atlas")
+            .unwrap()
+            .id;
+        db.forget_user_fact(&open_fact_id, "2026-07-02T00:00:00Z")
+            .unwrap();
+        assert!(
+            db.search_user_facts_visible("atlas", 8, &none).unwrap().is_empty(),
+            "a closed (forgotten) fact must not match"
+        );
+    }
+
+    /// Brain v2 L2.2 LOCK-AT-REST: the purge-on-seal DELETE and `delete_meeting` both remove the
+    /// fact's tokens from the `fts_user_facts` index (the `_ad` trigger fires on the direct
+    /// DELETE) — no sealed/deleted fact text survives as a searchable token. Mirrors
+    /// `sealed_tokens_purged_from_fts_after_blank` for the user-facts index.
+    #[test]
+    fn user_fact_tokens_purged_from_fts_on_seal_and_delete() {
+        let db = file_db("user-facts-fts-purge");
+        seed_note(&db, "m1", "note", None);
+        seed_note(&db, "m2", "note2", None);
+        db.apply_user_fact_ops(&[
+            user_add_op("codename", "Zenith", "2026-07-01T00:00:00Z", "m1"),
+            user_add_op("codename2", "Quasar", "2026-07-01T00:00:00Z", "m2"),
+        ])
+        .unwrap();
+        let fts_count = |term: &str| -> i64 {
+            let conn = db.lock();
+            conn.query_row(
+                "SELECT count(*) FROM fts_user_facts WHERE fts_user_facts MATCH ?1",
+                rusqlite::params![format!("\"{term}\"")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(fts_count("zenith"), 1);
+        assert_eq!(fts_count("quasar"), 1);
+
+        // Purge-on-seal path (the direct DELETE inside the seal tx).
+        db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert_eq!(fts_count("zenith"), 0, "sealed fact tokens must leave the index");
+
+        // delete_meeting path (explicit purge in-tx).
+        db.delete_meeting("m2").unwrap();
+        assert_eq!(fts_count("quasar"), 0, "deleted fact tokens must leave the index");
+    }
+
+    /// FIX 1a (CRITICAL leak — the DB half): every seal/delete transaction purges ALL
+    /// `memory_rollups` rows and returns their `exported_path`s for the caller's file deletion —
+    /// `purge_chunks_for_meetings` (lock_folder / move-into-locked), `blank_sealed_notes_in_folders`
+    /// (relock), `reblank_locked_folders_at_rest` (startup reconcile — purges ONLY when a locked
+    /// folder exists, so an open-only DB keeps its rollups across restarts), and `delete_meeting`.
+    /// RED on the pre-fix code: none of these touched `memory_rollups`.
+    #[test]
+    fn seal_paths_purge_memory_rollup_rows_and_return_export_paths() {
+        let db = file_db("rollup-purge-paths");
+        seed_folder(&db, "f1", "Secret");
+        seed_note(&db, "m1", "note", Some("f1"));
+        let seed_rollup = |db: &Db| {
+            db.upsert_memory_rollup("entity:e1", "synth", "h", "2026-07-09T12:00:00Z")
+                .unwrap();
+            db.set_memory_rollup_exported("entity:e1", "/vault/brain/memory/entity-e1.md")
+                .unwrap();
+        };
+
+        // lock_folder / move-into-locked chain.
+        seed_rollup(&db);
+        let paths = db.purge_chunks_for_meetings(&["m1".to_string()]).unwrap();
+        assert_eq!(paths, vec!["/vault/brain/memory/entity-e1.md".to_string()]);
+        assert!(db.list_memory_rollups().unwrap().is_empty());
+
+        // relock chain.
+        seed_rollup(&db);
+        let mut folders = HashSet::new();
+        folders.insert("f1".to_string());
+        let paths = db.blank_sealed_notes_in_folders(&folders).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(db.list_memory_rollups().unwrap().is_empty());
+
+        // Startup reconcile with NO locked folder ⇒ rollups SURVIVE (nothing sealed, no leak).
+        seed_rollup(&db);
+        let (_, paths) = db.reblank_locked_folders_at_rest().unwrap();
+        assert!(paths.is_empty());
+        assert_eq!(
+            db.list_memory_rollups().unwrap().len(),
+            1,
+            "an open-only DB keeps its rollups across restarts"
+        );
+
+        // Startup reconcile WITH a locked folder ⇒ purged.
+        db.set_folder_locked("f1", true, None).unwrap();
+        let (_, paths) = db.reblank_locked_folders_at_rest().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(db.list_memory_rollups().unwrap().is_empty());
+
+        // delete_meeting.
+        seed_rollup(&db);
+        let paths = db.delete_meeting("m1").unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(db.list_memory_rollups().unwrap().is_empty());
     }
 
     // ── Voiceprints: at-rest storage + LOCK invariants (mirror the user_facts tests exactly) ──────

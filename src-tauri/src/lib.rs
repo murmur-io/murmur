@@ -14,6 +14,7 @@ pub mod events;
 pub mod export;
 pub mod facts;
 pub mod mcp;
+pub mod memory;
 pub mod orchestrate;
 pub mod pipeline;
 pub mod proactive;
@@ -144,6 +145,7 @@ pub fn run() {
             commands::get_user_memory,
             commands::forget_user_fact,
             commands::clear_user_memory,
+            commands::import_memories,
             // Re-Truth (the vault heals itself) — supersession review + one-tap stamp + undo.
             commands::preview_supersessions,
             commands::apply_supersessions,
@@ -397,6 +399,33 @@ pub fn run() {
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(target: "rag", error = %e, "topic-chunk backfill failed");
+                        }
+                    }
+                });
+            }
+            // Brain v2 L2.1 — the HOURLY memory consolidation/reflection job. Each tick re-resolves
+            // everything from the LIVE AppState (the `memory_consolidation_enabled` +
+            // `user_memory_enabled` flags, the LIGHT local-or-stub reasoner — NEVER cloud, so zero
+            // egress — and the vault path), runs one `run_consolidation_pass` on a BLOCKING worker
+            // (the local reasoner is synchronous; the DB lock is never held across an LLM call),
+            // and warns-and-continues on any failure — the loop never exits. First tick is a full
+            // interval after launch (no startup Metal contention); a stub/light-model-absent tick
+            // is a cheap no-op inside `consolidation_tick`.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::memory::CONSOLIDATION_INTERVAL_SECS,
+                        ))
+                        .await;
+                        let tick_handle = handle.clone();
+                        let joined = tauri::async_runtime::spawn_blocking(move || {
+                            crate::memory::consolidation_tick(&tick_handle);
+                        })
+                        .await;
+                        if let Err(e) = joined {
+                            tracing::warn!(target: "memory", error = %e, "consolidation tick join failed");
                         }
                     }
                 });

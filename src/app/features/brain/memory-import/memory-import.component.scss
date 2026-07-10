@@ -1,0 +1,80 @@
+:host {
+  display: block;
+}
+.mi {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Small collapsible affordance under the memory card (mirrors .mem-toggle, quieter). */
+.mi-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-start;
+  padding: var(--space-1) 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+.mi-toggle:hover {
+  color: var(--text-primary);
+}
+.mi-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  border-radius: var(--radius-sm);
+}
+.mi-chevron {
+  flex: none;
+  transition: transform var(--transition);
+}
+.mi-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.mi-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.mi-hint {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+.mi-text {
+  width: 100%;
+  resize: vertical;
+  min-height: 96px;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+.mi-text:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.mi-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.mi-result {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}

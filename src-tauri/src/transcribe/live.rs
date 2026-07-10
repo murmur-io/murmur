@@ -736,8 +736,8 @@ fn run_informational(
         // it and steps up. This is "deterministic escalation, model-driven retrieval": which tools are
         // reachable is code-enforced, retrieval within a tier stays model-driven.
         if let Some(result) = run_cascade(
-            app, state, config, unlocked, meeting_id, loop_user, intent, tool_event, thread_id,
-            &*reasoner,
+            app, state, config, unlocked, meeting_id, command, loop_user, intent, tool_event,
+            thread_id, &*reasoner,
         ) {
             return result;
         }
@@ -950,6 +950,7 @@ fn run_cascade(
     config: &crate::settings::AppConfig,
     unlocked: &std::collections::HashSet<String>,
     meeting_id: &str,
+    command: &str,
     loop_user: &str,
     intent: &crate::audio::wake::VoiceIntent,
     tool_event: &'static str,
@@ -959,10 +960,12 @@ fn run_cascade(
     // Shared per-turn injected context (gated). Tier 1 leans on the live buffer + typed notes for the
     // CURRENT meeting (read through `gated_live_context`, fail-closed on the LIVE unlocked set); the
     // memory brief + recording flag ride along exactly as before. NO new egress class — every segment
-    // goes through the same RedactingProvider + cloud-consent gate.
+    // goes through the same RedactingProvider + cloud-consent gate. L2.2: the brief is relevance-
+    // filtered against the user's CURRENT command (`command`, never the whole rendered conversation).
     let (live, typed_notes) =
         gated_live_context(&state.db, &state.live_transcript, meeting_id, unlocked);
-    let memory_brief = gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled);
+    let memory_brief =
+        gated_user_memory_brief(&state.db, unlocked, config.user_memory_enabled, command);
     let recording_in_progress = state.recorder.lock().map(|g| g.is_some()).unwrap_or(false);
     let base_system =
         assistant_system_prompt(&live, &typed_notes, &memory_brief, recording_in_progress);
@@ -1621,16 +1624,20 @@ fn gated_live_context(
 /// `enabled` is the config `user_memory_enabled` master gate: when FALSE the brief is EMPTY (no read,
 /// no injection) — so turning memory off suppresses injection into the @brain loop too, identically
 /// to Ask / per-meeting chat.
+///
+/// Brain v2 L2.2: `query` is the user's CURRENT command/question — the brief is RELEVANCE-FILTERED
+/// (BM25 top-k over the SAME visible set via `build_memory_brief`); an empty query or zero hits
+/// falls back to the full-list brief, byte-identical to the pre-L2.2 behavior.
 fn gated_user_memory_brief(
     db: &crate::storage::Db,
     unlocked: &std::collections::HashSet<String>,
     enabled: bool,
+    query: &str,
 ) -> String {
     if !enabled {
         return String::new();
     }
-    let facts = db.list_user_facts_visible(unlocked).unwrap_or_default();
-    crate::user_memory::synthesize_brief(&facts)
+    crate::user_memory::build_memory_brief(db, query, unlocked)
 }
 
 /// Clear the accumulated live-transcript buffer. Called when a recording STOPS
@@ -3174,7 +3181,7 @@ mod tests {
 
         // While the folder is OPEN the fact is visible → the brief contains it.
         let mut unlocked = std::collections::HashSet::new();
-        let brief_open = gated_user_memory_brief(&db, &unlocked, true);
+        let brief_open = gated_user_memory_brief(&db, &unlocked, true, "");
         assert!(
             brief_open.contains("Polish replies"),
             "an open-folder user fact must be in the brief"
@@ -3195,7 +3202,7 @@ mod tests {
             visible_sealed.is_empty(),
             "a sealed-not-unlocked meeting's user fact must be INVISIBLE to the gated reader"
         );
-        let brief_sealed = gated_user_memory_brief(&db, &unlocked, true);
+        let brief_sealed = gated_user_memory_brief(&db, &unlocked, true, "");
         assert!(
             brief_sealed.is_empty(),
             "sealed-source fact must NOT appear in the injected brief"
@@ -3213,14 +3220,14 @@ mod tests {
         // A SESSION UNLOCK re-admits it (reversible gate).
         unlocked.insert("f1".to_string());
         assert!(
-            gated_user_memory_brief(&db, &unlocked, true).contains("Polish replies"),
+            gated_user_memory_brief(&db, &unlocked, true, "").contains("Polish replies"),
             "a session unlock must re-inject the user fact"
         );
 
         // FLAG OFF: even a VISIBLE, open-folder fact must NOT be injected when memory is disabled —
         // the brief is empty regardless of visibility, so the @brain loop injects nothing.
         assert!(
-            gated_user_memory_brief(&db, &unlocked, false).is_empty(),
+            gated_user_memory_brief(&db, &unlocked, false, "").is_empty(),
             "memory disabled must suppress the brief even for a visible fact"
         );
     }
