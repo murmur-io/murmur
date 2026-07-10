@@ -110,8 +110,12 @@ fn is_summary_heading(heading_line: &str) -> bool {
     let t = section_title(heading_line);
     const KEYS: &[&str] = &[
         // English
-        "summary", "tl;dr", "overview", // Polish
-        "podsumowanie", "streszczenie", "przegląd",
+        "summary",
+        "tl;dr",
+        "overview", // Polish
+        "podsumowanie",
+        "streszczenie",
+        "przegląd",
     ];
     KEYS.iter().any(|k| t.starts_with(k))
 }
@@ -171,7 +175,10 @@ fn strip_list_marker(trimmed: &str) -> &str {
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
     if digits > 0 {
         let after = &trimmed[digits..];
-        if let Some(r) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+        if let Some(r) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
             return r.trim_start();
         }
     }
@@ -372,7 +379,11 @@ fn gated_candidates(
     // MCP/Ask query path in `tools.rs`.
     match e.embed_query(std::slice::from_ref(&query.to_string())) {
         Ok(v) => match v.into_iter().next() {
-            Some(qv) if !qv.is_empty() => db.search_hybrid_visible(query, &qv, limit, unlocked),
+            // No temporal window here: the grounding query is a derived salient-term string, not
+            // a user question (a temporal phrase in it would be note prose, not intent).
+            Some(qv) if !qv.is_empty() => {
+                db.search_hybrid_visible(query, &qv, limit, unlocked, None)
+            }
             // Empty/degenerate query vector → FTS (never a stub-vector KNN).
             _ => db.search_visible(query, limit, unlocked),
         },
@@ -510,7 +521,14 @@ pub fn related_note_links(
 ) -> Result<Vec<ContextHit>> {
     // Activate semantic recall ONLY on real-model presence; else the embedder is None → FTS.
     let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    related_note_links_with_embedder(db, this_meeting_id, query, unlocked, max, embedder.as_deref())
+    related_note_links_with_embedder(
+        db,
+        this_meeting_id,
+        query,
+        unlocked,
+        max,
+        embedder.as_deref(),
+    )
 }
 
 /// Deterministic core of [`related_note_links`] with the embedder injected (so gating/semantic tests
@@ -775,9 +793,18 @@ mod tests {
             gist.contains("memory foam felt better"),
             "summary prose must be kept; got: {gist}"
         );
-        assert!(!gist.contains("Weronika"), "action items must be excluded; got: {gist}");
-        assert!(!gist.contains("foam samples"), "checklist tasks must be excluded; got: {gist}");
-        assert!(!gist.contains("Action items"), "the heading must not be in the gist; got: {gist}");
+        assert!(
+            !gist.contains("Weronika"),
+            "action items must be excluded; got: {gist}"
+        );
+        assert!(
+            !gist.contains("foam samples"),
+            "checklist tasks must be excluded; got: {gist}"
+        );
+        assert!(
+            !gist.contains("Action items"),
+            "the heading must not be in the gist; got: {gist}"
+        );
     }
 
     /// CORRECTION #3 (Polish leak), RED-before-GREEN: a Polish note whose FIRST section is a prose
@@ -788,8 +815,14 @@ mod tests {
     fn reference_gist_polish_decyzje_never_leaks() {
         let note = "## Decyzje\n\n- Weronika ma weryfikować rampę Alcon do piątku.\n\n## Notatki\n\nJakieś inne uwagi na później.\n";
         let gist = reference_gist(note);
-        assert!(!gist.contains("Weronika"), "PL decisions must not leak into the gist; got: {gist}");
-        assert!(!gist.contains("Alcon"), "PL decisions must not leak into the gist; got: {gist}");
+        assert!(
+            !gist.contains("Weronika"),
+            "PL decisions must not leak into the gist; got: {gist}"
+        );
+        assert!(
+            !gist.contains("Alcon"),
+            "PL decisions must not leak into the gist; got: {gist}"
+        );
         assert!(
             gist.contains("Jakieś inne uwagi"),
             "the first non-task prose must be the gist; got: {gist}"
@@ -806,7 +839,10 @@ mod tests {
             gist.contains("komforcie łóżka"),
             "PL summary prose must be kept; got: {gist}"
         );
-        assert!(!gist.contains("Weronika"), "PL tasks must not leak; got: {gist}");
+        assert!(
+            !gist.contains("Weronika"),
+            "PL tasks must not leak; got: {gist}"
+        );
     }
 
     /// Char-boundary-safe truncation: a long multi-byte (PL diacritic) summary is capped at 280
@@ -817,7 +853,10 @@ mod tests {
         let note = format!("## Summary\n\n{body}\n");
         let gist = reference_gist(&note);
         assert!(gist.chars().count() <= 280, "gist must be ≤ 280 chars");
-        assert!(gist.chars().count() >= 200, "a long summary must still produce a gist");
+        assert!(
+            gist.chars().count() >= 200,
+            "a long summary must still produce a gist"
+        );
     }
 
     // ── build_related_context: weak providers get NOTHING copyable ────────────────────────────────
@@ -827,7 +866,13 @@ mod tests {
     #[test]
     fn build_related_context_weak_provider_header_only() {
         let db = temp_db();
-        seed_note(&db, "this", "Bed Comfort", "unrelated bed comfort trial", None);
+        seed_note(
+            &db,
+            "this",
+            "Bed Comfort",
+            "unrelated bed comfort trial",
+            None,
+        );
         seed_note(
             &db,
             "prior",
@@ -840,8 +885,14 @@ mod tests {
         let (corpus, sources) =
             build_related_context(&db, "this", "bed comfort trial foam", &nothing, "ollama")
                 .unwrap();
-        assert!(corpus.contains("[[Bed Comfort Review]]"), "header must be cited; got: {corpus}");
-        assert!(corpus.contains("id:prior"), "header id must be cited; got: {corpus}");
+        assert!(
+            corpus.contains("[[Bed Comfort Review]]"),
+            "header must be cited; got: {corpus}"
+        );
+        assert!(
+            corpus.contains("id:prior"),
+            "header id must be cited; got: {corpus}"
+        );
         assert!(
             !corpus.contains("SUPERCOMFY"),
             "weak provider must NOT get the gist body; got: {corpus}"
@@ -857,7 +908,13 @@ mod tests {
     #[test]
     fn build_related_context_strong_provider_gets_gist() {
         let db = temp_db();
-        seed_note(&db, "this", "Bed Comfort", "unrelated bed comfort trial", None);
+        seed_note(
+            &db,
+            "this",
+            "Bed Comfort",
+            "unrelated bed comfort trial",
+            None,
+        );
         seed_note(
             &db,
             "prior",
@@ -869,7 +926,10 @@ mod tests {
         let (corpus, _sources) =
             build_related_context(&db, "this", "bed comfort trial foam", &nothing, "anthropic")
                 .unwrap();
-        assert!(corpus.contains("SUPERCOMFY"), "strong provider gets the gist prose; got: {corpus}");
+        assert!(
+            corpus.contains("SUPERCOMFY"),
+            "strong provider gets the gist prose; got: {corpus}"
+        );
         assert!(
             !corpus.contains("Weronika"),
             "even a strong provider never gets copyable action items; got: {corpus}"
@@ -887,7 +947,13 @@ mod tests {
     fn related_note_links_gated_self_excluded_and_task_free() {
         let db = temp_db();
         // The note we're linking FROM (its own content also matches the query → must be self-excluded).
-        seed_note(&db, "this", "Acquisition Talk", "PROJECT atlas acquisition terms roadmap", None);
+        seed_note(
+            &db,
+            "this",
+            "Acquisition Talk",
+            "PROJECT atlas acquisition terms roadmap",
+            None,
+        );
         seed_folder(&db, "f-locked", false);
         seed_note(
             &db,
@@ -900,13 +966,24 @@ mod tests {
 
         // Not session-unlocked → the sealed related note yields NO link, and "this" links nothing to itself.
         let nothing = HashSet::new();
-        let links = related_note_links(&db, "this", "PROJECT atlas acquisition roadmap", &nothing, 4).unwrap();
+        let links = related_note_links(
+            &db,
+            "this",
+            "PROJECT atlas acquisition roadmap",
+            &nothing,
+            4,
+        )
+        .unwrap();
         assert!(
-            links.iter().all(|h| h.url.as_deref() != Some("[[Secret Acquisition]]")),
+            links
+                .iter()
+                .all(|h| h.url.as_deref() != Some("[[Secret Acquisition]]")),
             "sealed-not-unlocked related note must not be linked (gate violation)"
         );
         assert!(
-            links.iter().all(|h| h.url.as_deref() != Some("[[Acquisition Talk]]")),
+            links
+                .iter()
+                .all(|h| h.url.as_deref() != Some("[[Acquisition Talk]]")),
             "a note must never be linked to itself"
         );
         assert!(
@@ -917,7 +994,14 @@ mod tests {
         // Session-unlock the folder → the related note is now legitimately linkable.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
-        let links2 = related_note_links(&db, "this", "PROJECT atlas acquisition roadmap", &unlocked, 4).unwrap();
+        let links2 = related_note_links(
+            &db,
+            "this",
+            "PROJECT atlas acquisition roadmap",
+            &unlocked,
+            4,
+        )
+        .unwrap();
         let link = links2
             .iter()
             .find(|h| h.url.as_deref() == Some("[[Secret Acquisition]]"))
@@ -940,9 +1024,17 @@ mod tests {
     fn related_note_links_empty_query_is_empty() {
         let db = temp_db();
         seed_note(&db, "this", "Standup", "daily standup notes", None);
-        seed_note(&db, "prior", "Old Standup", "## Summary\n\nolder standup summary\n", None);
+        seed_note(
+            &db,
+            "prior",
+            "Old Standup",
+            "## Summary\n\nolder standup summary\n",
+            None,
+        );
         let nothing = HashSet::new();
-        assert!(related_note_links(&db, "this", "", &nothing, 4).unwrap().is_empty());
+        assert!(related_note_links(&db, "this", "", &nothing, 4)
+            .unwrap()
+            .is_empty());
     }
 
     /// An empty query (transcript was all stopwords) yields an empty corpus — never a panic, never
