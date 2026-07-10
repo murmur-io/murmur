@@ -449,29 +449,61 @@
   background: var(--border-subtle);
 }
 
-/* Body textarea (document surface). */
+/* Body textarea (document surface) with CSS auto-grow. */
 .body-wrap {
   position: relative;
 }
-.body-area {
-  display: block;
+/* The grid mirror: the `::after` pseudo (fed by [data-value]="body()") renders the
+   SAME text HIDDEN and sizes the single grid cell; the textarea overlays + fills it.
+   Both share identical typography + box so they wrap line-for-line — the textarea
+   auto-grows with content with ZERO per-keystroke JS reflow (the old height:auto →
+   scrollHeight thrash was the typing-lag culprit). */
+.body-grow {
+  display: grid;
+}
+.body-grow::after {
+  content: attr(data-value) " ";
+  visibility: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+.body-grow > .body-area,
+.body-grow::after {
+  grid-area: 1 / 1 / 2 / 2;
   width: 100%;
   min-height: 60vh;
-  border: 0;
-  background: transparent;
-  color: var(--text-primary);
+  box-sizing: border-box;
   font: inherit;
   font-size: 1rem;
   line-height: 1.7;
+  padding: 0;
+  border: 0;
+  margin: 0;
+}
+.body-area {
+  display: block;
+  background: transparent;
+  color: var(--text-primary);
   resize: none;
   overflow: hidden;
-  padding: 0;
 }
 .body-area::placeholder {
   color: var(--text-muted);
 }
 .body-area:focus {
   outline: none;
+  box-shadow: none;
+}
+/* Make the selection clearly VISIBLE — it's the whole anchor the Brain popover acts
+   on. A strong accent highlight so you always see what's selected. */
+.body-area::selection {
+  background: color-mix(in srgb, var(--accent) 42%, transparent);
+  color: var(--text-primary);
+}
+.body-area::-moz-selection {
+  background: color-mix(in srgb, var(--accent) 42%, transparent);
+  color: var(--text-primary);
 }
 .slash-menu {
   position: absolute;

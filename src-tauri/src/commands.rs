@@ -1323,6 +1323,9 @@ pub fn update_note(
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the upsert.
+    let _lifecycle = lifecycle_guard(state.inner());
     // D4 READ/WRITE-GATE: refuse to mutate a sealed-and-not-session-unlocked meeting's note. Its
     // plaintext markdown is blanked while sealed, so an edit here would overwrite the (sealed)
     // content with the blanked value and corrupt it. Fail closed.
@@ -1337,16 +1340,22 @@ pub fn update_note(
         .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
 
     let created_at = chrono::Utc::now().to_rfc3339();
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.clone(),
-        provider_id: existing.provider_id.clone(),
-        markdown: markdown.clone(),
-        created_at,
-        exported_path: existing.exported_path.clone(),
-        model_requested: existing.model_requested.clone(),
-        model_served: existing.model_served.clone(),
-        gateway_host: existing.gateway_host.clone(),
-    })?;
+    // Seal-on-write (audit F1): an edit while the meeting's LOCKED folder is session-unlocked
+    // re-seals the fresh markdown into `content_blob` — otherwise the relock would restore the
+    // stale lock-time copy and destroy this edit. Open/rootless takes the plain upsert.
+    upsert_note_reseal_if_locked(
+        state.inner(),
+        &NoteRecord {
+            meeting_id: meeting_id.clone(),
+            provider_id: existing.provider_id.clone(),
+            markdown: markdown.clone(),
+            created_at,
+            exported_path: existing.exported_path.clone(),
+            model_requested: existing.model_requested.clone(),
+            model_served: existing.model_served.clone(),
+            gateway_host: existing.gateway_host.clone(),
+        },
+    )?;
 
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &markdown)?;
@@ -1452,6 +1461,9 @@ pub(crate) fn apply_note_verify_markers_inner(
     meeting_id: String,
     findings: Vec<crate::verify::VerifyFinding>,
 ) -> Result<NoteDto, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the upsert.
+    let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, &meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to edit the note".into(),
@@ -1478,21 +1490,25 @@ pub(crate) fn apply_note_verify_markers_inner(
     let marked = crate::verify::apply_verify_markers(&base, &findings);
     let as_of = chrono::Utc::now().to_rfc3339();
     let marked = crate::verify::apply_verify_callout(&marked, &findings, &as_of);
-    // Save + re-export — the exact `update_note` tail, with `marked`. Persisting via `upsert_note`
-    // keeps the callout in the CANONICAL DB note markdown so it SEALS with the note under the
-    // folder lock (the enrich.rs persistence lesson); the vault `.md` re-export follows when one
-    // exists.
+    // Save + re-export — the exact `update_note` tail, with `marked`. Persisting via the
+    // seal-on-write upsert keeps the callout in the CANONICAL DB note markdown so it SEALS with the
+    // note under the folder lock (the enrich.rs persistence lesson — and, for a session-unlocked
+    // LOCKED folder, the fresh markdown is re-sealed into `content_blob` in the same write); the
+    // vault `.md` re-export follows when one exists.
     let created_at = chrono::Utc::now().to_rfc3339();
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.clone(),
-        provider_id: existing.provider_id.clone(),
-        markdown: marked.clone(),
-        created_at,
-        exported_path: existing.exported_path.clone(),
-        model_requested: existing.model_requested.clone(),
-        model_served: existing.model_served.clone(),
-        gateway_host: existing.gateway_host.clone(),
-    })?;
+    upsert_note_reseal_if_locked(
+        state,
+        &NoteRecord {
+            meeting_id: meeting_id.clone(),
+            provider_id: existing.provider_id.clone(),
+            markdown: marked.clone(),
+            created_at,
+            exported_path: existing.exported_path.clone(),
+            model_requested: existing.model_requested.clone(),
+            model_served: existing.model_served.clone(),
+            gateway_host: existing.gateway_host.clone(),
+        },
+    )?;
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &marked)?;
     }
@@ -1658,16 +1674,21 @@ pub(crate) fn apply_note_enrichment_inner(
     let as_of = chrono::Utc::now().to_rfc3339();
     let enriched = crate::enrich::apply_context_markers(&existing.markdown, &hits, &as_of);
     let created_at = chrono::Utc::now().to_rfc3339();
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.clone(),
-        provider_id: existing.provider_id.clone(),
-        markdown: enriched.clone(),
-        created_at,
-        exported_path: existing.exported_path.clone(),
-        model_requested: existing.model_requested.clone(),
-        model_served: existing.model_served.clone(),
-        gateway_host: existing.gateway_host.clone(),
-    })?;
+    // Seal-on-write seam (audit F1): the sealed case was refused above, but a LOCKED folder whose
+    // note was never sealed (auto-filed while session-unlocked) still re-seals the fresh markdown.
+    upsert_note_reseal_if_locked(
+        state,
+        &NoteRecord {
+            meeting_id: meeting_id.clone(),
+            provider_id: existing.provider_id.clone(),
+            markdown: enriched.clone(),
+            created_at,
+            exported_path: existing.exported_path.clone(),
+            model_requested: existing.model_requested.clone(),
+            model_served: existing.model_served.clone(),
+            gateway_host: existing.gateway_host.clone(),
+        },
+    )?;
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &enriched)?;
     }
@@ -1769,16 +1790,21 @@ pub(crate) fn link_related_notes_inner(state: &AppState, meeting_id: &str) -> Re
         return Ok(());
     }
     let created_at = chrono::Utc::now().to_rfc3339();
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.to_string(),
-        provider_id: existing.provider_id.clone(),
-        markdown: linked.clone(),
-        created_at,
-        exported_path: existing.exported_path.clone(),
-        model_requested: existing.model_requested.clone(),
-        model_served: existing.model_served.clone(),
-        gateway_host: existing.gateway_host.clone(),
-    })?;
+    // Seal-on-write seam (audit F1): the sealed case was refused above, but a LOCKED folder whose
+    // note was never sealed (auto-filed while session-unlocked) still re-seals the fresh markdown.
+    upsert_note_reseal_if_locked(
+        state,
+        &NoteRecord {
+            meeting_id: meeting_id.to_string(),
+            provider_id: existing.provider_id.clone(),
+            markdown: linked.clone(),
+            created_at,
+            exported_path: existing.exported_path.clone(),
+            model_requested: existing.model_requested.clone(),
+            model_served: existing.model_served.clone(),
+            gateway_host: existing.gateway_host.clone(),
+        },
+    )?;
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &linked)?;
     }
@@ -1819,12 +1845,18 @@ pub(crate) fn save_manual_notes_inner(
     meeting_id: &str,
     text: &str,
 ) -> Result<(), AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the buffer write.
+    let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to edit your notes".into(),
         ));
     }
-    state.db.set_manual_notes(meeting_id, text)?;
+    // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh buffer into
+    // `manual_notes_blob` in the same write; open/rootless takes the plain update. Fail-closed on a
+    // missing session KEK.
+    set_manual_notes_reseal_if_locked(state, meeting_id, text)?;
     // PII rule: log only the meeting id + buffer length, never the typed text.
     tracing::debug!(target: "notes", meeting_id = %meeting_id, len = text.len(), "manual notes saved");
     Ok(())
@@ -2164,6 +2196,9 @@ pub(crate) fn create_note_inner(
     folder_id: Option<&str>,
     title: &str,
 ) -> Result<String, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+insert so a
+    // concurrent lock/relock cannot land between the unlock check and the row insert.
+    let _lifecycle = lifecycle_guard(state);
     // Resolve the anchor note-folder (default when None). ensure_default_note_folder is idempotent.
     let folder_id = match folder_id {
         Some(f) if !f.is_empty() => {
@@ -2191,6 +2226,11 @@ pub(crate) fn create_note_inner(
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis();
     state.db.insert_note(&id, &folder_id, &name, title, "", now)?;
+    // Seal-on-write (2026-07-10 audit F1): a note created in a session-unlocked LOCKED folder is
+    // sealed FROM BIRTH (a blob for the empty body), so the relock reblank — which rightly refuses
+    // to blank a blob-less row (never destroy the only copy) — always finds a durable sealed copy
+    // and never leaves this note's plaintext at rest. Open folders: a plain no-op rewrite.
+    reseal_document_if_locked(state, &folder_id, &id, title, "", now)?;
     // No chunks to index for an empty body — `update_note` re-indexes once the user writes.
     tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note created");
     Ok(id)
@@ -2256,6 +2296,9 @@ pub(crate) fn update_note_doc_inner(
     title: &str,
     markdown: &str,
 ) -> Result<NoteDoc, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the row write.
+    let _lifecycle = lifecycle_guard(state);
     let Some(row) = state.db.get_note_row(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
@@ -2269,7 +2312,10 @@ pub(crate) fn update_note_doc_inner(
     let title = title.trim();
     let title = if title.is_empty() { "Untitled" } else { title };
     let now = chrono::Utc::now().timestamp_millis();
-    state.db.update_note_row(id, title, markdown, now)?;
+    // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh text into
+    // `text_blob` in the same write; an open folder takes the plain update. Fail-closed on a
+    // missing session KEK.
+    reseal_document_if_locked(state, &row.folder_id, id, title, markdown, now)?;
 
     // WP3 — the note is a first-class brain source: purge the old chunks and re-index the new BODY
     // (front-matter stripped inside `index_note_body_chunks`). Chunks + FTS come back
@@ -2291,6 +2337,53 @@ pub(crate) fn update_note_doc_inner(
     get_note_inner(state, id)
 }
 
+/// FAST autosave path — persist the note's title + markdown + `updated_at` ONLY. NO re-chunk, NO
+/// re-embed, NO vault re-export: those are the expensive parts (the e5 embedder saturates the
+/// machine if run on every keystroke-pause) and are DEFERRED to [`update_note_doc`], which the FE
+/// runs on the natural boundaries (editor blur/close, Preview, explicit export/share). The frequent
+/// debounced autosave calls THIS so typing stays smooth even with the embed model present. WRITE-
+/// GATED exactly like the full update — a sealed-and-not-session-unlocked note is refused (never
+/// write plaintext behind a lock). The DB text is canonical, so nothing is lost if the app closes
+/// before the next full update. Returns the new `updated_at` (epoch ms) so the FE reconciles its
+/// indicator without a full DTO round-trip.
+#[tauri::command]
+pub fn save_note_text(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+    markdown: String,
+) -> Result<i64, AppError> {
+    save_note_text_inner(state.inner(), &id, &title, &markdown)
+}
+
+/// Inner of [`save_note_text`] taking `&AppState` (unit-testable gate).
+pub(crate) fn save_note_text_inner(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<i64, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the row write.
+    let _lifecycle = lifecycle_guard(state);
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Err(AppError::Locked(
+            "this note is locked — unlock its folder to edit it".into(),
+        ));
+    }
+    let title = title.trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
+    let now = chrono::Utc::now().timestamp_millis();
+    // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh text into
+    // `text_blob` in the same write; an open folder takes the plain update. Fail-closed on a
+    // missing session KEK.
+    reseal_document_if_locked(state, &row.folder_id, id, title, markdown, now)?;
+    Ok(now)
+}
+
 /// Move a note to a different note-folder. GATED on BOTH the source and target folder-unlock (never
 /// leave plaintext in a locked folder, never move out of a sealed one). Re-exports into the new
 /// folder path (the old vault file is removed by the export path's move). Idempotent.
@@ -2309,6 +2402,9 @@ pub(crate) fn move_note_doc_inner(
     id: &str,
     folder_id: &str,
 ) -> Result<(), AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across the double gate + the
+    // reassign/seal writes so a concurrent lock/relock cannot land mid-move.
+    let _lifecycle = lifecycle_guard(state);
     let Some(row) = state.db.get_note_row(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
@@ -2337,6 +2433,23 @@ pub(crate) fn move_note_doc_inner(
     }
     state.db.set_note_doc_folder(id, folder_id)?;
     state.db.set_note_doc_exported_path(id, None)?;
+    // Seal alignment (2026-07-10 audit F1): the seal blob must always match the OWNING folder's CK.
+    // Moving INTO a session-unlocked LOCKED folder re-seals the plaintext under the TARGET folder's
+    // CK (fail-closed on a missing session KEK); moving into an OPEN folder clears any stale blob
+    // from the previous folder's CK (the plaintext column is canonical again — a stale blob would
+    // be undecryptable under a future lock of the new folder and could shadow fresh content).
+    let target_locked = state
+        .db
+        .folder_by_id(folder_id)?
+        .map(|f| f.locked)
+        .unwrap_or(false);
+    if target_locked {
+        let title = row.title.clone().unwrap_or_else(|| row.name.clone());
+        let updated_at = row.updated_at.unwrap_or(row.created_at);
+        reseal_document_if_locked(state, folder_id, id, &title, &row.text, updated_at)?;
+    } else if row.sealed {
+        state.db.clear_document_blob(id)?;
+    }
     if let Err(e) = export_note_to_vault(state, id) {
         tracing::warn!(target: "notes", error = %e, "note re-export after move failed (moved in db)");
     }
@@ -3619,6 +3732,9 @@ pub fn patch_note_tasks(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<NoteDto, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the upsert.
+    let _lifecycle = lifecycle_guard(state.inner());
     // D4 WRITE-GATE: refuse to rewrite a sealed-and-not-unlocked meeting's note (its plaintext is
     // blanked; patching would persist the blanked value over the sealed content). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
@@ -3632,16 +3748,20 @@ pub fn patch_note_tasks(
         .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
     let patched = crate::summarize::action_items::patch_tasks_markdown(&existing.markdown);
     let created_at = chrono::Utc::now().to_rfc3339();
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.clone(),
-        provider_id: existing.provider_id.clone(),
-        markdown: patched.clone(),
-        created_at,
-        exported_path: existing.exported_path.clone(),
-        model_requested: existing.model_requested.clone(),
-        model_served: existing.model_served.clone(),
-        gateway_host: existing.gateway_host.clone(),
-    })?;
+    // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the patched markdown.
+    upsert_note_reseal_if_locked(
+        state.inner(),
+        &NoteRecord {
+            meeting_id: meeting_id.clone(),
+            provider_id: existing.provider_id.clone(),
+            markdown: patched.clone(),
+            created_at,
+            exported_path: existing.exported_path.clone(),
+            model_requested: existing.model_requested.clone(),
+            model_served: existing.model_served.clone(),
+            gateway_host: existing.gateway_host.clone(),
+        },
+    )?;
     if let Some(path) = existing.exported_path.as_deref() {
         crate::export::overwrite_note(std::path::Path::new(path), &patched)?;
     }
@@ -3770,6 +3890,9 @@ pub fn pin_moment(
     seconds: f64,
     label: String,
 ) -> Result<PinResult, AppError> {
+    // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
+    // concurrent relock/seal cannot land between the unlock check and the upsert.
+    let _lifecycle = lifecycle_guard(state.inner());
     // BLK-2b WRITE-GATE: refuse to pin into a sealed-and-not-unlocked meeting's note — its plaintext
     // markdown is blanked, so appending a pin would persist the blanked value over the sealed
     // content AND re-export a plaintext `.md`. Fail closed.
@@ -3787,16 +3910,20 @@ pub fn pin_moment(
     let mmss = format!("{}:{:02}", secs / 60, secs % 60);
     let new_md = crate::export::append_pin(&existing.markdown, &mmss, &label, &block_id);
     let created_at = chrono::Utc::now().to_rfc3339();
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.clone(),
-        provider_id: existing.provider_id.clone(),
-        markdown: new_md.clone(),
-        created_at,
-        exported_path: existing.exported_path.clone(),
-        model_requested: existing.model_requested.clone(),
-        model_served: existing.model_served.clone(),
-        gateway_host: existing.gateway_host.clone(),
-    })?;
+    // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the pinned markdown.
+    upsert_note_reseal_if_locked(
+        state.inner(),
+        &NoteRecord {
+            meeting_id: meeting_id.clone(),
+            provider_id: existing.provider_id.clone(),
+            markdown: new_md.clone(),
+            created_at,
+            exported_path: existing.exported_path.clone(),
+            model_requested: existing.model_requested.clone(),
+            model_served: existing.model_served.clone(),
+            gateway_host: existing.gateway_host.clone(),
+        },
+    )?;
     let url = match existing.exported_path.as_deref() {
         Some(path) => {
             crate::export::overwrite_note(std::path::Path::new(path), &new_md)?;
@@ -10997,6 +11124,148 @@ fn folder_is_unlocked(state: &AppState, folder_id: &str) -> Result<bool, AppErro
     Ok(unlocked.contains(folder_id))
 }
 
+// ── SEAL-ON-WRITE (2026-07-10 lock-audit F1) ─────────────────────────────────────────────────────
+//
+// Content WRITTEN while a locked folder is session-unlocked must be re-sealed under the folder CK
+// AT WRITE TIME. The relock/reblank paths re-blank plaintext and keep the *_blob as the durable
+// copy — so a plaintext-only write against a stale blob is CONTENT LOSS on the next relock, and a
+// blob-less write (a note created while unlocked) is a PLAINTEXT LEAK at rest (the reblank guards on
+// `blob IS NOT NULL` and rightly never blanks the only copy). These helpers give every write path
+// one seam: open folder → the plain write; locked folder → encrypt the FRESH content, VERIFY it
+// decrypts back byte-identical (verify-before-destroy), then persist plaintext + fresh blob in one
+// atomic statement. FAIL-CLOSED: no session-cached KEK ⇒ `AppError::Locked` — never silently
+// persist unsealable plaintext behind a lock.
+
+/// Unwrap a LOCKED folder's content key from the SESSION-cached master KEK (set by `unlock_folder`
+/// / `remove_lock`; zeroized by `relock_all_inner`). FAIL-CLOSED: with no cached KEK this returns
+/// `AppError::Locked` — a background write path must never pop a Touch ID prompt, and must never
+/// fall back to writing unsealed plaintext into a locked folder. The unwrap is AAD-bound to the
+/// folder id exactly like `unlock_folder`'s (legacy empty-AAD fallback lives inside
+/// `crypto::decrypt`).
+fn session_folder_ck(state: &AppState, folder_id: &str) -> Result<Zeroizing<[u8; 32]>, AppError> {
+    let wrapped = state
+        .db
+        .folder_wrapped_key(folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+    let kek: Zeroizing<[u8; 32]> = {
+        let g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        g.clone().ok_or_else(|| {
+            AppError::Locked("folder key unavailable — unlock the folder again".into())
+        })?
+    };
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
+        &kek,
+        &wrapped,
+        &aad_wrapped_ck(folder_id),
+    )?);
+    Ok(Zeroizing::new(ck_bytes.as_slice().try_into().map_err(
+        |_| AppError::Storage("unwrapped content key has wrong length".into()),
+    )?))
+}
+
+/// Persist an authored note's `title`+`text`+`updated_at`, RE-SEALING the fresh text into
+/// `text_blob` when the owning folder is LOCKED (it is session-unlocked, or the caller's write gate
+/// already refused). Open folder → the plain [`Db::update_note_row`]. Locked folder → encrypt under
+/// the folder CK with the SAME AAD the folder seal uses (`aad_document`), VERIFY the blob decrypts
+/// back byte-identical, then write plaintext + fresh blob atomically
+/// ([`Db::update_note_row_sealed`]) — so relock re-blanks to THIS write, never a stale copy.
+/// FAIL-CLOSED via [`session_folder_ck`]. Callers hold the lifecycle guard across gate+write.
+fn reseal_document_if_locked(
+    state: &AppState,
+    folder_id: &str,
+    doc_id: &str,
+    title: &str,
+    text: &str,
+    updated_at: i64,
+) -> Result<(), AppError> {
+    let locked = state
+        .db
+        .folder_by_id(folder_id)?
+        .map(|f| f.locked)
+        .unwrap_or(false);
+    if !locked {
+        return state.db.update_note_row(doc_id, title, text, updated_at);
+    }
+    let ck = session_folder_ck(state, folder_id)?;
+    let aad = aad_document(folder_id, doc_id);
+    let blob = crate::crypto::encrypt(&ck, text.as_bytes(), &aad)?;
+    if crate::crypto::decrypt(&ck, &blob, &aad)? != text.as_bytes() {
+        return Err(AppError::Storage(
+            "note seal-on-write verification failed (blob mismatch)".into(),
+        ));
+    }
+    state
+        .db
+        .update_note_row_sealed(doc_id, title, text, &blob, updated_at)?;
+    tracing::debug!(target: "lock", note_id = %doc_id, "seal-on-write: authored note re-sealed under the folder CK");
+    Ok(())
+}
+
+/// Persist a meeting note row, RE-SEALING the fresh markdown into `content_blob` when the meeting's
+/// folder is LOCKED (session-unlocked, or the caller's gate already refused). Open/rootless meeting
+/// → the plain [`Db::upsert_note`]. Locked → encrypt under the folder CK with the SAME AAD the
+/// folder seal uses (`aad_content(..,"note")`), VERIFY byte-identical, then upsert plaintext + fresh
+/// blob + the governing `folder_id` atomically ([`Db::upsert_note_sealed`]) — so relock re-blanks to
+/// THIS markdown, and a NEW provider row created while unlocked is governed (and sealed) from birth.
+/// FAIL-CLOSED via [`session_folder_ck`]. `pub(crate)` for the pipeline's (re)summarize persist.
+pub(crate) fn upsert_note_reseal_if_locked(
+    state: &AppState,
+    note: &NoteRecord,
+) -> Result<(), AppError> {
+    let locked_folder = match state.db.folder_for_meeting(&note.meeting_id)? {
+        Some(fid) => state.db.folder_by_id(&fid)?.filter(|f| f.locked),
+        None => None,
+    };
+    let Some(folder) = locked_folder else {
+        return state.db.upsert_note(note);
+    };
+    let ck = session_folder_ck(state, &folder.id)?;
+    let aad = aad_content(&folder.id, &note.meeting_id, &note.provider_id, "note");
+    let blob = crate::crypto::encrypt(&ck, note.markdown.as_bytes(), &aad)?;
+    if crate::crypto::decrypt(&ck, &blob, &aad)? != note.markdown.as_bytes() {
+        return Err(AppError::Storage(
+            "note seal-on-write verification failed (blob mismatch)".into(),
+        ));
+    }
+    state.db.upsert_note_sealed(note, &blob, &folder.id)?;
+    tracing::debug!(target: "lock", meeting_id = %note.meeting_id, "seal-on-write: meeting note re-sealed under the folder CK");
+    Ok(())
+}
+
+/// Persist the meeting's typed-notes buffer, RE-SEALING the fresh text into `manual_notes_blob`
+/// when the meeting's folder is LOCKED (session-unlocked, or the caller's gate already refused).
+/// Open/rootless → the plain [`Db::set_manual_notes`]. Locked → encrypt under the folder CK with
+/// the SAME AAD the folder seal uses (`aad_content(.., "manual_notes")`), VERIFY byte-identical,
+/// then write plaintext + fresh blob atomically ([`Db::set_manual_notes_sealed`]). FAIL-CLOSED via
+/// [`session_folder_ck`].
+fn set_manual_notes_reseal_if_locked(
+    state: &AppState,
+    meeting_id: &str,
+    text: &str,
+) -> Result<(), AppError> {
+    let locked_folder = match state.db.folder_for_meeting(meeting_id)? {
+        Some(fid) => state.db.folder_by_id(&fid)?.filter(|f| f.locked),
+        None => None,
+    };
+    let Some(folder) = locked_folder else {
+        return state.db.set_manual_notes(meeting_id, text);
+    };
+    let ck = session_folder_ck(state, &folder.id)?;
+    let aad = aad_content(&folder.id, meeting_id, AAD_NO_PROVIDER, "manual_notes");
+    let blob = crate::crypto::encrypt(&ck, text.as_bytes(), &aad)?;
+    if crate::crypto::decrypt(&ck, &blob, &aad)? != text.as_bytes() {
+        return Err(AppError::Storage(
+            "manual-notes seal-on-write verification failed (blob mismatch)".into(),
+        ));
+    }
+    state.db.set_manual_notes_sealed(meeting_id, text, &blob)?;
+    tracing::debug!(target: "lock", meeting_id = %meeting_id, "seal-on-write: typed notes re-sealed under the folder CK");
+    Ok(())
+}
+
 /// The configured vault path (non-empty), or `None`. Takes `&AppState` (callers holding a
 /// `tauri::State` pass `&state`, which Deref-coerces) so the `&AppState` inner cores can call it too.
 fn vault_path(state: &AppState) -> Option<String> {
@@ -15915,7 +16184,7 @@ mod lifecycle_tests {
             "sealed-not-unlocked read must mask the buffer, never leak it"
         );
 
-        // Session-unlock the folder ⇒ both read and write work again.
+        // Session-unlock the folder ⇒ the READ works again.
         state
             .unlocked_folders
             .lock()
@@ -15925,10 +16194,20 @@ mod lifecycle_tests {
             get_manual_notes_inner(&state, "m1").unwrap(),
             "secret typed plaintext"
         );
-        save_manual_notes_inner(&state, "m1", "edited after unlock").unwrap();
+        // 2026-07-10 audit F1 (seal-on-write, fail-closed): a WRITE into a session-unlocked LOCKED
+        // folder must re-seal under the folder CK — this fixture has a garbage wrapped key and NO
+        // session-cached KEK (a shape the production unlock can never produce), so the write is
+        // REFUSED rather than persisted as unsealable plaintext. The happy path (real seal, cached
+        // KEK) is covered by `manual_notes_edit_during_session_unlock_survives_relock`.
+        let err = save_manual_notes_inner(&state, "m1", "edited after unlock").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less write into a locked folder must fail closed, got {err:?}"
+        );
         assert_eq!(
             get_manual_notes_inner(&state, "m1").unwrap(),
-            "edited after unlock"
+            "secret typed plaintext",
+            "the refused write must not have mutated the buffer"
         );
     }
 
@@ -16575,15 +16854,15 @@ mod lifecycle_tests {
     }
 
     /// WP0 — create_note into a SEALED-and-not-session-unlocked note-folder is REFUSED with Locked
-    /// (never resurrect plaintext behind a lock). Session-unlocking the folder allows it.
+    /// (never resurrect plaintext behind a lock). Session-unlocking the folder allows it — and
+    /// (2026-07-10 audit F1) the note created while unlocked is SEALED FROM BIRTH. The seal is a
+    /// REAL `lock_folder_inner` seal (seal-on-write needs the real wrapped key + the session KEK the
+    /// production unlock caches, not a garbage-blob fixture).
     #[test]
     fn create_note_refused_when_target_folder_sealed() {
         let state = build_state("note-create-sealed");
         let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
-        state
-            .db
-            .set_folder_locked(&fid, true, Some(&b"wrapped"[..]))
-            .unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
 
         assert!(
             matches!(
@@ -16593,14 +16872,14 @@ mod lifecycle_tests {
             "sealed-not-unlocked target folder refuses a new note"
         );
 
-        // Session-unlock ⇒ allowed.
-        state
-            .unlocked_folders
-            .lock()
-            .unwrap()
-            .insert(fid.clone());
+        // Session-unlock (KEK cached exactly like the production unlock) ⇒ allowed.
+        let _ck = session_unlock(&state, &fid);
         let id = create_note_inner(&state, Some(&fid), "n").unwrap();
         assert!(!id.is_empty());
+        assert!(
+            state.db.get_note_row(&id).unwrap().unwrap().sealed,
+            "a note created in a session-unlocked LOCKED folder is sealed from birth"
+        );
     }
 
     /// WP0 gate — a note in a SEALED-and-not-session-unlocked folder MUST be MASKED: `get_note`
@@ -16764,6 +17043,46 @@ mod lifecycle_tests {
         );
     }
 
+    /// PERF two-tier save: `save_note_text` (the cheap frequent-autosave path) PERSISTS the body +
+    /// updated_at but does NOT re-chunk/re-embed (no `doc_chunks`) or re-export — so typing never
+    /// triggers the e5 re-embed. The deferred `update_note_doc` (blur/close/preview) is what indexes.
+    #[test]
+    fn save_note_text_persists_without_reindexing() {
+        let state = build_state("note-save-text");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+
+        // Cheap save: body persisted + retrievable via get_note, updated_at set…
+        let now =
+            save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        let doc = get_note_inner(&state, &id).unwrap();
+        assert_eq!(doc.markdown, "Alpha bravo cheap-save body.");
+        assert_eq!(doc.updated_at, now);
+
+        // …but it must NOT index (no doc_chunks) — the re-embed is deferred.
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "cheap save must NOT re-index (no doc_chunks) — the e5 re-embed is deferred"
+        );
+        let unlocked = HashSet::new();
+        assert!(
+            state
+                .db
+                .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+                .unwrap()
+                .is_empty(),
+            "cheap-saved body is not searchable until the deferred full save indexes it"
+        );
+
+        // The deferred full save DOES index it (proves the two-tier design end-to-end).
+        update_note_doc_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "the deferred full update re-indexes the note"
+        );
+    }
+
     /// WP1 — export_note writes `<vault>/Notes/<title>.md`, records exported_path, and on LOCK the
     /// vault `.md` is deleted + exported_path NULLed (a sealed note leaves no plaintext on disk).
     #[test]
@@ -16853,6 +17172,246 @@ mod lifecycle_tests {
                 .unwrap()
                 .is_empty(),
             "relock NULLs exported_path again"
+        );
+    }
+
+    // ── 2026-07-10 lock-audit: SEAL-ON-WRITE (content written while session-unlocked) ─────────────
+
+    /// Session-unlock a just-locked folder the way `unlock_folder` does — KEK → unwrap CK → unseal
+    /// the extras → add to the unlock set → CACHE the KEK (the production unlock always caches it;
+    /// seal-on-write depends on that cache). Returns the CK so a test can re-unseal after a relock.
+    fn session_unlock(state: &AppState, fid: &str) -> [u8; 32] {
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(state, fid, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(fid.to_string());
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        ck
+    }
+
+    /// CRITICAL content-loss (RED-before-GREEN, 2026-07-10 audit F1): an autosave edit made WHILE the
+    /// locked folder is session-unlocked must be RE-SEALED at write time — before the fix the write
+    /// landed plaintext-only against the STALE lock-time blob, so relock blanked the plaintext and the
+    /// next unlock restored the OLD text (the edit was silently destroyed).
+    #[test]
+    fn edits_during_session_unlock_survive_relock_roundtrip() {
+        let state = build_state("seal-on-write-edit");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "T0 original").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let ck = session_unlock(&state, &fid);
+        // The FAST autosave edit while session-unlocked (the fixed write path).
+        save_note_text_inner(&state, &id, "Plan", "T1 edited under session unlock").unwrap();
+
+        // RELOCK (command-layer shape: drop from the unlock set + reblank the extras).
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+        let at_rest = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(at_rest.text, "", "plaintext re-blanked at rest after relock");
+        assert!(at_rest.sealed, "seal blob present at rest");
+
+        // UNLOCK again: the EDIT must come back — not the stale lock-time seal.
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().text,
+            "T1 edited under session unlock",
+            "an edit made while session-unlocked must survive the relock round-trip byte-identical"
+        );
+    }
+
+    /// CRITICAL leak (RED-before-GREEN, 2026-07-10 audit F1): a note CREATED (and written) while the
+    /// locked folder is session-unlocked must be sealed FROM BIRTH. Before the fix it had NO blob, so
+    /// the relock reblank (guarded on `text_blob IS NOT NULL`) left its plaintext at rest behind the
+    /// lock forever.
+    #[test]
+    fn note_created_while_unlocked_is_sealed_at_rest() {
+        let state = build_state("seal-on-create");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let ck = session_unlock(&state, &fid);
+        let id = create_note_inner(&state, Some(&fid), "Born locked").unwrap();
+        update_note_doc_inner(&state, &id, "Born locked", "T1 secret body").unwrap();
+        assert!(
+            state.db.get_note_row(&id).unwrap().unwrap().sealed,
+            "a note written into a session-unlocked LOCKED folder carries a fresh seal blob from birth"
+        );
+
+        // RELOCK: NO plaintext at rest (the pre-fix leak), blob present.
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+        let at_rest = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(
+            at_rest.text, "",
+            "a note created while session-unlocked must leave NO plaintext at rest after relock"
+        );
+        assert!(at_rest.sealed, "seal blob present at rest");
+
+        // UNLOCK: byte-identical restore.
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().text,
+            "T1 secret body",
+            "the created-while-unlocked note restores byte-identical"
+        );
+    }
+
+    /// FAIL-CLOSED (RED-before-GREEN, 2026-07-10 audit F1): a write into a session-unlocked LOCKED
+    /// folder with NO cached master KEK (so the folder CK cannot be unwrapped to re-seal) must be
+    /// REFUSED with `AppError::Locked` — never silently persisted as unsealed plaintext.
+    #[test]
+    fn write_refused_when_kek_unavailable() {
+        let state = build_state("seal-on-write-no-kek");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "T0 original").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let _ck = session_unlock(&state, &fid);
+        // The session cache is gone (e.g. a relock-all zeroized it) but the unlock set still has the
+        // folder — the write must fail closed rather than write unsealable plaintext.
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = save_note_text_inner(&state, &id, "Plan", "T1 must not land").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less write into a locked folder must be AppError::Locked, got {err:?}"
+        );
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().text,
+            "T0 original",
+            "the refused write must not have mutated the note"
+        );
+    }
+
+    /// PINNED behavior: once the folder is relocked (dropped from the unlock set) any note write is
+    /// refused with `AppError::Locked`. The gate+write now sits under the lifecycle guard, so a
+    /// relock cannot interleave between the check and the write (serialization-by-construction).
+    #[test]
+    fn write_after_relock_is_refused() {
+        let state = build_state("write-after-relock");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "T0 original").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let _ck = session_unlock(&state, &fid);
+
+        // RELOCK: drop the session unlock; the write gate must refuse from here on.
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+
+        let err = save_note_text_inner(&state, &id, "Plan", "T1 after relock").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a write after relock must be AppError::Locked, got {err:?}"
+        );
+    }
+
+    /// SEAL-ON-WRITE for the typed in-meeting notes twin (2026-07-10 audit F1): an edit to
+    /// `manual_notes` while the meeting's locked folder is session-unlocked must re-seal the fresh
+    /// buffer — before the fix the stale lock-time blob survived and the next unlock restored the OLD
+    /// buffer (the edit was destroyed).
+    #[test]
+    fn manual_notes_edit_during_session_unlock_survives_relock() {
+        let state = build_state("manual-notes-seal-on-write");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        state.db.set_manual_notes("m1", "T0 typed").unwrap();
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let ck = session_unlock(&state, "f-lock");
+        save_manual_notes_inner(&state, "m1", "T1 edited under session unlock").unwrap();
+
+        // RELOCK, then UNLOCK: the edit must come back, not the stale T0 seal.
+        state.unlocked_folders.lock().unwrap().remove("f-lock");
+        reblank_folder_extras(&state, "f-lock").unwrap();
+        assert_eq!(
+            state.db.raw_manual_notes("m1").unwrap().unwrap().text,
+            "",
+            "typed buffer re-blanked at rest after relock"
+        );
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            "T1 edited under session unlock",
+            "a typed-notes edit made while session-unlocked must survive the relock round-trip"
+        );
+    }
+
+    /// SEAL-ON-WRITE for the meeting-note upsert (2026-07-10 audit F1): an in-app `update_note`-shaped
+    /// edit while the meeting's locked folder is session-unlocked must re-seal the fresh markdown into
+    /// `content_blob` — before the fix the stale lock-time blob survived and the next unlock restored
+    /// the OLD markdown (the edit was destroyed).
+    #[test]
+    fn meeting_note_edit_during_session_unlock_survives_relock() {
+        let state = build_state("meeting-note-seal-on-write");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "T0 note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let ck = session_unlock(&state, "f-lock");
+        // Restore the note markdown for the session, exactly like `unlock_folder` does before extras.
+        {
+            let notes = state.db.notes_in_folder("f-lock").unwrap();
+            for n in &notes {
+                let blob = n.content_blob.as_ref().unwrap();
+                let aad = aad_content("f-lock", &n.meeting_id, &n.provider_id, "note");
+                let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .unwrap();
+            }
+        }
+
+        // The `update_note` write tail (gate passed — session-unlocked) with fresh markdown. RED ran
+        // this through the raw `db.upsert_note` production used pre-fix; production now routes every
+        // meeting-note upsert through this seal-on-write seam.
+        let existing = state.db.get_latest_note_for_meeting("m1").unwrap().unwrap();
+        upsert_note_reseal_if_locked(
+            &state,
+            &NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: existing.provider_id.clone(),
+                markdown: "T1 edited under session unlock".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            },
+        )
+        .unwrap();
+
+        // RELOCK, then decrypt the blob directly: it must carry T1, not the stale T0.
+        state.unlocked_folders.lock().unwrap().remove("f-lock");
+        let mut one = HashSet::new();
+        one.insert("f-lock".to_string());
+        state.db.blank_sealed_notes_in_folders(&one).unwrap();
+        reblank_folder_extras(&state, "f-lock").unwrap();
+
+        let sealed = state
+            .db
+            .notes_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.meeting_id == "m1")
+            .unwrap();
+        assert_eq!(sealed.markdown, "", "markdown re-blanked at rest");
+        let blob = sealed.content_blob.expect("sealed blob present at rest");
+        let aad = aad_content("f-lock", "m1", &sealed.provider_id, "note");
+        let pt = crate::crypto::decrypt(&ck, &blob, &aad).unwrap();
+        assert_eq!(
+            String::from_utf8(pt).unwrap(),
+            "T1 edited under session unlock",
+            "the sealed blob must carry the FRESH markdown, not the stale lock-time copy"
         );
     }
 
