@@ -134,3 +134,9 @@
 - **Caught by:** adversarial-verifier (`.claude/tmp/brain-p0-hotfixes/adversarial-verify.json`, MAJOR) — builder's tests were green; the regression was on paths the new tests didn't cover.
 - **Lesson:** carry per-call bounds IN the options struct (`GenOptions.timeout: Option<Duration>`, default None = old behavior; presets opt in), never as a blanket const at the lowest layer. Before bounding a shared seam, enumerate every caller class (live / notes / floor / background extraction) and ask which of them legitimately exceeds the bound.
 - **Status:** journal
+
+### [2026-07-10 brain-l1-retrieval] MSRV-gated std items: no `LazyLock` — use the repo's `OnceLock` accessor pattern
+- **Pattern:** new module used `std::sync::LazyLock` for static regexes; `cargo test --lib` was green but the ci.sh clippy `-D warnings` stage failed with 36 MSRV errors (`LazyLock` stable since 1.80, crate MSRV 1.77).
+- **Caught by:** scripts/ci.sh clippy stage (and initially MASKED by piping ci.sh through `| tail` — the pipe's exit code hid the failure; always capture ci.sh exit directly).
+- **Lesson:** for lazy statics use the established repo pattern — `fn re_x() -> &'static Regex { static R: OnceLock<Regex> = OnceLock::new(); R.get_or_init(|| ...) }` (see redact.rs email_re). Check clippy.toml/Cargo.toml MSRV before reaching for newer std items.
+- **Status:** journal

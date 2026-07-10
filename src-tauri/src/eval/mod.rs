@@ -563,7 +563,10 @@ mod tests {
         assert!(md.contains("- labeled set: rag-bakeoff-synthetic.json (20 queries, k=5)"));
         assert!(md.contains("- config: RRF_K=60"));
         assert!(md.contains("- embedder: multilingual-e5-small (REAL model"));
-        assert!(!md.contains("STUB"), "real run must NOT carry the stub warning");
+        assert!(
+            !md.contains("STUB"),
+            "real run must NOT carry the stub warning"
+        );
         assert!(md.contains("| mode | recall@5 | ndcg@5 | mrr |"));
         assert!(md.contains("| fts | 0.5000 | 0.4500 | 0.5100 |"));
         assert!(md.contains("| semantic | 0.7000 | 0.6500 | 0.7100 |"));
