@@ -11,7 +11,8 @@ use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe, CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
-    NoteRecord, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
+    NoteAssistRequest, NoteAssistResult, NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary,
+    OrganizeMove, OrganizePlan, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -161,6 +162,15 @@ pub struct AppConfigDto {
     #[serde(default)]
     pub notes_mode: String,
     pub auto_organize: bool,
+    /// NOTES assistant action toggles (`noteAssistRefine`/`noteAssistShorten`/`noteAssistEnhance`).
+    /// Default true (`#[serde(default = "default_true")]`) so an older FE payload that omits them
+    /// keeps all three ON — a missing toggle enables, never silently disables, the action.
+    #[serde(default = "default_true")]
+    pub note_assist_refine: bool,
+    #[serde(default = "default_true")]
+    pub note_assist_shorten: bool,
+    #[serde(default = "default_true")]
+    pub note_assist_enhance: bool,
     pub note_language: String,
     /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
     /// payload — an omitted flag must FAIL CLOSED (require a token), never silently disable MCP
@@ -2077,6 +2087,953 @@ pub(crate) fn delete_document_inner(state: &AppState, id: &str) -> Result<(), Ap
     }
     state.db.delete_document(id)?;
     tracing::info!(target: "documents", document_id = %id, "document deleted");
+    Ok(())
+}
+
+// ── NOTES (authored `documents(kind='note')`) ────────────────────────────────────────────────────
+//
+// Standalone authored notes are `documents` rows with `kind='note'` — they REUSE the document
+// substrate (folder-anchored, sealed with verify-before-destroy, gated, brain-indexed) and add only
+// the authoring layer: create-empty, title/properties/tags, edit-and-reindex, a Notes folder tree,
+// and vault `.md` export. Every read/list/export/write GATES on the note's FOLDER (via
+// `folder_is_unlocked`) exactly like the document commands; a sealed-not-unlocked note is MASKED
+// (title → "🔒 Locked", no markdown/snippet/tags) so its topic never leaks.
+
+/// The DISPLAY-safe fallback for a note title: the stored `title` when present, else the `name`
+/// slug. (Kept out of the DTO builders so the mask path can substitute "🔒 Locked" cleanly.)
+fn note_display_title(row: &crate::storage::db::NoteRow) -> String {
+    row.title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| row.name.clone())
+}
+
+/// Build the FULL (editor) DTO from a raw note row — caller has ALREADY confirmed the folder is
+/// unlocked. Parses front-matter into tags/properties; `markdown` is the full stored text.
+fn note_doc_from_row(row: &crate::storage::db::NoteRow) -> NoteDoc {
+    let (tags, properties) = crate::storage::db::parse_front_matter(&row.text);
+    NoteDoc {
+        id: row.id.clone(),
+        title: note_display_title(row),
+        folder_id: row.folder_id.clone(),
+        markdown: row.text.clone(),
+        tags,
+        properties,
+        updated_at: row.updated_at.unwrap_or(row.created_at),
+        created_at: row.created_at,
+        exported_path: row.exported_path.clone(),
+        locked: false,
+        shared: false, // WP6 wires this.
+    }
+}
+
+/// The MASKED (sealed-not-unlocked) editor DTO: identity + timestamps only, NO body/title/tags —
+/// the topic never leaks. Mirrors the masked meeting-detail DTO.
+fn masked_note_doc(row: &crate::storage::db::NoteRow) -> NoteDoc {
+    NoteDoc {
+        id: row.id.clone(),
+        title: "🔒 Locked".into(),
+        folder_id: row.folder_id.clone(),
+        markdown: String::new(),
+        tags: Vec::new(),
+        properties: std::collections::BTreeMap::new(),
+        updated_at: row.updated_at.unwrap_or(row.created_at),
+        created_at: row.created_at,
+        exported_path: None,
+        locked: true,
+        shared: false,
+    }
+}
+
+/// Create an EMPTY authored note. `folder_id = None` ⇒ the default note-folder (created on first
+/// use). WRITE-GATED: a sealed-and-not-session-unlocked target folder is refused (never resurrect
+/// plaintext behind a lock). Returns the new note id. (Unlike `import_text` the empty-text refusal
+/// is relaxed — an empty note is the whole point of "New note".)
+#[tauri::command]
+pub fn create_note(
+    state: State<'_, AppState>,
+    folder_id: Option<String>,
+    title: String,
+) -> Result<String, AppError> {
+    create_note_inner(state.inner(), folder_id.as_deref(), &title)
+}
+
+/// Inner of [`create_note`] taking `&AppState` (unit-testable gate).
+pub(crate) fn create_note_inner(
+    state: &AppState,
+    folder_id: Option<&str>,
+    title: &str,
+) -> Result<String, AppError> {
+    // Resolve the anchor note-folder (default when None). ensure_default_note_folder is idempotent.
+    let folder_id = match folder_id {
+        Some(f) if !f.is_empty() => {
+            // Must be a NOTE folder — never create a note inside a meeting folder.
+            if state.db.note_folder_by_id(f)?.is_none() {
+                return Err(AppError::InvalidArg(format!("no note folder {f}")));
+            }
+            f.to_string()
+        }
+        _ => state.db.ensure_default_note_folder()?,
+    };
+
+    // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused.
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to add a note".into(),
+        ));
+    }
+
+    let title = title.trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
+    // The `name` is the filesystem-safe slug; `title` is the display title.
+    let name = crate::export::sanitize_title(title);
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+    state.db.insert_note(&id, &folder_id, &name, title, "", now)?;
+    // No chunks to index for an empty body — `update_note` re-indexes once the user writes.
+    tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note created");
+    Ok(id)
+}
+
+/// Read ONE note (editor DTO). GATED: a sealed-and-not-session-unlocked note returns the MASKED DTO
+/// (title "🔒 Locked", no body/tags), never the stored text.
+#[tauri::command]
+pub fn get_note(state: State<'_, AppState>, id: String) -> Result<NoteDoc, AppError> {
+    get_note_inner(state.inner(), &id)
+}
+
+/// Inner of [`get_note`] taking `&AppState` (unit-testable gate).
+pub(crate) fn get_note_inner(state: &AppState, id: &str) -> Result<NoteDoc, AppError> {
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Ok(masked_note_doc(&row)); // sealed-not-unlocked ⇒ masked, never the stored text.
+    }
+    let mut doc = note_doc_from_row(&row);
+    doc.shared = state.db.note_has_active_share(&row.id)?; // WP6 — active-share flag.
+    Ok(doc)
+}
+
+/// List note summaries (leak-free). `folder_id = None` ⇒ all VISIBLE notes; `Some(fid)` scopes to
+/// one note-folder. Filtered IN THE QUERY by `visibility_clause` — a sealed-not-unlocked note is
+/// ABSENT (its title never leaks), not per-row masked.
+#[tauri::command]
+pub fn list_notes(
+    state: State<'_, AppState>,
+    folder_id: Option<String>,
+) -> Result<Vec<NoteSummary>, AppError> {
+    list_notes_inner(state.inner(), folder_id.as_deref())
+}
+
+/// Inner of [`list_notes`] taking `&AppState` (unit-testable gate).
+pub(crate) fn list_notes_inner(
+    state: &AppState,
+    folder_id: Option<&str>,
+) -> Result<Vec<NoteSummary>, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    state.db.list_notes_visible(folder_id, &unlocked)
+}
+
+/// Update a note's title + markdown (write path). WRITE-GATED. Bumps `updated_at`, PURGES the old
+/// `doc_chunks` and re-chunks+re-embeds the new BODY (front-matter stripped) so the note stays a
+/// first-class brain source, then re-exports the vault `.md`. Returns the fresh DTO.
+#[tauri::command]
+pub fn update_note_doc(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+    markdown: String,
+) -> Result<NoteDoc, AppError> {
+    update_note_doc_inner(state.inner(), &id, &title, &markdown)
+}
+
+/// Inner of [`update_note_doc`] taking `&AppState` (unit-testable gate).
+pub(crate) fn update_note_doc_inner(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<NoteDoc, AppError> {
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
+    // WRITE-GATE: refuse editing a sealed-and-not-session-unlocked note (never write plaintext
+    // behind a lock).
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Err(AppError::Locked(
+            "this note is locked — unlock its folder to edit it".into(),
+        ));
+    }
+    let title = title.trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
+    let now = chrono::Utc::now().timestamp_millis();
+    state.db.update_note_row(id, title, markdown, now)?;
+
+    // WP3 — the note is a first-class brain source: purge the old chunks and re-index the new BODY
+    // (front-matter stripped inside `index_note_body_chunks`). Chunks + FTS come back
+    // unconditionally (keyword works model-less); vectors ONLY when the REAL e5 model is present
+    // (never stub vectors; mirrors `ingest_into_folder`/`should_auto_index`). Best-effort: a failure
+    // logs (no PII) and does NOT fail the update — the plaintext is durable.
+    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    if let Err(e) = index_note_body_chunks(state, id, title, markdown, embedder.as_deref()) {
+        tracing::warn!(target: "rag", error = %e, "note re-index on update failed (text saved)");
+    }
+
+    // Re-export the vault `.md` (best-effort). A sealed folder has no export (gated above), so this
+    // only runs for a visible note.
+    if let Err(e) = export_note_to_vault(state, id) {
+        tracing::warn!(target: "notes", error = %e, "note vault re-export failed (text saved)");
+    }
+
+    tracing::info!(target: "notes", note_id = %id, "note updated + re-indexed");
+    get_note_inner(state, id)
+}
+
+/// Move a note to a different note-folder. GATED on BOTH the source and target folder-unlock (never
+/// leave plaintext in a locked folder, never move out of a sealed one). Re-exports into the new
+/// folder path (the old vault file is removed by the export path's move). Idempotent.
+#[tauri::command]
+pub fn move_note_doc(
+    state: State<'_, AppState>,
+    id: String,
+    folder_id: String,
+) -> Result<(), AppError> {
+    move_note_doc_inner(state.inner(), &id, &folder_id)
+}
+
+/// Inner of [`move_note_doc`] taking `&AppState` (unit-testable gate).
+pub(crate) fn move_note_doc_inner(
+    state: &AppState,
+    id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
+    // Source gate: refuse moving a sealed-not-unlocked note (its plaintext is blanked — we'd move an
+    // empty note and lose the seal anchoring; unlock first).
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Err(AppError::Locked(
+            "this note is locked — unlock its folder to move it".into(),
+        ));
+    }
+    // Target must be a NOTE folder and be unlocked (never land plaintext behind a lock). We do not
+    // support sealing-on-move into a locked note-folder in WP0 — refuse (the FE unlocks first).
+    if state.db.note_folder_by_id(folder_id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+    }
+    if !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "the target folder is locked — unlock it to move a note there".into(),
+        ));
+    }
+
+    // Remove the old vault file (best-effort) BEFORE reassigning, then reassign + re-export into the
+    // new folder path. Never loses content: the note's canonical copy is the DB `text` column.
+    if let Some(old_path) = &row.exported_path {
+        let _ = std::fs::remove_file(old_path);
+    }
+    state.db.set_note_doc_folder(id, folder_id)?;
+    state.db.set_note_doc_exported_path(id, None)?;
+    if let Err(e) = export_note_to_vault(state, id) {
+        tracing::warn!(target: "notes", error = %e, "note re-export after move failed (moved in db)");
+    }
+    tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note moved");
+    Ok(())
+}
+
+/// Permanently delete a note (cascade its chunks + vectors + vault `.md`). GATED: a
+/// sealed-and-not-session-unlocked folder is refused. Reuses `delete_document` semantics.
+#[tauri::command]
+pub fn delete_note(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    delete_note_inner(state.inner(), &id)
+}
+
+/// Inner of [`delete_note`] taking `&AppState` (unit-testable gate).
+pub(crate) fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Ok(()); // unknown id → idempotent no-op.
+    };
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to delete a note".into(),
+        ));
+    }
+    // Remove the vault file first (best-effort), then cascade-delete the row + its chunks/vectors.
+    if let Some(path) = &row.exported_path {
+        let _ = std::fs::remove_file(path);
+    }
+    state.db.delete_document(id)?;
+    tracing::info!(target: "notes", note_id = %id, "note deleted");
+    Ok(())
+}
+
+/// (Re)write a note's vault `.md` and return the path. GATED. Idempotent (atomic, collision-suffixed
+/// `write_note`). Stores the path in `documents.exported_path`.
+#[tauri::command]
+pub fn export_note_doc(state: State<'_, AppState>, id: String) -> Result<String, AppError> {
+    let path = export_note_to_vault(state.inner(), &id)?;
+    path.ok_or_else(|| AppError::Export("no vault configured — set your Obsidian vault first".into()))
+}
+
+/// WP1 — write the note's markdown to `<vault>/<note-folder-path>/<title>.md` (note folders are
+/// rooted under `Notes/…`, so this lands under `<vault>/Notes/…`), record the path in
+/// `exported_path`. GATED (a sealed-not-unlocked note is never exported). Returns `Ok(None)` when no
+/// vault is configured (a no-op, not an error, so the create/update save path never fails on it).
+/// Idempotent + atomic + collision-suffixed via `export::write_note`.
+fn export_note_to_vault(state: &AppState, id: &str) -> Result<Option<String>, AppError> {
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Ok(None); // unknown id.
+    };
+    // GATE: never materialize a sealed-not-unlocked note's plaintext on disk. (The unseal path uses
+    // `write_note_to_vault` directly — its authorization is the CK it just decrypted with.)
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Ok(None);
+    }
+    write_note_to_vault(state, &row)
+}
+
+/// The actual vault-write for a note — NO folder gate. Callers MUST be authorized:
+/// [`export_note_to_vault`] gates first; the unseal re-export path
+/// ([`reexport_notes_in_folder`]) is authorized by the CK it decrypted the plaintext with (the
+/// folder is mid-unlock, plaintext already restored) — exactly parallel to how `unseal_folder_extras`
+/// writes restored plaintext into the DB columns without re-gating. Returns `Ok(None)` when no vault
+/// is configured. Skips a sealed row (blank text) so a stray call never writes an empty note.
+fn write_note_to_vault(
+    state: &AppState,
+    row: &crate::storage::db::NoteRow,
+) -> Result<Option<String>, AppError> {
+    if row.text.is_empty() {
+        // A sealed (blanked) note or a fresh empty note: nothing meaningful to export; leave the
+        // vault as-is (an empty file would be a leak of the note's existence, and content lives in
+        // the DB regardless).
+        return Ok(None);
+    }
+    let Some(vault) = vault_path(state) else {
+        return Ok(None); // no vault → nothing to export (not an error).
+    };
+
+    // Subfolder = the note-folder's vault-relative path (rooted under "Notes/…"). Assert it stays
+    // inside the vault (D5) before write_note creates the dir.
+    let subfolder = state
+        .db
+        .note_folder_by_id(&row.folder_id)?
+        .map(|f| f.path)
+        .unwrap_or_else(|| "Notes".to_string());
+    let vault_root = std::path::Path::new(&vault);
+    assert_in_vault(vault_root, std::path::Path::new(&subfolder))?;
+
+    let title = note_display_title(row);
+    // The date prefix uses the note's created time (ISO) so the filename is stable across re-exports
+    // (mirrors the meeting `YYYY-MM-DD HHmm - title.md` convention).
+    let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339();
+    let path = crate::export::write_note(
+        vault_root,
+        Some(&subfolder),
+        &title,
+        &created_iso,
+        &row.text,
+    )?;
+    let path_str = path.to_string_lossy().to_string();
+    state.db.set_note_doc_exported_path(&row.id, Some(&path_str))?;
+    Ok(Some(path_str))
+}
+
+/// WP3 — (re)index a note's BODY into `doc_chunks` (+ FTS via triggers) and `doc_vec_chunks` (only
+/// when a real embedder is present). The FRONT-MATTER IS STRIPPED so tags/properties never pollute
+/// the vectors (DESIGN §1a) — only the body is embedded, with the TITLE as the chunk header for
+/// provenance. Old chunks for the note are purged first (clean replace) inside the same tx as the
+/// re-insert. Mirrors `Db::index_document_chunks` but chunks the body (not the raw `text`, which for
+/// a note carries YAML front-matter).
+fn index_note_body_chunks(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    markdown: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<(), AppError> {
+    let (_yaml, body) = crate::storage::db::split_front_matter(markdown);
+    state
+        .db
+        .index_note_chunks(id, title, &body, embedder)
+}
+
+/// List every note-folder (`kind='note'`). Lock state comes through unchanged from `folders.locked`.
+#[tauri::command]
+pub fn list_note_folders(state: State<'_, AppState>) -> Result<Vec<NoteFolder>, AppError> {
+    state.db.list_note_folders()
+}
+
+/// Create a note-folder (`kind='note'`). `parent_id` must itself be a note-folder (or None = a
+/// root note-folder). Path is rooted under the default "Notes" tree so it can't collide with a
+/// meeting-folder path. Mirrors [`create_folder`] but stamps kind='note'.
+#[tauri::command]
+pub fn create_note_folder(
+    state: State<'_, AppState>,
+    name: String,
+    parent_id: Option<String>,
+) -> Result<NoteFolder, AppError> {
+    create_note_folder_inner(state.inner(), &name, parent_id.as_deref())
+}
+
+/// Inner of [`create_note_folder`] taking `&AppState`.
+pub(crate) fn create_note_folder_inner(
+    state: &AppState,
+    name: &str,
+    parent_id: Option<&str>,
+) -> Result<NoteFolder, AppError> {
+    let clean = crate::summarize::organize::sanitize_folder(name)
+        .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
+
+    // Resolve the parent's path. A None parent roots under the default "Notes" folder so every note
+    // folder is namespaced under "Notes/…" (can't collide with a meeting path; vault export lands
+    // under <vault>/Notes/…). A Some parent MUST be a note-folder.
+    let parent_path = match parent_id {
+        Some(pid) => {
+            let parent = state
+                .db
+                .note_folder_by_id(pid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {pid}")))?;
+            parent.path
+        }
+        None => {
+            // Ensure the root "Notes" folder exists and nest under it.
+            state.db.ensure_default_note_folder()?;
+            "Notes".to_string()
+        }
+    };
+    let rel_path = format!("{parent_path}/{clean}");
+
+    // Create the vault subdirectory (only when a vault is configured); assert it stays in-vault.
+    if let Some(vault) = vault_path(state) {
+        let vault_root = std::path::Path::new(&vault);
+        let dir = assert_in_vault(vault_root, std::path::Path::new(&rel_path))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Export(format!("create note folder dir failed: {e}")))?;
+    }
+
+    let folder = NoteFolder {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: clean,
+        path: rel_path,
+        parent_id: parent_id.map(|s| s.to_string()),
+        locked: false,
+        kind: "note".into(),
+    };
+    state
+        .db
+        .insert_note_folder(&folder, &chrono::Utc::now().to_rfc3339())?;
+    Ok(folder)
+}
+
+/// Rename a note-folder (reuses the meeting-folder rename machinery — folder-id based and
+/// kind-agnostic; it rewrites the `path` + all descendant paths + moves the vault dir). Gated to a
+/// note-folder id so a meeting folder can't be renamed through here.
+#[tauri::command]
+pub fn rename_note_folder(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<(), AppError> {
+    if state.db.note_folder_by_id(&id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no note folder {id}")));
+    }
+    rename_folder_inner(state.inner(), id, name)?;
+    Ok(())
+}
+
+/// Delete a note-folder (reuses the meeting-folder delete machinery). Gated to a note-folder id.
+#[tauri::command]
+pub fn delete_note_folder(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    if state.db.note_folder_by_id(&id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no note folder {id}")));
+    }
+    delete_folder_inner(state.inner(), id)
+}
+
+/// Reparent a note-folder. Gated to a note-folder id; the new parent (if any) must also be a
+/// note-folder. Rewrites the folder's `path` (and every descendant's) so vault export + gating stay
+/// coherent, holding the lifecycle guard so it can't interleave with a lock/unlock.
+#[tauri::command]
+pub fn move_note_folder(
+    state: State<'_, AppState>,
+    id: String,
+    parent_id: Option<String>,
+) -> Result<(), AppError> {
+    move_note_folder_inner(state.inner(), &id, parent_id.as_deref())
+}
+
+/// Inner of [`move_note_folder`] taking `&AppState`.
+pub(crate) fn move_note_folder_inner(
+    state: &AppState,
+    id: &str,
+    parent_id: Option<&str>,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let folder = state
+        .db
+        .note_folder_by_id(id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note folder {id}")))?;
+    // New parent must be a note-folder (or None = a root note-folder under "Notes").
+    let parent_path = match parent_id {
+        Some(pid) => {
+            if pid == id {
+                return Err(AppError::InvalidArg("a folder cannot be its own parent".into()));
+            }
+            state
+                .db
+                .note_folder_by_id(pid)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {pid}")))?
+                .path
+        }
+        None => {
+            state.db.ensure_default_note_folder()?;
+            "Notes".to_string()
+        }
+    };
+    let new_path = format!("{parent_path}/{}", folder.name);
+    if new_path == folder.path {
+        return Ok(()); // no-op reparent.
+    }
+    // A note-folder cannot move under its own descendant (would orphan the subtree). Descendants
+    // have a path prefixed by this folder's path + "/".
+    if parent_path == folder.path || parent_path.starts_with(&format!("{}/", folder.path)) {
+        return Err(AppError::InvalidArg(
+            "cannot move a folder into its own descendant".into(),
+        ));
+    }
+    // Move the vault directory (best-effort) + rewrite this folder's + descendants' paths in the DB.
+    reparent_note_folder_paths(state, id, &folder.path, &new_path, parent_id)?;
+    Ok(())
+}
+
+/// Rewrite `folders.path` for a moved note-folder and EVERY descendant (prefix rewrite), reparent
+/// the row, and move the vault directory on disk (best-effort). Path uniqueness is preserved by the
+/// prefix rewrite (the whole subtree moves as a unit). Kept small + note-scoped (the meeting-folder
+/// rename has its own richer machinery; a note-folder tree is simpler).
+fn reparent_note_folder_paths(
+    state: &AppState,
+    id: &str,
+    old_path: &str,
+    new_path: &str,
+    parent_id: Option<&str>,
+) -> Result<(), AppError> {
+    // Vault dir move first (best-effort; a leftover/absent dir is reconcilable, lost content is not,
+    // but note content lives in the DB — the .md files are re-exportable).
+    if let Some(vault) = vault_path(state) {
+        let vault_root = std::path::Path::new(&vault);
+        let src = assert_in_vault(vault_root, std::path::Path::new(old_path))?;
+        let dst = assert_in_vault(vault_root, std::path::Path::new(new_path))?;
+        if src.exists() {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&src, &dst);
+        }
+    }
+    state
+        .db
+        .reparent_note_folder(id, old_path, new_path, parent_id)?;
+    Ok(())
+}
+
+// ── NOTES — selection Brain-assistant (WP4) ──────────────────────────────────────────────────────
+//
+// The editor's selection popover calls `note_assistant_action`. Refine/Shorten rewrite the
+// selection; Enhance retrieves related brain context (VISIBLE sources only, excluding the current
+// note) and proposes an ADDITIVE passage with citations. Routing is `provider_for(Role::Notes)` —
+// which gives local-Qwen-vs-cloud-Claude selection, the fail-closed consent gate, the
+// `RedactingProvider` firewall, and the egress ledger FOR FREE — never a direct provider build.
+
+/// The selection Brain-assistant action. GATED four ways: (1) the note's folder must be unlocked
+/// (never send a sealed note's text off-device / to any model); (2) the action must be ENABLED in
+/// config (else `Unavailable`); (3) enhance retrieval contributes ONLY visible/unlocked sources;
+/// (4) the cloud path rides the redaction firewall via `provider_for`. Returns the suggestion +
+/// (enhance) citations + display metadata (modelLabel/mode/redacted).
+#[tauri::command]
+pub async fn note_assistant_action(
+    state: State<'_, AppState>,
+    req: NoteAssistRequest,
+) -> Result<NoteAssistResult, AppError> {
+    note_assistant_action_inner(state.inner(), req).await
+}
+
+/// Core of [`note_assistant_action`] over `&AppState` (unit-testable headless). The gate order is
+/// normative: config-enabled → note-unlocked → build provider (consent/firewall) → retrieve → call.
+pub(crate) async fn note_assistant_action_inner(
+    state: &AppState,
+    req: NoteAssistRequest,
+) -> Result<NoteAssistResult, AppError> {
+    let action = req.action.trim().to_lowercase();
+    // (1) ACTION ENABLED? A disabled action is refused BEFORE any read/egress.
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let enabled = match action.as_str() {
+        "refine" => config.note_assist_refine,
+        "shorten" => config.note_assist_shorten,
+        "enhance" => config.note_assist_enhance,
+        other => {
+            return Err(AppError::InvalidArg(format!(
+                "unknown note-assistant action: {other}"
+            )));
+        }
+    };
+    if !enabled {
+        return Err(AppError::Unavailable(format!(
+            "the {action} note action is turned off in Settings"
+        )));
+    }
+    if req.selection.trim().is_empty() {
+        return Err(AppError::InvalidArg("no text selected".into()));
+    }
+
+    // (2) READ-GATE: the note's folder must be unlocked (never egress a sealed note's text).
+    let Some(row) = state.db.get_note_row(&req.note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {}", req.note_id)));
+    };
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Err(AppError::Locked(
+            "this note is locked — unlock its folder to use the assistant".into(),
+        ));
+    }
+
+    // (3) Resolve the display metadata (modelLabel/mode) from the RESOLVED target BEFORE the call.
+    let target =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config);
+    let mode = if crate::summarize::egress_is_cloud(&target.connection, &config) {
+        "cloud"
+    } else {
+        "local"
+    };
+    let model_requested =
+        crate::summarize::effective_model_requested(&target, &config);
+    let conn_label = crate::summarize::roles::connection_display_name(&target.connection);
+    let model_label = if model_requested.trim().is_empty() {
+        conn_label.to_string()
+    } else {
+        format!("{conn_label} · {model_requested}")
+    };
+
+    // (4) enhance: retrieve VISIBLE related sources (EXCLUDING this note) → grounded prompt + citations.
+    let citations = if action == "enhance" {
+        gather_note_enhance_citations(state, &req)?
+    } else {
+        Vec::new()
+    };
+
+    // (5) Build the prompts, then call the NOTES-role provider (consent gate + redaction firewall +
+    //     egress ledger ride inside `provider_for`/`complete_with_meta`).
+    let (system, user) = build_note_assist_prompt(&action, &req, &citations, &config.note_language);
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let (suggestion, meta) = provider.complete_with_meta(&system, &user).await?;
+
+    // `redacted` = the firewall scrubbed at least one PII token on THIS call (only a cloud
+    // RedactingProvider populates `meta.redactions`; a local provider leaves it None → false).
+    let redacted = meta
+        .redactions
+        .as_ref()
+        .map(|r| r.email + r.card + r.phone + r.name > 0)
+        .unwrap_or(false);
+
+    tracing::info!(
+        target: "notes",
+        action = %action,
+        mode = %mode,
+        citations = citations.len(),
+        redacted,
+        "note assistant action completed"
+    );
+
+    Ok(NoteAssistResult {
+        action,
+        suggestion: suggestion.trim().to_string(),
+        citations,
+        model_label,
+        mode: mode.to_string(),
+        redacted,
+    })
+}
+
+/// enhance-context retrieval: run the GATED brain readers (meeting `search_visible` + document/note
+/// `search_doc_chunks_*_visible`), EXCLUDE the current note's own document id, cap at ≤6, and build
+/// [`NoteCitation`]s. Only VISIBLE/unlocked sources contribute (both readers push the live session
+/// unlock set through `visibility_clause`), so a sealed source never grounds an enhancement.
+fn gather_note_enhance_citations(
+    state: &AppState,
+    req: &NoteAssistRequest,
+) -> Result<Vec<NoteCitation>, AppError> {
+    const MAX_CITATIONS: usize = 6;
+    let unlocked = unlocked_snapshot(state)?;
+    // The query is the selection plus a little surrounding context (better recall than the raw
+    // selection alone); the readers tokenize/defuse it safely.
+    let mut query = req.selection.clone();
+    if let Some(b) = &req.before {
+        query.push(' ');
+        query.push_str(b);
+    }
+    if let Some(a) = &req.after {
+        query.push(' ');
+        query.push_str(a);
+    }
+
+    let mut out: Vec<NoteCitation> = Vec::new();
+
+    // Meeting notes/segments (FTS over visible meetings).
+    for hit in state.db.search_visible(&query, MAX_CITATIONS as i64, &unlocked)? {
+        out.push(NoteCitation {
+            kind: "meeting".into(),
+            id: hit.meeting.id.clone(),
+            title: hit.meeting.title.clone().unwrap_or_else(|| "Meeting".into()),
+            snippet: hit.snippet,
+        });
+        if out.len() >= MAX_CITATIONS {
+            break;
+        }
+    }
+
+    // Other notes/documents (semantic when the e5 model is present, else FTS). EXCLUDE the current
+    // note's own document id (never cite the note being edited).
+    if out.len() < MAX_CITATIONS {
+        let doc_hits = if crate::embed::embed_model_present() {
+            let embedder = crate::embed::active_embedder();
+            let qvecs = embedder.embed_query(std::slice::from_ref(&query))?;
+            match qvecs.into_iter().next() {
+                Some(qvec) => state
+                    .db
+                    .search_doc_chunks_visible(&qvec, MAX_CITATIONS as i64, &unlocked)?,
+                None => Vec::new(),
+            }
+        } else {
+            state
+                .db
+                .search_doc_chunks_fts_visible(&query, MAX_CITATIONS as i64, &unlocked)?
+        };
+        for hit in doc_hits {
+            if hit.document_id == req.note_id {
+                continue; // never cite the note being edited.
+            }
+            out.push(NoteCitation {
+                kind: "note".into(),
+                id: hit.document_id,
+                title: hit.name,
+                snippet: hit.snippet,
+            });
+            if out.len() >= MAX_CITATIONS {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build the (system, user) prompts for a note-assistant action. Refine/Shorten operate on the
+/// selection with its surrounding context; Enhance grounds an ADDITIVE passage in the retrieved
+/// citations only. `note_language` steers the reply language (matching the rest of the note stack).
+fn build_note_assist_prompt(
+    action: &str,
+    req: &NoteAssistRequest,
+    citations: &[NoteCitation],
+    note_language: &str,
+) -> (String, String) {
+    let lang = if note_language.trim().is_empty() || note_language == "auto" {
+        "the same language as the selected text".to_string()
+    } else {
+        format!("language code '{note_language}'")
+    };
+    let before = req.before.as_deref().unwrap_or("");
+    let after = req.after.as_deref().unwrap_or("");
+    match action {
+        "refine" => {
+            let system = format!(
+                "You improve a passage of the user's own note: clarity, grammar, and flow, WITHOUT \
+                 changing its meaning or adding new facts. Reply in {lang}. Output ONLY the rewritten \
+                 passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!(
+                "CONTEXT BEFORE:\n{before}\n\nSELECTION TO REFINE:\n{sel}\n\nCONTEXT AFTER:\n{after}",
+                sel = req.selection
+            );
+            (system, user)
+        }
+        "shorten" => {
+            let system = format!(
+                "You make a passage of the user's own note more concise while preserving every fact \
+                 and its meaning. Reply in {lang}. Output ONLY the shortened passage — no preamble, \
+                 no quotes, no explanation."
+            );
+            let user = format!(
+                "CONTEXT BEFORE:\n{before}\n\nSELECTION TO SHORTEN:\n{sel}\n\nCONTEXT AFTER:\n{after}",
+                sel = req.selection
+            );
+            (system, user)
+        }
+        // enhance
+        _ => {
+            let mut grounding = String::new();
+            for (i, c) in citations.iter().enumerate() {
+                grounding.push_str(&format!(
+                    "[{n}] ({kind}) {title}: {snippet}\n",
+                    n = i + 1,
+                    kind = c.kind,
+                    title = c.title,
+                    snippet = c.snippet
+                ));
+            }
+            if grounding.is_empty() {
+                grounding.push_str("(no related material found)\n");
+            }
+            let system = format!(
+                "You expand the user's note by proposing a SHORT ADDITIVE passage that builds on \
+                 the selection using ONLY the RELATED MATERIAL provided — never invent facts. If the \
+                 material adds nothing, reply with an empty line. Reply in {lang}. Output ONLY the \
+                 additive passage to INSERT after the selection — no preamble, no headings, no \
+                 explanation."
+            );
+            let user = format!(
+                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO EXPAND:\n{sel}",
+                sel = req.selection
+            );
+            (system, user)
+        }
+    }
+}
+
+// ── NOTES — auto-organize (WP5) ──────────────────────────────────────────────────────────────────
+//
+// Two-step, non-destructive. `plan_organize_notes` PROPOSES a target note-folder per visible note
+// (via `organize::classify_subfolder` on the Notes-role provider); `apply_organize_plan` creates
+// the needed note-folders and MOVES notes (reusing the gated `move_note_doc_inner`). The user
+// reviews the plan before applying.
+
+/// Propose folder assignments for the VISIBLE notes (`folder_id = Some` scopes to one note-folder,
+/// `None` = all visible notes). Non-destructive: returns an [`OrganizePlan`] the FE reviews. A note
+/// already correctly filed (proposed folder == its current folder) is SKIPPED.
+#[tauri::command]
+pub async fn plan_organize_notes(
+    state: State<'_, AppState>,
+    folder_id: Option<String>,
+) -> Result<OrganizePlan, AppError> {
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let notes = state
+        .db
+        .list_notes_visible(folder_id.as_deref(), &unlocked)?;
+    if notes.is_empty() {
+        return Ok(OrganizePlan { moves: Vec::new() });
+    }
+
+    // The existing note-folder names (for reuse-preference) + a name→id map for resolving toFolderId.
+    let note_folders = state.db.list_note_folders()?;
+    let existing_names: Vec<String> = note_folders.iter().map(|f| f.name.clone()).collect();
+    let name_to_id: std::collections::HashMap<String, String> = note_folders
+        .iter()
+        .map(|f| (f.name.clone(), f.id.clone()))
+        .collect();
+    let id_to_name: std::collections::HashMap<String, String> = note_folders
+        .iter()
+        .map(|f| (f.id.clone(), f.name.clone()))
+        .collect();
+
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+
+    let mut moves = Vec::new();
+    for n in &notes {
+        // The classifier reads the note's TITLE + a body excerpt (the summary passed to
+        // classify_subfolder). The list DTO carries a leak-free snippet already (visible content).
+        let target = crate::summarize::organize::classify_subfolder(
+            provider.as_ref(),
+            &n.title,
+            &n.snippet,
+            &existing_names,
+        )
+        .await;
+        let Some(to_folder) = target else {
+            continue; // model declined / unusable → leave this note where it is.
+        };
+        let from_folder = id_to_name
+            .get(&n.folder_id)
+            .cloned()
+            .unwrap_or_else(|| "Notes".to_string());
+        // Skip a note already filed under the proposed folder (no-op move).
+        if to_folder == from_folder {
+            continue;
+        }
+        let to_folder_id = name_to_id.get(&to_folder).cloned();
+        moves.push(OrganizeMove {
+            note_id: n.id.clone(),
+            title: n.title.clone(),
+            from_folder_id: n.folder_id.clone(),
+            from_folder,
+            to_folder,
+            to_folder_id,
+            reason: "content-based filing".to_string(),
+        });
+    }
+    Ok(OrganizePlan { moves })
+}
+
+/// Apply an auto-organize plan: per move, ensure the target note-folder exists (create it under the
+/// Notes root when `toFolderId` is null), then MOVE the note (reusing the gated `move_note_doc_inner`
+/// — both-sides folder gate + re-export). Non-destructive + best-effort per move (a single failure
+/// logs IDs/stage and continues; the rest still apply). Idempotent on an already-filed note.
+#[tauri::command]
+pub fn apply_organize_plan(state: State<'_, AppState>, plan: OrganizePlan) -> Result<(), AppError> {
+    apply_organize_plan_inner(state.inner(), plan)
+}
+
+/// Inner of [`apply_organize_plan`] taking `&AppState`.
+pub(crate) fn apply_organize_plan_inner(
+    state: &AppState,
+    plan: OrganizePlan,
+) -> Result<(), AppError> {
+    // Cache newly-created folder ids by NAME so several notes routed to the same NEW folder create it
+    // exactly once.
+    let mut created: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for mv in &plan.moves {
+        // Resolve or create the target note-folder id.
+        let target_id = if let Some(id) = mv.to_folder_id.as_deref() {
+            // Must still be a note-folder (defensive — the plan could be stale).
+            if state.db.note_folder_by_id(id)?.is_none() {
+                tracing::warn!(target: "notes", "organize: stale target folder id, skipping a move");
+                continue;
+            }
+            id.to_string()
+        } else if let Some(id) = created.get(&mv.to_folder) {
+            id.clone()
+        } else {
+            // Create a new note-folder under the Notes root.
+            match create_note_folder_inner(state, &mv.to_folder, None) {
+                Ok(f) => {
+                    created.insert(mv.to_folder.clone(), f.id.clone());
+                    f.id
+                }
+                Err(e) => {
+                    tracing::warn!(target: "notes", error = %e, "organize: create target folder failed, skipping a move");
+                    continue;
+                }
+            }
+        };
+        // Move the note (gated both sides + re-export). Best-effort per move.
+        if let Err(e) = move_note_doc_inner(state, &mv.note_id, &target_id) {
+            tracing::warn!(target: "notes", note_id = %mv.note_id, error = %e, "organize: move failed");
+        }
+    }
+    tracing::info!(target: "notes", moves = plan.moves.len(), "organize plan applied");
     Ok(())
 }
 
@@ -5622,6 +6579,9 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_style: c.note_style.clone(),
         notes_mode: c.notes_mode.clone(),
         auto_organize: c.auto_organize,
+        note_assist_refine: c.note_assist_refine,
+        note_assist_shorten: c.note_assist_shorten,
+        note_assist_enhance: c.note_assist_enhance,
         note_language: c.note_language.clone(),
         mcp_require_token: c.mcp_require_token,
         lock_require_biometric: c.lock_require_biometric,
@@ -5728,6 +6688,9 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             d.notes_mode
         },
         auto_organize: d.auto_organize,
+        note_assist_refine: d.note_assist_refine,
+        note_assist_shorten: d.note_assist_shorten,
+        note_assist_enhance: d.note_assist_enhance,
         note_language: if d.note_language.trim().is_empty() {
             "auto".to_string()
         } else {
@@ -8203,6 +9166,19 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         let _ = std::fs::remove_file(&p);
     }
 
+    // NOTES: an authored note's markdown is sealed by the (kind-agnostic) document seal leg in
+    // `seal_folder_extras` above — but its vault `.md` (a note-only concern; documents have no
+    // `exported_path`) must be deleted on lock exactly like a meeting note's `.md`, so a sealed
+    // note leaves no plaintext on disk. Capture the paths, delete the files, then NULL the column.
+    // Done after the seal (the DB blob is the recoverable copy).
+    let note_md_paths = state.db.note_exported_paths_in_folder(&folder_id)?;
+    for p in note_md_paths {
+        let _ = std::fs::remove_file(&p);
+    }
+    state
+        .db
+        .clear_note_exported_paths_in_folder(&folder_id)?;
+
     // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer at
     // the moment a folder seals (post clear-on-Stop it is normally already empty; idempotent).
     clear_stale_live_transcript(state);
@@ -9753,7 +10729,43 @@ fn unseal_folder_extras(
     // BEFORE this call). The caller supplies the model-gated `meeting_embedder` — never a stub
     // vector; mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
     reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
+
+    // NOTES: re-export each authored note's vault `.md` (deleted on lock). Best-effort — the note's
+    // plaintext text was restored just above (document unseal leg), so `export_note_to_vault` writes
+    // the fresh `.md` + re-records `exported_path`. A failure logs (no PII) and never fails the
+    // unlock.
+    reexport_notes_in_folder(state, folder_id);
     Ok(())
+}
+
+/// Re-export every authored NOTE's vault `.md` in a folder whose plaintext was JUST restored by the
+/// unseal path (session-unlock or permanent remove-lock), re-recording each `exported_path`. Called
+/// from INSIDE the unseal path — the folder is still `locked=1` and not yet in the session unlock set
+/// at this point (see `unlock_folder`'s ordering), so it uses the UNGATED [`write_note_to_vault`]
+/// (authorized by the CK the caller decrypted with), exactly as `unseal_folder_extras` writes the
+/// restored plaintext into the DB without re-gating. Best-effort per note (a failure logs IDs/stage
+/// only and continues). A blanked (still-sealed) row is skipped inside `write_note_to_vault`.
+fn reexport_notes_in_folder(state: &AppState, folder_id: &str) {
+    let note_ids = match state.db.note_ids_in_folder(folder_id) {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(target: "notes", error = %e, "note re-export: list failed");
+            return;
+        }
+    };
+    for nid in &note_ids {
+        match state.db.get_note_row(nid) {
+            Ok(Some(row)) => {
+                if let Err(e) = write_note_to_vault(state, &row) {
+                    tracing::warn!(target: "notes", note_id = %nid, error = %e, "note re-export on unlock failed");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(target: "notes", note_id = %nid, error = %e, "note re-export: read failed");
+            }
+        }
+    }
 }
 
 /// RE-BLANK (relock): re-blank the plaintext transcript + timeline of every governed meeting and
@@ -9803,6 +10815,17 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
     state
         .db
         .purge_doc_chunks_for_documents(&reblanked_doc_ids)?;
+
+    // NOTES: a session-unlock RE-EXPORTED each authored note's vault `.md` (and re-set
+    // `exported_path`). On relock that plaintext `.md` must be deleted again + the path NULLed —
+    // otherwise a re-sealed folder leaves a plaintext note on disk (a leak). Mirrors the on-lock
+    // note-file deletion in `lock_folder_inner`.
+    for p in state.db.note_exported_paths_in_folder(folder_id)? {
+        let _ = std::fs::remove_file(&p);
+    }
+    state
+        .db
+        .clear_note_exported_paths_in_folder(folder_id)?;
     Ok(())
 }
 
@@ -9914,6 +10937,10 @@ fn unseal_folder_extras_permanent(
     // again. Mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
+
+    // NOTES: the folder is permanently open — re-export each authored note's vault `.md` (deleted on
+    // lock) so the note lives on disk again. Best-effort (the plaintext text was restored above).
+    reexport_notes_in_folder(state, folder_id);
     Ok(())
 }
 
@@ -10144,9 +11171,13 @@ pub struct MyShareEntry {
     pub expires_at: Option<String>,
     pub revoked: bool,
     pub download_count: u32,
-    /// The LOCAL meeting this share belongs to (so the FE can filter to THIS note). `None` when the
-    /// share was created on another device (no local `outbound_shares` row) — masked, same as `title`.
+    /// The LOCAL meeting this share belongs to (so the FE can filter to THIS meeting). `None` when the
+    /// share was created on another device OR is a NOTE share (no meeting anchor) — masked like `title`.
     pub meeting_id: Option<String>,
+    /// The LOCAL authored-note `document_id` this share belongs to (WP6), so the FE can filter a note's
+    /// share panel to THIS note. `None` for a meeting share or a share created on another device.
+    #[serde(default)]
+    pub document_id: Option<String>,
     /// The server-enforced open cap (`None` ⇒ uncapped); sourced from the server list row. Drives the
     /// `X / Y opens` label. The server enforces the cap atomically on `/fetch`; this is display-only.
     pub max_downloads: Option<u32>,
@@ -10889,6 +11920,123 @@ pub(crate) async fn share_note_to_link_inner(
     ))
 }
 
+/// WP6 — share an authored NOTE as a zero-knowledge link (mirrors [`share_note_to_link`] for
+/// meetings). GATE order is normative (copies the meeting path): (1) the note's folder must be
+/// UNLOCKED (a sealed-not-unlocked note is refused `AppError::Locked` — its text never leaves the
+/// device); (2) share consent + login; then clean → envelope → seal → upload. Records the outbound
+/// share against the note's `document_id`. Returns the assembled share URL (L only in the fragment).
+#[tauri::command]
+pub async fn share_note_to_link_doc(
+    state: State<'_, AppState>,
+    id: String,
+    expires_days: Option<u32>,
+    password: Option<String>,
+    max_downloads: Option<u32>,
+) -> Result<String, AppError> {
+    share_note_to_link_doc_inner(state.inner(), id, expires_days, password, max_downloads).await
+}
+
+/// Core of [`share_note_to_link_doc`] over `&AppState` (unit-testable headless gate).
+pub(crate) async fn share_note_to_link_doc_inner(
+    state: &AppState,
+    id: String,
+    expires_days: Option<u32>,
+    password: Option<String>,
+    max_downloads: Option<u32>,
+) -> Result<String, AppError> {
+    // (1) READ-GATE — FIRST statement. A sealed-not-unlocked note refuses (its text never egresses).
+    let Some(row) = state.db.get_note_row(&id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Err(AppError::Locked(
+            "this note's folder is locked — unlock it to share the note".into(),
+        ));
+    }
+
+    // (2) Consent (first-ever share) + logged-in bearer, exactly like the meeting path.
+    let base = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.share_egress_consented {
+            return Err(AppError::Unavailable(
+                "sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+        cfg.share_base_url.clone()
+    };
+    let access_token = valid_access_token(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // (3) The note's display title + created timestamp; clean its full markdown (strip front-matter,
+    //     flatten wikilinks, strip obsidian://) — the SAME pure transform meeting shares use.
+    let title = note_display_title(&row);
+    let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339();
+    let clean_body = crate::share::envelope::clean_note_body(&row.text);
+
+    // (4) Seal a fresh link share.
+    let share_id = crate::share::new_share_id();
+    let rev = 1u32;
+    let env = murmur_protocol::envelope::ShareEnvelope::new(title, clean_body, created_at);
+    let pw_ref = password.as_deref().filter(|s| !s.is_empty());
+    let sealed = crate::e2ee::link::seal_link_share(&env, &share_id, rev, pw_ref)?;
+
+    let expires_at = expires_days.map(|d| {
+        let days = d.clamp(1, 365) as i64;
+        (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339()
+    });
+    let argon = if pw_ref.is_some() {
+        Some(murmur_protocol::dto::ArgonParams {
+            m: sealed.argon_params.m_cost_kib,
+            t: sealed.argon_params.t_cost,
+            p: sealed.argon_params.p_cost,
+        })
+    } else {
+        None
+    };
+    let cell_bytes = sealed.ciphertext_cell.len();
+    let create_req = murmur_protocol::dto::CreateShareRequest {
+        share_id: share_id.clone(),
+        mode: murmur_protocol::dto::ShareMode::Link,
+        content_cell: sealed.ciphertext_cell,
+        wrapped_nk: sealed.wrapped_nk,
+        gate_salt: sealed.gate_salt.to_vec(),
+        gate_secret: sealed.gate_secret.to_vec(),
+        rev,
+        password_required: pw_ref.is_some(),
+        argon,
+        expires_at,
+        max_downloads: max_downloads.map(|n| n.max(1)),
+        recipients: None,
+    };
+    let created = client.create_share(&access_token, create_req).await?;
+
+    // (5) CONTENT-FREE egress ledger + local bookkeeping (share_id + document_id only, NO title).
+    crate::share::ledger_row(&state.db, &client.host(), "share_create", cell_bytes);
+    state.db.insert_outbound_note_share(
+        &share_id,
+        &id,
+        "link",
+        rev,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+
+    let base_for_url = if created.share_base_url.trim().is_empty() {
+        base
+    } else {
+        created.share_base_url
+    };
+    Ok(crate::share::assemble_share_url(
+        &base_for_url,
+        &share_id,
+        &sealed.l,
+    ))
+}
+
 /// `list_my_shares() -> Vec<MyShareEntry>` — the server's share list, with each entry's local title
 /// added ONLY when the meeting is unlocked (a sealed-not-unlocked meeting is MASKED: `locked:true`,
 /// no title). §7 inv. 6.
@@ -10901,19 +12049,35 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
 
     let mut out = Vec::with_capacity(resp.shares.len());
     for s in resp.shares {
-        // Resolve the local meeting for this share (None ⇒ created on another device ⇒ masked).
+        // NOTE shares (WP6) are anchored on `document_id`; meeting shares on `meeting_id`. Prefer the
+        // note anchor. In BOTH cases the title is surfaced ONLY when the source's folder is unlocked
+        // (a sealed-not-unlocked source is MASKED: `locked:true`, no title) — same §7 inv. 6 as
+        // meetings. A share created on another device (neither anchor local) is masked too.
+        let local_document = state.db.outbound_share_document(&s.share_id)?;
         let local_meeting = state.db.outbound_share_meeting(&s.share_id)?;
-        let (title, locked) = match &local_meeting {
-            Some(meeting_id) => {
-                if meeting_is_unlocked(state.inner(), meeting_id)? {
-                    let t = state.db.get_meeting(meeting_id)?.and_then(|m| m.title);
-                    (t, false)
-                } else {
-                    // Sealed-and-not-unlocked ⇒ MASK the title.
-                    (None, true)
+        let (title, locked) = if let Some(doc_id) = &local_document {
+            // Note share: resolve title only when the note's folder is unlocked (via get_note_inner's
+            // masking) — a masked note returns title "🔒 Locked"/locked:true.
+            match state.db.get_note_row(doc_id)? {
+                Some(row) if folder_is_unlocked(state.inner(), &row.folder_id)? => {
+                    (Some(note_display_title(&row)), false)
                 }
+                Some(_) => (None, true), // sealed-not-unlocked ⇒ masked.
+                None => (None, true),    // note deleted / unknown.
             }
-            None => (None, true),
+        } else {
+            // Meeting share: gate on the meeting's lock state (the original path).
+            match local_meeting.as_deref().filter(|m| !m.is_empty()) {
+                Some(meeting_id) => {
+                    if meeting_is_unlocked(state.inner(), meeting_id)? {
+                        let t = state.db.get_meeting(meeting_id)?.and_then(|m| m.title);
+                        (t, false)
+                    } else {
+                        (None, true)
+                    }
+                }
+                None => (None, true),
+            }
         };
         out.push(MyShareEntry {
             share_id: s.share_id,
@@ -10924,7 +12088,10 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
             expires_at: s.expires_at,
             revoked: s.revoked_at.is_some(),
             download_count: s.download_count,
-            meeting_id: local_meeting,
+            // The meeting anchor is masked-empty ('') for a note share — surface it as None there so
+            // the FE never keys a note share on an empty meeting id.
+            meeting_id: local_meeting.filter(|m| !m.is_empty()),
+            document_id: local_document,
             max_downloads: s.max_downloads,
             mode: s.mode,
         });
@@ -15366,6 +16533,513 @@ mod lifecycle_tests {
             state.db.doc_chunk_count(&id).unwrap(),
             0,
             "doc chunks cascade-deleted with the document"
+        );
+    }
+
+    // ── NOTES feature (WP0–WP3) ──────────────────────────────────────────────────────────────────
+
+    /// WP0 — create_note with a NULL folder lands in the default "Notes" note-folder (created on
+    /// first use), and the note is readable + listed. The folder is `kind='note'`.
+    #[test]
+    fn create_note_null_folder_lands_in_default_note_folder() {
+        let state = build_state("note-default-folder");
+        let id = create_note_inner(&state, None, "My first note").unwrap();
+
+        // The default note-folder exists, is kind='note', and its path is "Notes".
+        let folders = state.db.list_note_folders().unwrap();
+        assert_eq!(folders.len(), 1, "exactly one default note-folder created");
+        assert_eq!(folders[0].name, "Notes");
+        assert_eq!(folders[0].path, "Notes");
+        assert_eq!(folders[0].kind, "note");
+
+        // The note is readable (empty body, our title) and listed under the default folder.
+        let doc = get_note_inner(&state, &id).unwrap();
+        assert!(!doc.locked);
+        assert_eq!(doc.title, "My first note");
+        assert_eq!(doc.markdown, "", "a fresh note has an empty body");
+        assert_eq!(doc.folder_id, folders[0].id);
+
+        let listed = list_notes_inner(&state, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "My first note");
+        assert_eq!(listed[0].id, id);
+
+        // create_note is idempotent about the default folder: a SECOND null-folder note reuses it.
+        let id2 = create_note_inner(&state, None, "Second").unwrap();
+        assert_ne!(id, id2);
+        assert_eq!(
+            state.db.list_note_folders().unwrap().len(),
+            1,
+            "the default note-folder is not duplicated"
+        );
+    }
+
+    /// WP0 — create_note into a SEALED-and-not-session-unlocked note-folder is REFUSED with Locked
+    /// (never resurrect plaintext behind a lock). Session-unlocking the folder allows it.
+    #[test]
+    fn create_note_refused_when_target_folder_sealed() {
+        let state = build_state("note-create-sealed");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        state
+            .db
+            .set_folder_locked(&fid, true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        assert!(
+            matches!(
+                create_note_inner(&state, Some(&fid), "n").unwrap_err(),
+                AppError::Locked(_)
+            ),
+            "sealed-not-unlocked target folder refuses a new note"
+        );
+
+        // Session-unlock ⇒ allowed.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(fid.clone());
+        let id = create_note_inner(&state, Some(&fid), "n").unwrap();
+        assert!(!id.is_empty());
+    }
+
+    /// WP0 gate — a note in a SEALED-and-not-session-unlocked folder MUST be MASKED: `get_note`
+    /// returns locked:true, title "🔒 Locked", NO markdown/tags/properties; `list_notes` EXCLUDES it
+    /// entirely (the title/topic never leaks through the list). Session-unlock reveals both.
+    #[test]
+    fn sealed_note_is_masked_in_get_and_absent_in_list() {
+        let state = build_state("note-gate-mask");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let md = "---\ntags: [secret, launch]\nstatus: draft\n---\nThe launch code is 4291.";
+        let id = create_note_inner(&state, Some(&fid), "Launch plan").unwrap();
+        update_note_doc_inner(&state, &id, "Launch plan", md).unwrap();
+
+        // Seal the folder (production seal blanks text → blob).
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // get_note MASKED — no body, no tags, no properties, title hidden.
+        let masked = get_note_inner(&state, &id).unwrap();
+        assert!(masked.locked, "sealed note reports locked");
+        assert_eq!(masked.title, "🔒 Locked", "sealed note title masked");
+        assert_eq!(masked.markdown, "", "sealed note body never leaks");
+        assert!(masked.tags.is_empty(), "sealed note tags never leak");
+        assert!(
+            masked.properties.is_empty(),
+            "sealed note properties never leak"
+        );
+
+        // list_notes EXCLUDES the sealed note (title never leaks through the list).
+        assert!(
+            list_notes_inner(&state, None).unwrap().is_empty(),
+            "sealed note absent from the list (no per-row leak)"
+        );
+        assert!(
+            list_notes_inner(&state, Some(&fid)).unwrap().is_empty(),
+            "sealed note absent from the folder-scoped list too"
+        );
+
+        // Session-unlock: mirror `unlock_folder`'s internals — add to the unlock set AND unseal the
+        // plaintext back (adding to the set alone makes the note VISIBLE but its text is still
+        // blanked until the extras are unsealed).
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        state.unlocked_folders.lock().unwrap().insert(fid.clone());
+
+        let unlocked = get_note_inner(&state, &id).unwrap();
+        assert!(!unlocked.locked);
+        assert_eq!(unlocked.title, "Launch plan");
+        assert!(unlocked.markdown.contains("launch code"));
+        assert_eq!(unlocked.tags, vec!["secret".to_string(), "launch".to_string()]);
+        assert_eq!(
+            unlocked.properties.get("status"),
+            Some(&"draft".to_string())
+        );
+        assert_eq!(list_notes_inner(&state, None).unwrap().len(), 1);
+    }
+
+    /// WP2 seal round-trip — a note's full markdown (front-matter + Unicode body) survives a real
+    /// production lock→unlock cycle BYTE-IDENTICAL (verify-before-destroy). On lock the plaintext is
+    /// blanked + chunks purged; on unlock it is restored exactly and re-indexed.
+    #[test]
+    fn note_markdown_survives_lock_unlock_byte_identical() {
+        let state = build_state("note-seal-cycle");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let original =
+            "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
+        let id = create_note_inner(&state, Some(&fid), "Decyzja").unwrap();
+        update_note_doc_inner(&state, &id, "Decyzja", original).unwrap();
+
+        // LOCK → production seal: text blanked, blob present, doc chunks purged.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let sealed = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .expect("row still present");
+        assert_eq!(sealed.text, "", "note plaintext blanked while sealed");
+        assert!(sealed.sealed, "note sealed under the folder CK (blob present)");
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "note chunks purged on lock (re-embeddable on unlock)"
+        );
+
+        // UNLOCK (mirror unlock_folder internals): KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+
+        let restored = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(
+            restored.text, original,
+            "note markdown restored byte-identical on unlock — never lost"
+        );
+    }
+
+    /// WP3 — update_note PURGES the old chunks and re-indexes the new BODY (front-matter stripped),
+    /// and bumps updated_at. RED-before-GREEN shape: after the first save the body is chunked; after
+    /// an edit the OLD chunk text is gone and the NEW body is chunked; front-matter never chunked.
+    #[test]
+    fn update_note_reindexes_body_and_bumps_updated_at() {
+        let state = build_state("note-reindex");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+
+        // First save: front-matter + body. The BODY is chunked; the front-matter is NOT. The tag
+        // `frontmatteronlyterm` appears ONLY in the front-matter, never in the body — so if it is
+        // retrievable the front-matter leaked into the index.
+        let v1 = "---\ntags: [frontmatteronlyterm]\n---\nBravo charlie decision.";
+        let d1 = update_note_doc_inner(&state, &id, "Draft", v1).unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "note body chunked on save"
+        );
+        // The chunk text must be the BODY (front-matter tags absent from the index).
+        let unlocked = HashSet::new();
+        let hits = state
+            .db
+            .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.document_id == id),
+            "body term retrievable"
+        );
+        let tag_hits = state
+            .db
+            .search_doc_chunks_fts_visible("frontmatteronlyterm", 10, &unlocked)
+            .unwrap();
+        assert!(
+            !tag_hits.iter().any(|h| h.document_id == id),
+            "front-matter-only tag is NOT chunked (front-matter stripped before embed)"
+        );
+
+        // Edit: a wholly new body. Old body term gone; new term present. updated_at advances.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let v2 = "---\ntags: [frontmatteronlyterm]\n---\nZulu yankee xray rewrite.";
+        let d2 = update_note_doc_inner(&state, &id, "Draft", v2).unwrap();
+        let old = state
+            .db
+            .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+            .unwrap();
+        assert!(
+            !old.iter().any(|h| h.document_id == id),
+            "old body chunk purged on re-index"
+        );
+        let new = state
+            .db
+            .search_doc_chunks_fts_visible("yankee", 10, &unlocked)
+            .unwrap();
+        assert!(
+            new.iter().any(|h| h.document_id == id),
+            "new body chunk indexed on re-index"
+        );
+        assert!(
+            d2.updated_at >= d1.updated_at,
+            "updated_at is bumped on edit"
+        );
+    }
+
+    /// WP1 — export_note writes `<vault>/Notes/<title>.md`, records exported_path, and on LOCK the
+    /// vault `.md` is deleted + exported_path NULLed (a sealed note leaves no plaintext on disk).
+    #[test]
+    fn note_exports_to_vault_and_md_deleted_on_lock() {
+        let vault = tmp_vault("note-export");
+        let state = build_state_with_vault("note-export", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Roadmap", "# Roadmap\nShip Q3.").unwrap();
+
+        // The note's .md exists under <vault>/Notes/Ideas/.
+        let doc = get_note_inner(&state, &id).unwrap();
+        let path = doc.exported_path.expect("note exported to vault");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "vault .md written on save"
+        );
+        assert!(
+            path.contains("Notes/Ideas"),
+            "note lands under the Notes/<folder> tree: {path}"
+        );
+
+        // LOCK: the .md is deleted and exported_path cleared.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "sealed note's vault .md deleted on lock"
+        );
+        assert!(
+            state
+                .db
+                .note_exported_paths_in_folder(&fid)
+                .unwrap()
+                .is_empty(),
+            "exported_path NULLed on lock"
+        );
+    }
+
+    /// WP2 relock-leak regression (RED-before-GREEN): a session-UNLOCK re-exports a note's vault
+    /// `.md` (and re-sets exported_path); a subsequent RELOCK MUST delete that plaintext `.md` again
+    /// and NULL exported_path — else a re-sealed folder leaves a plaintext note on disk. This drives
+    /// `reblank_folder_extras` (the relock path). RED on the pre-fix code (reblank only re-blanked the
+    /// DB text, leaving the .md + exported_path).
+    #[test]
+    fn relock_deletes_reexported_note_md() {
+        let vault = tmp_vault("note-relock-leak");
+        let state = build_state_with_vault("note-relock-leak", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Secret roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Secret roadmap", "# Secret\nInternal launch April.")
+            .unwrap();
+
+        // LOCK: .md deleted, exported_path NULL.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // UNLOCK (unseal extras + add to unlock set): the note's .md is RE-EXPORTED, exported_path set.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        state.unlocked_folders.lock().unwrap().insert(fid.clone());
+
+        let reexported = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("note re-exported on unlock");
+        assert!(
+            std::path::Path::new(&reexported).exists(),
+            "vault .md re-materialized on unlock"
+        );
+
+        // RELOCK: drop the session unlock + reblank → the re-exported .md MUST be gone again.
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+        assert!(
+            !std::path::Path::new(&reexported).exists(),
+            "relock deletes the re-exported plaintext .md (no on-disk leak)"
+        );
+        assert!(
+            state
+                .db
+                .note_exported_paths_in_folder(&fid)
+                .unwrap()
+                .is_empty(),
+            "relock NULLs exported_path again"
+        );
+    }
+
+    // ── NOTES phase 2 (WP4 / WP5 / WP6) ──────────────────────────────────────────────────────────
+
+    /// WP4 config gate — a DISABLED assistant action is refused with `Unavailable` BEFORE any read or
+    /// provider egress. This is the FIRST gate; it never touches a provider (so it runs headless).
+    #[test]
+    fn note_assistant_refuses_a_disabled_action() {
+        let state = build_state("note-assist-disabled");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+        update_note_doc_inner(&state, &id, "Draft", "Some body text to refine.").unwrap();
+
+        // Turn Refine OFF in config.
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_refine = false;
+        }
+        let req = NoteAssistRequest {
+            note_id: id.clone(),
+            action: "refine".into(),
+            selection: "body text".into(),
+            before: None,
+            after: None,
+        };
+        let err = block_on(note_assistant_action_inner(&state, req)).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "a disabled action is refused Unavailable, not attempted"
+        );
+
+        // An unknown action is InvalidArg (before any egress).
+        let bad = NoteAssistRequest {
+            note_id: id,
+            action: "frobnicate".into(),
+            selection: "x".into(),
+            before: None,
+            after: None,
+        };
+        assert!(matches!(
+            block_on(note_assistant_action_inner(&state, bad)).unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+    }
+
+    /// WP4 enhance retrieval — `gather_note_enhance_citations` EXCLUDES the current note's own
+    /// document id and contributes ONLY visible sources. Uses the model-less FTS path (default
+    /// install), so it runs headless with no provider call.
+    #[test]
+    fn enhance_retrieval_excludes_current_note_and_gates_visibility() {
+        let state = build_state("note-enhance-retrieval");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+
+        // The note being edited — its own body contains the query term, but it must NOT self-cite.
+        let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
+        update_note_doc_inner(&state, &self_id, "Self", "The launchcode discussion is here.")
+            .unwrap();
+        // A DIFFERENT visible note that also mentions the term — this SHOULD be a citation.
+        let other_id = create_note_inner(&state, Some(&fid), "Other").unwrap();
+        update_note_doc_inner(&state, &other_id, "Other", "More on the launchcode topic.").unwrap();
+        // A note in a SEALED-not-unlocked folder mentioning the term — must NOT contribute.
+        let sfid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let sealed_id = create_note_inner(&state, Some(&sfid), "Sealed").unwrap();
+        update_note_doc_inner(&state, &sealed_id, "Sealed", "Secret launchcode plan.").unwrap();
+        lock_folder_inner(&state, sfid.clone()).unwrap();
+
+        let req = NoteAssistRequest {
+            note_id: self_id.clone(),
+            action: "enhance".into(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+        };
+        let cites = gather_note_enhance_citations(&state, &req).unwrap();
+        let ids: Vec<&str> = cites.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(&self_id.as_str()),
+            "the note being edited is never cited"
+        );
+        assert!(
+            !ids.contains(&sealed_id.as_str()),
+            "a sealed-not-unlocked note never contributes to enhance"
+        );
+        assert!(
+            ids.contains(&other_id.as_str()),
+            "a different VISIBLE note that matches IS cited"
+        );
+    }
+
+    /// WP5 — plan → apply CREATES the target note-folder and MOVES the note into it (non-destructive).
+    /// Drives `apply_organize_plan_inner` directly with a synthetic plan (planning itself needs a
+    /// provider; applying does not).
+    #[test]
+    fn apply_organize_plan_creates_folder_and_moves_note() {
+        let state = build_state("note-organize-apply");
+        let src = create_note_folder_inner(&state, "Inbox", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&src), "Standup 2026-07-10").unwrap();
+        update_note_doc_inner(&state, &id, "Standup 2026-07-10", "Daily standup notes.").unwrap();
+
+        // A plan routing the note into a NOT-yet-existing "Standups" folder (toFolderId = None).
+        let plan = OrganizePlan {
+            moves: vec![OrganizeMove {
+                note_id: id.clone(),
+                title: "Standup 2026-07-10".into(),
+                from_folder_id: src.clone(),
+                from_folder: "Inbox".into(),
+                to_folder: "Standups".into(),
+                to_folder_id: None,
+                reason: "content-based filing".into(),
+            }],
+        };
+        apply_organize_plan_inner(&state, plan).unwrap();
+
+        // "Standups" note-folder now exists and the note lives in it.
+        let folders = state.db.list_note_folders().unwrap();
+        let standups = folders
+            .iter()
+            .find(|f| f.name == "Standups")
+            .expect("Standups folder created");
+        let moved = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(moved.folder_id, standups.id, "note moved into the new folder");
+        // The note is still readable (non-destructive).
+        assert!(!get_note_inner(&state, &id).unwrap().markdown.is_empty());
+    }
+
+    /// WP6 — sharing a SEALED-and-not-session-unlocked note is REFUSED with `Locked` BEFORE any
+    /// consent/egress (mirrors `share_note_to_link_refuses_a_sealed_meeting`). The gate is the FIRST
+    /// statement, so no server/session is needed to prove it.
+    #[test]
+    fn share_note_to_link_doc_refuses_a_sealed_note() {
+        let state = build_state("note-share-lockgate");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Board strategy").unwrap();
+        update_note_doc_inner(&state, &id, "Board strategy", "# secret\nDetails.").unwrap();
+        // Seal WITHOUT session-unlock.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let err = block_on(share_note_to_link_doc_inner(
+            &state,
+            id.clone(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sharing a sealed-not-unlocked note is refused Locked (before consent/egress)"
+        );
+    }
+
+    /// WP6 — the `shared` flag on the note DTOs reflects an ACTIVE outbound share, and is cleared on
+    /// revoke. Drives the db bookkeeping directly (no server needed).
+    #[test]
+    fn note_shared_flag_tracks_active_outbound_share() {
+        let state = build_state("note-shared-flag");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Roadmap", "Ship Q3.").unwrap();
+
+        assert!(!get_note_inner(&state, &id).unwrap().shared, "not shared yet");
+
+        // Record an active outbound note share (the bookkeeping half of share_note_to_link_doc).
+        state
+            .db
+            .insert_outbound_note_share("sh-1", &id, "link", 1, "2026-07-10T00:00:00Z")
+            .unwrap();
+        assert!(
+            get_note_inner(&state, &id).unwrap().shared,
+            "shared:true once an active share exists"
+        );
+        assert!(
+            list_notes_inner(&state, Some(&fid))
+                .unwrap()
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .shared,
+            "list DTO also reflects shared"
+        );
+
+        // Revoke → shared:false.
+        state.db.set_outbound_share_state("sh-1", "revoked").unwrap();
+        assert!(
+            !get_note_inner(&state, &id).unwrap().shared,
+            "shared:false after revoke"
         );
     }
 

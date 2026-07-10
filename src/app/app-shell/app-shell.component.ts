@@ -99,6 +99,7 @@ export class AppShellComponent {
   readonly navItems: readonly NavItem[] = [
     { path: "/record", label: "Record", icon: "record" },
     { path: "/library", label: "Meetings", icon: "meetings" },
+    { path: "/notes", label: "Notes", icon: "notes" },
     { path: "/analytics", label: "Analytics", icon: "analytics" },
     { path: "/graph", label: "Graph", icon: "graph" },
     { path: "/people", label: "People", icon: "people" },

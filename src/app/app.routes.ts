@@ -49,6 +49,30 @@ export const routes: Routes = [
           ),
       },
       {
+        // Notes home — the [note-folder rail | note list] drill layout.
+        path: "notes",
+        loadComponent: () =>
+          import("./features/notes/notes-home/notes-home.component").then(
+            (m) => m.NotesHomeComponent,
+          ),
+      },
+      {
+        // New-note gateway: creates a note then replaces the URL with /notes/:id.
+        path: "notes/new",
+        loadComponent: () =>
+          import("./features/notes/note-editor/note-editor.component").then(
+            (m) => m.NoteEditorComponent,
+          ),
+      },
+      {
+        // The note editor — drills like /meeting/:id (its own back-affordance).
+        path: "notes/:id",
+        loadComponent: () =>
+          import("./features/notes/note-editor/note-editor.component").then(
+            (m) => m.NoteEditorComponent,
+          ),
+      },
+      {
         path: "analytics",
         loadComponent: () =>
           import("./features/analytics/analytics/analytics.component").then(

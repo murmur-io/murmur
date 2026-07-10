@@ -10,7 +10,7 @@ use crate::error::{AppError, Result};
 /// Characters that are illegal in filenames on macOS/Obsidian or that Obsidian
 /// reserves for wiki-link / tag syntax. We strip/replace them so the produced
 /// filename is always safe and round-trips as a clean note title.
-fn sanitize_title(title: &str) -> String {
+pub fn sanitize_title(title: &str) -> String {
     // Replace path separators and reserved characters with a space, collapse
     // runs of whitespace, then trim. Obsidian forbids: * " \ / < > : | ? and #
     // and ^ [ ] are link/anchor syntax that break titles.

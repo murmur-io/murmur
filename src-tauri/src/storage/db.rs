@@ -11,8 +11,8 @@ use crate::embed::Embedder;
 use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
-    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteRecord, PendingShareAccept,
-    PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
+    PendingShareAccept, PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
 };
 use crate::transcribe::types::Segment;
 
@@ -585,6 +585,28 @@ impl Db {
         // deliberately separate from note_chunks so the load-bearing meeting-gating joins stay
         // untouched. Additive + guarded so migrate() stays idempotent.
         Self::migrate_documents(&conn)?;
+        // NOTES feature — AUTHORED `documents(kind='note')` rows gain an authoring layer over the
+        // existing document substrate (seal/gate/brain-index reused verbatim). Three additive,
+        // guarded columns (idempotent; NULL-safe for every legacy row):
+        //   • `title`         — the display title (may contain spaces/emoji); NULL ⇒ fall back to
+        //                        `name` (the filesystem-safe slug). NON-CONTENT metadata, but it CAN
+        //                        reveal the topic → the gated list/get DTOs MASK it ("🔒 Locked") for
+        //                        a sealed-not-unlocked note, exactly like a masked meeting title.
+        //   • `updated_at`    — epoch-ms last-edit time; NULL ⇒ fall back to `created_at`.
+        //   • `exported_path` — the vault `.md` path (NULL when never exported / sealed). Captured
+        //                        before lock so the seal path can delete the on-disk `.md` (mirrors
+        //                        `notes.exported_path`), and re-set on unlock/remove-lock re-export.
+        // The `text` column still stores the FULL markdown incl. YAML front-matter (owned-file). These
+        // columns are non-content and are NOT sealed/blanked — they ride the SQLCipher-at-rest layer;
+        // only `text` is sealed (kind-agnostic document seal leg).
+        Self::add_column_if_missing(&conn, "documents", "title", "TEXT")?;
+        Self::add_column_if_missing(&conn, "documents", "updated_at", "INTEGER")?;
+        Self::add_column_if_missing(&conn, "documents", "exported_path", "TEXT")?;
+        // NOTES feature — separate the Notes folder tree from the Meetings tree. `kind` defaults
+        // 'meeting' so every existing folder + all meeting behavior stays byte-identical; note
+        // folders are created with kind='note'. Lock/seal/CK machinery is folder-id-keyed and
+        // kind-agnostic → reused verbatim. Additive + guarded (idempotent).
+        Self::add_column_if_missing(&conn, "folders", "kind", "TEXT NOT NULL DEFAULT 'meeting'")?;
         // Phase 2b — content-free egress audit log. One row per cloud provider call written by
         // `DbEgressSink`. The table carries ONLY counts, ids, labels, byte sizes, and token counts —
         // NEVER transcript, prompt, scrubbed values, API keys, or any meeting content (§8: no PII
@@ -732,6 +754,12 @@ impl Db {
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_acct_id", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "recipient_email", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "content_hash", "BLOB")?;
+        // NOTES sharing (WP6): a share can anchor on an authored NOTE instead of a meeting. Additive
+        // nullable — a note share stores its `documents(kind='note')` id here and leaves the NOT NULL
+        // `meeting_id` as '' (empty) so the meeting-title join in `list_my_shares` skips it and
+        // resolves the NOTE title (gated on the note's folder) instead. Legacy meeting shares keep
+        // `document_id` NULL → byte-identical behavior.
+        Self::add_column_if_missing(&conn, "outbound_shares", "document_id", "TEXT")?;
 
         // Re-Truth: guarded ALTERs for the supersession undo pre-images. The columns are also in the
         // `CREATE TABLE IF NOT EXISTS supersessions` above (so a fresh DB gets them there and these are
@@ -1387,6 +1415,77 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Record an outbound NOTE share (WP6). The share anchors on a `documents(kind='note')` id in the
+    /// additive `document_id` column; the NOT NULL `meeting_id` is stored as '' so the meeting-title
+    /// join skips it and `list_my_shares` resolves the NOTE title instead. Mirrors
+    /// [`Db::insert_outbound_share`] otherwise.
+    pub fn insert_outbound_note_share(
+        &self,
+        share_id: &str,
+        document_id: &str,
+        mode: &str,
+        rev: u32,
+        created_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO outbound_shares
+               (share_id, meeting_id, document_id, mode, rev, state, created_at)
+             VALUES (?1, '', ?2, ?3, ?4, 'active', ?5)",
+            rusqlite::params![share_id, document_id, mode, rev as i64, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The local NOTE `document_id` for an outbound share (so the share list can gate on the note's
+    /// folder lock state before revealing its title). `None` for a meeting share or an unknown share.
+    pub fn outbound_share_document(&self, share_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT document_id FROM outbound_shares WHERE share_id = ?1",
+            rusqlite::params![share_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
+    }
+
+    /// True iff a NOTE (`document_id`) has at least one ACTIVE (non-revoked) outbound share. Drives
+    /// the `shared` flag on the note DTOs. A bare boolean — leaks nothing.
+    pub fn note_has_active_share(&self, document_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbound_shares
+                            WHERE document_id = ?1 AND state = 'active')",
+            rusqlite::params![document_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(map_err)
+        .map(|n| n != 0)
+    }
+
+    /// The set of NOTE `document_id`s with at least one ACTIVE outbound share (batch form of
+    /// [`Db::note_has_active_share`] for the list DTO — one query instead of N). Leaks nothing.
+    pub fn notes_with_active_share(&self) -> Result<HashSet<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT document_id FROM outbound_shares
+                  WHERE document_id IS NOT NULL AND state = 'active'",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = HashSet::new();
+        for r in rows {
+            out.insert(r.map_err(map_err)?);
+        }
+        Ok(out)
     }
 
     /// The local `meeting_id` for an outbound share (so the share list can gate on the meeting's lock
@@ -3771,6 +3870,86 @@ impl Db {
         Ok(())
     }
 
+    /// (Re)index an authored NOTE's BODY into `doc_chunks` (+ FTS triggers) and `doc_vec_chunks`
+    /// (only with a real `embedder`). Differs from [`Db::index_document_chunks`] ONLY in that the
+    /// caller passes the pre-stripped BODY + the display TITLE explicitly (a note's `text` column
+    /// carries YAML front-matter, which must NOT be embedded — DESIGN §1a) rather than re-reading
+    /// the raw `text`. The title becomes the chunk header for provenance (the date axis is N/A →
+    /// empty, like a document). Old chunks are purged first (clean replace) in the same tx.
+    pub fn index_note_chunks(
+        &self,
+        note_id: &str,
+        title: &str,
+        body: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<()> {
+        let chunks = crate::embed::chunk_note(title, "", body);
+        let vectors = match embedder {
+            Some(e) if !chunks.is_empty() => e.embed_passage(&chunks)?,
+            _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
+        };
+        let this_doc = [note_id.to_string()];
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_doc_chunks_tx(&tx, &this_doc)?;
+        {
+            let mut ins_chunk = tx
+                .prepare(
+                    "INSERT INTO doc_chunks (document_id, chunk_index, text) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(map_err)?;
+            let mut ins_vec = tx
+                .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
+                .map_err(map_err)?;
+            for (idx, text) in chunks.iter().enumerate() {
+                ins_chunk
+                    .execute(rusqlite::params![note_id, idx as i64, text])
+                    .map_err(map_err)?;
+                if let Some(vector) = vectors.get(idx) {
+                    let chunk_id = tx.last_insert_rowid();
+                    let blob = crate::embed::vec_to_blob(vector);
+                    ins_vec
+                        .execute(rusqlite::params![chunk_id, blob])
+                        .map_err(map_err)?;
+                }
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Reparent a note-folder + rewrite the `path` of it and EVERY descendant (a prefix rewrite, so
+    /// the subtree moves as a unit and `path` stays UNIQUE). Additive UPDATE only. `old_path` /
+    /// `new_path` are the folder's vault-relative paths; `parent_id` is the new parent (NULL for a
+    /// root note-folder). All in one tx.
+    pub fn reparent_note_folder(
+        &self,
+        id: &str,
+        old_path: &str,
+        new_path: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // Descendants first: rewrite every `<old_path>/…` prefix to `<new_path>/…`.
+        let like = format!("{}/%", old_path.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
+        tx.execute(
+            "UPDATE folders
+                SET path = ?1 || substr(path, ?2)
+              WHERE kind = 'note' AND path LIKE ?3 ESCAPE '!'",
+            rusqlite::params![new_path, (old_path.len() + 1) as i64, like],
+        )
+        .map_err(map_err)?;
+        // Then the folder itself: its own path + parent link.
+        tx.execute(
+            "UPDATE folders SET path = ?2, parent_id = ?3 WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, new_path, parent_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
     /// Purge (delete) every `doc_chunks` + `doc_vec_chunks` row for the given documents. The vec0 row
     /// is deleted by its `chunk_id` (== doc_chunks.id) BEFORE the doc_chunks row. Used on lock (seal),
     /// on the index "clean replace", and on document delete. Mirrors [`Db::purge_chunks_for_meetings`].
@@ -3914,6 +4093,293 @@ impl Db {
             }
         }
         Ok(hits)
+    }
+
+    // ── NOTES (authored `documents(kind='note')`) ───────────────────────────────────────────────
+
+    /// Insert an authored note row (`documents` with `kind='note'`). Separate from
+    /// [`Db::insert_document`] only to persist the authoring columns (`title`/`updated_at`);
+    /// `text_blob`/`exported_path` start NULL. The COMMAND layer gates the folder first.
+    pub fn insert_note(
+        &self,
+        id: &str,
+        folder_id: &str,
+        name: &str,
+        title: &str,
+        text: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO documents
+               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at, exported_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'note', NULL, ?6, ?6, NULL)",
+            rusqlite::params![id, folder_id, name, title, text, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Read ONE note's raw row (every column the DTO builders need), or `None` if the id is unknown
+    /// OR the row is not `kind='note'`. The COMMAND layer gates the folder before surfacing the text.
+    pub fn get_note_row(&self, id: &str) -> Result<Option<NoteRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, folder_id, name, title, COALESCE(text, ''), created_at, updated_at,
+                    exported_path, (text_blob IS NOT NULL)
+               FROM documents WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id],
+            row_to_note_row,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Update an authored note's `title` + `text` + `updated_at` (write path). Leaves `text_blob`
+    /// alone (an update on a session-unlocked locked folder writes plaintext; the seal blob is
+    /// rebuilt on the next relock). Idempotent on an unknown id / non-note row (0 rows affected).
+    pub fn update_note_row(&self, id: &str, title: &str, text: &str, updated_at: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
+               WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, title, text, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Persist (or clear with `None`) an authored NOTE's exported vault `.md` path. Set on
+    /// export/unlock re-export; cleared (NULL) when the folder seals and the vault file is deleted.
+    /// Named `_doc` to disambiguate from the MEETING-note [`Db::set_note_exported_path`].
+    pub fn set_note_doc_exported_path(&self, id: &str, path: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET exported_path = ?2 WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The vault `.md` paths of every authored NOTE in a folder that has one (`exported_path`
+    /// non-NULL). Captured BEFORE seal so `lock_folder` can delete the on-disk `.md` (mirrors the
+    /// meeting-notes `.md` deletion). No text — just paths (never PII-in-a-log; the caller doesn't
+    /// log these).
+    pub fn note_exported_paths_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT exported_path FROM documents
+                   WHERE folder_id = ?1 AND kind = 'note' AND exported_path IS NOT NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// NULL the `exported_path` of every authored NOTE in a folder (called on seal, after the vault
+    /// `.md` files are deleted — a sealed note has no on-disk export). Re-set on unlock re-export.
+    pub fn clear_note_exported_paths_in_folder(&self, folder_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET exported_path = NULL
+               WHERE folder_id = ?1 AND kind = 'note'",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Ids of every authored NOTE in a folder (its `documents(kind='note')` rows). Used to re-export
+    /// each note's vault `.md` on unlock/remove-lock. Mirrors [`Db::document_ids_in_folder`] but
+    /// scoped to notes.
+    pub fn note_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM documents WHERE folder_id = ?1 AND kind = 'note'")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Reassign an authored NOTE to a different note-folder (the gate/seal anchor). The COMMAND
+    /// layer gates both the source and target folder. Idempotent on an unknown id / non-note row.
+    /// Named `_doc` to disambiguate from the MEETING-note [`Db::set_note_folder`].
+    pub fn set_note_doc_folder(&self, id: &str, folder_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET folder_id = ?2 WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, folder_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED list of note summaries. `folder_id = Some(fid)` scopes to one note-folder; `None` lists
+    /// every VISIBLE note across all note-folders. The `visibility_clause` is applied IN THE QUERY
+    /// (never a per-row skip) so a sealed-and-not-session-unlocked note's row is EXCLUDED entirely —
+    /// its title/topic never leaks. Newest-updated first. Snippet/tags are derived from the (visible)
+    /// plaintext markdown; a locked note is simply absent here, so no masking is needed at this layer.
+    pub fn list_notes_visible(
+        &self,
+        folder_id: Option<&str>,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<NoteSummary>> {
+        // WP6 — the set of notes with an ACTIVE outbound share (one query; drives `shared`). Computed
+        // BEFORE the main lock (it re-locks internally) so the connection guard is held only once.
+        let shared_set = self.notes_with_active_share()?;
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let folder_pred = if folder_id.is_some() {
+            " AND d.folder_id = ?1"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT d.id, d.folder_id, d.name, d.title, COALESCE(d.text, ''),
+                    d.created_at, d.updated_at
+               FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE d.kind = 'note' AND {visible}{folder_pred}
+              ORDER BY COALESCE(d.updated_at, d.created_at) DESC, d.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let map_row = |r: &Row<'_>| -> rusqlite::Result<NoteSummary> {
+            let id: String = r.get(0)?;
+            let folder_id: String = r.get(1)?;
+            let name: String = r.get(2)?;
+            let title: Option<String> = r.get(3)?;
+            let text: String = r.get(4)?;
+            let created_at: i64 = r.get(5)?;
+            let updated_at: Option<i64> = r.get(6)?;
+            let (tags, _props) = parse_front_matter(&text);
+            let shared = shared_set.contains(&id);
+            Ok(NoteSummary {
+                id,
+                title: title.filter(|t| !t.is_empty()).unwrap_or(name),
+                folder_id,
+                snippet: note_snippet(&text),
+                tags,
+                updated_at: updated_at.unwrap_or(created_at),
+                created_at,
+                locked: false, // a visible note is unlocked by construction (gated in the query).
+                shared,
+            })
+        };
+        let rows = if let Some(fid) = folder_id {
+            stmt.query_map(rusqlite::params![fid], map_row)
+        } else {
+            stmt.query_map([], map_row)
+        }
+        .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    // ── NOTE FOLDERS (`folders` with `kind='note'`) ──────────────────────────────────────────────
+
+    /// Ensure the root note-folder exists (name "Notes", `kind='note'`, path "Notes") and return its
+    /// id. Idempotent: on the SECOND+ call it finds the existing row by its unique `path` and returns
+    /// that id (never a duplicate). Every note anchors on a note-folder (the gate anchor).
+    pub fn ensure_default_note_folder(&self) -> Result<String> {
+        if let Some(f) = self.folder_by_path("Notes")? {
+            return Ok(f.id);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = self.lock();
+        // Guard against a race / a pre-existing "Notes" path created between the check and here:
+        // INSERT OR IGNORE on the UNIQUE path, then read the id back (ours or the winner's).
+        conn.execute(
+            "INSERT OR IGNORE INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind)
+             VALUES (?1, 'Notes', 'Notes', NULL, 0, NULL, ?2, 'note')",
+            rusqlite::params![id, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(map_err)?;
+        conn.query_row(
+            "SELECT id FROM folders WHERE path = 'Notes'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Insert a note-folder (`kind='note'`). Mirrors [`Db::insert_folder`] but stamps the kind.
+    pub fn insert_note_folder(&self, f: &NoteFolder, created_at: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'note')",
+            rusqlite::params![
+                f.id,
+                f.name,
+                f.path,
+                f.parent_id,
+                f.locked as i64,
+                created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// All note-folders (`kind='note'`), creation order. The Notes tree; the Meetings tree
+    /// (`kind != 'note'`) is served by [`Db::list_folders`], which is unchanged.
+    pub fn list_note_folders(&self) -> Result<Vec<NoteFolder>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, path, parent_id, locked, kind
+                   FROM folders WHERE kind = 'note' ORDER BY created_at, name",
+            )
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_note_folder).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// A note-folder by id (`kind='note'` enforced), or `None`. Used to gate note-folder ops so a
+    /// meeting-folder id can't be driven through a note-folder command.
+    pub fn note_folder_by_id(&self, id: &str) -> Result<Option<NoteFolder>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, name, path, parent_id, locked, kind
+               FROM folders WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id],
+            row_to_note_folder,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// The `kind` of a folder (or `None` if unknown). Lets the command layer reject cross-tree ops.
+    pub fn folder_kind(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(kind, 'meeting') FROM folders WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
     }
 
     /// Ids of every VISIBLE document (its folder open or session-unlocked), oldest-first. The
@@ -7897,6 +8363,24 @@ pub struct RawDocument {
     pub blob: Option<Vec<u8>>,
 }
 
+/// The raw column read for one authored note (`documents(kind='note')`) — the low-level shape the
+/// gated command layer turns into a [`NoteDoc`]/[`NoteSummary`]. `title`/`updated_at` are the new
+/// nullable authoring columns (NULL ⇒ fall back to `name`/`created_at` at the DTO layer). `sealed`
+/// is true when a `text_blob` exists (the folder is or was locked) — used only as a hint; the actual
+/// mask decision is the command-layer session-unlock check.
+#[derive(Debug, Clone)]
+pub struct NoteRow {
+    pub id: String,
+    pub folder_id: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub text: String,
+    pub created_at: i64,
+    pub updated_at: Option<i64>,
+    pub exported_path: Option<String>,
+    pub sealed: bool,
+}
+
 /// One stored speaker voiceprint row (opt-in voice biometric for a diarized "others" cluster).
 /// `embedding` is the decoded, L2-normalized CAM++ vector (`dim` floats). `label` is the bound
 /// person name once the cluster is enrolled by rename (NULL until then). Read ONLY through the gated
@@ -7928,6 +8412,136 @@ fn visibility_clause(_alias: &str, unlocked: &HashSet<String>) -> String {
     }
     clause.push(')');
     clause
+}
+
+/// Split a note's full markdown into `(front_matter_yaml, body)`. A leading `---\n … \n---` block
+/// is the YAML front-matter (Obsidian-native properties); everything after the closing `---` is the
+/// BODY. When there is no well-formed front-matter block the whole string is the body and the yaml
+/// is empty. Hand-rolled (no `serde_yaml` dep) — mirrors the frontmatter detection in
+/// `verify::extract_issue_keys` and `export::obsidian::inject_provenance_frontmatter`.
+pub(crate) fn split_front_matter(markdown: &str) -> (String, String) {
+    // Walk lines by BYTE OFFSET (robust to `\r\n` and a final line without a trailing newline).
+    // `rest` is the remaining input; `offset` is its start position in `markdown`.
+    let mut offset = 0usize;
+    let mut fm_lines: Vec<&str> = Vec::new();
+    let mut saw_open = false;
+    while offset < markdown.len() {
+        let rest = &markdown[offset..];
+        // Length of this line INCLUDING its line terminator (\n or \r\n), and the trimmed content.
+        let (line, advance) = match rest.find('\n') {
+            Some(nl) => (rest[..nl].trim_end_matches('\r'), nl + 1),
+            None => (rest.trim_end_matches('\r'), rest.len()),
+        };
+        if !saw_open {
+            // The FIRST line must be a `---` fence, else there is no front-matter.
+            if line.trim() != "---" {
+                return (String::new(), markdown.to_string());
+            }
+            saw_open = true;
+            offset += advance;
+            continue;
+        }
+        if line.trim() == "---" {
+            // Closing fence: the body is whatever follows, with one leading newline trimmed.
+            let body = &markdown[offset + advance..];
+            let body = body.strip_prefix('\n').unwrap_or(body);
+            return (fm_lines.join("\n"), body.to_string());
+        }
+        fm_lines.push(line);
+        offset += advance;
+    }
+    // Opened but never closed → not valid front-matter; the whole thing is body.
+    (String::new(), markdown.to_string())
+}
+
+/// Parse a note's YAML front-matter into `(tags, properties)`. `tags` = the `tags:` list (either a
+/// flow list `[a, b]` or a `- item` block, or a single scalar); `properties` = every OTHER scalar
+/// `key: value` pair (excluding `tags`). Nested/complex YAML is best-effort: only top-level scalar
+/// keys and the `tags` list are recognized (no `serde_yaml` — additive, dep-free). Values are
+/// unquoted + trimmed. Used to build the leak-free note DTOs.
+pub(crate) fn parse_front_matter(
+    markdown: &str,
+) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+    let (yaml, _body) = split_front_matter(markdown);
+    let mut tags: Vec<String> = Vec::new();
+    let mut props: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut pending_tags_block = false; // inside a `tags:` block-list (`- item` lines)
+    for raw in yaml.lines() {
+        let line = raw.trim_end();
+        // Continuation of a `tags:` block list — a `- value` line under `tags:`.
+        if pending_tags_block {
+            let t = line.trim_start();
+            if let Some(item) = t.strip_prefix("- ") {
+                push_tag(&mut tags, item);
+                continue;
+            }
+            if let Some(item) = t.strip_prefix('-') {
+                push_tag(&mut tags, item);
+                continue;
+            }
+            // A non-`-` line ends the tags block; fall through to normal key parsing.
+            pending_tags_block = false;
+        }
+        // Only top-level keys (no leading indentation) are parsed as scalars.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("tags") {
+            if value.is_empty() {
+                pending_tags_block = true; // a `tags:` header → block list follows.
+            } else if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                for part in inner.split(',') {
+                    push_tag(&mut tags, part);
+                }
+            } else {
+                push_tag(&mut tags, value); // single scalar tag
+            }
+            continue;
+        }
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        props.insert(key.to_string(), unquote(value));
+    }
+    (tags, props)
+}
+
+/// Push a cleaned, non-empty tag (unquoted, `#`-stripped, trimmed) — de-duplicated.
+fn push_tag(tags: &mut Vec<String>, raw: &str) {
+    let t = unquote(raw.trim()).trim_start_matches('#').trim().to_string();
+    if !t.is_empty() && !tags.contains(&t) {
+        tags.push(t);
+    }
+}
+
+/// Strip a single pair of matching surrounding quotes (`"…"` or `'…'`) from a YAML scalar.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// The first ~180 chars of a note's BODY (front-matter stripped), collapsed to single-spaced,
+/// markdown heading/emphasis markers softened, for a leak-free list snippet. Empty for an empty body.
+pub(crate) fn note_snippet(markdown: &str) -> String {
+    let (_yaml, body) = split_front_matter(markdown);
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 180 {
+        flat
+    } else {
+        let truncated: String = flat.chars().take(180).collect();
+        format!("{}…", truncated.trim_end())
+    }
 }
 
 /// Brain v2 L1.5 — the optional `started_at` window predicate (half-open `[from, to)`), rendered
@@ -8345,6 +8959,33 @@ fn row_to_folder(row: &Row<'_>) -> rusqlite::Result<Folder> {
     })
 }
 
+/// Column order: `id, name, path, parent_id, locked, kind`.
+fn row_to_note_folder(row: &Row<'_>) -> rusqlite::Result<NoteFolder> {
+    Ok(NoteFolder {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        parent_id: row.get(3)?,
+        locked: row.get::<_, i64>(4)? != 0,
+        kind: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "note".into()),
+    })
+}
+
+/// Column order: `id, folder_id, name, title, text, created_at, updated_at, exported_path, sealed`.
+fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
+    Ok(NoteRow {
+        id: row.get(0)?,
+        folder_id: row.get(1)?,
+        name: row.get(2)?,
+        title: row.get(3)?,
+        text: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        exported_path: row.get(7)?,
+        sealed: row.get::<_, i64>(8)? != 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8382,6 +9023,88 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    /// NOTES feature — the additive columns exist after migrate() and re-migrating is a no-op
+    /// (idempotent guard). `documents.title/updated_at/exported_path` + `folders.kind` are present,
+    /// and existing folders default to `kind='meeting'`.
+    #[test]
+    fn notes_migration_adds_columns_and_is_idempotent() {
+        let db = mem_db();
+        let has_col = |table: &str, col: &str| -> bool {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            cols.iter().any(|c| c == col)
+        };
+        for col in ["title", "updated_at", "exported_path"] {
+            assert!(has_col("documents", col), "documents.{col} added");
+        }
+        assert!(has_col("folders", "kind"), "folders.kind added");
+
+        // A folder inserted via the legacy 6-column path reads back kind='meeting' (the DEFAULT).
+        db.insert_folder(&Folder {
+            id: "leg".into(),
+            name: "Legacy".into(),
+            path: "Legacy".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-10T00:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            db.folder_kind("leg").unwrap().as_deref(),
+            Some("meeting"),
+            "existing folders default to kind='meeting' (Meetings tree unchanged)"
+        );
+        assert!(
+            db.list_note_folders().unwrap().is_empty(),
+            "a meeting folder is NOT a note-folder"
+        );
+
+        // Re-migrate: still fine (idempotent), columns still present.
+        db.migrate().unwrap();
+        assert!(has_col("documents", "exported_path"));
+    }
+
+    /// NOTES — front-matter parsing: `tags` (flow list, block list, single scalar), scalar
+    /// `properties` (excl. tags), and the body snippet (front-matter stripped). No new deps.
+    #[test]
+    fn front_matter_parse_and_snippet() {
+        // Flow-list tags + scalar props.
+        let md = "---\ntags: [alpha, \"beta gamma\"]\nstatus: draft\ndate: 2026-07-10\n---\nBody text here.";
+        let (tags, props) = parse_front_matter(md);
+        assert_eq!(tags, vec!["alpha".to_string(), "beta gamma".to_string()]);
+        assert_eq!(props.get("status"), Some(&"draft".to_string()));
+        assert_eq!(props.get("date"), Some(&"2026-07-10".to_string()));
+        assert!(!props.contains_key("tags"), "tags excluded from properties");
+        assert_eq!(note_snippet(md), "Body text here.");
+        let (_yaml, body) = split_front_matter(md);
+        assert_eq!(body, "Body text here.", "front-matter stripped from body");
+
+        // Block-list tags.
+        let md2 = "---\ntags:\n  - one\n  - two\n---\n# Heading\nMore.";
+        let (tags2, _p2) = parse_front_matter(md2);
+        assert_eq!(tags2, vec!["one".to_string(), "two".to_string()]);
+
+        // No front-matter: whole string is body, no tags/props.
+        let md3 = "Just a plain note, no YAML.";
+        let (tags3, props3) = parse_front_matter(md3);
+        assert!(tags3.is_empty() && props3.is_empty());
+        assert_eq!(split_front_matter(md3).1, md3);
+
+        // Snippet truncation at ~180 chars.
+        let long = format!("---\ntags: []\n---\n{}", "word ".repeat(100));
+        assert!(
+            note_snippet(&long).chars().count() <= 181,
+            "snippet capped ~180 chars (+ellipsis)"
+        );
     }
 
     /// TIER 1 installed-base flip: `migrate()` sets `semantic_search_enabled='true'` + the
