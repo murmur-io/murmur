@@ -21249,7 +21249,7 @@ mod lifecycle_tests {
                 "2026-07-10T09:00:00Z",
                 2,
                 1,
-                &vec![5u8; 32],
+                &[5u8; 32],
                 None,
             )
             .unwrap();
