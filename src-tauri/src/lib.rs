@@ -267,6 +267,8 @@ pub fn run() {
             commands::clear_voiceprints,
             commands::model_present,
             commands::download_model,
+            commands::parakeet_models_present,
+            commands::download_parakeet_models,
             commands::brain_model_present,
             commands::list_brain_models,
             commands::brain_model_retirement_nudge,
