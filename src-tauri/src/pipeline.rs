@@ -974,6 +974,20 @@ async fn summarize_and_export(
     // resummarize is gated upstream by meeting_is_unlocked).
     let manual_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
 
+    // Brain v2 L4 — the RUNNING LIVE BULLETS captured during the recording (the crash-recovery
+    // `live_bullets` row `transcribe::bullets::bullets_tick` maintained; the RAM buffer was
+    // already cleared at Stop). PRODUCER-side read like `manual_notes` above (ungated by design
+    // here — the pipeline produces this meeting's own note plaintext; a sealed meeting has no row
+    // anyway, purge-on-seal). Present ⇒ rendered as the "Live notes (auto)" section before the
+    // transcript (riding the RedactingProvider firewall like every other prompt field) and
+    // CONSUMED (row cleared) after the note persists below; absent (bullets off / stub /
+    // resummarize after the consume) ⇒ the prompt is byte-identical to before.
+    let live_bullets = state
+        .db
+        .get_live_bullets(meeting_id)
+        .unwrap_or_default()
+        .filter(|b| !b.trim().is_empty());
+
     let request = SummarizeRequest {
         // TIER 0: the SPEAKER-LABELED transcript (or the flat one for a solo-`me` meeting). It rides
         // `req.transcript`, so the RedactingProvider firewall scrubs any name in a `(speaker)` tag.
@@ -994,6 +1008,7 @@ async fn summarize_and_export(
         } else {
             None
         },
+        live_bullets: live_bullets.clone(),
     };
 
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
@@ -1092,6 +1107,16 @@ async fn summarize_and_export(
         model_served: call_meta.model_served.clone(),
         gateway_host,
     })?;
+
+    // Brain v2 L4 — the live bullets are now folded into the persisted note: CONSUME the
+    // crash-recovery row (best-effort; a failed clear only means a later resummarize would see
+    // the same bullets again — never content loss). A summarize FAILURE above keeps the row, so
+    // a retry / crash-salvage re-run still gets its bullets.
+    if live_bullets.is_some() {
+        if let Err(e) = state.db.clear_live_bullets(meeting_id) {
+            tracing::debug!(target: "bullets", error = %e, "live-bullets consume (row clear) failed");
+        }
+    }
 
     // brain2 RAG Phase 2b — index the just-persisted note into the on-device vector layer, GATED by
     // the master flag AND the meeting's visibility (never index a sealed-not-unlocked folder's

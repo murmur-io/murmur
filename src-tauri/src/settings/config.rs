@@ -446,6 +446,15 @@ pub struct AppConfig {
     /// K_LOOP_TRANSCRIPT_COMPACTION.
     #[serde(default = "default_true")]
     pub loop_transcript_compaction: bool,
+    /// Brain v2 L4 — INCREMENTAL LIVE BULLETS: the reactions worker maintains running
+    /// `- [topic]: point` notes of the recording in progress on the LOCAL light engine
+    /// (`transcribe::bullets`, zero egress). Default ON — the worker itself no-ops to the legacy
+    /// behavior when no local light model is present (the stub guard), so ON is safe on every
+    /// install; OFF is the field escape hatch (legacy raw-tail reactions substrate, no bullets
+    /// row, legacy 6k live inject). ADDITIVE; not on the settings DTO; round-trips via
+    /// K_LIVE_BULLETS_ENABLED.
+    #[serde(default = "default_true")]
+    pub live_bullets_enabled: bool,
     /// Model-role override — the CONNECTION serving the **Notes** role (everything Murmur writes).
     /// `""` (the default, and every pre-role install) = inherit the legacy mapping EXACTLY — see
     /// [`crate::summarize::roles::resolve`]. Values: `claude_code`/`anthropic`/`ollama`/`gateway`
@@ -559,6 +568,7 @@ impl Default for AppConfig {
             brain_heavy_grammar_enabled: false,
             ask_jit_retrieval: false,
             loop_transcript_compaction: true,
+            live_bullets_enabled: true,
             role_notes_connection: String::new(),
             role_notes_model: String::new(),
             role_notes_effort: String::new(),
@@ -636,6 +646,7 @@ const K_GROUND_SUMMARY: &str = "ground_summary";
 const K_BRAIN_HEAVY_GRAMMAR_ENABLED: &str = "brain_heavy_grammar_enabled";
 const K_ASK_JIT_RETRIEVAL: &str = "ask_jit_retrieval";
 const K_LOOP_TRANSCRIPT_COMPACTION: &str = "loop_transcript_compaction";
+const K_LIVE_BULLETS_ENABLED: &str = "live_bullets_enabled";
 const K_ROLE_NOTES_CONNECTION: &str = "role_notes_connection";
 const K_ROLE_NOTES_MODEL: &str = "role_notes_model";
 const K_ROLE_NOTES_EFFORT: &str = "role_notes_effort";
@@ -850,6 +861,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_LOOP_TRANSCRIPT_COMPACTION)? {
             cfg.loop_transcript_compaction = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_LIVE_BULLETS_ENABLED)? {
+            cfg.live_bullets_enabled = v == "true";
         }
         // Model-role keys: `""` is a VALID value (= inherit legacy) and also the default, so the
         // stored value is taken verbatim (mirrors `provider_model`, not `anthropic_model`).
@@ -1148,6 +1162,14 @@ impl AppConfig {
         db.set_setting(
             K_LOOP_TRANSCRIPT_COMPACTION,
             if self.loop_transcript_compaction {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_LIVE_BULLETS_ENABLED,
+            if self.live_bullets_enabled {
                 "true"
             } else {
                 "false"

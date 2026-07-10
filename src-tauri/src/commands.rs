@@ -469,6 +469,9 @@ pub async fn start_recording(
     if let Ok(mut e) = state.reactions_emitted.lock() {
         e.clear();
     }
+    // Brain v2 L4: fresh recording ⇒ fresh running bullets (RAM buffer + delta tracker) — a stale
+    // previous meeting's bullets must never seed the new meeting's substrate or prompt inject.
+    crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
 
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
@@ -662,6 +665,10 @@ pub async fn stop_recording(
     // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
     // the just-recorded folder is sealed). The authoritative transcript is produced below.
     crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+    // Brain v2 L4: clear the running-bullets RAM the same way. The crash-recovery `live_bullets`
+    // DB row deliberately SURVIVES this clear — the note pipeline below reads it as the
+    // "Live notes (auto)" Stage-1 input and consumes (clears) it after the note persists.
+    crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
 
     let meeting_uuid = {
         let mut current = state
@@ -5543,6 +5550,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         brain_heavy_grammar_enabled: current.brain_heavy_grammar_enabled,
         ask_jit_retrieval: current.ask_jit_retrieval,
         loop_transcript_compaction: current.loop_transcript_compaction,
+        // Brain v2 L4: the live-bullets flag is NOT carried on the settings DTO (no FE toggle
+        // yet) — PRESERVE the live value (same discipline as the L3 flags above); it round-trips
+        // through the dedicated K_LIVE_BULLETS_ENABLED load/save keys.
+        live_bullets_enabled: current.live_bullets_enabled,
         // Model-role keys ARE settable from the DTO (a future Settings UI owns the rows), like
         // `gateway_model` — plain strings, `""` = inherit legacy. An omitted key deserializes to
         // `""` (`#[serde(default)]`), so an older FE payload can never flip a role.
@@ -7905,6 +7916,12 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
 fn clear_stale_live_transcript(state: &AppState) {
     let recording = state.recorder.lock().map(|g| g.is_some()).unwrap_or(true);
     crate::transcribe::live::clear_live_transcript_if_idle(&state.live_transcript, recording);
+    // Brain v2 L4: the running-bullets RAM mirrors the live buffer — same idle-only hygiene
+    // (never wipe an in-flight recording's bullets; mid-recording correctness is owned by the
+    // `gated_live_bullets` visibility gate).
+    if !recording {
+        crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
+    }
 }
 
 /// SESSION-unlock a sealed folder: KEK → unwrap CK → decrypt each note's `content_blob` back into
@@ -11864,6 +11881,8 @@ mod lifecycle_tests {
             current_meeting: Mutex::new(None),
             focus_meeting: Mutex::new(None),
             live_transcript: Mutex::new(String::new()),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
             reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
             reactions_emitted: Mutex::new(HashSet::new()),

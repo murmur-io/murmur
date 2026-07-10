@@ -286,6 +286,24 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
         }
     }
 
+    // Brain v2 L4 — LIVE NOTES (auto): the running bullets captured during the recording, as a
+    // labeled grounding section BEFORE the transcript. The transcript stays authoritative — the
+    // bullets are a light-model digest and must never override it. Absent/blank ⇒ byte-identical
+    // output (the same contract as `user_notes` above).
+    if let Some(bullets) = &req.live_bullets {
+        if !bullets.trim().is_empty() {
+            out.push_str(
+                "\n## Live notes (auto)\n\
+                 Running bullets auto-captured during the meeting by the on-device assistant. \
+                 Use them as ADDITIONAL grounding for what mattered; the transcript below is \
+                 authoritative — never include a bullet the transcript does not support, and \
+                 never output a section titled `Live notes`.\n",
+            );
+            out.push_str(bullets.trim());
+            out.push('\n');
+        }
+    }
+
     out.push_str("\nTRANSCRIPT\n");
     out.push_str(&req.transcript);
     out.push('\n');
@@ -311,6 +329,7 @@ mod tests {
             vault_titles: vec!["Roadmap".to_string()],
             related_context: related,
             user_notes: None,
+            live_bullets: None,
         }
     }
 
@@ -446,6 +465,40 @@ mod tests {
         assert!(
             s.contains("Never output a section titled"),
             "forbids a My notes section"
+        );
+    }
+
+    /// Brain v2 L4: `live_bullets: None` (and blank) render byte-identical to the pre-field
+    /// prompt — the section only exists when a recording actually produced bullets.
+    #[test]
+    fn live_bullets_none_or_blank_renders_without_section() {
+        let base = render_user_content(&req(None));
+        assert!(!base.contains("Live notes (auto)"), "no section without bullets");
+        let mut blank = req(None);
+        blank.live_bullets = Some("  \n ".to_string());
+        assert_eq!(
+            render_user_content(&blank),
+            base,
+            "blank bullets must be byte-identical to None"
+        );
+    }
+
+    /// Brain v2 L4: the "Live notes (auto)" section lands BEFORE the transcript, carries the
+    /// bullets verbatim, and labels the transcript as authoritative.
+    #[test]
+    fn live_bullets_section_renders_before_transcript() {
+        let mut r = req(None);
+        r.live_bullets = Some("- [deal]: pricing agreed\n- [QA]: Anna owns testing".to_string());
+        let s = render_user_content(&r);
+        let bullets_at = s
+            .find("- [deal]: pricing agreed\n- [QA]: Anna owns testing")
+            .expect("bullets verbatim");
+        let transcript_at = s.find("\nTRANSCRIPT\n").expect("transcript section");
+        assert!(bullets_at < transcript_at, "live notes before transcript");
+        assert!(s.contains("## Live notes (auto)"), "labeled section");
+        assert!(
+            s.contains("the transcript below is authoritative"),
+            "transcript stays authoritative: {s}"
         );
     }
 
