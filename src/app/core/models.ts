@@ -1126,6 +1126,29 @@ export interface VaultSource {
   meetingId: string;
   title: string;
   startedAt: string;
+  /**
+   * Shared Brain v1 — provenance of the retrieval hit. Absent/null for a plain
+   * LOCAL owned-content source (a meeting or note the user recorded/authored
+   * themselves); present with `kind:"org"` for an org-brain hit synced from a
+   * colleague's share. Lets `SourcesComponent` render an org-origin chip (author +
+   * date) that routes to the read-only org-item viewer instead of `/meeting/:id`.
+   * Mirrors the Rust `VaultSource.origin` (serde camelCase, `#[serde(skip_serializing_if)]`).
+   */
+  origin?: SourceOrigin | null;
+}
+
+/**
+ * Shared Brain v1 — where a retrieval hit came from. `kind:"local"` (the default
+ * for owned content) or `kind:"org"` (an org-brain item synced from a colleague).
+ * For an org hit `author` is the `author_hint` label and `orgItemId` is the id
+ * the org-item viewer loads via `orgGetItem`. Mirrors the Rust `SourceOrigin`.
+ */
+export interface SourceOrigin {
+  kind: "local" | "org";
+  /** The org item's author hint (present only for an org hit). */
+  author?: string | null;
+  /** The org item id for the read-only viewer route (present only for an org hit). */
+  orgItemId?: string | null;
 }
 
 /** The two entity kinds the self-assembling graph resolves (Rust `EntityKind`, camelCase). */
@@ -1464,8 +1487,13 @@ export interface MyShareEntry {
   documentId: string | null;
   /** The server-enforced open cap (`null` ⇒ uncapped) driving the `X / Y opens` label. Display-only. */
   maxDownloads: number | null;
-  /** `link` (mode-A zero-knowledge link) vs `user` (mode-B Murmur↔Murmur grant). */
-  mode: "link" | "user";
+  /**
+   * `link` (mode-A zero-knowledge link) · `user` (mode-B Murmur↔Murmur grant) ·
+   * `org` (Shared Brain — an org-wide E2EE item published to the org feed). The
+   * `org` mode drives the "In Org Brain" `.pill` badge in the detail header and
+   * library rows (mirrors the existing per-mode share badges).
+   */
+  mode: "link" | "user" | "org";
 }
 
 // ── M5-CLIENT: Murmur↔Murmur (mode B) ──
@@ -1717,4 +1745,162 @@ export interface NoteFolder {
   parentId: string | null;
   locked: boolean;
   kind: string;
+}
+
+// ── Shared Brain v1 — org-wide E2EE replicated brain (DTOs mirror the spec
+// contract `docs/superpowers/specs/2026-07-10-shared-brain-v1-spec.md`, Rust
+// `#[serde(rename_all = "camelCase")]`). Org items live OUTSIDE the folder-lock
+// domain (they are deliberately org-disclosed content); egress from THIS user is
+// gated by consent + `meeting_is_unlocked`. All the list/preview/status commands
+// are leak-conscious per the spec's "no content-derived strings" discipline.
+
+/** The member's role in an org. `owner` can invite/remove members + drive OCK rotation. */
+export type OrgRole = "owner" | "member";
+
+/**
+ * The org membership + sync state for the Settings › Organization section
+ * (`orgStatus` / `orgCreate`). `null` from `orgStatus` ⇒ this user is in no org
+ * yet (show the create form). `memberCount` + `itemCount` are counts only (no
+ * names/content); `lastSeq` is the last synced feed sequence; `pendingShares`
+ * is the count of queued/failed local outbound org shares awaiting the sweep.
+ * Mirrors the Rust `OrgStatus`.
+ */
+export interface OrgStatus {
+  orgId: string;
+  name: string;
+  role: OrgRole;
+  memberCount: number;
+  /** The one-time org-egress consent has been granted (mirrors `shareConsented`). */
+  consented: boolean;
+  /** Last synced feed sequence (drives the "N items synced" status). */
+  lastSeq: number;
+  /** Number of decrypted org items in the local replica. */
+  itemCount: number;
+  /** Local outbound org shares still queued/failed (awaiting the launch sweep). */
+  pendingShares: number;
+}
+
+/**
+ * One org member row for the owner's member list (`orgListMembers`). Content-free:
+ * an `email` the owner already knows + a role + join time. `removed` marks a
+ * former member (rendered muted / historical). Mirrors the Rust `OrgMember`.
+ */
+export interface OrgMember {
+  userId: string;
+  email: string;
+  role: OrgRole;
+  addedAt: string;
+  removed: boolean;
+}
+
+/**
+ * The preview of an outgoing org share (`previewOrgShare`) — rendered in the
+ * OPAQUE preview sheet (trap T3) so the user sees EXACTLY the markdown that would
+ * leave the device before confirming. `markdown` is the cleaned+scrubbed outgoing
+ * envelope body; `bytes` its size; `chunkCount` how many retrieval chunks it makes.
+ * `scrubbed` counts what the regex PII scrub removed at the CURRENT `scrub` setting
+ * (all zero when `scrub` is off). Re-fetched whenever the scrub toggle flips (the
+ * markdown + counts change). Mirrors the Rust `OrgSharePreview`.
+ */
+export interface OrgSharePreview {
+  title: string;
+  /** The exact outgoing markdown (scrolled + shown verbatim in the sheet). */
+  markdown: string;
+  /** Byte size of the outgoing envelope body. */
+  bytes: number;
+  /** Retrieval chunk count the body would produce. */
+  chunkCount: number;
+  /** What the regex PII scrub removed at the current `scrub` setting. */
+  scrubbed: OrgScrubCounts;
+  /** Whether the regex PII scrub is ON for this preview (drives the toggle). */
+  scrub: boolean;
+}
+
+/** Per-kind PII scrub counts for the preview sheet. Zero for every kind when scrub is off. */
+export interface OrgScrubCounts {
+  emails: number;
+  phones: number;
+  cards: number;
+}
+
+/**
+ * One row of this user's outgoing org shares (`listOrgShares`) — drives the
+ * "In Org Brain" state + the per-item revoke. `state` mirrors the local
+ * `org_shares` state machine (queued → uploaded, or revoke_pending → revoked).
+ * Content-free beyond `title` (which renders only to the local owner who can
+ * already read it). Mirrors the Rust `OrgShareEntry`.
+ */
+export interface OrgShareEntry {
+  itemId: string;
+  kind: "note" | "summary";
+  title: string;
+  sharedAt: string;
+  rev: number;
+  state: "queued" | "uploaded" | "failed" | "revoke_pending" | "revoked";
+}
+
+/**
+ * A summary row of a synced org item (feed replica). Content-free beyond the
+ * title/author-hint the local user is allowed to see. Mirrors the Rust
+ * `OrgItemSummary`.
+ */
+export interface OrgItemSummary {
+  itemId: string;
+  authorHint: string;
+  title: string;
+  createdAt: string;
+  rev: number;
+}
+
+/**
+ * The full decrypted org item for the read-only viewer route (`orgGetItem`).
+ * `markdown` is the plaintext envelope body — this is deliberately-disclosed org
+ * content (no lock gate applies to org items), rendered read-only with an
+ * author + date header. Mirrors the Rust `OrgItemDetail`.
+ */
+export interface OrgItemDetail {
+  itemId: string;
+  authorHint: string;
+  title: string;
+  createdAt: string;
+  rev: number;
+  markdown: string;
+}
+
+/**
+ * The result of a manual `orgSyncNow()` — counts + errors only, no content.
+ * `ftsOnly` is true when the local member has no real embedder (StubEmbedder ⇒
+ * the org partition is FTS-only until a model appears + a re-embed runs).
+ * Mirrors the Rust `OrgSyncReport`.
+ */
+export interface OrgSyncReport {
+  pulled: number;
+  ingested: number;
+  tombstoned: number;
+  lastSeq: number;
+  /** No real embedder → org partition indexed FTS-only (re-embed when a model lands). */
+  ftsOnly: boolean;
+  errors: string[];
+}
+
+/**
+ * The active-shares report for the lock×shares dialog (`folderActiveShares`),
+ * gathered when the user tries to lock a folder that has outgoing shares. Titles
+ * render only to the local owner (who can already read them) — content-free
+ * enough for a dialog. `links`/`users` are 1:1 share counts; `org` is the list
+ * of org-brain items shared from this folder. Mirrors the Rust `ActiveSharesReport`.
+ */
+export interface ActiveSharesReport {
+  /** Count of active zero-knowledge LINK shares from this folder. */
+  links: number;
+  /** Count of active Murmur↔Murmur USER shares from this folder. */
+  users: number;
+  /** Org-brain items shared from this folder (item id + title). */
+  org: OrgActiveShare[];
+}
+
+/** One org-brain item active for a folder (lock×shares dialog). */
+export interface OrgActiveShare {
+  itemId: string;
+  title: string;
 }

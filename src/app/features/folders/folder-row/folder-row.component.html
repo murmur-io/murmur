@@ -360,4 +360,17 @@
     (dropNote)="dropNote.emit($event)"
   />
 }
+
+<!-- Lock×shares blocking dialog — shown when locking a folder that still has
+     active shares (Shared Brain v1). OPAQUE overlay (trap T3). -->
+@if (sharesReport(); as report) {
+  <app-lock-shares-dialog
+    [folderName]="node().name"
+    [report]="report"
+    [busy]="revokingShares()"
+    (revokeAndLock)="onRevokeAndLock()"
+    (lockAnyway)="onLockAnyway()"
+    (cancelled)="onCancelLockShares()"
+  />
+}
   

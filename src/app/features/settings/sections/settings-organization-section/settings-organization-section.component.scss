@@ -1,0 +1,181 @@
+/* Host stays layout-transparent so this section's card is a direct flex item
+   of the shell's .section-body (identical spacing to sibling sections). */
+:host {
+  display: contents;
+}
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.account-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.account-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+.account-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  min-width: 48px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
+}
+.account-mark svg {
+  display: block;
+}
+.account-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.account-copy h3 {
+  margin: 0;
+}
+.account-sub {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+.account-sub strong {
+  color: var(--text-primary);
+}
+
+.account-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.account-section-label {
+  font-size: 0.8125rem;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+.account-note {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+.account-note strong {
+  color: var(--text-primary);
+}
+
+.signed-in-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.signed-pill {
+  align-self: flex-start;
+}
+.org-role-chip {
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.consent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* Shared text input — mirrors the account section's input treatment via tokens. */
+.text-input {
+  height: 38px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.9rem;
+}
+.text-input::placeholder {
+  color: var(--text-muted);
+}
+.text-input:focus-visible {
+  outline: none;
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.invite-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.invite-input {
+  flex: 1 1 16rem;
+  min-width: 12rem;
+}
+
+.mini-btn {
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  flex: none;
+}
+
+.member-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.member-row:first-child {
+  border-top: none;
+}
+.member-row.is-removed {
+  opacity: 0.55;
+}
+.member-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.member-email {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.member-sub {
+  font-size: 0.78rem;
+}
+.member-empty {
+  padding: var(--space-3) 0;
+  font-size: 0.875rem;
+}
