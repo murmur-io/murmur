@@ -73,11 +73,15 @@ impl AssistantScope {
             "get_open_commitments",
             "get_entity_dossier",
         ];
-        const CONNECTORS: [&str; 4] = [
+        const CONNECTORS: [&str; 5] = [
             "web_search",
             "calendar_lookup",
             "jira_search",
             "slack_search",
+            // Shared Brain: org search is egress-FREE (a local read) but UNTRUSTED multi-writer
+            // content, so it is partitioned as connector-class — reachable only at Tier 3 / Full,
+            // never at the current-meeting / owned-vault isolation tiers.
+            "org_brain_search",
         ];
         // Brain v2 L5 — every DYNAMIC MCP tool (`mcp_<server_id>_query`) is CONNECTOR-CLASS:
         // reachable ONLY at Tier 3 / Full. Matched by prefix here (the names are per-server) so a
@@ -151,6 +155,15 @@ pub enum ToolCall {
     /// is exposed (enabled + consented + user token). It EGRESSES: the redacted query reaches the
     /// user's Slack workspace through the consent-gated, redacting connector framework.
     SlackSearch { query: String },
+    /// SHARED BRAIN — search the ORG partition (colleagues' shared items, synced + decrypted
+    /// locally). UNLIKE the web/jira/slack connectors this EGRESSES NOTHING — it reads the LOCAL
+    /// int8 org partition (`org_vec_chunks`/`fts_org_chunks`), so it runs through the synchronous,
+    /// egress-free [`execute_tool`]. It is CONNECTOR-CLASS in the tier gate (Tier 3 / Full only) and
+    /// advertised ONLY when an org is joined + org egress is consented. Its results are UNTRUSTED
+    /// multi-writer content: they are provenance-labelled `[org · <author>]` and fence-neutralized
+    /// ([`neutralize_murmur_fences`]) before entering the loop, and NEVER injected into a system
+    /// prompt.
+    OrgBrainSearch { query: String },
 }
 
 /// Model-facing description of one tool the agentic brain may call. `parameters` is a JSON-schema
@@ -261,6 +274,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                           results are loud-attributed '(via Slack)'. Use for 'what did we say/decide \
                           about X in Slack' questions.".into(),
             parameters: str_arg("query", "What to look for in Slack, in the user's own language."),
+            write: false,
+        },
+        ToolSpec {
+            name: "org_brain_search".into(),
+            description: "Search the ORGANIZATION brain — notes your colleagues explicitly shared to \
+                          the shared org brain (synced + decrypted on this device, no data leaves). \
+                          Only available when you have joined an org and consented; results are \
+                          loud-attributed '[org · <author>]' and MUST be cited as coming from that \
+                          colleague. Use for 'what does the team / someone else know / decide about \
+                          X' questions that your own vault can't answer.".into(),
+            parameters: str_arg("query", "What to look for in the shared org brain, in the user's own language."),
             write: false,
         },
         ToolSpec {
@@ -527,6 +551,16 @@ pub fn execute_tool(
                     .to_string(),
             ))
         }
+        ToolCall::OrgBrainSearch { query } => {
+            // EGRESS-FREE: the org partition is a LOCAL decrypted replica, so — unlike the web/jira/
+            // slack connectors — org search runs through this synchronous path. The results are
+            // UNTRUSTED multi-writer content: `search_org_brain` provenance-labels each hit
+            // `[org · <author>]` and FENCE-NEUTRALIZES the whole payload before returning it as loop
+            // DATA (never a system prompt). The availability gate (org joined + consented) is applied
+            // at ADVERTISEMENT time; a call that reaches here on an unavailable org simply finds an
+            // empty partition and returns "no results" (never an error, never a leak).
+            search_org_brain(db, config, query)
+        }
     }
 }
 
@@ -781,6 +815,91 @@ fn format_web_hits(hits: &[crate::connectors::ConnectorHit]) -> String {
         .join("\n")
 }
 
+/// SHARED BRAIN — is the org partition available as a tool for THIS session? True iff an org is
+/// joined AND org egress is consented (the same one-time consent that governs SHARING; a member who
+/// consented to publish into the org brain has opted into the org-brain surface). Fail-closed on any
+/// DB read error. This is the single advertisement predicate for BOTH the agent tool
+/// (`org_brain_search`) and the MCP tool (`org_search`).
+pub(crate) fn org_brain_available(db: &Db, config: &AppConfig) -> bool {
+    config.org_egress_consented
+        && db
+            .list_org_states()
+            .map(|orgs| !orgs.is_empty())
+            .unwrap_or(false)
+}
+
+/// SHARED BRAIN — the single org retrieval + format seam used by BOTH `org_brain_search` (agent) and
+/// the MCP `org_search` tool. Runs the int8 vector KNN leg (with the member's OWN query embedding,
+/// skipped on the StubEmbedder / semantic-off path) + the keyword FTS leg (LIMIT-pushdown), RRF-fuses
+/// them, DROPS self-shared items (whose `content_sha256` matches a local `org_shares` row — a member
+/// never re-surfaces their own published note as an "org" result), formats each hit LOUDLY as
+/// `[org · <author>] <title> — <snippet>`, and FENCE-NEUTRALIZES the whole payload
+/// ([`neutralize_murmur_fences`]) so an UNTRUSTED org author cannot smuggle managed-block markers or
+/// a system-prompt override into the loop. The output is DATA for the loop — NEVER a system prompt.
+pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Result<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok("No org-brain results for an empty query.".to_string());
+    }
+    // Vector leg: only with a real embedder + semantic on (mirrors the vault semantic gate). The
+    // query is embedded with the e5 `query:` prefix, then int8-quantized inside the Db reader.
+    let knn = if config.semantic_search_enabled && crate::embed::embed_model_present() {
+        let embedder = crate::embed::active_embedder();
+        match embedder.embed_query(std::slice::from_ref(&q.to_string())) {
+            Ok(v) => {
+                let qv = v.into_iter().next().unwrap_or_default();
+                db.search_org_chunks_knn(&qv, 20).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let fts = db.search_org_chunks_fts(q, 20).unwrap_or_default();
+    let mut hits = crate::embed::fuse_org_hits(knn, fts);
+
+    // SELF-SHARE DEDUP: drop any hit whose plaintext content hash matches a locally-published share.
+    let mine: std::collections::HashSet<Vec<u8>> = db
+        .all_org_shared_content_hashes()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !mine.is_empty() {
+        hits.retain(|h| h.content_sha256.is_empty() || !mine.contains(&h.content_sha256));
+    }
+
+    if hits.is_empty() {
+        return Ok(format!("No org-brain results for \"{q}\"."));
+    }
+    Ok(neutralize_murmur_fences(&format_org_hits(&hits)))
+}
+
+/// Render org-partition hits into the tool text payload — one LOUD line per item with its untrusted
+/// author provenance: `[org · <author>] <title> — <snippet>`. The `[org · …]` label is the
+/// spec-mandated provenance the model must attribute to; the whole payload is fence-neutralized by
+/// the caller ([`search_org_brain`]) before it enters the loop.
+fn format_org_hits(hits: &[crate::storage::models::OrgChunkHit]) -> String {
+    hits.iter()
+        .map(|h| {
+            let author = {
+                let a = h.author_hint.trim();
+                if a.is_empty() {
+                    "member".to_string()
+                } else {
+                    a.to_string()
+                }
+            };
+            let mut line = format!("- [org · {author}] {}", h.title.trim());
+            let snippet = h.snippet.trim();
+            if !snippet.is_empty() {
+                line.push_str(&format!(" — {snippet}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Render the open-commitments rollup into the tool text payload — one line per item:
 /// `- owner · due · "text" · [[Title]]` (owner/due omitted when absent).
 fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
@@ -918,6 +1037,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             .filter(|s| match s.name.as_str() {
                 // Connectors require the AppHandle (async sidecar / consent path).
                 "web_search" | "calendar_lookup" | "jira_search" | "slack_search" => has_app,
+                // Shared Brain: advertised ONLY when an org is joined + org egress is consented
+                // (fail-closed). Unlike the connectors it is egress-free (a local read), so it needs
+                // NO AppHandle — it runs on the DB + config alone.
+                "org_brain_search" => org_brain_available(self.db, self.config),
                 // The draft tool is advertised only on surfaces with a notes flow / Accept
                 // affordance (in-meeting yes, the vault-wide Ask page no).
                 "propose_note" => self.note_drafts,
@@ -1048,6 +1171,16 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 &ToolCall::GetEntityDossier {
                     entity: s("entity"),
                 },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
+            // Shared Brain — egress-free LOCAL read of the org partition (the allowlist above already
+            // proved it was advertised this turn: Tier 3/Full + org joined + consented). Runs through
+            // the synchronous, egress-free `execute_tool`, which provenance-labels + fence-neutralizes
+            // the untrusted org text before returning it as loop DATA.
+            "org_brain_search" => execute_tool(
+                &ToolCall::OrgBrainSearch { query: s("query") },
                 self.db,
                 &unlocked,
                 self.config,

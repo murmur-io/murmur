@@ -943,6 +943,33 @@ pub fn fuse_doc_hits(
         .collect()
 }
 
+/// RRF-fuse the two ORG-partition retrieval legs (int8 vector KNN + keyword FTS) into one
+/// best-first, per-item-deduped hit list — the org twin of [`fuse_doc_hits`]. Either leg may be
+/// empty (StubEmbedder ⇒ no KNN; punctuation query ⇒ no FTS). The kept snippet is first-seen, KNN
+/// (nearest) preferred over FTS. Pure fusion — no gate is applied (org items are outside the
+/// folder-lock domain), but the SELF-SHARE dedup (drop hits whose `content_sha256` matches a local
+/// `org_shares` row) is the caller's responsibility BEFORE this, so a member never re-surfaces their
+/// own published item as an "org" result.
+pub fn fuse_org_hits(
+    knn: Vec<crate::storage::models::OrgChunkHit>,
+    fts: Vec<crate::storage::models::OrgChunkHit>,
+) -> Vec<crate::storage::models::OrgChunkHit> {
+    if knn.is_empty() && fts.is_empty() {
+        return Vec::new();
+    }
+    let knn_ids: Vec<String> = knn.iter().map(|h| h.item_id.clone()).collect();
+    let fts_ids: Vec<String> = fts.iter().map(|h| h.item_id.clone()).collect();
+    let fused = rrf_fuse(&[knn_ids, fts_ids], RRF_K);
+    let mut by_id: HashMap<String, crate::storage::models::OrgChunkHit> = HashMap::new();
+    for h in knn.into_iter().chain(fts) {
+        by_id.entry(h.item_id.clone()).or_insert(h);
+    }
+    fused
+        .into_iter()
+        .filter_map(|(id, _score)| by_id.remove(&id))
+        .collect()
+}
+
 /// Download the three model files for the SELECTED embedder into [`embed_model_dir`], INBOUND-ONLY,
 /// with progress.
 ///
