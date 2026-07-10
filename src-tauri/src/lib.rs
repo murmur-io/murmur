@@ -258,6 +258,8 @@ pub fn run() {
             commands::get_meeting_detail,
             commands::get_analytics,
             commands::get_timeline,
+            commands::generate_timeline,
+            commands::timeline_generation_on_device,
             commands::rename_speaker,
             commands::suggest_speaker_labels,
             commands::list_voiceprints,

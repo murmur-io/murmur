@@ -2529,10 +2529,21 @@ pub(crate) fn move_note_doc_inner(
     // NULLed exported_path in ONE atomic UPDATE ([`Db::move_note_row_sealed`]). The pre-fix
     // reassign-then-seal left the note sitting in the locked target with a stale wrong-CK blob when
     // the reseal failed (the target's next unlock would fail on it); now a seal failure leaves the
-    // note untouched in the SOURCE folder (old `.md` included — it is only removed after success).
+    // note untouched in the SOURCE folder (old `.md` included — the seal is computed BEFORE the
+    // R1 delete below, so a fail-closed seal mutates nothing at all).
     // Moving into an OPEN folder clears any stale blob from the previous folder's CK (the plaintext
     // column is canonical again — a stale blob would be undecryptable under a future lock of the
     // new folder and could shadow fresh content).
+    //
+    // R1 (#231 review residual) — DELETE-THEN-MOVE: the OLD vault `.md` is removed BEFORE the
+    // move UPDATE clears/NULLs `exported_path` (but AFTER the fallible seal, so a seal failure
+    // still touches nothing). INVARIANT: a plaintext `.md` of locked-folder content is never left
+    // on disk with no `exported_path` record pointing at it — the pre-fix best-effort remove
+    // AFTER the UPDATE orphaned the file when the delete failed (or the app crashed between the
+    // two), untracked and unreconcilable. An already-absent file is success; any other delete
+    // failure REFUSES the move with the row (folder, exported_path, seal state) untouched — the
+    // user retries. The DB `text` column stays the canonical copy throughout, so a crash after
+    // this delete loses no content (the re-export recreates the `.md`).
     let target_locked = state
         .db
         .folder_by_id(folder_id)?
@@ -2542,27 +2553,40 @@ pub(crate) fn move_note_doc_inner(
         let title = row.title.clone().unwrap_or_else(|| row.name.clone());
         let updated_at = row.updated_at.unwrap_or(row.created_at);
         let blob = sealed_document_blob(state, folder_id, id, &row.text)?;
+        remove_note_export_before_move(row.exported_path.as_deref())?;
         state
             .db
             .move_note_row_sealed(id, folder_id, &title, &row.text, &blob, updated_at)?;
     } else {
+        remove_note_export_before_move(row.exported_path.as_deref())?;
         state.db.set_note_doc_folder(id, folder_id)?;
         state.db.set_note_doc_exported_path(id, None)?;
         if row.sealed {
             state.db.clear_document_blob(id)?;
         }
     }
-    // Remove the old vault file only AFTER the move committed (best-effort): a failed move above
-    // leaves the source note — and its exported `.md` — exactly as it was. Never loses content:
-    // the note's canonical copy is the DB `text` column.
-    if let Some(old_path) = &row.exported_path {
-        let _ = std::fs::remove_file(old_path);
-    }
     if let Err(e) = export_note_to_vault(state, id) {
         tracing::warn!(target: "notes", error = %e, "note re-export after move failed (moved in db)");
     }
     tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note moved");
     Ok(())
+}
+
+/// R1 helper — delete a note's OLD exported vault `.md` as the DELETE-THEN-MOVE step of
+/// [`move_note_doc_inner`]. `None` / an already-absent file is success; any other failure is a
+/// clear [`AppError::Export`] the caller propagates to REFUSE the move (nothing mutated yet, the
+/// user retries) — never a silently orphaned plaintext file.
+fn remove_note_export_before_move(old_path: Option<&str>) -> Result<(), AppError> {
+    let Some(old_path) = old_path else {
+        return Ok(()); // never exported — nothing to remove.
+    };
+    match std::fs::remove_file(old_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AppError::Export(format!(
+            "could not remove the note's exported vault file before moving it: {e}"
+        ))),
+    }
 }
 
 /// Permanently delete a note (cascade its chunks + vectors + vault `.md`). GATED: a
@@ -8015,9 +8039,16 @@ pub fn clear_voiceprints(state: State<'_, AppState>) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Speaker + topic timeline for a meeting (AI-derived, cached after first generation).
+/// Speaker + topic timeline for a meeting — READ-ONLY (cached-or-empty; NEVER generates).
+///
+/// perf-memory-audit / OOM: a passive Audio-tab open must not have a multi-GB side effect. Reading a
+/// not-yet-cached timeline used to synchronously load the on-device Notes model (Qwen/Bielik) and
+/// compile Metal shaders on first run, which swap-death-beachballed the whole Mac on OPEN. Generation
+/// now lives in the SEPARATE, EXPLICIT `generate_timeline` command (auto-fired by the FE only for
+/// cheap CLOUD providers; hidden behind a user click for on-device — see
+/// `timeline_generation_on_device`).
 #[tauri::command]
-pub async fn get_timeline(
+pub fn get_timeline(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<MeetingTimeline, AppError> {
@@ -8027,9 +8058,8 @@ pub async fn get_timeline(
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
         return Ok(MeetingTimeline::default());
     }
-    // Fetch segments up-front: they anchor the coverage-repair for BOTH a cached timeline (so a
-    // legacy cache generated before the repair existed — e.g. one ending at 0:14 for a 0:45
-    // recording — heals on read) and a freshly-generated one.
+    // Return the CACHED timeline (coverage-repaired on read so a legacy cache — e.g. one ending at
+    // 0:14 for a 0:45 recording — heals) or an EMPTY one when nothing is cached. No provider load.
     let segments = state.db.get_segments(&meeting_id)?;
     if let Some(json) = state.db.get_timeline_data(&meeting_id)? {
         if let Ok(mut t) = serde_json::from_str::<MeetingTimeline>(&json) {
@@ -8037,6 +8067,45 @@ pub async fn get_timeline(
             return Ok(t);
         }
     }
+    Ok(MeetingTimeline::default())
+}
+
+/// Would generating THIS install's timeline load a residency-bound on-device model? True when the
+/// resolved Notes-role provider is on-device (local GGUF / Ollama / Apple FM) — the residency-bound
+/// engines whose synchronous multi-GB load on a passive Audio-tab open OOM-beachballed the Mac. The
+/// FE uses this to decide: auto-generate for CLOUD (cheap), or hide generation behind an explicit
+/// "Generate timeline" click for on-device (never a surprise heavy load). Cheap: config read only.
+#[tauri::command]
+pub fn timeline_generation_on_device(state: State<'_, AppState>) -> Result<bool, AppError> {
+    let config = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        c.clone()
+    };
+    let target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Notes, &config);
+    Ok(crate::summarize::timeline::is_on_device_provider(
+        &target.connection,
+    ))
+}
+
+/// EXPLICIT timeline generation — the HEAVY path split out of `get_timeline`. Runs the Notes-role
+/// provider over the (decimated, for on-device) transcript to derive the speaker/topic map, caches
+/// it, and returns it. For an on-device provider this loads a multi-GB model, so it is only ever
+/// invoked deliberately: the FE auto-fires it for cheap cloud providers, and gates it behind a user
+/// click for on-device ones. The on-device RAM guard in `reason::mistral` still applies as a backstop
+/// (refuse-don't-OOM → deterministic floor).
+#[tauri::command]
+pub async fn generate_timeline(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<MeetingTimeline, AppError> {
+    // Same READ-GATE as `get_timeline`: never derive a sealed-not-unlocked meeting's timeline.
+    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+        return Ok(MeetingTimeline::default());
+    }
+    let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Ok(MeetingTimeline::default());
     }
@@ -9357,6 +9426,20 @@ pub(crate) fn lifecycle_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()>
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// R7 (2026-07-10) — bump the SEAL EPOCH ([`AppState::seal_epoch`]): the monotonic counter every
+/// lock-surface mutation advances at ENTRY (before any blank/purge), so the hourly memory
+/// consolidation job can detect a seal/relock/remove-lock that interleaved with its pass and
+/// abort BEFORE writing a rollup derived from a pre-seal fact read (the pass-vs-seal TOCTOU —
+/// see [`crate::memory::run_consolidation_pass`]). Bumping at entry is load-bearing: the seal's
+/// own rollup purge runs AFTER the bump, so a job that passes its epoch check pre-bump has its
+/// write cleaned up by the purge, and a job that checks post-bump aborts — no ordering leaves a
+/// stale rollup behind. Content-free (a counter), infallible, never blocks.
+pub(crate) fn bump_seal_epoch(state: &AppState) {
+    state
+        .seal_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Inner of [`lock_folder`] taking `&AppState` (so the lifecycle stress test can drive it without a
 /// `tauri::State`). Holds the [`AppState::lifecycle`] guard for the whole seal.
 pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
@@ -9368,6 +9451,8 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     if folder.locked {
         return Ok(()); // already sealed — idempotent.
     }
+    // R7: advance the seal epoch at ENTRY (before any seal work) — see `bump_seal_epoch`.
+    bump_seal_epoch(state);
 
     // Prefer the SESSION-CACHED KEK (set by a successful unlock — possibly a RECOVERED key): it
     // keeps every folder sealed this session convergent on the key that demonstrably unwraps the
@@ -9471,15 +9556,29 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // NOTES: an authored note's markdown is sealed by the (kind-agnostic) document seal leg in
     // `seal_folder_extras` above — but its vault `.md` (a note-only concern; documents have no
     // `exported_path`) must be deleted on lock exactly like a meeting note's `.md`, so a sealed
-    // note leaves no plaintext on disk. Capture the paths, delete the files, then NULL the column.
-    // Done after the seal (the DB blob is the recoverable copy).
-    let note_md_paths = state.db.note_exported_paths_in_folder(&folder_id)?;
-    for p in note_md_paths {
-        let _ = std::fs::remove_file(&p);
+    // note leaves no plaintext on disk. PER ROW (residual W5, extended to the INITIAL seal by the
+    // R2 hardening, 2026-07-10): each row's `exported_path` is cleared ONLY after its `.md` was
+    // actually deleted (or is already absent) — a FAILED delete keeps that row's path recorded so
+    // the next relock/startup pass retries the file (the pre-fix bulk clear forgot the leaked
+    // `.md` forever). The lock itself still completes (the DB blob is the recoverable copy).
+    // Count-only log — never paths (they embed note titles).
+    for (doc_id, p) in state.db.note_exported_path_rows_in_folder(&folder_id)? {
+        let removed = match std::fs::remove_file(&p) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "lock",
+                    error = %e,
+                    "lock: deleting a note .md failed — keeping exported_path for retry"
+                );
+                false
+            }
+        };
+        if removed {
+            state.db.set_note_doc_exported_path(&doc_id, None)?;
+        }
     }
-    state
-        .db
-        .clear_note_exported_paths_in_folder(&folder_id)?;
 
     // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer at
     // the moment a folder seals (post clear-on-Stop it is normally already empty; idempotent).
@@ -9725,6 +9824,8 @@ pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<()
     // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
     // `remove_lock` is mid-restoring).
     let _lifecycle = lifecycle_guard(state.inner());
+    // R7: advance the seal epoch at ENTRY — see `bump_seal_epoch`.
+    bump_seal_epoch(state.inner());
     {
         let mut g = state
             .unlocked_folders
@@ -9766,6 +9867,8 @@ pub fn relock_all(state: State<'_, AppState>) -> Result<(), AppError> {
 /// must NOT take it separately — a std `Mutex` is non-reentrant and would self-deadlock).
 pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    // R7: advance the seal epoch at ENTRY — see `bump_seal_epoch`.
+    bump_seal_epoch(state);
     // Clear the session set.
     {
         let mut g = state
@@ -9837,6 +9940,9 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     if !folder.locked {
         return Ok(()); // already open — idempotent.
     }
+    // R7: advance the seal epoch at ENTRY — remove-lock rewrites the same lock-surface columns
+    // the consolidation pass must not interleave with. See `bump_seal_epoch`.
+    bump_seal_epoch(state);
     let wrapped = state
         .db
         .folder_wrapped_key(&folder_id)?
@@ -13880,6 +13986,7 @@ mod lifecycle_tests {
             account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
             share_refresh_lock: tokio::sync::Mutex::new(()),
+            seal_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -17410,6 +17517,112 @@ mod lifecycle_tests {
                 .unwrap()
                 .is_empty(),
             "relock NULLs exported_path again"
+        );
+    }
+
+    /// R1 (lock residual, #231 review) RED-before-GREEN — DELETE-THEN-MOVE: when the OLD vault
+    /// `.md` cannot be deleted, `move_note_doc` MUST be REFUSED with the note row, its
+    /// `exported_path`, and the on-disk entry all unchanged. Pre-fix the move committed the
+    /// UPDATE first (clearing `exported_path`) and removed the file BEST-EFFORT afterwards — a
+    /// failed delete orphaned an on-disk plaintext `.md` with no `exported_path` record pointing
+    /// at it (for a session-unlocked LOCKED source, an untracked plaintext leak the seal can
+    /// never reconcile). An already-absent old file still counts as success.
+    #[test]
+    fn move_refused_when_old_vault_md_cannot_be_deleted() {
+        let state = build_state("move-delete-refuse");
+        let src = create_note_folder_inner(&state, "Src", None).unwrap().id;
+        let dst = create_note_folder_inner(&state, "Dst", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&src), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "body").unwrap();
+
+        // Sabotage: point exported_path at a NON-EMPTY DIRECTORY — `remove_file` fails on it
+        // (and NOT with NotFound, which counts as an already-absent success).
+        let blocker = tmp_vault("move-delete-refuse-blocker");
+        std::fs::write(blocker.join("occupant.txt"), "x").unwrap();
+        let blocker_str = blocker.to_string_lossy().to_string();
+        state
+            .db
+            .set_note_doc_exported_path(&id, Some(&blocker_str))
+            .unwrap();
+
+        let err = move_note_doc_inner(&state, &id, &dst).unwrap_err();
+        assert!(
+            matches!(err, AppError::Export(_)),
+            "a failed old-.md delete refuses the move with a clear export error, got {err:?}"
+        );
+
+        // NOTHING moved: folder, exported_path record, and the on-disk entry are all unchanged.
+        let row = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(row.folder_id, src, "note stays in the source folder");
+        assert_eq!(
+            row.exported_path.as_deref(),
+            Some(blocker_str.as_str()),
+            "exported_path record kept — no orphaned on-disk plaintext"
+        );
+        assert!(blocker.exists(), "the on-disk path is untouched");
+
+        // An ALREADY-ABSENT old file is success: point at a missing file and the move proceeds.
+        let gone = blocker.join("gone.md").to_string_lossy().to_string();
+        state
+            .db
+            .set_note_doc_exported_path(&id, Some(&gone))
+            .unwrap();
+        move_note_doc_inner(&state, &id, &dst).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().folder_id,
+            dst,
+            "an absent old .md never blocks the move"
+        );
+    }
+
+    /// R2 (residual W5 at the INITIAL seal) RED-before-GREEN — `lock_folder_inner`'s authored-note
+    /// `.md` cleanup must clear each row's `exported_path` ONLY after its file was actually
+    /// deleted (or is already absent): one failing delete keeps EXACTLY that row's path recorded
+    /// (the next relock/startup pass retries the file) while the lock itself still completes.
+    /// Pre-fix the cleanup bulk-cleared the whole folder's `exported_path` regardless of per-file
+    /// delete success, forgetting a leaked plaintext `.md` forever.
+    #[test]
+    fn lock_keeps_exported_path_of_a_note_md_that_failed_to_delete() {
+        let vault = tmp_vault("lock-w5-initial");
+        let state = build_state_with_vault("lock-w5-initial", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let a = create_note_inner(&state, Some(&fid), "Alpha").unwrap();
+        update_note_doc_inner(&state, &a, "Alpha", "alpha body").unwrap();
+        let b = create_note_inner(&state, Some(&fid), "Beta").unwrap();
+        update_note_doc_inner(&state, &b, "Beta", "beta body").unwrap();
+
+        let pa = state
+            .db
+            .get_note_row(&a)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("A exported to the vault");
+        let pb = state
+            .db
+            .get_note_row(&b)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("B exported to the vault");
+
+        // Sabotage B's export: replace the file with a NON-EMPTY DIRECTORY at the same path, so
+        // the lock-time `remove_file` fails (not NotFound).
+        std::fs::remove_file(&pb).unwrap();
+        std::fs::create_dir(&pb).unwrap();
+        std::fs::write(std::path::Path::new(&pb).join("occupant.txt"), "x").unwrap();
+
+        lock_folder_inner(&state, fid.clone()).unwrap(); // the lock itself still completes
+
+        assert!(
+            !std::path::Path::new(&pa).exists(),
+            "the deletable note's .md is gone after lock"
+        );
+        let rows = state.db.note_exported_path_rows_in_folder(&fid).unwrap();
+        assert_eq!(
+            rows,
+            vec![(b.clone(), pb.clone())],
+            "exactly the failed-delete row keeps its exported_path for the retry pass"
         );
     }
 

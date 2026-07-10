@@ -386,14 +386,28 @@ fn rollup_markdown(scope: &str, updated_at: &str, content: &str) -> String {
 ///
 /// Per-entity / per-file errors warn + continue; only a hard DB error on the scoring path errors
 /// the pass (the caller loop warns + retries next tick).
+///
+/// `seal_epoch` (L2 follow-up, 2026-07-10 — the pass-vs-seal TOCTOU): the caller passes
+/// `AppState::seal_epoch`, the monotonic counter every seal/relock/remove-lock bumps at entry.
+/// The pass SNAPSHOTS it here, before any read, and re-checks it before EVERY rollup write
+/// (row upsert AND vault `.md` export): a mismatch means a lock-surface mutation interleaved
+/// with this pass, so facts read earlier may now be sealed — the pass ABORTS silently (counts
+/// logged, no error; the next hourly tick retries against the post-seal visible set). Without
+/// this, a seal landing between the gated fact read and the rollup write could resurrect
+/// just-sealed content into a rollup row/file the seal's own purge had already run for.
 pub fn run_consolidation_pass(
     db: &Db,
     reasoner: &dyn LocalReasoner,
     vault_dir: Option<&Path>,
     now: &str,
+    seal_epoch: &std::sync::atomic::AtomicU64,
 ) -> Result<PassStats> {
+    use std::sync::atomic::Ordering;
     let mut stats = PassStats::default();
     let no_unlocks: HashSet<String> = HashSet::new();
+    // Snapshot BEFORE any read — every rollup write below re-checks against this.
+    let epoch_at_start = seal_epoch.load(Ordering::SeqCst);
+    let seal_interleaved = || seal_epoch.load(Ordering::SeqCst) != epoch_at_start;
 
     // 1. Closed facts keep no score rows (purged/deleted ones already cascaded off the FK).
     if let Err(e) = db.delete_memory_scores_for_closed_facts() {
@@ -474,6 +488,13 @@ pub fn run_consolidation_pass(
             }
             let label = entity_names.get(entity_id).cloned().unwrap_or_default();
             if let Some(content) = reflect(reasoner, &label, &open) {
+                // R7 — the pass-vs-seal TOCTOU check: a seal/relock landed since the
+                // snapshot ⇒ the facts read above may now be sealed. Abort SILENTLY before this
+                // (and every later) rollup write; the next hourly tick retries post-seal.
+                if seal_interleaved() {
+                    tracing::debug!(target: "memory", "seal epoch advanced mid-pass; aborting before rollup write");
+                    return Ok(stats);
+                }
                 if let Err(e) = db.upsert_memory_rollup(&r.scope, &content, &hash, now) {
                     tracing::warn!(target: "memory", scope = %r.scope, error = %e, "rollup re-reflect upsert failed; continuing");
                     continue;
@@ -497,6 +518,13 @@ pub fn run_consolidation_pass(
             if let Some(content) =
                 reflect(reasoner, "what the user is working on and prefers", &refs)
             {
+                // R7 — the pass-vs-seal TOCTOU check: a seal/relock landed since the
+                // snapshot ⇒ the facts read above may now be sealed. Abort SILENTLY before this
+                // (and every later) rollup write; the next hourly tick retries post-seal.
+                if seal_interleaved() {
+                    tracing::debug!(target: "memory", "seal epoch advanced mid-pass; aborting before rollup write");
+                    return Ok(stats);
+                }
                 if let Err(e) = db.upsert_memory_rollup(&r.scope, &content, &user_hash, now) {
                     tracing::warn!(target: "memory", scope = %r.scope, error = %e, "weekly re-reflect upsert failed; continuing");
                     continue;
@@ -537,6 +565,13 @@ pub fn run_consolidation_pass(
             let ids: Vec<&str> = open.iter().map(|f| f.id.as_str()).collect();
             let hash = fact_set_hash(&ids);
             if let Some(content) = reflect(reasoner, &ent.name, &open) {
+                // R7 — the pass-vs-seal TOCTOU check: a seal/relock landed since the
+                // snapshot ⇒ the facts read above may now be sealed. Abort SILENTLY before this
+                // (and every later) rollup write; the next hourly tick retries post-seal.
+                if seal_interleaved() {
+                    tracing::debug!(target: "memory", "seal epoch advanced mid-pass; aborting before rollup write");
+                    return Ok(stats);
+                }
                 if let Err(e) = db.upsert_memory_rollup(&scope, &content, &hash, now) {
                     tracing::warn!(target: "memory", scope = %scope, error = %e, "rollup upsert failed; continuing");
                     continue;
@@ -556,6 +591,13 @@ pub fn run_consolidation_pass(
                 if let Some(content) =
                     reflect(reasoner, "what the user is working on and prefers", &refs)
                 {
+                    // R7 — the pass-vs-seal TOCTOU check: a seal/relock landed since the
+                    // snapshot ⇒ the facts read above may now be sealed. Abort SILENTLY before this
+                    // (and every later) rollup write; the next hourly tick retries post-seal.
+                    if seal_interleaved() {
+                        tracing::debug!(target: "memory", "seal epoch advanced mid-pass; aborting before rollup write");
+                        return Ok(stats);
+                    }
                     if let Err(e) = db.upsert_memory_rollup(&scope, &content, &user_hash, now) {
                         tracing::warn!(target: "memory", scope = %scope, error = %e, "weekly rollup upsert failed");
                     } else {
@@ -571,6 +613,13 @@ pub fn run_consolidation_pass(
         for r in db.list_memory_rollups()? {
             if r.exported_path.is_some() {
                 continue;
+            }
+            // R7 — re-check before EVERY vault write too: a seal interleaving after the row read
+            // above purges rollup rows, and materializing a pre-purge row's content as an `.md`
+            // would resurrect it on disk. Abort silently; the next tick re-exports what survives.
+            if seal_interleaved() {
+                tracing::debug!(target: "memory", "seal epoch advanced mid-pass; aborting before rollup export");
+                return Ok(stats);
             }
             let path = rollup_export_path(vault, &r.scope);
             let md = rollup_markdown(&r.scope, &r.updated_at, &r.content);
@@ -625,7 +674,13 @@ pub fn consolidation_tick(handle: &tauri::AppHandle) {
         .and_then(|c| c.vault_path.clone())
         .map(PathBuf::from);
     let now = chrono::Utc::now().to_rfc3339();
-    match run_consolidation_pass(&state.db, reasoner.as_ref(), vault.as_deref(), &now) {
+    match run_consolidation_pass(
+        &state.db,
+        reasoner.as_ref(),
+        vault.as_deref(),
+        &now,
+        &state.seal_epoch,
+    ) {
         Ok(stats) => {
             if stats.scored > 0 || stats.rollups > 0 || stats.exported > 0 {
                 tracing::info!(
@@ -655,6 +710,12 @@ mod tests {
     fn file_db(label: &str) -> Db {
         let p = crate::storage::db::unique_temp_path(&format!("murmur-memory-{label}"), "sqlite");
         Db::open_with_key(&p, TEST_DEK).unwrap()
+    }
+
+    /// A seal epoch that never moves during the pass — the no-interleave steady state every
+    /// pre-existing test runs under.
+    fn quiet_epoch() -> std::sync::atomic::AtomicU64 {
+        std::sync::atomic::AtomicU64::new(0)
     }
 
     fn temp_vault(label: &str) -> PathBuf {
@@ -772,7 +833,7 @@ mod tests {
         seed_user_fact(&db, "works on", "Project Atlas", "m1");
 
         let stats =
-            run_consolidation_pass(&db, &StubReasoner, None, "2026-07-09T12:00:00Z").unwrap();
+            run_consolidation_pass(&db, &StubReasoner, None, "2026-07-09T12:00:00Z", &quiet_epoch()).unwrap();
         assert_eq!(stats.scored, 2);
         assert_eq!(stats.rollups, 0, "the stub must never produce a rollup");
         assert_eq!(stats.exported, 0);
@@ -817,7 +878,7 @@ mod tests {
         db.set_folder_locked("f-lock", true, None).unwrap();
 
         let stats =
-            run_consolidation_pass(&db, &StubReasoner, None, "2026-07-09T12:00:00Z").unwrap();
+            run_consolidation_pass(&db, &StubReasoner, None, "2026-07-09T12:00:00Z", &quiet_epoch()).unwrap();
         assert_eq!(stats.scored, 0, "sealed facts must not be scored");
         assert!(db.list_memory_scores().unwrap().is_empty());
     }
@@ -834,7 +895,7 @@ mod tests {
         seed_user_fact(&db, "works on", "Project Atlas", "m1");
 
         let now = "2026-07-09T12:00:00Z";
-        let stats = run_consolidation_pass(&db, &MockBrain, Some(&vault), now).unwrap();
+        let stats = run_consolidation_pass(&db, &MockBrain, Some(&vault), now, &quiet_epoch()).unwrap();
         assert_eq!(stats.scored, 2);
         assert_eq!(stats.rollups, 1, "the weekly rollup (no entity has ≥3 facts)");
         assert_eq!(stats.exported, 1);
@@ -854,7 +915,7 @@ mod tests {
         assert!(on_disk.contains("Project Atlas"));
 
         // SAME ISO WEEK re-run: no second weekly rollup, nothing re-exported.
-        let again = run_consolidation_pass(&db, &MockBrain, Some(&vault), now).unwrap();
+        let again = run_consolidation_pass(&db, &MockBrain, Some(&vault), now, &quiet_epoch()).unwrap();
         assert_eq!(again.rollups, 0, "weekly rollup is once per ISO week");
         assert_eq!(again.exported, 0);
         assert_eq!(db.list_memory_rollups().unwrap().len(), 1);
@@ -901,7 +962,7 @@ mod tests {
         seed_meeting(&db, "m2");
         seed_user_fact(&db, "prefer", "Polish replies", "m1");
         seed_user_fact(&db, "works on", "Project Atlas", "m2");
-        run_consolidation_pass(&db, &StubReasoner, None, "2026-07-09T12:00:00Z").unwrap();
+        run_consolidation_pass(&db, &StubReasoner, None, "2026-07-09T12:00:00Z", &quiet_epoch()).unwrap();
         assert_eq!(db.list_memory_scores().unwrap().len(), 2);
 
         // Purge-on-seal path (direct DELETE inside the seal tx).
@@ -918,6 +979,84 @@ mod tests {
             db.list_memory_scores().unwrap().is_empty(),
             "deleted meeting's fact score must cascade away"
         );
+    }
+
+    /// R7 (pass-vs-seal TOCTOU) — a mock brain that BUMPS the shared seal epoch from inside its
+    /// reflection call, simulating a `lock_folder`/`relock_all` landing BETWEEN the pass's gated
+    /// fact read and its rollup write. Importance assessment (`structured`) answers like
+    /// [`MockBrain`]; the bump happens in `reason` (the reflect call), i.e. immediately before
+    /// the rollup upsert would run.
+    struct SealMidPassBrain(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl LocalReasoner for SealMidPassBrain {
+        fn id(&self) -> &str {
+            "seal-mid-pass"
+        }
+        fn reason(&self, _system: &str, _user: &str) -> Result<String> {
+            // The interleaved seal: bump the epoch mid-pass, then hand back a synthesis that
+            // paraphrases the (now-sealed) facts — the exact content the epoch check must refuse
+            // to persist.
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("The user is heads-down on Project Atlas.".to_string())
+        }
+        fn structured(
+            &self,
+            _system: &str,
+            user: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            let scores: Vec<serde_json::Value> = user
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.split("id=").nth(1)?;
+                    let id = rest.split(' ').next()?.trim();
+                    Some(serde_json::json!({ "id": id, "importance": 8.0 }))
+                })
+                .collect();
+            Ok(serde_json::json!({ "scores": scores }))
+        }
+    }
+
+    /// R7 RED-before-GREEN — the pass-vs-seal TOCTOU: a seal epoch bump BETWEEN the pass's fact
+    /// read and its rollup write must abort the pass BEFORE any rollup row or vault `.md` is
+    /// written (the next hourly tick regenerates from the post-seal visible set). On the
+    /// unpatched code (epoch accepted but unchecked) the weekly rollup row + export were written
+    /// from the pre-seal read — the resurrection this check closes. Captured failing pre-fix.
+    #[test]
+    fn seal_epoch_bump_mid_pass_aborts_before_any_rollup_write() {
+        let db = file_db("seal-epoch-abort");
+        let vault = temp_vault("seal-epoch-abort");
+        seed_meeting(&db, "m1");
+        seed_user_fact(&db, "prefer", "Polish replies", "m1");
+        seed_user_fact(&db, "works on", "Project Atlas", "m1");
+
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let brain = SealMidPassBrain(epoch.clone());
+        let stats =
+            run_consolidation_pass(&db, &brain, Some(&vault), "2026-07-09T12:00:00Z", &epoch)
+                .unwrap();
+
+        assert_eq!(stats.rollups, 0, "no rollup row written after a mid-pass seal");
+        assert_eq!(stats.exported, 0, "no rollup .md exported after a mid-pass seal");
+        assert!(
+            db.list_memory_rollups().unwrap().is_empty(),
+            "the rollup table stays empty — nothing resurrected from the pre-seal read"
+        );
+        let memory_dir = vault.join("brain").join("memory");
+        let exported_files = std::fs::read_dir(&memory_dir)
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(exported_files, 0, "no rollup file reaches the vault");
+
+        // A QUIET follow-up pass (no interleave) regenerates normally — abort is retry-safe.
+        let stats2 = run_consolidation_pass(
+            &db,
+            &MockBrain,
+            Some(&vault),
+            "2026-07-09T13:00:00Z",
+            &quiet_epoch(),
+        )
+        .unwrap();
+        assert_eq!(stats2.rollups, 1, "the next quiet pass writes the weekly rollup");
     }
 
     /// A mock brain whose reflection ECHOES the fact lines it was given — so stale-vs-fresh rollup
@@ -975,7 +1114,7 @@ mod tests {
         seed_user_fact(&db, "prefer", "Polish replies", "m1");
 
         let now = "2026-07-09T12:00:00Z";
-        let first = run_consolidation_pass(&db, &EchoBrain, Some(&vault), now).unwrap();
+        let first = run_consolidation_pass(&db, &EchoBrain, Some(&vault), now, &quiet_epoch()).unwrap();
         assert_eq!(first.rollups, 1, "the weekly rollup");
         let rollup = &db.list_memory_rollups().unwrap()[0];
         assert!(rollup.content.contains("Polish replies"));
@@ -993,7 +1132,7 @@ mod tests {
 
         // Next pass (same ISO week): the hash changed ⇒ re-reflect + re-export, not a frozen copy.
         let second =
-            run_consolidation_pass(&db, &EchoBrain, Some(&vault), "2026-07-09T14:00:00Z").unwrap();
+            run_consolidation_pass(&db, &EchoBrain, Some(&vault), "2026-07-09T14:00:00Z", &quiet_epoch()).unwrap();
         assert_eq!(second.rollups, 1, "the weekly rollup must be RE-reflected");
         assert_eq!(second.exported, 1, "and re-exported");
         let rollup = &db.list_memory_rollups().unwrap()[0];
@@ -1047,7 +1186,7 @@ mod tests {
         seed_entity_fact(&db, &eid, "owner", "Kim", "m-e");
 
         let now = "2026-07-09T12:00:00Z";
-        let stats = run_consolidation_pass(&db, &MockBrain, Some(&vault), now).unwrap();
+        let stats = run_consolidation_pass(&db, &MockBrain, Some(&vault), now, &quiet_epoch()).unwrap();
         assert_eq!(stats.rollups, 1, "the entity rollup (no user facts ⇒ no weekly)");
         let exported = db.list_memory_rollups().unwrap()[0]
             .exported_path
@@ -1059,7 +1198,7 @@ mod tests {
         // seal purge is tested separately; this is the GC safety net).
         db.set_folder_locked("f-e", true, None).unwrap();
         let stats =
-            run_consolidation_pass(&db, &MockBrain, Some(&vault), "2026-07-09T13:00:00Z").unwrap();
+            run_consolidation_pass(&db, &MockBrain, Some(&vault), "2026-07-09T13:00:00Z", &quiet_epoch()).unwrap();
         assert_eq!(stats.deleted, 1, "the invisible scope must be GC'd");
         assert!(db.list_memory_rollups().unwrap().is_empty(), "row deleted");
         assert!(
@@ -1085,7 +1224,7 @@ mod tests {
         seed_entity_fact(&db, &eid, "deadline", "Friday", "m1");
 
         let stats =
-            run_consolidation_pass(&db, &MockBrain, None, "2026-07-09T12:00:00Z").unwrap();
+            run_consolidation_pass(&db, &MockBrain, None, "2026-07-09T12:00:00Z", &quiet_epoch()).unwrap();
         assert_eq!(
             stats.rollups, 1,
             "2 facts with importance 8 ⇒ eligible via the importance arm"
