@@ -414,6 +414,24 @@ pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Scalar-quantize an L2-normalized f32 embedding (components in ≈[-1, 1]) into an int8 byte blob
+/// for binding to a `vec0 int8[N]` column via `vec_int8(?)` (the M6 org partition — int8 is 3.7×
+/// smaller than f32 and holds in-query-budget at 300k chunks, the scale-spike finding).
+///
+/// Each component is scaled by 127, rounded, and CLAMPED to `[-127, 127]` (i8-safe: -128 is
+/// avoided so magnitudes stay symmetric). A non-normalized input still maps deterministically —
+/// out-of-range components saturate — so this is safe on the stub embedder too (its output is
+/// L2-normalized, so no saturation occurs). The returned `Vec<u8>` is the two's-complement byte
+/// image of the i8 array, which is exactly what `vec_int8()` expects. Length == the input length.
+pub(crate) fn vec_to_int8_blob(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .map(|&f| {
+            let scaled = (f * 127.0).round().clamp(-127.0, 127.0) as i8;
+            scaled as u8
+        })
+        .collect()
+}
+
 /// Split a note's markdown into deterministic chunks, each PREFIXED with a `<title> · <date>`
 /// header so the embedded text always carries its provenance (and the real model can ground each
 /// chunk). Paragraphs (blank-line-separated) are merged greedily up to [`CHUNK_CHAR_TARGET`]; a
@@ -954,6 +972,33 @@ pub fn fuse_doc_hits(
     let mut by_id: HashMap<String, crate::storage::models::DocChunkHit> = HashMap::new();
     for h in knn.into_iter().chain(fts) {
         by_id.entry(h.document_id.clone()).or_insert(h);
+    }
+    fused
+        .into_iter()
+        .filter_map(|(id, _score)| by_id.remove(&id))
+        .collect()
+}
+
+/// RRF-fuse the two ORG-partition retrieval legs (int8 vector KNN + keyword FTS) into one
+/// best-first, per-item-deduped hit list — the org twin of [`fuse_doc_hits`]. Either leg may be
+/// empty (StubEmbedder ⇒ no KNN; punctuation query ⇒ no FTS). The kept snippet is first-seen, KNN
+/// (nearest) preferred over FTS. Pure fusion — no gate is applied (org items are outside the
+/// folder-lock domain), but the SELF-SHARE dedup (drop hits whose `content_sha256` matches a local
+/// `org_shares` row) is the caller's responsibility BEFORE this, so a member never re-surfaces their
+/// own published item as an "org" result.
+pub fn fuse_org_hits(
+    knn: Vec<crate::storage::models::OrgChunkHit>,
+    fts: Vec<crate::storage::models::OrgChunkHit>,
+) -> Vec<crate::storage::models::OrgChunkHit> {
+    if knn.is_empty() && fts.is_empty() {
+        return Vec::new();
+    }
+    let knn_ids: Vec<String> = knn.iter().map(|h| h.item_id.clone()).collect();
+    let fts_ids: Vec<String> = fts.iter().map(|h| h.item_id.clone()).collect();
+    let fused = rrf_fuse(&[knn_ids, fts_ids], RRF_K);
+    let mut by_id: HashMap<String, crate::storage::models::OrgChunkHit> = HashMap::new();
+    for h in knn.into_iter().chain(fts) {
+        by_id.entry(h.item_id.clone()).or_insert(h);
     }
     fused
         .into_iter()

@@ -17,9 +17,11 @@ import {
   type FolderExposure,
 } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
-import type { FolderNode } from "../../../core/models";
+import { IpcService } from "../../../core/ipc.service";
+import type { ActiveSharesReport, FolderNode } from "../../../core/models";
 import { FolderTreeComponent } from "../folder-tree/folder-tree.component";
 import { FolderDropDirective } from "../folder-drop.directive";
+import { LockSharesDialogComponent } from "../lock-shares-dialog/lock-shares-dialog.component";
 
 /**
  * One folder row in the tree: disclosure caret · folder glyph · name · note-count
@@ -56,13 +58,18 @@ import { FolderDropDirective } from "../folder-drop.directive";
   // — Angular would then hit `getComponentDef(undefined)` (reading 'ɵcmp') the
   // first time a row instantiates a child tree. `forwardRef` defers the lookup
   // until the def exists, breaking the cycle. (See folder-tree for the mirror.)
-  imports: [FolderDropDirective, forwardRef(() => FolderTreeComponent)],
+  imports: [
+    FolderDropDirective,
+    LockSharesDialogComponent,
+    forwardRef(() => FolderTreeComponent),
+  ],
   templateUrl: "./folder-row.component.html",
   styleUrl: "./folder-row.component.scss",
 })
 export class FolderRowComponent {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
 
   /** This row's folder node. */
@@ -84,6 +91,16 @@ export class FolderRowComponent {
   readonly busy = signal(false);
   /** Per-row lock/action error (cleared on the next attempt). */
   readonly lockError = signal<string | null>(null);
+
+  // --- Lock×shares dialog (Shared Brain v1) --------------------------------
+  /**
+   * The active-shares report when a lock is blocked by live shares (null = the
+   * dialog is closed). When set, the blocking dialog is shown: Revoke & lock /
+   * Lock anyway / Cancel.
+   */
+  readonly sharesReport = signal<ActiveSharesReport | null>(null);
+  /** True while the Revoke-&-lock (revoke + lock) sequence is in flight. */
+  readonly revokingShares = signal(false);
 
   // --- ⋯ folder-actions menu + inline rename + delete confirm ---------------
   /** Whether the ⋯ actions menu popover is open. */
@@ -144,9 +161,64 @@ export class FolderRowComponent {
     this.expanded.update((v) => !v);
   }
 
-  /** Seal this folder (delegates to the service; tree reload re-renders the row). */
+  /**
+   * Seal this folder. Shared Brain v1: FIRST check for active shares (link /
+   * user / org) via `folder_active_shares`. If any exist, open the blocking
+   * lock×shares dialog instead of locking straight away; the dialog's actions
+   * (Revoke & lock / Lock anyway / Cancel) drive the real lock. With no active
+   * shares (or if the check itself fails — fail-open to the plain lock, the old
+   * behavior), lock directly.
+   */
   async onLock(): Promise<void> {
+    if (this.busy() || this.revokingShares()) {
+      return;
+    }
+    this.lockError.set(null);
+    let report: ActiveSharesReport | null;
+    try {
+      report = await this.ipc.folderActiveShares(this.node().id);
+    } catch {
+      // The check failed (older backend / no sharing) — fall through to a plain
+      // lock. Never block locking on the share probe.
+      report = null;
+    }
+    if (report && report.links + report.users + report.org.length > 0) {
+      this.sharesReport.set(report);
+      return;
+    }
     await this.run(() => this.folders.lock(this.node().id));
+  }
+
+  /** Dialog: Revoke every share, then lock. */
+  async onRevokeAndLock(): Promise<void> {
+    if (this.revokingShares()) {
+      return;
+    }
+    this.revokingShares.set(true);
+    this.lockError.set(null);
+    try {
+      await this.ipc.revokeSharesForFolder(this.node().id);
+      await this.folders.lock(this.node().id);
+      this.sharesReport.set(null);
+    } catch {
+      this.lockError.set("Couldn’t revoke the shares and lock. Try again.");
+    } finally {
+      this.revokingShares.set(false);
+    }
+  }
+
+  /** Dialog: Lock while leaving the shares live. */
+  async onLockAnyway(): Promise<void> {
+    if (this.revokingShares()) {
+      return;
+    }
+    this.sharesReport.set(null);
+    await this.run(() => this.folders.lock(this.node().id));
+  }
+
+  /** Dialog: Cancel — do nothing. */
+  onCancelLockShares(): void {
+    this.sharesReport.set(null);
   }
 
   /** Session-unlock this folder. */

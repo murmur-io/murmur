@@ -228,6 +228,9 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::CalendarLookup { .. } => "Calendar",
         ToolCall::JiraSearch { .. } => "Jira",
         ToolCall::SlackSearch { .. } => "Slack",
+        // Shared Brain — org search is an EXPLICIT interactive tool, never auto-planned into note
+        // generation (`map_to_tool_call` doesn't map it), so this label is only for completeness.
+        ToolCall::OrgBrainSearch { .. } => "Org brain",
     }
 }
 

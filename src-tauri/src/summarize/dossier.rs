@@ -571,6 +571,7 @@ mod tests {
                 meeting_id: "m1".to_string(),
                 title: "Kickoff".to_string(),
                 started_at: "2026-07-01T09:00:00Z".to_string(),
+                origin: None,
             }],
             commitments: vec![],
             neighbors: vec![],

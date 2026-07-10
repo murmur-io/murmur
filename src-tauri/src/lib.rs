@@ -201,6 +201,25 @@ pub fn run() {
             commands::list_share_inbox,
             commands::accept_share,
             commands::decline_share,
+            // M6 Shared Brain (Organizations): create/status/members + consent + preview + share.
+            commands::org_create,
+            commands::org_status,
+            commands::org_invite_member,
+            commands::org_list_members,
+            commands::org_remove_member,
+            commands::org_leave,
+            commands::consent_to_org_egress,
+            commands::revoke_org_egress,
+            commands::preview_org_share,
+            commands::share_meeting_to_org,
+            commands::share_document_to_org,
+            commands::list_org_shares,
+            commands::revoke_org_share,
+            commands::org_sweep_pending,
+            commands::org_sync_now,
+            commands::org_get_item,
+            commands::folder_active_shares,
+            commands::revoke_shares_for_folder,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::set_gateway_key,
@@ -487,6 +506,30 @@ pub fn run() {
                         ))
                         .await;
                         crate::brief_runner::brief_tick(&handle).await;
+                    }
+                });
+            }
+            // M6 Shared Brain — the background org-feed sync loop. Each tick best-effort (a) drains the
+            // OUTBOUND org-share queue (offline-failed publishes + pending revokes) and (b) pulls +
+            // ingests the INBOUND org feed into the local int8 partition, so every member's brain stays
+            // fresh for Ask/MCP WITHOUT opening Settings — the "replicated brain" contract. Mirrors the
+            // memory/brief loops: re-reads live AppState each tick via `try_state`, gates to a cheap
+            // no-op when logged out / no org joined, first tick a short delay after launch.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        crate::commands::ORG_SYNC_FIRST_DELAY_SECS,
+                    ))
+                    .await;
+                    loop {
+                        if let Some(state) = handle.try_state::<AppState>() {
+                            crate::commands::org_background_sync_tick(state.inner()).await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::commands::ORG_SYNC_TICK_SECS,
+                        ))
+                        .await;
                     }
                 });
             }

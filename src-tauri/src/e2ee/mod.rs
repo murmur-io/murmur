@@ -26,6 +26,7 @@
 
 pub mod keys;
 pub mod link;
+pub mod org;
 pub mod recovery;
 pub mod wrap;
 

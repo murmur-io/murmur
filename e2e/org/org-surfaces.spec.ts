@@ -1,0 +1,186 @@
+import { test, expect } from "@playwright/test";
+import { mockTauri } from "../settings-ai/mock-invoke";
+
+/**
+ * Shared Brain v1 — FE smoke over the new org surfaces against the spec DTO
+ * contract with a mocked Tauri IPC (no Rust core). Each test drives one surface
+ * to a visible state, asserts the load-bearing bits render, and screenshots it
+ * so the PNGs can be eyeballed. NOT a proof of end-to-end behavior (no OCK / no
+ * server) — a render + no-console-error smoke.
+ *
+ * The overrides run PAGE-SIDE (serialized to strings), so they must be
+ * self-contained — no closures over test scope.
+ */
+
+// A signed-in, sharing-ready account so the share panel opens past its gate.
+const ACCOUNT_STATUS = () => ({
+  loggedIn: true,
+  email: "you@example.com",
+  unlockedForSharing: true,
+  shareConsented: true,
+  serverConfigured: true,
+  biometricUnlockAvailable: true,
+});
+
+// An org this user owns, with a couple of members + a couple of synced items.
+const ORG_STATUS = () => ({
+  orgId: "org-1",
+  name: "Acme Inc.",
+  role: "owner",
+  memberCount: 3,
+  consented: true,
+  lastSeq: 42,
+  itemCount: 12,
+  pendingShares: 1,
+});
+
+test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
+  test("Settings › Organization renders the managed state", async ({ page }) => {
+    await mockTauri(page, {
+      org_status: ORG_STATUS,
+      account_status: ACCOUNT_STATUS,
+      org_list_members: () => [
+        {
+          userId: "u-1",
+          email: "you@example.com",
+          role: "owner",
+          addedAt: new Date().toISOString(),
+          removed: false,
+        },
+        {
+          userId: "u-2",
+          email: "kasia@example.com",
+          role: "member",
+          addedAt: new Date().toISOString(),
+          removed: false,
+        },
+      ],
+    });
+    await page.goto("/settings");
+    await page.getByText("Organization").first().click();
+
+    await expect(
+      page.locator("app-settings-organization-section"),
+    ).toBeVisible({ timeout: 10_000 });
+    // Managed state: org name, member email, sync affordance.
+    await expect(page.getByText("Acme Inc.").first()).toBeVisible();
+    await expect(page.getByText("kasia@example.com")).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Sync now" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Invite" }),
+    ).toBeVisible();
+
+    await page.screenshot({
+      path: "e2e/org/__screens__/settings-organization.png",
+      fullPage: true,
+    });
+  });
+
+  test("Settings › Organization renders the create form with no org", async ({
+    page,
+  }) => {
+    await mockTauri(page, {
+      org_status: () => null,
+      account_status: ACCOUNT_STATUS,
+    });
+    await page.goto("/settings");
+    await page.getByText("Organization").first().click();
+
+    await expect(
+      page.getByText("Create an organization"),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("button", { name: "Create organization" }),
+    ).toBeVisible();
+
+    await page.screenshot({
+      path: "e2e/org/__screens__/settings-organization-create.png",
+      fullPage: true,
+    });
+  });
+
+  test("Share panel shows the Org Brain flow + preview sheet", async ({
+    page,
+  }) => {
+    await mockTauri(page, {
+      account_status: ACCOUNT_STATUS,
+      org_status: ORG_STATUS,
+      list_my_shares: () => [],
+      list_org_shares: () => [],
+      preview_org_share: () => ({
+        title: "Weekly sync",
+        markdown:
+          "# Weekly sync\n\n- Shipped the org brain\n- Next: mobile\n\nContact: alex@example.com",
+        bytes: 96,
+        chunkCount: 2,
+        scrubbed: { emails: 1, phones: 0, cards: 0 },
+        scrub: true,
+      }),
+    });
+    // Open a meeting, go to the Share tab.
+    await page.goto("/library");
+    await page.locator("a[href^='/meeting/']").first().click();
+    await page.getByRole("tab", { name: /share/i }).first().click().catch(async () => {
+      // Fallback if the tab is a button, not a role=tab.
+      await page.getByText("Share", { exact: false }).first().click();
+    });
+
+    // The Org Brain section CTA.
+    const addBtn = page.getByRole("button", { name: "Add to Org Brain" }).first();
+    await expect(addBtn).toBeVisible({ timeout: 10_000 });
+    await page.screenshot({
+      path: "e2e/org/__screens__/share-panel-org-section.png",
+      fullPage: true,
+    });
+
+    // Open the preview sheet. The host element has no size (its content is
+    // position:fixed), so assert on the inner dialog + its content.
+    await addBtn.click();
+    await expect(
+      page.locator("app-org-share-sheet [role='dialog']"),
+    ).toBeVisible();
+    // The exact outgoing markdown + the scrubbed-email count render.
+    await expect(page.getByText("Exactly what leaves your Mac")).toBeVisible();
+    await expect(page.getByText("Who can see this:")).toBeVisible();
+    await page.screenshot({
+      path: "e2e/org/__screens__/org-share-sheet.png",
+      fullPage: true,
+    });
+  });
+
+  test("Lock×shares dialog blocks locking a shared folder", async ({ page }) => {
+    await mockTauri(page, {
+      folder_active_shares: () => ({
+        links: 1,
+        users: 0,
+        org: [{ itemId: "it-1", title: "Weekly sync" }],
+      }),
+    });
+    await page.goto("/library");
+    // Wait for the folder tree, then trigger a lock on the first open folder row.
+    await expect(page.locator("app-folder-row").first()).toBeVisible({
+      timeout: 10_000,
+    });
+    // The lock affordance is the .lock-toggle on an open folder row.
+    const lockBtn = page.locator("app-folder-row .lock-toggle").first();
+    await lockBtn.click();
+
+    // The blocking dialog appears with the three choices. The host has no size
+    // (position:fixed content), so assert on the inner dialog.
+    await expect(
+      page.locator("app-lock-shares-dialog [role='dialog']"),
+    ).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByRole("button", { name: "Revoke & lock" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Lock anyway" }),
+    ).toBeVisible();
+    await page.screenshot({
+      path: "e2e/org/__screens__/lock-shares-dialog.png",
+      fullPage: true,
+    });
+  });
+});

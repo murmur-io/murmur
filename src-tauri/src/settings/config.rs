@@ -261,6 +261,16 @@ pub struct AppConfig {
     /// (fail-closed — a pre-existing install has NOT consented to share egress).
     #[serde(default)]
     pub share_egress_consented: bool,
+    /// M6 Shared Brain — one-time ORG-egress consent (spec §"App: Tauri commands"). Publishing a note
+    /// to an Org Brain uploads an OCK-sealed envelope to the org ciphertext feed — a distinct egress
+    /// class from a 1:1 share, so it has its OWN one-time consent. Same PRESERVE-ONLY discipline as
+    /// `share_egress_consented`: it round-trips through the DTO for DISPLAY, but
+    /// `dto_to_config`/`save_config` PRESERVE the stored value — a settings save can never grant or
+    /// clear it; only `consent_to_org_egress` / `revoke_org_egress` mutate it. `#[serde(default)]` ⇒ a
+    /// config persisted before this field existed loads as `false` (fail-closed — no org egress until
+    /// the user confirms the one-time notice).
+    #[serde(default)]
+    pub org_egress_consented: bool,
     /// Sharing-onboarding gate — has the user RESOLVED the first-run sharing decision? Either they
     /// chose "use Murmur locally (no account)" OR they went through the account door. A one-way
     /// latch: once `true` it is never auto-cleared, so the init gateway (`/welcome`) never nags a
@@ -599,6 +609,7 @@ impl Default for AppConfig {
             relock_on_screenshare: true,
             cloud_egress_consented: false,
             share_egress_consented: false,
+            org_egress_consented: false,
             sharing_choice_made: false,
             semantic_search_enabled: true,
             embed_model_id: None,
@@ -686,6 +697,7 @@ const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
 const K_CLOUD_EGRESS_CONSENTED: &str = "cloud_egress_consented";
 const K_SHARE_EGRESS_CONSENTED: &str = "share_egress_consented";
+const K_ORG_EGRESS_CONSENTED: &str = "org_egress_consented";
 const K_SHARING_CHOICE_MADE: &str = "sharing_choice_made";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
 const K_EMBED_MODEL_ID: &str = "embed_model_id";
@@ -862,6 +874,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_SHARE_EGRESS_CONSENTED)? {
             cfg.share_egress_consented = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_ORG_EGRESS_CONSENTED)? {
+            cfg.org_egress_consented = v == "true";
         }
         if let Some(v) = db.get_setting(K_SHARING_CHOICE_MADE)? {
             cfg.sharing_choice_made = v == "true";
@@ -1372,6 +1387,25 @@ impl AppConfig {
     pub fn revoke_share_egress(&mut self, db: &Db) -> Result<()> {
         self.share_egress_consented = false;
         db.set_setting(K_SHARE_EGRESS_CONSENTED, "false")
+    }
+
+    /// M6 Shared Brain — record the user's one-time consent to publish an OCK-sealed note to an Org
+    /// Brain feed (a distinct egress class from a 1:1 share). Mirrors [`grant_share_egress_consent`]:
+    /// persist FIRST, flip the in-memory flag ONLY on a durable write success (fail-closed — never
+    /// egress on a consent that isn't recorded). The ONLY mutator that sets this true.
+    pub fn grant_org_egress_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_ORG_EGRESS_CONSENTED, "true")?;
+        self.org_egress_consented = true;
+        Ok(())
+    }
+
+    /// M6 Shared Brain — REVOKE the org-egress consent. Mirror of [`revoke_share_egress`]: flips the
+    /// in-memory flag FIRST, THEN persists (revoke's safe-failure direction is "stop egressing"), so
+    /// the next `share_meeting_to_org` / `share_document_to_org` is refused fail-closed until
+    /// re-consented.
+    pub fn revoke_org_egress(&mut self, db: &Db) -> Result<()> {
+        self.org_egress_consented = false;
+        db.set_setting(K_ORG_EGRESS_CONSENTED, "false")
     }
 
     /// Latch that the user has RESOLVED the first-run sharing decision (chose local-only OR went
