@@ -40,7 +40,7 @@
 
 use crate::settings::{AppConfig, BrainBackend};
 
-/// Reasoner-only connection id: the on-device GGUF brain ([`crate::reason::mistral`]).
+/// Reasoner-only connection id: the on-device GGUF brain ([`crate::reason::sidecar`]).
 pub const CONN_LOCAL: &str = "local";
 /// Reasoner-only connection id: no model — the deterministic [`crate::reason::StubReasoner`] floor.
 pub const CONN_OFF: &str = "off";

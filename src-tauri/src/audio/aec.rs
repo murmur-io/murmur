@@ -65,10 +65,15 @@ pub fn sweep_stale_scratch() {
 /// without a clean Stop — a crash, a force-quit, or (in dev) a `tauri dev` hot-rebuild SIGKILLing
 /// the app mid-recording. An orphan reparents to launchd (ppid 1) and keeps capturing system audio
 /// to its temp WAV until its own 4h self-limit — gigabytes of dead-session audio.
-const CAPTURE_HELPERS: [&str; 3] = [
+const CAPTURE_HELPERS: [&str; 4] = [
     "meetnotes-sysaudio",
     "meetnotes-audiocap",
     "meetnotes-aeccap",
+    // The on-device brain sidecar: a launchd-reparented `meetnotes-brain` (the app was SIGKILL'd
+    // mid-generation, or `kill_on_quit`'s bounded reap abandoned a slow-dying child) keeps a
+    // multi-GB model resident until its own idle self-exit. It carries NO scratch WAV arg, so the
+    // `wav` field is `None` for it (nothing to delete) — the SIGTERM alone reclaims its RAM.
+    "meetnotes-brain",
 ];
 
 /// SIGTERM any ORPHANED capture helper (a [`CAPTURE_HELPERS`] binary reparented to launchd) and
