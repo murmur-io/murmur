@@ -153,6 +153,12 @@ pub struct AppConfigDto {
     #[serde(default)]
     pub audio_auto_prune: bool,
     pub model_size: String,
+    /// OPTIONAL live-caption ASR engine (`"whisper"` default / `"parakeet"`). Settable from the DTO
+    /// (Settings ▸ Transcription owns the picker), like `model_size`. An omitted key deserializes to
+    /// `"whisper"` (`#[serde(default = "default_live_asr_engine")]`) so an older FE payload never
+    /// silently blanks it. Mirrors Rust `AppConfig::live_asr_engine` / FE `liveAsrEngine`.
+    #[serde(default = "default_live_asr_engine")]
+    pub live_asr_engine: String,
     pub voice_trigger: bool,
     pub onboarded: bool,
     pub note_style: String,
@@ -355,6 +361,12 @@ pub struct AppConfigDto {
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
 fn default_true() -> bool {
     true
+}
+
+/// serde default for the DTO's `live_asr_engine` — the whisper live path (today's behavior), so an
+/// older FE payload that omits `liveAsrEngine` never blanks the engine.
+fn default_live_asr_engine() -> String {
+    crate::transcribe::live_asr::ENGINE_WHISPER.to_string()
 }
 
 /// Lenient `brain_backend` deserialization for the settings DTO: an UNKNOWN/garbage token
@@ -6891,6 +6903,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         audio_storage_limit_gb: c.audio_storage_limit_gb,
         audio_auto_prune: c.audio_auto_prune,
         model_size: c.model_size.clone(),
+        live_asr_engine: c.live_asr_engine.clone(),
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
         note_style: c.note_style.clone(),
@@ -6989,6 +7002,15 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             AppConfig::default().model_size
         } else {
             d.model_size
+        },
+        // OPTIONAL parakeet live-ASR: the engine selector IS settable from the DTO (Settings ▸
+        // Transcription owns the picker), like `model_size`. An empty/blank choice falls back to
+        // the `"whisper"` default (never a blank engine); the seam's `should_use_parakeet` then
+        // also falls back to whisper if parakeet's models aren't downloaded.
+        live_asr_engine: if d.live_asr_engine.trim().is_empty() {
+            crate::transcribe::live_asr::ENGINE_WHISPER.to_string()
+        } else {
+            d.live_asr_engine
         },
         // T1.3/T1.4 (transcription heat): the live-model pin + live VAD gate are NOT carried on
         // the settings DTO (no FE toggles yet) — PRESERVE the live values (the L3/L4-flag
@@ -8291,6 +8313,50 @@ pub async fn download_model(
         },
     );
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Whether the OPTIONAL parakeet live-ASR engine's four int8 models are all present on disk (in
+/// `<models_dir>/parakeet-tdt-0.6b-v3-int8`). A file-on-disk check only — no content read / no
+/// egress. Feeds the Settings ▸ Transcription engine picker (offer the download when absent).
+#[tauri::command]
+pub fn parakeet_models_present() -> Result<bool, AppError> {
+    Ok(crate::transcribe::model::parakeet_models_present())
+}
+
+/// Download the OPTIONAL parakeet live-ASR engine's four int8 models (~600 MB) from the csukuangfj
+/// sherpa-onnx HF mirror into `<models_dir>/parakeet-tdt-0.6b-v3-int8` if missing (atomic per-file
+/// `.part` → rename; a file already present is skipped). Emits the SAME
+/// [`crate::events::EVENT_MODEL_DOWNLOAD`] progress (throttled) as the whisper download so the FE
+/// reuses one progress bar. No-op when all four are already present.
+#[tauri::command]
+pub async fn download_parakeet_models(app: AppHandle) -> Result<(), AppError> {
+    // Throttle progress events to roughly every 8 MB (parity with `download_model`).
+    const EMIT_EVERY: u64 = 8 * 1024 * 1024;
+    let mut last_emit: u64 = 0;
+    crate::transcribe::model::ensure_parakeet_models(|downloaded, total| {
+        if downloaded - last_emit >= EMIT_EVERY {
+            last_emit = downloaded;
+            let _ = app.emit(
+                crate::events::EVENT_MODEL_DOWNLOAD,
+                crate::events::ModelDownloadPayload {
+                    downloaded,
+                    total,
+                    done: false,
+                },
+            );
+        }
+    })
+    .await?;
+
+    let _ = app.emit(
+        crate::events::EVENT_MODEL_DOWNLOAD,
+        crate::events::ModelDownloadPayload {
+            downloaded: 0,
+            total: None,
+            done: true,
+        },
+    );
+    Ok(())
 }
 
 /// Whether a usable on-device brain (reasoning GGUF) is present at the resolved path — the
