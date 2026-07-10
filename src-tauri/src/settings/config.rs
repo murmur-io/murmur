@@ -177,6 +177,17 @@ pub struct AppConfig {
     pub notes_mode: String,
     /// When true, Claude files each note into a thematic subfolder of the vault.
     pub auto_organize: bool,
+    /// NOTES feature — the selection Brain-assistant action toggles (Refine / Shorten / Enhance).
+    /// Each default ON (`#[serde(default = "default_true")]` ⇒ a config persisted before these
+    /// fields existed loads as `true`, and the FE — which sends all three on every save — treats a
+    /// missing field as `true`). `note_assistant_action` REFUSES a disabled action with
+    /// `AppError::Unavailable`, and the popover hides a disabled action.
+    #[serde(default = "default_true")]
+    pub note_assist_refine: bool,
+    #[serde(default = "default_true")]
+    pub note_assist_shorten: bool,
+    #[serde(default = "default_true")]
+    pub note_assist_enhance: bool,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
     /// Require an `Authorization: Bearer <token>` on EVERY MCP method (E3) — including
@@ -528,6 +539,9 @@ impl Default for AppConfig {
             onboarded: false,
             note_style: "standard".to_string(),
             notes_mode: "enhance".to_string(),
+            note_assist_refine: true,
+            note_assist_shorten: true,
+            note_assist_enhance: true,
             auto_organize: false,
             note_language: "auto".to_string(),
             mcp_require_token: true,
@@ -609,6 +623,9 @@ const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
 const K_NOTE_STYLE: &str = "note_style";
 const K_NOTES_MODE: &str = "notes_mode";
+const K_NOTE_ASSIST_REFINE: &str = "note_assist_refine";
+const K_NOTE_ASSIST_SHORTEN: &str = "note_assist_shorten";
+const K_NOTE_ASSIST_ENHANCE: &str = "note_assist_enhance";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
@@ -746,6 +763,17 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_AUTO_ORGANIZE)? {
             cfg.auto_organize = v == "true";
+        }
+        // NOTES assistant action toggles — each defaults ON (a missing setting keeps the Default's
+        // `true`, so a config persisted before these existed enables all three).
+        if let Some(v) = db.get_setting(K_NOTE_ASSIST_REFINE)? {
+            cfg.note_assist_refine = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_NOTE_ASSIST_SHORTEN)? {
+            cfg.note_assist_shorten = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_NOTE_ASSIST_ENHANCE)? {
+            cfg.note_assist_enhance = v == "true";
         }
         if let Some(v) = db.get_setting(K_NOTE_LANGUAGE)? {
             if !v.is_empty() {
@@ -981,6 +1009,26 @@ impl AppConfig {
         db.set_setting(
             K_AUTO_ORGANIZE,
             if self.auto_organize { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_NOTE_ASSIST_REFINE,
+            if self.note_assist_refine { "true" } else { "false" },
+        )?;
+        db.set_setting(
+            K_NOTE_ASSIST_SHORTEN,
+            if self.note_assist_shorten {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
+            K_NOTE_ASSIST_ENHANCE,
+            if self.note_assist_enhance {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
         db.set_setting(
@@ -1597,6 +1645,31 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    /// NOTES WP4 — the three note-assistant toggles default ON on a fresh DB (missing keys keep the
+    /// Default's `true`), and an explicit opt-OUT round-trips through save/load (a user who turns
+    /// Refine off stays off despite default-true — the same footgun guard as semantic search).
+    #[test]
+    fn note_assist_toggles_default_on_and_opt_out_round_trips() {
+        let db = temp_db();
+        // Fresh DB (no stored keys) ⇒ all three default ON.
+        let fresh = AppConfig::load(&db).unwrap();
+        assert!(fresh.note_assist_refine, "refine defaults ON");
+        assert!(fresh.note_assist_shorten, "shorten defaults ON");
+        assert!(fresh.note_assist_enhance, "enhance defaults ON");
+
+        // An explicit opt-out of Refine persists; the other two stay ON.
+        AppConfig {
+            note_assist_refine: false,
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert!(!loaded.note_assist_refine, "a Refine opt-out persists");
+        assert!(loaded.note_assist_shorten, "shorten still ON");
+        assert!(loaded.note_assist_enhance, "enhance still ON");
     }
 
     /// TIER 1 default-on: an EXPLICIT opt-out (a stored `false`) must PERSIST across reload — a user

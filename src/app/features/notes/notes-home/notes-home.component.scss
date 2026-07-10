@@ -1,0 +1,582 @@
+/* Notes is a full drill-down (L2): app-shell hides the primary rail and this
+   fixed host fills the window as a flush-left [note-folder rail | content]
+   layout, below the toast viewport. Mirrors library.component. */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  display: block;
+  background: var(--surface-base);
+}
+
+/* Two-pane shell: full-height folder rail + scrolling notes content. */
+.notes {
+  display: grid;
+  grid-template-columns: 268px minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* --- Left pane: note-folder rail (shared floating glass panel) --- */
+.folders-pane {
+  gap: var(--space-2);
+  animation: notes-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Enter transition — TRANSFORM ONLY (the fixed :host is opaque, so an opacity
+   fade would flash the base color). Mirrors the library rail glide. */
+@keyframes notes-enter {
+  from {
+    transform: translateY(8px);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+/* Top drag strip — mirrors the primary rail (traffic-light clearance). */
+.rail-drag {
+  flex: none;
+  height: 30px;
+}
+
+/* "← Murmur" drill-down up-affordance. */
+.rail-back {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 34px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.rail-back:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.rail-back:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.rail-back-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+.folders-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  min-height: 24px;
+}
+.folders-title {
+  margin: 0;
+  padding: 0 var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* The lean note-folder list scrolls independently within the fixed rail. */
+.folders-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.folder-row:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.folder-row:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.folder-row.is-selected {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+.folder-icon {
+  flex: none;
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Right pane: note list --- */
+.notes-content {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  min-width: 0;
+}
+
+.content-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-6) var(--space-4);
+  /* Reserve room for the overlay traffic lights on the right-pane top edge. */
+  padding-top: var(--space-6);
+}
+.content-title {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+.new-note-btn {
+  gap: var(--space-2);
+}
+
+.content-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--space-6) var(--space-6);
+}
+
+.notes-status {
+  color: var(--text-muted);
+  padding: var(--space-4) var(--space-2);
+}
+
+.empty-title {
+  margin: 0 0 var(--space-2);
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.empty-body {
+  margin: 0 0 var(--space-4);
+  color: var(--text-secondary);
+  max-width: 42ch;
+}
+
+/* Note cards — a single-column list of frosted .card containers. Each card holds
+   a full-bleed clickable "open" button plus a floating "Move to…" affordance
+   (the two can't be nested — invalid interactive nesting — so the card is a
+   div and the open target is its own button). */
+.note-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-width: var(--content-max);
+}
+.note-item {
+  list-style: none;
+}
+.note-card {
+  position: relative;
+  padding: 0;
+  transition:
+    border-color var(--transition-fast),
+    transform var(--transition-fast);
+}
+.note-card:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+.note-card.is-locked {
+  color: var(--text-muted);
+}
+/* Raise the card whose move-menu is open ABOVE the click-away scrim (z 30), so
+   the menu (z 40 within this card) receives clicks instead of the scrim. */
+.note-card.menu-open {
+  z-index: 50;
+}
+
+/* The full-card open target. */
+.note-open {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-4);
+  /* Leave room for the floating move button in the top-right. */
+  padding-right: calc(var(--space-4) + 28px);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: inherit;
+}
+.note-open:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.note-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.note-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 1rem;
+  font-weight: 650;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.note-lock {
+  flex: none;
+  color: var(--text-muted);
+}
+.note-shared {
+  flex: none;
+}
+
+.note-snippet {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.note-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-1);
+}
+.note-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.note-tag {
+  font-size: 0.72rem;
+}
+.note-date {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+/* --- Folder rail: add button + per-folder managed row + inline edits --- */
+.folders-head {
+  justify-content: space-between;
+}
+.folder-add {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.folder-add:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.folder-add:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* A managed folder row: the select target + a hover-revealed action cluster. */
+.folder-row--managed {
+  cursor: default;
+  padding: 0;
+  gap: 0;
+}
+.folder-row--managed:hover {
+  background: var(--surface-hover);
+}
+.folder-row--managed.is-selected {
+  background: var(--accent-soft);
+}
+.folder-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+}
+.folder-select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.folder-lock-badge {
+  flex: none;
+  margin-left: auto;
+  font-size: 0.66rem;
+  letter-spacing: 0.03em;
+}
+
+/* Per-folder actions — quiet, revealed on row hover/focus-within. */
+.folder-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: var(--space-1);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+.folder-row--managed:hover .folder-actions,
+.folder-row--managed:focus-within .folder-actions {
+  opacity: 1;
+}
+.folder-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.folder-act:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+.folder-act:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.folder-act:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.folder-act--danger:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+/* Inline folder create / rename field + delete confirm. */
+.folder-edit,
+.folder-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+.folder-edit-input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-base);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.9rem;
+}
+.folder-edit-input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.folder-edit-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+.folder-confirm-copy {
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.btn-tiny {
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.8rem;
+}
+
+/* --- Right-pane header actions --- */
+.content-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.organize-btn,
+.new-note-btn {
+  gap: var(--space-2);
+}
+
+/* --- Locked-folder gate (right pane) --- */
+.lock-gate {
+  align-items: center;
+  text-align: center;
+}
+.lock-glyph {
+  color: var(--text-muted);
+  margin-bottom: var(--space-3);
+}
+
+/* --- Per-note "Move to…" affordance + opaque menu (T3) --- */
+.note-move {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+}
+.note-move-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.note-move-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.note-move-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+/* Opaque floating menu (T3): --surface-overlay, never the frosted card. */
+.move-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  min-width: 200px;
+  max-width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.menu-current {
+  margin-left: auto;
+  font-size: 0.72rem;
+}
+.menu-empty {
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.82rem;
+}
+/* Full-viewport click-away target below the open menu. */
+.move-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  border: 0;
+  background: transparent;
+  cursor: default;
+}
+
+/* Inline spinner (Auto-organize planning state). */
+.spin-ring {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--text-primary);
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Narrow widths: stack the rail above the content so neither pane squeezes. */
+@media (max-width: 720px) {
+  .notes {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .folders-pane {
+    animation: none;
+  }
+  .spin-ring {
+    animation: none;
+  }
+}
