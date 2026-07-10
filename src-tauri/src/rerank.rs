@@ -104,6 +104,7 @@ impl Reranker for PromptedReranker {
                 temperature: Some(0.0),
                 enable_thinking: false,
                 timeout: Some(remaining),
+                ..GenOptions::default()
             };
             match self.reasoner.structured_with(system, &user, &schema, opts) {
                 Ok(v) => {

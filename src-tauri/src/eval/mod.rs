@@ -278,6 +278,10 @@ pub struct ReportContext {
     /// `true` iff the REAL model produced the vectors. `false` = StubEmbedder — the semantic and
     /// hybrid rows are then NOT a quality signal, and the artifact says so loudly.
     pub embedder_real: bool,
+    /// The prompt-set version the run happened under ([`crate::prompts::PROMPT_VERSION`]) — spec
+    /// §L3: eval artifacts STAMP the version so a metric shift can be attributed to a prompt
+    /// change. Runners pass the live constant; tests may pin a literal.
+    pub prompt_version: String,
 }
 
 /// Render a [`BakeoffReport`] + [`ReportContext`] as the COMMITTED markdown artifact (spec §L1.6):
@@ -296,6 +300,7 @@ pub fn format_report_markdown(report: &BakeoffReport, ctx: &ReportContext) -> St
         ctx.labeled_set, report.queries, report.k
     ));
     out.push_str(&format!("- config: {}\n", ctx.config));
+    out.push_str(&format!("- prompts: {}\n", ctx.prompt_version));
     if ctx.embedder_real {
         out.push_str(&format!(
             "- embedder: {} (REAL model — semantic/hybrid rows are a genuine quality signal)\n",
@@ -549,6 +554,7 @@ mod tests {
             config: "RRF_K=60".to_string(),
             embedder_id: "multilingual-e5-small".to_string(),
             embedder_real: real,
+            prompt_version: "v2026-07-10".to_string(),
         }
     }
 
@@ -562,6 +568,10 @@ mod tests {
         assert!(md.contains("- corpus: synthetic (eval::corpus, 16 seeded meetings)"));
         assert!(md.contains("- labeled set: rag-bakeoff-synthetic.json (20 queries, k=5)"));
         assert!(md.contains("- config: RRF_K=60"));
+        assert!(
+            md.contains("- prompts: v2026-07-10"),
+            "the artifact must stamp the prompt-set version (spec §L3): {md}"
+        );
         assert!(md.contains("- embedder: multilingual-e5-small (REAL model"));
         assert!(
             !md.contains("STUB"),

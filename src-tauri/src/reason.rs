@@ -12,13 +12,16 @@
 //! Foundation sidecar ([`afm::AfmReasoner`]), or the dependency-free [`StubReasoner`] fallback.
 //!
 //! The [`LocalReasoner::structured`] method is the load-bearing seam: it is where reliable
-//! tool-call / NER-classification / retrieval-plan JSON comes from. NONE of the shipped reasoners
-//! grammar-constrain the decode — the on-device GGUF path DELIBERATELY abandoned
+//! tool-call / NER-classification / retrieval-plan JSON comes from. By DEFAULT none of the shipped
+//! reasoners grammar-constrain the decode — the on-device GGUF path DELIBERATELY abandoned
 //! `Constraint::JsonSchema` (it overflowed the model context on Bielik-11B; see
 //! [`mistral::MistralReasoner::structured`]) and instead INSTRUCTS the JSON schema in the prompt,
 //! recovering the object with [`extract_first_json`], the SAME schema-in-prompt approach
 //! [`CloudReasoner`] uses. The robust recover-JSON-from-noisy-text path is therefore load-bearing
-//! for every backend, and every reasoner (stub included) routes through it.
+//! for every backend, and every reasoner (stub included) routes through it. (Brain v2 L3 adds ONE
+//! flag-gated exception: `GenOptions::use_grammar_constraint` re-enables `Constraint::JsonSchema`
+//! on the GGUF path for TINY schemas only — < 512 bytes, never the Bielik-overflow class — with a
+//! graceful fallback to schema-in-prompt on any failure; default off.)
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -833,14 +836,14 @@ fn local_reasoner_resolved(
 /// so a rambling on-device generation can't saturate Metal for tens of seconds — the sampler cap is
 /// the ONLY real per-call bound (an in-flight generation is not cancellable). `enable_thinking=false`
 /// keeps qwen3 thinking traces out of structured extraction (a no-op on non-thinking models).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct GenOptions {
     /// Hard decode cap (mistralrs `set_sampler_max_len`). `None` = the model's own default (today's
     /// behavior). Load-bearing for the realtime path.
     pub max_tokens: Option<usize>,
     /// Sampling temperature. `None` = the model's default sampler.
     pub temperature: Option<f64>,
-    /// Whether to allow qwen3 "thinking" traces. Default `false` (the derived bool default) — we never
+    /// Whether to allow qwen3 "thinking" traces. Default `false` — we never
     /// want thinking in structured extraction; on non-thinking models this is a no-op.
     pub enable_thinking: bool,
     /// Wall-clock bound on ONE on-device generation (honored only by the local GGUF path —
@@ -850,6 +853,38 @@ pub struct GenOptions {
     /// (`MISTRALRS_METAL_PRECOMPILE=0` defers Metal shader compile into the first request). The LIVE
     /// presets set `Some(30 s)` — the P0.3 live-path discipline (spec §P0.3).
     pub timeout: Option<std::time::Duration>,
+    /// Brain v2 L3 — grammar-constrain the on-device structured decode with mistralrs
+    /// `Constraint::JsonSchema`, ONLY for TINY schemas (< 512 serialized bytes — the Bielik-11B
+    /// overflow was a HUGE schema; a 3-key enum is not that) and with a graceful fallback to the
+    /// schema-in-prompt path on ANY constraint failure. Honored ONLY by
+    /// [`mistral::MistralReasoner`]; a no-op on stub/cloud/AFM. Default `false`; call sites opt in
+    /// via [`GenOptions::with_grammar_constraint`], gated by the additive
+    /// `brain_heavy_grammar_enabled` config flag (default false until real-Mac proven — spec
+    /// decision #4).
+    pub use_grammar_constraint: bool,
+    /// Brain v2 L3 — deterministic agentic-loop transcript COMPACTION: when the loop transcript
+    /// exceeds [`crate::agent::TRANSCRIPT_BUDGET`], keep the "User request:" head + the last 2
+    /// tool-result blocks verbatim + an "[N earlier results omitted]" marker. Default `true`
+    /// (mirrors the `loop_transcript_compaction` config flag's default-on); the loop call sites
+    /// wire the flag via [`GenOptions::with_transcript_compaction`]. Only read by
+    /// [`crate::agent::run_agentic_loop`] — inert for single-shot generations.
+    pub transcript_compaction: bool,
+}
+
+/// `Default` is MANUAL (not derived) because `transcript_compaction` defaults TRUE — compaction is
+/// on by default (the `loop_transcript_compaction` flag defaults on), unlike every other option
+/// which defaults to its inert value.
+impl Default for GenOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            temperature: None,
+            enable_thinking: false,
+            timeout: None,
+            use_grammar_constraint: false,
+            transcript_compaction: true,
+        }
+    }
 }
 
 impl GenOptions {
@@ -863,6 +898,7 @@ impl GenOptions {
             temperature: Some(0.2),
             enable_thinking: false,
             timeout: Some(std::time::Duration::from_secs(30)),
+            ..Self::default()
         }
     }
 
@@ -877,6 +913,7 @@ impl GenOptions {
             temperature: None,
             enable_thinking: false,
             timeout: Some(std::time::Duration::from_secs(30)),
+            ..Self::default()
         }
     }
 
@@ -889,7 +926,23 @@ impl GenOptions {
             temperature: None,
             enable_thinking: false,
             timeout: Some(std::time::Duration::from_secs(30)),
+            ..Self::default()
         }
+    }
+
+    /// Brain v2 L3 — opt into the tiny-schema grammar constraint (see the field doc). The call
+    /// site passes the `brain_heavy_grammar_enabled` config flag here, so the constraint stays
+    /// config-gated and defaults off.
+    pub fn with_grammar_constraint(mut self, enabled: bool) -> Self {
+        self.use_grammar_constraint = enabled;
+        self
+    }
+
+    /// Brain v2 L3 — wire the `loop_transcript_compaction` config flag (default true) into this
+    /// call's options; `false` disables the agentic-loop transcript compaction for the turn.
+    pub fn with_transcript_compaction(mut self, enabled: bool) -> Self {
+        self.transcript_compaction = enabled;
+        self
     }
 }
 
@@ -987,6 +1040,17 @@ pub fn parse_first_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T>
         .ok_or_else(|| AppError::Summarize("reasoner: no JSON object in reply".to_string()))?;
     serde_json::from_str(json)
         .map_err(|e| AppError::Summarize(format!("reasoner: invalid JSON ({e})")))
+}
+
+/// Is this the MALFORMED-JSON error class minted by [`parse_first_json`] (no recoverable object,
+/// or an object serde can't deserialize)? THE centralized predicate the agentic loop's one-shot
+/// corrective retry keys on (Brain v2 L3 structured-output hardening) — kept NEXT TO the two
+/// `AppError::Summarize` messages it matches so the retry can never silently drift from the error
+/// text. Every other error class (Unavailable/no-consent, Storage, timeouts, …) returns `false`
+/// and must propagate un-retried.
+pub fn is_malformed_json_error(e: &AppError) -> bool {
+    matches!(e, AppError::Summarize(msg)
+        if msg.starts_with("reasoner: no JSON object") || msg.starts_with("reasoner: invalid JSON"))
 }
 
 /// Deterministic, dependency-free stand-in for the real local reasoner (Phase 3b). Produces stable
@@ -1253,6 +1317,30 @@ mod tests {
         let p: P = parse_first_json("prefix {\"a\":7} suffix").unwrap();
         assert_eq!(p.a, 7);
         assert!(parse_first_json::<P>("no json").is_err());
+    }
+
+    /// The centralized malformed-JSON predicate (L3): true for BOTH `parse_first_json` failure
+    /// shapes (bound against the REAL errors the function mints, not hand-written strings), false
+    /// for every other error class — so the loop retry never fires on Unavailable/Storage/etc.
+    #[test]
+    fn is_malformed_json_error_matches_exactly_the_parse_failures() {
+        #[derive(Debug, serde::Deserialize)]
+        struct P {
+            #[allow(dead_code)]
+            a: i32,
+        }
+        // The real "no JSON object" error.
+        let no_obj = parse_first_json::<P>("no json here").unwrap_err();
+        assert!(is_malformed_json_error(&no_obj), "{no_obj:?}");
+        // The real "invalid JSON" (undeserializable object) error.
+        let bad = parse_first_json::<P>("{\"a\":\"not-a-number\"}").unwrap_err();
+        assert!(is_malformed_json_error(&bad), "{bad:?}");
+        // Other classes never match.
+        assert!(!is_malformed_json_error(&AppError::Unavailable("no consent".into())));
+        assert!(!is_malformed_json_error(&AppError::Storage("boom".into())));
+        assert!(!is_malformed_json_error(&AppError::Summarize(
+            "some other summarize failure".into()
+        )));
     }
 
     #[test]

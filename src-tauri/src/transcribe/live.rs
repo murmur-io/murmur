@@ -362,35 +362,12 @@ fn should_dispatch(config: &crate::settings::AppConfig) -> bool {
     config.realtime_reactions
 }
 
-// ── Phase 5 tier system-prompt SUFFIXES ─────────────────────────────────────────────────────────
-// Each is appended to the shared `assistant_system_prompt` (which injects the current-meeting live
-// buffer / typed notes / memory brief). They give the tier its SCOPE contract + the `__ESCALATE__`
-// escalation instruction. The suffix is prose only — the actual tool boundary is STRUCTURAL
-// (`AssistantScope` in the executor), so a model that ignores the prose still cannot reach a higher
-// tier's tools. `__ESCALATE__` must exactly match `crate::agent::ESCALATE_SENTINEL`.
-
-/// Tier 1 — answer ONLY from THIS meeting's own content (the injected live transcript / typed notes),
-/// never the vault. If it is not answerable from this meeting, escalate.
-const TIER1_SUFFIX: &str = "SCOPE — CURRENT MEETING ONLY: Answer STRICTLY from THIS meeting's own \
-    content shown above (its live transcript and the user's typed notes). Do NOT use any outside \
-    knowledge or other saved meetings. You have NO search tools at this step — that is intentional. \
-    If — and only if — the question CANNOT be answered from THIS meeting's content, reply with \
-    EXACTLY this JSON and nothing else: {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
-
-/// Tier 2 — answer from the user's OWN VAULT (their saved meetings/notes) via the gated search tools;
-/// if the vault doesn't cover it, escalate.
-const TIER2_SUFFIX: &str = "SCOPE — YOUR VAULT: Answer from the user's OWN saved meetings and notes, \
-    using the gated vault search tools to ground your answer. Cite meetings by their [[Title]] \
-    wikilink. If — and only if — the answer is NOT in the user's vault (it needs the web, Jira, \
-    Slack, or the calendar), reply with EXACTLY this JSON and nothing else: \
-    {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
-
-/// Tier 3 — TERMINAL: reach the consent-gated connectors/web. If it still can't be answered, say so
-/// honestly — there is NO further tier, so NEVER emit the escalation sentinel here.
-const TIER3_SUFFIX: &str = "SCOPE — CONNECTORS & WEB (last resort): Use the consent-gated connector \
-    and web tools (and the vault tools for grounding) to answer. Loud-attribute external facts \
-    (\"(via web)\", \"(via Jira)\", \"(via Slack)\"). This is the LAST step — if you still cannot \
-    find the answer, say so plainly; do NOT emit any escalation marker.";
+// ── Phase 5 tier system-prompt SUFFIXES — SINGLE-SOURCED in `crate::prompts` (Brain v2 L3) ──────
+// Moved verbatim; re-exported here so this module (and any historical `live::TIER*_SUFFIX` path)
+// keeps compiling. Each is appended to the shared `assistant_system_prompt`; the actual tool
+// boundary stays STRUCTURAL (`AssistantScope`), and the `__ESCALATE__` token is drift-guarded
+// against `crate::agent::ESCALATE_SENTINEL` in `prompts::tests`.
+pub(crate) use crate::prompts::{TIER1_SUFFIX, TIER2_SUFFIX, TIER3_SUFFIX};
 
 /// Resolve the turn's THREAD id: the FE-supplied id when present (an @brain thread), else a fresh
 /// UUID v4 (the voice/wake path and the single-shot text composer send none), so EVERY persisted
@@ -726,9 +703,44 @@ fn run_informational(
     let reasoner = state
         .reasoner
         .current_for(crate::summarize::roles::Role::Live);
-    if !crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config)
-        .is_reasoner_only()
+    let live_is_reasoner_only =
+        crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config)
+            .is_reasoner_only();
+    // Brain v2 L3 — SHADOW ROUTER (observation only, NOT dispatch): log the route the explicit
+    // `crate::router` decision table WOULD take next to what the legacy gate below actually
+    // chooses, so router↔legacy parity can be validated on real usage BEFORE any cutover.
+    // CONTENT-FREE: coarse class + decision labels only — never the command text.
     {
+        let decision = crate::router::route(&crate::router::RouterInput {
+            role: crate::summarize::roles::Role::Live,
+            config,
+            query_class: crate::router::classify_query(command),
+            heavy_available: crate::router::class_model_available(
+                config,
+                crate::reason::ModelClass::Heavy,
+            ),
+            light_available: crate::router::class_model_available(
+                config,
+                crate::reason::ModelClass::Light,
+            ),
+        });
+        // The legacy path below has exactly two outcomes: the cloud cascade or the deterministic
+        // floor. Divergence on `local` targets is EXPECTED (the router plans local tiers the
+        // legacy path floors) — that gap is what this log measures.
+        let legacy = if live_is_reasoner_only {
+            "floor"
+        } else {
+            "cloud_agentic"
+        };
+        tracing::debug!(
+            target: "router",
+            shadow = decision.label(),
+            legacy,
+            agree = decision.label() == legacy,
+            "shadow route (legacy path decides)"
+        );
+    }
+    if !live_is_reasoner_only {
         // Phase 5 — the CURRENT-FIRST BRAIN CASCADE. Try each tier in order (current meeting →
         // vault → connectors), each with a STRUCTURALLY-scoped executor (`AssistantScope`) that
         // advertises only that tier's tools. The tier's prompt instructs the model to reply with the
@@ -998,7 +1010,16 @@ fn run_cascade(
         ),
     ];
 
-    for (scope, suffix, max_steps, badge, may_escalate) in tiers {
+    // L3 escalation ledger — the connection the NEXT tier will run on. The whole cascade is gated
+    // by the caller to run ONLY on a non-reasoner-only (provider) Live target and every tier shares
+    // that ONE resolved reasoner, so today the next tier is always provider-served; the
+    // `is_reasoner_only` guard below keeps a future local-tier cascade from writing bogus rows
+    // (a local→local escalation sends nothing off-device and is NOT egress).
+    let live_target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config);
+
+    for (tier_idx, (scope, suffix, max_steps, badge, may_escalate)) in
+        tiers.into_iter().enumerate()
+    {
         let executor = crate::tools::GatedToolExecutor {
             db: &state.db,
             // The LIVE set behind its Mutex — re-read per tool call (C6), so a mid-loop relock is gated
@@ -1032,7 +1053,12 @@ fn run_cascade(
             Some(&sink as &dyn crate::agent::DeltaSink),
             // P0.3: the LIVE preset — a 1024-token cap (+ the GGUF 30 s wall-clock timeout) so a
             // runaway on-device decode can't saturate Metal mid-recording. No-op on stub/cloud.
-            crate::reason::GenOptions::live_answer(),
+            // L3: rides the `loop_transcript_compaction` flag (default ON) + the default-off
+            // `brain_heavy_grammar_enabled` tiny-schema constraint (a no-op on today's cloud-only
+            // cascade reasoners; correct if a local tier ever runs here).
+            crate::reason::GenOptions::live_answer()
+                .with_transcript_compaction(config.loop_transcript_compaction)
+                .with_grammar_constraint(config.brain_heavy_grammar_enabled),
         ) {
             Ok(Some(outcome)) => {
                 // ESCALATION vs a REAL answer. `is_escalation` matches the WHOLE answer (never a
@@ -1040,6 +1066,21 @@ fn run_cascade(
                 if crate::agent::is_escalation(&outcome.answer) {
                     if may_escalate {
                         tracing::debug!(target: "voice", "tier escalating to the next tier");
+                        // Brain v2 L3 — ESCALATION IS A LEDGERED EVENT: a content-free
+                        // `egress_log` row (call_kind "escalation", tierN→tierN+1, NO query text)
+                        // makes the step-up visible in the privacy receipt. The record/skip
+                        // DECISION is the pure, test-bound `should_ledger_escalation` (the
+                        // reasoner-only guard lives there); only the `active_sink().record(...)`
+                        // side-effect below stays code-read-verified (it needs the running app's
+                        // startup-wired sink — headless tests get the NoopEgressSink).
+                        if let Some(entry) = should_ledger_escalation(
+                            live_target.is_reasoner_only(),
+                            &live_target.connection,
+                            tier_idx as u8 + 1,
+                            tier_idx as u8 + 2,
+                        ) {
+                            crate::summarize::egress_log::active_sink().record(entry);
+                        }
                         continue; // try the next tier
                     }
                     // Terminal tier said escalate but there is no higher tier → treat as "no answer
@@ -1071,6 +1112,27 @@ fn run_cascade(
         }
     }
     None
+}
+
+/// Brain v2 L3 — the escalation-ledger DECISION, factored PURE so the guard is test-bound
+/// (adversarial finding 2026-07-10: removing the reasoner-only guard survived the full suite —
+/// nothing bound it). Returns the content-free `escalation_entry` to record when the Live target
+/// is an egress-bearing (provider) connection; `None` when the target is reasoner-only
+/// (local/AFM/off) — a local→local escalation sends NOTHING off-device and must never write an
+/// egress row. `run_cascade` records whatever this returns via `active_sink()` (the AppHandle-era
+/// side-effect that stays code-read-verified; THIS function owns the decision).
+fn should_ledger_escalation(
+    live_target_reasoner_only: bool,
+    connection: &str,
+    from_tier: u8,
+    to_tier: u8,
+) -> Option<crate::summarize::egress_log::EgressEntry> {
+    if live_target_reasoner_only {
+        return None;
+    }
+    Some(crate::summarize::egress_log::escalation_entry(
+        connection, from_tier, to_tier,
+    ))
 }
 
 /// The tier-specific extra citations the loop's `gathered`-scraped citations miss. Tier 1's answer is
@@ -1701,14 +1763,15 @@ fn assistant_system_prompt(
                 note about the decisions\", \"save that we ship Friday\"), call the propose_note tool \
                 with the note content enriched from the meeting context — that drafts a note for the \
                 user to review and accept; do NOT call propose_note for ordinary questions.";
-    // NOTE (shared recording-awareness wording): the three load-bearing phrases below —
-    // "recorded RIGHT NOW", "meeting just started", and the "do NOT search the vault for other saved
-    // meetings" substitution ban — are ALSO the deterministic FLOOR's phrases, defined ONCE as
-    // `voice_action::{RECORDING_NOW_PHRASE, MEETING_JUST_STARTED_PHRASE,
-    // NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE}` and consumed by `voice_action::rag_answer` so the
-    // local-model floor frames a live recording IDENTICALLY to this cascade prompt. This prose is kept
-    // LITERAL here (not wired to the consts) because the cascade prompt tests pin these exact
-    // substrings verbatim — the duplication is deliberate and cross-referenced; keep the two in sync.
+    // Shared recording-awareness wording (Brain v2 L3, single-sourced): the three load-bearing
+    // phrases — `prompts::{RECORDING_NOW_PHRASE, MEETING_JUST_STARTED_PHRASE,
+    // NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE}` — are INTERPOLATED into this prose (and into the
+    // deterministic FLOOR's prose in `voice_action::rag_answer`) from ONE definition, so the two
+    // prompts can never drift. The interpolation is byte-identical to the former literal prose —
+    // the prompt-pinning tests below prove it.
+    use crate::prompts::{
+        MEETING_JUST_STARTED_PHRASE, NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE, RECORDING_NOW_PHRASE,
+    };
     let t = live_transcript.trim();
     let mut prompt = if t.is_empty() {
         if recording_in_progress {
@@ -1719,12 +1782,12 @@ fn assistant_system_prompt(
             // "brain talks about other recordings" bug): with no live content, the honest answer is
             // that the meeting just started.
             format!(
-                "{base} A meeting is being recorded RIGHT NOW. When the user asks about \"this \
+                "{base} A meeting is being {RECORDING_NOW_PHRASE}. When the user asks about \"this \
                  meeting\", \"this conversation\", \"ta rozmowa\" or similar, they mean the recording \
                  IN PROGRESS — NOT any other saved meeting. Nothing has been transcribed from it yet \
                  (it just started or the user has not spoken much). If you cannot answer from the \
-                 current meeting, say plainly that the meeting just started and little has been \
-                 captured so far — do NOT search the vault for other saved meetings and describe them \
+                 current meeting, say plainly that the {MEETING_JUST_STARTED_PHRASE} and little has been \
+                 captured so far — {NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE} and describe them \
                  as if they were this one. Use your gated vault tools ONLY when the user EXPLICITLY \
                  asks about their saved notes/past meetings."
             )
@@ -1739,7 +1802,7 @@ fn assistant_system_prompt(
         // HONESTY: the buffer is mic-stream-only and carries no speaker labels — the prompt must
         // not invite "who said what" answers (any attribution from it would be hallucinated).
         format!(
-            "{base} A meeting is being recorded RIGHT NOW — use the LIVE TRANSCRIPT below to answer \
+            "{base} A meeting is being {RECORDING_NOW_PHRASE} — use the LIVE TRANSCRIPT below to answer \
              questions about THIS current meeting (its topic and what has been said so far), and your \
              gated tools for anything in the user's saved notes/vault. When the user asks what this \
              meeting/conversation is about, answer FROM THE LIVE TRANSCRIPT — do NOT substitute other \
@@ -3520,5 +3583,27 @@ mod tests {
             "the live buffer is the Tier-1 source for a recording: {ctx}"
         );
         assert!(ctx.contains("ship Friday"), "typed notes come along: {ctx}");
+    }
+
+    /// Brain v2 L3 — the escalation-ledger GUARD, bound (adversarial finding 2026-07-10: removing
+    /// the reasoner-only guard previously survived the whole suite). A reasoner-only Live target
+    /// (local/AFM/off — a local→local escalation is NOT egress) yields `None`: NO ledger row. A
+    /// provider target yields exactly the content-free `escalation_entry` row.
+    #[test]
+    fn escalation_ledger_guard_skips_reasoner_only_targets() {
+        // The guard the mutation probe killed silently: reasoner-only ⇒ None, whatever the tiers.
+        assert!(should_ledger_escalation(true, "local", 1, 2).is_none());
+        assert!(should_ledger_escalation(true, "claude_code", 2, 3).is_none());
+
+        // Provider-served next tier ⇒ the content-free row (connection + tier transition only).
+        let e = should_ledger_escalation(false, "claude_code", 1, 2)
+            .expect("a provider target must ledger the escalation");
+        assert_eq!(e.call_kind, "escalation");
+        assert_eq!(e.provider_id, "claude_code");
+        assert_eq!(e.destination, "cascade tier1→tier2");
+        assert_eq!(e.model_requested, "");
+        assert_eq!(e.system_bytes, 0);
+        assert_eq!(e.user_bytes, 0);
+        assert!(e.meeting_id.is_none(), "content-free: no meeting id, no query text");
     }
 }

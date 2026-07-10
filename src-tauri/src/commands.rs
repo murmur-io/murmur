@@ -1056,9 +1056,36 @@ pub struct ChatMsg {
 /// Cap on conversation turns fed back as context — bounds tokens (and cloud egress) on a long chat.
 const CHAT_CONTEXT_TURNS: usize = 12;
 
+/// Brain v2 L3 — token-ish CHAR budget on the rendered chat history (~16k tokens). The turn-only
+/// cap ([`CHAT_CONTEXT_TURNS`]) bounds the COUNT but not the SIZE — 12 pasted-document-sized turns
+/// still blow a small model's context — so the char budget trims on top of it, OLDEST-first.
+const CHAT_HISTORY_CHAR_BUDGET: usize = 64_000;
+
+/// Brain v2 L3 — trim `messages` to the newest suffix whose total text is within `budget` chars.
+/// OLDEST-first: walk backward from the newest message accumulating chars and cut where the budget
+/// runs out. The NEWEST message is ALWAYS kept, even if it alone exceeds the budget (dropping the
+/// user's live question is never acceptable — the provider's own limits bound that pathological
+/// case). Pure slice-in/slice-out, so the boundary is unit-testable.
+fn trim_history_to_budget(messages: &[ChatMsg], budget: usize) -> &[ChatMsg] {
+    let mut total = 0usize;
+    let mut start = messages.len();
+    for (i, m) in messages.iter().enumerate().rev() {
+        let cost = m.text.chars().count();
+        // Keep the newest unconditionally; stop BEFORE an older message that would bust the budget.
+        if start < messages.len() && total + cost > budget {
+            break;
+        }
+        total = total.saturating_add(cost);
+        start = i;
+    }
+    &messages[start..]
+}
+
 /// Format the chat `messages` into `(latest, conversation)`: `latest` is the user's newest message
 /// (drives intent-routing + the deterministic floor), `conversation` is the recent history rendered
-/// for the agentic loop's context. Errors when the last message is not a non-empty user message.
+/// for the agentic loop's context — capped to the last [`CHAT_CONTEXT_TURNS`] turns AND (L3) to
+/// [`CHAT_HISTORY_CHAR_BUDGET`] chars, oldest-first. Errors when the last message is not a
+/// non-empty user message.
 fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
     let last = messages
         .last()
@@ -1070,9 +1097,10 @@ fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
     }
     let latest = last.text.trim().to_string();
     let start = messages.len().saturating_sub(CHAT_CONTEXT_TURNS);
+    let recent = trim_history_to_budget(&messages[start..], CHAT_HISTORY_CHAR_BUDGET);
     let mut convo =
         String::from("This is an ongoing chat during a live meeting. Conversation so far:\n");
-    for m in &messages[start..] {
+    for m in recent {
         let who = if m.role.eq_ignore_ascii_case("assistant") {
             "Assistant"
         } else {
@@ -1185,6 +1213,56 @@ mod chat_format_tests {
         assert!(
             format_chat(&[msg("user", "hi"), msg("assistant", "hello")]).is_err(),
             "the last message must be from the user"
+        );
+    }
+
+    /// Brain v2 L3 — the CHAR-budget boundary: exactly-at-budget keeps everything; one char over
+    /// drops the OLDEST message; the newest message is ALWAYS kept even when it alone busts the
+    /// budget; an empty slice stays empty.
+    #[test]
+    fn trim_history_to_budget_boundary() {
+        let m = |text: &str| msg("user", text);
+
+        // 3 × 10 chars against a 30-char budget: EXACTLY at budget ⇒ all kept.
+        let msgs = vec![m(&"a".repeat(10)), m(&"b".repeat(10)), m(&"c".repeat(10))];
+        assert_eq!(trim_history_to_budget(&msgs, 30).len(), 3);
+        // One char under ⇒ the oldest is dropped, newest two kept.
+        let kept = trim_history_to_budget(&msgs, 29);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].text.starts_with('b'), "oldest-first trim");
+        // Budget below even the newest ⇒ the newest alone is still kept (never dropped).
+        let kept_one = trim_history_to_budget(&msgs, 5);
+        assert_eq!(kept_one.len(), 1);
+        assert!(kept_one[0].text.starts_with('c'));
+        // Empty in, empty out.
+        assert!(trim_history_to_budget(&[], 100).is_empty());
+    }
+
+    /// Brain v2 L3 — format_chat applies the char budget on top of the turn cap: a chat whose 12
+    /// recent turns carry ~7k chars each renders only the newest turns that fit 64k, oldest
+    /// dropped; and small chats are untouched (the turn-cap test above stays green).
+    #[test]
+    fn format_chat_trims_oversized_history_to_char_budget() {
+        // 12 turns × 7_000 chars = 84k > 64k ⇒ the oldest ~3 turns fall out.
+        let mut msgs: Vec<ChatMsg> = (0..11)
+            .map(|i| msg("user", &format!("turn-{i}-{}", "x".repeat(7_000))))
+            .collect();
+        msgs.push(msg("user", "the final question"));
+        let (latest, convo) = format_chat(&msgs).unwrap();
+        assert_eq!(latest, "the final question");
+        assert!(convo.contains("the final question"), "the newest turn always renders");
+        assert!(
+            !convo.contains("turn-0-"),
+            "an over-budget oldest turn is dropped"
+        );
+        assert!(
+            convo.contains("turn-10-"),
+            "the newest big turn still renders"
+        );
+        assert!(
+            convo.chars().count() < CHAT_HISTORY_CHAR_BUDGET + 1_000,
+            "the rendered conversation stays near the budget, got {}",
+            convo.chars().count()
         );
     }
 
@@ -3762,6 +3840,38 @@ fn ask_vault_agentic_attempt(
         .map(|g| g.clone())
         .unwrap_or_default();
     let memory_brief = gated_memory_brief_for_injection(&state, &unlocked_now, question);
+    // Brain v2 L3 — JIT retrieval (behind `ask_jit_retrieval`, default OFF): seed the persona with
+    // a compact GATED meeting listing (id | title | date, top-30 — hybrid when semantic search is
+    // on, gated FTS otherwise) + search-then-`get_meeting` instructions, instead of any pre-packed
+    // content. Flag OFF passes "" ⇒ the persona is BYTE-IDENTICAL to the legacy agentic prompt.
+    // Every candidate source is `visibility_clause`-gated, so a sealed-not-unlocked meeting
+    // contributes no line; a listing failure degrades to the legacy prompt (never an error).
+    let jit_listing = if config.ask_jit_retrieval {
+        let query_vec = if config.semantic_search_enabled {
+            crate::embed::active_embedder()
+                .embed_query(std::slice::from_ref(&question.to_string()))
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        crate::summarize::vault_context::build_meeting_listing_visible(
+            &state.db,
+            question,
+            &query_vec,
+            30,
+            &unlocked_now,
+        )
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // L3: the ASK preset + the `loop_transcript_compaction` flag (default ON) + the default-off
+    // grammar gate (a no-op on today's cloud-only agentic reasoners).
+    let opts = crate::reason::GenOptions::ask_answer()
+        .with_transcript_compaction(config.loop_transcript_compaction)
+        .with_grammar_constraint(config.brain_heavy_grammar_enabled);
     match ask_vault_loop(
         &*reasoner,
         &executor,
@@ -3770,7 +3880,9 @@ fn ask_vault_agentic_attempt(
         question,
         history,
         &memory_brief,
+        &jit_listing,
         Some(&sink as &dyn crate::agent::DeltaSink),
+        opts,
     ) {
         Ok(converged) => converged,
         Err(e) => {
@@ -3789,6 +3901,11 @@ fn ask_vault_agentic_attempt(
 /// vault-QA persona over the rendered conversation, then map a converged outcome onto the Ask DTO.
 /// `Ok(None)` = non-convergence (caller floors); `Err` propagates (caller floors) — the loop
 /// contract of `run_informational`, applied to the Ask surface.
+///
+/// `jit_listing` (Brain v2 L3) is the compact gated meeting listing for JIT retrieval — `""` (the
+/// `ask_jit_retrieval`-off path) keeps the persona BYTE-IDENTICAL to the legacy agentic prompt
+/// (`agentic_system_jit`'s empty-listing contract). `opts` carries the caller's per-step
+/// generation bounds (the P0.3 ASK preset + the L3 compaction/grammar flags).
 #[allow(clippy::too_many_arguments)]
 fn ask_vault_loop(
     reasoner: &dyn crate::reason::LocalReasoner,
@@ -3798,9 +3915,11 @@ fn ask_vault_loop(
     question: &str,
     history: &[ChatTurn],
     memory_brief: &str,
+    jit_listing: &str,
     sink: Option<&dyn crate::agent::DeltaSink>,
+    opts: crate::reason::GenOptions,
 ) -> Result<Option<AskVaultResult>, AppError> {
-    let system = crate::summarize::vault_chat::agentic_system(memory_brief);
+    let system = crate::summarize::vault_chat::agentic_system_jit(memory_brief, jit_listing);
     let user = crate::summarize::vault_chat::render_conversation(history, question);
     let Some(outcome) = crate::agent::run_agentic_loop(
         reasoner,
@@ -3809,9 +3928,7 @@ fn ask_vault_loop(
         executor,
         ASK_MAX_STEPS,
         sink,
-        // P0.3: the ASK preset — a 2048-token cap (roomier than live, still bounded; the GGUF path
-        // additionally rides the 30 s wall-clock generation timeout). No-op on stub/cloud.
-        crate::reason::GenOptions::ask_answer(),
+        opts,
     )?
     else {
         return Ok(None);
@@ -4092,6 +4209,94 @@ mod ask_vault_tests {
         }
     }
 
+    /// Brain v2 L3 — the flag-ON JIT wiring, bound headless (adversarial finding 2026-07-10: only
+    /// the flag-OFF byte-identity was tested): the exact glue `ask_vault_agentic_attempt` runs
+    /// when `ask_jit_retrieval` is ON — `build_meeting_listing_visible` (gated; the FTS/recency
+    /// path with semantic search off) fed through `ask_vault_loop` → `agentic_system_jit` — must
+    /// inject the "MEETING LISTING" section WITH the visible meeting's `id | title | date` line
+    /// into the system prompt the model actually sees. The AppState-driven flag read in
+    /// `ask_vault_agentic_attempt` itself stays code-read-verified (it needs a running app).
+    #[test]
+    fn ask_jit_flag_on_injects_the_gated_listing_into_the_system_prompt() {
+        /// Records every SYSTEM prompt handed to the model, then answers immediately.
+        struct SystemRecordingReasoner {
+            systems: Mutex<Vec<String>>,
+        }
+        impl LocalReasoner for SystemRecordingReasoner {
+            fn id(&self) -> &str {
+                "system-recording"
+            }
+            fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+            fn structured(
+                &self,
+                s: &str,
+                _u: &str,
+                _schema: &Value,
+            ) -> crate::error::Result<Value> {
+                self.systems.lock().unwrap().push(s.to_string());
+                Ok(serde_json::json!({ "answer": "done" }))
+            }
+        }
+
+        let db = tmp_db();
+        seed_note(
+            &db,
+            "m1",
+            "Atlas Kickoff",
+            "We decided to ship atlas on Friday.",
+            None,
+        );
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = ask_executor(&db, &unlocked, &cfg);
+
+        // The flag-ON branch of `ask_vault_agentic_attempt`, headless shape: semantic search off
+        // ⇒ empty query vector ⇒ the gated FTS/recency listing.
+        let listing = crate::summarize::vault_context::build_meeting_listing_visible(
+            &db,
+            "atlas",
+            &[],
+            30,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            listing.contains("Atlas Kickoff"),
+            "seed self-check: the visible meeting must be listed: {listing}"
+        );
+
+        let r = SystemRecordingReasoner {
+            systems: Mutex::new(Vec::new()),
+        };
+        let out = ask_vault_loop(
+            &r,
+            &exec,
+            &db,
+            &unlocked,
+            "atlas?",
+            &[],
+            "",
+            &listing,
+            None,
+            crate::reason::GenOptions::ask_answer(),
+        )
+        .unwrap()
+        .expect("scripted brain converged");
+        assert_eq!(out.answer, "done");
+        let systems = r.systems.lock().unwrap();
+        let sys = systems.first().expect("at least one model turn");
+        assert!(
+            sys.contains("MEETING LISTING"),
+            "flag-ON must inject the JIT listing section into the system prompt"
+        );
+        assert!(
+            sys.contains("Atlas Kickoff") && sys.contains("m1"),
+            "the visible meeting's `id | title | date` line must reach the model"
+        );
+    }
+
     /// RED-first floor equivalence (the binding test of "the floor is today's behavior"): the
     /// extracted floor prompt must be BYTE-IDENTICAL to the pre-change statement sequence —
     /// `build_vault_context_visible` → `vault_chat::build` — for the same inputs, and the
@@ -4253,7 +4458,9 @@ mod ask_vault_tests {
             "who owns the deck?",
             &[],
             "",
+            "",
             None,
+            crate::reason::GenOptions::ask_answer(),
         )
         .unwrap()
         .expect("scripted brain converged");
@@ -4291,7 +4498,19 @@ mod ask_vault_tests {
         let stuck = ScriptReasoner::ok(vec![
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "a" } }),
         ]);
-        let out = ask_vault_loop(&stuck, &exec, &db, &unlocked, "q", &[], "", None).unwrap();
+        let out = ask_vault_loop(
+            &stuck,
+            &exec,
+            &db,
+            &unlocked,
+            "q",
+            &[],
+            "",
+            "",
+            None,
+            crate::reason::GenOptions::ask_answer(),
+        )
+        .unwrap();
         assert!(
             out.is_none(),
             "non-convergence must return Ok(None) for the command to floor"
@@ -4314,7 +4533,18 @@ mod ask_vault_tests {
                 Err(AppError::Unavailable("no consent".into()))
             }
         }
-        let res = ask_vault_loop(&Refuses, &exec, &db, &unlocked, "q", &[], "", None);
+        let res = ask_vault_loop(
+            &Refuses,
+            &exec,
+            &db,
+            &unlocked,
+            "q",
+            &[],
+            "",
+            "",
+            None,
+            crate::reason::GenOptions::ask_answer(),
+        );
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
             "a loop error must propagate so the attempt wrapper can floor: {res:?}"
@@ -4450,7 +4680,9 @@ mod ask_vault_tests {
             "the secret terms?",
             &[],
             "",
+            "",
             None,
+            crate::reason::GenOptions::ask_answer(),
         )
         .unwrap()
         .expect("converged");
@@ -5304,6 +5536,13 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // and it round-trips through the dedicated K_GROUND_SUMMARY load/save keys. Mirrors the
         // preserve-only discipline used for consent + embedder id.
         ground_summary: current.ground_summary,
+        // Brain v2 L3: the grammar-constraint gate, the JIT-Ask flag, and the loop-compaction
+        // flag are NOT carried on the settings DTO (no FE toggles yet) — PRESERVE the live values
+        // so a settings save can neither enable nor clear them; each round-trips through its
+        // dedicated K_* load/save key (the memory_consolidation_enabled discipline).
+        brain_heavy_grammar_enabled: current.brain_heavy_grammar_enabled,
+        ask_jit_retrieval: current.ask_jit_retrieval,
+        loop_transcript_compaction: current.loop_transcript_compaction,
         // Model-role keys ARE settable from the DTO (a future Settings UI owns the rows), like
         // `gateway_model` — plain strings, `""` = inherit legacy. An omitted key deserializes to
         // `""` (`#[serde(default)]`), so an older FE payload can never flip a role.
