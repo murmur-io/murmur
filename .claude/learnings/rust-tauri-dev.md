@@ -140,3 +140,9 @@
 - **Caught by:** scripts/ci.sh clippy stage (and initially MASKED by piping ci.sh through `| tail` — the pipe's exit code hid the failure; always capture ci.sh exit directly).
 - **Lesson:** for lazy statics use the established repo pattern — `fn re_x() -> &'static Regex { static R: OnceLock<Regex> = OnceLock::new(); R.get_or_init(|| ...) }` (see redact.rs email_re). Check clippy.toml/Cargo.toml MSRV before reaching for newer std items.
 - **Status:** journal
+
+### [2026-07-10 brain-l2-memory] Derived artifacts EXPORTED OUTSIDE the DB need their own seal hooks
+- **Pattern:** memory rollups (LLM synthesis over facts) were written to `memory_rollups` AND exported as plaintext `.md` into the vault. Purge-on-seal covered the source facts but not the synthesis: "regenerates next pass" was false (weekly scopes never re-touched; entity scopes only on NEW facts — a seal removes facts and is invisible to that detector). Locking a folder left a plaintext paraphrase of its content in Obsidian forever.
+- **Caught by:** lock-security-reviewer + adversarial-verifier (both FAIL, independently reproduced end-to-end; builder's 1234 green tests never exercised seal-then-pass).
+- **Lesson:** any derived artifact that leaves the DB (vault export, cache file) must be (1) purged at EVERY seal path (rows in-tx, files at the command layer via recorded exported_path — same layering as sealed-note .md deletion, incl. screen-share relock + startup reconcile + delete_meeting), and (2) covered by a change-detector for regeneration (fact-set hash), never "new data arrived" heuristics — seals REMOVE data. Test shape: synthesize → export → seal → assert row AND file gone → later pass recreates nothing.
+- **Status:** journal

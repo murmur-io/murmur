@@ -125,6 +125,41 @@ pub struct Meeting {
     pub folder_id: Option<String>,
 }
 
+/// Brain v2 L2.1 — one memory-consolidation rollup row (`memory_rollups`): cross-meeting synthesis
+/// for one reflection scope (`entity:<id>` or `weekly:<YYYY-WNN>`). Lock model: ALL rollup rows are
+/// purged inside every seal transaction (and their exported `.md`s deleted by the caller), and the
+/// hourly pass re-reflects/GCs any rollup whose VISIBLE fact set changed (`fact_set_hash`) — see
+/// `crate::memory`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRollup {
+    pub id: String,
+    pub scope: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Absolute vault `.md` path this rollup was last exported to (`None` until exported).
+    pub exported_path: Option<String>,
+    /// Deterministic hash of the SORTED visible-open-fact id set the content was synthesized from
+    /// (`crate::memory::fact_set_hash`); `None` on rows written before the hash existed — treated
+    /// as "changed" so they re-reflect on the next pass.
+    pub fact_set_hash: Option<String>,
+}
+
+/// Brain v2 L2.1 — one memory score row (`memory_scores`): the deterministic components + the
+/// composite for one OPEN user fact. CONTENT-FREE (ids + floats); cascades off `user_facts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryScore {
+    pub fact_id: String,
+    pub scope: String,
+    pub recency: f64,
+    pub importance: f64,
+    pub relevance: f64,
+    pub composite: f64,
+    pub scored_at: String,
+}
+
 /// A vault folder Murmur tracks for organization + per-folder locking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -11,6 +11,7 @@ import { IpcService } from "../../../core/ipc.service";
 import type { UserMemory, UserMemoryFact } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
+import { MemoryImportComponent } from "../memory-import/memory-import.component";
 
 /**
  * "What the brain knows about you" — the user-memory audit section on the Brain
@@ -29,7 +30,7 @@ import { ToastService } from "../../../services/toast.service";
 @Component({
   selector: "app-brain-memory",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, MemoryImportComponent],
   templateUrl: "./brain-memory.component.html",
   styleUrl: "./brain-memory.component.scss",
 })
@@ -75,6 +76,11 @@ export class BrainMemoryComponent {
         void this.fetch();
       },
     );
+  }
+
+  /** Refetch after a memory import added new facts (L2.3 — the child emits `imported`). */
+  onImported(): void {
+    void this.fetch();
   }
 
   /** Render one fact as a plain sentence: "<subject> <predicate> <object>". */
