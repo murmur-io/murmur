@@ -1373,12 +1373,26 @@ pub(crate) async fn verify_note_sources_inner(
             "this meeting's folder is locked — unlock it to verify the note".into(),
         ));
     }
+    // Brain v2 L5 — SESSION verify cache, checked AFTER the read gate (the gate is never skipped
+    // for a cache hit). A hit re-renders the panel without a second Jira egress; the cache is
+    // RAM-only and cleared on relock_folder / relock_all, so it never outlives the session unlock.
+    if let Some(cached) = state
+        .verify_cache
+        .lock()
+        .map_err(|_| AppError::Other(anyhow::anyhow!("verify cache lock")))?
+        .get(&meeting_id)
+    {
+        return Ok(cached.clone());
+    }
     let note = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
-    // Strip our own old markers so extraction/judgment sees the canonical note lines.
-    let stripped = crate::verify::apply_verify_markers(&note.markdown, &[]);
+    // Strip our own old CALLOUT first (its body lines carry issue keys of their own), THEN the
+    // inline markers, so extraction/judgment sees the canonical note lines and line numbers line
+    // up with `apply_verify_markers`' post-strip numbering.
+    let base = crate::verify::apply_verify_callout(&note.markdown, &[], "");
+    let stripped = crate::verify::apply_verify_markers(&base, &[]);
     let keys = crate::verify::extract_issue_keys(&stripped);
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -1403,6 +1417,11 @@ pub(crate) async fn verify_note_sources_inner(
             detail,
             url,
         });
+    }
+    // Populate the session cache (RAM-only; cleared on relock). A poisoned lock only skips the
+    // cache — the findings still return.
+    if let Ok(mut cache) = state.verify_cache.lock() {
+        cache.insert(meeting_id, findings.clone());
     }
     Ok(findings)
 }
@@ -1441,8 +1460,18 @@ pub(crate) fn apply_note_verify_markers_inner(
         .db
         .get_latest_note_for_meeting(&meeting_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
-    let marked = crate::verify::apply_verify_markers(&existing.markdown, &findings);
-    // Save + re-export — the exact `update_note` tail, with `marked`.
+    // Brain v2 L5 — strip our own old CALLOUT first (so `apply_verify_markers`' internal
+    // marker-strip numbering matches the findings, which were computed against the
+    // callout-stripped note), apply the inline markers, then append the fresh consolidated
+    // `> [!verify]-` callout dated now. All three regions are self-managed + idempotent.
+    let base = crate::verify::apply_verify_callout(&existing.markdown, &[], "");
+    let marked = crate::verify::apply_verify_markers(&base, &findings);
+    let as_of = chrono::Utc::now().to_rfc3339();
+    let marked = crate::verify::apply_verify_callout(&marked, &findings, &as_of);
+    // Save + re-export — the exact `update_note` tail, with `marked`. Persisting via `upsert_note`
+    // keeps the callout in the CANONICAL DB note markdown so it SEALS with the note under the
+    // folder lock (the enrich.rs persistence lesson); the vault `.md` re-export follows when one
+    // exists.
     let created_at = chrono::Utc::now().to_rfc3339();
     state.db.upsert_note(&NoteRecord {
         meeting_id: meeting_id.clone(),
@@ -4604,7 +4633,8 @@ mod ask_vault_tests {
         let unlocked = Mutex::new(HashSet::new());
 
         let vault = ask_executor(&db, &unlocked, &cfg);
-        let names: Vec<&str> = vault.specs().iter().map(|s| s.name).collect();
+        let names_specs = vault.specs();
+        let names: Vec<&str> = names_specs.iter().map(|s| s.name.as_str()).collect();
         assert!(
             !names.contains(&"propose_note"),
             "the Ask surface must not advertise propose_note: {names:?}"
@@ -4865,6 +4895,275 @@ pub async fn generate_digest(
         markdown,
         exported_path,
     })
+}
+
+// ── Brain v2 L5 — scheduled briefs (schedule CRUD + propose-accept runs) ─────────────────────────
+
+/// All brief schedules (config rows — labels, timing, hints; no meeting content).
+#[tauri::command]
+pub fn list_brief_schedules(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::storage::models::BriefSchedule>, AppError> {
+    state.db.list_brief_schedules()
+}
+
+/// Validate a brief schedule's user-editable fields (shared by create + update).
+fn validate_brief_schedule(s: &crate::storage::models::BriefSchedule) -> Result<(), AppError> {
+    if s.label.trim().is_empty() {
+        return Err(AppError::InvalidArg("brief label is empty".into()));
+    }
+    if let Some(d) = s.day_of_week {
+        if !(0..=6).contains(&d) {
+            return Err(AppError::InvalidArg(
+                "day_of_week must be 0 (Monday) … 6 (Sunday)".into(),
+            ));
+        }
+    }
+    if !(0..=23).contains(&s.hour_local) {
+        return Err(AppError::InvalidArg("hour must be 0…23".into()));
+    }
+    if !(0..=59).contains(&s.minute_local) {
+        return Err(AppError::InvalidArg("minute must be 0…59".into()));
+    }
+    if !(1..=90).contains(&s.scope_days) {
+        return Err(AppError::InvalidArg("scope_days must be 1…90".into()));
+    }
+    Ok(())
+}
+
+/// Create one brief schedule. `day_of_week`: 0 = Monday … 6 = Sunday, `None` = daily. The runner
+/// (`crate::brief_runner`) fires it at most once per local day; the first fire is the first 60s
+/// tick at/after `hour:minute` local.
+#[tauri::command]
+pub fn create_brief_schedule(
+    state: State<'_, AppState>,
+    label: String,
+    day_of_week: Option<i64>,
+    hour_local: i64,
+    minute_local: i64,
+    scope_days: Option<i64>,
+    prompt_hint: Option<String>,
+) -> Result<crate::storage::models::BriefSchedule, AppError> {
+    let schedule = crate::storage::models::BriefSchedule {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        label: label.trim().to_string(),
+        day_of_week,
+        hour_local,
+        minute_local,
+        scope_days: scope_days.unwrap_or(7),
+        prompt_hint: prompt_hint.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()),
+        enabled: true,
+        last_run_at: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    validate_brief_schedule(&schedule)?;
+    state.db.insert_brief_schedule(&schedule)?;
+    Ok(schedule)
+}
+
+/// Update one brief schedule's editable fields (label / timing / window / hint / enabled).
+#[tauri::command]
+pub fn update_brief_schedule(
+    state: State<'_, AppState>,
+    schedule: crate::storage::models::BriefSchedule,
+) -> Result<(), AppError> {
+    validate_brief_schedule(&schedule)?;
+    state.db.update_brief_schedule(&schedule)
+}
+
+/// Delete one brief schedule AND its staged runs.
+#[tauri::command]
+pub fn delete_brief_schedule(
+    state: State<'_, AppState>,
+    schedule_id: String,
+) -> Result<(), AppError> {
+    state.db.delete_brief_schedule(&schedule_id)
+}
+
+/// The PENDING (proposed, not yet accepted/dismissed) brief runs — the FE's proposal cards.
+/// `note_md` was synthesized by the runner from VISIBLE-ONLY content (empty unlock set — the
+/// consolidation-job discipline), so it cannot contain sealed content AT synthesis time; and a
+/// meeting sealed AFTER the proposal purges its pending runs inside the seal tx
+/// (`Db::purge_pending_brief_runs_tx` — the lock-security LEAK fix, 2026-07-10), so a row this
+/// returns never paraphrases a currently-sealed meeting. That pair is what makes this read safe
+/// without a per-meeting gate (documented posture, see `crate::brief_runner` + `migrate_briefs`).
+#[tauri::command]
+pub fn list_brief_runs(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::storage::models::BriefRun>, AppError> {
+    state.db.list_pending_brief_runs()
+}
+
+/// ACCEPT a proposed brief: export its markdown to `<vault>/Briefs/` (atomic write) and CONSUME
+/// the staged `note_md` (the vault `.md` becomes the only copy). Returns the exported path.
+#[tauri::command]
+pub fn accept_brief(state: State<'_, AppState>, run_id: String) -> Result<String, AppError> {
+    let run = state
+        .db
+        .get_brief_run(&run_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no brief run {run_id}")))?;
+    if run.status != "pending" {
+        return Err(AppError::InvalidArg("this brief was already handled".into()));
+    }
+    if run.note_md.trim().is_empty() {
+        return Err(AppError::InvalidArg("this brief has no content".into()));
+    }
+    let vault = vault_path(state.inner())
+        .ok_or_else(|| AppError::InvalidArg("set an Obsidian vault first (Settings)".into()))?;
+    let label = state
+        .db
+        .list_brief_schedules()?
+        .into_iter()
+        .find(|s| s.id == run.schedule_id)
+        .map(|s| s.label)
+        .unwrap_or_else(|| "Brief".to_string());
+    let path = crate::export::write_note(
+        std::path::Path::new(&vault),
+        Some("Briefs"),
+        &label,
+        &run.proposed_at,
+        &run.note_md,
+    )?;
+    state
+        .db
+        .accept_brief_run(&run_id, &chrono::Utc::now().to_rfc3339())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// DISMISS a proposed brief: the staged row (markdown included) is deleted outright.
+#[tauri::command]
+pub fn dismiss_brief(state: State<'_, AppState>, run_id: String) -> Result<(), AppError> {
+    state.db.delete_brief_run(&run_id)
+}
+
+// ── Brain v2 L5 — MCP server config (list/add/remove + per-server consent + test) ───────────────
+
+/// All configured MCP servers (connection config only).
+#[tauri::command]
+pub fn list_mcp_servers(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::storage::models::McpServer>, AppError> {
+    state.db.list_mcp_servers()
+}
+
+/// Add one MCP server. `transport` is `"http"` (a JSON-RPC endpoint URL) or `"stdio"` (a LOCAL
+/// PROCESS — `endpoint` must be an ABSOLUTE path).
+///
+/// ⚠️ stdio WARNING (surface this in the FE add-server flow): a stdio MCP server is ARBITRARY
+/// CODE EXECUTION — Murmur launches that binary with your user's permissions every time the brain
+/// queries it. Only add binaries you trust and control; the absolute-path requirement prevents
+/// $PATH hijacking but does NOT make an untrusted binary safe. The server stays fail-closed
+/// (absent from the brain's tools) until `consent_to_mcp_server` is granted.
+#[tauri::command]
+pub fn add_mcp_server(
+    state: State<'_, AppState>,
+    label: String,
+    transport: String,
+    endpoint: String,
+    args: Option<Vec<String>>,
+) -> Result<crate::storage::models::McpServer, AppError> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err(AppError::InvalidArg("server label is empty".into()));
+    }
+    let endpoint = endpoint.trim().to_string();
+    match transport.as_str() {
+        "http" => {
+            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                return Err(AppError::InvalidArg(
+                    "an http MCP server needs an http(s):// endpoint URL".into(),
+                ));
+            }
+        }
+        "stdio" => {
+            // ABSOLUTE-PATH-ONLY (defense-in-depth against $PATH hijacking; re-checked at spawn).
+            if !std::path::Path::new(&endpoint).is_absolute() {
+                return Err(AppError::InvalidArg(
+                    "a stdio MCP server command must be an ABSOLUTE path".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(AppError::InvalidArg(
+                "transport must be \"http\" or \"stdio\"".into(),
+            ))
+        }
+    }
+    let server = crate::storage::models::McpServer {
+        // Hyphen-free id so it embeds cleanly in the `mcp_<id>_query` tool name.
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        label,
+        transport,
+        endpoint,
+        args: args.unwrap_or_default(),
+        enabled: true,
+        consented: false, // fail-closed until the dedicated consent command flips it.
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.db.insert_mcp_server(&server)?;
+    Ok(server)
+}
+
+/// Remove one MCP server (its tool disappears from the brain on the next spec build).
+#[tauri::command]
+pub fn remove_mcp_server(state: State<'_, AppState>, server_id: String) -> Result<(), AppError> {
+    state.db.delete_mcp_server(&server_id)
+}
+
+/// Grant the ONE-TIME per-server egress consent for an MCP server. Mirrors
+/// `consent_to_web_search`: the dedicated command is the ONLY writer that can flip consent ON.
+#[tauri::command]
+pub fn consent_to_mcp_server(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<(), AppError> {
+    if state.db.get_mcp_server(&server_id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no MCP server {server_id}")));
+    }
+    state.db.set_mcp_server_consented(&server_id, true)
+}
+
+/// Revoke an MCP server's egress consent — it drops out of the connector registry and the brain's
+/// tool list on the next build (fail-closed).
+#[tauri::command]
+pub fn revoke_mcp_consent(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<(), AppError> {
+    state.db.set_mcp_server_consented(&server_id, false)
+}
+
+/// TEST a configured MCP server: JSON-RPC `initialize` + `tools/list`, returning the discovered
+/// tool COUNT (never the tool metadata — server-supplied descriptions are untrusted input and stay
+/// out of the FE/prompts). CONSENT-GATED like every other egress to the server: an unconsented or
+/// disabled server refuses BEFORE any connection — for a stdio server the test LAUNCHES the
+/// configured binary, so consent must come first.
+#[tauri::command]
+pub async fn test_mcp_server(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<usize, AppError> {
+    let server = state
+        .db
+        .get_mcp_server(&server_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no MCP server {server_id}")))?;
+    if !server.enabled || !server.consented {
+        return Err(AppError::Unavailable(
+            "this MCP server needs your one-time consent first".into(),
+        ));
+    }
+    let client = crate::connectors::mcp_client::McpClient::for_server(&server)
+        .ok_or_else(|| AppError::InvalidArg("invalid MCP server configuration".into()))?;
+    // Content-free egress ledger row for the ATTEMPT, recorded BEFORE the handshake like every
+    // connector egress — a failing test connection is still attempted egress (for a stdio server
+    // the probe launches the configured binary), and the privacy receipt must show it
+    // (lock-security WEAKNESS fix, 2026-07-10). No query text exists here; the row carries only
+    // the per-server attribution (see `mcp_probe_entry`).
+    crate::summarize::egress_log::active_sink()
+        .record(crate::summarize::egress_log::mcp_probe_entry(&server.id));
+    client.initialize().await.map_err(AppError::from)?;
+    let tools = client.list_tools().await.map_err(AppError::from)?;
+    Ok(tools.len())
 }
 
 /// Topic Threads: cluster the per-meeting topic spans (from cached timelines) across the whole
@@ -8155,6 +8454,13 @@ pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<()
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.remove(&folder_id);
     }
+    // Brain v2 L5 — drop the SESSION verify cache on relock: cached findings paraphrase live
+    // connector values about note lines and must not outlive the session unlock. Cleared WHOLE
+    // (conservative — a per-folder filter would need a meeting→folder walk for no security gain).
+    // A poisoned lock only skips the clear-by-mutex; the cache is RAM-only either way.
+    if let Ok(mut cache) = state.verify_cache.lock() {
+        cache.clear();
+    }
     let mut one = std::collections::HashSet::new();
     one.insert(folder_id.clone());
     // The re-blank tx also purges ALL memory rollups (may paraphrase the re-sealed facts) and
@@ -8189,6 +8495,12 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
             .lock()
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.clear();
+    }
+    // Brain v2 L5 — drop the SESSION verify cache on relock-all (screen-share auto-relock,
+    // window-close, app-exit, manual "Lock all"): cached findings paraphrase note lines and must
+    // not outlive the session unlock. Best-effort on a poisoned lock (RAM-only cache).
+    if let Ok(mut cache) = state.verify_cache.lock() {
+        cache.clear();
     }
     // Zeroize the cached KEK copy (C5: use zeroize::Zeroize, not a hand byte-loop the optimizer
     // could elide — `Zeroize::zeroize` is a guaranteed, non-elidable wipe). Taking the `Zeroizing`
@@ -11888,6 +12200,7 @@ mod lifecycle_tests {
             reactions_emitted: Mutex::new(HashSet::new()),
             in_flight_turns: Mutex::new(std::collections::HashMap::new()),
             user_turn_in_progress: std::sync::atomic::AtomicBool::new(false),
+            verify_cache: Mutex::new(std::collections::HashMap::new()),
             unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
             master_kek: Mutex::new(None),
             account_session: Mutex::new(None),
@@ -11979,6 +12292,213 @@ mod lifecycle_tests {
             matches!(e3, AppError::Unavailable(_)),
             "past the lock gate, an unconfigured Jira verify fails Unavailable, got: {e3:?}"
         );
+    }
+
+    /// Brain v2 L5 — the SESSION verify cache: a cached meeting returns its findings WITHOUT a
+    /// second connector egress (RED-able: with the cache check removed, this call falls through
+    /// to `jira_lookup` on an unexposed connector and errors `Unavailable`), and a RELOCK clears
+    /// the cache (the next call is back on the connector path).
+    #[test]
+    fn verify_cache_returns_findings_and_relock_clears_it() {
+        let state = build_state("verify-cache");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vc".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vc".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::Confirmed,
+            detail: "PROJ-1 · Status: Done".into(),
+            url: String::new(),
+        };
+        state
+            .verify_cache
+            .lock()
+            .unwrap()
+            .insert("m-vc".to_string(), vec![finding.clone()]);
+
+        // Cache HIT: findings return WITHOUT touching the (unexposed) Jira connector.
+        let got = block_on(verify_note_sources_inner(&state, "m-vc".to_string())).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "PROJ-1");
+        assert_eq!(got[0].detail, "PROJ-1 · Status: Done");
+
+        // RELOCK-ALL clears the session cache → the next call is back on the connector path,
+        // which fails closed Unavailable (no Jira exposed) — proving the cache is gone.
+        relock_all_inner(&state).unwrap();
+        assert!(
+            state.verify_cache.lock().unwrap().is_empty(),
+            "relock_all must clear the verify cache"
+        );
+        let e = block_on(verify_note_sources_inner(&state, "m-vc".to_string())).unwrap_err();
+        assert!(
+            matches!(e, AppError::Unavailable(_)),
+            "post-relock the cache is empty ⇒ the connector gate speaks again, got: {e:?}"
+        );
+    }
+
+    /// Lock-security NIT promotion (the adversarial verifier's probe A, 2026-07-10): a SEALED and
+    /// NOT-session-unlocked meeting with a POISONED verify-cache entry must still refuse
+    /// `Err(Locked)` — the gate runs BEFORE the cache is read, so a cache hit can never leak
+    /// findings for a locked meeting. RED-able: hoisting the cache check above the lock gate in
+    /// `verify_note_sources_inner` returns the poisoned findings here instead of `Locked`.
+    #[test]
+    fn verify_cache_is_never_read_for_a_sealed_meeting() {
+        let state = build_state("verify-cache-lockgate");
+        make_open_folder(&state.db, "f-vcl", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vcl".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-vcl".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vcl".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-vcl", Some("f-vcl")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-vcl", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // Poison the cache as if an earlier (unlocked) session had populated it and a relock's
+        // cache-clear were somehow missed.
+        state.verify_cache.lock().unwrap().insert(
+            "m-vcl".to_string(),
+            vec![crate::verify::VerifyFinding {
+                line_no: 2,
+                key: "PROJ-1".into(),
+                verdict: crate::verify::Verdict::Confirmed,
+                detail: "POISONED — must never surface for a locked meeting".into(),
+                url: String::new(),
+            }],
+        );
+        let e = block_on(verify_note_sources_inner(&state, "m-vcl".to_string())).unwrap_err();
+        assert!(
+            matches!(e, AppError::Locked(_)),
+            "the lock gate must speak BEFORE the cache is consulted, got: {e:?}"
+        );
+        // The poisoned entry is untouched — proof the refusal came from the gate, not from a
+        // cache miss/clear (relock_folder/relock_all own the clearing in real flows).
+        assert!(
+            state.verify_cache.lock().unwrap().contains_key("m-vcl"),
+            "the entry must still be present: the gate refused without reading the cache"
+        );
+    }
+
+    /// Brain v2 L5 — `apply_note_verify_markers` persists the inline markers AND the consolidated
+    /// `> [!verify]-` callout into the CANONICAL DB note markdown, idempotently (re-applying never
+    /// stacks either region), and an empty-findings apply restores the original note byte-exact.
+    #[test]
+    fn apply_verify_markers_persists_callout_idempotently_and_undoes() {
+        let state = build_state("verify-callout-persist");
+        let original = "# N\n- Ship PROJ-1 by 2026-07-08\n- other line\n";
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-cb".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-cb".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: original.to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::Conflict,
+            detail: "note says 2026-07-08, PROJ-1 due 2026-07-10".into(),
+            url: "https://x/browse/PROJ-1".into(),
+        };
+        let once = apply_note_verify_markers_inner(
+            &state,
+            "m-cb".to_string(),
+            vec![finding.clone()],
+        )
+        .unwrap();
+        assert!(once.markdown.contains("> ⧗ note says"), "inline marker present");
+        assert!(once.markdown.contains("> [!verify]- Source check (as of "));
+        assert!(once.markdown.contains(
+            "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
+        ));
+        // Persisted CANONICALLY (upsert_note): the DB row carries the callout, so it seals with
+        // the note under a folder lock.
+        let db_md = state
+            .db
+            .get_latest_note_for_meeting("m-cb")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(db_md, once.markdown);
+
+        // Re-apply: neither region stacks (one inline marker, one fenced callout).
+        let twice =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
+        assert_eq!(twice.markdown.matches("(via Jira)").count(), 2, "1 marker + 1 callout line");
+        assert_eq!(twice.markdown.matches("[!verify]-").count(), 1);
+        assert_eq!(twice.markdown.matches("<!-- murmur:verify -->").count(), 1);
+
+        // Empty findings: markers + callout stripped, the ORIGINAL note restored byte-exact.
+        let undone =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
+        assert_eq!(undone.markdown, original, "byte-exact undo through the command");
     }
 
     /// `get_mcp_config` must emit a ready-to-paste Claude Code config: `type: "http"`, the
