@@ -8,14 +8,14 @@
 //! (`ask_vault`, note synthesis in `commands.rs` / `pipeline.rs`). [`active_reasoner`] selects the
 //! concrete impl at runtime from the configured [`BrainBackend`]: the cloud provider
 //! ([`CloudReasoner`], claude_code / anthropic / gateway / local Ollama), the on-device GGUF
-//! ([`mistral::MistralReasoner`], selected when a model resolves on disk), the experimental Apple
+//! ([`sidecar::SidecarReasoner`], selected when a model resolves on disk), the experimental Apple
 //! Foundation sidecar ([`afm::AfmReasoner`]), or the dependency-free [`StubReasoner`] fallback.
 //!
 //! The [`LocalReasoner::structured`] method is the load-bearing seam: it is where reliable
 //! tool-call / NER-classification / retrieval-plan JSON comes from. By DEFAULT none of the shipped
 //! reasoners grammar-constrain the decode — the on-device GGUF path DELIBERATELY abandoned
 //! `Constraint::JsonSchema` (it overflowed the model context on Bielik-11B; see
-//! [`mistral::MistralReasoner::structured`]) and instead INSTRUCTS the JSON schema in the prompt,
+//! [`sidecar::SidecarReasoner`]) and instead INSTRUCTS the JSON schema in the prompt,
 //! recovering the object with [`extract_first_json`], the SAME schema-in-prompt approach
 //! [`CloudReasoner`] uses. The robust recover-JSON-from-noisy-text path is therefore load-bearing
 //! for every backend, and every reasoner (stub included) routes through it. (Brain v2 L3 adds ONE
@@ -34,9 +34,12 @@ use crate::settings::{AppConfig, BrainBackend};
 use crate::summarize::provider::SummarizerProvider;
 use crate::summarize::roles::{self, Role};
 
-/// The REAL on-device reasoner (mistral.rs / GGUF). ALWAYS compiled; the real impl is selected at
-/// runtime by [`local_reasoner`] when a GGUF resolves on disk, else the dependency-free stub.
-pub mod mistral;
+/// The REAL on-device reasoner — the HOST half of the brain-sidecar extraction. mistralrs no longer
+/// links into the app crate; instead [`sidecar::SidecarReasoner`] drives the killable
+/// `meetnotes-brain` child over the NDJSON protocol, and killing the child reclaims ALL model RAM to
+/// the OS. Selected at runtime by [`local_reasoner`] when a GGUF resolves on disk, else the
+/// dependency-free stub.
+pub mod sidecar;
 
 /// WS2 — the EXPERIMENTAL on-device Apple Foundation Models reasoner ([`afm::AfmReasoner`]), driven
 /// by the `meetnotes-afm` Swift sidecar (macOS 26+). Selected at runtime for
@@ -576,7 +579,7 @@ where
 ///
 /// Graceful degradation, in priority order:
 /// - a GGUF is present at the resolved [`resolve_brain_model`] → the real
-///   [`mistral::MistralReasoner`] (lazy: the model loads on first use, not here, so this never blocks
+///   [`sidecar::SidecarReasoner`] (lazy: the model loads on first use, not here, so this never blocks
 ///   startup and never panics);
 /// - otherwise (no model, or a path-resolution error) → the dependency-free [`StubReasoner`]. The app
 ///   works either way — just less smart without the model.
@@ -732,12 +735,15 @@ impl ReasonerCell {
     /// override (`brain_model_path`), so the light and heavy handles can't collide on one custom file.
     /// A poisoned config mutex still yields the stub (fail-closed, no egress).
     fn class_or_stub(&self, class: ModelClass) -> Arc<dyn LocalReasoner> {
-        let model_id = match self.config.lock() {
-            Ok(c) => class_model_id(&c, class),
-            Err(p) => class_model_id(&p.into_inner(), class),
+        let (model_id, timeouts) = match self.config.lock() {
+            Ok(c) => (class_model_id(&c, class), sidecar_timeouts(&c)),
+            Err(p) => {
+                let c = p.into_inner();
+                (class_model_id(&c, class), sidecar_timeouts(&c))
+            }
         };
         match resolve_brain_model(None, model_id.as_deref()) {
-            Ok(Some(_)) => Arc::from(local_reasoner_resolved(None, model_id.as_deref())),
+            Ok(Some(_)) => Arc::from(local_reasoner_resolved(None, model_id.as_deref(), timeouts)),
             _ => Arc::new(StubReasoner),
         }
     }
@@ -783,38 +789,58 @@ impl ReasonerCell {
         };
         if let Some((cached_key, cached)) = cache.as_ref() {
             if *cached_key == key {
+                // Cache HIT: reuse the loaded reasoner but STILL refresh the process-global timeout
+                // snapshot from the current config — a cache hit skips `SidecarReasoner::new`
+                // (the only other `set_timeouts` caller), so without this a Settings change to the
+                // 3 brain timeouts would stay stale until the model path changed.
+                sidecar::apply_timeouts(sidecar_timeouts(cfg));
                 return Arc::clone(cached);
             }
         }
-        let built: Arc<dyn LocalReasoner> =
-            Arc::from(local_reasoner_resolved(configured, model_id.as_deref()));
+        let built: Arc<dyn LocalReasoner> = Arc::from(local_reasoner_resolved(
+            configured,
+            model_id.as_deref(),
+            sidecar_timeouts(cfg),
+        ));
         *cache = Some((key, Arc::clone(&built)));
         built
     }
 }
 
-/// Resolve the LOCAL on-device reasoner: the real [`mistral::MistralReasoner`] when a GGUF resolves
-/// on disk (lazy load — never blocks or panics at startup), otherwise the dependency-free
-/// [`StubReasoner`]. Used only for [`BrainBackend::Local`]; with no model present it always yields
-/// the stub (selection keys ONLY on model presence — mistralrs is always compiled).
+/// Build the brain-sidecar timeout policy from the live config (the 3 additive fields). Snapshotted
+/// into [`sidecar::SidecarReasoner::new`] so the process-global dispatcher honors the user's values.
+fn sidecar_timeouts(config: &AppConfig) -> sidecar::SidecarTimeouts {
+    sidecar::SidecarTimeouts {
+        idle_secs: config.brain_idle_timeout_secs,
+        ready_secs: config.brain_ready_timeout_secs,
+        hard_cap_secs: config.brain_hard_cap_secs,
+    }
+}
+
+/// Resolve the LOCAL on-device reasoner: the real [`sidecar::SidecarReasoner`] (the killable child)
+/// when a GGUF resolves on disk (lazy spawn on first call — never blocks or panics at startup),
+/// otherwise the dependency-free [`StubReasoner`]. Used only for [`BrainBackend::Local`]; with no
+/// model present it always yields the stub (selection keys ONLY on model presence).
 fn local_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
     local_reasoner_resolved(
         config.brain_model_path.as_deref().map(Path::new),
         config.brain_model_id.as_deref(),
+        sidecar_timeouts(config),
     )
 }
 
 /// The parameterized core of [`local_reasoner`]: build from an explicit custom path override +
 /// registry model id (the role layer supplies the effective id; the legacy path passes
-/// `brain_model_path`/`brain_model_id` verbatim).
+/// `brain_model_path`/`brain_model_id` verbatim) + the timeout policy for the child lifecycle.
 fn local_reasoner_resolved(
     configured: Option<&Path>,
     model_id: Option<&str>,
+    timeouts: sidecar::SidecarTimeouts,
 ) -> Box<dyn LocalReasoner> {
     match resolve_brain_model(configured, model_id) {
-        Ok(Some(path)) => match mistral::MistralReasoner::new(path) {
+        Ok(Some(path)) => match sidecar::SidecarReasoner::new(path, timeouts) {
             Ok(r) => {
-                tracing::info!(target: "reason", id = r.id(), "local brain ready (lazy model load)");
+                tracing::info!(target: "reason", id = r.id(), "local brain ready (lazy sidecar spawn)");
                 return Box::new(r);
             }
             Err(e) => {
@@ -847,7 +873,7 @@ pub struct GenOptions {
     /// want thinking in structured extraction; on non-thinking models this is a no-op.
     pub enable_thinking: bool,
     /// Wall-clock bound on ONE on-device generation (honored only by the local GGUF path —
-    /// [`mistral::MistralReasoner`]; a no-op elsewhere). `None` (the default) = UNBOUNDED, exactly the
+    /// [`sidecar::SidecarReasoner`]; a no-op elsewhere). `None` (the default) = UNBOUNDED, exactly the
     /// pre-P0 behavior — load-bearing for FullyLocal note generation (30–90 s on Qwen3-4B), the
     /// FullyLocal Ask floor (a huge prefill), and the FIRST local generation on a CLT-only Mac
     /// (`MISTRALRS_METAL_PRECOMPILE=0` defers Metal shader compile into the first request). The LIVE
@@ -857,7 +883,7 @@ pub struct GenOptions {
     /// `Constraint::JsonSchema`, ONLY for TINY schemas (< 512 serialized bytes — the Bielik-11B
     /// overflow was a HUGE schema; a 3-key enum is not that) and with a graceful fallback to the
     /// schema-in-prompt path on ANY constraint failure. Honored ONLY by
-    /// [`mistral::MistralReasoner`]; a no-op on stub/cloud/AFM. Default `false`; call sites opt in
+    /// [`sidecar::SidecarReasoner`]; a no-op on stub/cloud/AFM. Default `false`; call sites opt in
     /// via [`GenOptions::with_grammar_constraint`], gated by the additive
     /// `brain_heavy_grammar_enabled` config flag (default false until real-Mac proven — spec
     /// decision #4).
@@ -959,7 +985,7 @@ pub trait LocalReasoner: Send + Sync {
     /// Free-form reasoning WITH generation options (a token cap etc. — Brain v2 P0.3). Default:
     /// IGNORE the options and delegate to [`reason`](Self::reason) — the Stub / Cloud / AFM
     /// reasoners have no local sampler to bound, so this is non-breaking for every implementor.
-    /// [`mistral::MistralReasoner`] OVERRIDES it to honor the cap on the on-device GGUF path.
+    /// [`sidecar::SidecarReasoner`] OVERRIDES it to honor the cap on the on-device GGUF path.
     fn reason_with(&self, system: &str, user: &str, _opts: GenOptions) -> Result<String> {
         self.reason(system, user)
     }
@@ -974,7 +1000,7 @@ pub trait LocalReasoner: Send + Sync {
 
     /// Structured reasoning WITH generation options (a token cap etc.). Default: IGNORE the options
     /// and delegate to [`structured`](Self::structured) — the Stub / Cloud / AFM reasoners have no
-    /// local sampler to bound. [`mistral::MistralReasoner`] OVERRIDES this to honor the cap, the only
+    /// local sampler to bound. [`sidecar::SidecarReasoner`] OVERRIDES this to honor the cap, the only
     /// real per-call bound on a runaway on-device generation (spec §4.3).
     fn structured_with(
         &self,
@@ -2173,7 +2199,7 @@ mod tests {
         let cell = ReasonerCell::new(Arc::clone(&cfg));
         for id in [cell.light().id().to_string(), cell.heavy().id().to_string()] {
             assert!(
-                id == "stub" || id.starts_with("mistralrs:"),
+                id == "stub" || id.starts_with("sidecar:"),
                 "class handle must be local-or-stub, got {id}"
             );
             assert!(

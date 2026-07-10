@@ -133,8 +133,8 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 ## Stage 6 — STOP the dev server
 
-The running `tauri dev` (from `/tauri-dev`) holds the `src-tauri/target` cargo lock —
-a release build will block on it.
+The running `tauri dev` (from `/tauri-dev`) holds the `target` cargo lock (at the WORKSPACE
+ROOT since the brain-sidecar extraction made this a virtual workspace) — a release build blocks on it.
 
 ```bash
 pkill -f 'tauri dev' ; pkill -x Murmur ; pkill -f 'target/debug/Murmur' || true
@@ -142,16 +142,19 @@ pkill -f 'tauri dev' ; pkill -x Murmur ; pkill -f 'target/debug/Murmur' || true
 
 ## Stage 7 — Universal build
 
-The full product IS the default build — the local-model cargo features were removed, so the
-on-device brain (mistralrs) + embedder/NER (candle) are always compiled and activate at runtime on
-model-presence. NO `--features` flag. `MISTRALRS_METAL_PRECOMPILE=0` is baked into
-`src-tauri/.cargo/config.toml [env]` (CLT-only Mac → defer Metal-shader compile to first run); keep
-it on the command line too as a guard.
+The full product IS the default build. The on-device brain (mistralrs) now lives in the
+`crates/murmur-brain` workspace member, compiled to the `meetnotes-brain` helper; the embedder/NER
+(candle) are always compiled in the app crate and activate at runtime on model-presence. NO
+`--features` flag. `MISTRALRS_METAL_PRECOMPILE=0` is baked into the WORKSPACE-ROOT `.cargo/config.toml
+[env]` (moved there so the brain member inherits it; CLT-only Mac → defer Metal-shader compile to
+first run); keep it on the command line too as a guard. The `beforeBuildCommand` builds
+`meetnotes-brain` universal (both arches + `lipo`) into `src-tauri/binaries/` before the app compiles.
 
 ```bash
 source "$HOME/.cargo/env"
 MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app
-APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
+APP="target/universal-apple-darwin/release/bundle/macos/Murmur.app"   # target is at the workspace ROOT now
+lipo -archs "$APP/Contents/Resources/meetnotes-brain"   # NEW: MUST also print x86_64 arm64 (the brain helper)
 lipo -archs "$APP/Contents/MacOS/Murmur"     # MUST print: x86_64 arm64
 ```
 

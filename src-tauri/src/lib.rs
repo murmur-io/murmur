@@ -562,6 +562,10 @@ pub fn run() {
             // last-chance cleanup before the process tears down.
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 relock_and_zeroize_on_lifecycle(handle, "app-exit");
+                // Kill the on-device brain sidecar so its multi-GB model RAM is reclaimed on quit
+                // (bounded reap — never hangs app-exit; a slow-dying child reparents to launchd and
+                // the startup reaper SIGTERMs it next launch).
+                crate::reason::sidecar::kill_on_quit();
             }
         });
 }
