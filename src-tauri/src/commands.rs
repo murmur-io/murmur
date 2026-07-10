@@ -2043,6 +2043,100 @@ pub(crate) fn clear_user_memory_inner(state: &AppState) -> Result<(), AppError> 
     Ok(())
 }
 
+/// Brain v2 L2.3 — IMPORT pasted memories from another AI assistant (a ChatGPT/Claude "what I
+/// remember about you" export) into the user-memory store. Returns the number of NEW facts added.
+///
+/// Flow: extract candidates on the ON-DEVICE light reasoner (`user_memory::extract_imported_memories`
+/// — stub ⇒ empty ⇒ 0) → deterministic `reconcile_facts` against ALL existing user facts (a
+/// re-import of the same text reconciles to NoOps ⇒ 0 new) → ONLY when there is ≥1 Add, create a
+/// SYNTHETIC anchor meeting (`import-<uuid>`, title "Memory Import", `Exported`, no audio, no
+/// folder — so its facts are VISIBLE via the no-note arm of the visibility predicate) → stamp +
+/// apply atomically. ORDER IS LOAD-BEARING: the meeting row is created only after reconcile found
+/// something to add, so a stub/duplicate import leaves NO synthetic meeting behind. Deleting that
+/// meeting undoes the whole import (`delete_meeting` purges its `user_facts` in-tx). ZERO egress:
+/// extraction runs on [`import_extraction_reasoner`] — LOCAL-or-stub, NEVER cloud (the FE copy
+/// promises on-device; a pasted third-party memory export must not ride the cloud Notes provider).
+/// No local model ⇒ 0 imported (the FE hints the model may be missing). Runs on a blocking worker
+/// (a local-model extraction can take seconds). Logs counts only.
+#[tauri::command]
+pub async fn import_memories(state: State<'_, AppState>, text: String) -> Result<usize, AppError> {
+    let db = state.db.clone();
+    let reasoner = import_extraction_reasoner(state.inner());
+    let enabled = user_memory_enabled(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        import_memories_inner(&db, reasoner.as_ref(), enabled, &text)
+    })
+    .await
+    .map_err(|e| AppError::Other(anyhow::anyhow!("import task join failed: {e}")))?
+}
+
+/// The reasoner the memory IMPORT extracts on: the LIGHT engine handle (`ReasonerCell::light`) —
+/// LOCAL-or-stub, NEVER cloud, regardless of Brain Live / role config / consent. The FE copy
+/// promises "extracts the durable facts on-device"; routing the pasted export through
+/// `extraction_reasoner()` (cloud-classified Notes provider under the default `brain_live=false`)
+/// would egress a content class users were told stays local (lock-security W2). Stub ⇒ the import
+/// extracts nothing (0 imported) — degrade, never egress.
+fn import_extraction_reasoner(state: &AppState) -> std::sync::Arc<dyn crate::reason::LocalReasoner> {
+    state.reasoner.light()
+}
+
+/// Inner of [`import_memories`] (unit-testable: Db + reasoner + flag injected).
+pub(crate) fn import_memories_inner(
+    db: &crate::storage::Db,
+    reasoner: &dyn crate::reason::LocalReasoner,
+    memory_enabled: bool,
+    text: &str,
+) -> Result<usize, AppError> {
+    if !memory_enabled {
+        return Err(AppError::InvalidArg(
+            "cross-meeting memory is turned off — enable it in Settings to import memories".into(),
+        ));
+    }
+    if text.trim().is_empty() {
+        return Err(AppError::InvalidArg("nothing to import — paste the memory text".into()));
+    }
+    // 1) Best-effort extraction (stub / decode failure ⇒ empty ⇒ 0 imported, nothing persisted).
+    let candidates = crate::user_memory::extract_imported_memories(reasoner, text);
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    // 2) Deterministic reconcile against ALL existing user facts — the dedup: re-importing the same
+    //    export yields NoOps only.
+    let existing = db.user_facts_all()?;
+    let at = chrono::Utc::now().to_rfc3339();
+    let mut ops = crate::facts::reconcile_facts(&existing, &candidates, &at);
+    let adds = ops
+        .iter()
+        .filter(|o| matches!(o, crate::facts::FactOp::Add(_)))
+        .count();
+    if adds == 0 {
+        return Ok(0); // pure dedup/no-op import — no synthetic meeting is created.
+    }
+    // 3) The synthetic anchor meeting — created ONLY now that something will be added, so deleting
+    //    it undoes the import and a no-op import leaves nothing behind.
+    let meeting_id = format!("import-{}", uuid::Uuid::new_v4());
+    db.insert_meeting(&crate::storage::models::Meeting {
+        id: meeting_id.clone(),
+        started_at: at.clone(),
+        ended_at: None,
+        title: Some("Memory Import".to_string()),
+        duration_s: 0,
+        audio_path: None,
+        status: crate::storage::models::MeetingStatus::Exported,
+        folder_id: None,
+    })?;
+    // 4) Stamp the anchor onto the Adds (gating + purge anchor) and apply atomically.
+    crate::facts::set_meeting_id(&mut ops, &meeting_id);
+    db.apply_user_fact_ops(&ops)?;
+    tracing::info!(
+        target: "user_memory",
+        meeting_id = %meeting_id,
+        added = adds,
+        "memories imported (anchored to a synthetic meeting)"
+    );
+    Ok(adds)
+}
+
 /// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
 #[tauri::command]
 pub fn search_meetings(
@@ -2078,7 +2172,23 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
             let _ = std::fs::remove_file(path);
         }
     }
-    state.db.delete_meeting(&meeting_id)
+    // Brain v2 L2.1: the delete tx purges ALL memory rollups (they may paraphrase this meeting's
+    // facts) and returns their exported vault paths — remove those files here, the same layer that
+    // removed the note `.md`/audio above. Rollups regenerate from visible facts on the next pass.
+    let rollup_exports = state.db.delete_meeting(&meeting_id)?;
+    remove_rollup_export_files(&rollup_exports);
+    Ok(())
+}
+
+/// Brain v2 L2.1 LOCK-SAFETY (the filesystem half of `Db::purge_memory_rollups_tx`): best-effort
+/// removal of purged memory rollups' exported vault `.md`s. Only ever the paths the DB recorded at
+/// export time — never any other file; a missing file is fine (the DB rows are already gone, which
+/// is what the leak gate needs). Same layering as the sealed-note vault `.md` deletion: rows in the
+/// db-layer tx, files at the command layer.
+fn remove_rollup_export_files(paths: &[String]) {
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// Rename a meeting's title (in-app + Library list). Does not rename the vault file.
@@ -2139,7 +2249,7 @@ pub async fn chat_meeting(
     // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
     // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
     let unlocked = unlocked_snapshot(state.inner())?;
-    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked);
+    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
     let (system, user) =
         crate::summarize::chat::build(&transcript, &history, &question, &memory_brief);
     provider.complete(&system, &user).await
@@ -3391,18 +3501,19 @@ fn gated_meeting_thread_turns(state: &AppState, meeting_id: &str) -> String {
 /// memory is disabled (config `user_memory_enabled == false`) it returns EMPTY, so the prompt is
 /// byte-identical to the pre-memory prompt. Rides the EXISTING redaction + consent egress of the
 /// surface it is injected into — no new egress class.
+///
+/// Brain v2 L2.2: `query` is the user's question when the surface has one in hand — the brief is
+/// then RELEVANCE-FILTERED (BM25 top-k over the SAME visible set, `build_memory_brief`); an empty
+/// query or zero hits falls back to the full-list brief (behavior-preserving).
 fn gated_memory_brief_for_injection(
     state: &AppState,
     unlocked: &std::collections::HashSet<String>,
+    query: &str,
 ) -> String {
     if !user_memory_enabled(state) {
         return String::new();
     }
-    let facts = state
-        .db
-        .list_user_facts_visible(unlocked)
-        .unwrap_or_default();
-    crate::user_memory::synthesize_brief(&facts)
+    crate::user_memory::build_memory_brief(&state.db, query, unlocked)
 }
 
 /// Resolve the people + projects in a meeting note → persist them to the encrypted DB graph
@@ -3565,7 +3676,8 @@ pub async fn ask_vault(
     let unlocked = unlocked_snapshot(state.inner())?;
     // Gated cross-meeting USER MEMORY brief (parity with the @brain loop): VISIBLE facts only under
     // this same unlock snapshot, empty when memory is disabled ⇒ the floor prompt is byte-identical.
-    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked);
+    // L2.2: relevance-filtered against the question (full-list fallback on zero hits).
+    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
     // Brain v2 L1.4 — the Ask-only reranker: resolve from the LIVE Ask-role reasoner.
     // `active_reranker` degrades stub/cloud reasoners to the identity StubReranker (rerank is
     // strictly on-device — a cloud reasoner would turn each pointwise judgment into egress).
@@ -3649,7 +3761,7 @@ fn ask_vault_agentic_attempt(
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
-    let memory_brief = gated_memory_brief_for_injection(&state, &unlocked_now);
+    let memory_brief = gated_memory_brief_for_injection(&state, &unlocked_now, question);
     match ask_vault_loop(
         &*reasoner,
         &executor,
@@ -5183,6 +5295,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // toggle). An omitted value defaults ON (`default_true`), matching AppConfig::default — an
         // older FE payload can never silently turn memory off.
         user_memory_enabled: d.user_memory_enabled,
+        // Brain v2 L2.1: the consolidation-job flag is NOT carried on the settings DTO (no FE
+        // toggle yet) — PRESERVE the live value so a settings save can neither enable nor clear it;
+        // it round-trips through the dedicated K_MEMORY_CONSOLIDATION_ENABLED load/save keys.
+        memory_consolidation_enabled: current.memory_consolidation_enabled,
         // Tier 3b (B) grounding: NOT yet carried on the settings DTO (the FE toggle is a follow-up),
         // so PRESERVE the live value here — a normal settings save can neither enable nor clear it,
         // and it round-trips through the dedicated K_GROUND_SUMMARY load/save keys. Mirrors the
@@ -7339,10 +7455,13 @@ fn seal_moved_note(
     // The note's chunks/vectors are plaintext-derived and a dense embedding is invertible, so they
     // must NOT survive at rest for a meeting now sealed into a locked folder — same invariant the
     // lock_folder / relock / startup-reconcile paths enforce. Covers both the manual move-into-locked
-    // and the auto-file callers. (Re-indexed on unlock once indexing ships.)
-    state
+    // and the auto-file callers. (Re-indexed on unlock once indexing ships.) The same tx purges ALL
+    // memory rollups (cross-meeting synthesis that may paraphrase the just-sealed facts) — remove
+    // their exported vault `.md`s here, like the note `.md`s above.
+    let rollup_exports = state
         .db
         .purge_chunks_for_meetings(&[meeting_id.to_string()])?;
+    remove_rollup_export_files(&rollup_exports);
     Ok(())
 }
 
@@ -7516,7 +7635,11 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // lands a locked-then-unlocked folder is simply not semantically searchable (degraded, not
     // leaky).
     let sealed_meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
-    state.db.purge_chunks_for_meetings(&sealed_meeting_ids)?;
+    // The purge tx also drops ALL memory rollups (cross-meeting synthesis that may paraphrase the
+    // just-sealed facts; regenerated from visible facts on the next hourly pass) and returns their
+    // exported vault paths — deleted below alongside the sealed notes' `.md`s.
+    let rollup_exports = state.db.purge_chunks_for_meetings(&sealed_meeting_ids)?;
+    remove_rollup_export_files(&rollup_exports);
     // Document ingestion LOCK-SAFETY: purge the (now-sealed) documents' plaintext-derived chunks +
     // their invertible vectors too — a doc vector is PII derived from the plaintext, so it must not
     // survive at rest in a locked folder. Re-embeddable on unlock (the text seal is restorable).
@@ -7778,7 +7901,10 @@ pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<()
     }
     let mut one = std::collections::HashSet::new();
     one.insert(folder_id.clone());
-    state.db.blank_sealed_notes_in_folders(&one)?;
+    // The re-blank tx also purges ALL memory rollups (may paraphrase the re-sealed facts) and
+    // returns their exported vault paths — the files are removed here (command layer).
+    let rollup_exports = state.db.blank_sealed_notes_in_folders(&one)?;
+    remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline plaintext and drop the decrypted session WAV
     // (the .enc + the *_blob columns stay; the folder is still locked=1 on disk).
     reblank_folder_extras(state.inner(), &folder_id)?;
@@ -7820,10 +7946,12 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
             k.zeroize();
         }
     }
-    // Re-blank every sealed note across all locked folders.
+    // Re-blank every sealed note across all locked folders. The tx also purges ALL memory rollups
+    // (may paraphrase the re-sealed facts) — their exported vault `.md`s are removed here.
     let locked: std::collections::HashSet<String> =
         state.db.locked_folder_ids()?.into_iter().collect();
-    state.db.blank_sealed_notes_in_folders(&locked)?;
+    let rollup_exports = state.db.blank_sealed_notes_in_folders(&locked)?;
+    remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline + drop the decrypted session WAVs for every
     // locked folder too (the .enc + *_blob columns stay).
     for fid in &locked {
@@ -12989,7 +13117,7 @@ mod lifecycle_tests {
 
         // OPEN folder: the fact is VISIBLE → the gated brief carries it → it reaches the Ask prompt.
         let open = unlocked_snapshot(&state).unwrap();
-        let brief_open = gated_memory_brief_for_injection(&state, &open);
+        let brief_open = gated_memory_brief_for_injection(&state, &open, "what did we ship?");
         assert!(
             brief_open.contains("Polish replies"),
             "an open-folder user fact must be in the brief"
@@ -13012,7 +13140,7 @@ mod lifecycle_tests {
             .set_folder_locked("f1", true, Some(&b"wrapped"[..]))
             .unwrap();
         let sealed = unlocked_snapshot(&state).unwrap();
-        let brief_sealed = gated_memory_brief_for_injection(&state, &sealed);
+        let brief_sealed = gated_memory_brief_for_injection(&state, &sealed, "what did we ship?");
         assert!(
             brief_sealed.is_empty(),
             "a sealed-source user fact must NOT be in the injected brief"
@@ -13037,14 +13165,14 @@ mod lifecycle_tests {
             .insert("f1".to_string());
         let unlocked = unlocked_snapshot(&state).unwrap();
         assert!(
-            gated_memory_brief_for_injection(&state, &unlocked).contains("Polish replies"),
+            gated_memory_brief_for_injection(&state, &unlocked, "what did we ship?").contains("Polish replies"),
             "a session unlock must re-admit the user fact to the Ask brief"
         );
 
         // FLAG OFF: even the visible fact must NOT be injected when memory is disabled.
         state.config.lock().unwrap().user_memory_enabled = false;
         assert!(
-            gated_memory_brief_for_injection(&state, &unlocked).is_empty(),
+            gated_memory_brief_for_injection(&state, &unlocked, "what did we ship?").is_empty(),
             "memory disabled must suppress the Ask brief even for a visible fact"
         );
         // And get_user_memory reports the explicit disabled marker (empty + disabled:true).
@@ -13057,6 +13185,201 @@ mod lifecycle_tests {
             mem.facts.is_empty() && mem.brief.is_empty(),
             "disabled ⇒ nothing surfaced"
         );
+    }
+
+    /// A deterministic "real" brain for the memory-import path: non-stub id, and `structured`
+    /// returns two fixed user-fact candidates regardless of prompt (the extraction seam is
+    /// exercised; the reconcile + anchoring are the deterministic core under test).
+    struct MockImportBrain;
+    impl crate::reason::LocalReasoner for MockImportBrain {
+        fn id(&self) -> &str {
+            "mock-import"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> Result<String, AppError> {
+            Ok(String::new())
+        }
+        fn structured(
+            &self,
+            _s: &str,
+            _u: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, AppError> {
+            Ok(serde_json::json!({
+                "facts": [
+                    { "predicate": "prefers", "object": "Polish replies" },
+                    { "predicate": "works on", "object": "Project Atlas" }
+                ]
+            }))
+        }
+    }
+
+    /// Brain v2 L2.3 (RED-first): `import_memories` — the stub imports 0 and leaves NO synthetic
+    /// meeting behind; a real extraction anchors the Adds to ONE synthetic "Memory Import" meeting
+    /// whose facts are VISIBLE; a re-import of the same text reconciles to NoOps (0 new, and no
+    /// second synthetic meeting); deleting the synthetic meeting UNDOES the whole import. Fails
+    /// before L2.3: the command/inner did not exist.
+    #[test]
+    fn import_memories_dedups_anchors_and_delete_undoes() {
+        let state = build_state("mem-import");
+        let none = HashSet::new();
+        let count_import_meetings = |db: &Db| -> usize {
+            db.list_meetings(100)
+                .unwrap()
+                .iter()
+                .filter(|m| m.id.starts_with("import-"))
+                .count()
+        };
+
+        // Memory disabled ⇒ a loud refusal, nothing persisted.
+        assert!(matches!(
+            import_memories_inner(&state.db, &MockImportBrain, false, "x"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // Empty text ⇒ a loud refusal.
+        assert!(matches!(
+            import_memories_inner(&state.db, &MockImportBrain, true, "   "),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // STUB (default install): 0 imported, NO synthetic meeting left behind.
+        let n = import_memories_inner(
+            &state.db,
+            &crate::reason::StubReasoner,
+            true,
+            "I like tea",
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(count_import_meetings(&state.db), 0, "stub must not create a meeting");
+        assert!(state.db.user_facts_all().unwrap().is_empty());
+
+        // REAL extraction: 2 added, anchored to ONE synthetic meeting, visible via the gated read.
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(count_import_meetings(&state.db), 1);
+        let visible = state.db.list_user_facts_visible(&none).unwrap();
+        assert_eq!(visible.len(), 2, "imported facts are visible (no-folder meeting)");
+        assert!(visible
+            .iter()
+            .all(|f| f.meeting_id.as_deref().unwrap().starts_with("import-")));
+
+        // RE-IMPORT of the same text: pure dedup — 0 new, and NO second synthetic meeting.
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
+            .unwrap();
+        assert_eq!(n, 0, "re-import must reconcile to NoOps");
+        assert_eq!(
+            count_import_meetings(&state.db),
+            1,
+            "a no-op import must not create another meeting"
+        );
+
+        // DELETE the synthetic meeting ⇒ the import is undone (facts + their scores gone).
+        let import_id = state
+            .db
+            .list_meetings(100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id.starts_with("import-"))
+            .unwrap()
+            .id;
+        state.db.delete_meeting(&import_id).unwrap();
+        assert!(
+            state.db.user_facts_all().unwrap().is_empty(),
+            "deleting the synthetic meeting must undo the import"
+        );
+    }
+
+    /// FIX 2 (lock-security W2, RED-before-GREEN): the memory-IMPORT extraction reasoner is the
+    /// LIGHT local-or-stub handle — NEVER cloud, even under the exact config where the general
+    /// `extraction_reasoner()` goes cloud (default `brain_live=false` + cloud backend + consent).
+    /// RED on the pre-fix code: `import_memories` resolved `extraction_reasoner()`, whose id is
+    /// `cloud:*` under this config — the pasted third-party memory export would have egressed
+    /// while the FE copy promised on-device.
+    #[test]
+    fn import_extraction_reasoner_is_never_cloud() {
+        let mut state = build_state("import-reasoner");
+        let cloud_cfg = Arc::new(Mutex::new(AppConfig {
+            brain_backend: crate::settings::config::BrainBackend::Cloud,
+            cloud_egress_consented: true,
+            brain_live: false,
+            ..Default::default()
+        }));
+        state.reasoner = crate::reason::ReasonerCell::new(Arc::clone(&cloud_cfg));
+
+        // PRECONDITION (the trap): this config cloud-routes the general extraction seam.
+        assert!(
+            state
+                .reasoner
+                .extraction_reasoner()
+                .id()
+                .starts_with("cloud:"),
+            "precondition: the general extraction seam is cloud under this config"
+        );
+        // The import seam must stay local-or-stub regardless. On a machine WITH the light model
+        // installed this is the local engine (`mistralrs:*`); without it, the stub (⇒ 0 imported).
+        // Both are on-device — the binding invariant is NEVER `cloud:*`.
+        let id = import_extraction_reasoner(&state).id().to_string();
+        assert!(
+            !id.starts_with("cloud:"),
+            "memory import must NEVER extract on a cloud reasoner (got {id})"
+        );
+        assert!(
+            id == "stub" || id.starts_with("mistralrs:"),
+            "the import reasoner must be the LIGHT local-or-stub handle (got {id})"
+        );
+    }
+
+    /// FIX 1a (CRITICAL leak, both reviewers — RED-before-GREEN): SEALING purges every
+    /// memory-rollup row inside the seal tx AND deletes its exported vault `.md` at this (command)
+    /// layer — the reproduced leak was a rollup paraphrasing sealed facts persisting indefinitely
+    /// in `memory_rollups.content` + `<vault>/brain/memory/*.md` after `lock_folder`. Also covers
+    /// the relock path (`relock_all_inner`). Rollups are cheap re-derivable synthesis; the next
+    /// hourly pass regenerates them FROM VISIBLE FACTS ONLY.
+    #[test]
+    fn lock_and_relock_purge_memory_rollups_and_their_vault_exports() {
+        let vault = tmp_vault("rollup-seal");
+        let state = build_state_with_vault("rollup-seal", &vault);
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+
+        // A rollup exported to the vault, exactly as the hourly job leaves it.
+        let md = vault.join("brain").join("memory").join("weekly-2026-W28.md");
+        std::fs::create_dir_all(md.parent().unwrap()).unwrap();
+        std::fs::write(&md, "---\nmurmur: memory-rollup\n---\n\nsecret synthesis\n").unwrap();
+        state
+            .db
+            .upsert_memory_rollup("weekly:2026-W28", "secret synthesis", "h1", "2026-07-09T12:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_memory_rollup_exported("weekly:2026-W28", &md.to_string_lossy())
+            .unwrap();
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert!(
+            state.db.list_memory_rollups().unwrap().is_empty(),
+            "seal must purge every memory-rollup row"
+        );
+        assert!(!md.exists(), "seal must delete the rollup's exported vault .md");
+
+        // RELOCK path: re-seed (the folder stays locked=1 on disk), then relock_all.
+        std::fs::write(&md, "stale synthesis").unwrap();
+        state
+            .db
+            .upsert_memory_rollup("weekly:2026-W28", "stale synthesis", "h2", "2026-07-09T13:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_memory_rollup_exported("weekly:2026-W28", &md.to_string_lossy())
+            .unwrap();
+        relock_all_inner(&state).unwrap();
+        assert!(
+            state.db.list_memory_rollups().unwrap().is_empty(),
+            "relock must purge rollup rows too"
+        );
+        assert!(!md.exists(), "relock must delete the exported .md too");
     }
 
     // ── VOICEPRINTS (Phase 2): matcher gating + enroll + management ───────────────────────────────
