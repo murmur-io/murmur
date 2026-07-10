@@ -12234,6 +12234,12 @@ pub async fn account_logout(state: State<'_, AppState>) -> Result<(), AppError> 
     if let Ok(mut session) = state.account_session.lock() {
         *session = None; // drops the AccountSession → zeroizes MK.
     }
+    // Drop every unwrapped org content key too — the OCK cache is RAM-only and MUST be cleared
+    // wholesale on logout (state.rs contract; lock-security review 2026-07-10). Best-effort so a
+    // poisoned mutex can't block the rest of logout.
+    if let Ok(mut ocks) = state.org_ock_cache.lock() {
+        ocks.clear();
+    }
     crate::share::clear_tokens()?;
     crate::secrets::keychain::clear_account_mk()?; // drop the biometric MK cache too (idempotent).
     Ok(())
@@ -21614,9 +21620,17 @@ async fn acquire_org_ock(
             ))
         })?;
 
-    // The granter identity: for v1 the OWNER issues grants. We pin the granter on first contact via
-    // the pack framing (the wrapped_key carries the granter's pubkeys). Resolve the pinned granter
-    // account id from the framed sender pubkeys' fingerprint; TOFU-pin it so a later key change blocks.
+    // The granter identity: for v1 the OWNER issues grants (the wrapped_key frame carries the granter's
+    // pubkeys, and the grant signature is verified against them fail-closed in `open_own_grant`).
+    //
+    // HONEST V1 BOUNDARY (lock-security 2026-07-10, tracked follow-up): the granter fingerprint is
+    // pinned under ITSELF, so this TOFU detects nothing — a granter key substitution just yields a new
+    // first-contact pin, never a `Changed` block. That is acceptable ONLY under the documented
+    // honest-but-curious relay threat model (the server relays but does not forge). A MALICIOUS server
+    // could name a forged granter and inject org items. The hardening (a separate slice, mirroring
+    // mode-B) is to pin the granter under the org OWNER's STABLE account_id — resolvable from the
+    // member list (role='owner') — and surface a safety-word block on owner key rotation. Until then,
+    // org-item authenticity rests on the relay being honest, NOT on this pin.
     let unpacked = crate::e2ee::wrap::unpack_wrapped_key(&grant.wrapped_key, &grant.grant_sig)?;
     let granter_fp =
         crate::e2ee::key_fingerprint(&unpacked.sender_pk_enc, &unpacked.sender_pk_sig);
