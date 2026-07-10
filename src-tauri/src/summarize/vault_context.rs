@@ -59,11 +59,16 @@ pub fn build_vault_context_visible(
 ) -> Result<(String, Vec<VaultSource>)> {
     let budget = budget_for(provider_id);
 
+    // Brain v2 L1.5 — time-aware expansion: a temporal phrase in the question windows the
+    // candidate search on `started_at` (query-time `now` is the right anchor for a user query).
+    let date_filter =
+        crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
+
     // Relevance-first: VISIBLE search hits, else the most recent VISIBLE meetings. Both queries
     // apply the sealed-folder visibility clause against `unlocked`, so sealed-not-unlocked
     // meetings are filtered out of the candidate set before any content is read.
     let mut meetings: Vec<crate::storage::models::Meeting> = db
-        .search_visible(query, 40, unlocked)?
+        .search_visible_in_range(query, 40, unlocked, date_filter)?
         .into_iter()
         .map(|h| h.meeting)
         .collect();
@@ -96,13 +101,45 @@ pub fn build_vault_context_hybrid_visible(
     provider_id: &str,
     query_vec: &[f32],
     unlocked: &HashSet<String>,
+    reranker: Option<&dyn crate::rerank::Reranker>,
 ) -> Result<(String, Vec<VaultSource>)> {
     let budget = budget_for(provider_id);
-    let mut meetings: Vec<crate::storage::models::Meeting> = db
-        .search_hybrid_visible(query, query_vec, 40, unlocked)?
-        .into_iter()
-        .map(|h| h.meeting)
-        .collect();
+    // Brain v2 L1.5 — temporal window (all hybrid legs apply it; query-time `now` anchor).
+    let date_filter =
+        crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
+    let mut hits = db.search_hybrid_visible(query, query_vec, 40, unlocked, date_filter)?;
+
+    // Brain v2 L1.4 — the RERANKER seam (Ask-only): reorder the TOP-K fused candidates before
+    // packing. The reranker sees ONLY already-gated hits (id + title/snippet — content the caller
+    // may already pack into the prompt) and MUST degrade to input order on failure/timeout, so
+    // this can only reorder, never widen, the candidate set. `None` (no local model / cloud
+    // brain / non-Ask callers) = byte-identical to the un-reranked path.
+    if let Some(rr) = reranker {
+        let k = crate::rerank::RERANK_TOP_K.min(hits.len());
+        if k >= 2 {
+            let candidates: Vec<(String, String)> = hits[..k]
+                .iter()
+                .map(|h| {
+                    let title = h.meeting.title.clone().unwrap_or_default();
+                    (h.meeting.id.clone(), format!("{title}\n{}", h.snippet))
+                })
+                .collect();
+            let order = rr.rerank(query, &candidates, crate::rerank::RERANK_TIMEOUT_MS);
+            let mut head: Vec<crate::storage::models::SearchHit> = Vec::with_capacity(k);
+            let mut pool: Vec<crate::storage::models::SearchHit> = hits.drain(..k).collect();
+            for id in order {
+                if let Some(pos) = pool.iter().position(|h| h.meeting.id == id) {
+                    head.push(pool.remove(pos));
+                }
+            }
+            head.extend(pool); // degrade-safety: an id the reranker lost keeps its slot.
+            head.extend(hits);
+            hits = head;
+        }
+    }
+
+    let mut meetings: Vec<crate::storage::models::Meeting> =
+        hits.into_iter().map(|h| h.meeting).collect();
     if meetings.is_empty() {
         meetings = db.list_meetings_visible(30, unlocked)?;
     }
@@ -334,7 +371,8 @@ mod tests {
         // proving the READ-time gate (not just absence of an index row) excludes it.
         let emb = crate::embed::active_embedder();
         db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
-        db.index_meeting_chunks("sealed", &[], emb.as_ref()).unwrap();
+        db.index_meeting_chunks("sealed", &[], emb.as_ref())
+            .unwrap();
         db.set_folder_locked("f-locked", true, None).unwrap();
 
         let qv = emb
@@ -344,7 +382,7 @@ mod tests {
 
         let nothing = HashSet::new();
         let (corpus, sources) =
-            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing)
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &nothing, None)
                 .unwrap();
         assert!(
             corpus.contains("OPEN-SECRET"),
@@ -359,7 +397,7 @@ mod tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
         let (corpus2, _) =
-            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked)
+            build_vault_context_hybrid_visible(&db, "SECRET", "anthropic", &qvec, &unlocked, None)
                 .unwrap();
         assert!(
             corpus2.contains("LOCKED-SECRET"),

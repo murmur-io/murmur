@@ -453,8 +453,11 @@ pub fn seed_synthetic_corpus(db: &Db, embedder: &dyn Embedder) -> Result<Vec<Str
             .collect();
         db.insert_segments(m.id, &segments)?;
         // Mirror the pipeline's auto-index: both chunk classes (note 'voice' + 'transcript'),
-        // embedded with the caller's embedder.
+        // embedded with the caller's embedder — plus the Brain v2 L1.1 topic chunks, exactly as
+        // `index_meeting_if_enabled` writes them (index_meeting_chunks FIRST — its clean-replace
+        // purge covers all chunk classes — then the topic pass).
         db.index_meeting_chunks(m.id, &segments, embedder)?;
+        db.index_meeting_topic_chunks(m.id, &segments, embedder, &Default::default())?;
         ids.push(m.id.to_string());
     }
     tracing::info!(target: "eval", meetings = ids.len(), "synthetic bake-off corpus seeded");

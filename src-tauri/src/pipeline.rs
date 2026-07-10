@@ -417,10 +417,10 @@ async fn run_inner(
             let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
             if let Err(e) = audio::write_wav_f32(&mic_master, samples, src_rate, 1) {
                 tracing::warn!(target: "audio", error = %e, "mic master write failed");
-            } else if let Err(e) = state
-                .db
-                .set_meeting_mic_master_path(meeting_id, Some(mic_master.to_string_lossy().as_ref()))
-            {
+            } else if let Err(e) = state.db.set_meeting_mic_master_path(
+                meeting_id,
+                Some(mic_master.to_string_lossy().as_ref()),
+            ) {
                 // Best-effort: a stranded, untracked master plaintext is unreferenced + ungated-out;
                 // never fail the recording over it.
                 tracing::warn!(target: "audio", error = %e, "persisting mic master path failed");
@@ -1362,7 +1362,10 @@ pub(crate) fn index_meeting_if_enabled(
     // 'transcript') are indexed alongside the note-summary chunks. A sealed meeting is already excluded
     // above, so these are visible plaintext; an empty transcript simply yields zero transcript chunks.
     let segments = db.get_segments(meeting_id)?;
-    db.index_meeting_chunks(meeting_id, &segments, embedder)
+    db.index_meeting_chunks(meeting_id, &segments, embedder)?;
+    // Brain v2 L1.1 — TOPIC chunks ride the same gate, AFTER the note/transcript index (whose
+    // clean-replace purge covers all chunk classes via the shared `purge_chunks_tx` choke point).
+    db.index_meeting_topic_chunks(meeting_id, &segments, embedder, unlocked)
 }
 
 /// brain2 RAG Phase 4 — RETRIEVAL-AUGMENTED NOTE GENERATION (ALWAYS ON). Build the GATED corpus of
