@@ -181,6 +181,70 @@ pub fn judge(line_text: &str, key: &str, snap: Option<&IssueSnapshot>) -> (Verdi
     }
 }
 
+/// Brain v2 L5 — the HUMAN prefix a verdict renders with in the `> [!verify]-` callout. Kept as a
+/// tiny shared helper so [`judge_with_detail`] and [`apply_verify_callout`] can never drift.
+fn human_prefix(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Confirmed => "✓ Confirmed",
+        Verdict::NotFound => "⚠ Not found",
+        Verdict::Conflict => "⧗ Conflict",
+    }
+}
+
+/// Brain v2 L5 — [`judge`] extended with a HUMAN detail string (the callout body wording):
+/// `✓ Confirmed — PROJ-1 · Status: In Progress · due 2026-07-10` / `⚠ Not found — …` /
+/// `⧗ Conflict — note says …, PROJ-1 due …`. PURE and deterministic exactly like `judge` — the LLM
+/// is never the judge; the wording carries ONLY connector-sourced values + dates already present in
+/// the note line.
+pub fn judge_with_detail(
+    line_text: &str,
+    key: &str,
+    snap: Option<&IssueSnapshot>,
+) -> (Verdict, String) {
+    let (verdict, base) = judge(line_text, key, snap);
+    let detail = format!("{} — {base}", human_prefix(verdict));
+    (verdict, detail)
+}
+
+/// The fence delimiting the managed verify callout (HTML comments render as nothing in Obsidian).
+/// A DISTINCT fence from the enrich lanes (`murmur:context` / `murmur:links`) so all three managed
+/// blocks are independent: each strips + reapplies ONLY its own fence.
+pub(crate) const VERIFY_FENCE_START: &str = "<!-- murmur:verify -->";
+pub(crate) const VERIFY_FENCE_END: &str = "<!-- /murmur:verify -->";
+
+/// Brain v2 L5 — append (or idempotently replace) the consolidated, collapsed `> [!verify]-`
+/// callout carrying the verification findings, dated `as_of` (caller-supplied so the function is
+/// pure). Mirrors `enrich.rs` fence discipline EXACTLY (it reuses the same engine):
+/// - **Idempotent** — the old fenced block is stripped first, never stacked;
+/// - **Byte-exact undo** — empty `findings` strips the block and returns the note byte-identical;
+/// - **Injection-hardened** — every rendered value rides [`crate::enrich::sanitize`], so a
+///   connector-sourced detail carrying CR/LF or a forged `<!-- /murmur:verify -->` fence can
+///   neither escape the block nor break the strip.
+///
+/// Callers that EXTRACT keys from a note (or compute line numbers) must strip this callout first
+/// (`apply_verify_callout(md, &[], "")`) — the body lines carry issue keys of their own.
+pub fn apply_verify_callout(note_md: &str, findings: &[VerifyFinding], as_of: &str) -> String {
+    let callout = format!(
+        "> [!verify]- Source check (as of {})",
+        crate::enrich::sanitize(as_of)
+    );
+    let body: Vec<String> = findings
+        .iter()
+        .map(|f| {
+            let detail = crate::enrich::sanitize(&f.detail);
+            let prefix = human_prefix(f.verdict);
+            match f.url.trim() {
+                "" => format!("> - {prefix} — {detail} (via Jira)"),
+                url => format!(
+                    "> - {prefix} — {detail} (via Jira) — {}",
+                    crate::enrich::sanitize(url)
+                ),
+            }
+        })
+        .collect();
+    crate::enrich::apply_fenced_block(note_md, VERIFY_FENCE_START, VERIFY_FENCE_END, &callout, &body)
+}
+
 /// Append one non-destructive marker blockquote after each finding's line. IDEMPOTENT: all
 /// existing `(via Jira)` marker lines are stripped first, so re-verifying replaces (never stacks).
 /// Every ORIGINAL line is preserved byte-identically (the annotate_unverified discipline).
@@ -317,6 +381,131 @@ mod tests {
         // And idempotency holds.
         let twice = apply_verify_markers(&once, &[f]);
         assert_eq!(once, twice);
+    }
+
+    // ── Brain v2 L5: judge_with_detail + the `> [!verify]-` fenced callout ──────────────────────
+
+    /// The human detail strings render the verdict wording the callout shows: ✓ Confirmed /
+    /// ⚠ Not found / ⧗ Conflict, each carrying the connector-sourced status/due detail.
+    #[test]
+    fn judge_with_detail_formats_human_strings() {
+        let s = snap("PROJ-1", "In Progress", Some("2026-07-10"));
+        let (v, d) = judge_with_detail("- Ship PROJ-1 soon", "PROJ-1", Some(&s));
+        assert!(matches!(v, Verdict::Confirmed));
+        assert_eq!(d, "✓ Confirmed — PROJ-1 · Status: In Progress · due 2026-07-10");
+
+        let (v, d) = judge_with_detail("- Ship PROJ-1", "PROJ-1", None);
+        assert!(matches!(v, Verdict::NotFound));
+        assert_eq!(d, "⚠ Not found — PROJ-1 not found in Jira");
+
+        let (v, d) = judge_with_detail("- Ship PROJ-1 by 2026-07-08", "PROJ-1", Some(&s));
+        assert!(matches!(v, Verdict::Conflict));
+        assert_eq!(d, "⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10");
+    }
+
+    fn finding(verdict: Verdict, detail: &str, url: &str) -> VerifyFinding {
+        VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict,
+            detail: detail.into(),
+            url: url.into(),
+        }
+    }
+
+    /// The callout appends ONE collapsed `> [!verify]-` block (fenced), idempotent — re-applying
+    /// with the same findings+timestamp is byte-identical and the block never stacks.
+    #[test]
+    fn verify_callout_appends_once_and_is_idempotent() {
+        let md = "# N\n- Ship PROJ-1 by 2026-07-08\n";
+        let fs = vec![finding(
+            Verdict::Conflict,
+            "note says 2026-07-08, PROJ-1 due 2026-07-10",
+            "https://x/browse/PROJ-1",
+        )];
+        let once = apply_verify_callout(md, &fs, "2026-07-10T12:00:00Z");
+        assert!(once.starts_with(md), "original note preserved byte-for-byte");
+        assert!(once.contains("> [!verify]- Source check (as of 2026-07-10T12:00:00Z)"));
+        assert!(once.contains(
+            "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
+        ));
+        assert_eq!(once.matches(VERIFY_FENCE_START).count(), 1);
+        let twice = apply_verify_callout(&once, &fs, "2026-07-10T12:00:00Z");
+        assert_eq!(once, twice, "re-applying replaces, never stacks");
+        assert_eq!(twice.matches("[!verify]-").count(), 1);
+    }
+
+    /// Empty findings STRIP the callout byte-exact (the undo path), across trailing-newline /
+    /// front-matter / empty-note shapes — the enrich.rs invariant, inherited via the shared engine.
+    #[test]
+    fn verify_callout_empty_findings_strip_byte_exact() {
+        let fs = vec![finding(Verdict::Confirmed, "PROJ-1 · Status: Done", "")];
+        for md in [
+            "# N\n- done PROJ-1\n",
+            "# N\n- done PROJ-1",
+            "---\nk: v\n---\n# T\nbody\n",
+            "",
+        ] {
+            let with = apply_verify_callout(md, &fs, "2026-07-10T12:00:00Z");
+            assert_ne!(with, md, "the callout was actually added");
+            let undone = apply_verify_callout(&with, &[], "");
+            assert_eq!(undone, md, "empty findings must undo byte-exact: {md:?}");
+        }
+    }
+
+    /// A hostile finding forging the verify fence (or carrying newlines) can neither escape the
+    /// block nor break the strip — the sanitize hardening from enrich.rs applies here too.
+    #[test]
+    fn verify_callout_survives_fence_forging_and_newlines() {
+        let evil = finding(
+            Verdict::NotFound,
+            "legit <!-- /murmur:verify --> gotcha\n> [!danger] injected",
+            "https://x/<!-- /murmur:verify -->",
+        );
+        let out = apply_verify_callout("# N\n- keep me\n", std::slice::from_ref(&evil), "now");
+        assert_eq!(out.matches(VERIFY_FENCE_START).count(), 1, "no forged start fence");
+        assert_eq!(out.matches(VERIFY_FENCE_END).count(), 1, "no forged end fence");
+        assert_eq!(
+            out.lines().filter(|l| l.trim_start().starts_with("> [!danger")).count(),
+            0,
+            "an injected callout never reaches a line-start position"
+        );
+        assert_eq!(
+            apply_verify_callout(&out, &[], ""),
+            "# N\n- keep me\n",
+            "byte-exact undo holds despite the hostile value"
+        );
+        let twice = apply_verify_callout(&out, std::slice::from_ref(&evil), "now");
+        assert_eq!(out, twice, "idempotent with the hostile finding");
+    }
+
+    /// The verify callout COEXISTS with the inline `> ✓ … (via Jira)` markers and with the enrich
+    /// context block: each managed lane strips/reapplies only its own region. Also: stripping the
+    /// callout restores the marker-only note byte-exact.
+    #[test]
+    fn verify_callout_coexists_with_inline_markers_and_context_block() {
+        let md = "# N\n- Ship PROJ-1 by 2026-07-08\n";
+        let f = finding(Verdict::Conflict, "note says 2026-07-08, PROJ-1 due 2026-07-10", "");
+        let marked = apply_verify_markers(md, std::slice::from_ref(&f));
+        let both = apply_verify_callout(&marked, std::slice::from_ref(&f), "2026-07-10T12:00:00Z");
+        assert!(both.contains("> ⧗ note says"), "inline marker present");
+        assert_eq!(both.matches("[!verify]-").count(), 1, "one callout");
+        // Add the enrich context block on top — three managed regions coexist.
+        let hit = crate::enrich::ContextHit {
+            source: "Jira".into(),
+            detail: "PROJ-1 · In Progress".into(),
+            url: None,
+        };
+        let all = crate::enrich::apply_context_markers(&both, std::slice::from_ref(&hit), "t0");
+        assert_eq!(all.matches("[!verify]-").count(), 1);
+        assert_eq!(all.matches("[!context]-").count(), 1);
+        // Stripping the verify callout leaves the context block + markers untouched.
+        let no_verify = apply_verify_callout(&all, &[], "");
+        assert_eq!(no_verify.matches("[!verify]-").count(), 0);
+        assert_eq!(no_verify.matches("[!context]-").count(), 1);
+        assert!(no_verify.contains("> ⧗ note says"));
+        // And stripping the callout from `both` restores the marker-only note byte-exact.
+        assert_eq!(apply_verify_callout(&both, &[], ""), marked);
     }
 
     #[test]

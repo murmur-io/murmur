@@ -1,0 +1,184 @@
+:host {
+  display: block;
+}
+.br {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Collapsible header — mirrors the memory / Connections sections on the Brain page. */
+.br-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.br-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  border-radius: var(--radius-sm);
+}
+.br-chevron {
+  flex: none;
+  color: var(--text-muted);
+  transition: transform var(--transition);
+}
+.br-chevron.is-open {
+  transform: rotate(90deg);
+}
+.br-title {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.br-count {
+  flex: none;
+}
+.br-sub {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-left: var(--space-2);
+}
+@media (max-width: 560px) {
+  .br-sub {
+    display: none;
+  }
+}
+
+/* Pending proposal card. */
+.br-run {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.br-run-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.br-run-label {
+  font-weight: 600;
+}
+.br-run-date {
+  font-size: 0.85rem;
+}
+.br-run-preview {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-line;
+}
+.br-run-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
+}
+
+/* Schedule rows. */
+.br-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.br-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.br-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.br-item.is-off {
+  opacity: 0.6;
+}
+.br-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.br-item-label {
+  font-size: 0.925rem;
+  font-weight: 600;
+}
+.br-item-when,
+.br-item-hint {
+  font-size: 0.82rem;
+}
+.br-item-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex: none;
+}
+.br-delete {
+  color: var(--text-muted);
+}
+
+/* Create form. */
+.br-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.br-form-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.br-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.br-field-grow {
+  flex: 1 1 auto;
+}
+.br-field-time .br-input {
+  width: 110px;
+}
+.br-field-days .br-input {
+  width: 90px;
+}
+.br-field-label {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.br-input {
+  height: 34px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.9rem;
+}
+.br-input:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.br-add {
+  flex: none;
+}

@@ -246,6 +246,9 @@
   <!-- 4 — MEMORY: "what the brain knows about you" (collapsible) --------- -->
   <app-brain-memory />
 
+  <!-- 5 — SCHEDULED BRIEFS: propose-accept recurring digests (Brain v2 L5) -->
+  <app-briefs />
+
   @if (noteEditorOpen()) {
     <app-brain-note-editor
       [saving]="savingNote()"

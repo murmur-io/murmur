@@ -22,6 +22,7 @@ import { BrainMapComponent } from "../brain-map/brain-map.component";
 import { BrainMemoryComponent } from "../brain-memory/brain-memory.component";
 import { BrainNoteEditorComponent } from "../brain-note-editor/brain-note-editor.component";
 import { BrainSourceCardComponent } from "../brain-source-card/brain-source-card.component";
+import { BriefsComponent } from "../../briefs/briefs/briefs.component";
 
 /** The hard cap the map applies — kept in sync with BrainMapComponent's MAX_NODES. */
 const MAP_NODE_CAP = 60;
@@ -79,6 +80,7 @@ interface FolderOption {
     BrainNoteEditorComponent,
     BrainMapComponent,
     BrainMemoryComponent,
+    BriefsComponent,
   ],
   templateUrl: "./brain.component.html",
   styleUrl: "./brain.component.scss",
