@@ -25,16 +25,35 @@ pub const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
 pub const DIARIZE_SEG_MODEL_FILE: &str = "sherpa-pyannote-segmentation-3.0.onnx";
 pub const DIARIZE_EMB_MODEL_FILE: &str = "wespeaker_en_voxceleb_CAM++.onnx";
 
+/// QUANT-SUFFIXED model sizes accepted by [`model_filename`] (T2 quant plumbing — NO default
+/// flip: `AppConfig::default().model_size` stays `"small"`). Each maps `"<size>-<quant>"` →
+/// `ggml-<size>-<quant>.bin`, verified BY URL SHAPE against the ggerganov/whisper.cpp HF
+/// mirror's file tree (which hosts `ggml-small-q8_0.bin`, `ggml-medium-q8_0.bin`,
+/// `ggml-large-v3-turbo.bin`, `ggml-large-v3-turbo-q8_0.bin`, `ggml-large-v3-q5_0.bin`).
+/// The mirror ALSO hosts `.en` quant builds (`ggml-small.en-q8_0.bin`, …) but we deliberately
+/// resolve quant selections to the MULTILINGUAL build only — the `.en` shortcut applies to the
+/// four plain small sizes exactly as before, never to a quant/large variant (the conservative
+/// URL-shape-only contract; the `.en` quant rows can be added later once someone actually
+/// wants them, with their own tests).
+pub const QUANT_MODEL_SIZES: &[&str] = &[
+    "small-q8_0",
+    "medium-q8_0",
+    "large-v3-turbo-q8_0",
+    "large-v3-q5_0",
+];
+
 /// Map a chosen size + language to a whisper.cpp GGML model filename.
 ///
 /// Supported sizes (all served by the ggerganov/whisper.cpp HF mirror):
-/// `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3`.
+/// `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `large-v3`, plus the quant-suffixed
+/// variants in [`QUANT_MODEL_SIZES`] (`small-q8_0`, `medium-q8_0`, `large-v3-turbo-q8_0`,
+/// `large-v3-q5_0`) — `"<size>-<quant>"` maps to `ggml-<size>-<quant>.bin`.
 ///
-/// English-only (`.en`) builds exist for tiny/base/small/medium — smaller + faster — and
+/// English-only (`.en`) builds exist for PLAIN tiny/base/small/medium — smaller + faster — and
 /// are used ONLY when the user explicitly selects English. Any other language (incl.
-/// Polish) or auto-detect needs the multilingual build. `large-v3` and `large-v3-turbo`
-/// are multilingual-only (no `.en` variant), so Polish always resolves the full
-/// multilingual `ggml-large-v3.bin`.
+/// Polish) or auto-detect needs the multilingual build. `large-v3` / `large-v3-turbo` and
+/// EVERY quant-suffixed size resolve multilingual-only (no `.en` is ever appended to a
+/// quant/large variant — see [`QUANT_MODEL_SIZES`]).
 ///
 /// An empty size falls back to the app default (`small`), matching
 /// `AppConfig::default().model_size` — a RAM-safe default so a config that bypasses onboarding
@@ -44,12 +63,67 @@ pub fn model_filename(size: &str, language: &str) -> String {
         "" => "small",
         s => s,
     };
+    // The `.en` shortcut applies ONLY to the four plain small sizes (exact match — a
+    // quant-suffixed size like `small-q8_0` deliberately does NOT match, so quants always
+    // resolve the multilingual `ggml-<size>-<quant>.bin`).
     let en_only = language == "en" && matches!(size, "tiny" | "base" | "small" | "medium");
     if en_only {
         format!("ggml-{size}.en.bin")
     } else {
         format!("ggml-{size}.bin")
     }
+}
+
+/// T1.3 — the LIVE-tick model-pin decision (pure; the file-presence resolution stays with the
+/// caller). Returns the SIZE the live loop should pin to, or `None` = use the configured model:
+///
+/// 1. A non-empty `live_model_pin` (config; serde-default `"small"`) pins UNCONDITIONALLY —
+///    live captions are throwaway (the authoritative transcript is the post-Stop Accurate
+///    pass) and a `large-v3` live tick alone can saturate the shared Metal GPU for the whole
+///    meeting (the heat complaint).
+/// 2. An EMPTY pin disables it → today's pre-pin behavior, which still includes the legacy
+///    `brain_live` pin-to-small (D1, spec §4.3: the live tick must not starve the light
+///    reasoner) — so turning the new pin off never regresses the Brain-Live guarantee.
+pub fn live_pin_size(live_model_pin: &str, brain_live: bool) -> Option<String> {
+    let pin = live_model_pin.trim();
+    if !pin.is_empty() {
+        return Some(pin.to_string());
+    }
+    if brain_live {
+        return Some("small".to_string());
+    }
+    None
+}
+
+/// T1.3 — resolve the SMALLEST downloaded whisper model for the WAKE listener
+/// (`audio/listener.rs`): tiny → base → small, first present in [`models_dir`], respecting the
+/// language-appropriate build ([`model_filename`]). NEVER medium/large — wake-phrase matching
+/// needs rough text only, and a large standby decode every ~2.2 s is a heat/RAM source.
+/// `None` = no suitable model downloaded (the caller does not start the listener).
+pub fn smallest_wake_model(language: &str) -> Option<PathBuf> {
+    let dir = models_dir().ok()?;
+    smallest_wake_model_in(&dir, language)
+}
+
+/// File-presence core of [`smallest_wake_model`], factored over an explicit `dir` so the
+/// tiny→base→small preference order is testable headless with a temp dir.
+pub fn smallest_wake_model_in(dir: &Path, language: &str) -> Option<PathBuf> {
+    for size in ["tiny", "base", "small"] {
+        let preferred = dir.join(model_filename(size, language));
+        if preferred.is_file() {
+            return Some(preferred);
+        }
+        // An English selection can also ride a downloaded MULTILINGUAL build of the same size
+        // (multilingual handles English fine; the reverse is not true, so a non-English
+        // language never falls back onto an `.en` build).
+        if language == "en" {
+            let multilingual = dir.join(model_filename(size, ""));
+            if multilingual.is_file() {
+                return Some(multilingual);
+            }
+        }
+    }
+    None
 }
 
 /// Hugging Face mirror of the official whisper.cpp GGML models (ggerganov/whisper.cpp).
@@ -294,6 +368,104 @@ mod tests {
         assert_eq!(model_filename("   ", "pl"), "ggml-small.bin");
         // large-v3 stays selectable when explicitly chosen.
         assert_eq!(model_filename("large-v3", ""), "ggml-large-v3.bin");
+    }
+
+    /// T2 — every supported quant-suffixed size maps `"<size>-<quant>"` →
+    /// `ggml-<size>-<quant>.bin`, for EVERY language (`.en` never applies to a quant/large
+    /// variant — URL-shape contract against the HF mirror).
+    #[test]
+    fn quant_sizes_map_to_quant_filenames_never_en() {
+        for size in QUANT_MODEL_SIZES {
+            let expected = format!("ggml-{size}.bin");
+            for lang in ["", "en", "pl"] {
+                assert_eq!(model_filename(size, lang), expected, "size={size} lang={lang}");
+            }
+        }
+        // The concrete rows, spelled out (the mirror's actual file names):
+        assert_eq!(model_filename("small-q8_0", "pl"), "ggml-small-q8_0.bin");
+        assert_eq!(model_filename("medium-q8_0", "en"), "ggml-medium-q8_0.bin");
+        assert_eq!(
+            model_filename("large-v3-turbo-q8_0", ""),
+            "ggml-large-v3-turbo-q8_0.bin"
+        );
+        assert_eq!(model_filename("large-v3-q5_0", "en"), "ggml-large-v3-q5_0.bin");
+    }
+
+    /// T2 — quant filenames ride the same HF mirror URL as the plain sizes.
+    #[test]
+    fn quant_url_points_at_whispercpp_hf_mirror() {
+        assert_eq!(
+            model_url(&model_filename("large-v3-turbo-q8_0", "pl")),
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin"
+        );
+    }
+
+    /// T1.3 — the live pin decision: a non-empty pin wins unconditionally; an empty pin falls
+    /// back to the legacy `brain_live` pin-to-small; neither ⇒ the configured model.
+    #[test]
+    fn live_pin_size_resolution() {
+        // Default config pin ("small") pins regardless of brain_live.
+        assert_eq!(live_pin_size("small", false).as_deref(), Some("small"));
+        assert_eq!(live_pin_size("small", true).as_deref(), Some("small"));
+        // Any explicit size (incl. a quant) pins.
+        assert_eq!(live_pin_size("base", false).as_deref(), Some("base"));
+        assert_eq!(
+            live_pin_size("small-q8_0", false).as_deref(),
+            Some("small-q8_0")
+        );
+        // Whitespace counts as empty.
+        assert_eq!(live_pin_size("  ", false), None);
+        // Empty pin = today's behavior: configured model, EXCEPT the legacy brain_live pin.
+        assert_eq!(live_pin_size("", false), None);
+        assert_eq!(live_pin_size("", true).as_deref(), Some("small"));
+    }
+
+    /// T1.3 — the wake listener resolves the SMALLEST downloaded model (tiny → base → small),
+    /// never medium/large, and honors the `.en` build for English.
+    #[test]
+    fn smallest_wake_model_prefers_tiny_and_never_medium_or_large() {
+        let dir = std::env::temp_dir().join(format!("murmur-wake-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing downloaded → None (the listener does not start).
+        assert_eq!(smallest_wake_model_in(&dir, ""), None);
+
+        // Only medium/large present → STILL None (never a big standby model).
+        std::fs::write(dir.join("ggml-medium.bin"), b"x").unwrap();
+        std::fs::write(dir.join("ggml-large-v3.bin"), b"x").unwrap();
+        assert_eq!(smallest_wake_model_in(&dir, ""), None);
+
+        // small appears → picked; base appears → preferred; tiny appears → wins.
+        std::fs::write(dir.join("ggml-small.bin"), b"x").unwrap();
+        assert_eq!(
+            smallest_wake_model_in(&dir, "pl"),
+            Some(dir.join("ggml-small.bin"))
+        );
+        std::fs::write(dir.join("ggml-base.bin"), b"x").unwrap();
+        assert_eq!(
+            smallest_wake_model_in(&dir, ""),
+            Some(dir.join("ggml-base.bin"))
+        );
+        std::fs::write(dir.join("ggml-tiny.bin"), b"x").unwrap();
+        assert_eq!(
+            smallest_wake_model_in(&dir, ""),
+            Some(dir.join("ggml-tiny.bin"))
+        );
+
+        // English PREFERS the `.en` build of a size but falls back to the multilingual build
+        // of the SAME size (multilingual handles English; smallest-size still wins overall).
+        assert_eq!(
+            smallest_wake_model_in(&dir, "en"),
+            Some(dir.join("ggml-tiny.bin")),
+            "en falls back to the multilingual tiny when no .en build exists"
+        );
+        std::fs::write(dir.join("ggml-tiny.en.bin"), b"x").unwrap();
+        assert_eq!(
+            smallest_wake_model_in(&dir, "en"),
+            Some(dir.join("ggml-tiny.en.bin"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
