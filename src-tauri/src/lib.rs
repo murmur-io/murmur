@@ -216,6 +216,8 @@ pub fn run() {
             commands::list_org_shares,
             commands::revoke_org_share,
             commands::org_sweep_pending,
+            commands::org_sync_now,
+            commands::org_get_item,
             commands::set_anthropic_key,
             commands::has_anthropic_key,
             commands::set_gateway_key,
