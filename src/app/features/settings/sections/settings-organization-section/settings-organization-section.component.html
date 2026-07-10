@@ -1,0 +1,226 @@
+<div class="section-stack">
+  <div class="card account-card">
+    <div class="account-head">
+      <span class="account-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" role="img" aria-label="Organization">
+          <circle cx="12" cy="8" r="3.2" fill="var(--accent-soft)" stroke="var(--accent-hover)" stroke-width="1.3" />
+          <path d="M5.5 20a6.5 6.5 0 0 1 13 0" fill="none" stroke="var(--accent-hover)" stroke-width="1.3" stroke-linecap="round" />
+          <circle cx="4.5" cy="10.5" r="1.8" fill="none" stroke="var(--accent-hover)" stroke-width="1.2" />
+          <circle cx="19.5" cy="10.5" r="1.8" fill="none" stroke="var(--accent-hover)" stroke-width="1.2" />
+        </svg>
+      </span>
+      <div class="account-copy">
+        <h3>Organization</h3>
+        <p class="text-secondary account-sub">
+          Share notes into your org's <strong>shared brain</strong> — a
+          searchable knowledge base every member syncs on-device. It's
+          end-to-end encrypted; the server can't read it.
+        </p>
+      </div>
+    </div>
+
+    @if (!loaded()) {
+      <p class="text-muted account-note">Loading organization…</p>
+    } @else if (status(); as st) {
+      <!-- ── In an org: manage ── -->
+      <div class="account-section">
+        <span class="account-section-label text-muted">Your organization</span>
+        <div class="signed-in-row">
+          <span class="pill is-success signed-pill">
+            <span class="pill-dot"></span>
+            {{ st.name }}
+          </span>
+          <span class="org-role-chip">{{ st.role === "owner" ? "Owner" : "Member" }}</span>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="leave()"
+            [disabled]="busy()"
+          >
+            Leave organization
+          </button>
+        </div>
+        <p class="text-secondary account-note">
+          {{ st.memberCount }}
+          {{ st.memberCount === 1 ? "member" : "members" }} ·
+          {{ st.itemCount }} shared
+          {{ st.itemCount === 1 ? "item" : "items" }} synced
+        </p>
+      </div>
+
+      <!-- Org-egress consent — a dedicated command (preserve-only config). -->
+      <div class="account-section">
+        <span class="account-section-label text-muted">Sharing to the org brain</span>
+        <div class="consent-row">
+          @if (consented()) {
+            <span class="pill is-success signed-pill">
+              <span class="pill-dot"></span>
+              Org sharing allowed
+            </span>
+            <button
+              type="button"
+              class="btn btn-ghost"
+              (click)="toggleConsent()"
+              [disabled]="consentBusy()"
+            >
+              {{ consentBusy() ? "…" : "Turn off" }}
+            </button>
+          } @else {
+            <p class="text-secondary account-note">
+              You haven't allowed org sharing yet. When you add an item, its
+              encrypted copy is uploaded to your org's feed.
+            </p>
+            <button
+              type="button"
+              class="btn btn-primary"
+              (click)="toggleConsent()"
+              [disabled]="consentBusy()"
+            >
+              {{ consentBusy() ? "…" : "Allow org sharing" }}
+            </button>
+          }
+        </div>
+      </div>
+
+      <!-- Sync status + Sync now. -->
+      <div class="account-section">
+        <span class="account-section-label text-muted">Sync</span>
+        <div class="signed-in-row">
+          <span class="text-secondary account-note">
+            Last synced sequence <strong>{{ st.lastSeq }}</strong> ·
+            {{ st.itemCount }} {{ st.itemCount === 1 ? "item" : "items" }} in your
+            local brain
+          </span>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="syncNow()"
+            [disabled]="syncing()"
+          >
+            {{ syncing() ? "Syncing…" : "Sync now" }}
+          </button>
+        </div>
+        @if (st.pendingShares > 0) {
+          <p class="text-secondary account-note">
+            {{ st.pendingShares }}
+            {{ st.pendingShares === 1 ? "share" : "shares" }} still queued to
+            upload — they'll sync on the next launch.
+          </p>
+        }
+        @if (lastSync(); as report) {
+          <p class="text-secondary account-note" role="status">
+            Pulled {{ report.pulled }}, ingested {{ report.ingested }},
+            removed {{ report.tombstoned }}.
+            @if (report.ftsOnly) {
+              <span class="text-muted">
+                (Text-only search — download an embedding model in AI &amp;
+                Models for semantic search.)
+              </span>
+            }
+          </p>
+          @for (err of report.errors; track err) {
+            <p class="text-danger account-note">{{ err }}</p>
+          }
+        }
+      </div>
+
+      <!-- Members (owner only). -->
+      @if (isOwner()) {
+        <div class="account-section">
+          <span class="account-section-label text-muted">Members</span>
+          <div class="invite-row">
+            <input
+              type="email"
+              class="text-input invite-input"
+              [value]="inviteEmail()"
+              (input)="onInviteEmailInput($event)"
+              (keydown.enter)="invite()"
+              placeholder="colleague@example.com"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Invite a member by email"
+              [disabled]="inviting()"
+            />
+            <button
+              type="button"
+              class="btn btn-primary"
+              (click)="invite()"
+              [disabled]="inviting() || !inviteEmail().trim()"
+            >
+              {{ inviting() ? "Inviting…" : "Invite" }}
+            </button>
+          </div>
+          @if (membersError(); as merr) {
+            <p class="text-danger account-note" role="alert">{{ merr }}</p>
+          }
+          <ul class="member-list">
+            @for (m of sortedMembers(); track m.userId) {
+              <li class="member-row" [class.is-removed]="m.removed">
+                <div class="member-meta">
+                  <span class="member-email">{{ m.email }}</span>
+                  <span class="member-sub text-muted">
+                    {{ m.role === "owner" ? "Owner" : "Member" }} ·
+                    joined {{ formatDate(m.addedAt) }}
+                    @if (m.removed) {
+                      · removed
+                    }
+                  </span>
+                </div>
+                @if (!m.removed && m.role !== "owner") {
+                  <button
+                    type="button"
+                    class="btn btn-ghost mini-btn"
+                    (click)="removeMember(m)"
+                    [disabled]="removingId() !== null"
+                  >
+                    {{ removingId() === m.userId ? "Removing…" : "Remove" }}
+                  </button>
+                }
+              </li>
+            } @empty {
+              <li class="member-empty text-muted">No other members yet — invite a colleague.</li>
+            }
+          </ul>
+          <p class="text-muted account-note">
+            Removing a member rotates the org's encryption key so they can no
+            longer read new items.
+          </p>
+        </div>
+      }
+    } @else {
+      <!-- ── No org: create ── -->
+      <div class="account-section">
+        <span class="account-section-label text-muted">Create an organization</span>
+        <p class="text-secondary account-note">
+          Start a shared brain for your team. You'll be its owner and can invite
+          colleagues by email.
+        </p>
+        <div class="invite-row">
+          <input
+            type="text"
+            class="text-input invite-input"
+            [value]="createName()"
+            (input)="onCreateNameInput($event)"
+            (keydown.enter)="createOrg()"
+            placeholder="Acme Inc."
+            autocomplete="off"
+            aria-label="Organization name"
+            [disabled]="creating()"
+          />
+          <button
+            type="button"
+            class="btn btn-primary"
+            (click)="createOrg()"
+            [disabled]="creating() || !createName().trim()"
+          >
+            {{ creating() ? "Creating…" : "Create organization" }}
+          </button>
+        </div>
+      </div>
+    }
+
+    @if (error(); as err) {
+      <p class="text-danger account-note" role="alert">{{ err }}</p>
+    }
+  </div>
+</div>

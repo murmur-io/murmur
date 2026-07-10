@@ -10,7 +10,15 @@ import {
   signal,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { AccountStatus, MyShareEntry } from "../../../core/models";
+import type {
+  AccountStatus,
+  MyShareEntry,
+  OrgStatus,
+} from "../../../core/models";
+import {
+  OrgShareSheetComponent,
+  type OrgShareTarget,
+} from "../../detail/org-share-sheet/org-share-sheet.component";
 
 /** The link-share flow step (Manage always coexists as the list below). */
 type ShareStep = "configure" | "created";
@@ -57,6 +65,7 @@ interface LinkShareRow {
 @Component({
   selector: "app-note-share-panel",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [OrgShareSheetComponent],
   templateUrl: "./note-share-panel.component.html",
   styleUrl: "./note-share-panel.component.scss",
 })
@@ -187,6 +196,19 @@ export class NoteSharePanelComponent {
   readonly revokingId = signal<string | null>(null);
   readonly copiedRowId = signal<string | null>(null);
 
+  // --- Org Brain (Shared Brain v1) ------------------------------------------
+  /** The user's org membership; `null` when in no org (hides the section). */
+  private readonly orgStatus = signal<OrgStatus | null>(null);
+  readonly org = this.orgStatus.asReadonly();
+  /** True while the org-share preview sheet is open. */
+  readonly orgSheetOpen = signal(false);
+
+  /** The org-share sheet target (THIS note), passed into the preview sheet. */
+  readonly orgTarget = computed<OrgShareTarget>(() => ({
+    kind: "note",
+    id: this.noteId(),
+  }));
+
   /** Active-links view-model: `listMyShares()` filtered to THIS note + mode 'link'. */
   readonly linkRows = computed<LinkShareRow[]>(() => {
     const id = this.noteId();
@@ -269,12 +291,46 @@ export class NoteSharePanelComponent {
       } else {
         this.myShares.set([]);
       }
+      // Org Brain state (best-effort): the section only appears when in an org.
+      void this.refreshOrg(id);
     } catch (e) {
       this.listError.set(String(e));
       this.gateError.set(String(e));
     } finally {
       this.loading.set(false);
     }
+  }
+
+  /** Load the org status (stale-guarded on the note id). A failure hides the section. */
+  private async refreshOrg(id: string): Promise<void> {
+    try {
+      const status = await this.ipc.orgStatus();
+      if (this.noteId() !== id) {
+        return;
+      }
+      this.orgStatus.set(status);
+    } catch {
+      this.orgStatus.set(null);
+    }
+  }
+
+  // --- Org Brain handlers ---------------------------------------------------
+
+  /** Open the "Add to Org Brain" preview sheet. */
+  openOrgSheet(): void {
+    this.orgSheetOpen.set(true);
+  }
+
+  /** Close the org-share sheet (cancel / backdrop / Escape). */
+  closeOrgSheet(): void {
+    this.orgSheetOpen.set(false);
+  }
+
+  /** The sheet published → close it, refresh org state, ping the editor. */
+  async onOrgShared(): Promise<void> {
+    this.orgSheetOpen.set(false);
+    await this.refreshOrg(this.noteId());
+    this.changed.emit();
   }
 
   /** One-tap Touch ID unlock from the gate → re-read status + load this note's shares. */

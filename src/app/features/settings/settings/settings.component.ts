@@ -21,6 +21,7 @@ import { SettingsNotesSectionComponent } from "../sections/settings-notes-sectio
 import { SettingsAiSectionComponent } from "../sections/settings-ai-section/settings-ai-section.component";
 import { SettingsConnectorsSectionComponent } from "../sections/settings-connectors-section/settings-connectors-section.component";
 import { SettingsAccountSectionComponent } from "../sections/settings-account-section/settings-account-section.component";
+import { SettingsOrganizationSectionComponent } from "../sections/settings-organization-section/settings-organization-section.component";
 import { SettingsPrivacySectionComponent } from "../sections/settings-privacy-section/settings-privacy-section.component";
 import { SettingsObsidianSectionComponent } from "../sections/settings-obsidian-section/settings-obsidian-section.component";
 import { SettingsAboutSectionComponent } from "../sections/settings-about-section/settings-about-section.component";
@@ -47,6 +48,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "ai", label: "AI & Models", keywords: "provider assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake anthropic ollama claude code gateway openai api key availability binary default consent revoke privacy egress" },
   { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet" },
   { id: "account", label: "Account", keywords: "sign in login sign up account sharing share link server e2ee zero knowledge recovery" },
+  { id: "organization", label: "Organization", keywords: "org team shared brain company workspace members invite colleague owner consent sync org brain shared knowledge base leave" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
@@ -80,6 +82,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     SettingsAiSectionComponent,
     SettingsConnectorsSectionComponent,
     SettingsAccountSectionComponent,
+    SettingsOrganizationSectionComponent,
     SettingsPrivacySectionComponent,
     SettingsObsidianSectionComponent,
     SettingsAboutSectionComponent,
