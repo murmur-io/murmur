@@ -122,6 +122,7 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             commands::recording_level,
+            commands::recording_status,
             commands::set_mic_muted,
             commands::is_mic_muted,
             commands::begin_voice_command,

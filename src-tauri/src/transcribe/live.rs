@@ -1427,6 +1427,13 @@ fn run_cascade(
             // Phase 5: the STRUCTURAL escalation boundary — this tier's executor advertises only its
             // tools; `run()` refuses any other. A weak model CANNOT reach a higher tier's tools.
             scope,
+            // Seal-on-write handles (residual W1): this surface is read-only (`allow_writes:
+            // false`), but the executor carries the live seam so a future write-enabled turn can
+            // never silently skip the manual-notes seal.
+            seal: Some(crate::tools::SealAccess {
+                master_kek: &state.master_kek,
+                lifecycle: &state.lifecycle,
+            }),
             proposed_note: std::sync::Mutex::new(None),
         };
         let sink = ToolEventSink {
