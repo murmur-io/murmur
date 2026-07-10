@@ -1206,6 +1206,20 @@ export class IpcService {
     return invoke<string>("download_model");
   }
 
+  /** Whether the OPTIONAL parakeet live-ASR engine's models are all present on disk. */
+  parakeetModelsPresent(): Promise<boolean> {
+    return invoke<boolean>("parakeet_models_present");
+  }
+
+  /**
+   * Download the parakeet live-ASR engine's int8 models (~600 MB) if missing. Progress streams
+   * over {@link onModelDownload} (EVENT_MODEL_DOWNLOAD, shared with the whisper download); the
+   * promise resolves when the download finishes (or rejects on failure).
+   */
+  downloadParakeetModels(): Promise<void> {
+    return invoke<void>("download_parakeet_models");
+  }
+
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
 
   /**

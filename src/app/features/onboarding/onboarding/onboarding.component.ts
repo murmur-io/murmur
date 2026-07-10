@@ -516,6 +516,9 @@ export class OnboardingComponent implements OnInit {
       audioStorageLimitGb: base?.audioStorageLimitGb ?? null,
       audioAutoPrune: base?.audioAutoPrune ?? false,
       modelSize: this.modelSize(),
+      // Live-caption engine — preserve-only here (the Settings Transcription section owns the
+      // toggle + the parakeet download); round-trip the snapshot, default "whisper".
+      liveAsrEngine: base?.liveAsrEngine ?? "whisper",
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
       // First-run sharing latch — preserve-only here (the /welcome gateway owns
