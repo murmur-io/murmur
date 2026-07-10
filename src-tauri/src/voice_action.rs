@@ -196,28 +196,14 @@ impl VoiceActionResult {
 const NO_MODEL_ANSWER_NOTICE: &str = "No AI model is available to answer — showing matching notes \
     instead. Pick a provider or download an on-device model in Settings.";
 
-/// RECORDING-AWARENESS phrases — the THREE load-bearing substrings the CLOUD cascade prompt
-/// ([`crate::transcribe::live::assistant_system_prompt`]) already asserts (test
-/// `assistant_system_prompt_scopes_empty_buffer_to_the_live_recording`), lifted into ONE place so the
-/// deterministic FLOOR (`rag_answer`, reasoner-only backend that skips the cascade) frames a live
-/// recording IDENTICALLY and the two prompts cannot drift. These are BARE substrings composed into the
-/// prose below — NOT the whole clause — so both prompts read naturally while sharing the exact wording
-/// the cascade test pins.
-///
-/// - [`RECORDING_NOW_PHRASE`]: a meeting is being **recorded RIGHT NOW** (both the empty-buffer and
-///   has-content recording cases open with it).
-/// - [`MEETING_JUST_STARTED_PHRASE`]: the honest empty-buffer answer — the **meeting just started** and
-///   little has been captured.
-/// - [`NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE`]: the substitution BAN — **do NOT search the vault for
-///   other saved meetings** and describe them as if they were this one.
-///
-/// The cascade `assistant_system_prompt` duplicates this wording verbatim (its own tests pin the exact
-/// substrings); wiring these consts INTO it would risk those verified tests, so it keeps its literal
-/// prose with a cross-reference comment. The shared consts are the single source the FLOOR uses.
-pub(crate) const RECORDING_NOW_PHRASE: &str = "recorded RIGHT NOW";
-pub(crate) const MEETING_JUST_STARTED_PHRASE: &str = "meeting just started";
-pub(crate) const NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE: &str =
-    "do NOT search the vault for other saved meetings";
+// RECORDING-AWARENESS phrases — SINGLE-SOURCED in `crate::prompts` (Brain v2 L3): the THREE
+// load-bearing substrings BOTH the CLOUD cascade prompt
+// (`crate::transcribe::live::assistant_system_prompt`, which now interpolates them) AND the
+// deterministic FLOOR's prose below (`rag_answer`) compose in, so the two prompts cannot drift.
+// Re-exported here so every historical `voice_action::*_PHRASE` path keeps working.
+pub(crate) use crate::prompts::{
+    MEETING_JUST_STARTED_PHRASE, NO_SUBSTITUTE_OTHER_MEETINGS_PHRASE, RECORDING_NOW_PHRASE,
+};
 
 /// Dispatch one parsed [`VoiceIntent`] over the GATED vault + consent-gated brain. Synchronous (the
 /// live loop spawns it off-thread) and PANIC-FREE: every fallible step degrades to a graceful

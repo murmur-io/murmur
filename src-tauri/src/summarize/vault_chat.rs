@@ -95,6 +95,29 @@ pub fn agentic_system(memory_brief: &str) -> String {
     )
 }
 
+/// Brain v2 L3 — the agentic persona WITH just-in-time retrieval seeding (behind the
+/// `ask_jit_retrieval` flag). `listing` is the compact, GATED meeting listing
+/// ([`crate::summarize::vault_context::build_meeting_listing_visible`]: `- id | title | date`
+/// lines, ids/titles/dates ONLY — never content). Non-empty ⇒ the base persona plus a
+/// search-then-`get_meeting` instruction block and the listing, so the model reads only the
+/// meetings it needs instead of a pre-stuffed corpus. EMPTY (the flag-off path and the
+/// nothing-visible vault) ⇒ BYTE-IDENTICAL to [`agentic_system`] — the flag-off legacy-prompt
+/// contract, pinned by `agentic_system_jit_empty_listing_is_byte_identical`.
+pub fn agentic_system_jit(memory_brief: &str, listing: &str) -> String {
+    let base = agentic_system(memory_brief);
+    let listing = listing.trim();
+    if listing.is_empty() {
+        return base;
+    }
+    format!(
+        "{base}\n\nRETRIEVAL (just-in-time): you start with NO meeting content — only the \
+         candidate MEETING LISTING below (`id | title | date`). Use search_meetings / \
+         search_semantic to find candidates and call get_meeting with a listed (or found) id to \
+         READ a meeting's note + transcript before answering. Read only the few meetings you \
+         actually need.\n\nMEETING LISTING (top candidates for this question):\n{listing}"
+    )
+}
+
 /// The agentic persona's optional USER MEMORY suffix. EMPTY brief ⇒ EMPTY string (byte-identical to
 /// the pre-memory persona); a present brief ⇒ a leading-newline-separated labelled block.
 fn agentic_memory_suffix(memory_brief: &str) -> String {
@@ -148,6 +171,22 @@ mod tests {
         let mem_at = s.find("Polish replies").unwrap();
         let corpus_at = s.find("corpus text").unwrap();
         assert!(mem_at < corpus_at, "memory must precede the corpus");
+    }
+
+    /// Brain v2 L3 (flag-off contract): an EMPTY/blank JIT listing yields the BYTE-IDENTICAL
+    /// legacy agentic persona — `ask_jit_retrieval = false` (which passes "") can never change the
+    /// prompt. A present listing appends the search-then-get instructions + the listing block.
+    #[test]
+    fn agentic_system_jit_empty_listing_is_byte_identical() {
+        for brief in ["", "- You prefer: Polish replies"] {
+            assert_eq!(agentic_system_jit(brief, ""), agentic_system(brief));
+            assert_eq!(agentic_system_jit(brief, "   "), agentic_system(brief));
+        }
+        let with = agentic_system_jit("", "- m1 | Standup | 2026-07-01");
+        assert!(with.starts_with(&agentic_system("")), "the base persona prefix is unchanged");
+        assert!(with.contains("MEETING LISTING"));
+        assert!(with.contains("get_meeting"));
+        assert!(with.contains("- m1 | Standup | 2026-07-01"));
     }
 
     /// The agentic persona injects the SAME brief the same way: empty ⇒ byte-identical, present ⇒
