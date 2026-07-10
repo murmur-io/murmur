@@ -2376,8 +2376,11 @@ export class SettingsStore {
       tiny: "~75 MB",
       base: "~150 MB",
       small: "~470 MB",
+      "small-q8_0": "~270 MB",
       medium: "~1.5 GB",
+      "medium-q8_0": "~850 MB",
       "large-v3-turbo": "~1.6 GB",
+      "large-v3-turbo-q8_0": "~875 MB",
       "large-v3": "~3 GB",
     };
     this._downloadHint.set(hints[this.form.getRawValue().modelSize] ?? "");

@@ -161,6 +161,26 @@ pub struct AppConfig {
     /// on 8 GB Macs, and onboarding already preselects `small`. All sizes (incl. `large-v3`, best
     /// for Polish) stay selectable; the chosen model is downloaded on demand via `download_model`.
     pub model_size: String,
+    /// T1.3 (transcription heat) — the LIVE caption tick's model PIN. Non-empty (default
+    /// `"small"`) ⇒ while recording, the live loop decodes with THIS size whenever its file is
+    /// downloaded, regardless of `model_size` and `brain_live` — live captions are throwaway
+    /// (the authoritative transcript is the post-Stop Accurate pass on the CONFIGURED model),
+    /// and a `large-v3` live tick saturates the shared Metal GPU for the whole meeting (the
+    /// heat complaint). `""` disables the pin → the configured model (today's pre-pin
+    /// behavior, incl. the legacy `brain_live` pin-to-small). If the pinned model file is
+    /// absent the loop falls back to the configured model (never a dead live loop).
+    /// `#[serde(default = "default_live_model_pin")]` ⇒ a config persisted before this field
+    /// existed loads as `"small"` (the fix applies to existing installs).
+    #[serde(default = "default_live_model_pin")]
+    pub live_model_pin: String,
+    /// T1.4 (transcription heat) — the Silero VAD TICK GATE for the live caption loop: run the
+    /// CPU-only Silero VAD on the newest ~3 s of each tick's window and SKIP the whisper decode
+    /// on silent ticks (with a 2-tick hangover). Default ON. Bypassed (always decode) while a
+    /// manual voice-capture is armed or a wake-suppression window is active, and disabled
+    /// automatically when the VAD model file is absent — so it can never eat a caption the
+    /// user's flows need. `#[serde(default = "default_true")]` ⇒ pre-existing configs load ON.
+    #[serde(default = "default_true")]
+    pub live_vad_gate: bool,
     /// Voice trigger: start recording when a wake phrase is heard. Default off.
     pub voice_trigger: bool,
     /// Whether the first-run onboarding has been completed.
@@ -510,6 +530,11 @@ fn default_true() -> bool {
     true
 }
 
+/// serde default for [`AppConfig::live_model_pin`] — pin the live tick to `small` (T1.3).
+fn default_live_model_pin() -> String {
+    "small".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -535,6 +560,8 @@ impl Default for AppConfig {
             audio_storage_limit_gb: None,
             audio_auto_prune: false,
             model_size: "small".to_string(),
+            live_model_pin: default_live_model_pin(),
+            live_vad_gate: true,
             voice_trigger: false,
             onboarded: false,
             note_style: "standard".to_string(),
@@ -619,6 +646,8 @@ const K_POST_AEC_ENABLED: &str = "post_aec_enabled";
 const K_AUDIO_STORAGE_LIMIT_GB: &str = "audio_storage_limit_gb";
 const K_AUDIO_AUTO_PRUNE: &str = "audio_auto_prune";
 const K_MODEL_SIZE: &str = "model_size";
+const K_LIVE_MODEL_PIN: &str = "live_model_pin";
+const K_LIVE_VAD_GATE: &str = "live_vad_gate";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
 const K_ONBOARDED: &str = "onboarded";
 const K_NOTE_STYLE: &str = "note_style";
@@ -744,6 +773,14 @@ impl AppConfig {
             if !v.is_empty() {
                 cfg.model_size = v;
             }
+        }
+        // `""` is a VALID stored value (= pin disabled), so it is taken verbatim — only an
+        // ABSENT key keeps the `"small"` default (mirrors `provider_model`, not `anthropic_model`).
+        if let Some(v) = db.get_setting(K_LIVE_MODEL_PIN)? {
+            cfg.live_model_pin = v;
+        }
+        if let Some(v) = db.get_setting(K_LIVE_VAD_GATE)? {
+            cfg.live_vad_gate = v == "true";
         }
         if let Some(v) = db.get_setting(K_VOICE_TRIGGER)? {
             cfg.voice_trigger = v == "true";
@@ -999,6 +1036,11 @@ impl AppConfig {
             },
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
+        db.set_setting(K_LIVE_MODEL_PIN, &self.live_model_pin)?;
+        db.set_setting(
+            K_LIVE_VAD_GATE,
+            if self.live_vad_gate { "true" } else { "false" },
+        )?;
         db.set_setting(
             K_VOICE_TRIGGER,
             if self.voice_trigger { "true" } else { "false" },
@@ -1435,6 +1477,39 @@ mod tests {
         // Empty settings table loads the same default.
         let db = temp_db();
         assert_eq!(AppConfig::load(&db).unwrap().model_size, "small");
+    }
+
+    /// T1.3/T1.4 — the live-tick pin defaults to `small` and the VAD tick gate defaults ON
+    /// (both on a fresh config AND an empty settings table, so existing installs get the heat
+    /// fix), while the explicit opt-outs (`""` pin / gate OFF) persist + reload verbatim.
+    #[test]
+    fn live_pin_defaults_small_and_vad_gate_on_and_opt_outs_round_trip() {
+        assert_eq!(AppConfig::default().live_model_pin, "small");
+        assert!(AppConfig::default().live_vad_gate);
+        let db = temp_db();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.live_model_pin, "small");
+        assert!(loaded.live_vad_gate);
+
+        // The opt-outs are VALID stored values and must survive a save/load round-trip:
+        // `""` = pin disabled (NOT re-defaulted to "small"), `false` = gate off.
+        let cfg = AppConfig {
+            live_model_pin: String::new(),
+            live_vad_gate: false,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let reloaded = AppConfig::load(&db).unwrap();
+        assert_eq!(reloaded.live_model_pin, "");
+        assert!(!reloaded.live_vad_gate);
+
+        // And a quant pin round-trips verbatim too.
+        let cfg = AppConfig {
+            live_model_pin: "small-q8_0".to_string(),
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        assert_eq!(AppConfig::load(&db).unwrap().live_model_pin, "small-q8_0");
     }
 
     #[test]

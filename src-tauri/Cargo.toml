@@ -156,7 +156,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+# `NSProcessInfo` feature: the typed `thermalState` binding for the live-loop thermal governor
+# (`src/thermal.rs`) — a feature flip on an existing dep, no new crate.
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSProcessInfo"] }
 objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString"] }
