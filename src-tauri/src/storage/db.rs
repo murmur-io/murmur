@@ -29,6 +29,11 @@ pub struct LockedMeetingAudio {
     pub sys_master_path: Option<String>,
 }
 
+/// Return shape of [`Db::reblank_locked_folders_at_rest`]: the locked meetings' audio to
+/// re-seal, the rollup vault exports to delete, and `(note_id, exported_path)` of every
+/// authored note whose session-re-exported `.md` must be reconciled (audit F2, W5 semantics).
+pub type LockedAtRestCleanup = (Vec<LockedMeetingAudio>, Vec<String>, Vec<(String, String)>);
+
 /// One meeting eligible for storage prune: NOT in a locked folder, with its three audio paths.
 /// Ordered oldest-first by [`Db::prunable_audio_candidates`]. Any column may be `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4141,6 +4146,34 @@ impl Db {
         Ok(())
     }
 
+    /// BIRTH-SEAL twin of [`Db::insert_note`] for a session-unlocked LOCKED folder (2026-07-10
+    /// residual W3): insert the row WITH its freshly-encrypted `text_blob` in ONE atomic INSERT, so
+    /// there is never a blob-less plaintext row in a locked folder — not even transiently between an
+    /// insert and a follow-up seal (the pre-fix shape, where a failed birth-seal left the plaintext
+    /// row lingering). The CALLER must have verified the blob decrypts back byte-identical BEFORE
+    /// calling this (verify-before-destroy), exactly like [`Db::update_note_row_sealed`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_note_sealed(
+        &self,
+        id: &str,
+        folder_id: &str,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: &[u8],
+        created_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO documents
+               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at, exported_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'note', ?6, ?7, ?7, NULL)",
+            rusqlite::params![id, folder_id, name, title, text, text_blob, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Read ONE note's raw row (every column the DTO builders need), or `None` if the id is unknown
     /// OR the row is not `kind='note'`. The COMMAND layer gates the folder before surfacing the text.
     pub fn get_note_row(&self, id: &str) -> Result<Option<NoteRow>> {
@@ -4197,6 +4230,34 @@ impl Db {
         Ok(())
     }
 
+    /// MOVE-INTO-LOCKED twin of [`Db::update_note_row_sealed`] (2026-07-10 residual W2): reassign an
+    /// authored note to a (session-unlocked, LOCKED) target folder AND write its fresh `text_blob`
+    /// (sealed under the TARGET folder's CK) in ONE atomic UPDATE — never a reassign-then-seal
+    /// two-step, whose failure window left the note sitting in the locked target with a stale
+    /// wrong-CK blob (undecryptable at the target's next unlock). `exported_path` is NULLed in the
+    /// same statement (a note governed by a locked folder has no on-disk export). The CALLER must
+    /// have verified the blob decrypts back byte-identical BEFORE calling this
+    /// (verify-before-destroy). Idempotent on an unknown id / non-note row.
+    pub fn move_note_row_sealed(
+        &self,
+        id: &str,
+        folder_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: &[u8],
+        updated_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET folder_id = ?2, title = ?3, text = ?4, text_blob = ?5,
+                    updated_at = ?6, exported_path = NULL
+               WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, folder_id, title, text, text_blob, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Persist (or clear with `None`) an authored NOTE's exported vault `.md` path. Set on
     /// export/unlock re-export; cleared (NULL) when the folder seals and the vault file is deleted.
     /// Named `_doc` to disambiguate from the MEETING-note [`Db::set_note_exported_path`].
@@ -4224,6 +4285,34 @@ impl Db {
             .map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// `(id, exported_path)` of every authored NOTE in a folder that has an on-disk export
+    /// (2026-07-10 residual W5): the id lets the relock cleanup clear each note's `exported_path`
+    /// INDIVIDUALLY, only after its `.md` was actually deleted (or is already absent) — a failed
+    /// delete keeps the path recorded so the next relock/startup pass retries. No text — ids +
+    /// paths only (the caller never logs the paths; they embed note titles).
+    pub fn note_exported_path_rows_in_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, exported_path FROM documents
+                   WHERE folder_id = ?1 AND kind = 'note' AND exported_path IS NOT NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(map_err)?;
         let mut out = Vec::new();
         for r in rows {
@@ -5633,16 +5722,15 @@ impl Db {
     /// The second tuple element is the `exported_path`s of the memory rollups purged in-tx when any
     /// folder is locked (`purge_memory_rollups_tx`) — the caller deletes those vault `.md` files.
     ///
-    /// The third tuple element (2026-07-10 audit F2) is the recorded `exported_path` of every
-    /// authored NOTE in a locked folder: a session unlock re-exports each note's vault `.md`
+    /// The third tuple element (2026-07-10 audit F2) is `(id, exported_path)` of every authored
+    /// NOTE in a locked folder: a session unlock re-exports each note's vault `.md`
     /// (`reexport_notes_in_folder`), so a crash-while-unlocked leaves that plaintext `.md` on disk.
-    /// The caller ([`crate::state`] `reconcile_locked_at_rest`) deletes those files and THEN clears
-    /// the column via [`Db::clear_note_exported_paths_in_locked_folders`] (delete-then-clear, so a
-    /// crash between the two keeps the path recorded and the next startup retries). Mirrors the
-    /// clean-relock cleanup in `reblank_folder_extras`.
-    pub fn reblank_locked_folders_at_rest(
-        &self,
-    ) -> Result<(Vec<LockedMeetingAudio>, Vec<String>, Vec<String>)> {
+    /// The caller ([`crate::state`] `reconcile_locked_at_rest`) deletes each file and clears that
+    /// note's `exported_path` INDIVIDUALLY, only on a successful delete / already-absent file
+    /// (delete-then-clear, per row — 2026-07-10 residual W5): a FAILED delete keeps the path
+    /// recorded so the next startup retries. Mirrors the clean-relock cleanup in
+    /// `reblank_folder_extras`.
+    pub fn reblank_locked_folders_at_rest(&self) -> Result<LockedAtRestCleanup> {
         const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
              WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
         let mut conn = self.lock();
@@ -5865,20 +5953,20 @@ impl Db {
         } else {
             Vec::new()
         };
-        // 2026-07-10 audit F2: surface the authored notes' re-exported vault `.md` paths for every
-        // LOCKED folder (a crash while session-unlocked leaves them plaintext on disk with the
-        // column still set). Paths only — the caller deletes the files then clears the column
-        // (`clear_note_exported_paths_in_locked_folders`), never text (no PII here).
+        // 2026-07-10 audit F2: surface the authored notes' re-exported vault `.md` (id, path) pairs
+        // for every LOCKED folder (a crash while session-unlocked leaves them plaintext on disk with
+        // the column still set). Ids + paths only — the caller deletes each file then clears THAT
+        // note's column (per-row delete-then-clear, residual W5), never text (no PII here).
         let note_md_exports = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT exported_path FROM documents \
+                    "SELECT id, exported_path FROM documents \
                        WHERE kind = 'note' AND exported_path IS NOT NULL \
                          AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
                 )
                 .map_err(map_err)?;
             let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(map_err)?;
             let mut out = Vec::new();
             for r in rows {
@@ -5888,22 +5976,6 @@ impl Db {
         };
         tx.commit().map_err(map_err)?;
         Ok((audio, rollup_exports, note_md_exports))
-    }
-
-    /// NULL the `exported_path` of every authored NOTE in EVERY locked folder — the startup-
-    /// reconcile companion of [`Db::clear_note_exported_paths_in_folder`], run AFTER the caller has
-    /// deleted the on-disk `.md` files surfaced by [`Db::reblank_locked_folders_at_rest`]
-    /// (delete-then-clear; 2026-07-10 audit F2).
-    pub fn clear_note_exported_paths_in_locked_folders(&self) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET exported_path = NULL \
-               WHERE kind = 'note' \
-                 AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
-            [],
-        )
-        .map_err(map_err)?;
-        Ok(())
     }
 
     /// Folder ids that are sealed (`locked=1`) — used to re-blank every sealed note on relock-all.
