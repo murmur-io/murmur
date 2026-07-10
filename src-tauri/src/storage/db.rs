@@ -2001,6 +2001,69 @@ impl Db {
         Ok(out)
     }
 
+    /// The folder's ACTIVE 1:1 shares (LINK + Murmur↔Murmur USER) as `(share_id, mode)`, joined to
+    /// the folder through the shared meeting/document. Powers the lock×shares dialog + bulk-revoke —
+    /// closing the pre-existing hole where `lock_folder` never surfaced live 1:1 shares. Mirrors
+    /// [`Self::active_org_shares_for_folder`]. `state = 'active'` only (revoked rows excluded).
+    pub fn active_link_user_shares_for_folder(&self, folder_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.share_id, s.mode
+                   FROM outbound_shares s
+                   LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
+                   LEFT JOIN documents d ON d.id = s.document_id
+                  WHERE s.state = 'active'
+                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The folder's ACTIVE org shares as `(row_id, item_id?, title)` for bulk-revoke: an uploaded row
+    /// (item_id present) is tombstoned server-side; a still-`queued` row (no item_id) is cancelled
+    /// locally so the launch sweep never egresses it. Same folder join + state set as
+    /// [`Self::active_org_shares_for_folder`], but carries the local row id + item id for revocation.
+    pub fn active_org_share_ids_for_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.item_id, s.title
+                   FROM org_shares s
+                   LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
+                   LEFT JOIN documents d ON d.id = s.document_id
+                  WHERE s.state IN ('queued','uploaded','revoke_pending')
+                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     // ── M5-CLIENT: TOFU pins, mode-B outbound bookkeeping, inbound accept idempotency (spec §4.8/§7) ──
 
     /// TOFU-pin a contact's identity fingerprint under a STABLE `account_id` (spec §4.8: pin on
