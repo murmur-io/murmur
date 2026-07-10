@@ -113,6 +113,19 @@ Fixed-window re-decode is the documented anti-pattern. **LocalAgreement-2** (UFA
 - SpeechAnalyzer locale list on a live macOS 26 box (may grow in point releases).
 - whisper-rs maintenance cadence (GitHub archived → Codeberg; 0.16.0 is 2026-03) — a mild strategic argument for the sherpa-onnx/parakeet seam.
 
+## Measured results (2026-07-10 appendix — in-house, M-series dev Mac)
+
+First real numbers from the harnesses this report demanded (`asr_ab_harness_from_env` + `parakeet_spike_from_env`, both shipped as `#[ignore]` env-driven tests; 131 s synthesized PL→EN→PL WAV, macOS `say`/Zosia — clean TTS, NOT meeting audio; post-#230 tree, so flash-attn ON + VAD-segmented batch):
+
+| config | wall | RTF | Polish quality (same WAV, eyeballed diff) |
+|---|---:|---:|---|
+| small, Fast profile (today's live) | 0.77 s | ~170× | names garbled (Jakub→"jak ut", Łukasz→"półkarz", SQLCipher→"skłelcifer"), EN segment DROPPED, hallucination repeat-loops |
+| small, Accurate (today's batch default) | 2.75 s | ~48× | same error classes as Fast |
+| **large-v3-turbo-q8_0, Accurate** | **2.73 s** | ~48× | near-perfect PL (Jakub/Łukasz/Apple Silicon right), EN intact — **same batch wall as small, ~2.5× fewer errors** |
+| parakeet-tdt-0.6b-v3 int8, CPU ×4 (off Metal) | 10.0 s | ~13× | better than small (names right, zero loops, clean PL↔EN auto-LID), below turbo ("Apple śliczon", "modelu ISP") |
+
+Confirms the report's ladder (`small < parakeet < turbo`) and both engine recommendations: **(T2)** the turbo-q8_0 batch default costs the SAME wall as small on the VAD-segmented flash-attn batch path — the flip is now evidence-backed (cost: 874 MB download, ~1.2 GB RAM vs small's 470 MB); **(T3)** parakeet is a viable live-path engine at ~13× realtime on four CPU threads with Metal left entirely to the LLM, via the sherpa-onnx crate already in the lockfile (1.13.3 — no missing-words symptom on this WAV). Open: watts (T0 powermetrics protocol still pending, user-assisted), real-meeting audio, and PL WER on non-TTS speech.
+
 ## Sources
 
 **Repo (symbols):** `transcribe/live.rs` (`TICK`, `WINDOW_SECS`, tick body, `accumulate_live_caption`, `step_manual_capture`), `transcribe/whisper.rs` (`Transcriber::load`, `build_params`, `TranscribeQuality`, batch consts), `transcribe/vad.rs` (CPU-only rationale), `transcribe/model.rs` (`model_filename`, `ensure_model`), `audio/listener.rs` (`VoiceListener::start`), `commands.rs` (`live_model` pin, `restart_voice_listener`), `pipeline.rs` (`transcribe_stream`, `decode_windows`), `settings/config.rs` (`model_size`, `voice_trigger`), `Cargo.toml`/`Cargo.lock` (whisper-rs 0.16 / sherpa-onnx 1.13.3 / objc2-foundation); vendored: `whisper-rs-0.16.0/src/whisper_ctx.rs` (flash_attn default), `whisper-rs-sys-0.15.0/whisper.cpp` (1.8.3, FA default true; coreml build.rs), `sherpa-onnx-1.13.3/src/offline_asr.rs` (nemo_transducer example).
