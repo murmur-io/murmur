@@ -5256,6 +5256,7 @@ fn agent_outcome_to_ask_result(
                     meeting_id: m.id,
                     title: m.title.unwrap_or_else(|| title.to_string()),
                     started_at: m.started_at,
+                    origin: None,
                 });
             }
             Ok(_) => {}

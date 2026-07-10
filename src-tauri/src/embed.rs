@@ -414,6 +414,24 @@ pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Scalar-quantize an L2-normalized f32 embedding (components in ≈[-1, 1]) into an int8 byte blob
+/// for binding to a `vec0 int8[N]` column via `vec_int8(?)` (the M6 org partition — int8 is 3.7×
+/// smaller than f32 and holds in-query-budget at 300k chunks, the scale-spike finding).
+///
+/// Each component is scaled by 127, rounded, and CLAMPED to `[-127, 127]` (i8-safe: -128 is
+/// avoided so magnitudes stay symmetric). A non-normalized input still maps deterministically —
+/// out-of-range components saturate — so this is safe on the stub embedder too (its output is
+/// L2-normalized, so no saturation occurs). The returned `Vec<u8>` is the two's-complement byte
+/// image of the i8 array, which is exactly what `vec_int8()` expects. Length == the input length.
+pub(crate) fn vec_to_int8_blob(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .map(|&f| {
+            let scaled = (f * 127.0).round().clamp(-127.0, 127.0) as i8;
+            scaled as u8
+        })
+        .collect()
+}
+
 /// Split a note's markdown into deterministic chunks, each PREFIXED with a `<title> · <date>`
 /// header so the embedded text always carries its provenance (and the real model can ground each
 /// chunk). Paragraphs (blank-line-separated) are merged greedily up to [`CHUNK_CHAR_TARGET`]; a
