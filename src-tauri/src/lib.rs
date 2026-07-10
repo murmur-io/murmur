@@ -293,6 +293,7 @@ pub fn run() {
             commands::create_note,
             commands::get_note,
             commands::update_note_doc,
+            commands::save_note_text,
             commands::list_notes,
             commands::move_note_doc,
             commands::delete_note,

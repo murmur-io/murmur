@@ -193,6 +193,13 @@ export class NoteEditorComponent {
   private requestSeq = 0;
   /** True while applying the loaded doc into the edit signals (suppress autosave). */
   private hydrating = false;
+  /**
+   * True when there are edits not yet persisted through the FULL path (re-index +
+   * vault export). Cheap autosaves keep the DB text current but leave this set; the
+   * full save runs once on a natural boundary (Preview / editor close / retry) so the
+   * e5 re-embed never fires per keystroke-pause. Cleared after a successful full save.
+   */
+  private dirtyFull = false;
 
   /** The rendered preview HTML source — a cached `computed` off title + doc markdown. */
   readonly previewMarkdown = computed(() =>
@@ -281,8 +288,15 @@ export class NoteEditorComponent {
     void this.loadFolders();
     void this.notes.loadNotes(null);
     void this.loadConfig();
-    // Flush a pending autosave when the editor is torn down (route-leave).
-    this.destroyRef.onDestroy(() => this.flushSave());
+    // On teardown (route-leave) run the FULL save ONCE if there are unindexed edits —
+    // fire-and-forget so navigation is instant; the backend re-indexes + re-exports in
+    // the background. Nothing is lost either way (cheap autosaves already persisted the
+    // text). No pending edits ⇒ no needless re-embed on open-then-close.
+    this.destroyRef.onDestroy(() => {
+      if (this.dirtyFull) {
+        this.flushFull();
+      }
+    });
   }
 
   /**
@@ -363,8 +377,8 @@ export class NoteEditorComponent {
     );
     this.propsOpen.set(this.tags().length > 0 || this.propertyRows().length > 0);
     this.saveState.set("idle");
+    this.dirtyFull = false;
     this.hydrating = false;
-    this.autoGrow();
   }
 
   // ── Title ────────────────────────────────────────────────────────────────
@@ -384,90 +398,115 @@ export class NoteEditorComponent {
     this.scheduleSave();
   }
 
-  /** Grow the textarea to fit its content (document-like, no inner scrollbar). */
+  /**
+   * The textarea auto-grows via CSS (the `.body-grow` grid mirror sizes the row to
+   * the content) — so there is NO per-keystroke JS layout reflow (the old
+   * `height:auto` → read `scrollHeight` → set `height` thrash was the typing-lag
+   * culprit). Kept as a no-op so the historical call sites need no change.
+   */
   private autoGrow(): void {
-    afterNextRender(
-      () => {
-        const el = this.bodyArea()?.nativeElement;
-        if (el) {
-          el.style.height = "auto";
-          el.style.height = `${el.scrollHeight}px`;
-        }
-      },
-      { injector: this.injector },
-    );
+    /* CSS `.body-grow` mirror handles sizing — intentionally no JS reflow. */
   }
 
   // ── Autosave ─────────────────────────────────────────────────────────────
 
-  /** Debounced autosave (idle). No-op while hydrating or on a locked note. */
+  /**
+   * Debounced autosave — the CHEAP path (`saveNoteText`: persist title + markdown
+   * only, NO re-index / no vault export) so typing stays smooth even with the embed
+   * model loaded. Marks the note `dirtyFull` so the deferred full save (re-index +
+   * export) runs once on the next boundary. No-op while hydrating or locked.
+   */
   private scheduleSave(): void {
     if (this.hydrating || this.note()?.locked) {
       return;
     }
+    this.dirtyFull = true;
     this.saveState.set("saving");
-    this.debounce.schedule("note-editor-save", () => void this.save(), AUTOSAVE_MS);
+    this.debounce.schedule("note-editor-save", () => void this.saveText(), AUTOSAVE_MS);
   }
 
-  /** Persist NOW (on blur / route-leave). Cancels the pending debounce first. */
-  private flushSave(): void {
-    if (this.note()?.locked) {
-      return;
-    }
-    this.debounce.cancel("note-editor-save");
-    void this.save();
-  }
-
-  /** Blur handler (title / body) — flush any pending edit immediately. */
-  onBlur(): void {
-    if (this.saveState() === "saving") {
-      this.flushSave();
-    }
+  /** The current title + full markdown (front-matter re-emitted). */
+  private currentPayload(): { title: string; markdown: string } {
+    return {
+      title: this.title().trim() || "Untitled",
+      markdown: serializeDoc(this.tags(), this.properties(), this.body()),
+    };
   }
 
   /**
-   * Write the current title + full markdown (front-matter re-emitted) via
-   * `updateNoteDoc`, then reconcile with the returned {@link NoteDoc}. Optimistic:
-   * the edit signals stay the source of truth (we only refresh non-content flags
-   * like `exportedPath`/`shared`). A stale-guard-free single writer is fine here —
-   * the debounce coalesces rapid edits, and only the last save runs.
+   * CHEAP persist — text only (no re-index, no export). Used by the frequent
+   * autosave + blur so typing never triggers the e5 re-embed. The DB text is
+   * canonical, so nothing is lost; the brain index catches up on the next full save.
    */
-  private async save(): Promise<void> {
+  private async saveText(): Promise<void> {
     const doc = this.note();
     if (!doc || doc.locked) {
       return;
     }
-    const markdown = serializeDoc(this.tags(), this.properties(), this.body());
-    const title = this.title().trim() || "Untitled";
+    const { title, markdown } = this.currentPayload();
     this.saveState.set("saving");
     try {
-      const fresh = await this.ipc.updateNoteDoc(doc.id, title, markdown);
-      // Reconcile ONLY the backend-owned, non-editable fields; do NOT clobber the
-      // user's in-progress body/title (they may have typed more mid-save).
-      this.note.update((cur) =>
-        cur
-          ? {
-              ...cur,
-              updatedAt: fresh.updatedAt,
-              exportedPath: fresh.exportedPath,
-              shared: fresh.shared,
-              locked: fresh.locked,
-            }
-          : fresh,
-      );
+      const updatedAt = await this.ipc.saveNoteText(doc.id, title, markdown);
+      this.note.update((cur) => (cur ? { ...cur, updatedAt } : cur));
       this.saveState.set("saved");
     } catch (e) {
       this.saveState.set("error");
-      // A Locked rejection means the folder sealed under us — surface it.
       if (String(e).includes("Locked")) {
         this.toast.danger("This note is locked — unlock its folder to edit.");
       }
     }
   }
 
-  /** Retry a failed save. */
+  /**
+   * FULL save (fire-and-forget) — persist + RE-INDEX (brain) + vault re-export via
+   * `updateNoteDoc`. Runs ONLY on natural boundaries (Preview, editor close, retry) so
+   * the e5 re-embed never fires per keystroke-pause. NOT awaited by navigation, so
+   * leaving is instant and the backend catches up. Clears `dirtyFull` on success.
+   */
+  private flushFull(): void {
+    const doc = this.note();
+    if (!doc || doc.locked) {
+      return;
+    }
+    this.debounce.cancel("note-editor-save");
+    const { title, markdown } = this.currentPayload();
+    this.saveState.set("saving");
+    void this.ipc
+      .updateNoteDoc(doc.id, title, markdown)
+      .then((fresh) => {
+        this.dirtyFull = false;
+        this.note.update((cur) =>
+          cur
+            ? {
+                ...cur,
+                updatedAt: fresh.updatedAt,
+                exportedPath: fresh.exportedPath,
+                shared: fresh.shared,
+                locked: fresh.locked,
+              }
+            : cur,
+        );
+        this.saveState.set("saved");
+      })
+      .catch((e) => {
+        this.saveState.set("error");
+        if (String(e).includes("Locked")) {
+          this.toast.danger("This note is locked — unlock its folder to edit.");
+        }
+      });
+  }
+
+  /** Blur handler (title / body) — flush the pending CHEAP save immediately. */
+  onBlur(): void {
+    if (this.saveState() === "saving") {
+      this.debounce.cancel("note-editor-save");
+      void this.saveText();
+    }
+  }
+
+  /** Retry a failed save — the full path (re-index + export). */
   retrySave(): void {
-    void this.save();
+    this.flushFull();
   }
 
   // ── Tags ─────────────────────────────────────────────────────────────────
@@ -556,12 +595,12 @@ export class NoteEditorComponent {
   // ── Edit / Preview ───────────────────────────────────────────────────────
 
   setPreview(on: boolean): void {
-    if (on && this.saveState() === "saving") {
-      this.flushSave();
-    }
     this.preview.set(on);
-    if (!on) {
-      this.autoGrow();
+    // Switching to Preview is a natural "I'm reviewing" pause: run the deferred FULL
+    // save (re-index + vault export) once if there are unindexed edits, so the note
+    // becomes brain-searchable + vault-synced without waiting for editor close.
+    if (on && this.dirtyFull) {
+      this.flushFull();
     }
   }
 
@@ -908,8 +947,9 @@ export class NoteEditorComponent {
       return;
     }
     this.closeMenus();
-    // Flush any pending edit first so the exported file is current.
-    this.flushSave();
+    // Persist the latest text first (cheap) so the exported file is current.
+    this.debounce.cancel("note-editor-save");
+    await this.saveText();
     try {
       const path = await this.ipc.exportNoteDoc(doc.id);
       this.note.update((cur) => (cur ? { ...cur, exportedPath: path } : cur));
@@ -931,7 +971,9 @@ export class NoteEditorComponent {
     if (!doc || doc.locked) {
       return;
     }
-    this.flushSave();
+    // Persist the latest text (cheap) so the shared body is current.
+    this.debounce.cancel("note-editor-save");
+    void this.saveText();
     this.shareOpen.set(true);
   }
 
@@ -977,8 +1019,10 @@ export class NoteEditorComponent {
     if (!doc) {
       return;
     }
-    // Cancel a pending autosave so a delete isn't followed by a resurrecting write.
+    // Cancel a pending autosave + clear the dirty flag so the teardown full-save never
+    // resurrects the just-deleted note.
     this.debounce.cancel("note-editor-save");
+    this.dirtyFull = false;
     try {
       await this.notes.remove(doc.id);
       this.toast.success("Note deleted");
@@ -1162,9 +1206,12 @@ export class NoteEditorComponent {
     }
   }
 
-  /** Return to the Notes home. */
+  /**
+   * Return to the Notes home. Navigation is INSTANT — the teardown (`onDestroy`) runs
+   * the full save (re-index + export) fire-and-forget in the background, so leaving is
+   * never blocked on the e5 re-embed. The text was already cheap-persisted.
+   */
   back(): void {
-    this.flushSave();
     void this.router.navigate(["/notes"]);
   }
 }
