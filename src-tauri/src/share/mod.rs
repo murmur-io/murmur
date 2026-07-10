@@ -21,6 +21,8 @@
 pub mod client;
 pub mod envelope;
 pub mod opaque_client;
+pub mod org_dto;
+pub mod org_envelope;
 
 use crate::error::{AppError, Result};
 use zeroize::Zeroizing;

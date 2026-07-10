@@ -862,6 +862,41 @@ pub struct TopicThread {
     pub mentions: Vec<TopicMention>,
 }
 
+/// M6 Shared Brain — a locally-joined org (row of `org_state`). Membership metadata only; no content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgState {
+    pub org_id: String,
+    pub name: String,
+    pub role: String,
+    pub joined_at: String,
+    pub consented: bool,
+    pub last_seq: i64,
+    pub generation: u32,
+}
+
+/// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a
+/// local `meeting_id` XOR `document_id`; carries the item kind, the content-hash dedup key, the
+/// server `item_id` once published, and the current `state`. NO note title/body/OCK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgShareRow {
+    pub id: String,
+    pub org_id: String,
+    pub meeting_id: Option<String>,
+    pub document_id: Option<String>,
+    pub kind: String,
+    /// A local display title for the owner's own share list (renders only to the local owner who can
+    /// already read it). NOT sent to the server.
+    pub title: Option<String>,
+    pub rev: u32,
+    pub generation: u32,
+    pub content_sha256: Option<Vec<u8>>,
+    pub item_id: Option<String>,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
