@@ -39,9 +39,18 @@
                   <option value="tiny">Tiny — fastest (~75 MB)</option>
                   <option value="base">Base (~150 MB)</option>
                   <option value="small">Small (~470 MB)</option>
+                  <option value="small-q8_0">
+                    Small (q8) — Small accuracy, less RAM (~270 MB)
+                  </option>
                   <option value="medium">Medium (~1.5 GB)</option>
+                  <option value="medium-q8_0">
+                    Medium (q8) — Medium accuracy, less RAM (~850 MB)
+                  </option>
                   <option value="large-v3-turbo">
                     Large v3 Turbo — fast &amp; accurate (~1.6 GB)
+                  </option>
+                  <option value="large-v3-turbo-q8_0">
+                    Large v3 Turbo (q8) — Turbo accuracy, less RAM (~875 MB)
                   </option>
                   <option value="large-v3">
                     Large v3 — best accuracy, recommended (~3 GB)
@@ -49,7 +58,9 @@
                 </select>
                 <span class="field-help text-muted">
                   Large v3 is the most accurate and the default — it’s a one-time ~3
-                  GB download. Turbo is nearly as good and much smaller.
+                  GB download. Turbo is nearly as good and much smaller. The (q8)
+                  variants are quantized: near-identical accuracy with a smaller
+                  download and less RAM while transcribing.
                 </span>
               </label>
             </div>
