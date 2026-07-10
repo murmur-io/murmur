@@ -29,6 +29,12 @@ const STDIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// balloon memory).
 const STDIO_MAX_OUTPUT: usize = 1 << 20; // 1 MiB
 
+/// Hard cap on an HTTP MCP response BODY, in bytes, enforced while STREAMING the body — before any
+/// parse (L5 follow-up, 2026-07-10): a hostile/runaway HTTP server cannot balloon memory with an
+/// unbounded reply. An over-cap body degrades to a synthetic truncated-with-note tool RESULT (see
+/// [`parse_http_body`]), never an unbounded buffer. Mirrors [`STDIO_MAX_OUTPUT`].
+const HTTP_MAX_BODY: usize = 1 << 20; // 1 MiB
+
 /// The protocol version this client advertises in `initialize`.
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -203,11 +209,51 @@ async fn http_rpc(endpoint: &str, method: &str, params: Value) -> Result<Value, 
         tracing::warn!(target: "connector", provider = "mcp", status = status.as_u16(), "mcp http error");
         return Err(ConnectorError::Failed(format!("mcp HTTP {status}")));
     }
-    let body: Value = resp
-        .json()
-        .await
-        .map_err(|e| ConnectorError::Failed(format!("mcp body parse: {}", e.without_url())))?;
-    jsonrpc_result(&body)
+    // Stream the body under the hard [`HTTP_MAX_BODY`] cap: stop reading the moment the next chunk
+    // would exceed it (memory is bounded at cap + one network chunk, and the connection is dropped
+    // with the response). The old `resp.json()` buffered an UNBOUNDED body before parsing.
+    let mut resp = resp;
+    let mut body: Vec<u8> = Vec::new();
+    let mut over_cap = false;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > HTTP_MAX_BODY {
+                    over_cap = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(ConnectorError::Failed(format!(
+                    "mcp body read: {}",
+                    e.without_url()
+                )))
+            }
+        }
+    }
+    parse_http_body(&body, over_cap)
+}
+
+/// PURE cap-then-parse of a (bounded) HTTP JSON-RPC body. `over_cap` — or a body that somehow
+/// still exceeds [`HTTP_MAX_BODY`] — degrades to a synthetic truncated-with-note tool RESULT
+/// (`content[].text`), so the agent loop sees a harmless, loud data note instead of either an
+/// unbounded buffer or a hard failure; a bounded body parses as the normal JSON-RPC envelope.
+/// Logs the cap only — NEVER body content.
+pub(crate) fn parse_http_body(body: &[u8], over_cap: bool) -> Result<Value, ConnectorError> {
+    if over_cap || body.len() > HTTP_MAX_BODY {
+        tracing::warn!(target: "connector", provider = "mcp", cap_bytes = HTTP_MAX_BODY, "mcp http body over cap; degrading to a truncated note");
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": "[MCP response truncated: the server reply exceeded the 1 MiB body cap]"
+            }]
+        }));
+    }
+    let envelope: Value = serde_json::from_slice(body)
+        .map_err(|e| ConnectorError::Failed(format!("mcp body parse: {e}")))?;
+    jsonrpc_result(&envelope)
 }
 
 /// stdio transport: spawn the (ABSOLUTE-path, re-validated) command, run the MCP handshake
@@ -415,6 +461,40 @@ mod tests {
             ..base
         };
         assert!(McpClient::for_server(&unk).is_none());
+    }
+
+    /// L5 follow-up (R4) — the HTTP body cap, tested on the PURE cap-then-parse core (no network):
+    /// an over-cap body (by flag or by length) degrades to the truncated-with-note tool result and
+    /// NEVER attempts to parse/hold the oversized bytes; a bounded body parses normally.
+    #[test]
+    fn http_body_over_cap_degrades_to_truncated_note() {
+        // Synthetic oversized body: one byte past the cap.
+        let oversized = vec![b'x'; HTTP_MAX_BODY + 1];
+        let v = parse_http_body(&oversized, false).unwrap();
+        let text = parse_tool_result_text(&v);
+        assert!(
+            text.contains("truncated") && text.contains("1 MiB"),
+            "over-cap body becomes a loud truncated note: {text}"
+        );
+        assert!(
+            !text.contains("xxx"),
+            "no oversized content survives into the result"
+        );
+
+        // The streaming reader signals over_cap with a PARTIAL buffer — same degradation.
+        let v = parse_http_body(b"{\"partial\":", true).unwrap();
+        assert!(parse_tool_result_text(&v).contains("truncated"));
+
+        // A bounded, valid envelope parses as the normal JSON-RPC result.
+        let ok = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hi"}]}}"#;
+        let v = parse_http_body(ok, false).unwrap();
+        assert_eq!(parse_tool_result_text(&v), "hi");
+
+        // A bounded but malformed body is still a parse failure (unchanged posture).
+        assert!(matches!(
+            parse_http_body(b"not json", false),
+            Err(ConnectorError::Failed(_))
+        ));
     }
 
     /// A relative stdio command is refused at the rpc layer too (defense-in-depth), WITHOUT any
