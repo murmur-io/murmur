@@ -25,8 +25,8 @@ pub const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
 pub const DIARIZE_SEG_MODEL_FILE: &str = "sherpa-pyannote-segmentation-3.0.onnx";
 pub const DIARIZE_EMB_MODEL_FILE: &str = "wespeaker_en_voxceleb_CAM++.onnx";
 
-/// QUANT-SUFFIXED model sizes accepted by [`model_filename`] (T2 quant plumbing — NO default
-/// flip: `AppConfig::default().model_size` stays `"small"`). Each maps `"<size>-<quant>"` →
+/// QUANT-SUFFIXED model sizes accepted by [`model_filename`] (T2 quant plumbing; the CONDITIONAL
+/// default flip lives in [`default_model_size`]). Each maps `"<size>-<quant>"` →
 /// `ggml-<size>-<quant>.bin`, verified BY URL SHAPE against the ggerganov/whisper.cpp HF
 /// mirror's file tree (which hosts `ggml-small-q8_0.bin`, `ggml-medium-q8_0.bin`,
 /// `ggml-large-v3-turbo.bin`, `ggml-large-v3-turbo-q8_0.bin`, `ggml-large-v3-q5_0.bin`).
@@ -42,6 +42,103 @@ pub const QUANT_MODEL_SIZES: &[&str] = &[
     "large-v3-q5_0",
 ];
 
+/// T2 DEFAULT FLIP (the SAFE shape) — the size a NO-CHOICE config defaults to when the machine
+/// qualifies. Measured evidence (docs/research/2026-07-09-transcription-performance.md,
+/// "Measured results"): the turbo q8_0 quant runs an Accurate batch in the same wall-clock as
+/// `small` with near-perfect Polish, at ~875 MB download. Only [`default_model_size`] decides
+/// WHO gets it — existing installs and low-RAM machines stay on `small`.
+pub const TURBO_DEFAULT_SIZE: &str = "large-v3-turbo-q8_0";
+
+/// On-disk filename of [`TURBO_DEFAULT_SIZE`]'s (multilingual-only) build — must equal
+/// `model_filename(TURBO_DEFAULT_SIZE, _)` (test: `turbo_default_file_matches_model_filename`).
+const TURBO_DEFAULT_FILE: &str = "ggml-large-v3-turbo-q8_0.bin";
+
+/// RAM floor for defaulting a FRESH install to the turbo quant: the ~1 GB-resident turbo is a
+/// safe default on ≥ 12 GB machines; 8 GB Macs stay on `small` (the A2 RAM-safety rationale).
+const TURBO_DEFAULT_MIN_RAM_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+
+/// T2 DEFAULT FLIP — the ONE place that decides what an EMPTY `model_size` means. PURE over the
+/// models-dir file names + total RAM so every branch is headless-testable:
+///
+/// 1. `ggml-large-v3-turbo-q8_0.bin` already downloaded → `large-v3-turbo-q8_0` (the user
+///    already paid the download; same wall-clock as `small`, much better Polish).
+/// 2. NO whisper `ggml-*.bin` at all (fresh install — onboarding will download whatever we
+///    return) AND total RAM ≥ 12 GB → `large-v3-turbo-q8_0`.
+/// 3. Otherwise → `small`. An EXISTING install (any whisper model on disk, e.g. `small`) NEVER
+///    gets a surprise 874 MB download or a behavior change, and unknown RAM (`None`) never
+///    triggers one either (fail-SMALL, not fail-open — the opposite of the reasoner's RAM guard,
+///    because "open" here would mean a large unrequested download).
+///
+/// The VAD model (`ggml-silero-v5.1.2.bin`) is a `ggml-*.bin` but NOT a whisper model — its
+/// presence alone still counts as a fresh install. `.part` partials never count (no `.bin`
+/// suffix). The LIVE pin (`live_model_pin`, default `small`) is deliberately untouched — turbo
+/// is a BATCH default only, ENFORCED at the record-start pin resolution: when the pinned file
+/// is absent the live tick falls back to [`live_fallback_model`] (live-safe sizes only) and
+/// NEVER to a medium/large configured model ([`is_live_heavy_model_file`]).
+pub fn default_model_size<S: AsRef<str>>(
+    models_dir_files: &[S],
+    total_ram_bytes: Option<u64>,
+) -> &'static str {
+    if models_dir_files
+        .iter()
+        .any(|f| f.as_ref() == TURBO_DEFAULT_FILE)
+    {
+        return TURBO_DEFAULT_SIZE;
+    }
+    let any_whisper_model = models_dir_files.iter().any(|f| {
+        let name = f.as_ref();
+        name.starts_with("ggml-") && name.ends_with(".bin") && name != VAD_MODEL_FILE
+    });
+    if !any_whisper_model && total_ram_bytes.is_some_and(|b| b >= TURBO_DEFAULT_MIN_RAM_BYTES) {
+        return TURBO_DEFAULT_SIZE;
+    }
+    "small"
+}
+
+/// [`default_model_size`] over the REAL machine: lists [`models_dir`] + reads total RAM via
+/// `sysctl -n hw.memsize` (the same no-new-dep pattern as `commands.rs::total_ram_gb`). Any
+/// probe/listing failure resolves `small` — a broken probe must never trigger a large download.
+/// Called by `AppConfig::default()` (the onboarding preselect) and by [`effective_model_size`].
+pub fn default_model_size_now() -> &'static str {
+    let Ok(dir) = models_dir() else {
+        return "small";
+    };
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return "small";
+    };
+    let files: Vec<String> = read
+        .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+        .collect();
+    default_model_size(&files, total_ram_bytes())
+}
+
+/// Resolve a possibly-empty configured `model_size` to the size that should actually load:
+/// non-empty passes through verbatim; empty/blank resolves the machine-conditional default
+/// ([`default_model_size_now`]). [`resolve_model_path`] / [`ensure_model`] route through this so
+/// a legacy config that persisted `""` follows the same ONE decision as a fresh default.
+pub fn effective_model_size(size: &str) -> String {
+    let s = size.trim();
+    if s.is_empty() {
+        default_model_size_now().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// macOS total physical RAM in bytes via `sysctl -n hw.memsize` — mirrors
+/// `commands.rs::total_ram_gb` (no new FFI/crate). `None` on any failure.
+fn total_ram_bytes() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.memsize")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
 /// Map a chosen size + language to a whisper.cpp GGML model filename.
 ///
 /// Supported sizes (all served by the ggerganov/whisper.cpp HF mirror):
@@ -55,9 +152,11 @@ pub const QUANT_MODEL_SIZES: &[&str] = &[
 /// EVERY quant-suffixed size resolve multilingual-only (no `.en` is ever appended to a
 /// quant/large variant — see [`QUANT_MODEL_SIZES`]).
 ///
-/// An empty size falls back to the app default (`small`), matching
-/// `AppConfig::default().model_size` — a RAM-safe default so a config that bypasses onboarding
-/// no longer lands on the ~3 GB `large-v3`. All sizes (incl. `large-v3`) stay selectable.
+/// An empty size falls back to `small` here as a STATIC safety net only — the real
+/// machine-conditional default (T2 flip: turbo when already downloaded / fresh big-RAM install)
+/// is applied BEFORE this function by [`effective_model_size`] inside [`resolve_model_path`] /
+/// [`ensure_model`], and by `AppConfig::default()` via [`default_model_size_now`]. All sizes
+/// (incl. `large-v3`) stay selectable.
 pub fn model_filename(size: &str, language: &str) -> String {
     let size = match size.trim() {
         "" => "small",
@@ -108,14 +207,37 @@ pub fn smallest_wake_model(language: &str) -> Option<PathBuf> {
 /// File-presence core of [`smallest_wake_model`], factored over an explicit `dir` so the
 /// tiny→base→small preference order is testable headless with a temp dir.
 pub fn smallest_wake_model_in(dir: &Path, language: &str) -> Option<PathBuf> {
-    for size in ["tiny", "base", "small"] {
+    first_present_model_in(dir, &["tiny", "base", "small"], language)
+}
+
+/// T2 default-flip follow-up — the LIVE-pin ABSENT-FILE fallback: the pinned live model
+/// (default `small`) is not on disk, so pick the LARGEST downloaded live-SAFE model instead
+/// (small → small-q8_0 → base → tiny; captions want the best of the safe sizes). NEVER
+/// medium/large — falling through to a large-class configured model is exactly the T1.3
+/// "large live tick saturates the shared Metal GPU" heat scenario the pin exists to prevent,
+/// and on a fresh turbo-default install (ONLY `ggml-large-v3-turbo-q8_0.bin` downloaded) it
+/// would be the DEFAULT experience. `None` = nothing live-safe downloaded (the caller skips
+/// captions and may background-download the pinned size).
+pub fn live_fallback_model(language: &str) -> Option<PathBuf> {
+    let dir = models_dir().ok()?;
+    live_fallback_model_in(&dir, language)
+}
+
+/// File-presence core of [`live_fallback_model`], testable headless with a temp dir.
+pub fn live_fallback_model_in(dir: &Path, language: &str) -> Option<PathBuf> {
+    first_present_model_in(dir, &["small", "small-q8_0", "base", "tiny"], language)
+}
+
+/// First size in `sizes` whose model file exists in `dir`, honoring the language-appropriate
+/// build ([`model_filename`]). An English selection can also ride a downloaded MULTILINGUAL
+/// build of the same size (multilingual handles English fine; the reverse is not true, so a
+/// non-English language never falls back onto an `.en` build).
+fn first_present_model_in(dir: &Path, sizes: &[&str], language: &str) -> Option<PathBuf> {
+    for size in sizes {
         let preferred = dir.join(model_filename(size, language));
         if preferred.is_file() {
             return Some(preferred);
         }
-        // An English selection can also ride a downloaded MULTILINGUAL build of the same size
-        // (multilingual handles English fine; the reverse is not true, so a non-English
-        // language never falls back onto an `.en` build).
         if language == "en" {
             let multilingual = dir.join(model_filename(size, ""));
             if multilingual.is_file() {
@@ -124,6 +246,20 @@ pub fn smallest_wake_model_in(dir: &Path, language: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether a whisper model FILE is too heavy for the 3 s LIVE tick (medium/large class, incl.
+/// every large-v3 / turbo / quant variant — the name-based check covers `ggml-large-v3.bin`,
+/// `ggml-large-v3-turbo-q8_0.bin`, `ggml-medium.en.bin`, …). Best-effort by design: an
+/// unrecognizable custom filename classifies NOT-heavy, which preserves the pre-pin behavior
+/// for explicit `whisper_model_path` users.
+pub fn is_live_heavy_model_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| {
+            let n = n.to_ascii_lowercase();
+            n.contains("large") || n.contains("medium")
+        })
 }
 
 /// Hugging Face mirror of the official whisper.cpp GGML models (ggerganov/whisper.cpp).
@@ -179,7 +315,9 @@ pub fn resolve_model_path(
             return Ok(Some(p.to_path_buf()));
         }
     }
-    let derived = models_dir()?.join(model_filename(size, language));
+    // An empty configured size resolves the machine-conditional default (T2 flip) so a legacy
+    // `""` config follows the same ONE decision as `AppConfig::default()`.
+    let derived = models_dir()?.join(model_filename(&effective_model_size(size), language));
     if derived.is_file() {
         return Ok(Some(derived));
     }
@@ -204,12 +342,15 @@ pub async fn ensure_model<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
-    if let Some(found) = resolve_model_path(configured, size, language)? {
+    // Resolve the effective size ONCE so the presence check and the download name can't diverge
+    // (an empty size resolves the machine-conditional default — see `effective_model_size`).
+    let size = effective_model_size(size);
+    if let Some(found) = resolve_model_path(configured, &size, language)? {
         return Ok(found);
     }
 
     let dir = models_dir()?;
-    let file = model_filename(size, language);
+    let file = model_filename(&size, language);
     let dest = dir.join(&file);
     download_model_streaming(&model_url(&file), &dest, on_progress).await?;
     Ok(dest)
@@ -391,6 +532,92 @@ mod tests {
         assert_eq!(model_filename("large-v3-q5_0", "en"), "ggml-large-v3-q5_0.bin");
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// T2 DEFAULT FLIP branch 1 — turbo already downloaded wins regardless of RAM (even
+    /// unknown/low): the user already paid the 874 MB.
+    #[test]
+    fn default_model_size_prefers_downloaded_turbo() {
+        let files = ["ggml-large-v3-turbo-q8_0.bin", "ggml-small.bin"];
+        assert_eq!(default_model_size(&files, None), TURBO_DEFAULT_SIZE);
+        assert_eq!(default_model_size(&files, Some(8 * GIB)), TURBO_DEFAULT_SIZE);
+        assert_eq!(
+            default_model_size(&["ggml-large-v3-turbo-q8_0.bin"], Some(64 * GIB)),
+            TURBO_DEFAULT_SIZE
+        );
+    }
+
+    /// T2 DEFAULT FLIP branch 2 — a FRESH install (no whisper model on disk) with ≥ 12 GB RAM
+    /// defaults to turbo; the VAD ggml file / onnx sidecars / `.part` partials do NOT make an
+    /// install "existing".
+    #[test]
+    fn default_model_size_fresh_install_big_ram_gets_turbo() {
+        let none: [&str; 0] = [];
+        assert_eq!(default_model_size(&none, Some(16 * GIB)), TURBO_DEFAULT_SIZE);
+        // The floor is inclusive.
+        assert_eq!(default_model_size(&none, Some(12 * GIB)), TURBO_DEFAULT_SIZE);
+        // Non-whisper residents of the models dir still count as fresh.
+        let sidecars = [
+            VAD_MODEL_FILE,
+            DIARIZE_SEG_MODEL_FILE,
+            DIARIZE_EMB_MODEL_FILE,
+            "ggml-small.bin.part",
+        ];
+        assert_eq!(default_model_size(&sidecars, Some(16 * GIB)), TURBO_DEFAULT_SIZE);
+    }
+
+    /// T2 DEFAULT FLIP branch 3a — low or UNKNOWN RAM stays on `small` (a broken RAM probe must
+    /// never trigger an 874 MB download: fail-SMALL, not fail-open).
+    #[test]
+    fn default_model_size_low_or_unknown_ram_stays_small() {
+        let none: [&str; 0] = [];
+        assert_eq!(default_model_size(&none, Some(8 * GIB)), "small");
+        assert_eq!(default_model_size(&none, Some(12 * GIB - 1)), "small");
+        assert_eq!(default_model_size(&none, None), "small");
+    }
+
+    /// T2 DEFAULT FLIP branch 3b — the existing-install-no-surprise PROPERTY: ANY whisper model
+    /// already on disk (and no turbo) keeps the default at `small`, however big the RAM. An
+    /// install that chose `small` never gets a surprise download or behavior change.
+    #[test]
+    fn default_model_size_existing_install_never_surprised() {
+        for present in [
+            "ggml-tiny.bin",
+            "ggml-base.bin",
+            "ggml-small.bin",
+            "ggml-small.en.bin",
+            "ggml-medium-q8_0.bin",
+            "ggml-large-v3.bin",
+        ] {
+            assert_eq!(
+                default_model_size(&[present], Some(64 * GIB)),
+                "small",
+                "existing install with {present} must stay on small"
+            );
+        }
+    }
+
+    /// T2 DEFAULT FLIP — the constant pair stays coherent with `model_filename` for every
+    /// language (turbo is multilingual-only).
+    #[test]
+    fn turbo_default_file_matches_model_filename() {
+        for lang in ["", "en", "pl"] {
+            assert_eq!(model_filename(TURBO_DEFAULT_SIZE, lang), TURBO_DEFAULT_FILE);
+        }
+    }
+
+    /// T2 DEFAULT FLIP — `effective_model_size`: non-empty passes through verbatim; blank
+    /// resolves the same value as the machine-conditional resolver (ONE decision).
+    #[test]
+    fn effective_model_size_passthrough_and_blank_resolution() {
+        assert_eq!(effective_model_size("small"), "small");
+        assert_eq!(effective_model_size(" large-v3 "), "large-v3");
+        let resolved = default_model_size_now();
+        assert_eq!(effective_model_size(""), resolved);
+        assert_eq!(effective_model_size("   "), resolved);
+        assert!(resolved == "small" || resolved == TURBO_DEFAULT_SIZE);
+    }
+
     /// T2 — quant filenames ride the same HF mirror URL as the plain sizes.
     #[test]
     fn quant_url_points_at_whispercpp_hf_mirror() {
@@ -466,6 +693,95 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2 default-flip follow-up — the live-pin ABSENT-FILE fallback picks the LARGEST
+    /// downloaded live-SAFE model (small → small-q8_0 → base → tiny) and NEVER medium/large:
+    /// a fresh turbo-only install (the flip's target machines) must resolve `None` so the
+    /// live tick never decodes a large-v3 encoder.
+    #[test]
+    fn live_fallback_never_picks_medium_or_large() {
+        let dir = std::env::temp_dir().join(format!("murmur-live-fb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Fresh turbo-default install: ONLY the turbo file (+ VAD) on disk → None.
+        std::fs::write(dir.join("ggml-large-v3-turbo-q8_0.bin"), b"x").unwrap();
+        std::fs::write(dir.join(VAD_MODEL_FILE), b"x").unwrap();
+        assert_eq!(live_fallback_model_in(&dir, ""), None);
+        assert_eq!(live_fallback_model_in(&dir, "pl"), None);
+
+        // medium/large additions still resolve None.
+        std::fs::write(dir.join("ggml-medium.bin"), b"x").unwrap();
+        std::fs::write(dir.join("ggml-large-v3.bin"), b"x").unwrap();
+        assert_eq!(live_fallback_model_in(&dir, ""), None);
+
+        // tiny appears → picked; base → preferred; small-q8_0 → preferred; small wins.
+        std::fs::write(dir.join("ggml-tiny.bin"), b"x").unwrap();
+        assert_eq!(
+            live_fallback_model_in(&dir, "pl"),
+            Some(dir.join("ggml-tiny.bin"))
+        );
+        std::fs::write(dir.join("ggml-base.bin"), b"x").unwrap();
+        assert_eq!(
+            live_fallback_model_in(&dir, ""),
+            Some(dir.join("ggml-base.bin"))
+        );
+        std::fs::write(dir.join("ggml-small-q8_0.bin"), b"x").unwrap();
+        assert_eq!(
+            live_fallback_model_in(&dir, ""),
+            Some(dir.join("ggml-small-q8_0.bin"))
+        );
+        std::fs::write(dir.join("ggml-small.bin"), b"x").unwrap();
+        assert_eq!(
+            live_fallback_model_in(&dir, ""),
+            Some(dir.join("ggml-small.bin"))
+        );
+
+        // English prefers the `.en` build but rides a multilingual of the same size.
+        assert_eq!(
+            live_fallback_model_in(&dir, "en"),
+            Some(dir.join("ggml-small.bin"))
+        );
+        std::fs::write(dir.join("ggml-small.en.bin"), b"x").unwrap();
+        assert_eq!(
+            live_fallback_model_in(&dir, "en"),
+            Some(dir.join("ggml-small.en.bin"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2 default-flip follow-up — the heavy-file classifier: every medium/large-class name
+    /// (incl. turbo + quants + `.en`) is heavy; live-safe sizes and unrecognizable custom
+    /// names are not (custom `whisper_model_path` keeps its pre-pin fallback behavior).
+    #[test]
+    fn live_heavy_classifier_flags_medium_and_large_class_files() {
+        for heavy in [
+            "ggml-large-v3.bin",
+            "ggml-large-v3-turbo.bin",
+            "ggml-large-v3-turbo-q8_0.bin",
+            "ggml-large-v3-q5_0.bin",
+            "ggml-medium.bin",
+            "ggml-medium.en.bin",
+            "ggml-medium-q8_0.bin",
+        ] {
+            assert!(
+                is_live_heavy_model_file(Path::new(heavy)),
+                "{heavy} must classify heavy"
+            );
+        }
+        for safe in [
+            "ggml-tiny.bin",
+            "ggml-base.en.bin",
+            "ggml-small.bin",
+            "ggml-small-q8_0.bin",
+            "my-custom-model.bin",
+        ] {
+            assert!(
+                !is_live_heavy_model_file(Path::new(safe)),
+                "{safe} must classify live-safe"
+            );
+        }
     }
 
     #[test]

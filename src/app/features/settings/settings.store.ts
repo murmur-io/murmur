@@ -1262,7 +1262,9 @@ export class SettingsStore {
         audioStorageLimitGb:
           cfg.audioStorageLimitGb != null ? String(cfg.audioStorageLimitGb) : "",
         audioAutoPrune: cfg.audioAutoPrune ?? false,
-        // Mirrors backend default model_size = "small" (settings/config.rs, AppConfig::default).
+        // The backend default is machine-conditional (small, or large-v3-turbo-q8_0 when already
+        // downloaded / on a fresh 12+ GB Mac — transcribe/model.rs default_model_size); "small"
+        // here is only the nullish safety net.
         modelSize: cfg.modelSize ?? "small",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
