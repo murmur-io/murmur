@@ -332,13 +332,20 @@ impl AppState {
 /// there is no content key at startup). Best-effort and panic-free: every failure is logged, never
 /// fatal to launch.
 fn reconcile_locked_at_rest(db: &Db) {
-    let rows = match db.reblank_locked_folders_at_rest() {
+    let (rows, rollup_exports) = match db.reblank_locked_folders_at_rest() {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
             return;
         }
     };
+    // Brain v2 L2.1 LOCK-SAFETY (filesystem half): when any folder is locked, the reconcile tx
+    // purged EVERY memory-rollup row (a rollup may paraphrase sealed facts) — remove their exported
+    // vault `.md`s here. Only ever the recorded exported paths; a missing file is fine. The rollups
+    // regenerate from visible facts on the next hourly pass.
+    for p in &rollup_exports {
+        let _ = std::fs::remove_file(p);
+    }
     for row in rows {
         let crate::storage::LockedMeetingAudio {
             meeting_id,

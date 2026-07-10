@@ -141,6 +141,37 @@ pub fn synthesize_brief(facts: &[Fact]) -> String {
     brief
 }
 
+/// Brain v2 L2.2 — max user facts fed into a RELEVANCE-FILTERED brief (the FTS top-k). Smaller than
+/// [`MAX_BRIEF_FACTS`] on purpose: when a query is in hand, a tight, on-topic brief beats breadth.
+pub const RELEVANT_BRIEF_FACTS: usize = 8;
+
+/// Brain v2 L2.2 — the RELEVANCE-FILTERED memory brief: when a user `query` is in hand, rank the
+/// visible open user facts by BM25 against it (`Db::search_user_facts_visible` — the SAME
+/// visibility predicate as `list_user_facts_visible`, so a sealed-not-unlocked meeting's facts are
+/// NEVER read) and synthesize the brief from the top [`RELEVANT_BRIEF_FACTS`] hits.
+///
+/// BEHAVIOR-PRESERVING FALLBACK: an empty/punctuation-only query (the note-gen path), an FTS error,
+/// or ZERO hits all fall back to today's full-list `list_user_facts_visible` + [`synthesize_brief`]
+/// — so the brief is never emptier than the pre-L2.2 one just because relevance filtering found
+/// nothing. [`MEMORY_BRIEF_MAX_CHARS`] applies unchanged on both paths. Best-effort like the
+/// existing brief call sites: a DB read error degrades to an empty brief, never a failure. The
+/// CALLER still owns the `user_memory_enabled` flag check (this fn only assembles).
+pub fn build_memory_brief(
+    db: &crate::storage::Db,
+    query: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> String {
+    if !query.trim().is_empty() {
+        if let Ok(hits) = db.search_user_facts_visible(query, RELEVANT_BRIEF_FACTS, unlocked) {
+            if !hits.is_empty() {
+                return synthesize_brief(&hits);
+            }
+        }
+    }
+    let facts = db.list_user_facts_visible(unlocked).unwrap_or_default();
+    synthesize_brief(&facts)
+}
+
 /// The shape the reasoner must emit. Best-effort: parse failures degrade to no facts.
 #[derive(Debug, Deserialize)]
 struct UserFactsReply {
@@ -256,6 +287,73 @@ pub fn extract_user_fact_candidates(
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(target: "user_memory", error = %e, "user-fact extraction reply unparseable; no candidates");
+            return Vec::new();
+        }
+    };
+    candidates_from_raw(reply.facts)
+}
+
+/// Brain v2 L2.3 — max chars of a pasted memory export fed to the import extractor (bounds the
+/// prompt / leak surface exactly like the note excerpt).
+const IMPORT_EXCERPT_CHARS: usize = 8_000;
+
+/// PURE + headless-testable assembly of the MEMORY-IMPORT user prompt (Brain v2 L2.3): the pasted
+/// text is labelled as pre-extracted memories from ANOTHER AI assistant (ChatGPT/Claude memory
+/// export), hard-bounded to [`IMPORT_EXCERPT_CHARS`]. Split out so the labelling + the bound can be
+/// unit-tested without a live model.
+fn build_import_user_prompt(text: &str) -> String {
+    let excerpt: String = text.chars().take(IMPORT_EXCERPT_CHARS).collect();
+    format!(
+        "PRE-EXTRACTED MEMORIES FROM ANOTHER AI ASSISTANT (the user pasted their memory export; \
+         each line is already a durable fact/preference about the user — convert them, do not \
+         re-summarize):\n{excerpt}"
+    )
+}
+
+/// Brain v2 L2.3 — BEST-EFFORT extraction of user-scoped fact candidates from a PASTED memory
+/// export (ChatGPT/Claude "what the assistant remembers" text). Reuses the [`EXTRACT_SYSTEM`]
+/// machinery (same schema, same [`candidates_from_raw`] scoping) with an import-specific user
+/// prompt. Same degradation contract as [`extract_user_fact_candidates`]: the stub reasoner / any
+/// decode or parse failure ⇒ an EMPTY vec — never an error, never a panic. ZERO egress: the
+/// command resolves the LIGHT local-or-stub reasoner (`import_extraction_reasoner` in commands.rs
+/// — NEVER cloud; the FE copy promises on-device, and a pasted third-party memory export must not
+/// ride the cloud Notes provider). No local model ⇒ nothing extracted ⇒ 0 imported.
+pub fn extract_imported_memories(
+    reasoner: &dyn LocalReasoner,
+    text: &str,
+) -> Vec<FactCandidate> {
+    if reasoner.id() == "stub" {
+        return Vec::new();
+    }
+    let user = build_import_user_prompt(text);
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "predicate": { "type": "string" },
+                        "object": { "type": "string" }
+                    },
+                    "required": ["predicate", "object"]
+                }
+            }
+        },
+        "required": ["facts"]
+    });
+    let value = match reasoner.structured(EXTRACT_SYSTEM, &user, &schema) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(target: "user_memory", error = %e, "memory import extraction failed; no candidates (best-effort)");
+            return Vec::new();
+        }
+    };
+    let reply: UserFactsReply = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(target: "user_memory", error = %e, "memory import reply unparseable; no candidates");
             return Vec::new();
         }
     };
@@ -382,6 +480,157 @@ mod tests {
         let prompt = build_extraction_user_prompt("Sync", "n", "", &huge);
         let z_count = prompt.chars().filter(|c| *c == 'z').count();
         assert!(z_count <= THREAD_TURNS_MAX_CHARS);
+    }
+
+    /// Brain v2 L2.2 (RED-first): with a QUERY in hand the brief is RELEVANCE-FILTERED — only the
+    /// BM25-matching fact appears; an EMPTY query falls back to the full list (behavior-preserving).
+    /// Zero FTS hits also fall back to the full list (the brief is never emptier than before).
+    /// RED before L2.2: `build_memory_brief`/`search_user_facts_visible` did not exist and every
+    /// surface injected the unfiltered full-list brief.
+    #[test]
+    fn build_memory_brief_filters_by_query_and_falls_back() {
+        use crate::facts::{FactOp, NewFact};
+        use crate::storage::models::{Meeting, MeetingStatus};
+        use crate::storage::Db;
+
+        let path = crate::storage::db::unique_temp_path("murmur-brief-filter", "sqlite");
+        let db = Db::open_with_key(
+            &path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        db.insert_meeting(&Meeting {
+            id: "m1".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Sync".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        let add = |predicate: &str, object: &str| {
+            FactOp::Add(NewFact {
+                entity_id: USER_SCOPE.to_string(),
+                subject: "You".to_string(),
+                predicate: predicate.to_string(),
+                object: object.to_string(),
+                valid_from: "2026-07-01T09:00:00Z".to_string(),
+                recorded_at: "2026-07-01T09:00:00Z".to_string(),
+                confidence: 1.0,
+                meeting_id: Some("m1".to_string()),
+            })
+        };
+        db.apply_user_fact_ops(&[
+            add("prefer", "Polish replies"),
+            add("works on", "Project Atlas"),
+        ])
+        .unwrap();
+        let unlocked = std::collections::HashSet::new();
+
+        // Query matching ONE fact → the brief contains ONLY that fact.
+        let brief = build_memory_brief(&db, "what is the deadline for Atlas?", &unlocked);
+        assert!(brief.contains("Project Atlas"), "matching fact present: {brief}");
+        assert!(
+            !brief.contains("Polish replies"),
+            "non-matching fact filtered out: {brief}"
+        );
+
+        // Empty query → the full-list fallback (both facts, exactly the pre-L2.2 brief).
+        let brief_all = build_memory_brief(&db, "", &unlocked);
+        assert!(brief_all.contains("Project Atlas"));
+        assert!(brief_all.contains("Polish replies"));
+
+        // Zero hits → the full-list fallback too (never emptier than before).
+        let brief_nohit = build_memory_brief(&db, "qqqzzz nonexistent", &unlocked);
+        assert!(brief_nohit.contains("Project Atlas"));
+        assert!(brief_nohit.contains("Polish replies"));
+    }
+
+    /// FIX 3 RED (adversarial finding 2, reproduced): a query sharing ONLY STOPWORDS with an
+    /// irrelevant fact must NOT displace the full-list fallback. Facts {the darker theme / Polish
+    /// natively}; the question "what language should the assistant use?" shares only "the" with the
+    /// theme fact — on the pre-fix code the OR-joined FTS returned the theme fact as the whole
+    /// "relevant" set, so the brief contained ONLY the theme fact and the actually-relevant
+    /// language fact was DISPLACED. Post-fix: stopwords/<3-char tokens are dropped before the OR,
+    /// no content term matches, and the brief falls back to the FULL list — the language fact is
+    /// always present.
+    #[test]
+    fn stopword_only_overlap_never_displaces_the_full_list_fallback() {
+        use crate::facts::{FactOp, NewFact};
+        use crate::storage::models::{Meeting, MeetingStatus};
+        use crate::storage::Db;
+
+        let path = crate::storage::db::unique_temp_path("murmur-brief-stopword", "sqlite");
+        let db = Db::open_with_key(
+            &path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        db.insert_meeting(&Meeting {
+            id: "m1".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Sync".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        let add = |predicate: &str, object: &str| {
+            FactOp::Add(NewFact {
+                entity_id: USER_SCOPE.to_string(),
+                subject: "You".to_string(),
+                predicate: predicate.to_string(),
+                object: object.to_string(),
+                valid_from: "2026-07-01T09:00:00Z".to_string(),
+                recorded_at: "2026-07-01T09:00:00Z".to_string(),
+                confidence: 1.0,
+                meeting_id: Some("m1".to_string()),
+            })
+        };
+        db.apply_user_fact_ops(&[
+            add("prefer", "the darker theme"),
+            add("speaks", "Polish natively"),
+        ])
+        .unwrap();
+        let unlocked = std::collections::HashSet::new();
+
+        // The adversarial repro query: only "the" overlaps (with the WRONG fact).
+        let brief = build_memory_brief(&db, "what language should the assistant use?", &unlocked);
+        assert!(
+            brief.contains("Polish natively"),
+            "the language fact must never be displaced by a stopword-only match: {brief}"
+        );
+        assert!(
+            brief.contains("darker theme"),
+            "zero content-word hits ⇒ the FULL-list fallback (both facts): {brief}"
+        );
+    }
+
+    /// L2.3 — the import prompt labels the pasted text as pre-extracted memories from another
+    /// assistant and hard-bounds it (bounds the prompt / leak surface).
+    #[test]
+    fn import_prompt_labels_source_and_bounds_text() {
+        let prompt = build_import_user_prompt("I prefer replies in Polish");
+        assert!(prompt.contains("ANOTHER AI ASSISTANT"));
+        assert!(prompt.contains("I prefer replies in Polish"));
+
+        // 'q' does not occur in the label text (unlike 'z' — "re-summarize"), so the count below
+        // measures ONLY the pasted excerpt.
+        let huge = "q".repeat(IMPORT_EXCERPT_CHARS * 3);
+        let bounded = build_import_user_prompt(&huge);
+        let q_count = bounded.chars().filter(|c| *c == 'q').count();
+        assert!(q_count <= IMPORT_EXCERPT_CHARS);
+    }
+
+    /// L2.3 — the stub reasoner (default install, no model) imports NOTHING, gracefully.
+    #[test]
+    fn extract_imported_memories_stub_is_empty() {
+        let out = extract_imported_memories(&crate::reason::StubReasoner, "remember: I like tea");
+        assert!(out.is_empty());
     }
 
     /// candidates_from_raw scopes every candidate to the user + drops empty pairs.
