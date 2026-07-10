@@ -100,7 +100,11 @@ fn render_hit_line(h: &ContextHit) -> String {
 /// appends a fresh block `\n\n{fence_start}\n{callout_line}\n{body…}\n{fence_end}`. An EMPTY
 /// `body_lines` returns the stripped note byte-for-byte (byte-exact undo). Callers MUST pre-
 /// [`sanitize`] every value flowing into `callout_line` / `body_lines`.
-fn apply_fenced_block(
+///
+/// `pub(crate)` so sibling managed-block lanes (the verify `> [!verify]-` callout in
+/// [`crate::verify::apply_verify_callout`]) reuse EXACTLY this engine — one fence discipline,
+/// one set of idempotency / byte-exact-undo / anti-forging invariants, never a re-implementation.
+pub(crate) fn apply_fenced_block(
     note_md: &str,
     fence_start: &str,
     fence_end: &str,
@@ -164,7 +168,10 @@ fn strip_fenced_block(md: &str, fence_start: &str, fence_end: &str) -> String {
 ///   `<!-- /murmur:context -->` would make the next `strip_fenced_block` match that embedded marker
 ///   first and cut mid-block, permanently breaking the byte-exact undo / idempotency invariant
 ///   (2026-07-05 lock-security finding). The broken tokens render as harmless literal text.
-fn sanitize(s: &str) -> String {
+///
+/// `pub(crate)` so the verify-callout lane ([`crate::verify::apply_verify_callout`]) applies the
+/// SAME hardening to its connector-sourced values.
+pub(crate) fn sanitize(s: &str) -> String {
     s.replace(['\r', '\n'], " ")
         .replace("<!--", "<! --")
         .replace("-->", "-- >")
