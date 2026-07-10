@@ -232,8 +232,6 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         let state = app.state::<AppState>();
         crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
     }
-    // T0.1 telemetry label — the coarse model SIZE only (never the path), computed once.
-    let model_label = model_size_label(&model_path);
     let transcriber = match Transcriber::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
@@ -241,6 +239,24 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             return;
         }
     };
+    // OPTIONAL parakeet live-ASR seam: whisper is ALWAYS loaded above (it is the batch-quality Fast
+    // engine, the wake/manual-capture engine, AND the fall-back). The `asr` box drives ONLY the main
+    // caption decode; `build_live_asr` returns a parakeet CPU recognizer when the config selects it
+    // AND its models are present + RAM permits, else it re-shares the whisper transcriber (no
+    // double-load). `Arc` so the same whisper model backs both the seam's fall-back and the direct
+    // `&Transcriber` handle the wake/manual-capture paths keep (they need whisper's short-clip
+    // language forcing — `transcribe_since` at line ~1765, `step_manual_capture` below).
+    let engine = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map(|c| c.live_asr_engine.clone())
+        .unwrap_or_else(|_| crate::transcribe::live_asr::ENGINE_WHISPER.to_string());
+    let transcriber = std::sync::Arc::new(transcriber);
+    let asr = crate::transcribe::live_asr::build_live_asr(&engine, transcriber.clone());
+    // The caption telemetry label follows the ACTUAL live engine (whisper / parakeet), not the
+    // configured whisper size — a parakeet tick must report `parakeet`, not the batch model size.
+    let asr_label = asr.engine_label();
 
     // T1.4 — the Silero VAD tick gate (config `live_vad_gate`, default ON): load the tiny
     // (~885 kB) Silero model ONCE per recording, CPU-ONLY on purpose — a SECOND ggml Metal
@@ -553,20 +569,23 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             continue;
         }
 
-        // LIVE captions use the Fast (greedy/best_of:1) profile via `transcribe` — NOT the
-        // batch beam-search path. Captions tick every few seconds on overlapping windows, so
-        // latency must dominate; beam search + temperature fallback would burn CPU per tick.
-        // The authoritative high-quality transcript is produced once at Stop (pipeline.rs).
+        // LIVE captions use the Fast profile via the `LiveAsr` seam — whisper's greedy/best_of:1
+        // profile OR the CPU-only parakeet engine (config `live_asr_engine`), NOT the batch
+        // beam-search path. Captions tick every few seconds on overlapping windows, so latency must
+        // dominate. The authoritative high-quality transcript is produced once at Stop (pipeline.rs)
+        // — ALWAYS by whisper (parakeet is live-only), so the seam here never affects note quality.
         let decode_started = std::time::Instant::now();
-        let decoded = transcriber.transcribe(&samples_16k, lang.as_deref());
+        let decoded = asr.transcribe_live(&samples_16k, lang.as_deref());
         // T0.1 — per-tick decode telemetry (target `live_perf`): durations / window length /
-        // coarse model label ONLY — never content, never paths (§8). The in-app instrument
-        // behind `scripts/measure-live-power.sh`.
+        // coarse engine label ONLY — never content, never paths (§8). The in-app instrument
+        // behind `scripts/measure-live-power.sh`. `model` = the ACTUAL live engine (whisper/
+        // parakeet); `whisper_size` = the loaded whisper batch size (unchanged coarse label).
         tracing::info!(
             target: "live_perf",
             decode_ms = decode_started.elapsed().as_millis() as u64,
             window_s = samples_16k.len() as f64 / 16_000.0,
-            model = %model_label,
+            model = %asr_label,
+            whisper_size = %model_size_label(&model_path),
             ok = decoded.is_ok(),
             "live decode tick"
         );
@@ -595,7 +614,7 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 // Best-effort + panic-free: a poisoned lock or empty tail simply leaves the capture
                 // armed; the dispatch runs off-thread exactly like the wake path.
                 if let Some(decision) =
-                    step_manual_capture(&app, &transcriber, lang.as_deref(), &text)
+                    step_manual_capture(&app, transcriber.as_ref(), lang.as_deref(), &text)
                 {
                     match decision {
                         ManualCaptureDecision::Dispatch { command } => {

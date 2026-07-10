@@ -92,6 +92,11 @@ export class MeetingTimelineComponent {
   readonly loading = input<boolean>(false);
   /** True when getTimeline() errored or resolved empty. */
   readonly error = input<boolean>(false);
+  /**
+   * True when there is no cached timeline yet AND generating it is on-device (heavy) — render a
+   * "Generate timeline" prompt instead of silently loading a multi-GB model on open (perf/OOM).
+   */
+  readonly needsGeneration = input<boolean>(false);
   /** Whether a seek will actually move audio (false when audioPath is null). */
   readonly hasAudio = input<boolean>(false);
   /**
@@ -107,6 +112,8 @@ export class MeetingTimelineComponent {
   readonly seek = output<number>();
   /** Re-run getTimeline(). */
   readonly retry = output<void>();
+  /** User asked to derive the timeline now (the on-device "Generate timeline" click). */
+  readonly generate = output<void>();
   /**
    * Pin request carrying the CURRENT playhead position in seconds. Purely
    * presentational — the parent is responsible for the IPC pin + clipboard.
@@ -313,10 +320,15 @@ export class MeetingTimelineComponent {
       !this.loading() && (this.lanes().length > 0 || this.topics().length > 0),
   );
 
-  /** True when not loading and there is genuinely nothing to show (or errored). */
+  /**
+   * True when not loading and there is genuinely nothing to show (or errored) — EXCEPT the
+   * "awaiting explicit on-device generation" state, which has its own prompt (a bare empty timeline
+   * that just hasn't been generated yet is not "unavailable").
+   */
   readonly unavailable = computed(
     () =>
       !this.loading() &&
+      !this.needsGeneration() &&
       (this.error() ||
         (this.lanes().length === 0 && this.topics().length === 0)),
   );

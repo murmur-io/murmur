@@ -41,8 +41,12 @@ const LOCAL_TIMELINE_MAX_CHARS: usize = 14_000;
 /// True when `provider_id` names an ON-DEVICE model (the on-device brain, Ollama, or Apple
 /// Foundation Models) — the residency-bound engines the transcript cap protects. Mirrors
 /// `related_context::is_weak_provider` (same three connection ids) so the two OOM-relevant
-/// classifications never drift; kept local + private to timeline.rs so this file owns its guard.
-fn is_on_device_provider(provider_id: &str) -> bool {
+/// classifications never drift; this file owns the canonical timeline OOM classification.
+///
+/// `pub(crate)` so the command layer can ask "would generating this meeting's timeline load a
+/// residency-bound on-device model?" — the gate that keeps a passive Audio-tab open from firing a
+/// multi-GB synchronous model load (perf-memory-audit; the whole-Mac beachball on open).
+pub(crate) fn is_on_device_provider(provider_id: &str) -> bool {
     provider_id == crate::summarize::roles::CONN_LOCAL
         || provider_id == crate::summarize::roles::CONN_AFM
         || provider_id == crate::summarize::PROVIDER_OLLAMA

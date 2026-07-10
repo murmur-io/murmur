@@ -147,6 +147,8 @@ export class SettingsStore {
     audioStorageLimitGb: this.fb.nonNullable.control("", { updateOn: "blur" }),
     audioAutoPrune: false,
     modelSize: "large-v3",
+    // OPTIONAL live-caption engine: "whisper" (default) | "parakeet".
+    liveAsrEngine: "whisper",
     voiceTrigger: false,
     noteStyle: "standard",
     notesMode: "enhance",
@@ -368,6 +370,22 @@ export class SettingsStore {
   /** Approx download size for the selected quality (shown on the Download button). */
   private readonly _downloadHint = signal("~3 GB");
   readonly downloadHint = this._downloadHint.asReadonly();
+
+  /**
+   * OPTIONAL parakeet live-ASR engine model presence + download state (mirrors the Whisper
+   * download UX, but for the ~600 MB parakeet int8 bundle). `null` = not yet checked.
+   */
+  private readonly _parakeetPresent = signal<boolean | null>(null);
+  readonly parakeetPresent = this._parakeetPresent.asReadonly();
+  private readonly _downloadingParakeet = signal(false);
+  readonly downloadingParakeet = this._downloadingParakeet.asReadonly();
+  private readonly _parakeetDownloadError = signal<string | null>(null);
+  readonly parakeetDownloadError = this._parakeetDownloadError.asReadonly();
+  private readonly _parakeetDownloadFrac = signal(0);
+  readonly parakeetDownloadFrac = this._parakeetDownloadFrac.asReadonly();
+  readonly parakeetPct = computed(
+    () => Math.round(this.parakeetDownloadFrac() * 100) + "%",
+  );
 
   /** Preserved from the loaded config (not a form field) so saving never un-onboards. */
   private loadedOnboarded = true;
@@ -1266,6 +1284,7 @@ export class SettingsStore {
         // downloaded / on a fresh 12+ GB Mac — transcribe/model.rs default_model_size); "small"
         // here is only the nullish safety net.
         modelSize: cfg.modelSize ?? "small",
+        liveAsrEngine: cfg.liveAsrEngine ?? "whisper",
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
         notesMode: cfg.notesMode ?? "enhance",
@@ -1340,6 +1359,10 @@ export class SettingsStore {
       this._hasSlackToken.set(await this.ipc.hasSlackToken().catch(() => false));
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
       this._modelPresent.set(await this.ipc.modelPresent());
+      // OPTIONAL parakeet live-ASR engine presence (best-effort — absent is the common case).
+      this._parakeetPresent.set(
+        await this.ipc.parakeetModelsPresent().catch(() => false),
+      );
       // Whisper transcribe-model download-progress stream (best-effort).
       await this.subscribeModelDownload();
       await this.refreshProviders();
@@ -1390,12 +1413,19 @@ export class SettingsStore {
   private async subscribeModelDownload(): Promise<void> {
     try {
       this.unlistenModelDownload = await this.ipc.onModelDownload((p) => {
-        // Only meaningful while a download this component started is in-flight.
-        if (!this.downloadingModel()) return;
-        if (p.total && p.total > 0) {
-          this._modelDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+        // EVENT_MODEL_DOWNLOAD is shared by the whisper AND parakeet downloads; route the
+        // progress to whichever this component started (only one runs at a time).
+        if (this.downloadingModel()) {
+          if (p.total && p.total > 0) {
+            this._modelDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+          }
+          if (p.done) this._modelDownloadFrac.set(1);
+        } else if (this.downloadingParakeet()) {
+          if (p.total && p.total > 0) {
+            this._parakeetDownloadFrac.set(Math.min(1, p.downloaded / p.total));
+          }
+          if (p.done) this._parakeetDownloadFrac.set(1);
         }
-        if (p.done) this._modelDownloadFrac.set(1);
       });
       this.destroyRef.onDestroy(() => this.unlistenModelDownload?.());
     } catch {
@@ -1974,6 +2004,7 @@ export class SettingsStore {
       })(),
       audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
+      liveAsrEngine: v.liveAsrEngine,
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
       noteStyle: v.noteStyle,
@@ -2449,6 +2480,23 @@ export class SettingsStore {
       this._modelDownloadError.set(String(e));
     } finally {
       this._downloadingModel.set(false);
+    }
+  }
+
+  /** Download the OPTIONAL parakeet live-ASR engine models (~600 MB), then re-check presence. */
+  async downloadParakeet(): Promise<void> {
+    this._parakeetDownloadError.set(null);
+    this._parakeetDownloadFrac.set(0);
+    this._downloadingParakeet.set(true);
+    try {
+      await this.ipc.downloadParakeetModels();
+      this._parakeetPresent.set(
+        await this.ipc.parakeetModelsPresent().catch(() => false),
+      );
+    } catch (e) {
+      this._parakeetDownloadError.set(String(e));
+    } finally {
+      this._downloadingParakeet.set(false);
     }
   }
 }

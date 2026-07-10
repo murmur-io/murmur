@@ -1242,9 +1242,31 @@ export class IpcService {
     return invoke<FolderNode | null>("unlock_meeting", { meetingId });
   }
 
-  /** AI-derived speaker + topic timeline for a meeting (generated + cached on first call). */
+  /**
+   * READ-ONLY: the cached AI-derived speaker + topic timeline (or an EMPTY one when none is cached).
+   * NEVER generates — a passive Audio-tab open must not load a multi-GB on-device model. Use
+   * `generateTimeline` to derive it, gated by `timelineGenerationOnDevice` (perf/OOM).
+   */
   getTimeline(meetingId: string): Promise<MeetingTimeline> {
     return invoke<MeetingTimeline>("get_timeline", { meetingId });
+  }
+
+  /**
+   * EXPLICIT (heavy) timeline generation — derives + caches the speaker/topic map via the Notes-role
+   * provider. For an on-device provider this loads a multi-GB model, so the FE only calls it
+   * automatically for cheap cloud providers and behind a user click for on-device ones.
+   */
+  generateTimeline(meetingId: string): Promise<MeetingTimeline> {
+    return invoke<MeetingTimeline>("generate_timeline", { meetingId });
+  }
+
+  /**
+   * True when deriving this install's timeline would load a residency-bound on-device model (local
+   * GGUF / Ollama / Apple FM) — i.e. generation is HEAVY and must be hidden behind an explicit
+   * click, not auto-fired on tab open. False for cloud providers (cheap → auto-generate).
+   */
+  timelineGenerationOnDevice(): Promise<boolean> {
+    return invoke<boolean>("timeline_generation_on_device");
   }
 
   /** Rename a speaker across a meeting's timeline (e.g. "User 1" → "Sarah"). */
@@ -1298,6 +1320,20 @@ export class IpcService {
   /** Download the default Whisper model (~150 MB) if missing; resolves with its path. */
   downloadModel(): Promise<string> {
     return invoke<string>("download_model");
+  }
+
+  /** Whether the OPTIONAL parakeet live-ASR engine's models are all present on disk. */
+  parakeetModelsPresent(): Promise<boolean> {
+    return invoke<boolean>("parakeet_models_present");
+  }
+
+  /**
+   * Download the parakeet live-ASR engine's int8 models (~600 MB) if missing. Progress streams
+   * over {@link onModelDownload} (EVENT_MODEL_DOWNLOAD, shared with the whisper download); the
+   * promise resolves when the download finishes (or rejects on failure).
+   */
+  downloadParakeetModels(): Promise<void> {
+    return invoke<void>("download_parakeet_models");
   }
 
   // ── Phase H — brain (AI assistant) model registry ──────────────────────
